@@ -358,17 +358,48 @@ CREATE INDEX IF NOT EXISTS idx_chunks_symbol_qualified
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
 
+-- CJK bigram tokenizer (ported from PMBrain's pmbrain_cjk_search_tokens,
+-- renamed gbrain_*). Emits CJK unigrams plus adjacent bigrams as a
+-- whitespace-separated string so to_tsvector('simple', ...) turns them into
+-- lexemes under the existing GIN index (idx_chunks_search_vector). Chinese
+-- queries then ride the indexed FTS path instead of a full-table ILIKE scan.
+-- Character class matches CJK_SLUG_CHARS in src/core/cjk.ts: Han, Hiragana,
+-- Katakana, Hangul syllables (BMP only).
+CREATE OR REPLACE FUNCTION gbrain_cjk_search_tokens(input_text TEXT) RETURNS TEXT
+LANGUAGE SQL IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS \$cjkfn\$
+  WITH chars AS (
+    SELECT ch, ord
+    FROM regexp_split_to_table(COALESCE(input_text, ''), '') WITH ORDINALITY AS t(ch, ord)
+    WHERE ch ~ '[一-鿿぀-ゟ゠-ヿ가-힯]'
+  )
+  SELECT COALESCE(string_agg(
+    CASE WHEN next_char.ch IS NOT NULL
+      THEN current_char.ch || ' ' || current_char.ch || next_char.ch
+      ELSE current_char.ch
+    END,
+    ' ' ORDER BY current_char.ord
+  ), '')
+  FROM chars current_char
+  LEFT JOIN chars next_char ON next_char.ord = current_char.ord + 1
+\$cjkfn\$;
+
 -- v0.20.0 Cathedral II: chunk-grain FTS trigger.
 -- Weight 'A' on doc_comment + symbol_name_qualified; weight 'B' on chunk_text.
 -- NL queries ("how do we handle errors") rank doc-comment hits above body text.
 -- BEFORE INSERT OR UPDATE OF specific columns — only refires when those change,
 -- not on every chunk update (e.g., embedding refresh doesn't trigger rebuild).
+-- CJK lexemes ride the SAME vector: 'simple'-config unigram+bigram tokens from
+-- gbrain_cjk_search_tokens, weighted A on doc_comment/symbol and B on
+-- chunk_text (PMBrain parity). English lexemes and weights unchanged.
 CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER SET search_path = pg_catalog, public AS \$fn\$
 BEGIN
   NEW.search_vector :=
     setweight(to_tsvector('english', COALESCE(NEW.doc_comment, '')), 'A') ||
     setweight(to_tsvector('english', COALESCE(NEW.symbol_name_qualified, '')), 'A') ||
-    setweight(to_tsvector('english', COALESCE(NEW.chunk_text, '')), 'B');
+    setweight(to_tsvector('english', COALESCE(NEW.chunk_text, '')), 'B') ||
+    setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.doc_comment, ''))), 'A') ||
+    setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.symbol_name_qualified, ''))), 'A') ||
+    setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.chunk_text, ''))), 'B');
   RETURN NEW;
 END;
 \$fn\$ LANGUAGE plpgsql;

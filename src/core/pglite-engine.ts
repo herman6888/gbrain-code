@@ -2430,17 +2430,19 @@ export class PGLiteEngine implements BrainEngine {
     // v0.26.5: visibility filter (soft-deleted + archived-source).
     const visibilityClause = buildVisibilityClause('p', 's', opts);
 
-    // v0.32.7: CJK query branch. PGLite uses websearch_to_tsquery('english')
-    // which can't tokenize CJK; queries return empty. Switch to ILIKE on
-    // chunk_text with term-frequency-count ranking when the query contains
-    // CJK characters. ASCII path stays exactly the same below.
-    if (hasCJK(query)) {
-      return this._searchKeywordCJK(query, {
-        limit, offset, innerLimit, sourceFactorCase,
-        hardExcludeClause, visibilityClause, detailFilter, opts,
-        dedup: true,
-      });
-    }
+    // CJK rides the GIN-indexed bigram FTS path (v150, PMBrain port): the
+    // query is tokenized through gbrain_cjk_search_tokens +
+    // plainto_tsquery('simple') below instead of websearch_to_tsquery.
+    // The v0.32.7 ILIKE fallback is kept as a conservative SAFETY NET:
+    // when the FTS arm returns zero rows we still fall back to it
+    // (PMBrain dropped ILIKE outright; we stay more conservative).
+    // ASCII path stays exactly the same below.
+    const cjkQuery = hasCJK(query);
+    const cjkFallbackCtx = {
+      limit, offset, innerLimit, sourceFactorCase,
+      hardExcludeClause, visibilityClause, detailFilter, opts,
+      dedup: true,
+    };
 
     // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol-kind filters.
     const params: unknown[] = [query, innerLimit, limit, offset];
@@ -2482,6 +2484,12 @@ export class PGLiteEngine implements BrainEngine {
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
+    // CJK queries tokenize through gbrain_cjk_search_tokens (v150):
+    // 'simple' config keeps the unigram+bigram lexemes raw. The English
+    // branch compiles to the exact same expression as before.
+    const queryExpression = cjkQuery
+      ? "plainto_tsquery('simple', gbrain_cjk_search_tokens($1))"
+      : `websearch_to_tsquery('${ftsLang}', $1)`;
 
     const keywordSql =
       `WITH ranked AS (
@@ -2493,14 +2501,14 @@ export class PGLiteEngine implements BrainEngine {
            CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
              THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
+           ts_rank(cc.search_vector, ${queryExpression}) * ${sourceFactorCase} AS score,
            CASE WHEN p.updated_at < (
              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
            ) THEN true ELSE false END AS stale
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
-         WHERE cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+         WHERE cc.search_vector @@ ${queryExpression} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
            -- v0.27.1: hide image rows from default text-keyword search so
            -- OCR text doesn't drown text-page hits. Image-similarity queries
            -- run a separate vector path on embedding_image.
@@ -2514,6 +2522,13 @@ export class PGLiteEngine implements BrainEngine {
        LIMIT $3 OFFSET $4`;
 
     let { rows } = await this.db.query(keywordSql, params);
+    if (rows.length === 0 && cjkQuery) {
+      // FTS returned nothing for a CJK query → conservative ILIKE safety
+      // net (v0.32.7). Runs BEFORE the orFallback block so CJK queries
+      // never enter the English OR-of-terms relaxation path — same
+      // contract as the old early-return branch.
+      return this._searchKeywordCJK(query, cjkFallbackCtx);
+    }
     // D2 fix (fix/title-retrieval-arm): websearch AND semantics at chunk
     // grain mean one non-co-occurring token zeroes keyword recall. When the
     // strict query returns nothing, retry ONCE with OR-of-terms. Strict-AND
@@ -2730,16 +2745,17 @@ export class PGLiteEngine implements BrainEngine {
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
     const visibilityClause = buildVisibilityClause('p', 's', opts);
 
-    // v0.32.7: CJK branch (same as searchKeyword but without page-dedup).
-    if (hasCJK(query)) {
-      return this._searchKeywordCJK(query, {
-        limit, offset,
-        innerLimit: 0,             // unused on chunk-grain (no inner CTE)
-        sourceFactorCase,
-        hardExcludeClause, visibilityClause, detailFilter, opts,
-        dedup: false,
-      });
-    }
+    // CJK rides the GIN-indexed bigram FTS path (v150) — same treatment
+    // as searchKeyword but chunk-grain (no page-dedup), with the v0.32.7
+    // ILIKE fallback kept as a safety net on zero FTS rows.
+    const cjkQuery = hasCJK(query);
+    const cjkFallbackCtx = {
+      limit, offset,
+      innerLimit: 0,             // unused on chunk-grain (no inner CTE)
+      sourceFactorCase,
+      hardExcludeClause, visibilityClause, detailFilter, opts,
+      dedup: false,
+    };
 
     const params: unknown[] = [query, limit, offset];
     let extraFilter = '';
@@ -2775,6 +2791,11 @@ export class PGLiteEngine implements BrainEngine {
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
+    // CJK queries tokenize through gbrain_cjk_search_tokens (v150);
+    // English keeps the exact same expression as before.
+    const queryExpression = cjkQuery
+      ? "plainto_tsquery('simple', gbrain_cjk_search_tokens($1))"
+      : `websearch_to_tsquery('${ftsLang}', $1)`;
 
     const { rows } = await this.db.query(
       `SELECT
@@ -2785,18 +2806,23 @@ export class PGLiteEngine implements BrainEngine {
          CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
            THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-         ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
+         ts_rank(cc.search_vector, ${queryExpression}) * ${sourceFactorCase} AS score,
          CASE WHEN p.updated_at < (
            SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
          ) THEN true ELSE false END AS stale
        FROM content_chunks cc
        JOIN pages p ON p.id = cc.page_id
        JOIN sources s ON s.id = p.source_id
-       WHERE cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+       WHERE cc.search_vector @@ ${queryExpression} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
        ORDER BY score DESC
        LIMIT $2 OFFSET $3`,
       params
     );
+
+    if ((rows as unknown[]).length === 0 && cjkQuery) {
+      // FTS zero for a CJK query → conservative ILIKE safety net (v0.32.7).
+      return this._searchKeywordCJK(query, cjkFallbackCtx);
+    }
 
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }

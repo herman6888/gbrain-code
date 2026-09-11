@@ -487,14 +487,25 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
   });
 
   test('LIKE-meta-char escape: query with literal % does not wildcard-match', async () => {
-    // After our escape pass, ILIKE '%' || '\%' || '%' ESCAPE '\' looks
-    // for a literal `%` character — which our seeded CJK pages don't
-    // contain. So results should be empty (or at least not all 3 CJK pages).
-    const results = await engine.searchKeyword('100% 测试');
-    // Either the literal "100% 测试" exists nowhere (expected empty), or
-    // only the exact-substring pages match. None of our seeded pages
-    // contain this exact string.
-    expect(results.length).toBe(0);
+    // v150 changed the ROUTE (CJK rides bigram FTS first), so the literal
+    // `%` is dropped by gbrain_cjk_search_tokens instead of reaching ILIKE.
+    // The invariant this test guards is unchanged: a literal `%` must never
+    // act as a wildcard. Assert it directly instead of asserting an empty
+    // result set — the CJK part of the query (测试) legitimately matches.
+    const withPct = await engine.searchKeyword('100% 测试');
+    const plain = await engine.searchKeyword('测试');
+
+    // The `%` must not ADD matches: the %-query result set is a subset of
+    // the plain 测试 result set.
+    const plainSlugs = new Set(plain.map(r => r.slug));
+    expect(withPct.every(r => plainSlugs.has(r.slug))).toBe(true);
+    // And it must not leak into pages that have no 测试 at all — a wildcard
+    // `%测试%`-style blowup would have swept in every seeded page.
+    const leaked = withPct.filter(r =>
+      r.slug.includes('japanese') || r.slug.includes('korean') || r.slug.includes('english'));
+    expect(leaked).toEqual([]);
+    // The Chinese page (which does contain 测试) is still found.
+    expect(withPct.map(r => r.slug)).toContain('originals/chinese-essay');
   });
 
   test('empty CJK query returns no results', async () => {
