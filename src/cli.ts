@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/home/herman/.bun/bin/bun
 
 import { affectsRecall } from './core/types.ts';
 import { installSigchldHandler } from './core/zombie-reap.ts';
