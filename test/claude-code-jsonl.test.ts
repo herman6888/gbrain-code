@@ -107,6 +107,50 @@ describe('parseTranscript on the fixture [G3, A6]', () => {
     expect(r.skippedLines).toBeGreaterThanOrEqual(1);
   });
 
+  test('tracks genuine user turns without dropping archival tool placeholders', () => {
+    const dir = tdir();
+    const p = join(dir, 'origins.jsonl');
+    const line = (o: unknown) => JSON.stringify(o);
+    writeFileSync(p, [
+      line({ type: 'user', message: { role: 'user', content: 'I prefer weekly summaries on Friday afternoons.' } }),
+      line({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't-1', name: 'Read', input: { file_path: '/tmp/a' } }] } }),
+      line({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't-1', content: 'large private payload' }] } }),
+      line({ type: 'user', message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 't-2', content: 'another private payload' },
+        { type: 'text', text: 'Actually, send those summaries on Thursday afternoons.' },
+      ] } }),
+    ].join('\n') + '\n');
+
+    const r = parseTranscript(p);
+    expect(r.turns.map((turn) => turn.text)).toEqual([
+      'I prefer weekly summaries on Friday afternoons.',
+      '[tool: Read]',
+      '[tool result]',
+      '[tool result]\nActually, send those summaries on Thursday afternoons.',
+    ]);
+    expect(r.genuineUserTurnIndexes).toEqual([0, 3]);
+  });
+
+  test('slash-command bookkeeping records are not genuine user turns (writeback lane)', () => {
+    // Claude Code writes `/clear`-style commands and their stdout as `user`
+    // records whose content is ONLY harness tags. Nobody said that; feeding
+    // it to the writeback lane as the "user prompt" banks junk.
+    const dir = tdir();
+    const p = join(dir, 'commands.jsonl');
+    const line = (o: unknown) => JSON.stringify(o);
+    writeFileSync(p, [
+      line({ type: 'user', message: { role: 'user', content: 'Please remember I take my coffee black.' } }),
+      line({ type: 'user', message: { role: 'user', content: '<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>' } }),
+      line({ type: 'user', message: { role: 'user', content: '<local-command-stdout>Cleared 3 files</local-command-stdout>' } }),
+      line({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: '<local-command-stdout>ok</local-command-stdout>' }] } }),
+      line({ type: 'user', message: { role: 'user', content: '<command-name>/foo</command-name> and also: switch me to dark mode everywhere.' } }),
+    ].join('\n') + '\n');
+
+    const r = parseTranscript(p);
+    expect(r.turns).toHaveLength(5); // archival: the records stay in the window
+    expect(r.genuineUserTurnIndexes).toEqual([0, 4]);
+  });
+
   test('defaults exist and are sane', () => {
     expect(TRANSCRIPT_MAX_BYTES_DEFAULT).toBeGreaterThan(1024 * 1024);
     expect(TRANSCRIPT_HARD_CAP_BYTES).toBeGreaterThan(TRANSCRIPT_MAX_BYTES_DEFAULT);
@@ -231,6 +275,59 @@ describe('confineTranscriptPath [S3#8]', () => {
     const big = join(root, 'big.jsonl');
     writeFileSync(big, 'x'.repeat(64));
     expect(confineTranscriptPath(big, { root, maxBytes: 16 })).toEqual({ ok: false, reason: 'too_large' });
+  });
+
+  // #5701: a hook lane tail-reads a bounded window, so the whole-file size
+  // gate must not fire before the read it is about to bound.
+  test('allowOversize skips ONLY the size gate — confinement still applies', () => {
+    const root = tdir();
+    const big = join(root, 'big.jsonl');
+    writeFileSync(big, 'x'.repeat(64));
+    // Gate still fires without the opt-in.
+    expect(confineTranscriptPath(big, { root, maxBytes: 16 })).toEqual({ ok: false, reason: 'too_large' });
+    // Opt-in lets the file through, with its size reported.
+    const r = confineTranscriptPath(big, { root, maxBytes: 16, allowOversize: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.size).toBe(64);
+    // Path confinement is NOT relaxed by the opt-in.
+    const outside = join(root, '..', `gb-outside-${process.pid}.jsonl`);
+    writeFileSync(outside, '{}\n');
+    try {
+      expect(confineTranscriptPath(outside, {
+        root, maxBytes: 16, allowOversize: true,
+      })).toEqual({ ok: false, reason: 'outside_projects_dir' });
+    } finally {
+      rmSync(outside, { force: true });
+    }
+    // Nor is the symlink ladder.
+    const link = join(root, 'link.jsonl');
+    symlinkSync(big, link);
+    expect(confineTranscriptPath(link, { root, allowOversize: true })).toEqual({ ok: false, reason: 'symlink' });
+  });
+
+  test('a >TRANSCRIPT_HARD_CAP_BYTES session reaches the bounded tail read', () => {
+    const root = tdir();
+    const p = join(root, 'long.jsonl');
+    // A real Claude-shaped line, then padding past the 50MiB hard cap. The
+    // padding is NOT valid JSON, so a whole-file parse would count it as
+    // skipped lines while the bounded tail read never sees it.
+    const line = JSON.stringify({
+      type: 'user', sessionId: 'sess-5701', cwd: '/w', timestamp: '2026-09-29T00:00:00Z',
+      message: { role: 'user', content: 'remember the deploy window' },
+    });
+    const pad = 'x'.repeat(TRANSCRIPT_HARD_CAP_BYTES + 1024);
+    writeFileSync(p, `${line}\n${pad}\n`);
+
+    // Pre-fix the confinement refused the file outright.
+    expect(confineTranscriptPath(p, { root })).toEqual({ ok: false, reason: 'too_large' });
+
+    const conf = confineTranscriptPath(p, { root, allowOversize: true });
+    expect(conf.ok).toBe(true);
+    if (!conf.ok) return;
+    const parsed = parseTranscript(conf.path, { maxBytes: 64 * 1024 });
+    // The newest line (the padding) is what the tail holds; the read stayed
+    // bounded instead of pulling 50MiB into the hook lane.
+    expect(parsed.bytesRead).toBeLessThanOrEqual(64 * 1024);
   });
 
   test('rejects: directory named like a transcript', () => {

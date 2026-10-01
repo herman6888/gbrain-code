@@ -626,7 +626,9 @@ New prose appended here.`;
 
       const result = await runPhaseProposeTakes(buildCtx(engine), {
         extractor,
-        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes' }),
+        // The OpenRouter alias is not in the canonical pricing table; the
+        // opt-in bypass keeps this test about model-id preservation (C-16).
+        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes', allowUnpriced: true }),
       });
 
       expect(result.status).toBe('ok');
@@ -1026,6 +1028,37 @@ describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
   });
 });
 
+// ─── #4312: pricing.overrides reach the base-phase budget gate ─────
+
+describe('pricing.overrides reach the base-phase meter (#4312)', () => {
+  test('a $0 operator override lets a capped phase run instead of exhausting at list price', async () => {
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'test-key' } });
+    try {
+      const run = async (overrides: string | null) => {
+        const pages = [buildPage({ slug: 'wiki/override', body: 'an operator rate should price the gate' })];
+        const { engine, captured } = buildMockEngine({ pages });
+        (engine as unknown as { getConfig: (k: string) => Promise<string | null> }).getConfig =
+          async (k: string) => (k === 'pricing.overrides' ? overrides : null);
+        const extractor: ProposeTakesExtractor = async () => [
+          { claim_text: 'an operator rate should price the gate', kind: 'take', holder: 'brain', weight: 0.5 },
+        ];
+        const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, budgetUsd: 0.000001 });
+        return { result, inserted: captured.some(c => c.sql.includes('INSERT INTO take_proposals')) };
+      };
+      // Control: at list price the cap is binding.
+      const listed = await run(null);
+      expect(listed.result.details.budget_exhausted).toBe(true);
+      expect(listed.inserted).toBe(false);
+      // With the operator's $0 rate the same cap admits the call.
+      const priced = await run('{"anthropic:claude-sonnet-4-6": 0}');
+      expect(priced.result.details.budget_exhausted).toBe(false);
+      expect(priced.inserted).toBe(true);
+    } finally {
+      resetGateway();
+    }
+  });
+});
+
 // ─── #4102: cycle.propose_takes.enabled off switch ─────────────────
 
 describe('cycle.propose_takes.enabled gate (#4102)', () => {
@@ -1095,5 +1128,40 @@ describe('cycle.propose_takes.enabled gate (#4102)', () => {
     const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, once: true });
     expect(result.status).not.toBe('skipped');
     expect(calls()).toBe(1);
+  });
+});
+
+// ─── #4823: `gbrain dream --dry-run` promises "no writes" ────────────
+// BaseCyclePhase.run() must skip every subclass (propose_takes / grade_takes /
+// calibration_profile) under dry-run — they bill LLM calls and INSERT rows and
+// have no dry-run path of their own — the same shape extract uses.
+
+describe('runPhaseProposeTakes — dry-run (#4823)', () => {
+  function armedEngine(): { engine: BrainEngine; calls: () => number } {
+    let calls = 0;
+    const engine = {
+      kind: 'pglite',
+      async executeRaw() { calls++; throw new Error('executeRaw must not run under dry-run'); },
+      async listPages() { calls++; throw new Error('listPages must not run under dry-run'); },
+    } as unknown as BrainEngine;
+    return { engine, calls: () => calls };
+  }
+  const meter = () => new BudgetMeter({ budgetUsd: 1, phase: 'propose_takes' });
+
+  test('opts.dryRun: skipped with no_dry_run_support; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes(buildCtx(engine), { dryRun: true, meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(r.details.dryRun).toBe(true);
+    expect(calls()).toBe(0);
+  });
+
+  test('ctx.dryRun alone (caller forgot to thread opts): still skipped; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes({ ...buildCtx(engine), dryRun: true }, { meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(calls()).toBe(0);
   });
 });

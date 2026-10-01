@@ -16,7 +16,10 @@
  *     text blocks are extracted verbatim, non-text blocks become placeholders
  *     ([tool: name] / [tool result] / [thinking] / [image]) so the corpus
  *     records THAT a tool ran, never its payload.
- *   - isSidechain:true entries (subagent traffic) are skipped.
+ *   - root isSidechain/isMeta/isCompactSummary exactly true entries are skipped.
+ *   - user text with a non-empty structured origin.kind other than 'human'
+ *     is excluded; absent/unstructured origins stay compatible. Non-text
+ *     placeholders and assistant text are retained, not classified by origin.
  *   - type 'summary' entries and system/compact-boundary entries are skipped.
  *   - malformed lines are counted (skippedLines), never fatal.
  *
@@ -48,7 +51,9 @@ export const SPEC_TARGET: HostSpecTarget = {
     'block array ({type: "text"|"tool_use"|"tool_result"|"thinking"|"image", …}). ' +
     'Non-turn lines: {type: "summary"} and {type: "system", subtype: ' +
     '"compact_boundary"} among others — anything that is not a non-sidechain ' +
-    'user/assistant message is skipped. Unknown fields tolerated everywhere.',
+    'user/assistant message is skipped, as are root isMeta/isCompactSummary: true. ' +
+    'User text with a non-empty string origin.kind other than "human" is excluded; ' +
+    'missing/unstructured origins stay compatible. Unknown fields tolerated elsewhere.',
 };
 
 // ── Byte caps ───────────────────────────────────────────────────────────────
@@ -96,7 +101,7 @@ export type ConfineTranscriptResult =
  */
 export function confineTranscriptPath(
   p: unknown,
-  opts: { root?: string; maxBytes?: number; wslMountRoot?: string | null } = {},
+  opts: { root?: string; maxBytes?: number; wslMountRoot?: string | null; allowOversize?: boolean } = {},
 ): ConfineTranscriptResult {
   if (typeof p !== 'string' || p.length === 0) return { ok: false, reason: 'missing_path' };
   if (!p.endsWith('.jsonl')) return { ok: false, reason: 'not_jsonl' };
@@ -111,8 +116,17 @@ export function confineTranscriptPath(
   }
   if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
   if (!st.isFile()) return { ok: false, reason: 'not_file' };
+  // #5701: the size gate belongs to the READER, not the confinement. Every
+  // hook lane tail-reads a bounded window through parseTranscript (128KB
+  // writeback probe, 2MB user-prompt, 10MB session end), so refusing a
+  // legitimate >50MiB session here dropped automatic capture for long-running
+  // Claude Code sessions while the bounded read would have worked: one
+  // 12-hour heartbeat window recorded 41 `transcript_too_large` degrades.
+  // Callers that opt in skip the gate; path, symlink and root confinement
+  // still apply, and the full-file import path (parseClaudeSessionFile, whose
+  // cap lives in TRANSCRIPT_JSONL_HARD_CAP) is untouched.
   const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
-  if (st.size > cap) return { ok: false, reason: 'too_large' };
+  if (!opts.allowOversize && st.size > cap) return { ok: false, reason: 'too_large' };
   const rootRaw = opts.root ?? claudeProjectsDir();
   const root = (mountRoot !== null ? translateWindowsPath(rootRaw, mountRoot) : null) ?? rootRaw;
   if (!isPathContained(candidate, root)) {
@@ -163,6 +177,14 @@ function deriveTranslatedProjectsRoot(translated: string, mountRoot: string): st
 export interface ParsedTranscript {
   /** Conversation turns, oldest → newest (WindowTurn — the IPC window shape). */
   turns: WindowTurn[];
+  /**
+   * Turn indexes whose accepted user-role content contains genuine text. Claude records
+   * tool results as user-role messages too, so role alone cannot identify a
+   * human prompt. Kept parallel to `turns` instead of removing placeholders:
+   * archival/corpus consumers still see that tools ran, while prompt-only
+   * consumers can select structurally without matching rendered text.
+   */
+  genuineUserTurnIndexes: number[];
   /**
    * Context blocks a gbrain hook previously INJECTED this session, oldest →
    * newest. Claude Code records a UserPromptSubmit hook's additionalContext
@@ -259,6 +281,7 @@ export function parseTranscript(
 
   const lines = raw.split('\n');
   const turns: WindowTurn[] = [];
+  const genuineUserTurnIndexes: number[] = [];
   const injectedContextBlocks: string[] = [];
   const boundaryTurnIndexes: number[] = [];
   const toolCalls: ToolCallWithId[] = [];
@@ -298,8 +321,11 @@ export function parseTranscript(
       for (const c of entryToToolCalls(entry)) { toolCalls.push(c); toolCallTurnIndexes.push(turns.length); }
       for (const r of entryToToolResults(entry)) toolResults.set(r.tool_use_id, r.ok);
     }
-    const turn = entryToTurn(entry);
-    if (turn) turns.push(turn);
+    const parsedTurn = entryToTurn(entry);
+    if (parsedTurn) {
+      if (parsedTurn.genuineUser) genuineUserTurnIndexes.push(turns.length);
+      turns.push(parsedTurn.turn);
+    }
   }
   // Join results to calls by tool_use_id, then strip the internal id field so
   // the public ToolCallRecord shape (and the receipt JSON derived from it)
@@ -308,7 +334,7 @@ export function parseTranscript(
     const ok = c.id !== undefined ? toolResults.get(c.id) : undefined;
     return { name: c.name, input: capToolCallInput(c.input), ...(ok !== undefined ? { result: { ok } } : {}) };
   });
-  return { turns, injectedContextBlocks, bytesRead, parsedLines, skippedLines, compactBoundaries, boundaryTurnIndexes, toolCalls: joinedToolCalls, toolCallTurnIndexes };
+  return { turns, genuineUserTurnIndexes, injectedContextBlocks, bytesRead, parsedLines, skippedLines, compactBoundaries, boundaryTurnIndexes, toolCalls: joinedToolCalls, toolCallTurnIndexes };
 }
 
 /** {type:'system', subtype:'compact_boundary'} — Claude Code's on-disk compaction marker (v0.45.7). */
@@ -354,11 +380,32 @@ function entryToInjectedBlock(entry: unknown): string | null {
   return GBRAIN_BLOCK_MARKERS.some((m) => text.includes(m)) ? text : null;
 }
 
-/** One transcript line → a WindowTurn, or null for non-turn/skipped shapes. */
-function entryToTurn(entry: unknown): WindowTurn | null {
+/**
+ * Claude Code writes slash-command bookkeeping (`/clear`, its stdout) as
+ * `user` records whose content is ONLY harness tags. They stay in the window
+ * (archival) but are not something the human said, so they never count as a
+ * genuine user prompt for the writeback lane.
+ */
+const HARNESS_TAG_RE = /<(local-command-stdout|local-command-stderr|command-name|command-message|command-args)>[\s\S]*?<\/\1>/g;
+function isGenuineUserText(text: string): boolean {
+  return text.replace(HARNESS_TAG_RE, '').trim().length > 0;
+}
+
+function isSkippedTurnEntry(e: Record<string, unknown>): boolean {
+  return e.isSidechain === true || e.isMeta === true || e.isCompactSummary === true;
+}
+
+function hasNonHumanOrigin(e: Record<string, unknown>): boolean {
+  if (typeof e.origin !== 'object' || e.origin === null) return false;
+  const kind = (e.origin as Record<string, unknown>).kind;
+  return typeof kind === 'string' && kind.length > 0 && kind !== 'human';
+}
+
+/** One transcript line → a turn plus its structural human-prompt origin. */
+function entryToTurn(entry: unknown): { turn: WindowTurn; genuineUser: boolean } | null {
   if (typeof entry !== 'object' || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  if (e.isSidechain === true) return null; // subagent traffic — skipped
+  if (isSkippedTurnEntry(e)) return null;
   const type = e.type;
   if (type !== 'user' && type !== 'assistant') return null; // summary / system / compact boundary
   const msg = e.message;
@@ -366,11 +413,15 @@ function entryToTurn(entry: unknown): WindowTurn | null {
   const m = msg as Record<string, unknown>;
   const role: WindowTurn['role'] =
     m.role === 'assistant' || m.role === 'user' ? m.role : (type as WindowTurn['role']);
+  const acceptText = role !== 'user' || !hasNonHumanOrigin(e);
 
   const content = m.content;
   let text = '';
+  let hasGenuineText = false;
   if (typeof content === 'string') {
+    if (!acceptText) return null;
     text = content;
+    hasGenuineText = isGenuineUserText(content);
   } else if (Array.isArray(content)) {
     const parts: string[] = [];
     for (const block of content) {
@@ -378,7 +429,10 @@ function entryToTurn(entry: unknown): WindowTurn | null {
       const b = block as Record<string, unknown>;
       switch (b.type) {
         case 'text':
-          if (typeof b.text === 'string' && b.text.trim()) parts.push(b.text);
+          if (acceptText && typeof b.text === 'string' && b.text.trim()) {
+            parts.push(b.text);
+            if (isGenuineUserText(b.text)) hasGenuineText = true;
+          }
           break;
         case 'tool_use':
           parts.push(`[tool: ${typeof b.name === 'string' && b.name ? b.name : 'unknown'}]`);
@@ -400,7 +454,7 @@ function entryToTurn(entry: unknown): WindowTurn | null {
   }
   text = text.trim();
   if (!text) return null;
-  return { role, text };
+  return { turn: { role, text }, genuineUser: role === 'user' && hasGenuineText };
 }
 
 /**
@@ -435,7 +489,7 @@ interface ToolCallWithId extends ToolCallRecord {
 function entryContentBlocks(entry: unknown): unknown[] | null {
   if (typeof entry !== 'object' || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  if (e.isSidechain === true) return null; // subagent traffic — skipped, same as entryToTurn
+  if (isSkippedTurnEntry(e)) return null;
   const msg = e.message;
   if (typeof msg !== 'object' || msg === null) return null;
   const content = (msg as Record<string, unknown>).content;
@@ -530,6 +584,14 @@ export interface ParsedClaudeSession {
   turns: TimedTurn[];
   bytesRead: number;
   skippedLines: number;
+  /**
+   * Records that CLAIM to be importable turns: `type` user/assistant and not
+   * skipped by entry markers or explicit non-human origins. Zero of them means
+   * the file had nothing accepted to import (metadata or non-human text only) —
+   * understood, not host-format drift. Above zero with `turns` still empty is
+   * the real drift signal: turn records exist but no longer yield text.
+   */
+  turnShapedLines: number;
 }
 
 /**
@@ -552,6 +614,7 @@ export function parseClaudeSessionFile(
   let sessionId = '';
   let cwd: string | undefined;
   let skippedLines = 0;
+  let turnShapedLines = 0;
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -566,9 +629,15 @@ export function parseClaudeSessionFile(
     if (!sessionId && typeof e.sessionId === 'string' && e.sessionId) sessionId = e.sessionId;
     if (!cwd && typeof e.cwd === 'string' && e.cwd) cwd = e.cwd;
     const turn = entryToTurn(entry);
+    if (
+      !isSkippedTurnEntry(e) && (e.type === 'user' || e.type === 'assistant') &&
+      (turn || e.type === 'assistant' || !hasNonHumanOrigin(e))
+    ) {
+      turnShapedLines++;
+    }
     if (!turn) continue;
     const timestamp = typeof e.timestamp === 'string' ? e.timestamp : '';
-    turns.push({ role: turn.role, text: turn.text, timestamp });
+    turns.push({ role: turn.turn.role, text: turn.turn.text, timestamp });
   }
   return {
     sessionId,
@@ -577,6 +646,7 @@ export function parseClaudeSessionFile(
     turns,
     bytesRead: size,
     skippedLines,
+    turnShapedLines,
   };
 }
 
@@ -591,4 +661,3 @@ export function toCorpusText(turns: WindowTurn[]): string {
   if (!turns.length) return '';
   return turns.map((t) => `[${t.role}]\n${t.text}`).join('\n\n') + '\n';
 }
-

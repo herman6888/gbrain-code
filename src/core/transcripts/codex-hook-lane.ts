@@ -52,7 +52,7 @@ const HOOK_HEAD_WINDOW_BYTES = 256 * 1024;
  */
 export function confineCodexTranscriptPath(
   p: unknown,
-  opts: { root?: string; archivedRoot?: string; maxBytes?: number } = {},
+  opts: { root?: string; archivedRoot?: string; maxBytes?: number; allowOversize?: boolean } = {},
 ): ConfineTranscriptResult {
   if (typeof p !== 'string' || p.length === 0) return { ok: false, reason: 'missing_path' };
   if (!p.endsWith('.jsonl')) return { ok: false, reason: 'not_jsonl' };
@@ -73,8 +73,11 @@ export function confineCodexTranscriptPath(
   }
   if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
   if (!st.isFile()) return { ok: false, reason: 'not_file' };
+  // #5701: same split as the claude lane — this parser reads a bounded
+  // HEAD+TAIL window, so the size gate belongs to the caller that opts out of
+  // it, not to the confinement.
   const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
-  if (st.size > cap) return { ok: false, reason: 'too_large' };
+  if (!opts.allowOversize && st.size > cap) return { ok: false, reason: 'too_large' };
   const [root, archivedRoot] = codexRootsFor(opts);
   const contained =
     isPathContained(p, root) || (archivedRoot !== undefined && isPathContained(p, archivedRoot));
@@ -142,6 +145,7 @@ export function parseCodexHookTranscript(
   }
 
   const turns: WindowTurn[] = [];
+  const genuineUserTurnIndexes: number[] = [];
   const toolCalls: ToolCallRecord[] = [];
   const toolCallTurnIndexes: number[] = [];
   const boundaryTurnIndexes: number[] = [];
@@ -164,10 +168,15 @@ export function parseCodexHookTranscript(
     const mapped = mapCodexLine(entry);
     switch (mapped.kind) {
       case 'session':
-        if (mapped.sessionId) sessionId = mapped.sessionId;
-        if (mapped.cwd) cwd = mapped.cwd;
+        // #4981: first header wins (a forked rollout inherits its parent's header
+        // later in the file); identity is payload.id, the id in the rollout filename.
+        if (!sessionId && mapped.sessionId) sessionId = mapped.sessionId;
+        if (!cwd && mapped.cwd) cwd = mapped.cwd;
         break;
       case 'user':
+        genuineUserTurnIndexes.push(turns.length);
+        turns.push({ role: mapped.message.role, text: mapped.message.text });
+        break;
       case 'assistant':
         turns.push({ role: mapped.message.role, text: mapped.message.text });
         break;
@@ -193,6 +202,7 @@ export function parseCodexHookTranscript(
 
   return {
     turns,
+    genuineUserTurnIndexes,
     injectedContextBlocks: [], // codex's injected context is dropped at mapCodexLine, not surfaced
     bytesRead,
     parsedLines,

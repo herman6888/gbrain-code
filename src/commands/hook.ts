@@ -105,6 +105,7 @@ import {
   recordBackupSpawn,
 } from '../core/backup/status-file.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
+import { isClaudeCliSelfTranscriptPath } from '../core/ai/providers/claude-cli-scratch.ts';
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
@@ -719,10 +720,10 @@ async function statusFileNotice(): Promise<string | null> {
 const HOOK_GIT_TIMEOUT_MS = 1000;
 
 /**
- * Async execFile wrapper: the hook push paths must NEVER block the event
- * loop with execFileSync — a slow repo/network would keep withDeadline's
- * timer from ever firing and stall the harness for minutes. null on any
- * failure (missing binary, non-zero exit, timeout).
+ * Async execFile wrapper: hook push paths must NEVER block the event loop with
+ * execFileSync (a slow repo/network would stall withDeadline's timer for minutes).
+ * null on any failure (missing binary, non-zero exit, timeout). Explicit `env`:
+ * git must see the cwd-.env quarantine (env-trust.ts), not Bun's startup snapshot.
  */
 function tryExecAsync(bin: string, args: string[], timeoutMs = HOOK_GIT_TIMEOUT_MS): Promise<string | null> {
   return new Promise((resolve) => {
@@ -730,7 +731,7 @@ function tryExecAsync(bin: string, args: string[], timeoutMs = HOOK_GIT_TIMEOUT_
       execFile(
         bin,
         args,
-        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: process.env },
         (err, stdout) => resolve(err ? null : stdout.toString().trim()),
       );
     } catch {
@@ -813,7 +814,9 @@ function spawnDetachedPush(root: string): void {
   // Compiled binary: execPath IS gbrain. Dev (bun src/cli.ts): re-exec the
   // entrypoint — the jobs.ts --detach precedent.
   const argv = /[/\\]gbrain(\.exe)?$/.test(exec) ? pushArgs : [process.argv[1], ...pushArgs];
-  const child = spawn(exec, argv, { detached: true, stdio: 'ignore' });
+  // Explicit env: a child spawned without one does not see the parent's
+  // cwd-.env quarantine deletions (core/env-trust.ts).
+  const child = spawn(exec, argv, { detached: true, stdio: 'ignore', env: process.env });
   child.unref();
 }
 
@@ -1132,6 +1135,10 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     if (j.transcript_path !== undefined && j.transcript_path !== null) {
       const conf = confineTranscriptPath(j.transcript_path, {
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        // #5701: bounded tail read below — the 50MiB whole-file gate must not
+        // reject a long session before it runs (full rationale in
+        // claude-code-jsonl.ts's confinement).
+        allowOversize: true,
       });
       if (!conf.ok) return { outcome: 'degraded', reason: `transcript_${conf.reason}` };
       try {
@@ -1335,6 +1342,10 @@ async function hookCompact(io: HookIo): Promise<number> {
     if (j.transcript_path !== undefined && j.transcript_path !== null) {
       const conf = confineTranscriptPath(j.transcript_path, {
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        // #5701: bounded tail read below — the 50MiB whole-file gate must not
+        // reject a long session before it runs (full rationale in
+        // claude-code-jsonl.ts's confinement).
+        allowOversize: true,
       });
       if (!conf.ok) { outcome = 'degraded'; reason = `transcript_${conf.reason}`; return; }
       try {
@@ -1469,13 +1480,13 @@ async function hookStop(io: HookIo): Promise<number> {
       if (tp === undefined || tp === null) return 'no_transcript';
       const conf = confineTranscriptPath(tp as string, {
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        // #5701: bounded tail reads (128KB probe, then the 2MB cap).
+        allowOversize: true,
       });
       if (!conf.ok) return `transcript_${conf.reason}`;
-      const findLastUser = (ts: WindowTurn[]): WindowTurn | undefined => {
-        for (let i = ts.length - 1; i >= 0; i--) {
-          if (ts[i].role === 'user' && ts[i].text) return ts[i];
-        }
-        return undefined;
+      const findLastUser = (parsed: ReturnType<typeof parseTranscript>): WindowTurn | undefined => {
+        const index = parsed.genuineUserTurnIndexes.at(-1);
+        return index === undefined ? undefined : parsed.turns[index];
       };
       let lastUser: WindowTurn | undefined;
       try {
@@ -1488,11 +1499,11 @@ async function hookStop(io: HookIo): Promise<number> {
         // wide parse only ever runs when the cheap one failed, so the common
         // path keeps the 128KB cost inside this lane's 2s budget.
         lastUser = findLastUser(
-          parseTranscript(conf.path, { maxBytes: WRITEBACK_TRANSCRIPT_TAIL_BYTES }).turns,
+          parseTranscript(conf.path, { maxBytes: WRITEBACK_TRANSCRIPT_TAIL_BYTES }),
         );
         if (!lastUser) {
           lastUser = findLastUser(
-            parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES }).turns,
+            parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES }),
           );
         }
       } catch {
@@ -1665,7 +1676,8 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
     // (today's behavior, pinned by the capture-spec golden test).
     const spec = captureSpecFor(io.harness);
     const rootOpt = io.transcriptRoot ? { root: io.transcriptRoot } : {};
-    let conf = spec.confine(j?.transcript_path, { ...rootOpt });
+    // #5701: every spec parser reads a bounded window (claude tail, codex head+tail).
+    let conf = spec.confine(j?.transcript_path, { ...rootOpt, allowOversize: true });
     // A newest-mtime discovery with NO session-id match is a guess: on a
     // machine with concurrent sessions it can be a different, still-RUNNING
     // rollout. Fine for the local corpus (overwritten on the real session
@@ -1685,6 +1697,16 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
     }
     if (!conf.ok) {
       degrade(`transcript_${conf.reason}`);
+    } else if (
+      isClaudeCliSelfTranscriptPath(conf.path) ||
+      (ws !== undefined && isClaudeCliSelfTranscriptPath(ws))
+    ) {
+      // #5413: this session is gbrain's OWN claude-cli subprocess (the
+      // scratch cwd fingerprint appears in the transcript path or the
+      // payload cwd). Writing it to the dream corpus is a self-ingestion
+      // feedback loop — extraction prompts and page content re-enter as
+      // "conversations", and synthesize mints duplicate idea pages.
+      segmentMode = 'self_transcript';
     } else {
       const parsed = spec.parse(conf.path, { collectToolCalls: memorableAllowed });
       if (sessionId === 'unknown') {

@@ -606,6 +606,7 @@ export function renderPagesBlock(
   pages: SearchResult[],
   excerptLen = 600,
   query = '',
+  opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number } = {},
 ): string {
   return pages.map((p, idx) => {
     const page = p as unknown as {
@@ -619,6 +620,11 @@ export function renderPagesBlock(
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
     const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    // Evidence delivery: the block was already budgeted and cut around its
+    // hits; render it whole (capped only by excerptLen).
+    if (typeof opts.verbatim === 'function' ? opts.verbatim(p) : opts.verbatim) {
+      return `<page slug="${slug}" rank="${idx + 1}">\n${content.slice(0, opts.verbatimLen ?? excerptLen)}\n</page>`;
+    }
     const excerpt = selectRelevantExcerptDetailed(
       content,
       query,
