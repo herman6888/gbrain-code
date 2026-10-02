@@ -179,6 +179,11 @@
       "status": "ok"
     },
     {
+      "message": "Bun <bun-version> (minimum 1.4.0)",
+      "name": "bun_runtime",
+      "status": "ok"
+    },
+    {
       "message": "disabled (opt-in). Enable with: gbrain config set autopilot.nightly_quality_probe.enabled true",
       "name": "nightly_quality_probe_health",
       "status": "ok"

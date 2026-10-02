@@ -48,6 +48,9 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   ],
   "src/commands/export.ts": ["test/e2e/export-snapshot-postgres.test.ts", "test/e2e/memory-safety-wave-postgres.test.ts"],
   "src/core/export-*.ts": ["test/e2e/export-snapshot-postgres.test.ts", "test/e2e/memory-safety-wave-postgres.test.ts"],
+  // System One decide storage, egress page query and decide_health on Postgres/PgBouncer.
+  "src/core/ai/decide/**": ["test/e2e/decide-store-postgres.test.ts"],
+  "src/commands/doctor/checks/decide.ts": ["test/e2e/decide-store-postgres.test.ts"],
   "src/core/company-brain/receipts.ts": ["test/e2e/company-brain-receipts.test.ts"],
   "src/core/company-brain/receipt-schema.ts": ["test/e2e/company-brain-receipts.test.ts"],
   "src/core/minions/errors.ts": ["test/e2e/subagent-gateway-path.test.ts", "test/e2e/delegated-http-worker.test.ts", "test/e2e/subagent-crash-replay-multi-provider.test.ts"],

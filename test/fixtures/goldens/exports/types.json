@@ -398,7 +398,7 @@
         "kind": "variable",
         "name": "DEGRADED_REASONS",
         "signature": [
-          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"candidate_budget\", \"iterative_scan_unavailable\"]"
+          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"candidate_budget\", \"iterative_scan_unavailable\", \"egress_denied\"]"
         ]
       },
       {
@@ -412,7 +412,7 @@
         "kind": "type",
         "name": "DegradedReason",
         "signature": [
-          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\""
+          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"egress_denied\""
         ]
       },
       {
@@ -425,7 +425,7 @@
       {
         "kind": "interface",
         "members": [
-          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | undefined",
+          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"egress_denied\" | undefined",
           "stage: \"embed_unavailable\" | \"embed_timeout\" | \"expansion_failed\" | \"expansion_partial\" | \"rescore_skipped\" | \"vector_arm_failed\" | \"keyword_arm_failed\" | \"title_arm_failed\" | \"budget_dropped_all\" | \"budget_truncated\" | \"keyword_zero\" | \"cache_prestamp\" | \"reranker_skipped\" | \"rerank_passthrough\" | \"rerank_failed\" | \"keyword_relaxed_carried\" | \"safe_index_pending\" | \"vector_candidates_incomplete\" | \"projection_pending\" | \"projection_status_unknown\""
         ],
         "name": "DegradedStageEntry"
@@ -653,8 +653,10 @@
         "kind": "interface",
         "members": [
           "adaptive_return?: AdaptiveReturnDecision | undefined",
+          "answerability?: AnswerabilityVerdict | undefined",
           "autocut?: AutocutDecision | undefined",
           "cache?: { status: \"hit\" | \"miss\" | \"disabled\"; similarity?: number; age_seconds?: number; } | undefined",
+          "decide?: Partial<Record<\"rerank\" | \"intent\" | \"evidence\" | \"answerable\" | \"injection\" | \"recall_needed\" | \"triage\" | \"grounding\" | \"conflict\", DecideSlotMeta>> | undefined",
           "degraded?: DegradedStageEntry[] | undefined",
           "detail_resolved: \"low\" | \"medium\" | \"high\" | null",
           "embedding_column?: string | undefined",
@@ -666,6 +668,7 @@
           "relational_evidence_slot?: RelationalEvidenceSlotDecision | undefined",
           "relational_rerank_pin?: RelationalRerankPinDecision | undefined",
           "relaxed_dropped?: number | undefined",
+          "rerank?: { model_resolved: string; } | undefined",
           "retrieved_count?: number | undefined",
           "token_budget?: { budget: number; used: number; kept: number; dropped: number; truncated?: boolean; } | undefined",
           "vector_enabled: boolean",
@@ -1293,6 +1296,7 @@
           "content_flag?: { reason: string; detail: string; } | undefined",
           "cosine?: number | undefined",
           "create_safety?: CreateSafety | undefined",
+          "decide_evidence?: { p: number; clears: boolean; } | undefined",
           "delivered?: DeliveredEvidence | undefined",
           "effective_date?: string | null | undefined",
           "effective_date_source?: string | null | undefined",
@@ -1305,6 +1309,8 @@
           "graph_cross_source_hits?: number | undefined",
           "graph_session_demoted?: boolean | undefined",
           "graph_session_prefix?: string | undefined",
+          "injection_p?: number | undefined",
+          "injection_suspected?: true | undefined",
           "keyword_hit?: boolean | undefined",
           "keyword_relaxed?: boolean | undefined",
           "message_id?: string | undefined",
@@ -1317,6 +1323,7 @@
           "relational_seed?: string | undefined",
           "relational_via_link_types?: string[] | undefined",
           "rerank_score?: number | undefined",
+          "rerank_score_kind?: \"rubric\" | undefined",
           "reranker_delta?: number | undefined",
           "salience_boost?: number | undefined",
           "score: number",
@@ -1627,12 +1634,25 @@
         "members": [
           "documents: string[]",
           "model?: string | undefined",
+          "onMeta?: ((meta: RerankMeta) => void) | undefined",
           "query: string",
           "signal?: AbortSignal | undefined",
           "timeoutMs?: number | undefined",
           "topN?: number | undefined"
         ],
         "name": "RerankInput"
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "batches: number",
+          "input_tokens: number",
+          "latency_ms: number",
+          "model_resolved: string",
+          "output_tokens: number",
+          "score_semantics: \"rubric\""
+        ],
+        "name": "RerankMeta"
       },
       {
         "kind": "interface",
@@ -1751,6 +1771,13 @@
       },
       {
         "kind": "function",
+        "name": "__setDecideTransportForTests",
+        "signature": [
+          "(fn: RerankTransport | null) => void"
+        ]
+      },
+      {
+        "kind": "function",
         "name": "__setEmbedTransportForTests",
         "signature": [
           "(fn: EmbedManyFn | null) => void"
@@ -1852,6 +1879,20 @@
         "name": "configureGatewayIfUninitialized",
         "signature": [
           "() => void"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "decide",
+        "signature": [
+          "(req: DecideRequest, ctx: DecideContext) => Promise<DecideResult>"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "decideTransport",
+        "signature": [
+          "() => RerankTransport"
         ]
       },
       {
@@ -2189,7 +2230,7 @@
         "kind": "interface",
         "members": [
           "cacheWriteTtl?: \"5m\" | \"1h\" | undefined",
-          "kind: \"embedding\" | \"chat\" | \"rerank\" | \"multimodal\"",
+          "kind: \"embedding\" | \"rerank\" | \"chat\" | \"multimodal\" | \"decide\"",
           "maxInputTokens?: number | undefined",
           "maxOutputTokens?: number | undefined",
           "model: string",
@@ -6414,6 +6455,7 @@
           "beforeDate?: string | undefined",
           "beforeDateInclusive?: boolean | undefined",
           "crossModal?: \"image\" | \"text\" | \"both\" | \"auto\" | undefined",
+          "decide?: DecideSearchOpts | undefined",
           "dedupOpts?: { cosineThreshold?: number; maxTypeRatio?: number; maxPerPage?: number; } | undefined",
           "detail?: \"low\" | \"medium\" | \"high\" | undefined",
           "embeddingColumn?: string | ResolvedColumn | undefined",
@@ -6814,6 +6856,7 @@
       {
         "kind": "interface",
         "members": [
+          "abstained?: ThinkAbstention | undefined",
           "answer: string",
           "citations: ParsedCitation[]",
           "cost_usd?: number | undefined",
@@ -7172,7 +7215,7 @@
         "kind": "variable",
         "name": "DEGRADED_REASONS",
         "signature": [
-          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"candidate_budget\", \"iterative_scan_unavailable\"]"
+          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"candidate_budget\", \"iterative_scan_unavailable\", \"egress_denied\"]"
         ]
       },
       {
@@ -7186,7 +7229,7 @@
         "kind": "type",
         "name": "DegradedReason",
         "signature": [
-          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\""
+          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"egress_denied\""
         ]
       },
       {
@@ -7199,7 +7242,7 @@
       {
         "kind": "interface",
         "members": [
-          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | undefined",
+          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"egress_denied\" | undefined",
           "stage: \"embed_unavailable\" | \"embed_timeout\" | \"expansion_failed\" | \"expansion_partial\" | \"rescore_skipped\" | \"vector_arm_failed\" | \"keyword_arm_failed\" | \"title_arm_failed\" | \"budget_dropped_all\" | \"budget_truncated\" | \"keyword_zero\" | \"cache_prestamp\" | \"reranker_skipped\" | \"rerank_passthrough\" | \"rerank_failed\" | \"keyword_relaxed_carried\" | \"safe_index_pending\" | \"vector_candidates_incomplete\" | \"projection_pending\" | \"projection_status_unknown\""
         ],
         "name": "DegradedStageEntry"
@@ -7427,8 +7470,10 @@
         "kind": "interface",
         "members": [
           "adaptive_return?: AdaptiveReturnDecision | undefined",
+          "answerability?: AnswerabilityVerdict | undefined",
           "autocut?: AutocutDecision | undefined",
           "cache?: { status: \"hit\" | \"miss\" | \"disabled\"; similarity?: number; age_seconds?: number; } | undefined",
+          "decide?: Partial<Record<\"rerank\" | \"intent\" | \"evidence\" | \"answerable\" | \"injection\" | \"recall_needed\" | \"triage\" | \"grounding\" | \"conflict\", DecideSlotMeta>> | undefined",
           "degraded?: DegradedStageEntry[] | undefined",
           "detail_resolved: \"low\" | \"medium\" | \"high\" | null",
           "embedding_column?: string | undefined",
@@ -7440,6 +7485,7 @@
           "relational_evidence_slot?: RelationalEvidenceSlotDecision | undefined",
           "relational_rerank_pin?: RelationalRerankPinDecision | undefined",
           "relaxed_dropped?: number | undefined",
+          "rerank?: { model_resolved: string; } | undefined",
           "retrieved_count?: number | undefined",
           "token_budget?: { budget: number; used: number; kept: number; dropped: number; truncated?: boolean; } | undefined",
           "vector_enabled: boolean",
@@ -7859,6 +7905,7 @@
           "content_flag?: { reason: string; detail: string; } | undefined",
           "cosine?: number | undefined",
           "create_safety?: CreateSafety | undefined",
+          "decide_evidence?: { p: number; clears: boolean; } | undefined",
           "delivered?: DeliveredEvidence | undefined",
           "effective_date?: string | null | undefined",
           "effective_date_source?: string | null | undefined",
@@ -7871,6 +7918,8 @@
           "graph_cross_source_hits?: number | undefined",
           "graph_session_demoted?: boolean | undefined",
           "graph_session_prefix?: string | undefined",
+          "injection_p?: number | undefined",
+          "injection_suspected?: true | undefined",
           "keyword_hit?: boolean | undefined",
           "keyword_relaxed?: boolean | undefined",
           "message_id?: string | undefined",
@@ -7883,6 +7932,7 @@
           "relational_seed?: string | undefined",
           "relational_via_link_types?: string[] | undefined",
           "rerank_score?: number | undefined",
+          "rerank_score_kind?: \"rubric\" | undefined",
           "reranker_delta?: number | undefined",
           "salience_boost?: number | undefined",
           "score: number",

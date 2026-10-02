@@ -103,6 +103,10 @@
       },
       {
         "category": "ops",
+        "name": "bun_runtime"
+      },
+      {
+        "category": "ops",
         "name": "supervisor"
       },
       {
@@ -516,6 +520,10 @@
       {
         "category": "ops",
         "name": "db_only_collector_collision"
+      },
+      {
+        "category": "ops",
+        "name": "decide_health"
       },
       {
         "category": "ops",

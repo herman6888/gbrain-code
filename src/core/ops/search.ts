@@ -232,6 +232,9 @@ async function buildRetrievalResponseMeta(
       ...(m.cache ? { cache: m.cache.status } : {}),
       ...(m.token_budget ? { token_budget: m.token_budget } : {}),
       ...(m.vector_pool_underfilled ? { vector_pool_underfilled: m.vector_pool_underfilled } : {}),
+      ...(m.decide ? { decide: m.decide } : {}),
+      ...(m.rerank ? { rerank: m.rerank } : {}),
+      ...(m.answerability ? { answerability: m.answerability } : {}),
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
@@ -421,6 +424,7 @@ const search: Operation = {
       // #4415: agent-explicit recency + salience (same posture as `query`).
       salience: p.salience as 'off' | 'on' | 'strong' | undefined,
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,
+      decide: { remote: ctx.remote !== false },
       onMeta: (m) => { capturedMeta = m; },
     })).map(r => ({ ...r }));
     stampDeepResearchIds(results);
@@ -676,7 +680,7 @@ const query: Operation = {
       limit: (p.limit as number) || undefined,
       offset: (p.offset as number) || 0,
       excludePrivate,
-      requireSafeChunks: ctx.remote !== false,
+      requireSafeChunks: ctx.remote !== false, decide: { remote: ctx.remote !== false, answerability: true },
       takesHoldersAllowList: readHolders(ctx),
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
@@ -767,7 +771,7 @@ const query: Operation = {
             expansion: true,
             expandFn: expandQuery,
             relationalRetrieval: true,
-            autocut: false,
+            autocut: false, decide: { remote: ctx.remote !== false, rerankOnly: true }, // System One: S2-S5 off on the re-run
             detail,
             // Preserve the caller's #3985 type filter on the re-run (raw
             // pass-through; the base call already rejected malformed input).

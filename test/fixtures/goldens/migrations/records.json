@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 178,
+    "count": 181,
     "gaps": [
       17,
       18,
@@ -25,7 +25,7 @@
       "slugifyPath": "401dbca23580865d8b168dd8d84db4a6c708c6610d7cb61abafc7d0ee9809063",
       "verifyProjectionStatistics": "59d9ccfea1c53384d8607874a51209a9c2dfd51b2b85a2cb6269fa4120faf1f3"
     },
-    "latest": 183,
+    "latest": 186,
     "records": [
       {
         "handler": {
@@ -2712,6 +2712,45 @@
         "transaction": "absent",
         "verify": "absent",
         "version": 183
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "decision_receipts",
+        "sql": {
+          "length": 2716,
+          "sha256": "52fbd2953179f3124604362c4c2cd200349d5e45a14bc5866a41fafe537fd9bb"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 184
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "decide_calibrations",
+        "sql": {
+          "length": 1274,
+          "sha256": "bd2193c2b2bb6ca8c856a1ba9b1adb731c3bb1949ecd6c95fcaa307568872931"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 185
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "decide_proposals",
+        "sql": {
+          "length": 1578,
+          "sha256": "a6b48e0223120c874556adf9e38fd6a435287730dd417ee578d0fe71db090687"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 186
       }
     ],
     "versions": [
@@ -2892,7 +2931,10 @@
       180,
       181,
       182,
-      183
+      183,
+      184,
+      185,
+      186
     ]
   },
   "normalizer": "migrations-record-v1"
