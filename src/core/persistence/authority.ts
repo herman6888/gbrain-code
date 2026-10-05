@@ -1,9 +1,12 @@
 import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
-import { OperationError } from '../ops/contract.ts';
-import { slugUnderBoundPrefixes, matchesSlugAllowList } from '../ops/context.ts';
+import { opError, OperationError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { slugUnderBoundPrefixes, matchesSlugAllowList, noSourceGrantError } from '../ops/context.ts';
+import { NO_SOURCES } from '../source-id.ts';
 import { hasScope } from '../scope.ts';
-import { coerceLegacyPermissions, normalizeTokenScopes, parseLegacyTokenScope, parseTakesHoldersAllowList, parseLegacyOperationGrant } from '../legacy-token-scope.ts';
+import { normalizeTokenScopes } from '../legacy-token-scope.ts';
+import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
 import { readLocalWriter, currentVerifiedLocalWriter, verifyLocalWriter, type LocalGrant } from './identity.ts';
 import type { Principal, SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
 import { authorizePageVisibility, excludesPrivateWrites } from './page-visibility.ts';
@@ -23,6 +26,7 @@ function assertSkillWriteScopes(scopes: readonly string[], operation: string, re
   }
 }
 export async function submissionAuthority(ctx: OperationContext, operation: string, sourceId: string, sourceIncarnation: string, slug: string): Promise<WriteAuthority> {
+  if (ctx.auth?.sourceId === NO_SOURCES || sourceId === NO_SOURCES) throw noSourceGrantError(operation, ctx.auth);
   if (ctx.auth?.fenceProjectionDegraded || ctx.auth?.grantProjectionDegraded) deny('The grant projection is incomplete.');
   let principal: Principal;
   let localGrant: LocalGrant | undefined;
@@ -77,15 +81,14 @@ export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, opera
     return;
   }
   if (a.principal.kind === 'legacy_token') {
-    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT revoked_at,scopes,permissions FROM access_tokens WHERE id=$1${suffix}`, [a.principal.id]);
+    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT * FROM access_tokens WHERE id=$1${suffix}`, [a.principal.id]);
     if (!row || row.revoked_at != null) deny('The owning token is revoked.');
-    const permissions = coerceLegacyPermissions(row.permissions);
-    if (row.permissions != null && !permissions) deny('The current legacy grant is malformed.');
+    const grant = grantFromTokenRow(row);
+    if (grant.permissionsMalformed) deny('The current legacy grant is malformed.');
     assertSkillWriteScopes(normalizeTokenScopes(row.scopes) ?? [], operation, a.remote);
-    const liveOperations = parseLegacyOperationGrant(permissions?.allowed_operations);
+    const liveOperations = grant.allowedOperations;
     if (!operationAllowed(liveOperations, operation) || skillWrite(operation) && !liveOperations?.includes(operation)) deny('The current legacy operation grant excludes this write.');
-    if (!hasScope(normalizeTokenScopes(row.scopes) ?? ['read', 'write', 'admin'], 'write') ||
-      parseLegacyTokenScope(permissions?.source_id).sourceId !== a.sourceId) deny('The current token no longer permits this source write.');
+    if (!hasScope(grant.scopes, 'write') || authSourcesFromGrant(grant).sourceId !== a.sourceId) deny('The current token no longer permits this source write.');
     return;
   }
   if (a.principal.kind === 'local_cli' || a.principal.kind === 'local_stdio') {
@@ -104,7 +107,11 @@ export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, opera
 export async function authorizeStoredRequest(engine: SqlEngine, row: WriteRequest, lock = false): Promise<void> {
   const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean }>(
     `SELECT incarnation,archived FROM sources WHERE id=$1${lock ? ' FOR SHARE' : ''}`, [row.source_id]);
-  if (!source || source.archived || source.incarnation !== row.source_incarnation) throw new OperationError('source_changed', 'The accepted source is no longer active.');
+  if (!source || source.archived || source.incarnation !== row.source_incarnation) {
+    throw opError('source_changed', 'The accepted source is no longer active.',
+      `Source ${row.source_id} was archived, removed, or recreated after request ${row.request_id} was accepted, so it will not be applied. Check the source's writer status; a new write must target the current source.`,
+      { fix: readFix(`Shows source ${row.source_id}'s current registration and requests, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'] }) });
+  }
   await authorizeWrite(engine, row.authority, row.operation, row.slug, lock);
   if (skillWrite(row.operation)) {
     const affected = (row.authority as WriteAuthority & { skillSlugsUsed?: unknown }).skillSlugsUsed;
@@ -167,9 +174,13 @@ export async function authorizeTakeHolder(engine: SqlEngine, authority: WriteAut
   if (!(authority.takesHolders ?? ['world']).includes(holder)) deny('The take holder exceeds the original grant.');
   let current = ['world'];
   if (authority.principal.kind === 'legacy_token') {
-    const [row] = await engine.executeRaw<{ permissions: unknown }>('SELECT permissions FROM access_tokens WHERE id=$1 AND revoked_at IS NULL', [authority.principal.id]);
+    const [row] = await engine.executeRaw<Record<string, unknown>>('SELECT * FROM access_tokens WHERE id=$1 AND revoked_at IS NULL', [authority.principal.id]);
     if (!row) deny('The owning token is revoked.');
-    current = parseTakesHoldersAllowList(coerceLegacyPermissions(row.permissions)?.takes_holders) ?? ['world'];
+    current = grantFromTokenRow(row).takesHolders ?? ['world'];
+  } else if (authority.principal.kind === 'oauth_client') {
+    const [row] = await engine.executeRaw<{ takes_holders: unknown }>('SELECT takes_holders FROM oauth_clients WHERE client_id=$1 AND deleted_at IS NULL', [authority.principal.id]);
+    if (!row) deny('The owning OAuth client is revoked.');
+    current = row.takes_holders == null ? ['world'] : strings(row.takes_holders) ? row.takes_holders : [];
   }
   if (!current.includes(holder)) deny('The current holder grant excludes this write.');
 }

@@ -1,8 +1,13 @@
 import type { SqlEngine, WriteRequest } from './model.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 
+const declared = new WeakSet<object>();
+/** Transaction-local; #5984: a transaction engine declares it once (a savepoint is its own engine object). */
 export async function declarePersistenceProtocol(tx: SqlEngine): Promise<void> {
+  const inTransaction = (tx as { _pageTransaction?: boolean })._pageTransaction === true;
+  if (inTransaction && declared.has(tx)) return;
   await tx.executeRaw("SELECT set_config('gbrain.persistence_protocol','2',true)");
+  if (inTransaction) declared.add(tx);
 }
 
 export const PERSISTENCE_PROTOCOL_PREDICATE = "set_config('gbrain.persistence_protocol','2',true)='2'";
@@ -10,7 +15,8 @@ export const PERSISTENCE_PROTOCOL_PREDICATE = "set_config('gbrain.persistence_pr
 export function assertMutationProtocol(row: Pick<WriteRequest, 'target_kind' | 'protocol_version'>): void {
   if (((row.target_kind ?? 'page') === 'page' && (row.protocol_version ?? 1) === 1)
     || (row.target_kind === 'skill_bundle' && row.protocol_version === 2)) return;
-  throw new OperationError('unsupported_mutation_protocol', 'This consumer does not support the request target and protocol version.');
+  throw opError('unsupported_mutation_protocol', 'This consumer does not support the request target and protocol version.',
+    `This gbrain process cannot apply ${row.target_kind ?? 'page'} requests at protocol ${row.protocol_version ?? 1}, so it left the request untouched. A newer gbrain wrote it: upgrading gbrain on this host (the user's call) lets it be applied.`);
 }
 
 export async function assertSharedSkillPersistence(engine: SqlEngine, sourceId?: string): Promise<void> {

@@ -62,6 +62,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'transactionOn': OOS.helper,
   'withReservedConnection': OOS.lifecycle,
   'getPoolDiagnostics': OOS.lifecycle,
+  'onCheckout': OOS.lifecycle,
   'reconnect': OOS.lifecycle,
   'runUnsafe': OOS.helper,
   'executeRaw': OOS.lifecycle,
@@ -74,6 +75,8 @@ export const DOMAIN_OF: Record<string, string> = {
   'activeEmbeddingColId': OOS.helper,
   '_upsertChunksOnce': OOS.helper,
   '_searchKeywordCJK': OOS.helper,
+  'runVectorAttempt': OOS.helper,
+  'vectorIterativeScanSupported': OOS.helper,
 
   // pages
   'getPage': 'pages', 'readPageSnapshot': 'pages', 'lockPageKeys': 'pages', 'findDuplicatePage': 'pages',
@@ -130,7 +133,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'searchKeyword': 'cjk-search', 'searchKeywordChunks': 'cjk-search',
 
   // out of scope
-  'searchTitles': OOS.search, 'searchVector': OOS.search,
+  'searchTitles': OOS.search, 'searchVector': OOS.search, 'explainVectorSearch': OOS.search,
   'relationalFanout': OOS.enrichment, 'getBacklinkCounts': OOS.enrichment, 'getAdjacencyBoosts': OOS.enrichment,
   'getContentFlagsByPageIds': OOS.enrichment, 'getUnverifiedExtractionPageIds': OOS.enrichment,
   'getEffectiveDates': OOS.enrichment, 'getSalienceScores': OOS.enrichment, 'resolveAliases': OOS.enrichment,
@@ -653,7 +656,7 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('getTakeEmbeddings', [['default', (e) => e.getTakeEmbeddings([1, 2])]]),
   ...variants('countStaleTakes', [['default', (e) => e.countStaleTakes()]]),
   ...variants('listStaleTakes', [['default', (e) => e.listStaleTakes()]]),
-  ...variants('updateTakeEmbeddings', [['default', (e) => e.updateTakeEmbeddings([{ take_id: 1, embedding: EMB }])]]),
+  ...variants('updateTakeEmbeddings', [['default', (e) => e.updateTakeEmbeddings([{ take_id: 1, embedding: EMB, claim: 'x', model: 'openai:text-embedding-3-large' }])]]),
   ...variants('updateTake', [
     ['default', (e) => e.updateTake(1, 1, { since_date: '2026-01-01' }), [[/UPDATE takes/, [{ id: 1 }]]]],
     ['weight', (e) => e.updateTake(1, 1, { weight: 0.8 }), [[/UPDATE takes/, [{ id: 1 }]]]],
@@ -750,7 +753,7 @@ export const EXTRA_READ_CASES: SqlCase[] = [
   ...variants('searchTitles', [['default', (e) => e.searchTitles('alice example', { sourceId: SRC })]]),
   ...variants('searchVector', [['default', (e) => e.searchVector(EMB, { sourceId: SRC }), [[/AS eligible/, [{ eligible: 0 }]]]]]),
   ...variants('getStats', [['default', (e) => e.getStats(), [[/as page_count/, [{ page_count: 0, chunk_count: 0, embedded_count: 0, link_count: 0, tag_count: 0, timeline_entry_count: 0 }]]]]]),
-  ...variants('getHealth', [['default', (e) => e.getHealth(), [[/WITH scoped_pages/, [{ page_count: 0, embed_coverage: 1, dead_links: 0, missing_embeddings: 0, link_count: 0, entity_page_count: 0, link_coverage: 0, timeline_coverage: 0 }]]]]]),
+  ...variants('getHealth', [['default', (e) => e.getHealth(), [[/chunk_totals AS/, [{ page_count: 0, embed_coverage: 1, dead_links: 0, missing_embeddings: 0, link_count: 0, entity_page_count: 0, link_coverage: 0, timeline_coverage: 0 }]]]]]),
   ...variants('getRawData', [['default', (e) => e.getRawData(SLUG)]]),
   ...variants('getIngestLog', [['default', (e) => e.getIngestLog()]]),
   ...variants('getConfig', [['default', (e) => e.getConfig('embedding_model')]]),

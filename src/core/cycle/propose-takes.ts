@@ -351,8 +351,11 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
   return rows;
 }
 
-/** Per-call wall-clock timeout for the extractor LLM call. */
+/** Per-call wall-clock timeout for the extractor LLM call at the base cap. */
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
+/** Ceiling for the scaled timeout: the gateway's own chat default
+ *  (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) bounds the call regardless. */
+const EXTRACTOR_CALL_TIMEOUT_MAX_MS = 300_000;
 
 /**
  * #3763 — output caps for the extractor call. A stopReason 'length' response
@@ -372,6 +375,20 @@ const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
  */
 export const PROPOSE_TAKES_MAX_TOKENS = 2048;
 export const PROPOSE_TAKES_RETRY_MAX_TOKENS = 4096;
+
+/**
+ * Wall-clock timeout for one extractor call, scaled with its output cap
+ * (#5771). A flat 90s sized for the 2048-token base call starved the
+ * truncation retry: at a configured retry_max_tokens of 12000 a dense page's
+ * retry needs well over 90s to generate, so it timed out every cycle and the
+ * page was re-billed (base call + aborted retry) forever with no tombstone.
+ * 90s per PROPOSE_TAKES_MAX_TOKENS of output, floored at 90s, capped at
+ * EXTRACTOR_CALL_TIMEOUT_MAX_MS.
+ */
+function extractorCallTimeoutMs(maxTokens: number): number {
+  const scaled = Math.ceil((EXTRACTOR_CALL_TIMEOUT_MS * maxTokens) / PROPOSE_TAKES_MAX_TOKENS);
+  return Math.min(EXTRACTOR_CALL_TIMEOUT_MAX_MS, Math.max(EXTRACTOR_CALL_TIMEOUT_MS, scaled));
+}
 
 /**
  * #3763 — halt streak for a dead extractor lane. When EVERY extractor call in
@@ -416,11 +433,13 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
+  // The bound scales with maxTokens so an escalated or configured larger cap
+  // gets time to generate what it allows.
   const call = (maxTokens: number) => gatewayChat({
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
+    abortSignal: AbortSignal.timeout(extractorCallTimeoutMs(maxTokens)),
   });
   let result = await call(baseMaxTokens);
 

@@ -23,6 +23,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
+import type { Effect } from '../../../core/agent-output.ts';
 import { loadConfig } from '../../../core/config.ts';
 import { resolveGbrainHome } from '../../../core/gbrain-home.ts';
 import {
@@ -132,6 +133,16 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
       counters_note: `local, append-only, loss-tolerant observability over the last ${COUNTER_WINDOW_DAYS}d — never a source of truth`,
     };
 
+    // #5888: capture-lane exact duplicates dropped (every capture lane runs
+    // whether or not writeback is on) and near duplicates counted in shadow
+    // mode only (kept, never dropped).
+    try {
+      const cutoff = Date.now() - COUNTER_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+      const dedup = (await readHeartbeatTail(2000)).filter((e) => e.event === 'writeback_dedup' && Date.parse(e.ts) >= cutoff);
+      details.cross_lane_duplicates_7d = dedup.reduce((n, e) => n + (e.duplicate ?? 0), 0);
+      details.near_duplicates_shadow_7d = dedup.reduce((n, e) => n + (e.near_duplicate ?? 0), 0);
+    } catch { /* heartbeat unreadable — counters stay absent */ }
+
     // Plane comparison (the dual-write design's promised surfacing): the DB
     // row is authoritative at runtime; a disagreeing file mirror means a
     // failed dual-write, a foreign writer, or another machine's `config set`
@@ -225,19 +236,19 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
           }
           if (!existsSync(t.path)) {
             entry.probe = 'missing';
-            problems.push(`${t.host} instruction block missing at ${t.path} — re-run: gbrain bootstrap harness --yes`);
+            problems.push(`${t.host} instruction block missing at ${t.path} — after the user agrees, reinstall: gbrain bootstrap harness --yes`);
           } else {
             const probe = probeAmbientBlock(readFileSync(t.path, 'utf8'));
             if (probe.state === 'absent' || probe.state === 'damaged') {
               entry.probe = probe.state === 'damaged' ? 'damaged' : 'missing';
-              problems.push(`${t.host} instruction block ${probe.state === 'damaged' ? 'has damaged markers' : 'missing'} at ${t.path} — re-run: gbrain bootstrap harness --yes`);
+              problems.push(`${t.host} instruction block ${probe.state === 'damaged' ? 'has damaged markers' : 'missing'} at ${t.path} — after the user agrees, reinstall: gbrain bootstrap harness --yes`);
             } else if (probe.interior !== expectedBody) {
               entry.probe = 'drift';
               // The combo converges even when the file-plane posture stamp is
               // stale (e.g. facts.default_visibility flipped on ANOTHER
               // machine of a shared Postgres brain): the config set re-stamps
               // the mirror from DB truth, then the harness re-renders from it.
-              problems.push(`${t.host} instruction block is stale (config changed since install) — re-run: gbrain config set memory.auto_writeback ${wb.mode} && gbrain bootstrap harness --yes`);
+              problems.push(`${t.host} instruction block is stale (config changed since install) — after the user agrees, refresh: gbrain config set memory.auto_writeback ${wb.mode} && gbrain bootstrap harness --yes`);
             } else {
               entry.probe = 'current';
             }
@@ -312,6 +323,13 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
         ? `ambient writeback ${wb.mode}: ${problems.join('; ')}`
         : `ambient writeback ${wb.mode} (ttl ${wb.transient_ttl}, template visibility ${wb.visibility}, audience ${audience.audience})`,
       details,
+      ...(problems.some((p) => p.includes('gbrain bootstrap harness'))
+        ? { fix: {
+          argv: ['gbrain', 'bootstrap', 'harness', '--yes'], consent: ['persistent_install'] as Effect[], actor: 'agent' as const, requires_exclusive: false,
+          why: 'Rewrites the gbrain memory instruction block in each harness config from the current writeback settings.',
+          user_message: "gbrain's memory instructions in your agent app's config are missing or out of date. OK if I reinstall them?",
+          verify: { argv: ['gbrain', 'doctor', '--only', MEMORY_WRITEBACK_CHECK_NAME, '--json'] } } }
+        : problems.length ? { fix_unavailable_reason: 'operator_judgement' as const } : {}),
     };
   } catch (e) {
     return {

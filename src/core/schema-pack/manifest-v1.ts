@@ -35,6 +35,8 @@ const LinkInferenceSchema = z.object({
   regex: z.string().optional(),
   page_type: z.string().optional(),
   target_type: z.string().optional(),
+  /** The regex labels body mentions found by NER only; markdown links fall through to the in-code matchers (#5882). */
+  ner_only: z.boolean().optional(),
 }).strict();
 
 const LinkTypeSchema = z.object({

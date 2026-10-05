@@ -18,6 +18,21 @@ test('the CI admin build keeps container dependencies and Vite cache off the hos
   expect(Object.hasOwn(compose.volumes, 'gbrain-ci-admin-node-modules')).toBe(true);
   expect(compose.services.runner.volumes).toContain('gbrain-ci-admin-dist:/app/admin/dist');
   expect(Object.hasOwn(compose.volumes, 'gbrain-ci-admin-dist')).toBe(true);
+  // Compiled-CLI tests must run a Linux binary built in the container, never a
+  // host (e.g. macOS) build leaking through the /app bind mount.
+  expect(compose.services.runner.volumes).toContain('gbrain-ci-bin:/app/bin');
+  expect(Object.hasOwn(compose.volumes, 'gbrain-ci-bin')).toBe(true);
+});
+
+test('the runner compiles its own CLI and avoids GNU-only xargs flags', () => {
+  const template = source.slice(templateStart, templateEnd);
+  // `xargs -a FILE` is GNU-only; BSD xargs (macOS hosts) rejects it.
+  expect(source).not.toMatch(/xargs\s+-a\b/);
+  const install = template.indexOf('bun install --frozen-lockfile');
+  const build = template.indexOf('bun run build', install);
+  expect(install).toBeGreaterThanOrEqual(0);
+  expect(build).toBeGreaterThan(install);
+  expect(build).toBeLessThan(template.indexOf('__RUN_PHASES__'));
 });
 
 describe('ci-local command rendering', () => {

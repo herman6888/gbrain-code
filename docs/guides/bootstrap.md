@@ -39,6 +39,18 @@ follows is `BOOTSTRAP_FOR_AGENTS.md` at the repo root, fetched at the
 | Private GitHub repo | your account, created by `bootstrap repo` (or an empty repo you made yourself, adopted) | privacy verified via API |
 | Machine receipt | `~/.gbrain/bootstrap/receipt.json` | uninstall is keyed to it |
 
+**What session start shows:** the SessionStart hook prints your
+allowlisted MEMORY.md sections, push status and hook health, plus a warm
+context pack. It never shows another session's activity, and no setting
+turns that on. Session buffers that releases before v0.60.28.0 left in
+`~/.gbrain/transcripts/live/` are deleted by the stop hook once they are 7
+days old; you can also delete them by hand. If you set `GBRAIN_HOOKS=0` to
+hide the `Last session activity` line those releases printed, remove it from
+the environment the harness starts from (shell profile or service) after
+upgrading the `gbrain` the harness runs, then restart the harness:
+`GBRAIN_HOOKS=0` also turns off capture, session persistence and crash
+recovery.
+
 **What does NOT run:** anything while the harness is closed. Session-triggered
 schedules fire at turn/session boundaries only. True 24/7 operation is what a
 hosted brain provides — this is the honest desktop contract.
@@ -298,6 +310,47 @@ database backup, and do not clone live enrollment identities into an independent
 brain. Simultaneous editing from two machines is ordinary git conflict
 territory — `sources push` pulls divergence-safely (commit first, rebase pull,
 loud on conflicts).
+
+## Several agents, one brain (seats)
+
+When more than one agent feeds the same brain (two Claude Code homes, Claude
+Code and Codex side by side, or two people sharing a household brain), every
+captured session records which agent seat it came from, and pages the dream
+cycle synthesizes from it carry `seat: <label>` in their frontmatter next to
+`raw_source`. This is on by default and needs no setup.
+
+**Say to your agent:** *"Credit the sessions from this agent to the seat alice-desk"* —
+the agent runs `gbrain bootstrap hooks --harness claude-code --seat alice-desk`
+(or `gbrain bootstrap harness --seat alice-desk` for harness mode).
+
+**Say to your agent:** *"Which agent did this reflection come from?"* — the
+agent reads the page's `seat` frontmatter.
+
+- **Default seat.** Without a label, the seat is `home-<8 hex>`: a hash of the
+  agent's home directory (the Claude Code config directory, `CODEX_HOME`, or
+  the OpenClaw agent directory). The path itself never leaves the machine,
+  because page frontmatter may be committed to git.
+- **Named seat.** `--seat <label>` writes `GBRAIN_SEAT=<label>` into this
+  install's hook commands. A label is 1-64 characters of `a-z`, `0-9`, `.`,
+  `_` or `-`, starting with a letter or digit; uppercase is lowercased. A
+  re-install or `--repair` without `--seat` keeps the label; `--no-seat` goes
+  back to the default seat.
+- **Opt-out.** `--seat off` (or `GBRAIN_SEAT=off` in the agent's environment)
+  records no seat, so pages synthesized from those sessions carry none. Codex hooks and the committed cloud carrier do
+  not carry a label: set `GBRAIN_SEAT` in that environment instead (bootstrap
+  prints the exact line).
+- **Where it is recorded.** Each session gets one `<session-id>.seat.json`
+  next to its corpus file in `~/.gbrain/transcripts/corpus/`, written before
+  the corpus file and removed with the session's last corpus file. The first
+  seat recorded for a session is kept, even if the session is resumed from
+  another agent home.
+- **Hook health.** An invalid `GBRAIN_SEAT` falls back to the default seat
+  and records heartbeat reason `seat_label_invalid`; a resumed session from
+  another home records `seat_conflict`; an unwritable corpus dir records
+  `seat_write_failed`. Each heartbeat line carries a fixed `hint` with the fix.
+- **No re-synthesis.** Adding or changing a seat never re-runs synthesis of a
+  transcript that was already synthesized. A pattern page is credited to a
+  seat only when every reflection it was derived from shares that seat.
 
 ## Uninstall
 

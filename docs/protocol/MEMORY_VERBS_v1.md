@@ -49,10 +49,13 @@ the same registry.
 
 ```bash
 gbrain init --pglite                                      # 2-second local brain
-claude mcp add gbrain -- gbrain serve --surface verbs     # the memory-verb surface
-gbrain remember "I prefer dark mode in every editor" --provenance demo --entity people/me
-gbrain recall people/me                                   # …now ask your agent in a NEW session
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs     # the memory-verb surface
+gbrain remember "gbrain install check" --provenance install-check
+gbrain recall --query "gbrain install check"              # …now ask your agent in a NEW session
 ```
+
+The marker is a test value, never a fact about the user; ask the agent to
+`forget` it once the new session recalled it.
 
 > Memories agents save are readable by every agent connected to this brain;
 > pass `visibility: "private"` for local-CLI-only facts.
@@ -61,17 +64,17 @@ If `claude` is not found: install Claude Code first, or use a block below.
 
 **Codex**
 ```bash
-codex mcp add gbrain -- gbrain serve --surface verbs
+codex mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs
 ```
 
 **Grok Build** (verify with `grok mcp doctor gbrain` — the add is lazy)
 ```bash
-grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- gbrain serve --surface verbs
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface verbs
 ```
 
 **opencode** (verify with `opencode mcp list` — the add is lazy, and list SPAWNS the server)
 ```bash
-opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- gbrain serve --surface verbs
+opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface verbs
 ```
 
 **OpenClaw / any stdio MCP host** — register the server command
@@ -236,6 +239,13 @@ Save ONE fact with mandatory attribution.
   Empty ⇒ `provenance_required` error with a fix.
 - `entity`: set whenever the fact is about a specific person/company/project —
   entity-scoped recall will not find unattributed facts.
+- `infer_entity` (additive, boolean, default `true`): when `entity` is omitted,
+  the server may link the fact to the one entity page its text names exactly
+  (zero LLM; a second competing name, a bare first name or an ambiguous match
+  leaves it unattributed). Pass `false` to save it unattributed. An inferred
+  link that any write check would refuse falls back to the unattributed save;
+  it never errors. Inferred links dedup exact text only and never supersede.
+  Operators disable inference with `facts.entity_inference=off`.
 - `ttl`: duration shorthand (`"30d"`, `"12h"`, `"45m"`) or an absolute ISO 8601
   timestamp. ISO-8601 DURATIONS (`P30D`) are rejected with a self-correcting
   suggestion. Omitted ⇒ never expires.
@@ -257,6 +267,20 @@ near-duplicates may insert; dedup and supersession ride embedding similarity).
   similarity above the dedup threshold + different text = the new fact
   supersedes the old ("X at acme-example" → "X left acme-example").
 - Omitted optional inputs echo as `null`, never absent.
+
+#### remember entity attribution fields (additive)
+
+Optional response fields; clients must ignore any they do not know.
+
+- `entity_inferred: "mention"` — `entity` was omitted and `entity_slug` was
+  inferred from an exact mention. The stored fact's context reads
+  `entity inferred from mention`.
+- `warnings: string[]` — present only on an unattributed save
+  (`entity_slug: null`): `NO_ENTITY` (no entity given or inferred) or
+  `ENTITY_LINK_FAILED` (an inferred entity passed every scope and readability
+  check but could not be linked, e.g. its facts fence is malformed). A remote
+  caller is never told about an entity it cannot read: that case is `NO_ENTITY`.
+- `hint: string` — present with `warnings`; names the `entity` input.
 
 ### entity(name) — read, zero LLM, p99 < 100ms
 
@@ -409,6 +433,91 @@ For `forget`, a committed source- and visibility-scoped withdrawal is the
 durable memory outcome. Its filesystem mirror may remain pending; stale
 source imports must still respect the withdrawal.
 
+<a id="cli-exit-status-for-writes"></a>
+#### CLI exit status for writes (additive)
+
+On the CLI, exit 0 means the write committed. A write that was admitted but
+has not committed when the wait ends exits **10** and prints its receipt (in
+full with `--json`, plus `poll_command`). It may still commit: poll it, or
+repeat the same command with the same `--request-id`. Exit 10 is distinct
+from 75, which `gbrain upgrade` reads as "another migration runner holds the
+lock".
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Committed (or pending with `--accept-pending`). |
+| 10 | Accepted, still pending; the receipt names the request. |
+| 1 | Not committed: a terminal failure (`conflict`, `failed`, `cancelled`), a refusal before admission (for example "the persistence owner is closing", even with `--accept-pending`), or a lost response whose submission state is unknown (`submission_status: "unknown"`, no receipt). |
+
+The verdict keys on an admitted, non-terminal receipt, never on an error code
+alone. `--accept-pending` maps pending to exit 0 for hooks and cron;
+`GBRAIN_ACCEPT_PENDING=1` is its environment equivalent and
+`--no-accept-pending` overrides it (flag beats environment).
+
+The CLI waits up to 30 s for the commit (agents keep 5 s; a connector sync
+waiting for a retained publication to recover keeps 5 s unless one of the
+settings below is set). Precedence:
+`--wait <seconds>` (0 to 600) > `GBRAIN_WRITE_WAIT_MS` > the file-plane
+`persistence.write_wait_ms` (`gbrain config set persistence.write_wait_ms
+45000`) > 30 s. The wait reaches a resident owner with each request, and over
+a thin client or an older owner the CLI replays the same request ID until the
+wait is spent. Each exchange's transport deadline is the wait plus 15 s of
+admission headroom, so a slow commit exits 10 with a receipt, not with an
+unknown submission. `--timeout` bounds one exchange: with a shorter
+`--timeout` the owner is asked to stop waiting early enough to return the
+receipt, but a remote server's own 5 s wait cannot be shortened, so keep
+`--timeout` above it.
+
+```bash
+gbrain put notes/example --request-id 7f3c0e9a-0000-4000-8000-000000000001 < page.md
+echo $?   # 10: accepted, not yet committed
+gbrain call get_write_request '{"request_id":"7f3c0e9a-0000-4000-8000-000000000001"}'
+gbrain put notes/example --request-id 7f3c0e9a-0000-4000-8000-000000000001 --wait 60 < page.md   # 0 once committed
+```
+
+<a id="partial-page-edits-edit_page"></a>
+#### Partial page edits: edit_page (additive)
+
+`edit_page {slug, expected_revision, edits: [{old_text, new_text}], request_id?}`
+changes part of an existing page without resending it; agents should prefer it
+over `put_page` for small changes. Read `get_page` with `include_content:true`
+and pass its `revision`. Each edit replaces `old_text` (non-empty) with
+`new_text`; 1 to 50 edits apply in order, each against the text the previous
+edit produced, and all publish together or none do. Each `old_text` must match
+exactly once in the content `get_page` returned to you. Protected takes and
+facts sections never match and are preserved in place (use the `takes_*`
+operations or `remember`/`forget`); remote callers match against their
+sanitized view, so private facts and non-world takes are never matched,
+echoed or diffed. The write goes through the same receipts, revision check,
+fences, write-through and grants as `put_page`, with revision-bound editing
+semantics: removing a materialized timeline bullet removes its timeline row.
+
+Success returns the committed receipt with the new `revision` and `diff`, a
+unified diff of your view capped at 8 KB (`diff_truncated: true` when cut).
+Refusals name the edit and never include protected text:
+
+| Error | `detail` | Fix |
+| --- | --- | --- |
+| `edit_no_match` | `edit_index=<i> match_count=0` | Copy `old_text` exactly from the current content, remembering earlier edits in the call. |
+| `edit_ambiguous_match` | `edit_index=<i> match_count=<n>` | Quote more surrounding text. |
+| `edit_protected_span` | `edit_index=<i>` | The text touches a takes or facts section; use the scoped operations. |
+| `edit_invalid` | `edit_index=<i>` when one edit is malformed | Pass 1 to 50 `{old_text, new_text}` objects with non-empty `old_text`. |
+| `revision_conflict` | `current_revision=<uuid>` | Read the page again, rebuild the edits, resend. |
+
+```json
+→ get_page {"slug": "projects/example", "include_content": true}
+← {"revision": "5d1c…", "content": "---\ntitle: Example\n---\n\n- Status: draft\n…"}
+→ edit_page {"slug": "projects/example", "expected_revision": "5d1c…",
+             "edits": [{"old_text": "- Status: draft", "new_text": "- Status: shipped"}],
+             "request_id": "0b6e…"}
+← {"state": "committed", "request_id": "0b6e…", "revision": "9a42…",
+   "diff": "--- a/projects/example.md\n+++ b/projects/example.md\n@@ -4,1 +4,1 @@\n-- Status: draft\n+- Status: shipped\n"}
+→ edit_page {"slug": "projects/example", "expected_revision": "5d1c…", "edits": [...], "request_id": "a71f…"}
+← {"error": "revision_conflict", "detail": "current_revision=9a42…", "suggestion": "Read get_page with include_content:true again, …"}
+```
+
+From the CLI: `gbrain call edit_page '{"slug":"projects/example","expected_revision":"…","edits":[{"old_text":"…","new_text":"…"}]}'`.
+
 ### context_pack(entities, budget_tokens?, since?, session_id?, include_private?) — read, zero LLM
 
 One deterministic, budget-packed bundle for a set of standing
@@ -506,6 +615,17 @@ failures fail closed via the standard dispatch.
 Verbs are ordinary operations: they inherit fail-closed `remote` semantics,
 OAuth scope enforcement (`remember`/`forget` are write-scope), and per-source
 isolation on every read. Remote callers see `visibility = world` facts only.
+
+Read verbs redact credential-shaped values in their responses with the
+canonical secret scanner: a value becomes `<REDACTED:pattern>`. `recall`,
+`context_pack` and `delta` redact the facts' `fact`, `context` and `source`
+fields for remote callers (`ctx.remote !== false`; every MCP transport,
+including stdio, and thin clients) and return them as stored to the trusted
+local CLI, so a remembered credential is readable only with `gbrain recall` on
+the brain host. Search results, the rendered `text` and `entity` cards are
+redacted for every caller. Budgets, `budget_used` and the `delta` cursor are
+computed from the text each caller actually receives. See
+[secret scan refusals and redaction](../guides/write-refusals.md#secret-scan-refusals-and-redaction).
 
 ## Conformance + certification
 

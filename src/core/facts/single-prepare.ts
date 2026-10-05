@@ -3,6 +3,7 @@ import { verbError } from '../ops/contract.ts';
 import { isAvailable, embedOne, getEmbeddingModel } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
+import { cosineVerdict } from './capture-dedup.ts';
 
 export type FactCandidate = FactRow & { source_markdown_slug: string | null; row_num: number | null };
 export interface FactDecision { status: 'inserted' | 'duplicate' | 'superseded'; candidate: FactCandidate | null; }
@@ -26,8 +27,11 @@ export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: stri
       'Remember a corrected claim. Repeating the old claim does not restore withdrawn memory.');
   }
 }
-/** SQL-only, so publication can verify the semantic decision under its guard. */
-export async function decideSingleFact(engine: BrainEngine, sourceId: string, input: SingleFactIntent, embedding: Float32Array | null, embeddingModel?: string | null): Promise<FactDecision> {
+/**
+ * SQL-only, so publication can verify the semantic decision under its guard.
+ * `lane` is the writer's `facts.source`: capture lanes never drop by cosine (#5888).
+ */
+export async function decideSingleFact(engine: BrainEngine, sourceId: string, input: SingleFactIntent, embedding: Float32Array | null, embeddingModel?: string | null, lane?: string | null): Promise<FactDecision> {
   const [exact] = await engine.executeRaw<FactCandidate>(`SELECT * FROM facts WHERE source_id=$1
     AND entity_slug IS NOT DISTINCT FROM $2 AND visibility=$3 AND expired_at IS NULL
     AND (valid_until IS NULL OR valid_until>now()) AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($4)
@@ -52,7 +56,7 @@ export async function decideSingleFact(engine: BrainEngine, sourceId: string, in
       const next = cosineSimilarity(embedding, c.embedding);
       if (next > score) { score = next; candidate = c; }
     }
-    if (candidate && score >= 0.95) return {
+    if (candidate && cosineVerdict(lane, score, input.fact, candidate.fact) === 'duplicate') return {
       status: candidate.kind === input.kind ? 'superseded' : 'duplicate', candidate,
     };
   }

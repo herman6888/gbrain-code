@@ -35,8 +35,10 @@ import { PAGE_PROJECTION_SCHEMA_SQL } from '../src/core/page-state/projection-sc
 import { PAGE_STATE_SCHEMA_SQL } from '../src/core/page-state/schema.ts';
 import { POSTGRES_CONCURRENT_PERSISTENCE_INDEXES, PERSISTENCE_SCHEMA_STATEMENTS } from '../src/core/persistence/schema.ts';
 import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from '../src/core/persistence/topology-schema.ts';
+import { WORKTREE_REFRESH_SCHEMA_SQL } from '../src/core/persistence/worktree-refresh-schema.ts';
 import { SHARED_SKILLS_SCHEMA_SQL } from '../src/core/shared-skills/schema-all.ts';
 import { DECIDE_SCHEMA_SQL } from '../src/core/ai/decide/schema.ts';
+import { FACT_RELINK_SCHEMA_SQL } from '../src/core/facts/relink-schema.ts';
 
 const REPO = resolve(import.meta.dir, '..');
 export const SCHEMA_SQL_PATH = 'src/schema.sql';
@@ -88,9 +90,11 @@ export const FRAGMENTS: readonly Fragment[] = [
   },
   { source: 'src/core/page-state/projection-schema.ts', expr: 'PAGE_PROJECTION_SCHEMA_SQL', postgres: PAGE_PROJECTION_SCHEMA_SQL, pglite: PAGE_PROJECTION_SCHEMA_SQL },
   { source: 'src/core/persistence/topology-schema.ts', expr: 'PERSISTENCE_TOPOLOGY_SCHEMA_SQL', postgres: PERSISTENCE_TOPOLOGY_SCHEMA_SQL, pglite: PERSISTENCE_TOPOLOGY_SCHEMA_SQL },
+  { source: 'src/core/persistence/worktree-refresh-schema.ts', expr: 'WORKTREE_REFRESH_SCHEMA_SQL', postgres: WORKTREE_REFRESH_SCHEMA_SQL, pglite: WORKTREE_REFRESH_SCHEMA_SQL },
   { source: 'src/core/company-brain/receipt-schema.ts', expr: 'SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL', postgres: SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL, pglite: SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL },
   { source: 'src/core/shared-skills/schema-all.ts', expr: 'SHARED_SKILLS_SCHEMA_SQL', postgres: SHARED_SKILLS_SCHEMA_SQL, pglite: SHARED_SKILLS_SCHEMA_SQL },
   { source: 'src/core/ai/decide/schema.ts', expr: 'DECIDE_SCHEMA_SQL', postgres: DECIDE_SCHEMA_SQL, pglite: DECIDE_SCHEMA_SQL },
+  { source: 'src/core/facts/relink-schema.ts', expr: 'FACT_RELINK_SCHEMA_SQL', postgres: FACT_RELINK_SCHEMA_SQL, pglite: FACT_RELINK_SCHEMA_SQL },
 ];
 
 const fragmentLabel = (f: Fragment) => `${f.source} (${f.expr})`;
@@ -365,6 +369,9 @@ const MIGRATION_TIMING = 'PGLite gets it later from its migration, so fresh PGLi
 export const PGLITE_RULES: readonly Rule[] = [
   { id: 'extension:pgcrypto', reason: 'PGLite ships no pgcrypto; gen_random_uuid() is core', action: 'drop' },
   { id: 'table:sources', reason: `sources.chunker_version: ${MIGRATION_TIMING}`, action: omitColumns('chunker_version') },
+  { id: 'add-column:sources.upstream_checked_at', reason: MIGRATION_TIMING, action: 'drop' },
+  { id: 'add-column:sources.upstream_commit', reason: MIGRATION_TIMING, action: 'drop' },
+  { id: 'add-column:sources.upstream_behind', reason: MIGRATION_TIMING, action: 'drop' },
   { id: 'index:pages_generation_idx', reason: MIGRATION_TIMING, action: 'drop' },
   { id: 'index:idx_pages_updated_at_desc', reason: MIGRATION_TIMING, action: 'drop' },
   {

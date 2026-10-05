@@ -20,6 +20,7 @@ import type {
   MinionQueueOpts, TokenUpdate,
 } from './types.ts';
 import {
+  JobDeferredError,
   UnrecoverableError,
   ABORT_REASON_LOCK_RENEWAL_FAILED,
   ABORT_REASON_LOCK_LOST,
@@ -1458,6 +1459,13 @@ export class MinionWorker extends EventEmitter {
     execution.promise = promise;
   }
 
+  /** A handler deferral (JobDeferredError): back to delayed, no attempt counted. */
+  private async deferJob(job: MinionJob, lockToken: string, err: JobDeferredError): Promise<void> {
+    const deferred = await this.queue.deferJob(job.id, lockToken, `deferred (${err.reason}): ${err.message}`, err.retryInMs);
+    if (!deferred) console.warn(`Job ${job.id} deferral dropped (lock token mismatch)`);
+    else console.log(`Job ${job.id} (${job.name}) deferred (${err.reason}) for ${Math.round(err.retryInMs / 1000)}s (no attempt burned)`);
+  }
+
   private async executeJob(
     job: MinionJob,
     lockToken: string,
@@ -1656,6 +1664,7 @@ export class MinionWorker extends EventEmitter {
       // `failJob` minus the `attempts_made` increment. Audit row to
       // `minion_lease_pressure_log` so operators see pressure live in
       // `gbrain doctor` + `gbrain jobs stats lease_pressure`.
+      if (err instanceof JobDeferredError) return this.deferJob(job, lockToken, err);
       const isLeaseFull = err instanceof RateLeaseUnavailableError;
       if (isLeaseFull) {
         const leaseErr = err as RateLeaseUnavailableError;

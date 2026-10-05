@@ -5,9 +5,11 @@ import { realpathSync, statSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import type { AuthInfo, OperationContext } from '../ops/contract.ts';
 import { OperationError } from '../ops/contract.ts';
+import { catalogueError } from '../error-catalogue.ts';
+import { STOP_PRODUCERS, legacyRecoveryHint, selectCommand } from './legacy-selection.ts';
 import { normalizeSlugPrefix } from '../ops/context.ts';
 import { hasScope } from '../scope.ts';
-import { coerceLegacyPermissions, normalizeTokenScopes, parseLegacyTokenScope } from '../legacy-token-scope.ts';
+import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import type { MinionJob } from './types.ts';
@@ -135,11 +137,12 @@ export async function assertCurrentRemoteJobPrincipal(engine: BrainEngine, autho
     }
   } else {
     const [row] = await engine.executeRaw<Record<string, unknown>>(
-      'SELECT id, revoked_at, scopes, permissions FROM access_tokens WHERE id = $1', [principal.id]);
+      'SELECT * FROM access_tokens WHERE id = $1', [principal.id]);
     if (!row || row.revoked_at != null) deny('legacy token is missing or revoked');
-    scopes = normalizeTokenScopes(row.scopes) ?? ['read', 'write', 'admin'];
-    if (row.permissions != null && !coerceLegacyPermissions(row.permissions)) deny('malformed token permissions');
-    sourceId = parseLegacyTokenScope(coerceLegacyPermissions(row.permissions)?.source_id).sourceId;
+    const tokenGrant = grantFromTokenRow(row);
+    if (tokenGrant.permissionsMalformed) deny('malformed token permissions');
+    scopes = tokenGrant.scopes;
+    sourceId = authSourcesFromGrant(tokenGrant).sourceId;
   }
   if (!hasScope(grant.scopes, 'admin') || !hasScope(scopes, 'admin') || sourceId !== grant.sourceId) {
     deny('the original grant and current principal must both authorize this source and admin operation');
@@ -266,12 +269,67 @@ export async function assertRemoteJobControl(ctx: OperationContext, job: MinionJ
   await authorizeJobExecution(ctx.engine, job);
 }
 
+/** Statuses the claim gate covers: a row in one of them blocks every worker while its authority is unparsable. */
+export const LIVE_JOB_STATUSES = ['waiting', 'active', 'delayed', 'waiting-children', 'paused'] as const;
+
+/**
+ * The claim gate's population predicate, shared by `assertNoUnreviewedJobs`
+ * and the doctor `legacy_job_authority` check so their counts can never drift.
+ * Callers keep the rows `parseSubmissionAuthority` rejects.
+ */
+export const UNREVIEWED_LIVE_JOBS_WHERE = `status IN (${LIVE_JOB_STATUSES.map(s => `'${s}'`).join(',')})
+        AND submission_authority IS DISTINCT FROM '{"version":1,"kind":"application"}'::jsonb`;
+
+/** Select-list column every coalesce read adds so SQL NULL stays distinguishable from JSONB null. */
+export const LEGACY_AUTHORITY_COLUMN = 'submission_authority IS NULL AS legacy_authority_is_null';
+
+/** `permission_denied` for a job row whose SQL NULL authority predates the v0.50 cutover. */
+export function legacyJobAuthorityError(row: Record<string, unknown>, activeIds: readonly number[] = []): OperationError {
+  const id = String(row.id), name = String(row.name), status = String(row.status);
+  const what = `Queued job authorization: job ${id} (${name}, ${status}) has no submission authority because it predates the upgrade, so it cannot be reused until it is reviewed.`;
+  if (status === 'completed' || status === 'failed') {
+    return catalogueError('legacy_job_authority', what,
+      `Resubmit with a new idempotency key; a local operator can review the old row with ${selectCommand('authorize-legacy', { statuses: [status], names: [name] })}.`);
+  }
+  if (status === 'active') {
+    return catalogueError('legacy_job_authority', what, `${STOP_PRODUCERS}, then cancel it: gbrain jobs cancel ${id}; run gbrain doctor to review the rest.`);
+  }
+  return catalogueError('legacy_job_authority', what, legacyRecoveryHint(activeIds));
+}
+
+const RELEASABLE = new Set(['dead', 'cancelled']);
+
+/**
+ * The one coalesce rule for `MinionQueue.add` (idempotency fast path, param
+ * coalescing, the pending and waiting caps, and the insert race). `row` is a
+ * raw `minion_jobs` row selected with `LEGACY_AUTHORITY_COLUMN`.
+ *
+ * Only SQL NULL authority (rows from before the v0.50 cutover) gets the
+ * legacy rule: a dead or cancelled key is released, a completed or failed row
+ * coalesces for application callers only, and a live row is refused for every
+ * caller because the claim gate keeps workers from ever running it. JSONB
+ * null, malformed and future-version authority keep the cross-authority
+ * denial, as does any authority that differs from the caller's.
+ */
+export function coalesceDecision(row: Record<string, unknown>, authority: SubmissionAuthority): 'coalesce' | 'release' {
+  const status = String(row.status);
+  if (row.legacy_authority_is_null === true) {
+    if (RELEASABLE.has(status)) return 'release';
+    if ((status === 'completed' || status === 'failed') && authority.kind === 'application') return 'coalesce';
+    throw legacyJobAuthorityError(row);
+  }
+  assertSameAuthority(row.submission_authority, authority);
+  return RELEASABLE.has(status) ? 'release' : 'coalesce';
+}
+
 /** Startup and claim gate: do not let sweeps silently destroy unresolved legacy dependency graphs. */
 export async function assertNoUnreviewedJobs(engine: BrainEngine): Promise<void> {
   const rows = await engine.executeRaw<{ id: number; submission_authority: unknown }>(
     `SELECT id, submission_authority FROM minion_jobs
-      WHERE status IN ('waiting','active','delayed','waiting-children','paused')
-        AND submission_authority IS DISTINCT FROM '{"version":1,"kind":"application"}'::jsonb`);
+      WHERE ${UNREVIEWED_LIVE_JOBS_WHERE}`);
   const invalid = rows.filter(row => !parseSubmissionAuthority(row.submission_authority));
-  if (invalid.length) deny(`${invalid.length} legacy jobs have missing or unsupported authority; stop producers/workers. Review SQL NULL rows with jobs authorize-legacy --ids ...; unsupported non-NULL authority requires matching application/database versions or explicit local cancellation before workers start`);
+  if (!invalid.length) return;
+  throw catalogueError('legacy_job_authority',
+    `Queued job authorization: ${invalid.length} legacy jobs have missing or unsupported authority, so workers cannot start until they are reviewed.`,
+    `${legacyRecoveryHint()} Rows with unsupported non-NULL authority need matching application and database versions, or gbrain jobs cancel <id>; gbrain doctor lists them.`);
 }

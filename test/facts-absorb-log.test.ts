@@ -129,7 +129,9 @@ describe('writeFactsAbsorbLog — ingest_log row shape', () => {
     expect(FACTS_ABSORB_REASONS).toContain('gateway_auth');
     expect(FACTS_ABSORB_REASONS).toContain('gateway_billing');
     expect(FACTS_ABSORB_REASONS).toContain('gateway_rate_limit');
-    expect(FACTS_ABSORB_REASONS.length).toBe(15);
+    // #5362: write-path refusals record their own code.
+    expect(FACTS_ABSORB_REASONS).toContain('write_refused');
+    expect(FACTS_ABSORB_REASONS.length).toBe(16);
   });
 
   test.each([

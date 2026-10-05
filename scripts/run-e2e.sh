@@ -395,7 +395,9 @@ for f in "${files[@]}"; do
   # word-splitting into extra gtimeout arguments or breaking the 4x math.
   case "$file_timeout" in ''|*[!0-9]*) file_timeout=180 ;; esac
   case "$f" in
-    */skills.test.ts|*/serve-http-multi-agent.test.ts) file_timeout=$((file_timeout * 4)) ;;
+    */skills.test.ts|*/serve-http-multi-agent.test.ts|*/graduation-cli.test.ts|*/graduation-clients.test.ts|*/graduation-faults.test.ts) file_timeout=$((file_timeout * 4)) ;;
+    # One graduation per custody and rollback boundary (~30 SIGKILL-and-resume cases of ~15 s each).
+    */graduation-crash.test.ts) file_timeout=$((file_timeout * 10)) ;;
   esac
   if command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD="gtimeout $file_timeout"

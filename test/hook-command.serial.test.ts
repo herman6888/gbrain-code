@@ -24,6 +24,7 @@ import {
   DIGEST_MEMORY_CAP_BYTES,
   memoryDigest,
   PUSH_ANNOUNCE_REFIRE_MS,
+  HOOK_EVENTS,
   type HookHeartbeatEntry,
 } from '../src/commands/hook.ts';
 import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
@@ -468,6 +469,35 @@ describe('user-prompt', () => {
     expect((await lastHeartbeat())?.reason).toBe('transcript_outside_projects_dir');
   });
 
+  // #5465: Claude Code writes transcripts asynchronously, so turn 1 of a
+  // fresh session (or the only turn of `claude -p`) can hand the hook a
+  // path that does not exist yet. A CONFINED absent path has nothing to
+  // read — the same trust as no transcript_path at all — so the event
+  // proceeds prompt-only instead of aborting with transcript_unreadable.
+  test('#5465: an absent transcript inside the root still delivers prompt-only context', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'CTX: first-turn context' });
+    const projectsRoot = join(tmp, 'projects-root-5465');
+    // The project DIRECTORY exists (Claude Code creates it); only the
+    // session file is not written yet — the shape the issue observed.
+    mkdirSync(join(projectsRoot, 'proj-slug'), { recursive: true });
+    const absent = join(projectsRoot, 'proj-slug', 'fresh-session.jsonl');
+    const out = collectStdout();
+    expect(
+      await runHook(['user-prompt'], {
+        ...out.io,
+        stdin: JSON.stringify({ prompt: 'first turn of a fresh session', transcript_path: absent }),
+        transcriptRoot: projectsRoot,
+      }),
+    ).toBe(0);
+    const parsed = JSON.parse(out.get().trim());
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('CTX: first-turn context');
+    const hb = await lastHeartbeat();
+    expect(hb?.outcome).toBe('ok');
+    expect(hb?.turns).toBe(1);
+  });
+
   test('unauthorized (server holds a different secret) degrades cleanly', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);
@@ -599,7 +629,7 @@ describe('session-start', () => {
     expect(out.get()).not.toContain('run gbrain doctor');
   });
 
-  test('last-session line + stale push-status surfaced [B4]', async () => {
+  test('stale push-status surfaced; no buffered session text at session start [B4, #5558]', async () => {
     const liveDir = join(home(), 'transcripts', 'live');
     mkdirSync(liveDir, { recursive: true });
     writeFileSync(join(liveDir, 'prev.txt'), JSON.stringify({ ts: '2026-08-07T09:00:00Z', session_id: 'prev', exchange: 'wrapped up the acme-example memo' }) + '\n');
@@ -609,11 +639,29 @@ describe('session-start', () => {
     const ws = join(tmp, 'ws');
     mkdirSync(ws, { recursive: true });
     const out = collectStdout();
-    await runHook(['session-start'], { ...out.io, stdin: '', cwd: ws });
+    await runHook(['session-start'], { ...out.io, stdin: JSON.stringify({ session_id: 'prev', cwd: ws }), cwd: ws });
     const text = out.get();
-    expect(text).toContain('Last session activity');
-    expect(text).toContain('acme-example memo');
+    expect(text).not.toContain('Last session activity');
+    expect(text).not.toContain('acme-example memo');
     expect(text).toContain('>48h ago');
+  });
+
+  test('#5558: no hook event surfaces another session\'s text (every event, every buffer shape)', async () => {
+    const liveDir = join(home(), 'transcripts', 'live');
+    mkdirSync(liveDir, { recursive: true });
+    const secrets = ['private-json-exchange-marker', 'private-raw-line-marker', 'private-own-session-marker'];
+    writeFileSync(join(liveDir, 'other-agent.txt'), JSON.stringify({ ts: '2026-09-30T09:00:00Z', session_id: 'other-agent', exchange: secrets[0] }) + '\n');
+    writeFileSync(join(liveDir, 'unknown.txt'), secrets[1] + '\n');
+    writeFileSync(join(liveDir, 'me.txt'), JSON.stringify({ ts: '2026-09-30T09:01:00Z', session_id: 'me', exchange: secrets[2] }) + '\n');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    for (const event of HOOK_EVENTS) {
+      for (const stdin of ['', JSON.stringify({ session_id: 'me', cwd: ws, source: 'compact' })]) {
+        const out = collectStdout();
+        await runHook([event], { ...out.io, stdin, cwd: ws, spawnPush: () => {}, transcriptRoot: join(tmp, 'projects') });
+        for (const secret of secrets) expect(out.get()).not.toContain(secret);
+      }
+    }
   });
 
   test('parser-drift status file surfaced at session start [G3]', async () => {
@@ -630,7 +678,7 @@ describe('session-start', () => {
 // ── stop [G15] ──────────────────────────────────────────────────────────────
 
 describe('stop', () => {
-  test('appends to the per-session buffer (sanitized id) and GCs stale buffers', async () => {
+  test('writes no session buffer and GCs stale buffers left by older binaries [#5558]', async () => {
     const liveDir = join(home(), 'transcripts', 'live');
     mkdirSync(liveDir, { recursive: true });
     const stale = join(liveDir, 'stale.txt');
@@ -638,16 +686,14 @@ describe('stop', () => {
     const old = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
     utimesSync(stale, old, old);
 
-    expect(
-      await runHook(['stop'], {
-        stdin: JSON.stringify({ session_id: 'abc/../def', last_assistant_message: 'the widget-co answer' }),
-      }),
-    ).toBe(0);
-    const files = readdirSync(liveDir);
-    expect(files).toContain('abc-..-def.txt'); // '/' sanitized, no traversal possible
-    expect(files).not.toContain('stale.txt');
-    const body = readFileSync(join(liveDir, 'abc-..-def.txt'), 'utf8');
-    expect(body).toContain('the widget-co answer');
+    for (const session_id of ['abc/../def', undefined]) {
+      expect(
+        await runHook(['stop'], {
+          stdin: JSON.stringify({ session_id, last_assistant_message: 'the widget-co answer' }),
+        }),
+      ).toBe(0);
+    }
+    expect(readdirSync(liveDir)).toEqual([]);
     expect((await lastHeartbeat())?.outcome).toBe('ok');
   });
 });
@@ -711,8 +757,9 @@ describe('session-end', () => {
       transcriptRoot: projRoot,
     });
     const corpusDir = join(home(), 'transcripts', 'corpus');
-    const files = readdirSync(corpusDir).filter((f) => f.startsWith('sess-dup'));
-    expect(files).toEqual(['sess-dup.txt']);
+    const files = readdirSync(corpusDir).filter((f) => f.startsWith('sess-dup')).sort();
+    // One corpus file plus the session's one seat sidecar (#4618).
+    expect(files).toEqual(['sess-dup.seat.json', 'sess-dup.txt']);
     expect(readFileSync(join(corpusDir, 'sess-dup.txt'), 'utf8')).toContain('resumed pass content');
   });
 
@@ -1210,9 +1257,8 @@ describe('stop-hook per-turn push [D3]', () => {
     await runHook(['stop'], stopIo(repo, spawned));
     expect(spawned).toEqual([]);
     expect((await lastHeartbeat())?.reason).toBe('push_clean');
-    // the live-buffer append still happened (stop's original contract)
-    const bufDir = join(home(), 'transcripts', 'live');
-    expect(readdirSync(bufDir).some((n) => n.includes('sess-stop-push'))).toBe(true);
+    // #5558: stop no longer writes a live buffer
+    expect(existsSync(join(home(), 'transcripts', 'live', 'sess-stop-push.txt'))).toBe(false);
   });
 
   test('corrupt per-root state file is treated as due (fail-open)', async () => {
@@ -1590,5 +1636,25 @@ describe('session-end remainder (cathedral 5 dedup contract)', () => {
     expect(names).not.toContain('gone.txt.ingested');
     expect(names).toContain('live.txt');
     expect(names).toContain('live.txt.in-progress');
+  });
+
+  test('#5887: session-end reaps orphaned .progress sidecars and keeps a resumed session\'s live .progress', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(corpus(), { recursive: true });
+    writeFileSync(join(corpus(), 'gone.txt.progress'), '{}');
+    writeFileSync(join(corpus(), 'gone.txt.progress.lock'), '');
+    writeFileSync(join(corpus(), 'sess-prog.txt.progress'), '{"generation":1}');
+    const t1 = seedTranscript(join(projRoot, 'p1'), 'r5.jsonl', [userLine('resumed session content')]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-prog', transcript_path: t1, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const names = readdirSync(corpus());
+    expect(names).not.toContain('gone.txt.progress');
+    expect(names).not.toContain('gone.txt.progress.lock');
+    expect(names).toContain('sess-prog.txt');
+    expect(readFileSync(join(corpus(), 'sess-prog.txt.progress'), 'utf8')).toBe('{"generation":1}');
   });
 });

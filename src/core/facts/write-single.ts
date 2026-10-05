@@ -24,6 +24,7 @@
  */
 
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 const DEDUP_THRESHOLD = 0.95;
 const DEDUP_CANDIDATE_LIMIT = 5;
@@ -127,11 +128,13 @@ export async function writeSingleFact(
 
   if (managed) {
     // The coordinator's fact intent owns dedup, supersession, the fence row and
-    // the file on a managed brain; the legacy direct writes stay unmanaged.
+    // the file on a managed brain; the legacy direct writes stay unmanaged. An
+    // entity with no page keeps its resolver slug database-only, as the
+    // unmanaged path stores it, so dedup is per entity.
     const { publishManagedEntityFacts } = await import('./managed-fact-write.ts');
     const written = await publishManagedEntityFacts(engine, sourceId, resolvedSlug, [{ fact: factText, kind, notability: 'medium',
       source: input.provenance, visibility, confidence: input.confidence ?? 1.0, validFrom: new Date(), validUntil,
-      embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true });
+      embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true, attributeFallback: true });
     const [stored] = await engine.executeRaw<{ entity_slug: string | null }>('SELECT entity_slug FROM facts WHERE id=$1', [written.ids[0]]);
     return { id: written.ids[0], status: written.superseded ? 'superseded' : written.inserted ? 'inserted' : 'duplicate', entity_slug: stored?.entity_slug ?? null,
       valid_until: validUntil, degraded_dedup: degradedDedup };
@@ -245,10 +248,10 @@ export async function writeSingleFact(
     // tree unusable) → DB-only path below.
   }
 
-  const inserted = await engine.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
+  const inserted = await maintenanceTransaction(engine, tx => tx.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
     source_id: sourceId,
     ...(supersedeId !== null ? { supersedeId } : {}),
-  });
+  }));
 
   return {
     id: inserted.id,
@@ -283,7 +286,7 @@ async function expireSuperseded(engine: BrainEngine, oldId: number, newId: numbe
     report('fence strike', err);
   }
   try {
-    await engine.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]);
+    await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]));
   } catch (err) {
     report('superseded_by link', err);
   }

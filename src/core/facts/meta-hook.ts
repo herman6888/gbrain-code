@@ -7,7 +7,11 @@
  *     to no-_meta rather than failing the tool call.
  *   - Cache key is (source_id, session_id, hash(takesHoldersAllowList sorted)).
  *     Visibility-aware: cache entries don't bleed across token tiers.
- *   - 30s TTL per session. Refreshed on extraction event via `bumpCache`.
+ *   - 30s TTL per session. A successful mutating tool call on the engine
+ *     drops that engine's entries (`invalidateHotMemoryForEngine`, called by
+ *     dispatch on every MCP transport), and every hit revalidates the
+ *     source's withdrawal-ledger watermark, so a forget committed by any
+ *     process is never served from the cache.
  *   - Cap at top-K facts per response so the injection stays lean.
  *
  * Both stdio and HTTP MCP transports pass this hook into dispatchToolCall
@@ -17,6 +21,7 @@
 import type { OperationContext } from './../operations.ts';
 import type { FactRow } from './../engine.ts';
 import { effectiveConfidence } from './decay.ts';
+import { collapseHotFacts } from './capture-dedup.ts';
 
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_TOP_K = 10;
@@ -34,9 +39,34 @@ export const HOT_MEMORY_CACHE_MAX_ENTRIES = 1000;
 interface CacheEntry {
   expiresAt: number;
   payload: Record<string, unknown> | undefined;
+  withdrawals?: string;
 }
 
 const _cache = new Map<string, CacheEntry>();
+const _generations = new WeakMap<object, number>();
+
+/**
+ * Drop every cached payload built from `engine` and bump its generation, so
+ * a build that read the database before the write cannot store its stale
+ * result afterwards.
+ */
+export function invalidateHotMemoryForEngine(engine: object): void {
+  _generations.set(engine, (_generations.get(engine) ?? 0) + 1);
+  const key = ENGINE_KEYS.get(engine);
+  if (!key) return;
+  for (const k of _cache.keys()) if (k.split('::')[0] === key) _cache.delete(k);
+}
+
+/**
+ * Changes whenever a withdrawal is recorded for the source, by any process.
+ * Read-only embedder engines without raw SQL fall back to the TTL alone.
+ */
+async function withdrawalWatermark(engine: OperationContext['engine'], sourceId: string): Promise<string> {
+  if (typeof engine.executeRaw !== 'function') return '';
+  const [row] = await engine.executeRaw<{ n: number; at: string | null }>(
+    'SELECT count(*)::int AS n, max(withdrawn_at)::text AS at FROM fact_withdrawals WHERE source_id = $1', [sourceId]);
+  return `${row?.n ?? 0}:${row?.at ?? ''}`;
+}
 
 /** Bounded set: evict the oldest-expiry entry when inserting at capacity. */
 function cacheSet(key: string, entry: CacheEntry): void {
@@ -101,38 +131,50 @@ export async function getBrainHotMemoryMeta(
   const ttl = Math.max(1000, opts.ttlMs ?? DEFAULT_TTL_MS);
   const topK = Math.max(1, Math.min(opts.topK ?? DEFAULT_TOP_K, 25));
 
+  // The watermark is read before the rows, so a build that raced a forget
+  // stores the older watermark and the next hit rebuilds.
+  const generation = _generations.get(ctx.engine) ?? 0;
+  const withdrawals = await withdrawalWatermark(ctx.engine, sourceId);
+
   // Cache hit?
   const cached = _cache.get(cacheKey);
   if (cached) {
-    if (cached.expiresAt > Date.now()) return cached.payload;
-    // Expired: evict BEFORE the rebuild. If the rebuild below throws (the
-    // caller's try/catch absorbs it), the dead entry must not linger — with
-    // remote-influencable keys, lingering corpses defeat the size bound.
+    if (cached.expiresAt > Date.now() && cached.withdrawals === withdrawals) return cached.payload;
+    // Expired or withdrawn since: evict BEFORE the rebuild. If the rebuild
+    // below throws (the caller's try/catch absorbs it), the dead entry must
+    // not linger — with remote-influencable keys, lingering corpses defeat
+    // the size bound.
     _cache.delete(cacheKey);
   }
+  const store = (entry: CacheEntry) => {
+    if ((_generations.get(ctx.engine) ?? 0) === generation) cacheSet(cacheKey, { ...entry, withdrawals });
+  };
 
   // Build a fresh payload. Visibility tier: remote → world-only;
   // local → all rows.
   const visibility = ctx.remote === false ? undefined : ['world'] as ('world' | 'private')[];
 
-  let rows: FactRow[] = [];
+  // #5888 V2: over-fetch so collapsing duplicates still fills topK.
+  let fetched: FactRow[] = [];
   if (sessionId) {
-    rows = await ctx.engine.listFactsBySession(sourceId, sessionId, {
-      activeOnly: true, limit: topK, visibility,
+    fetched = await ctx.engine.listFactsBySession(sourceId, sessionId, {
+      activeOnly: true, limit: topK * 3, visibility, fingerprint: true,
     });
   }
   // If no session-scoped rows, fall back to recent across the source.
-  if (rows.length === 0) {
-    rows = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
-      activeOnly: true, limit: topK, visibility,
+  if (fetched.length === 0) {
+    fetched = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
+      activeOnly: true, limit: topK * 3, visibility, fingerprint: true,
     });
   }
-  if (rows.length === 0) {
-    cacheSet(cacheKey, { expiresAt: Date.now() + ttl, payload: undefined });
+  if (fetched.length === 0) {
+    store({ expiresAt: Date.now() + ttl, payload: undefined });
     return undefined;
   }
 
-  // Sort by effective confidence (decayed) before truncating.
+  // One representative per (fingerprint, entity) group, then sort by
+  // effective confidence (decayed) before truncating.
+  let rows = await collapseHotFacts(ctx.engine, sourceId, fetched);
   const now = new Date();
   rows.sort((a, b) => effectiveConfidence(b, now) - effectiveConfidence(a, now));
   rows = rows.slice(0, topK);
@@ -149,6 +191,7 @@ export async function getBrainHotMemoryMeta(
         // weight HIGH-tier facts in their context budget.
         notability: r.notability,
         entity_slug: r.entity_slug,
+        ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}),
         valid_from: r.valid_from.toISOString(),
         // v0.45.7 ambient recall: recording time, so delta's "new facts since my
         // last wake" filters on WHEN the fact was learned, not its semantic
@@ -171,7 +214,7 @@ export async function getBrainHotMemoryMeta(
     const vu = r.valid_until?.getTime();
     if (vu !== undefined && Number.isFinite(vu) && vu < expiresAt) expiresAt = vu;
   }
-  cacheSet(cacheKey, { expiresAt, payload });
+  store({ expiresAt, payload });
   return payload;
 }
 

@@ -131,6 +131,9 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'codeEdgesDeps',
   // refactor wave 1 C9: per-call engine-sql executor getter (EO1).
   'engineSql',
+  // Engine graduation: PGLite close/open that keeps the kernel lock across the custody window.
+  'closeRetainingLock',
+  'connectWithHeldLock',
 ];
 
 /**

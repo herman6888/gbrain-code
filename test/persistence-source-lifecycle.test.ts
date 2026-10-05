@@ -191,6 +191,32 @@ test('expiry sweep rechecks restored sources under the topology guard',()=>fixtu
 }),60_000);
 
 
+test('gbrain#5452 managed purge refuses missing/epoch archive stamps and still purges a real expiry',()=>fixture(async(_home,source)=>{
+  await runManagedSourceLifecycle(engine,{operation:'archive',sourceId:source});
+  const purge=()=>runManagedSourceLifecycle(engine,{operation:'purge',sourceId:source,confirmDestructive:true,expiredOnly:true});
+  const survives=async()=>expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(1);
+  // Epoch expiry — pre-column-stamp archive shape from the report.
+  await engine.executeRaw(`UPDATE sources SET archive_expires_at='1970-01-01T00:00:00Z' WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  // Missing expiry.
+  await engine.executeRaw(`UPDATE sources SET archive_expires_at=NULL WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  // A normal past expiry is not enough on its own: an epoch/missing
+  // archived_at means the 72h window was never provably granted.
+  await engine.executeRaw(`UPDATE sources SET archive_expires_at=now()-INTERVAL '1 hour' WHERE id=$1`,[source]);
+  await engine.executeRaw(`UPDATE sources SET archived_at='1970-01-01T00:00:00Z' WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  await engine.executeRaw(`UPDATE sources SET archived_at=NULL WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  // Real stamps + past expiry purge normally — a real purge receipt carries
+  // no `noop` marker and the row is gone.
+  await engine.executeRaw(`UPDATE sources SET archived_at=now()-INTERVAL '73 hours' WHERE id=$1`,[source]);
+  const receipt=await purge();
+  expect(receipt).toMatchObject({state:'committed'});
+  expect('noop' in receipt).toBe(false);
+  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(0);
+}),60_000);
+
 test('a failed new clone retries under the retained physical identity and a new explicit request',()=>fixture(async(home)=>{
   const target=join(home,'new-clone');
   const first={operation:'add' as const,sourceId:'new-clone-source',path:target,remoteUrl:'https://example.invalid/brain.git',requestId:randomUUID()};
@@ -265,17 +291,17 @@ test('new clone metadata is counted alongside staging before canonical installat
   const result=await runManagedSourceClone(engine,input,await topologyPrincipal(engine),input.requestId,{...input,requestId:undefined,dryRun:undefined},{
     clone:async(_url,stage,budget)=>{
       // Directory stat.size varies by filesystem. Fill the measured remaining
-      // space so raw staging fits and only its new manifest exceeds capacity.
-      for(let i=0;i<128;i++)writeFileSync(join(stage,`${String(i).padStart(4,'0')}-${'x'.repeat(175)}.md`),'');
+      // space so raw staging fits and only the prepared recovery record, which
+      // gains the manifest, stage identity and clone digest, exceeds capacity.
       const payload=join(stage,'payload.md');writeFileSync(payload,'');
-      const remaining=budget-await topologyDirectoryBytes(stage)-8192;
+      const remaining=budget-await topologyDirectoryBytes(stage)-64;
       writeFileSync(payload,'x'.repeat(Math.max(0,remaining)));
       cloneBudget=budget;stagedBytes=await topologyDirectoryBytes(stage);
       manifestBytes=Buffer.byteLength(JSON.stringify(worktreeManifest(stage)));
     },
   });
-  expect(stagedBytes).toBe(cloneBudget-8192);
-  expect(manifestBytes).toBeGreaterThan(8192);expect(manifestBytes).toBeLessThan(1_048_576);
+  expect(stagedBytes).toBe(cloneBudget-64);
+  expect(manifestBytes).toBeGreaterThan(64);expect(manifestBytes).toBeLessThan(1024);
   expect(result).toMatchObject({state:'failed',write_error:'request_too_large'});
   expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[input.sourceId])).toHaveLength(0);
   expect((await engine.executeRaw<{recovery_bytes:string}>("SELECT recovery_bytes::text FROM persistence_counters WHERE key='brain'"))[0].recovery_bytes).toBe('0');

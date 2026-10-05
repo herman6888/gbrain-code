@@ -313,11 +313,13 @@ export async function runPhaseSynthesizeConcepts(
     }
     // The narrative is a function of the member atoms, their strictest
     // visibility and the model. When none changed and the page holds a real
-    // narrative, there is nothing to spend or rewrite; a fallback page is retried.
-    const memberHash = createHash('sha256')
-      .update(JSON.stringify([synthModel, group.visibility, group.atomSlugs.map((s, i) => [s, group.atomTitles[i], group.atomBodies[i]])
+    // narrative, there is nothing to spend or rewrite; a fallback page is retried,
+    // and so is one a chat_fallback_chain model wrote (hashed under that model).
+    const hashFor = (model: string): string => createHash('sha256')
+      .update(JSON.stringify([model, group.visibility, group.atomSlugs.map((s, i) => [s, group.atomTitles[i], group.atomBodies[i]])
         .sort((a, b) => a[0].localeCompare(b[0]))]))
       .digest('hex').slice(0, 16);
+    const memberHash = hashFor(synthModel);
     const priorMode = existing?.frontmatter?.synthesis_mode;
     if (existing?.frontmatter?.member_hash === memberHash && (priorMode === 'llm' || priorMode === 'deterministic_tier')) {
       skippedUnchanged.push(conceptSlug);
@@ -326,6 +328,7 @@ export async function runPhaseSynthesizeConcepts(
     tierCounts[group.tier]++;
     let narrative: string;
     let synthesisMode: ConceptSynthesisMode;
+    let fallbackWriter: string | undefined;
     if (group.tier === 'T1' || group.tier === 'T2') {
       if (estimatedSpendUsd >= budgetCap) {
         narrative = deterministicNarrative(group);
@@ -367,6 +370,7 @@ export async function runPhaseSynthesizeConcepts(
           if (text) {
             narrative = text;
             synthesisMode = 'llm';
+            if (result.fallbackFrom) fallbackWriter = result.model;
           } else {
             failures.push({ concept: group.conceptSlug, error: 'empty model response' });
             narrative = deterministicNarrative(group);
@@ -420,7 +424,7 @@ export async function runPhaseSynthesizeConcepts(
         mention_count: group.atomTitles.length,
         composite_score: group.atomTitles.length,
         synthesis_mode: synthesisMode,
-        member_hash: memberHash,
+        member_hash: fallbackWriter ? hashFor(fallbackWriter) : memberHash,
         synthesized_at: synthesizedAt,
         synthesized_by: 'synthesize_concepts-v0.41',
         visibility: pageVisibility,

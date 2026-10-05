@@ -50,8 +50,9 @@ describe('CANONICAL_PRICING — table integrity', () => {
     expect(CANONICAL_PRICING['anthropic:claude-opus-4-7']).toMatchObject({ input: 5.0, output: 25.0 });
   });
 
-  test('Sonnet 5 present at $3/$15 (standard rate, intro discount not modeled)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 3.0, output: 15.0 });
+  test('Sonnet 5 and 5.5 present at $2/$10 (launch price became the standard rate)', () => {
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 2.0, output: 10.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5-5']).toMatchObject({ input: 2.0, output: 10.0, cache_read: 0.2 });
   });
 
   test('Fable 5 present at $10/$50', () => {

@@ -1,21 +1,26 @@
+import { noteForwardProgress } from '../core/forward-progress.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { BrainEngine } from '../core/engine.ts';
-import { operations } from '../core/operations.ts';
+import { operations, opError, OperationError } from '../core/operations.ts';
+import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { dispatchToolCall, buildOperationContext } from './dispatch.ts';
-import { validateParams, parseStrictParamsMode } from './validate-params.ts';
-import { filterOpsForSurface, allowedOpNames, clampSurface, type McpSurface } from './surface.ts';
+import { findInvalidParam, schemaInvalidParams, parseStrictParamsMode } from './validate-params.ts';
+import { filterOpsForSurface, allowedOpNames, clampSurface, isReadOnlyOperation, type McpAccess, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
+import { parseResultRowsMode, resolveResultRowsMode } from './result-rows.ts';
 import type { Operation } from '../core/operations.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
 import { bindResolveIpcForServe } from './resolve-ipc-binding.ts';
-import { createPersistenceIpcProvider } from '../core/persistence/provider.ts';
-import { resolveMcpInstructions } from './instructions.ts';
+import { createPersistenceIpcProvider, residentPersistenceConfig } from '../core/persistence/provider.ts';
+import { installInstructionsResolver, resolveMcpInstructions } from './instructions.ts';
+import { instructionReadiness, stdioCapabilityReadiness } from './initialize-context.ts';
+import { STATUS_TOOL_DEF, STATUS_TOOL_NAME, attemptStatusRecovery, statusHeadline, statusInstructionLine, statusModeErrorResult, statusModeOf, statusPayload, statusToolResult } from './status-mode.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from './capabilities.ts';
 import { createSkillResources } from './skill-resources.ts';
 import { operationScopesAllowed } from '../core/scope.ts';
@@ -27,7 +32,12 @@ import { assertStdioSourceBindable } from './source-preflight.ts';
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
   cwd: string = process.cwd(),
-): Promise<{ sourceId: string; localFederatedSourceIds?: string[]; tier: import('../core/source-resolver.ts').SourceTier }> {
+): Promise<{
+  sourceId: string;
+  localFederatedSourceIds?: string[];
+  explicitReadBinding?: import('../core/ops/contract.ts').ExplicitReadBinding;
+  tier: import('../core/source-resolver.ts').SourceTier;
+}> {
   // Degraded mode (db-availability 4c): short-circuit WITHOUT touching the
   // engine. This site runs before EVERY dispatch and its catch below
   // swallows errors into sourceId 'default' — letting it hit a degraded
@@ -47,12 +57,16 @@ export async function resolveMcpStdioSourceScope(
       : { sourceId: 'default', tier: 'seed_default' };
   }
   try {
-    const { resolveSourceWithTier, localFederatedSourceIds } = await import('../core/source-resolver.ts');
+    const { resolveSourceWithTier, localFederatedSourceIds, explicitReadBinding } = await import('../core/source-resolver.ts');
     const resolved = await resolveSourceWithTier(engine, null, cwd);
     const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    // #5081: the admission set is optional; a failed lookup must not discard
+    // the resolved binding (the catch below would fall back to 'default').
+    const binding = await explicitReadBinding(engine, resolved.source_id, resolved.tier).catch(() => undefined);
     return {
       sourceId: resolved.source_id,
       ...(federated ? { localFederatedSourceIds: federated } : {}),
+      ...(binding ? { explicitReadBinding: binding } : {}),
       tier: resolved.tier,
     };
   } catch {
@@ -132,34 +146,34 @@ export async function stdioVisibleTools(
   engine: BrainEngine,
   surfacedOps: Operation[],
 ): Promise<Operation[]> {
-  if (surfacedOps.some(op => op.requiredScopes?.length)) {
-    let scopes: readonly string[] = [];
-    if (!isEngineDegraded(engine)) {
-      try {
-        const verified = await verifyLocalWriter(engine, await readLocalWriter(engine, 'stdio'));
-        if (verified.remote) scopes = verified.grant.scopes;
-      } catch {}
-    }
-    surfacedOps = surfacedOps.filter(op => !op.requiredScopes?.length || operationScopesAllowed(scopes, op));
+  let scopes: readonly string[] = [];
+  if (surfacedOps.some(op => op.requiredScopes?.length) && !isEngineDegraded(engine)) {
+    try {
+      const verified = await verifyLocalWriter(engine, await readLocalWriter(engine, 'stdio'));
+      if (verified.remote) scopes = verified.grant.scopes;
+    } catch {}
   }
-  if (!surfacedOps.some(op => op.publishGateKey)) return surfacedOps;
   // Degraded serve (db-availability 4c): fail-closed WITHOUT touching the
-  // engine. The gate read below can hit engine.getConfig, which on the
-  // degraded wrapper would burn the one lazy reconnect attempt — and stall
-  // the client's INITIAL tools/list handshake behind the reconnect's wait
-  // cap. Recovery re-sends tools/list_changed, so the full catalog returns.
-  if (isEngineDegraded(engine)) {
-    const hidden = new Set(surfacedOps.filter(o => o.publishGateKey).map(o => o.name));
-    return surfacedOps.filter(op => !hidden.has(op.name));
+  // engine. The gate read can hit engine.getConfig, which on the degraded
+  // wrapper would burn the one lazy reconnect attempt — and stall the
+  // client's INITIAL tools/list handshake behind the reconnect's wait cap.
+  // Recovery re-sends tools/list_changed, so the full catalog returns.
+  let gateDisabled: ReadonlySet<string> = new Set();
+  if (surfacedOps.some(op => op.publishGateKey)) {
+    if (isEngineDegraded(engine)) {
+      gateDisabled = new Set(surfacedOps.filter(o => o.publishGateKey).map(o => o.name));
+    } else {
+      try {
+        gateDisabled = await disabledOpsForPublishGates(engine, loadConfig(), { transport: 'stdio' });
+      } catch {
+        gateDisabled = new Set(surfacedOps.filter(o => o.publishGateKey).map(o => o.name));
+      }
+    }
   }
-  let gateDisabled: ReadonlySet<string>;
-  try {
-    gateDisabled = await disabledOpsForPublishGates(engine, loadConfig());
-  } catch {
-    gateDisabled = new Set(surfacedOps.filter(o => o.publishGateKey).map(o => o.name));
-  }
-  if (gateDisabled.size === 0) return surfacedOps;
-  return surfacedOps.filter(op => !gateDisabled.has(op.name));
+  // Agent contract v1 (A2): the one callability predicate. The surface was
+  // applied by the caller (surfacedOps), so 'full' here adds no filter.
+  const publishGates = publishGatesFromDisabled(surfacedOps, gateDisabled);
+  return surfacedOps.filter(op => isCallable(op, { transport: 'stdio', surface: 'full', scopes, publishGates }));
 }
 
 // ─── #4409: in-flight stdio RPC tracking ────────────────────────────────
@@ -184,13 +198,19 @@ export async function trackStdioRpc<T>(work: () => Promise<T>): Promise<T> {
     return await work();
   } finally {
     _stdioRpcsInFlight--;
+    // A completed request is forward progress: serve's boot deadline must not
+    // stop a server that is answering its client while a boot phase waits on
+    // the engine behind those requests.
+    noteForwardProgress();
   }
 }
 
-export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean } = {}) {
+export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean; onBootPhase?: (phase: string) => void; access?: McpAccess } = {}) {
   const config = loadConfig();
+  const bootPhase = (phase: string) => { try { opts.onBootPhase?.(phase); } catch { /* diagnostic only */ } };
   // Refuse to serve a well-formed GBRAIN_SOURCE that no active source row
   // backs (see source-preflight.ts). Throws before any transport is attached.
+  bootPhase('source_preflight');
   await assertStdioSourceBindable(engine);
   // MEMORY_VERBS v1 surface mode: 'full' (default — every op, byte-identical
   // to pre-surface behavior), 'starter' (WP4 daily-driver set), or 'verbs'
@@ -204,8 +224,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // (Resolved before Server construction: the initialize instructions need
   // the allowed-op set to decide whether extract_facts may be advertised.)
   const surface: McpSurface = clampSurface(opts.surface ?? 'full');
-  const surfacedOps = filterOpsForSurface(operations, surface);
-  const allowedOps = surface === 'full' ? undefined : allowedOpNames(operations, surface);
+  const readOnly = opts.access === 'read-only';
+  const surfacedOps = filterOpsForSurface(operations, surface).filter(op => !readOnly || isReadOnlyOperation(op));
+  const allowedOps = readOnly ? new Set(surfacedOps.map(op => op.name)) : surface === 'full' ? undefined : allowedOpNames(operations, surface);
 
   // Ambient writeback (opt-in, default off): resolved ONCE at boot — a
   // config flip needs a serve restart on this lane, the same posture as
@@ -216,7 +237,15 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // private brain. Read failure here yields the OFF bundle — no section,
   // never a wrong posture — and the engine is already connected by the time
   // serve reaches this call.
-  const writeback = await resolveWritebackConfig(engine, config);
+  bootPhase('writeback_config');
+  // F4 status-only mode: never touch the lazy engine at boot (its gated
+  // reconnect belongs to tool calls).
+  const statusMode = statusModeOf(engine);
+  const writeback = statusMode ? null : await resolveWritebackConfig(engine, config);
+  const writebackOpts = writeback ? ambientOptsFrom(writeback, {
+    remember: allowedOps ? allowedOps.has('remember') : true,
+    extractFacts: allowedOps ? allowedOps.has('extract_facts') : true,
+  }) : null;
   const server = new Server(
     { name: 'gbrain', version: VERSION },
     // listChanged: a client that handshakes during DEGRADED mode receives the
@@ -227,17 +256,25 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       capabilities: { tools: { listChanged: true }, resources: {} },
       // #4748: canonical contract (+ opt-in ambient-writeback section) plus the
       // optional operator-set deployment identity, appended last.
-      instructions: resolveMcpInstructions(config, process.env, {
-        writeback: ambientOptsFrom(writeback, {
-          remember: allowedOps ? allowedOps.has('remember') : true,
-          extractFacts: allowedOps ? allowedOps.has('extract_facts') : true,
-        }),
-      }),
+      instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts }),
     },
   );
+  // F1: the contract for the effective callable set + readiness tail (or the
+  // status-only line), resolved when the client initializes.
+  installInstructionsResolver(server, async () => {
+    if (statusMode && isEngineDegraded(engine)) {
+      return resolveMcpInstructions(config, process.env, { tools: { callable: n => n === STATUS_TOOL_NAME, statusLine: statusInstructionLine(statusMode) } });
+    }
+    const visible = new Set((await stdioVisibleTools(engine, surfacedOps)).map(op => op.name));
+    return resolveMcpInstructions(config, process.env, {
+      writeback: writebackOpts,
+      tools: { callable: n => visible.has(n), readiness: await instructionReadiness(engine, config, 'stdio') },
+    });
+  });
 
   // WP3: strict-params schema emission, resolved ONCE at startup from the
   installCapabilitiesResource(server, async () => {
+    if (statusMode && isEngineDegraded(engine)) return { transport: 'stdio', status_only: statusPayload(statusMode) };
     const scope = await resolveMcpStdioSourceScope(engine);
     const available = (await stdioVisibleTools(engine, surfacedOps)).map(op => op.name);
     let scopes: readonly string[] = [];
@@ -247,12 +284,13 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
         if (verified.remote) scopes = verified.grant.scopes;
       } catch {}
     }
-    return { transport: 'stdio', scopes, surface, source_id: scope.sourceId,
+    return { transport: 'stdio', scopes, surface, access: readOnly ? 'read-only' : 'full', source_id: scope.sourceId,
       available_operations: available,
       administration: mcpAdministrationGuidance(),
       shared_skills: { protocol_version: 2, catalog: available.includes('list_skills') && available.includes('get_skill'),
         can_join: available.includes('join_brain'), can_edit: available.includes('put_skill') && available.includes('delete_skill'), native_activation: 'unverified' },
-      worker: { status: 'unknown' }, note: 'This local MCP pipe has no OAuth profile; agent-facing operation restrictions still apply.' };
+      ...await stdioCapabilityReadiness(engine, config),
+      note: 'This local MCP pipe has no OAuth profile; agent-facing operation restrictions still apply.' };
   }, createSkillResources(engine, async () => {
     const scope = await resolveMcpStdioSourceScope(engine);
     return { remote: true, transport: 'stdio', sourceId: scope.sourceId,
@@ -263,6 +301,10 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // `mcp.strict_params` flip needs a serve restart here (deliberate; the
   // OAuth HTTP path re-reads dual-plane per request).
   const strictParams = parseStrictParamsMode(config?.mcp?.strict_params) === 'reject';
+  // C1: row shape resolved once at boot like strict_params (stdio has no thin client; a degraded engine reads the file plane).
+  const resultRows = isEngineDegraded(engine)
+    ? parseResultRowsMode(config?.mcp?.result_rows) ?? 'lean'
+    : await resolveResultRowsMode(engine, config);
 
   // Generate tool definitions from operations. Extracted to buildToolDefs so
   // the subagent tool registry (v0.15+) can call the same mapper against a
@@ -271,7 +313,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // `gbrain config set mcp.publish_skills true` takes effect on the next
   // tools/list without a serve restart (matches the HTTP transports).
   server.setRequestHandler(ListToolsRequestSchema, async () => trackStdioRpc(async () => ({
-    tools: buildToolDefs(await stdioVisibleTools(engine, surfacedOps), { strictParams }),
+    tools: statusMode && isEngineDegraded(engine)
+      ? [STATUS_TOOL_DEF]
+      : buildToolDefs(await stdioVisibleTools(engine, surfacedOps), { strictParams }),
   })));
 
   // #4583 (fixes #4564's misrouted-write symptom): once-per-process advisory
@@ -287,6 +331,13 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
   server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(async () => {
     const { name, arguments: params } = request.params;
+    // F4: status-only mode answers gbrain_status and refuses the rest until
+    // a tool call's re-probe finds the brain openable (then dispatch normally).
+    if (statusMode) {
+      const open = await attemptStatusRecovery(engine, statusMode);
+      if (name === STATUS_TOOL_NAME) return statusToolResult(statusMode);
+      if (!open) return statusModeErrorResult(statusMode, name);
+    }
     // #3242 / #3906: stdio resolves its source through the same ambient chain
     // as local CLI dispatch: GBRAIN_SOURCE, then .gbrain-source, then the
     // non-explicit fallback tiers. Non-explicit tiers may widen to federated
@@ -327,6 +378,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       ...(sourceScope.localFederatedSourceIds
         ? { localFederatedSourceIds: sourceScope.localFederatedSourceIds }
         : {}),
+      ...(sourceScope.explicitReadBinding
+        ? { explicitReadBinding: sourceScope.explicitReadBinding }
+        : {}),
       // --source-guard (plugin lanes): thread the winning resolution tier so
       // dispatch can fail-close ambient-tier writes. Off (undefined) unless
       // the serve was started with the flag.
@@ -341,10 +395,12 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       // WP4 (D2): stdio has no per-client rows; its surface is the ceiling
       // request_tools bounds its catalog by (persist no-ops without auth).
       surfaceCeiling: surface,
+      resultRows,
     });
   }));
 
   const transport = new StdioServerTransport();
+  bootPhase('mcp_connect');
   await server.connect(transport);
 
   // Engine-dependent boot: the resolve-IPC listener, session-cursor GC, and
@@ -359,11 +415,12 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // (+ delegated sync/sweep) IPC listener. Wiring shared with `serve --http`
     // via bindResolveIpcForServe (#4474) — best-effort; failure to bind never
     // blocks the MCP server.
-    ipcBinding = await bindResolveIpcForServe(
-      engine,
-      (await resolveMcpStdioSourceScope(engine)).sourceId,
-      await createPersistenceIpcProvider(engine, config ?? { engine: engine.kind }),
-    );
+    bootPhase('source_scope');
+    const { sourceId: ipcSourceId } = await resolveMcpStdioSourceScope(engine);
+    bootPhase('persistence_consumer');
+    const persistence = await createPersistenceIpcProvider(engine, residentPersistenceConfig(config) ?? { engine: engine.kind });
+    bootPhase('resolve_ipc_bind');
+    ipcBinding = await bindResolveIpcForServe(engine, ipcSourceId, persistence);
 
     // v0.45.7 ambient recall: age out stale session cursors once per serve boot
     // (7-day TTL, indexed DELETE). Best-effort — GC failure never blocks serve.
@@ -376,6 +433,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // connect, unref'd (can never hold the process open), all errors
     // swallowed inside armStartupSweep. Kill switch: GBRAIN_SWEEP=0 (checked
     // inside the helper). Lazy import keeps sweep code off the boot path.
+    bootPhase('startup_sweep');
     try {
       const { armStartupSweep } = await import('../core/sweep.ts');
       const { sourceId } = await resolveMcpStdioSourceScope(engine);
@@ -389,7 +447,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
 
   if (isEngineDegraded(engine)) {
     // Structured enter/exit lines for harness-log forensics.
-    process.stderr.write('[gbrain-serve] DEGRADED: database unreachable at startup — tool calls return classified errors (GBRAIN_DB_ACCESS) and the server reconnects automatically. Fix: gbrain db-repair. Kill switch: GBRAIN_SERVE_DEGRADED=0.\n');
+    process.stderr.write(statusMode
+      ? `[gbrain-serve] STATUS-ONLY: ${statusHeadline(statusMode)} Serving gbrain_status; the full tool list returns once a tool call finds the brain openable. Supervisors: --fail-fast exits instead.\n`
+      : '[gbrain-serve] DEGRADED: database unreachable at startup — tool calls return classified errors (GBRAIN_DB_ACCESS) and the server reconnects automatically. Fix: gbrain db-repair. Kill switch: GBRAIN_SERVE_DEGRADED=0.\n');
     onEngineRecovered(engine, () => {
       // A reconnect can complete while shutdown is already draining (stdin
       // EOF during the attempt) — booting IPC/sweep on an exiting process
@@ -457,18 +517,19 @@ export async function handleToolCall(
   engine: BrainEngine,
   tool: string,
   params: Record<string, unknown>,
-  opts?: { sourceId?: string; localFederatedSourceIds?: string[] },
+  opts?: { sourceId?: string; localFederatedSourceIds?: string[]; writeWaitMs?: number },
 ): Promise<unknown> {
   const op = operations.find(o => o.name === tool);
-  if (!op) throw new Error(`Unknown tool: ${tool}`);
+  if (!op) throw opError('unknown_tool', `Unknown tool: ${tool}`, 'Run `gbrain --tools-json` to list the tool names.');
 
-  const validationError = validateParams(op, params);
-  if (validationError) throw new Error(validationError);
+  const validationFailure = findInvalidParam(op, params);
+  if (validationFailure) throw schemaInvalidParams(op, validationFailure, {});
 
   const ctx = buildOperationContext(engine, params, {
     remote: false,
     logger: { info: console.log, warn: console.warn, error: console.error },
     ...(opts?.sourceId ? { sourceId: opts.sourceId } : {}),
+    ...(opts?.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
     ...(opts?.localFederatedSourceIds
       ? { localFederatedSourceIds: opts.localFederatedSourceIds }
       : {}),

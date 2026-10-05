@@ -36,6 +36,7 @@ import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { deliverEvidence, effectivePlan, resolveEvidencePlan, EVIDENCE_BLOCK_CHAR_CAP, THINK_RETURN_UNIT_CONFIG_KEY, type DeliveryMeta } from '../search/evidence-delivery.ts';
 import { startThinkDecide, thinkAbstainResult, type ThinkAbstention } from './decide.ts';
 import { classifyIntent } from './intent.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -79,6 +80,8 @@ export interface RunThinkOpts {
    * default model path keeps its graceful-degrade behavior.
    */
   modelExplicit?: boolean;
+  /** `false` keeps the gateway client on `model` (no `chat_fallback_chain` hop); an explicit model always does. */
+  allowFallback?: boolean;
   /** Optional time window for temporal questions. */
   since?: string;
   until?: string;
@@ -447,17 +450,28 @@ async function persistCitations(
   engine: BrainEngine,
   synthesisPageId: number,
   citations: ParsedCitation[],
+  scope: { sourceId?: string; allowedSources?: string[] } = {},
 ): Promise<{ inserted: number; warnings: string[] }> {
   const warnings: string[] = [];
+  // #5426: the same slug can exist in several sources. Bind each citation to
+  // a page in the sources the synthesis drew from (preferring its own source),
+  // never to a same-slug page elsewhere in the brain. Unscoped only for an
+  // unscoped think.
+  const sources = scope.allowedSources?.length ? scope.allowedSources : scope.sourceId ? [scope.sourceId] : null;
   // Resolve unique slugs to page_ids
   const slugToPageId = new Map<string, number>();
   for (const c of citations) {
     if (c.row_num === null) continue;  // page-level, skip
     if (slugToPageId.has(c.page_slug)) continue;
-    const rows = await engine.executeRaw<{ id: number }>(
-      `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
-      [c.page_slug],
-    );
+    const rows = sources
+      ? await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 AND source_id = ANY($2::text[]) ORDER BY (source_id = $3) DESC, id LIMIT 1`,
+        [c.page_slug, sources, scope.sourceId ?? ''],
+      )
+      : await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
+        [c.page_slug],
+      );
     if (rows[0]) slugToPageId.set(c.page_slug, rows[0].id);
   }
   const evidenceInputs: SynthesisEvidenceInput[] = [];
@@ -762,7 +776,7 @@ export async function runThink(
     // That bypassed gateway config (gbrain config set anthropic_api_key)
     // because the Anthropic SDK only reads process.env.ANTHROPIC_API_KEY.
     // Closes #952 (think over MCP returns "no LLM available").
-    const client = opts.client ?? await tryBuildGatewayClient(modelUsed, { explicitModel: opts.modelExplicit });
+    const client = opts.client ?? await tryBuildGatewayClient(modelUsed, { explicitModel: opts.modelExplicit, allowFallback: opts.allowFallback });
     if (!client) {
       // Label the failure honestly: a missing key and an unusable model id are
       // different incidents with different fixes. Pre-fix EVERY null client was
@@ -1000,6 +1014,7 @@ export function stripGapsSection(answer: string): string {
 export async function persistSynthesis(
   engine: BrainEngine,
   result: ThinkResult,
+  scope: { sourceId?: string; allowedSources?: string[] } = {},
 ): Promise<{ slug: string; evidenceInserted: number; warnings: string[] }> {
   // #1698: never persist an empty synthesis. Returned signal (NOT a throw, F3) so
   // the MCP `think` op can return the gather result + warning instead of a bare error
@@ -1027,7 +1042,7 @@ export async function persistSynthesis(
     result.gaps.length > 0 ? '## Gaps\n\n' + result.gaps.map(g => `- ${g}`).join('\n') : '',
   ].filter(Boolean).join('\n');
 
-  const page = await engine.putPage(slug, {
+  const page = await maintenanceTransaction(engine, tx => tx.putPage(slug, {
     title: result.question.slice(0, 200),
     type: 'synthesis',
     compiled_truth: body,
@@ -1039,9 +1054,9 @@ export async function persistSynthesis(
       pages_gathered: result.pagesGathered,
       takes_gathered: result.takesGathered,
     },
-  });
+  }, scope.sourceId ? { sourceId: scope.sourceId } : undefined));
 
-  const persisted = await persistCitations(engine, page.id, result.citations);
+  const persisted = await persistCitations(engine, page.id, result.citations, scope);
   return { slug, evidenceInserted: persisted.inserted, warnings: persisted.warnings };
 }
 
@@ -1100,7 +1115,7 @@ async function readThinkTrajectoryEnabled(engine: BrainEngine): Promise<boolean>
  */
 async function tryBuildGatewayClient(
   modelUsed: string,
-  opts: { explicitModel?: boolean } = {},
+  opts: { explicitModel?: boolean; allowFallback?: boolean } = {},
 ): Promise<ThinkLLMClient | null> {
   // Normalize: ensure provider:model shape (and slash→colon — #1698). resolveModel
   // returns bare anthropic ids (`claude-opus-4-7`); gateway.chat needs `anthropic:...`.
@@ -1146,6 +1161,8 @@ async function tryBuildGatewayClient(
           system,
           messages,
           maxTokens: params.max_tokens,
+          // An explicit --model is a hard requirement (#1698), never a hop.
+          ...(opts.explicitModel || opts.allowFallback === false ? { allowFallback: false } : {}),
         });
       } catch (e) {
         // AIConfigError at chat time = e.g. key revoked mid-run. For an EXPLICIT

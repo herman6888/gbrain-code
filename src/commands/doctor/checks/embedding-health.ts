@@ -9,8 +9,31 @@
 
 import { hnswIndexExpected, hnswMaxDimsForType } from '../../../core/vector-index.ts';
 import { checkEmbeddingEnvOverride, checkEmbeddingMigrationState } from './search-eval.ts';
+import type { GBrainConfig } from '../../../core/config.ts';
+import { DEFAULT_EMBEDDING_MODEL } from '../../../core/ai/defaults.ts';
+import { providerKeyShadows, providerKeySource } from '../../../core/ai/provider-env.ts';
+import { credentialEnvName, keyShadowWarning } from '../../../core/ai/key-warnings.ts';
+import { getRecipe } from '../../../core/ai/recipes/index.ts';
 import type { Check } from '../../doctor.ts';
+import { embeddingsDisabled } from '../../../core/embedding-disabled.ts';
+import { checkError, doctorVerify, infoCheck, keylessEnablementFix } from '../check-fix.ts';
+import { brainRoutingArgs } from '../../../core/brain-resolver.ts';
+import type { Action } from '../../../core/agent-output.ts';
+import { embeddingProviderIsFree } from '../../../core/embed-consent.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
+
+/** The opt-in live probe: one ~9-token embedding request, so `paid` + `egress` (runs verbatim once approved). */
+export function embeddingProbeFix(model: string, free = false): Action {
+  return {
+    argv: ['gbrain', 'doctor', '--only', 'embedding_provider', '--probe', ...(free ? [] : ['--yes']), '--json', ...brainRoutingArgs()],
+    consent: free ? [] : ['paid', 'egress'],
+    actor: 'agent',
+    why: `Plain doctor never calls the provider. The probe sends one short embedding request to ${model} to confirm the key, model and dimensions work; it costs a fraction of a cent.`,
+    user_message: `To confirm your embedding provider works, gbrain can send it one tiny test request (${model}, well under a cent). OK to run it?`,
+    verify: doctorVerify('embedding_provider'),
+    requires_exclusive: false,
+  };
+}
 
 async function runEmbeddingProvider(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -20,6 +43,10 @@ async function runEmbeddingProvider(ctx: DoctorContext): Promise<Check[]> {
   // 8b. Embedding provider eval — live smoke test of the configured provider.
   //     Verifies: correct model, API key works, dimensions match config, DB column matches.
   progress.heartbeat('embedding_provider');
+  if (await embeddingsDisabled(engine)) {
+    checks.push(infoCheck('embedding_provider', 'Not probed: embeddings are disabled on this brain by choice (keyword search keeps working).', 'disabled_by_choice', keylessEnablementFix()));
+    return checks;
+  }
   try {
     const {
       getEmbeddingModel,
@@ -96,6 +123,31 @@ async function runEmbeddingProvider(ctx: DoctorContext): Promise<Check[]> {
         status: 'ok',
         message: `Skipped (no provider credentials). Model: ${configuredModel}.`,
       });
+    } else if (!ctx.args.includes('--probe')) {
+      let colDims: number | null = null;
+      try {
+        const { readContentChunksEmbeddingDim } = await import('../../../core/embedding-dim-check.ts');
+        const colDim = await readContentChunksEmbeddingDim(engine);
+        colDims = colDim.exists ? colDim.dims : null;
+      } catch { /* column or table missing: fresh brain */ }
+      const details = { probed: false, model: configuredModel, dimensions: configuredDims };
+      if (colDims !== null && colDims !== configuredDims) {
+        checks.push({
+          name: 'embedding_provider',
+          status: 'warn',
+          message: `${configuredModel} is configured for ${configuredDims} dims but the DB column is vector(${colDims}) (not probed). See docs/embedding-migrations.md for a verified backup, migration preview and explicitly authorized repair.`,
+          fix_unavailable_reason: 'operator_judgement',
+          details,
+        });
+      } else {
+        checks.push({
+          name: 'embedding_provider',
+          status: 'ok',
+          message: `${configuredModel} configured (${configuredDims} dims, credentials present, DB column aligned); not probed: a live probe sends one tiny paid embedding request to the provider and runs only when authorized.`,
+          fix: embeddingProbeFix(configuredModel, await embeddingProviderIsFree(configuredModel)),
+          details,
+        });
+      }
     } else {
       // Live embed test
       const start = Date.now();
@@ -399,11 +451,7 @@ async function runEmbeddingColumnRegistry(ctx: DoctorContext): Promise<Check[]> 
   } catch (err) {
     // Pre-config brains, registry-validation throws, etc. Surfaces the
     // error message but doesn't fail the doctor run.
-    checks.push({
-      name: 'embedding_column_registry',
-      status: 'warn',
-      message: `Could not check embedding column registry: ${(err as Error).message}`,
-    });
+    checks.push(checkError('embedding_column_registry', 'check embedding column registry', err));
   }
   return checks;
 }
@@ -432,4 +480,48 @@ export const embeddingEnvOverrideEntry: DoctorEntry = {
   name: 'embedding_env_override',
   emits: ['embedding_env_override', 'embedding_migration_state'],
   run: runEmbeddingEnvOverride,
+};
+
+/**
+ * Doctor `embedding_key_source` (#5137, DX-O8): which provider keys come from
+ * the environment and override a different config-plane key, and where the
+ * embedding key in effect comes from. Names only, never key values. It sees
+ * only the environment `gbrain doctor` runs in, not a daemon's. Engine-free
+ * filesystem-lane entry (also under `--fast`).
+ */
+const KEY_SOURCE_DOCS = 'docs/guides/repair.md#embedding-key-source';
+const KEY_SOURCE_SCOPE = 'This check sees only the environment `gbrain doctor` runs in; a daemon (gbrain serve, autopilot) has its own, and reports a mismatch in its log with a startup warning or embedding_auth_failed.';
+
+export function embeddingKeySource(fileCfg: GBrainConfig | null, env: Record<string, string | undefined>, file: string): Pick<Check, 'status' | 'message' | 'details'> {
+  const shadows = providerKeyShadows(fileCfg, env);
+  const model = env.GBRAIN_EMBEDDING_MODEL || fileCfg?.embedding_model || DEFAULT_EMBEDDING_MODEL;
+  const variable = credentialEnvName(getRecipe(model.split(':')[0] ?? '')?.auth_env);
+  const source = variable ? providerKeySource(fileCfg, env, variable) : null;
+  const inEffect = !source ? `The embedding model ${model} reads no API key.`
+    : source.kind === 'env' ? `The embedding key in effect is ${source.variable} from this environment.`
+      : source.kind === 'config' ? `The embedding key in effect is ${source.config_key} in ${file}.`
+        : `No embedding key is set here (${source.variable}${source.config_key ? ` or ${source.config_key}` : ''}).`;
+  const details = { shadows: shadows.map(shadow => ({ ...shadow, in_effect: 'env' as const })),
+    embedding_model: model, embedding_key: source ? { kind: source.kind, variable: source.variable, config_key: source.config_key ?? null } : null, docs: KEY_SOURCE_DOCS };
+  if (!shadows.length) return { status: 'ok', message: `${inEffect} No environment variable overrides a different config-plane provider key. ${KEY_SOURCE_SCOPE}`, details };
+  return {
+    status: 'warn',
+    message: `${inEffect} ${shadows.map(shadow => keyShadowWarning(shadow, file).replace('[gbrain] warning: ', '')).join(' ')} ${KEY_SOURCE_SCOPE}`,
+    details,
+  };
+}
+
+async function runEmbeddingKeySource(_ctx: DoctorContext): Promise<Check[]> {
+  const checks: Check[] = [];
+  const { configPath, loadConfigFileOnly } = await import('../../../core/config.ts');
+  let file = 'config.json';
+  try { file = configPath(); } catch { /* invalid GBRAIN_HOME: doctor reports it elsewhere */ }
+  checks.push({ name: 'embedding_key_source', ...embeddingKeySource(loadConfigFileOnly(), process.env, file) });
+  return checks;
+}
+
+export const embeddingKeySourceEntry: DoctorEntry = {
+  name: 'embedding_key_source',
+  emits: ['embedding_key_source'],
+  run: runEmbeddingKeySource,
 };

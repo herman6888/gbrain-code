@@ -333,6 +333,7 @@ async function callModel(prompt: string, modelFull: string): Promise<{ text: str
     model: modelFull,
     messages: [{ role: 'user', content: prompt }],
     maxTokens: 64,
+    allowFallback: false,
   });
   return {
     text: result.text,

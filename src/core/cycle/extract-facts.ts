@@ -23,39 +23,30 @@
  * fence-owned and are left alone. Active fence-owned rows of soft-deleted
  * pages are expired at the start of each run.
  *
- * Empty-fence guard (Codex R2-#7; #2484; #2646): the phase refuses to do
- * its destructive reconciliation pass when genuinely-backfillable legacy
- * rows still exist — in THIS run's source only (`source_id = sourceId`;
- * a pending row in source A must not jam extraction for source B — the
- * source-isolation invariant) — `row_num IS NULL` (never fenced) AND
- * `entity_slug` resolves to a live page in this source (so the v0_32_2
- * migration's Phase B could fence them) AND the row is not soft-expired
- * (`expired_at IS NULL`). Status returns `warn` with a hint to re-run
- * the v0.32.2 fence backfill (`apply-migrations --force-retry 0.32.2`
- * then `--yes` — a bare `--yes` is a no-op once the ledger says
- * complete). Without the guard, an interrupted upgrade where v0_32_2
- * hasn't run could leave the cycle silently misreporting "0 facts on
- * people/alice" while legacy rows linger.
+ * Unfenced rows (#5299): each run first fences the source's active
+ * `row_num IS NULL` rows onto their live entity pages through the shared
+ * core pass (`facts/unfenced-facts.ts`, also the v0.32.2 migration's Phase
+ * B) and reconciles those pages in the same run. The inline writer's
+ * DB-only fallback keeps producing such rows, so no manual migration retry
+ * is needed.
  *
- * The live-page requirement (#2484) is load-bearing: the inline facts
- * writer keeps producing `row_num IS NULL, entity_slug IS NOT NULL`
- * rows AFTER the migration completes, whenever a resolved slug has no
- * fenceable page (slugify-floor / stub-guard-blocked unprefixed slugs).
- * Those are structurally unfenceable — no page to fence onto, and the
- * ledger-complete migration won't re-run — so they must NOT gate, or
- * the phase jams forever (~16/day observed). Requiring a backing page
- * keeps genuine pre-v0.32.2 rows (whose entity page exists) gating
- * while excluding the inline-writer's permanent-unfenceable rows.
- *
- * Soft-expired rows don't count either (#2646): they're what
- * `forget_fact` produces, so excluding them lets operators drain the
- * backlog through the sanctioned removal path instead of raw SQL.
+ * Empty-fence guard (Codex R2-#7; #2484; #2646): rows the fence step could
+ * not fence this run (a page whose file is not on this host, a malformed
+ * fence, a held page lock) still block the destructive reconciliation pass
+ * — in THIS run's source only (`source_id = sourceId`, the source-isolation
+ * invariant). A row counts when `row_num IS NULL`, its `entity_slug`
+ * resolves to a live page in this source, it is not soft-expired
+ * (`expired_at IS NULL`; `forget_fact` drains rows that way) and the source
+ * has a `local_path`. Status returns `warn` naming each failed page. Rows
+ * with no backing page or checkout (slugify-floor / stub-guard-blocked
+ * slugs from the inline writer) are structurally unfenceable and never gate.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
 import { managedDerivedFactsPreflight, withDerivedFactsWrite } from '../persistence/derived-facts.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import {
   resolveSupersededByRow,
   supersessionChainOf,
@@ -63,9 +54,11 @@ import {
   type SupersessionChain,
 } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
+import { fenceUnfencedFacts, planUnfencedFacts } from '../facts/unfenced-facts.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
 import {
+  duplicateActiveFenceRows,
   extractFactsFromFenceText,
   type FenceExtractedFact,
 } from '../facts/extract-from-fence.ts';
@@ -344,7 +337,10 @@ export interface ExtractFactsResult {
   factsUpdated: number;
   /** Fence-owned rows expired and detached because their row left the fence. */
   factsDeleted: number;
+  /** Unfenced rows (`row_num IS NULL`, live entity page) still pending after this run's fence step. */
   legacyRowsPending: number;
+  /** Unfenced rows this run appended to their page's fence and stamped with a row number (#5299). */
+  unfencedRowsFenced: number;
   /** Active fence-owned rows expired because their page was soft-deleted. */
   factsExpiredForDeletedPages: number;
   guardTriggered: boolean;
@@ -443,7 +439,7 @@ export async function runExtractFacts(
   // inside the coordinator's source capability under the page key.
   const managed = await managedDerivedFactsPreflight(engine, sourceId);
   const transact = <T>(slugs: string[], fn: (tx: BrainEngine) => Promise<T>): Promise<T> =>
-    managed ? withDerivedFactsWrite(engine, sourceId, slugs, fn) : engine.transaction(fn);
+    managed ? withDerivedFactsWrite(engine, sourceId, slugs, fn) : maintenanceTransaction(engine, fn);
   const result: ExtractFactsResult = {
     pagesScanned: 0,
     pagesWithFacts: 0,
@@ -451,6 +447,7 @@ export async function runExtractFacts(
     factsUpdated: 0,
     factsDeleted: 0,
     legacyRowsPending: 0,
+    unfencedRowsFenced: 0,
     factsExpiredForDeletedPages: 0,
     pagesFailed: 0,
     guardTriggered: false,
@@ -463,48 +460,34 @@ export async function runExtractFacts(
     phantomsMorePending: false,
   };
 
+  // ── Fence unfenced rows (#5299) ─────────────────────────────────
+  // The inline writer's DB-only fallback keeps producing `row_num IS NULL`
+  // rows on live entity pages (a write from a host without the checkout,
+  // `sync.write_through=off`). Each run fences them itself through the
+  // shared core pass (the v0.32.2 migration's Phase B): the coordinator on a
+  // managed brain, the page file + maintenance transaction otherwise. The
+  // fenced pages join this run's reconcile below.
+  let fencedSlugs: string[] = [];
+  if (!opts.dryRun) {
+    try {
+      const fence = await fenceUnfencedFacts(engine, await planUnfencedFacts(engine, { sourceId }), { pageLockRoot: opts.pageLockRoot });
+      result.unfencedRowsFenced = fence.fenced;
+      fencedSlugs = fence.fenced_slugs;
+      for (const page of [...fence.failed_pages, ...fence.missing_files]) result.warnings.push(`FACTS_FENCE_FAILED: ${page}`);
+    } catch (e) {
+      result.warnings.push(`FACTS_FENCE_FAILED: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
+    }
+  }
+
   // ── Empty-fence guard (Codex R2-#7; #2484; #2646) ──────────────
-  // Pre-check: if any genuinely-backfillable legacy fact rows exist,
-  // refuse to run the destructive reconciliation pass — the v0_32_2
-  // orchestrator must fence them first.
-  //
-  // A row is a real backfill candidate only when `row_num IS NULL`
-  // (never fenced) AND its `entity_slug` resolves to a LIVE page in
-  // this source (the migration's Phase B only fences rows whose
-  // entity_slug maps to a writable page) AND it is not soft-expired.
-  // #2484: the original predicate was just `row_num IS NULL AND
-  // entity_slug IS NOT NULL`, which ALSO matched
-  // structurally-unfenceable hot-memory rows the inline writer keeps
-  // producing post-migration: the legacy DB-only fallback
-  // (backstop.ts) writes `entity_slug` (a resolved slug, e.g. a
-  // slugify-floor or stub-guard-blocked unprefixed slug like
-  // `people-jane-doe`) with `row_num` NULL whenever the slug has no
-  // fenceable page. Those rows can never satisfy the migration's exit
-  // condition (no page to fence onto, and `apply-migrations` is a
-  // ledger-complete no-op for them), so they jammed the phase forever
-  // — ~16/day, mislabeled "v0.31 pending backfill." We now require a
-  // live backing page, which both genuine pre-v0.32.2 rows (their
-  // entity page exists) satisfy and inline-writer unfenceable rows do
-  // not. #2646: soft-expired rows (`expired_at IS NOT NULL`) are also
-  // excluded — `forget_fact`, the officially sanctioned removal path,
-  // soft-expires legacy rows rather than deleting them, so counting
-  // expired rows would leave the guard permanently stuck with no
-  // supported way to drain the backlog.
-  //
-  // Source isolation (#3526): the count is scoped to THIS run's
-  // sourceId. The pre-fix query counted brain-wide, so a single pending
-  // legacy row in any mounted source jammed extract_facts for every
-  // source — a cross-source leak of one source's migration state into
-  // another's cycle (CLAUDE.md source-isolation invariant).
-  //
-  // #2763: the count also requires the source to have a `local_path` —
-  // mirroring the v0_32_2 Phase B fenceability rule (its backfill SKIPS
-  // rows whose source has no local_path, `skipped_no_local_path`, yet
-  // still returns complete). On a thin-client / DB-only source the
-  // backstop writer keeps producing row_num-NULL rows whose entity_slug
-  // maps to a LIVE page; without the local_path check those rows
-  // tripped the guard forever with drain advice (`apply-migrations
-  // --force-retry 0.32.2`) that is a structural no-op for them.
+  // Rows the fence step could not fence this run still block the destructive
+  // reconciliation pass. A row counts only when `row_num IS NULL`, its
+  // `entity_slug` resolves to a LIVE page in THIS run's source (#3526 source
+  // isolation), it is not soft-expired (#2646: `forget_fact` drains rows by
+  // soft-expiring them), and the source has a `local_path` (#2763). Rows
+  // without a page or checkout (#2484: the inline writer's
+  // slugify-floor / stub-guard-blocked slugs) are structurally unfenceable
+  // and never gate.
   const legacy = await engine.executeRaw<{ n: string }>(
     `SELECT COUNT(*) AS n
        FROM facts f
@@ -529,25 +512,17 @@ export async function runExtractFacts(
   result.legacyRowsPending = legacyCount;
   if (legacyCount > 0) {
     result.guardTriggered = true;
-    // Drain advice must actually work: a bare `apply-migrations --yes`
-    // is a no-op once the v0.32.2 ledger entry says complete (the
-    // runner classifies it as already-applied), so the sanctioned
-    // re-run path is the explicit retry marker first. Phase B is
-    // idempotent — it only touches `row_num IS NULL` rows and de-dupes
-    // against the existing fence — so the re-run is safe. Individual
-    // rows can instead be drained through `forget_fact` (soft-expired
-    // rows stop counting).
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
-      `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
-      `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
-      `\`gbrain apply-migrations --yes\`. Or drain individual rows via \`forget_fact\`.`,
+      `extract_facts: ${legacyCount} unfenced fact row(s) in source "${sourceId}" (entity page present, row_num NULL) ` +
+      (opts.dryRun
+        ? 'would be fenced by this phase; a dry run writes nothing, so reconciliation is skipped.'
+        : 'could not be fenced this run, so reconciliation is skipped. The FACTS_FENCE_FAILED warnings name each page and why; ' +
+          'a page whose canonical file does not exist on this host is fenced by the cycle on the host that holds the file. ' +
+          'Individual rows can instead be drained via `forget_fact`.'),
     );
     // #3683: book the halt BEFORE the early return. The end-of-run rollup
-    // write below is unreachable from this path, so pre-fix a guard-triggered
-    // run recorded NOTHING in extract_rollup_7d — halt_count was structurally
-    // 0 and doctor extract_health's `halt_rate > 10%` warning could never
-    // fire for facts.fence no matter how long the phase stayed jammed.
+    // write below is unreachable from this path, so a guard-triggered run
+    // must record its halt here for doctor extract_health's halt_rate.
     // upsertExtractRollup is best-effort internally (never throws).
     if (!opts.dryRun) {
       await upsertExtractRollup(engine, {
@@ -616,7 +591,7 @@ export async function runExtractFacts(
     );
     // Managed: one page at a time under its key, so a concurrent restore is
     // either seen as restored or waited for, never expired underneath it.
-    const expired = managed ? await expireDeletedPagesManaged(engine, sourceId, transact) : await expireDeleted(engine);
+    const expired = managed ? await expireDeletedPagesManaged(engine, sourceId, transact) : await maintenanceTransaction(engine, expireDeleted);
     result.factsExpiredForDeletedPages = expired.length;
   }
 
@@ -643,10 +618,8 @@ export async function runExtractFacts(
   // Without this, an incremental-mode cycle with phantom-but-not-canonical
   // in opts.slugs would leave canonical's DB facts stale until next full
   // walk (codex A1 — the round-14 risk specialized to scenario B).
-  if (phantomResult.touched_canonicals.length > 0) {
-    const slugSet = new Set(slugs);
-    for (const c of phantomResult.touched_canonicals) slugSet.add(c);
-    slugs = Array.from(slugSet);
+  if (phantomResult.touched_canonicals.length > 0 || fencedSlugs.length > 0) {
+    slugs = Array.from(new Set([...slugs, ...phantomResult.touched_canonicals, ...fencedSlugs]));
   }
 
   // ── Reconcile each page ───────────────────────────────────────
@@ -711,17 +684,10 @@ export async function runExtractFacts(
     // trajectory query against the page returns import dates instead of
     // claim dates.
     const pageEffectiveDate = page.effective_date ? new Date(page.effective_date) : null;
-    // #1781: duplicate ACTIVE rows (same claim and source) index once. A
-    // struck history row never collapses with an active row that carries the
-    // same text, so a claim that reverts to an earlier value stays active.
-    const activeKeys = new Set<string>();
-    const extracted = extractFactsFromFenceText(parsed.facts, slug, sourceId, { pageEffectiveDate }).filter(f => {
-      if (f.expired_at != null) return true;
-      const key = `${f.fact}\u0000${f.source}`;
-      if (activeKeys.has(key)) return false;
-      activeKeys.add(key);
-      return true;
-    });
+    // #1781: duplicate ACTIVE rows (same claim and source) index once.
+    const duplicates = duplicateActiveFenceRows(parsed.facts);
+    const extracted = extractFactsFromFenceText(parsed.facts, slug, sourceId, { pageEffectiveDate })
+      .filter(f => !duplicates.has(f.row_num));
 
     if (opts.dryRun) return 'next';
 

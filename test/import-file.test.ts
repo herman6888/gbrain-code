@@ -75,6 +75,8 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
       }
       // transaction: just call the fn with the same engine (no real DB transaction in tests)
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
+      // Like a real engine, executeRaw always resolves to a row array.
+      if (prop === 'executeRaw' && !overrides.executeRaw) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve([]); };
       return track(prop);
     },
   });

@@ -136,11 +136,12 @@ describe('#2849 — size-gated sync durably queues the deferred extraction', () 
     // branch fires again with the same pin, the idempotency fast path hands
     // back the still-waiting job, and no second row appears. Exactly 1 —
     // `<= 1` would also pass in the coalesce-drop failure state (0 jobs).
-    // Garble the stored hashes so the re-drain actually re-imports (the
-    // content_hash short-circuit would otherwise leave pagesAffected empty
+    // Make the stored rows diverge from their files so the re-drain actually
+    // re-imports (the unchanged-page short-circuit, which since #5158 also
+    // compares the row key-sorted, would otherwise leave pagesAffected empty
     // and never reach the defer branch).
     await engine.setConfig('sync.last_commit', baseCommit);
-    await engine.executeRaw(`UPDATE pages SET content_hash = 'stale-test' WHERE slug LIKE 'notes/%'`);
+    await engine.executeRaw(`UPDATE pages SET content_hash = 'stale-test', frontmatter = frontmatter || '{"stale_test": true}'::jsonb WHERE slug LIKE 'notes/%'`);
     await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     const jobs = await staleExtractJobs();
     expect(jobs.length).toBe(1);
@@ -180,12 +181,12 @@ describe('#2849 — size-gated sync durably queues the deferred extraction', () 
     await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     const [first] = await staleExtractJobs();
     await engine.executeRaw(`UPDATE minion_jobs SET status = 'completed' WHERE id = $1`, [first.id]);
-    // Rewind and re-drain the same range (garbled hashes force the
+    // Rewind and re-drain the same range (rows diverged from their files force the
     // re-import, mirroring a failed-file retry / checkpoint-resume drain):
     // pages' updated_at moves past the "completed" sweep, so a live sweep
     // must exist afterwards.
     await engine.setConfig('sync.last_commit', baseCommit);
-    await engine.executeRaw(`UPDATE pages SET content_hash = 'stale-test' WHERE slug LIKE 'notes/%'`);
+    await engine.executeRaw(`UPDATE pages SET content_hash = 'stale-test', frontmatter = frontmatter || '{"stale_test": true}'::jsonb WHERE slug LIKE 'notes/%'`);
     await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     const jobs = await staleExtractJobs();
     const waiting = jobs.filter(j => j.status === 'waiting');

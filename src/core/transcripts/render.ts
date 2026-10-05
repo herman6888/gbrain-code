@@ -30,14 +30,14 @@
 import { safeDump } from 'js-yaml';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_BYTES_BLOCK } from '../content-sanity.ts';
+import { DEFAULT_BYTES_WARN } from '../content-sanity.ts';
 import { applyRedaction, planRedaction, type EchoDictionary, type RedactionPlan } from '../secret-scan.ts';
 import { loadPatterns } from '../skillpack/harvest-lint.ts';
 import { sanitizeForJsonb } from '../batch-rows.ts';
 import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
 import { BUILTIN_PATTERNS } from '../conversation-parser/builtins.ts';
 import type { ParsedSession, TranscriptMessage } from './types.ts';
-import { buildTranscriptSlug, transcriptFullId } from './types.ts';
+import { buildTranscriptSlug, transcriptFullId, utcTimestamp } from './types.ts';
 
 // ── Shared line format (imessage-slack builtin) ─────────────────────────────
 
@@ -60,8 +60,18 @@ export const MESSAGE_CHAR_CAP = 4000;
  * would import as a zero-chunk, unsearchable page, defeating the split.
  * (Operators can lower the threshold via config; the 0.6 factor leaves
  * headroom for frontmatter overhead and modest overrides.)
+ *
+ * #5427: with the prior `min(300KB, floor(BLOCK * 0.6))` shape, the target
+ * landed at 300KB — six times the content-sanity WARN line (50KB). Every
+ * transcript-import part between 50KB and 300KB therefore took the
+ * content-sanity warn branch (`oversize_warn` audit row + stderr
+ * `exceeds warn threshold, consider splitting` — pointing at the very
+ * splitter that produced the page) on every re-ingest, drowning the doctor
+ * recent-events signal. The block tier stays untouched (the hard floor for
+ * the no-zero-chunk invariant). The 0.9 headroom against WARN gives the
+ * part header + OVERLAP_MESSAGES duplicates room to breathe.
  */
-export const PART_TARGET_BYTES = Math.min(300 * 1024, Math.floor(DEFAULT_BYTES_BLOCK * 0.6));
+export const PART_TARGET_BYTES = Math.floor(DEFAULT_BYTES_WARN * 0.9);
 /** Messages repeated at each part boundary for cross-part fact grounding. */
 export const OVERLAP_MESSAGES = 2;
 
@@ -217,7 +227,7 @@ export function redactSession(
 /** `2026-08-01T10:00:05.000Z` → `(2026-08-01 10:00 AM)` (UTC), matching the builtin. */
 function anchorTimestamp(iso: string): string {
   const d = new Date(iso);
-  const day = iso.slice(0, 10);
+  const day = Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toISOString().slice(0, 10);
   let h = d.getUTCHours();
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
@@ -312,7 +322,7 @@ export function renderSessionParts(
       `session ${meta.sessionId} carries no timestamps — refusing to fabricate provenance`,
     );
   }
-  const dateIso = firstTs;
+  const dateIso = utcTimestamp(firstTs);
   const baseSlug = buildTranscriptSlug(meta.harness, dateIso, {
     sessionId: meta.sessionId,
     title: meta.title,

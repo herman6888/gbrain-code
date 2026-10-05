@@ -16,6 +16,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import type { ToolLoopStopReason } from '../ai/gateway.ts';
 import type { ModelUsageRow } from '../budget/models-used.ts';
+import type { NoPricingGuidance } from '../budget/no-pricing.ts';
 import type { ModelsPlanEntry, SkillOptModels, StrictVerdict } from './models-plan.ts';
 
 // ─── Benchmarks + judges ──────────────────────────────────────────────────
@@ -250,6 +251,8 @@ export interface RunReceipt {
   // reason + the underlying error message, mirrored from the audit trail.
   abort_reason?: 'budget_exhausted' | 'runtime_exceeded' | 'sigint' | 'error';
   abort_detail?: string;
+  /** no_pricing abort: look up the model's price and register it (`register_command`), then retry. */
+  no_pricing?: NoPricingGuidance;
   /** #5584: why the loop stopped. */
   stop_reason?: 'completed' | 'early_stop_unusable_output' | 'aborted';
   /** #5584: optimizer-reply errors (reflect + one-shot), deduped, max 20 x 300 chars. */

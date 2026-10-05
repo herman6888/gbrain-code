@@ -65,7 +65,31 @@ function carryStatusFields(from: unknown, to: AIServiceError): AIServiceError {
   return to;
 }
 
-export function normalizeAIError(err: unknown, context?: string): AIServiceError {
+/**
+ * Scrub upstream text in place along a wrapped error's cause chain (message,
+ * stack, the SDK's responseBody and parsed data), keeping status, headers and
+ * shape, so `.cause` walkers still classify it and nothing serialized or
+ * printed later carries what `redact` removes.
+ */
+function scrubErrorChain(err: unknown, redact: (text: string) => string): void {
+  let cur = err;
+  for (let depth = 0; depth < 4 && cur && typeof cur === 'object'; depth++) {
+    const node = cur as Record<string, unknown>;
+    for (const key of ['message', 'stack', 'responseBody']) {
+      if (typeof node[key] === 'string') try { node[key] = redact(node[key] as string); } catch { /* read-only field */ }
+    }
+    if (node.data && typeof node.data === 'object') try { node.data = JSON.parse(redact(JSON.stringify(node.data))); } catch { /* not plain data */ }
+    cur = node.cause;
+  }
+}
+
+/**
+ * `redact` scrubs upstream text before it becomes the message, and in the
+ * wrapped error (#5137: the gateway passes its provider-key redactor, since
+ * auth errors echo keys).
+ */
+export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string): AIServiceError {
+  if (redact) scrubErrorChain(err, redact);
   if (err instanceof AIServiceError) return err;
 
   const anyErr = err as {
@@ -84,7 +108,8 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
     anyErr?.statusCode ??
     (typeof anyErr?.apiErrorStatus === 'number' ? anyErr.apiErrorStatus : undefined);
   const name = anyErr?.name ?? '';
-  const msg = anyErr?.message ?? String(err);
+  const raw = anyErr?.message ?? String(err);
+  const msg = redact ? redact(raw) : raw;
   const ctxPrefix = context ? `[${context}] ` : '';
 
   // 4xx (except 429) = config-level, non-retryable
@@ -105,6 +130,33 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
 
   // Everything else (5xx, timeouts, network) = transient
   return carryStatusFields(err, new AITransientError(`${ctxPrefix}${msg}`, err));
+}
+
+/** A provider refusal tied to the prompt, even when the SDK wraps its response. */
+export function providerContentBlockReason(err: unknown): string | undefined {
+  for (let depth = 0; depth < 8 && err != null; depth++) {
+    try {
+      if (typeof err !== 'object') break;
+      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown };
+      if (typeof value.responseBody === 'string' &&
+          (value.statusCode == null || value.statusCode === 200) &&
+          (value.status == null || value.status === 200)) {
+        const body = JSON.parse(value.responseBody);
+        const reason = body?.promptFeedback?.blockReason;
+        if (typeof reason === 'string' && reason.trim()) return reason;
+        const candidate = body?.candidates?.[0];
+        if (['PROHIBITED_CONTENT', 'SAFETY', 'BLOCKLIST', 'SPII'].includes(candidate?.finishReason) &&
+            (!Array.isArray(candidate?.content?.parts) || candidate.content.parts.length === 0)) {
+          return candidate.finishReason;
+        }
+      }
+      err = value.cause;
+    } catch {
+      // Malformed provider bodies and hostile error objects are not content blocks.
+      break;
+    }
+  }
+  return undefined;
 }
 
 /** Whole-run LLM failure classes — see classifyGlobalLlmError. */
@@ -319,4 +371,24 @@ export function createGlobalLlmHaltTracker(): GlobalLlmHaltTracker {
     },
     note: () => lastNote,
   };
+}
+
+/**
+ * Embedding providers whose own documentation says a rejected request is not
+ * billed. Only for these does a permanent request-shaped rejection (HTTP 400,
+ * 413 or 422; never 401/403/429) release its invocation reservation instead of
+ * keeping the maximum debit. Verified per provider:
+ *   - google: "If your request fails with a 400 or 500 error, you won't be
+ *     charged for the tokens used." (ai.google.dev/gemini-api/docs/billing,
+ *     "Am I charged for failed requests?", checked 2026-10-01)
+ * OpenAI, Voyage and the other embedding recipes publish no such statement, so
+ * their rejections keep the debit (token-limit rejections are handled above).
+ */
+const UNBILLED_REJECTION_PROVIDERS: ReadonlySet<string> = new Set(['google']);
+
+export function isUnbilledEmbeddingRejection(recipeId: string, err: unknown): boolean {
+  if (!UNBILLED_REJECTION_PROVIDERS.has(recipeId)) return false;
+  const e = err as { statusCode?: unknown; status?: unknown } | null;
+  const status = typeof e?.statusCode === 'number' ? e.statusCode : typeof e?.status === 'number' ? e.status : undefined;
+  return status === 400 || status === 413 || status === 422;
 }

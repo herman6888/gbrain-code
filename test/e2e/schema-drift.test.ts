@@ -176,7 +176,8 @@ describe.skipIf(skip)('schema drift: PGLite ↔ Postgres post-initSchema parity 
   }, 30_000);
 
   test('post-initSchema schemas are equivalent (modulo allowlist)', () => {
-    const diff = diffSnapshots(pgSnap, pgliteSnap, { allowlistPgOnlyTables: PG_ONLY_TABLES });
+    // F4b planner-stats accounting is PGLite-only by design (Postgres has autovacuum).
+    const diff = diffSnapshots(pgSnap, pgliteSnap, { allowlistPgOnlyTables: PG_ONLY_TABLES, allowlistPgliteOnlyTables: ['planner_stats_deltas', 'planner_stats_state'] });
     if (!isCleanDiff(diff)) {
       throw new Error(`Schema drift detected:\n${formatDiffForFailure(diff)}`);
     }
@@ -269,13 +270,14 @@ describe.skipIf(skip)('schema drift: PGLite ↔ Postgres post-initSchema parity 
         ],
       },
       {
-        // Facts ontology dedup (migration 122): partial unique keyed on the
-        // deterministic value_hash, scoped WHERE dimension IS NOT NULL.
-        name: 'idx_facts_ontology_dedup',
+        // Facts ontology dedup (migration 188): partial unique keyed on the
+        // deterministic value_hash plus the stint's valid_from, scoped
+        // WHERE dimension IS NOT NULL.
+        name: 'idx_facts_ontology_stint_dedup',
         table: 'facts',
         defMust: [
           'create unique index',
-          '(source_id, entity_slug, dimension, value_hash, source_markdown_slug)',
+          '(source_id, entity_slug, dimension, value_hash, source_markdown_slug, valid_from)',
           'where (dimension is not null)',
         ],
       },

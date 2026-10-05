@@ -5,11 +5,24 @@
  * command. The banner runs the full wave checks, not doctor --fast.
  */
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { postUpgradeRecoveryBanner } from '../src/commands/doctor/upgrade-banner.ts';
+import { writeSingleFact } from '../src/core/facts/write-single.ts';
+import { upsertOpenLoop } from '../src/core/loops/loops-store.ts';
 import { managedBrain } from './helpers/managed-brain.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { put, waveBrain } from './helpers/wave-fixture.ts';
+
+/** A CLAUDE_CONFIG_DIR holding one gbrain claude-cli scratch-project transcript (session `sess-self`). */
+function selfCaptureHost(): string {
+  const claude = mkdtempSync(join(tmpdir(), 'gbrain-banner-claude-'));
+  const scratch = join(claude, 'projects', '-tmp-gbrain-claude-cli-cwd-4242');
+  mkdirSync(scratch, { recursive: true });
+  writeFileSync(join(scratch, 'sess-self.jsonl'), '{}\n');
+  return claude;
+}
 
 describe('post-upgrade recovery banner', () => {
   test('a brain with wave findings gets one preview-only [AGENT] banner', async () => {
@@ -33,6 +46,35 @@ describe('post-upgrade recovery banner', () => {
     await managedBrain(async ({ engine, ctx }) => {
       await put(ctx, 'notes/clean', 'Nothing to repair.');
       expect(await postUpgradeRecoveryBanner(engine, 'host')).toEqual([]);
+    });
+  }, 180_000);
+
+  test('captured facts from gbrain\'s own sessions name the captured-facts preview (D14)', async () => {
+    const claude = selfCaptureHost();
+    try {
+      await withEnv({ CLAUDE_CONFIG_DIR: claude }, () => managedBrain(async ({ engine }) => {
+        for (const fact of ['Alice Example prefers Rust for systems work', 'Alice Example ships on Fridays']) {
+          await writeSingleFact(engine, 'default', { fact, entity: 'people/alice-example', provenance: 'hook:writeback', sessionId: 'sess-self' });
+        }
+        const text = (await postUpgradeRecoveryBanner(engine, 'host')).join('\n');
+        expect(text).toContain('[AGENT]   captured_facts_active: 2 (explicit_kind_required; preview with: gbrain repair captured-facts)');
+        expect(text).not.toContain('loop_facts_drift');
+        expect(text).not.toContain('--apply');
+      }));
+    } finally { rmSync(claude, { recursive: true, force: true }); }
+  }, 180_000);
+
+  test('closed loops with an active commitment fact name the loop-facts preview (D14)', async () => {
+    await managedBrain(async ({ engine }) => {
+      const { id: factId } = await writeSingleFact(engine, 'default', { fact: 'Send the deck by Friday', entity: 'people/alice-example', provenance: 'cli:remember' });
+      const { id: loopId } = await upsertOpenLoop(engine, { sourceId: 'default', dedupKey: 'commit:deck', loopType: 'commitment_owed_by_me',
+        summary: 'Send the deck by Friday', evidence: [], threadId: 'example', pageSlug: 'emails/example', detector: 'llm_extract', factId });
+      // What loops_close left before #5869: the loop closed, its fact still active.
+      await engine.executeRaw("UPDATE open_loops SET status='done', closed_at=now(), closed_by='manual' WHERE id=$1", [loopId]);
+      const text = (await postUpgradeRecoveryBanner(engine, 'host')).join('\n');
+      expect(text).toContain('[AGENT]   loop_facts_drift: 1 (explicit_kind_required; preview with: gbrain repair loop-facts)');
+      expect(text).not.toContain('captured_facts_active');
+      expect(text).not.toContain('--apply');
     });
   }, 180_000);
 

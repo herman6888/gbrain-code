@@ -414,6 +414,7 @@ export async function invalidateStaleSignatureEmbeddings(
             SET ${colId} = NULL, embedded_at = NULL
            FROM pages p
           WHERE cc.page_id = p.id
+            AND p.deleted_at IS NULL
             AND p.source_id=ANY(${sources}::text[])
             AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)
             AND cc.${colId} IS NOT NULL

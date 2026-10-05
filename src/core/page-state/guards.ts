@@ -18,6 +18,16 @@ export async function lockPageKeys(engine: Pick<BrainEngine, 'executeRaw'>, keys
     if (!rows.length) throw new Error(`Page source does not exist: ${sourceId}`);
     sources.set(sourceId, rows[0].incarnation);
   }
+  if (ordered.length > 1) {
+    // #5984: many keys in three statements, still created and locked in the sorted key order.
+    const incarnations = ordered.map(key => sources.get(key.sourceId)!), slugs = ordered.map(key => key.slug), sourceIds = ordered.map(key => key.sourceId);
+    await engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) SELECT i,s FROM unnest($1::uuid[],$2::text[]) WITH ORDINALITY AS k(i,s,n) ORDER BY n ON CONFLICT DO NOTHING', [incarnations, slugs]);
+    await engine.executeRaw(`SELECT g.slug FROM unnest($1::uuid[],$2::text[]) WITH ORDINALITY AS k(i,s,n)
+      JOIN page_write_guards g ON g.source_incarnation=k.i AND g.slug=k.s ORDER BY k.n FOR UPDATE OF g`, [incarnations, slugs]);
+    await engine.executeRaw(`SELECT p.id FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS k(src,s,n)
+      JOIN pages p ON p.source_id=k.src AND p.slug=k.s ORDER BY k.n FOR UPDATE OF p`, [sourceIds, slugs]);
+    return;
+  }
   for (const key of ordered) {
     const params = [sources.get(key.sourceId)!, key.slug];
     await engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) VALUES ($1::uuid,$2) ON CONFLICT DO NOTHING', params);

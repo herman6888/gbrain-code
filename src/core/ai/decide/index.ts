@@ -246,6 +246,8 @@ async function runLlm(req: DecideRequest, cfg: DecideConfig, a: RunArgs): Promis
         model, system: LLM_SYSTEM_PROMPT, messages: [{ role: 'user', content: buildLlmPrompt(a.state, questions) }],
         ...(capability === 'structured' ? { responseSchema: LLM_ANSWER_SCHEMA } : {}),
         temperature: 0, abortSignal: signal, purpose: `decide:${req.slot}`, maxTokens: 64 + questions.length * 96,
+        // The egress gate cleared this provider only; a chain hop would send the pack elsewhere.
+        allowFallback: false,
       });
       inputTokens += reply.usage.input_tokens;
       outputTokens += reply.usage.output_tokens;

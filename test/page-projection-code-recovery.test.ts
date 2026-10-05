@@ -9,6 +9,7 @@ import { runReindexCode } from '../src/commands/reindex-code.ts';
 import { readProjectionSnapshot, preparePageProjection, installPageProjection, rebuildPendingPageProjections, queuePageProjection } from '../src/core/page-state/projections.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { testBackends } from './helpers/test-backends.ts';
@@ -207,7 +208,7 @@ test('managed reindex uses a durable guarded receipt without canonical writes or
       const requests = await engine.executeRaw<{ state: string; revision: string }>('SELECT state,outcome->>\'revision\' AS revision FROM persistence_requests WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
       expect(requests).toEqual([{ state: 'committed', revision: before.revision }]);
       expect(await engine.executeRaw('SELECT id FROM persistence_effects WHERE source_id=$1', [sourceId])).toEqual([]);
-      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.softDeletePage(slug, { sourceId })));
+      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.softDeletePage(slug, { sourceId }), TEST_WRITE_ATTRIBUTION));
       expect((await runReindexCode(engine, { sourceId, noEmbed: true, force: true })).failed).toBe(0);
       expect(await engine.getPage(slug, { sourceId })).toBeNull();
     } finally { await disposePersistenceConsumer(engine); await engine.executeRaw('UPDATE persistence_brain SET enabled=false'); }

@@ -167,3 +167,27 @@ test.skipIf(!process.env.DATABASE_URL)('two real PostgreSQL processes with disti
     expect(await pg.engine.executeRaw('SELECT source_id FROM persistence_source_bindings')).toHaveLength(1);
   } finally { release?.(); for (const child of children) if (child.exitCode === null) child.kill(); await holding; await Promise.allSettled(children.map(child => child.exited)); await pg.close(); }
 }, 120_000);
+
+test('the overlap scan tolerates directories a concurrent git gc removes mid-walk', async () => {
+  const root = join(directory, randomUUID()); const objects = join(root, '.git', 'objects');
+  mkdirSync(objects, { recursive: true });
+  const churn = Bun.spawn(['bun', '-e', `
+    const { mkdirSync, rmSync, writeFileSync } = require('node:fs'); const { join } = require('node:path');
+    const end = Date.now() + 3000;
+    while (Date.now() < end) for (let i = 0; i < 64; i++) {
+      const dir = join(${JSON.stringify(objects)}, i.toString(16).padStart(2, '0'));
+      mkdirSync(join(dir, 'pack'), { recursive: true }); writeFileSync(join(dir, 'pack', 'o'), 'x');
+      rmSync(dir, { recursive: true, force: true });
+    }`]);
+  const { assertNoPhysicalRootOverlap } = await import('../src/core/persistence/physical-root-record.ts');
+  const failures: string[] = [];
+  let scans = 0;
+  while (churn.exitCode === null) {
+    try { assertNoPhysicalRootOverlap(root); } catch (error) { failures.push((error as Error).message); }
+    scans++;
+    await delay(0);
+  }
+  expect(await churn.exited).toBe(0);
+  expect(scans).toBeGreaterThan(10);
+  expect(failures).toEqual([]);
+});

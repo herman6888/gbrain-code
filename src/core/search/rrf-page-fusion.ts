@@ -67,6 +67,12 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
         // first saw via a vector list must still read keyword_hit when the
         // keyword arm ALSO surfaced it.
         if (r.keyword_hit === true) existing.keywordHit = true;
+        // A strict appearance in any list outranks the OR-relaxed fallback:
+        // the fused row is relaxed only when every list that held it was.
+        if (existing.result.keyword_relaxed === true && r.keyword_relaxed !== true) {
+          const { keyword_relaxed: _relaxed, ...strict } = existing.result;
+          existing.result = strict;
+        }
       } else {
         chunks.set(key, { result: r, score: 0, own: rrfScore, keywordHit: r.keyword_hit === true });
       }

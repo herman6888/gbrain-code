@@ -40,6 +40,7 @@ const LEDGER: Record<string, string> = {
   restore_page: 'test/pages-source-scoping-4329.test.ts',
   purge_deleted_pages: 'test/operations-trust-boundary.test.ts',
   capture: 'test/capture-op.test.ts',
+  edit_page: 'test/edit-page.test.ts',
   get_write_request: 'test/persistence-receipt-operations.test.ts',
   list_write_requests: 'test/persistence-receipt-operations.test.ts',
   cancel_write_request: 'test/persistence-receipt-operations.test.ts',
@@ -66,6 +67,7 @@ const LEDGER: Record<string, string> = {
   get_health: 'test/doctor-timeline-metric-labels-2298.test.ts',
   run_doctor: 'test/truthful-catalog.e2e-lite.test.ts',
   get_versions: 'test/get-page-federated-scope.test.ts',
+  get_write_attribution: 'test/write-attribution-read.test.ts',
   revert_version: 'test/e2e/mechanical.test.ts',
   get_brain_identity: 'test/get-brain-identity.test.ts',
   quarantine_list: 'test/quarantine-cache-ops.test.ts',
@@ -178,6 +180,7 @@ const LEDGER: Record<string, string> = {
   loops_close: 'test/ops-loops.test.ts',
   loops_mute: 'test/ops-loops.test.ts',
   loops_unmute: 'test/ops-loops.test.ts',
+  mute_notice: 'test/notice-ledger.test.ts',
   // v0.46.28.0+ master-wave ops, mapped at the test-gap-wave master merge.
   fetch: 'test/deep-research-fetch.test.ts',
   get_usage: 'test/chat-usage.test.ts',

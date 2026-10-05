@@ -275,6 +275,8 @@ describe('verifyWorkspace — keyless pass', () => {
       const scan = check(res.checks, 'secret_scan')[0];
       expect(scan.ok).toBe(false);
       expect(scan.detail).toContain('openai');
+      expect(scan.detail).toContain(`allowlist only a reviewed false positive by appending its fingerprint to ${join(ws, '.gbrain-scan-allow')}`);
+      expect(scan.detail).toContain('write-refusals.md#secret-scan-refusals-and-redaction');
       // Redaction discipline: the finding detail NEVER carries the secret value.
       expect(scan.detail).not.toContain('sk-AAAAAAAAAAAAAAAAAAAAAAAA');
 
@@ -354,6 +356,10 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       expect(check.detail).toContain('world');
       expect(check.detail).toContain('facts.default_visibility');
       expect(check.detail).toContain('gbrain config set');
+      // The key governs extraction-path writes only; `remember` hard-defaults
+      // to 'world' — the message must disclose that carve-out (#5605).
+      expect(check.detail).toContain('`remember`');
+      expect(check.detail).toContain('extraction-path');
 
       // Pre-set explicit value survives verify (set-if-unset, never override).
       await e2.setConfig('facts.default_visibility', 'private');
@@ -368,6 +374,7 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       const check2 = res2.checks.find((c) => c.id === 'facts_visibility')!;
       expect(check2.detail).toContain('private');
       expect(check2.detail).toContain('untouched');
+      expect(check2.detail).toContain('`remember`');
     } finally {
       await e2.disconnect();
       rmSync(ws2, { recursive: true, force: true });

@@ -83,10 +83,13 @@ else
   gbrain get "$SLUG" > "$RAW"   # prints the page as markdown with frontmatter
 fi
 
-# 3. Strip YAML frontmatter — sed: skip the opening '---' through the
-#    closing '---' (lines 1..N), then keep everything after.
+# 3. Strip the leading YAML frontmatter block only: line 1 '---' through
+#    the next '---'. A later '---' (a horizontal rule) and a page without
+#    frontmatter are kept as written. Plain awk, so it behaves the same with
+#    BSD (macOS) and GNU tools. Stop if nothing is left to render.
 CLEAN=$(mktemp /tmp/brain-page-clean-XXXXXX.md)
-sed '1{/^---$/!q}; /^---$/,/^---$/d' "$RAW" > "$CLEAN"
+awk 'NR==1 && /^---[[:space:]]*$/ {f=1; next} f==1 && /^---[[:space:]]*$/ {f=2; next} f!=1' "$RAW" > "$CLEAN"
+[ -s "$CLEAN" ] || { echo "brain-pdf: nothing to render for $SLUG after removing frontmatter" >&2; exit 1; }
 
 # 4. Render. NO --cover, NO --toc by default — they look corporate
 #    and waste space. Add them only if explicitly requested.
@@ -148,6 +151,13 @@ After rendering, deliver via the agent's preferred channel:
 Always include the brain page link in the delivery message so the user
 can also see it on GitHub / locally. The PDF is a rendering; the source
 is the artifact.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain get <slug>` fails with `page_not_found`: stop before rendering and resolve the real slug; report the page missing only after a title search.
+- The make-pdf binary is missing: this is a gstack dependency, not a gbrain error. Tell the user to install gstack; do not hand-roll a PDF.
 
 ## Anti-Patterns
 

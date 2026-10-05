@@ -107,6 +107,7 @@ jobs:
             test/persistence-admission-observer.test.ts \
             test/persistence-read-diagnostics.test.ts \
             test/persistence-journal.test.ts \
+            test/persistence-publication-refusal-5974.test.ts \
             test/persistence-staging.test.ts \
             test/persistence-effect-recovery-fairness.test.ts \
             test/import-publication-guards.test.ts \
@@ -149,6 +150,7 @@ jobs:
         run: >-
           bun --no-env-file test --timeout=120000
           test/persistence-reconcile.test.ts
+          test/persistence-reconcile-additive-5974.test.ts
           test/e2e/reconcile-pgbouncer.test.ts
           test/e2e/extract-atoms-page-state.test.ts
       - if: always()
@@ -197,7 +199,7 @@ jobs:
           SOAK_OPERATIONS: ${{ github.event_name == 'pull_request' && '2500' || '10000' }}
         run: >-
           bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
-          --operations="$SOAK_OPERATIONS"
+          --operations="$SOAK_OPERATIONS" --robot-seconds=0
           --manifest=.context/persistence-manifest.json
       - name: Upload executed-case and latency manifest
         if: always()
@@ -205,6 +207,85 @@ jobs:
         with:
           name: persistence-${{ matrix.engine }}-bun-${{ matrix.bun }}
           path: .context/persistence-manifest.json
+          if-no-files-found: error
+
+  # The crash robot runs beside the soak: generated sequences of real operations,
+  # SIGKILL at every crash seam they reach, and process faults, checked by the
+  # reference model. Postgres connects through a transaction-mode PgBouncer.
+  # Pull requests run a 150 s budget (Postgres skips the seams and the pooler
+  # disconnect fault that can wait out a dead owner's claim lease, listed in the
+  # manifest); pushes, schedules and manual runs crash every seam.
+  crash-robot:
+    name: Crash robot / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pglite, postgres]
+        bun: ['1.4.0', '1.4.2']
+        # Pull requests run the primary Bun version; pushes, schedules and
+        # manual runs keep every supported version.
+        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"bun":"1.4.0"}]' || '[]') }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      pgbouncer:
+        image: edoburu/pgbouncer:latest
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: gbrain_test
+          DB_PASSWORD: gbrain_test
+          POOL_MODE: transaction
+          AUTH_TYPE: plain
+          MAX_CLIENT_CONN: '200'
+          DEFAULT_POOL_SIZE: '10'
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
+        ports: ['55433:5432']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - run: bun install --frozen-lockfile --ignore-scripts
+      # The service password reaches every client through PGPASSWORD, so the URLs carry none.
+      - name: Crash every reachable seam of the generated sequences
+        env:
+          PGPASSWORD: gbrain_test
+          DATABASE_URL: postgres://gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test@127.0.0.1:55433/gbrain_test
+          ROBOT_SECONDS: ${{ github.event_name == 'pull_request' && '150' || '600' }}
+        run: >-
+          bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
+          --schedules=0 --operations=0 --no-crashes --robot-seconds="$ROBOT_SECONDS"
+          --manifest=.context/persistence-robot.json
+      - name: Replay every shrunk crash-robot failure and the history fixture
+        timeout-minutes: 10
+        env:
+          PGPASSWORD: gbrain_test
+          DATABASE_URL: postgres://gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+        run: |
+          if [ '${{ matrix.engine }}' = 'postgres' ]; then
+            GBRAIN_TEST_BACKEND=postgres bun --no-env-file test --timeout=300000 test/persistence-history-fixture.test.ts
+          else
+            env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun --no-env-file test --timeout=300000 test/persistence-crash-robot.slow.test.ts test/persistence-history-fixture.test.ts
+          fi
+      - name: Upload the crash-robot manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: persistence-robot-${{ matrix.engine }}-bun-${{ matrix.bun }}
+          path: .context/persistence-robot.json
           if-no-files-found: error
 
   # The reconciliation crash suites run beside the soak instead of after it, so

@@ -71,19 +71,27 @@ describe('pull-request CI scope', () => {
       expect(classify(`README.md\n${path}\n`), path).toBe('primary');
     }
     expect(classify('')).toBe('primary');
+    const large = Array.from({ length: 8000 }, (_, i) => `docs/guides/fixture-${i}-${'x'.repeat(72)}.md`);
+    expect(Buffer.byteLength(large.join('\n'))).toBeGreaterThan(64 * 1024);
+    expect(classify(large.join('\n'))).toBe('smoke');
+    for (const at of [0, large.length >> 1, large.length]) {
+      const files = [...large];
+      files.splice(at, 0, 'src/core/pglite-lock.ts');
+      expect(classify(files.join('\n')), `native marker at ${at}`).toBe('primary');
+    }
   });
 
   test('the planning job runs the full matrix off pull requests and never narrows on an unreadable diff', () => {
     const step = load('test.yml').jobs.changes.steps!.find(entry => entry.id === 'scope')!;
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-ci-scope-'));
     try {
-      const run = (event: string, gh: string) => {
+      const run = (event: string, gh: string, changedFiles = '1') => {
         writeFileSync(join(dir, 'gh'), `#!/usr/bin/env bash\n${gh}\n`);
         chmodSync(join(dir, 'gh'), 0o755);
         const output = join(dir, 'out');
         writeFileSync(output, '');
         const result = spawnSync('bash', ['-c', step.run!], { cwd: root, encoding: 'utf8',
-          env: { PATH: `${dir}:${process.env.PATH}`, EVENT: event, PR: '7', REPO: 'example/repo', GITHUB_OUTPUT: output } });
+          env: { PATH: `${dir}:${process.env.PATH}`, EVENT: event, PR: '7', REPO: 'example/repo', CHANGED_FILES: changedFiles, GITHUB_OUTPUT: output } });
         expect(result.status, result.stderr).toBe(0);
         return readFileSync(output, 'utf8').trim();
       };
@@ -93,6 +101,20 @@ describe('pull-request CI scope', () => {
       expect(run('pull_request', 'exit 1')).toBe('native=primary');
       expect(run('pull_request', "printf 'docs/a.md\\n'")).toBe('native=smoke');
       expect(run('pull_request', "printf 'src/core/pglite-lock.ts\\n'")).toBe('native=primary');
+      for (const count of ['', 'invalid', '3000', '4230', '99999']) {
+        expect(run('pull_request', "printf 'docs/a.md\\n'", count), count).toBe('native=primary');
+      }
+      // Even below the API cap, an incomplete or overlong successful response
+      // is unknown. A complete large docs-only response can still use smoke.
+      expect(run('pull_request', "printf 'docs/a.md\\n'", '2')).toBe('native=primary');
+      expect(run('pull_request', "printf 'docs/a.md\\ndocs/b.md\\n'", '1')).toBe('native=primary');
+      const fixture = join(dir, 'paths');
+      const docs = Array.from({ length: 2999 }, (_, i) => `docs/guides/fixture-${i}-${'x'.repeat(72)}.md`);
+      writeFileSync(fixture, docs.join('\n'));
+      expect(run('pull_request', `cat '${fixture}'`, '2999')).toBe('native=smoke');
+      docs[0] = 'src/core/pglite-lock.ts';
+      writeFileSync(fixture, docs.join('\n'));
+      expect(run('pull_request', `cat '${fixture}'`, '2999')).toBe('native=primary');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -136,7 +158,7 @@ describe('pull-request CI scope', () => {
     expect(/GBRAIN_E2E_BUN_IMAGE:-oven\/bun:([^}]+)\}/.exec(read('tests/docker/bootstrap-e2e.sh'))?.[1]).toBe(primary);
     const matrices = [load('test.yml').jobs['security-regressions'], ...Object.values(load('persistence-validation.yml').jobs)]
       .map(job => job.strategy?.matrix.bun).filter(Boolean);
-    expect(matrices).toHaveLength(5);
+    expect(matrices).toHaveLength(6);
     for (const bun of matrices) expect(bun).toEqual([MINIMUM_BUN_VERSION, primary]);
     for (const job of ['native', 'musl', 'windows-backup-console', 'windows-backup-dotnet']) {
       expect(native[job].strategy!.matrix.bun).toEqual([MINIMUM_BUN_VERSION, primary]);

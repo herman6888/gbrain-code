@@ -13,7 +13,7 @@ import type {
   ParseSessionsOpts,
   TranscriptAdapter,
 } from './types.ts';
-import { TRANSCRIPT_JSONL_HARD_CAP } from './types.ts';
+import { TRANSCRIPT_JSONL_HARD_CAP, utcTimestamp } from './types.ts';
 import { parseClaudeSessionFile, SPEC_TARGET } from './claude-code-jsonl.ts';
 import { basename } from 'node:path';
 import { closeSync, openSync, readSync } from 'node:fs';
@@ -79,6 +79,20 @@ export function isClaudeCodeWorkflowArtifactFile(path: string): boolean {
   const segs = path.split(/[/\\]/);
   const i = segs.lastIndexOf('subagents');
   return i !== -1 && segs[i + 1] === 'workflows' && segs.length > i + 2;
+}
+
+/**
+ * Claude Code Remote Control state files written next to session JSONL
+ * (`<session-uuid>.ccr-tip.json`, `bridge-pointer.json`). They match the
+ * importable `.json` extension but are never transcripts (#5597).
+ */
+const CCR_TIP_SUFFIX = '.ccr-tip.json';
+const CCR_BRIDGE_POINTER = 'bridge-pointer.json';
+
+/** True for Claude Code Remote Control state files (never transcripts). */
+export function isClaudeCodeRemoteControlStateFile(path: string): boolean {
+  const base = path.split(/[/\\]/).pop() ?? '';
+  return base.endsWith(CCR_TIP_SUFFIX) || base === CCR_BRIDGE_POINTER;
 }
 
 /** Keys that mark a Claude Code project transcript. */
@@ -183,12 +197,12 @@ export const claudeCodeAdapter: TranscriptAdapter = {
           harness: 'claude-code',
           sessionId,
           cwd: r.cwd,
-          startedAt: r.startedAt || undefined,
+          startedAt: utcTimestamp(r.startedAt) || undefined,
           raw: { sessionId, cwd: r.cwd ?? null, source_path: path },
         },
         messages: r.turns.map((t) => ({
           role: t.role,
-          timestamp: t.timestamp,
+          timestamp: utcTimestamp(t.timestamp),
           text: t.text,
         })),
       };

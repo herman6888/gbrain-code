@@ -99,7 +99,7 @@
 import { assertLegacySkillWriter } from '../skillpack/writer-guard.ts';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
+import { BudgetExhausted, BudgetTracker, loadPricingOverrides, type NoPricingGuidance } from '../budget/budget-tracker.ts';
 import type { PricingOverrides } from '../budget/reservation-cost.ts';
 import { buildModelsUsed } from '../budget/models-used.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
@@ -372,6 +372,8 @@ export function classifyAbortError(
   outcome: 'aborted' | 'errored';
   abortReason: 'budget_exhausted' | 'runtime_exceeded' | 'sigint' | 'error';
   abortDetail: string;
+  /** A no_pricing abort's lookup-and-register guidance. */
+  pricing?: NoPricingGuidance;
 } {
   const msg = err instanceof Error ? err.message : String(err);
   if (err instanceof BudgetExhausted) {
@@ -379,6 +381,7 @@ export function classifyAbortError(
       outcome: 'aborted',
       abortReason: err.reason === 'runtime' ? 'runtime_exceeded' : 'budget_exhausted',
       abortDetail: msg,
+      ...(err.pricing ? { pricing: err.pricing } : {}),
     };
   } else if (msg.includes(SKILLOPT_RUNTIME_EXCEEDED)) {
     return {
@@ -1044,7 +1047,7 @@ async function runOptimizationLoop(
     // #3516: abort/error detail rides the receipt so --json consumers and the
     // CLI's stderr summary both see WHY, not just that the run died.
     ...(abortReason !== undefined ? { abort_reason: abortReason } : {}),
-    ...(abortDetail !== undefined ? { abort_detail: abortDetail } : {}),
+    ...(abortDetail !== undefined ? { abort_detail: abortDetail, ...(caught?.pricing ? { no_pricing: caught.pricing } : {}) } : {}),
     stop_reason: stopReason,
     ...(tally.reflect_errors.length > 0 ? { reflect_errors: [...tally.reflect_errors] } : {}),
     ...(tally.invalid_edits_dropped > 0 ? { reflect_invalid_edits_dropped: tally.invalid_edits_dropped } : {}),

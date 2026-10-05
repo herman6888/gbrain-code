@@ -69,6 +69,107 @@ use the real consumer, authority checks, kernel locks, coordinator, durable
 files and database transactions. Four writes per producer stay in flight;
 every seventeenth logical write is replayed under the same request ID.
 
+## Crash robot
+
+The crash robot runs generated sequences of real operations against a
+managed brain and checks a reference model after every step, after every
+crash and recovery, and after the final drain. It is a phase of
+`validate.ts` with a time budget (`--robot-seconds`, default 300; `0` skips
+it). Run it alone with:
+
+```sh
+bun --no-env-file scripts/persistence/validate.ts --engine=pglite \
+  --schedules=0 --operations=0 --no-crashes --robot-seconds=300
+```
+
+Every op is a JSON descriptor (`ops.ts`) executed through its registered
+operation handler with a real `OperationContext`: page writes, edits,
+deletes and restores, `remember`/`forget`, takes add and supersede, timeline
+entries, a user commit followed by `sync_brain`, a GitHub connector publish,
+and credential revocation. Actors are the local CLI principal and two remote
+agents, an OAuth client and a legacy access token, authenticated through the
+production token verifier. Two sources share slugs, sit in two durability-
+hardened Git checkouts, and a third source is the connector's.
+
+Each run starts from a fresh datastore. The fixed sequences always run:
+withdrawal followed by a stale republication, overlapping slugs across two
+sources, competing writers on one page, caller-bound replay, an authority
+revoked while effects are pending, and sync plus connector publish racing
+direct writes. A counting pass records every crash seam a sequence reaches
+(`src/core/persistence/fault-points.ts`); the robot then crashes each seam at
+least once: the worker freezes at the seam, the driver SIGKILLs it, and a
+fresh worker checks the state left behind, drains, resubmits the interrupted
+requests with their original request ids and finishes the sequence. Random
+sequences fill the rest of the budget. Process faults run once per engine:
+a stale `index.lock`, a hung `git commit` that holds `index.lock` (it releases
+the lock on SIGTERM, not on SIGKILL), on Postgres every session of the run
+database dropped every 400 ms, and the owner killed right after a
+`facts-absorb` job's extraction commits (deterministic chat and embedding
+stubs); the job then runs again and every absorbed fact must be active
+exactly once.
+
+The reference model (`model.ts`) checks: a committed receipt is visible at
+once and later revisions move only through committed ops; a late receipt
+names a revision the page really had; a refused write never becomes visible;
+a withdrawn fact never returns through recall, `get_page` or the facts table;
+a write never lands in another source; another principal reusing a request
+id never receives the original receipt; takes and facts rows equal their
+page fences; content rows carry write attribution; no orphan rows; every
+request and effect drains (within 20 s on PGLite, whose restarted owner
+releases a dead owner's claims, and within the 2-minute effect lease plus
+margin on Postgres); a fresh write still commits. `lock-order.ts` checks each
+transaction's row locks: worktrees before sources, sources in id order, and
+no exclusive brain-row lock inside a publication.
+
+Postgres runs connect through `GBRAIN_PGBOUNCER_URL` when it is set, with
+prepared statements off. A Postgres run with a budget under 300 s (the
+pull-request run) skips what can wait out a dead owner's claim lease: the
+`effect:*` seams, `consumer:prepared`, the publication seams `prepared`,
+`before_publication` and `after_publication`, and the pooler disconnect
+fault. Full runs crash every seam and run every fault. The manifest's `robot`
+key lists every run (schedule, seed, seam and occurrence or process fault),
+`sequences_x_crash_points`, `lease_bound_seams_skipped`,
+`lease_bound_faults_skipped` and violations with the observed trace;
+`robot_full_gate` is true for a full-budget run with no violations.
+
+A failing run prints two commands. `--replay=<manifest>` re-runs exactly the
+manifest's failing runs. `--shrink=<manifest>` removes ops from the first
+failing run (an op whose producer was removed goes with it) while a
+violation of the same class remains, accepts the result only when it
+reproduces in 3 of 3 reruns, and writes `<manifest>.shrunk.json`. Accepted
+shrunk sequences are checked in under `test/fixtures/crash-robot/` and
+replayed by `test/persistence-crash-robot.slow.test.ts`.
+
+For a local Postgres and PgBouncer replay:
+
+```sh
+docker network create gbrain-robot
+docker run -d --name robot-pg --network gbrain-robot -p 5432:5432 \
+  -e POSTGRES_USER=gbrain_test -e POSTGRES_PASSWORD=gbrain_test -e POSTGRES_DB=gbrain_test \
+  pgvector/pgvector:pg16
+docker run -d --name robot-pgbouncer --network gbrain-robot -p 55433:5432 \
+  -e DB_HOST=robot-pg -e DB_PORT=5432 -e DB_USER=gbrain_test -e DB_PASSWORD=gbrain_test \
+  -e POOL_MODE=transaction -e AUTH_TYPE=plain -e MAX_CLIENT_CONN=200 -e DEFAULT_POOL_SIZE=10 \
+  -e IGNORE_STARTUP_PARAMETERS=extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path \
+  edoburu/pgbouncer:latest
+PGPASSWORD=gbrain_test DATABASE_URL=postgres://gbrain_test@127.0.0.1:5432/gbrain_test \
+  GBRAIN_PGBOUNCER_URL=postgres://gbrain_test@127.0.0.1:55433/gbrain_test \
+  bun --no-env-file scripts/persistence/validate.ts --engine=postgres --replay=<manifest>
+```
+
+`buildHistoryFixture(engine, { pages, seed, sources, worktrees })`
+(`history-fixture.ts`) builds a managed brain with real persistence history
+(up to 10,000 pages) through the same op protocol: committed and queued
+requests, a delayed Git effect, withdrawals, superseded takes, page versions,
+chronicle ledger rows, local writers, an OAuth client and token, and an
+access token with unified grant columns. The engine must be initialized and
+not yet activated, under an isolated `GBRAIN_HOME`.
+
+`would-have-caught.ts` measures the gate against past fixes: for each fix
+frozen in `would-have-caught.json` it reverse-applies the fix's `src/` hunks
+in a scratch worktree and runs the pre-robot gate and the robot phase
+against it, after a HEAD control that must pass.
+
 The default manifest is `.context/persistence-<engine>-manifest.json`. It
 contains the actual completed case counts, crash outcomes, runtime/platform,
 latency distributions (p50/p95/p99/max), concurrent canonical-read checks, throughput, peak resident RSS,

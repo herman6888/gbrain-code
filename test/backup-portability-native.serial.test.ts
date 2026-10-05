@@ -13,6 +13,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { getEmbeddingDimensions } from '../src/core/ai/gateway.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
 import * as privacy from '../src/core/backup/private-path.ts';
 
@@ -169,7 +170,7 @@ beforeAll(async () => {
       await tx.setConfig('sync.repo_path', join(root, 'memory', 'nested'));
       await tx.setConfig('mcp.skills_dir', join(root, 'instructions', 'nested'));
       await tx.setConfig('connectors.chatgpt.auto_sync', 'true');
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     const queue = new MinionQueue(engine);
     await queue.add('subagent', { fixture: 'unfinished' }, {}, { allowProtectedSubmit: true });
     const completed = await queue.add('subagent', { fixture: 'completed' }, {}, { allowProtectedSubmit: true });

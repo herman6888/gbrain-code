@@ -5,7 +5,7 @@
  *   - chat() resolves provider:model strings + aliases
  *   - assertTouchpoint surfaces chat-only providers correctly
  *   - getChatModel() default + override
- *   - chat_fallback_chain plumbing (config plumbing only — chatWithFallback ships in commit 3)
+ *   - chat_fallback_chain plumbing (the fallback loop itself: test/ai/gateway-chat-fallback.test.ts)
  *   - new openai-compat recipes (deepseek, groq, together) parse + resolve
  *   - new ChatTouchpoint shape: supports_subagent_loop, supports_prompt_cache
  *   - mapStopReason via the chat() boundary (mocked client) — refusal / content_filter / tool_calls / end / length

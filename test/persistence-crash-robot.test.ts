@@ -1,0 +1,152 @@
+/**
+ * The crash robot's in-process contracts (scripts/persistence/ops.ts,
+ * generator.ts, model.ts, robot-driver.ts, shrink.ts) and the PGLite release
+ * of claims a dead owner left behind (effect-journal.ts releaseAbandonedClaims).
+ *
+ * Protects: the op-descriptor protocol refuses malformed descriptors; the five
+ * cross-boundary sequences exist and pass the reference model through the real
+ * operation handlers; schedules are a function of their seed; shrinking keeps
+ * dependencies and accepts only a 3/3 reproduction; a PGLite owner releases a
+ * claim last written before it started, and never one written after.
+ * Fails when: a descriptor field stops being validated, a sequence family
+ * disappears or regresses on master, `restrict` keeps an op whose producer was
+ * dropped, or a restarted PGLite owner waits out a dead owner's lease.
+ * Seams: none (the fault hook stays uninstalled); PGLite.
+ */
+import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { descriptor, executeOp, parseDescriptor } from '../scripts/persistence/ops.ts';
+import { crossBoundarySequences, randomSchedule } from '../scripts/persistence/generator.ts';
+import { ROBOT_TOPOLOGY, restrict } from '../scripts/persistence/robot-driver.ts';
+import { shrinkRun } from '../scripts/persistence/shrink.ts';
+import { runSchedule } from '../scripts/persistence/crash-robot.ts';
+import { installLockOrderTrace, lockOrderReport } from '../scripts/persistence/lock-order.ts';
+import { prepareTopology } from '../scripts/persistence/history-fixture.ts';
+import { claimPersistenceEffect, releaseAbandonedClaims } from '../src/core/persistence/effect-journal.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { toAgentError } from '../src/core/agent-output.ts';
+import { dispatchRenderContext, type DispatchOpts } from '../src/mcp/dispatch.ts';
+import { LockUnavailableError } from '../src/core/db-lock.ts';
+
+async function robotBrain<T>(run: (brain: Awaited<ReturnType<typeof prepareTopology>>) => Promise<T>): Promise<T> {
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-test-'));
+  try {
+    return await withEnv({ GBRAIN_HOME: home, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined }, async () => {
+      const { engine, close } = await isolatedSharedSkillsEngine();
+      try { return await run(await prepareTopology(engine, { sources: 2, worktrees: 2, root: join(home, 'checkouts'), prefix: 'robot', connector: true })); }
+      finally { await disposePersistenceConsumer(engine); await close(); }
+    });
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+describe('op-descriptor protocol', () => {
+  test('accepts a well-formed descriptor and refuses every malformed field', () => {
+    const good = descriptor('op-1', 'put_page', 'local', 'robot-0', { slug: 'notes/a', content: 'x' }, { deps: ['op-0'] });
+    expect(parseDescriptor(JSON.parse(JSON.stringify(good)))).toEqual(good);
+    for (const bad of [{ ...good, v: 2 }, { ...good, id: '' }, { ...good, kind: 'drop_table' }, { ...good, actor: '' },
+      { ...good, requestId: 7 }, { ...good, args: [] }, { ...good, deps: [3] }]) {
+      expect(() => parseDescriptor(bad)).toThrow(/op descriptor/);
+    }
+  });
+});
+
+describe('generator', () => {
+  test('the cross-boundary sequences are always generated', () => {
+    expect(crossBoundarySequences(ROBOT_TOPOLOGY).map(s => s.label)).toEqual(['withdrawal_then_stale_publication',
+      'overlapping_slugs_two_sources', 'competing_writers_one_page', 'caller_bound_replay', 'authority_change_pending_effects',
+      'sync_and_connector_race_direct_write']);
+  });
+  test('a random schedule is a function of its seed and covers every write op', () => {
+    expect(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9))).toBe(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9)));
+    expect(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 10))).not.toBe(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9)));
+    const kinds = new Set(Array.from({ length: 40 }, (_, i) => randomSchedule(ROBOT_TOPOLOGY, i).ops.map(d => d.kind)).flat());
+    expect([...kinds].sort()).toEqual(['add_timeline_entry', 'delete_page', 'edit_page', 'forget', 'put_page', 'remember',
+      'restore_page', 'takes_add', 'takes_supersede']);
+  });
+});
+
+describe('shrinking', () => {
+  test('restrict drops an op whose producer was dropped and shrinks groups', () => {
+    const schedule = crossBoundarySequences(ROBOT_TOPOLOGY)[2];
+    const kept = restrict(schedule, new Set(schedule.ops.filter(d => d.id !== 'cw0').map(d => d.id)));
+    expect(kept.ops.map(d => d.id)).toEqual([]);
+    const partial = restrict(schedule, new Set(['cw0', 'cw1', 'cw4']));
+    expect(partial.ops.map(d => d.id)).toEqual(['cw0', 'cw1', 'cw4']);
+    expect(partial.groups).toEqual([]);
+  });
+  test('ddmin finds the minimal reproducing set and requires 3/3', async () => {
+    const failing = { schedule: 'random-1', seed: 1, length: 8, crashed: false, duration_ms: 0,
+      ops: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], violations: [{ class: 'lost_write' as const, detail: 'x' }] };
+    const result = await shrinkRun(failing, async run => ({ violations: run.ops!.includes('c') && run.ops!.includes('f') ? [{ class: 'lost_write' }] : [] }));
+    expect(result.shrunk.ops).toEqual(['c', 'f']);
+    expect(result).toMatchObject({ reproduced: 3, accepted: true });
+    let calls = 0;
+    const flaky = await shrinkRun(failing, async () => ({ violations: ++calls % 2 ? [{ class: 'lost_write' }] : [] }));
+    expect(flaky.accepted).toBe(false);
+  });
+});
+
+describe('reference model on master behavior', () => {
+  test('the cross-boundary sequences hold every invariant through the real handlers', async () => {
+    for (const schedule of crossBoundarySequences(ROBOT_TOPOLOGY)) {
+      const result = await robotBrain(({ world }) => runSchedule(world, schedule));
+      expect({ label: schedule.label, violations: result.violations }).toEqual({ label: schedule.label, violations: [] });
+    }
+  }, 180_000);
+});
+
+describe('lock order', () => {
+  test('real publications keep worktree > sources-by-id order; an inversion is reported', async () => {
+    await robotBrain(async ({ world }) => {
+      installLockOrderTrace();
+      const before = lockOrderReport().violations.length;
+      await runSchedule(world, crossBoundarySequences(ROBOT_TOPOLOGY)[1]);
+      const clean = lockOrderReport();
+      expect(clean.transactions).toBeGreaterThan(10);
+      expect(clean.violations.slice(before)).toEqual([]);
+      await world.engine.transaction(async tx => {
+        await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', ['robot-1']);
+        await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', ['robot-0']);
+        await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', ['00000000-0000-4000-8000-000000000000']);
+      });
+      expect(lockOrderReport().violations.slice(before).map(v => v.rule)).toEqual(['worktrees_before_sources', 'sources_in_id_order']);
+    });
+  }, 120_000);
+});
+
+// TODOS.md "A held sync lock reaches agents as internal_error": fails until the agent rows map the lock errors.
+test.skip('a held sync lock reaches agents as the retryable sync_in_progress code', () => {
+  const envelope = toAgentError(new LockUnavailableError('gbrain-sync:robot-gh'), { transport: 'http', op: 'sync_brain', mutating: true,
+    idempotent: true, outcome: 'unknown', render: dispatchRenderContext({ transport: 'http', remote: true } as DispatchOpts) });
+  expect(envelope.code).toBe('sync_in_progress');
+});
+
+describe('PGLite releases claims a dead owner left behind', () => {
+  test('a claim written before this owner started is released; a newer one is kept', async () => {
+    await robotBrain(async ({ world, checkouts }) => {
+      const engine = world.engine;
+      // A Git effect that failed on a stale index.lock is queued for a later attempt.
+      const lock = join(checkouts[0], '.git', 'index.lock'); writeFileSync(lock, '');
+      const seen = await executeOp(world, descriptor('p', 'put_page', 'local', 'robot-0', { slug: 'notes/claim', content: '---\ntype: note\ntitle: c\n---\n\nBody.\n' }));
+      expect(seen.status).toBe('committed');
+      let effect: { id: string } | undefined;
+      for (let i = 0; i < 200 && !effect; i++) {
+        [effect] = await engine.executeRaw<{ id: string }>("SELECT id::text FROM persistence_effects WHERE kind='git' AND state='queued' AND attempts>0");
+        if (!effect) await Bun.sleep(50);
+      }
+      await disposePersistenceConsumer(engine); rmSync(lock);
+      await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=$1', [effect!.id]); // what retry-effects does
+      const [owner] = await engine.executeRaw<{ host: string }>('SELECT owner_host_id::text AS host FROM persistence_worktrees LIMIT 1');
+      const claimed = await claimPersistenceEffect(engine, owner.host);
+      expect({ id: String(claimed?.id), state: claimed?.state }).toEqual({ id: effect!.id, state: 'running' });
+      expect(await releaseAbandonedClaims(engine, new Date(Date.now() - 60_000))).toBe(0);
+      expect(await releaseAbandonedClaims(engine, new Date(Date.now() + 1_000))).toBe(1);
+      const [row] = await engine.executeRaw<{ state: string; token: string | null }>('SELECT state,execution_token AS token FROM persistence_effects WHERE id=$1', [effect!.id]);
+      expect(row).toEqual({ state: 'queued', token: null });
+    });
+  }, 60_000);
+});

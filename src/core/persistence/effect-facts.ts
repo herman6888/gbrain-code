@@ -7,13 +7,14 @@ import { OperationError } from '../ops/contract.ts';
 import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
+import { derivedExtractionSkip } from './derived-extraction-gate.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
 export type FactsBackstopStatus = { queued: true } | { skipped: string };
 
 export async function authorizeFactsBackstop(engine: BrainEngine, row: WriteRequest, lock = false): Promise<void> {
-  if (row.authority.restrictedNamespace || row.authority.delegated || row.authority.slugPrefixes != null) {
+  if (derivedExtractionSkip(row.authority) === 'slug_bound_client') {
     throw new OperationError('permission_denied', 'A confined writer cannot extract into unnamed entity pages.');
   }
   await authorizeStoredRequest(engine, row, lock);
@@ -30,8 +31,8 @@ export async function authorizeFactsBackstop(engine: BrainEngine, row: WriteRequ
 
 /** Provider availability belongs to the durable job's execution process. */
 export async function prepareFactsBackstop(engine: BrainEngine, row: WriteRequest, page: ParsedPage): Promise<FactsBackstopStatus> {
-  if (row.authority.restrictedNamespace || row.authority.delegated || row.authority.slugPrefixes != null) return { skipped: 'slug_bound_client' };
-  if (row.authority.operations != null && !row.authority.operations.includes('extract_facts')) return { skipped: 'operation_bound_client' };
+  const confined = derivedExtractionSkip(row.authority);
+  if (confined) return { skipped: confined };
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };

@@ -34,6 +34,7 @@ import type { Operation } from '../core/operations.ts';
 import type { GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
+import { opError } from '../core/ops/contract.ts';
 import { BRAIN_TOOL_ALLOWLIST } from '../core/minions/tools/brain-allowlist.ts';
 
 export type McpSurface = 'verbs' | 'starter' | 'full';
@@ -96,6 +97,9 @@ export const STARTER_OPS: ReadonlySet<string> = new Set([
   // starter connect lanes retire the "unknown tool: capture" FAQ, which only
   // works if the starter surface actually lists it.
   'capture',
+  // #5616: the small-change companion of put_page (a direct literal, like
+  // capture, so subagents do not gain a new write tool).
+  'edit_page',
   'get_write_request', 'list_write_requests', 'cancel_write_request',
   'list_skills', 'get_skill', 'list_brain_skillpack', 'get_skill_asset',
   'join_brain', 'sync_brain_skills', 'leave_brain', 'put_skill', 'delete_skill',
@@ -130,12 +134,39 @@ export function parseSurfaceFlag(args: string[]): McpSurface | null {
   if (idx < 0) return null;
   const raw = args[idx + 1];
   if (raw === undefined || raw.startsWith('--')) {
-    throw new Error(`--surface requires a value: verbs | starter | full`);
+    throw opError('invalid_params', `--surface requires a value: verbs | starter | full`, 'Pass --surface verbs, --surface starter or --surface full (default full).');
   }
   if (!isMcpSurface(raw)) {
-    throw new Error(`Unknown --surface "${raw}". Use: verbs (the 7 memory verbs) | starter (the ~20 daily-driver ops) | full (all operations, default)`);
+    throw opError('invalid_params', `Unknown --surface "${raw}". Use: verbs (the 7 memory verbs) | starter (the ~20 daily-driver ops) | full (all operations, default)`,
+      'Pass --surface verbs (the 7 memory verbs), --surface starter (the ~20 daily-driver ops) or --surface full (all operations, default).');
   }
   return raw;
+}
+
+/**
+ * #4768: stdio access ceiling. `--access read-only` intersects the selected
+ * surface with operations that are read-scoped, non-mutating and need no
+ * capability scope, so tools/list, the capabilities resource, skill
+ * resources and dispatch all see one read-only set (`request_tools` is
+ * mutating, so discovery cannot widen it). It denies agent-requested
+ * mutations; owner maintenance (startup migrations, hook IPC banking) is a
+ * separate control. HTTP enforces per-token operation grants instead.
+ */
+export type McpAccess = 'full' | 'read-only';
+
+export function parseAccessFlag(args: string[]): McpAccess {
+  const idx = args.indexOf('--access');
+  if (idx < 0) return 'full';
+  const raw = args[idx + 1];
+  if (raw !== 'full' && raw !== 'read-only') {
+    throw opError('invalid_params', '--access takes read-only or full (default full); see docs/mcp/ADMIN.md#read-only-stdio-serve',
+      'Pass --access read-only or --access full (default full).', { docs: 'docs/mcp/ADMIN.md#read-only-stdio-serve' });
+  }
+  return raw;
+}
+
+export function isReadOnlyOperation(op: Pick<Operation, 'scope' | 'mutating' | 'requiredScopes'>): boolean {
+  return op.scope === 'read' && op.mutating !== true && !op.requiredScopes?.length;
 }
 
 /** Flag > config `mcp_surface` > 'full'. */

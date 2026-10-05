@@ -30,10 +30,11 @@
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
 import { operations, type Operation, type OperationContext } from '../operations.ts';
@@ -43,8 +44,11 @@ import { resolveGbrainHome } from '../gbrain-home.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { runMaintenanceSweep } from '../sweep.ts';
 import { detectCapabilities, renderCapabilityReport, type CapabilityReport } from '../capability.ts';
-import { loadWorkspaceAllowlist, matchesGlob, scanFiles, type SecretFinding } from '../secret-scan.ts';
-import { PUSH_DENY_GLOBS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses } from '../workspace-push.ts';
+import { loadWorkspaceAllowlist, matchesGlob, SCAN_ALLOW_FILENAME, scanFiles, type SecretFinding } from '../secret-scan.ts';
+import {
+  PUSH_DENY_GLOBS, SECRET_SCAN_REFUSAL_DOCS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses,
+} from '../workspace-push.ts';
+import { shellQuote } from '../mcp-registration.ts';
 import { FACTS_DEFAULT_VISIBILITY_KEY } from '../facts/visibility.ts';
 import { byteFloors } from './render.ts';
 import { CLAUDE_HOOK_EVENTS, GBRAIN_HOOK_MARKER_KEY, claudeUserSettingsPath } from './host-specs.ts';
@@ -218,7 +222,10 @@ async function removeProbes(engine: BrainEngine, ws: string, sourceId: string): 
     // must survive verify's cleanup [G13].
     const sql = `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug IN ($2, $3)`;
     const params = [sourceId, VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG];
-    if (managed) await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params)));
+    if (managed) {
+      const attribution = await maintenanceAttribution(engine);
+      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params), attribution));
+    }
     else await engine.executeRaw(sql, params);
   } catch {
     /* facts table may not exist on a pre-migration brain — doctor_green names that */
@@ -345,8 +352,16 @@ function checkSecretScan(ws: string): VerifyCheck {
       workspaceRoot: ws,
     });
     if (findings.length > 0) {
-      const sample = findings.slice(0, 5).map((f) => `${f.file}:${f.line} [${f.pattern}] ${f.fingerprint}`).join('; ');
-      return { id, ok: false, detail: `${findings.length} secret-scan finding(s): ${sample}${findings.length > 5 ? '; …' : ''} — fix, or allowlist a false positive in .gbrain-scan-allow` };
+      const sample = findings.slice(0, 5).map((f) => {
+        const { since } = f as SecretFinding & { since?: string };
+        return `${f.file}:${f.line} [${f.pattern}${since ? ` since gbrain v${since.replace(/^v/, '')}` : ''}] ${f.fingerprint}`;
+      }).join('; ');
+      return {
+        id, ok: false,
+        detail: `${findings.length} secret-scan finding(s): ${sample}${findings.length > 5 ? '; …' : ''} — ` +
+          'remove a real credential first; allowlist only a reviewed false positive by appending its fingerprint to ' +
+          `${shellQuote(resolve(ws, SCAN_ALLOW_FILENAME))} (${SECRET_SCAN_REFUSAL_DOCS})`,
+      };
     }
     return { id, ok: true, detail: `no secrets in ${files.length} ${via === 'git' ? 'tracked' : 'workspace'} file(s)` };
   } catch (e) {
@@ -506,6 +521,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
         ok: true,
         detail:
           `facts default visibility: world (set by bootstrap verify — was unset). ` +
+          `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
           `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} private\` if less-trusted surfaces will read this brain.`,
       };
     }
@@ -514,6 +530,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
       ok: true,
       detail:
         `facts default visibility: ${existing.trim()} (explicit operator value — untouched). ` +
+        `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
         `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} <world|private>\`.`,
     };
   } catch (e) {

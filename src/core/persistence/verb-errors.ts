@@ -2,6 +2,7 @@ import { verbError, OperationError } from '../ops/contract.ts';
 import { isTerminalWriteState, isWriteErrorCode, type WriteErrorCode, type WriteReceipt } from './types.ts';
 import { pendingWriteHint } from './health.ts';
 import { UNBOUND_COLLISION_MESSAGE, UNBOUND_PUBLICATION_MESSAGE } from './unbound-source.ts';
+import { isFrontmatterHoldMessage } from '../markdown.ts';
 
 const FRONTMATTER_SLUG_CONFLICT = /^The frontmatter slug "[^"\n]{1,300}" in [^/"\n][^"\n]{0,1000} conflicts with its path, which expects slug "[^"\n]{1,300}"\. Remove `slug:` or make it match the path\.$/;
 
@@ -10,7 +11,29 @@ export function frontmatterSlugConflictMessage(path: string, found: string, expe
   return `The frontmatter slug "${found}" in ${path} conflicts with its path, which expects slug "${expected}". Remove \`slug:\` or make it match the path.`;
 }
 
+/** #5988: the page's canonical file is held by sync; the code says why gbrain cannot import it. Location-free, so receipts may keep it. */
+const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \([a-z_]+\) (and differs from the page|occupies the canonical page path); the page is read-only for put_page until the file is repaired\.$/;
+
+export function heldFileMessage(kind: 'drift' | 'occupied', code: string): string {
+  return kind === 'drift'
+    ? `The canonical file is held by sync (${code}) and differs from the page; the page is read-only for put_page until the file is repaired.`
+    : `A file held by sync (${code}) occupies the canonical page path; the page is read-only for put_page until the file is repaired.`;
+}
+
+/** The diagnostic of a held-file refusal message (null for any other message); `sourceId` fills the commands when the caller knows it. */
+export function heldFileDiagnostic(message: string | null | undefined, sourceId = '<source>'): { reason: string; message: string; suggestion: string } | null {
+  const held = message ? HELD_FILE.exec(message) : null;
+  if (!held) return null;
+  return { reason: held[1] === 'and differs from the page' ? 'file_database_drift' : 'canonical_path_occupied', message: message!,
+    suggestion: `Sync holds this page's file because gbrain cannot import it; gbrain sources status ${sourceId} names the file, line and key. `
+      + 'The page keeps its last good revision and refuses put_page until the file is repaired, so retrying this write refuses the same way. '
+      + `On the source host, repair the file first (frontmatter holds: preview the fix with gbrain repair frontmatter --source ${sourceId} and apply it; file_too_large: split the file), `
+      + 'then submit the intended write with a new request_id. Neither copy was overwritten.' };
+}
+
 export function writeFailureDiagnostic(code: string, message?: string | null): { reason: string; message: string; suggestion: string } {
+  const held = code === 'source_changed' ? heldFileDiagnostic(message) : null;
+  if (held) return held;
   if (code === 'source_changed') {
     if (message === 'The canonical file contains an uncoordinated local edit.') return {
       reason: 'file_database_drift', message: 'The canonical file and database disagree. Neither copy was overwritten.',
@@ -60,6 +83,8 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
     suggestion: 'Read the current page and review the intended change before submitting a corrected write.' };
   if (code === 'invalid_params' && message && FRONTMATTER_SLUG_CONFLICT.test(message)) return { reason: code, message,
     suggestion: 'Correct the frontmatter in the file and commit the change.' };
+  if (code === 'invalid_params' && isFrontmatterHoldMessage(message)) return { reason: code, message: message!,
+    suggestion: 'Correct the named frontmatter line in the file (one line per key, the whole value quoted) and commit the change.' };
   return { reason: isWriteErrorCode(code) ? code : 'storage_error', message: 'The write did not commit. Inspect its durable request on the source host.',
     suggestion: 'Resolve the reported write failure before starting a corrected attempt.' };
 }

@@ -171,6 +171,16 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
       }
     });
 
+    test('an unrecognized link producer is named in the rejection', async () => {
+      await seed('notes/reference', 'note');
+      await seed('people/target', 'person');
+      const link = { from_slug: 'notes/reference', to_slug: 'people/target', link_type: 'mentions',
+        link_source: 'made-up-producer', from_source_id: sourceId, to_source_id: sourceId };
+      await expect(engine.replaceDerivedLinks(await origin('notes/reference'), [link]))
+        .rejects.toThrow('(got: "made-up-producer", allowed: markdown, wikilink-resolved, frontmatter)');
+      expect(await graph()).toHaveLength(0);
+    });
+
     test('owner replacement removes old derived edges, preserves manual rows, and is replay-safe', async () => {
       await seed('members/alice-example', 'person');
       await seed('members/bob-example', 'person');
@@ -196,7 +206,7 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
       await seed('sessions/weekly', 'meeting', 'See [[choices/choice]].', { attendees: ['members/alice-example'] });
       expect((await reconcileSourceLinks(engine, sourceId, { pack })).ok).toBe(true);
       expect((await graph()).map(row => [row.from_slug, row.to_slug, row.link_type])).toEqual([
-        ['sessions/weekly', 'choices/choice', 'mentions'], ['sessions/weekly', 'members/alice-example', 'attended'],
+        ['members/alice-example', 'sessions/weekly', 'attended'], ['sessions/weekly', 'choices/choice', 'mentions'],
       ]);
     });
 

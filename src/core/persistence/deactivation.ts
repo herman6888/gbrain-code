@@ -27,7 +27,8 @@ import { existsSync, lstatSync, readFileSync, readdirSync, unlinkSync } from 'no
 import { dirname, join, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { configDir } from '../config.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { acquireWorktree, getWorktreeBinding } from './ownership.ts';
 import { existingLocalHostId } from './identity.ts';
 import type { NativeLockHandle } from './native-lock.ts';
@@ -37,7 +38,7 @@ import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from '.
 import { recordTopologyChange } from './topology-receipts.ts';
 import { lockTopologyPrincipal, topologyPrincipal } from './topology-locks.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
-import { readAllSourceHolds } from '../connectors/item-holds-store.ts';
+import { carryHoldsToClassicState, holdCarryBlocked, planHoldCarry, type HoldCarry } from '../connectors/item-holds-store.ts';
 import { PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from './physical-root-record.ts';
 
 export const DEACTIVATE_DOCS = 'docs/architecture/topologies.md#deactivate-runbook';
@@ -68,6 +69,8 @@ export interface DeactivationReport {
   source_bindings: number;
   kept: { skill_bundles_enabled: boolean; writer_protocol_floor: number; writer_protocol_registrations: number };
   blockers: DeactivationBlocker[];
+  /** Held connector items copied (or, on a dry run, to be copied) into each source's classic state file. */
+  carried_holds?: HoldCarry[];
   local_markers?: LocalMarkerReport;
 }
 
@@ -78,7 +81,11 @@ async function readBrain(engine: BrainEngine, lock = false): Promise<BrainRow> {
       (to_jsonb(persistence_brain)->>'skill_bundles_enabled')::boolean AS skill_bundles_enabled,
       (to_jsonb(persistence_brain)->>'writer_protocol_floor')::int AS writer_protocol_floor
     FROM persistence_brain WHERE singleton=1${lock ? ' FOR UPDATE' : ''}`);
-  if (!brain) throw new OperationError('writer_not_initialized', 'Persistence identity is missing.');
+  if (!brain) {
+    throw opError('writer_not_initialized', 'Persistence identity is missing.',
+      'This brain has no persistence identity row, so there is no managed mode to read or deactivate. List the pending migrations that create it and ask the user before applying them.',
+      { fix: { argv: ['gbrain', 'apply-migrations', '--dry-run', '--json'], consent: [], actor: 'agent', why: 'Lists the pending migrations without applying them.', requires_exclusive: false } });
+  }
   return brain;
 }
 
@@ -113,11 +120,20 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
         : e.state === 'failed' ? `gbrain sources writer retry-effects ${e.source_id} --request-id ${e.request_id} --dry-run`
           : 'wait for the owner to drain it, then rerun deactivate' });
   }
-  // Managed connector holds live in the managed checkpoint, which classic mode does not read: a held item outside
-  // the classic backfill window would drop out of retries and coverage warnings, so it is resolved first.
-  for (const source of await readAllSourceHolds(engine)) {
-    blockers.push({ kind: 'connector_holds', id: source.sourceId, source_id: source.sourceId, detail: `${source.held.length} held ${source.kind} item(s)`,
-      exit: `gbrain sources status ${source.sourceId} names each item's error; fix its cause, then gbrain sources retry-held ${source.sourceId} and gbrain sync --source ${source.sourceId} (a successful re-attempt clears the hold)` });
+  // Managed connector holds live in the managed checkpoint, which classic mode does not read. Deactivation copies
+  // them into each source's classic state file; only a source whose holds have nowhere to go blocks it.
+  for (const carry of await planHoldCarry(engine, existingLocalHostId())) {
+    if (!holdCarryBlocked(carry)) continue;
+    const resolve = `gbrain sources status ${carry.source_id} names each item's error; fix its cause, then gbrain sources retry-held ${carry.source_id} and gbrain sync --source ${carry.source_id} (a successful re-attempt clears the hold)`;
+    blockers.push({ kind: 'connector_holds', id: carry.source_id, source_id: carry.source_id,
+      detail: carry.owner_host
+        ? `${carry.items} held item(s) on a worktree owned by host ${carry.owner_host}; deactivate cannot write that host's classic state`
+        : carry.state_file
+          ? `${carry.items} held item(s); the classic state file ${carry.state_file} does not parse (${carry.unreadable})`
+          : `${carry.items} held item(s) and no classic state directory to carry them into`,
+      exit: carry.owner_host
+        ? `run deactivate on host ${carry.owner_host}; or ${resolve}`
+        : carry.state_file ? `move ${carry.state_file} aside, then rerun deactivate; or ${resolve}` : resolve });
   }
   const leases = await engine.executeRaw<{ id: string; holder_host: string; holder_pid: number }>(
     'SELECT id, holder_host, holder_pid FROM gbrain_cycle_locks WHERE ttl_expires_at > now() ORDER BY id');
@@ -164,7 +180,10 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
       ...(opts.dryRun ? {} : { local_markers: await cleanupRetiredManagedMarkers(engine) }) };
   }
   const blockers = await deactivationBlockers(engine);
-  if (opts.dryRun) return { ...base, mode: 'managed', deactivated: false, mode_epoch: Number(brain.mode_epoch), blockers };
+  if (opts.dryRun) {
+    const carried_holds = (await planHoldCarry(engine, existingLocalHostId())).filter(c => c.items > 0 && !holdCarryBlocked(c));
+    return { ...base, mode: 'managed', deactivated: false, mode_epoch: Number(brain.mode_epoch), blockers, carried_holds };
+  }
   if (blockers.length) throw blockedError(blockers);
   const principal = await topologyPrincipal(engine);
   const requestId = opts.requestId ?? randomUUID();
@@ -190,12 +209,18 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
       const current = await readBrain(tx, true);
       await assertWriterAdminState(tx, opts.expectedState);
       await assertWriterAdminUnlocked(tx);
-      if (!current.enabled) throw new OperationError('writer_admin_state_changed', 'The brain was deactivated concurrently.');
+      if (!current.enabled) {
+        throw opError('writer_admin_state_changed', 'The brain was deactivated concurrently.',
+          'Another process already deactivated managed persistence, so this run changed nothing more. Confirm the state in writer status; no further deactivation is needed.',
+          { fix: readFix('Shows whether managed persistence is enabled, read-only.', { argv: ['gbrain', 'sources', 'writer', 'status', '--json'] }) });
+      }
       await tx.executeRaw('SELECT id FROM persistence_worktrees ORDER BY id FOR UPDATE');
       await tx.executeRaw('SELECT id FROM sources ORDER BY id FOR UPDATE');
       await opts.hooks?.afterLocks?.();
       const inside = await deactivationBlockers(tx);
       if (inside.length) throw blockedError(inside);
+      // Written before commit: if the transaction then fails, the brain stays managed and ignores these files.
+      const carried_holds = await carryHoldsToClassicState(tx, hostId);
       const retired = await retiredTopology(tx);
       const [epoch] = await tx.executeRaw<{ mode_epoch: string }>(
         'UPDATE persistence_brain SET enabled=false, mode_epoch=mode_epoch+1 WHERE singleton=1 RETURNING mode_epoch::text');
@@ -210,7 +235,7 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
         incarnation: null, worktrees: retired.worktrees.map(w => w.id) }, outcome);
       await refreshManagedFilesystemRoots(tx, managedFilesystemDatastorePath(engine));
       return { ...base, mode: 'classic' as const, deactivated: true, mode_epoch: Number(epoch.mode_epoch), retired_mode_epoch: Number(current.mode_epoch),
-        retired_worktrees: retired.worktrees, source_bindings: retired.bindings, blockers: [] };
+        retired_worktrees: retired.worktrees, source_bindings: retired.bindings, blockers: [], carried_holds };
     });
   } finally { for (const lock of locks.reverse()) await lock.release(); }
   return { ...report, local_markers: await cleanupRetiredManagedMarkers(engine) };

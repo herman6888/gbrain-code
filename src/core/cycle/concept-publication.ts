@@ -14,6 +14,7 @@ import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence, stripTakesFence } 
 import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
 import { publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { maintenanceAttribution } from '../persistence/attribution.ts';
 
 /** Error code for a concept held because republication could lose canonical material. */
 export const CONCEPT_PRESERVATION_CODE = 'concept_preservation_hold';
@@ -60,8 +61,9 @@ export async function publishManagedConcept(engine: BrainEngine, authority: Main
 
 /** Provenance edges inside a coordinated transaction scoped to the concept's source. */
 export async function addManagedProvenanceLinks(engine: BrainEngine, sourceId: string, links: LinkBatchInput[]): Promise<number> {
+  const attribution = await maintenanceAttribution(engine);
   return engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () =>
-    tx.addLinksBatch(links, { auditSite: 'cycle.synthesize_concepts.provenance' }))); // gbrain-allow-direct-insert: concept-provenance edges derived from the synthesis itself, inside the coordinated transaction
+    tx.addLinksBatch(links, { auditSite: 'cycle.synthesize_concepts.provenance' }), attribution)); // gbrain-allow-direct-insert: concept-provenance edges derived from the synthesis itself, inside the coordinated transaction
 }
 
 /**

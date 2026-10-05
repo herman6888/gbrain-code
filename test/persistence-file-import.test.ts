@@ -19,6 +19,7 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { runImport } from '../src/commands/import.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-file-import-'));
 const engines: BrainEngine[] = [];
@@ -149,7 +150,8 @@ test('managed import refuses cross-source input, symlink targets, skills, malfor
     symlinkSync(other.root, join(f.root, 'escape'));
     await expect(importManagedFile(engine, file, 'escape/note.md', opts)).rejects.toThrow('escapes');
     await expect(importManagedFile(engine, file, 'skills/unsafe.md', opts)).rejects.toThrow('skill');
-    writeFileSync(file, '---\ntitle: invalid: yaml\n---\nBody\n');
+    // #5988: `title: invalid: yaml` now imports by quoting; a mis-indented list cannot be read.
+    writeFileSync(file, '---\ntags:\n  - a\n - b\n---\nBody\n');
     await expect(importManagedFile(engine, file, 'note.md', opts)).rejects.toThrow('Invalid YAML');
     await expect(importManagedFile(engine, file, 'image.png', opts)).rejects.toThrow('GBRAIN_EMBEDDING_MULTIMODAL=true');
     expect(await engine.getPage('note', { sourceId: f.sourceId })).toBeNull();
@@ -195,7 +197,7 @@ test('publication refuses admitted input-byte, canonical-target and page-identit
     if (race === 'page') {
       await engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.putPage(slug, {
         type: 'note', title: 'Concurrent page', compiled_truth: 'Concurrent accepted page must survive.', timeline: '', frontmatter: {}, content_hash: 'concurrent',
-      }, { sourceId: f.sourceId })));
+      }, { sourceId: f.sourceId }), TEST_WRITE_ATTRIBUTION));
     } else writeFileSync(changedPath, 'Concurrent local edit must survive.\n');
     const outcome = await publishMutation(engine, row, prepared, localHostId());
     expect(outcome.state).toBe('conflict');

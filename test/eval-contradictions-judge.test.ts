@@ -21,6 +21,7 @@ import {
   DEFAULT_MAX_PAIR_CHARS,
 } from '../src/core/eval-contradictions/judge.ts';
 import type { ChatOpts, ChatResult } from '../src/core/ai/gateway.ts';
+import { PROMPT_VERSION } from '../src/core/eval-contradictions/types.ts';
 
 function mkResult(text: string, overrides: Partial<ChatResult> = {}): ChatResult {
   return {
@@ -106,6 +107,33 @@ describe('buildJudgePrompt', () => {
       maxPairChars: 1500,
     });
     expect(p).toContain('holder garry');
+  });
+
+  test('N2-3: temporal verdicts need two different times; look-alike names are different entities', () => {
+    const p = buildJudgePrompt({
+      query: 'headcount',
+      a: { slug: 'a', text: 'A', effective_date: '2025-01-16' },
+      b: { slug: 'b', text: 'B', effective_date: '2025-01-16' },
+      maxPairChars: 1500,
+    });
+    expect(p).toContain('The three temporal verdicts need evidence of two');
+    expect(p).toContain('time does not explain the difference');
+    expect(p).toContain('Only claims about the SAME entity can conflict.');
+  });
+
+  test('N2 undated conflicts: the time check comes first, forbids ordering by value, document kind or position, and silence is not a conflict', () => {
+    const p = buildJudgePrompt({
+      query: 'headcount',
+      a: { slug: 'a', text: 'A' },
+      b: { slug: 'b', text: 'B' },
+      maxPairChars: 1500,
+    });
+    expect(p.indexOf('Time check first.')).toBeLessThan(p.indexOf('Use temporal_supersession'));
+    expect(p).toContain('Silence is not a conflict');
+    expect(p).toContain('"Fund A is not leading the round"');
+    expect(p).toContain('Never infer an order from the values themselves');
+    expect(p).toContain('which statement is listed first');
+    expect(PROMPT_VERSION).toBe('4');
   });
 });
 

@@ -125,7 +125,14 @@ function parseFlags(args: string[]): ParsedFlags {
     if (a === '--source') { out.source = args[++i] ?? 'default'; out.sourceExplicit = true; continue; }
     if (a === '--source-id') { out.source = args[++i] ?? ''; out.sourceExplicit = true; continue; }
     if (a.startsWith('--source-id=')) { out.source = a.slice('--source-id='.length); out.sourceExplicit = true; continue; }
-    if (a === '--limit') { out.limit = parseInt(args[++i] ?? '50', 10) || 50; continue; }
+    if (a === '--limit') {
+      const raw = args[++i] ?? '';
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < 1) {
+        process.stderr.write(`Error: --limit must be a positive safe integer (got "${raw}").\n`);
+        process.exit(2);
+      }
+      out.limit = Number(raw); continue;
+    }
     if (a === '--query') { out.query = args[++i] ?? null; continue; }
     if (a === '--budget-tokens') { rawBudget = args[++i]; continue; }
     if (a === '--budget-policy') {
@@ -163,8 +170,10 @@ function parseFlags(args: string[]): ParsedFlags {
   return out;
 }
 
-export function hasRecallBudgetPolicy(args: string[]): boolean {
-  return parseFlags(args).budgetPolicy !== null;
+/** Only `--query`/`--budget-tokens` without --budget-policy runs the recall op in-process; every other form has a thin-client path. */
+export function recallNeedsLocalEngine(args: string[]): boolean {
+  const flags = parseFlags(args);
+  return flags.budgetPolicy === null && (flags.query !== null || flags.budgetTokens !== null);
 }
 
 function parseSinceParam(raw: string): Date | null {
@@ -213,9 +222,17 @@ async function resolveSourceForRecall(
   engine: BrainEngine,
   flagValue: string,
   thinClient: boolean,
+  // #5535: whether --source/--source-id was actually PASSED. parseFlags
+  // defaults flags.source to the literal 'default', so the value alone
+  // cannot distinguish "user asked for the default source" from "user
+  // passed no source flag".
+  sourceExplicit: boolean,
 ): Promise<string> {
   if (thinClient) {
-    if (flagValue !== 'default') return flagValue;
+    // #5535: an explicit `--source default` is a real selector, not an
+    // omitted flag — return the literal id instead of falling through to
+    // GBRAIN_SOURCE / the server's own default.
+    if (sourceExplicit || flagValue !== 'default') return flagValue;
     const env = process.env.GBRAIN_SOURCE;
     if (env && env.length > 0 && SOURCE_ID_RE.test(env)) return env;
     return 'default';
@@ -228,7 +245,10 @@ async function resolveSourceForRecall(
   // empty" behavior so existing tests + scripts keep working while
   // recall still benefits from the env/dotfile resolution chain.
   try {
-    return await resolveSourceId(engine, flagValue !== 'default' ? flagValue : null);
+    // #5535: pass the flag's literal value (including 'default') when it
+    // was explicit so tier 1 of the resolver wins; null only when the flag
+    // was omitted, which keeps the env/dotfile/config-default chain.
+    return await resolveSourceId(engine, sourceExplicit || flagValue !== 'default' ? flagValue : null);
   } catch (e) {
     process.stderr.write(
       `[recall] source not registered: ${flagValue}. Falling back to literal value.\n`,
@@ -288,7 +308,7 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
     );
   }
 
-  const sourceId = await resolveSourceForRecall(engine, flags.source, thinClient);
+  const sourceId = await resolveSourceForRecall(engine, flags.source, thinClient, flags.sourceExplicit);
 
   // MEMORY_VERBS v1 [c4]: the verb params route through the recall OP so the
   // CLI and MCP exercise the same arm (query/budget packing/superset envelope).
@@ -433,7 +453,11 @@ async function runRecallOnce(
     if (resolvedSince) params.since = resolvedSince.toISOString();
     if (flags.grep) params.grep = flags.grep;
     if (flags.pending) params.include_pending = true;
-    if (sourceId !== 'default') params.source_id = sourceId;
+    // #5535: send source_id whenever the selector was explicit — including
+    // an explicit 'default'. Omitting it let the remote server apply ITS
+    // own default (sources.default / GBRAIN_SOURCE server-side), so an
+    // explicit `--source default` silently queried a different source.
+    if (sourceId !== 'default' || flags.sourceExplicit) params.source_id = sourceId;
 
     const raw = await callRemoteTool(cfg!, 'recall', params, { timeoutMs: 30_000 });
     const unpacked = unpackToolResult<{

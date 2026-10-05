@@ -276,7 +276,7 @@ export async function runPhasePatterns(
     };
     const submitOpts: Partial<MinionJobInput> = {
       ...(maintenance ? { idempotency_key: `dream:patterns:${digest({ source: maintenance.writer.sourceIncarnation,
-        authority: maintenance.writer, reflections, model: config.model, output: config.outputSlugPrefix })}` } : {}),
+        authority: maintenance.writer, reflections: withoutSeats(reflections), model: config.model, output: config.outputSlugPrefix })}` } : {}),
       max_stalled: 3,
       timeout_ms: budgets.timeoutMs,
       queue: childQueueName,
@@ -361,7 +361,7 @@ export async function runPhasePatterns(
     throwIfAborted(opts.signal, '[dream] patterns output');
     const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
 
-    await stampPatternOutputs(engine, maintenance, writtenRefs.filter(ref => ref.slug.startsWith(`${config.outputSlugPrefix}/`)), cycleDate, opts.signal);
+    await stampPatternOutputs(engine, maintenance, writtenRefs.filter(ref => ref.slug.startsWith(`${config.outputSlugPrefix}/`)), cycleDate, config.sourceSlugPrefix, sharedSeat(reflections), opts.signal);
     const reverseWriteCount = maintenance ? await verifyMaintenanceOutputs(engine, maintenance, writtenRefs)
       : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
 
@@ -537,6 +537,20 @@ interface ReflectionRef {
   title: string;
   excerpt: string;
   updatedAt: Date;
+  /** #4618: the seat the reflection was synthesized from, when stamped. */
+  seat: string | null;
+}
+
+/** The submission key's reflection identity, unchanged by #4618's seat field
+ * (a seat must never re-key, and so re-pay, a retained patterns child). */
+function withoutSeats(reflections: ReflectionRef[]): Array<Omit<ReflectionRef, 'seat'>> {
+  return reflections.map(({ slug, title, excerpt, updatedAt }) => ({ slug, title, excerpt, updatedAt }));
+}
+
+/** #4618: a pattern credits a seat only when every input reflection shares one. */
+function sharedSeat(reflections: ReflectionRef[]): string | undefined {
+  const seats = new Set(reflections.map(r => r.seat));
+  return seats.size === 1 ? (reflections[0]?.seat ?? undefined) : undefined;
 }
 
 async function gatherReflections(
@@ -549,9 +563,9 @@ async function gatherReflections(
   // Reflections live under the configured source slug prefix (bound as a
   // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix).
   const rows = await engine.executeRaw<{
-    slug: string; title: string | null; compiled_truth: string | null; updated_at: string | Date;
+    slug: string; title: string | null; compiled_truth: string | null; updated_at: string | Date; seat: string | null;
   }>(
-    `SELECT slug, title, compiled_truth, updated_at
+    `SELECT slug, title, compiled_truth, updated_at, frontmatter->>'seat' AS seat
        FROM pages
       WHERE slug LIKE $2
         AND source_id = $3 AND deleted_at IS NULL AND COALESCE(frontmatter->>'visibility','') <> 'private'
@@ -571,6 +585,7 @@ async function gatherReflections(
     // into the minion job's JSONB payload. Use the shared safe truncator so a
     // reflection containing emoji cannot abort the entire patterns phase.
     excerpt: truncateUtf8(r.compiled_truth ?? '', 600),
+    seat: r.seat ?? null,
   }));
 }
 
@@ -615,13 +630,17 @@ When done, briefly list the pattern slugs you wrote/updated in your final messag
  * #5733: pages under the patterns output prefix are dream output and carry the
  * dream_generated identity stamp every dream_generated consumer reads, through
  * the managed maintenance write on a managed brain, before the reverse-write.
+ * #5884: a pattern is derived from reflection pages, not raw material, so it is
+ * stamped raw-trace exempt (doctor raw_provenance) on every run that writes it.
  */
 async function stampPatternOutputs(engine: BrainEngine, maintenance: MaintenanceAuthority | null,
-  refs: Array<{ slug: string; source_id: string }>, cycleDate: string, signal?: AbortSignal): Promise<void> {
-  if (!maintenance) return stampDreamProvenance(engine, refs, cycleDate, signal);
+  refs: Array<{ slug: string; source_id: string }>, cycleDate: string, sourceSlugPrefix: string, seat: string | undefined, signal?: AbortSignal): Promise<void> {
+  const reason = `derived from reflections under ${sourceSlugPrefix}/; raw traces live on the cited reflection pages`;
+  // A pattern earns a seat only while its reflections share one, so a pattern without one drops a seat an earlier run stamped.
+  if (!maintenance) return stampDreamProvenance(engine, refs.map(ref => ({ ...ref, raw_trace_exempt_reason: reason, seat: seat ?? null })), cycleDate, signal);
   for (const ref of refs) {
     throwIfAborted(signal, '[dream] patterns provenance');
-    await stampMaintenancePage(engine, maintenance, ref.slug, cycleDate);
+    await stampMaintenancePage(engine, maintenance, ref.slug, cycleDate, undefined, reason, seat ?? null);
   }
 }
 

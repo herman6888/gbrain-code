@@ -562,15 +562,20 @@ describe('writeTimelineEntryThrough helper', () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'notes/helper-throw';
     await seedPage(slug);
-    const broken = new Proxy(engine, {
+    // The row insert runs on the maintenance transaction's engine, so the fault is injected there too.
+    const failing = <T extends object>(base: T): T => new Proxy(base, {
       get(target, prop, receiver) {
         if (prop === 'addTimelineEntry') {
           return async () => { throw new Error('boom'); };
         }
+        if (prop === 'transaction') {
+          return (fn: (tx: PGLiteEngine) => Promise<unknown>) => (target as PGLiteEngine).transaction(tx => fn(failing(tx as PGLiteEngine)));
+        }
         const v = Reflect.get(target, prop, receiver);
         return typeof v === 'function' ? v.bind(target) : v;
       },
-    }) as unknown as PGLiteEngine;
+    });
+    const broken = failing(engine);
     const out = await writeTimelineEntryThrough(broken, slug, 'default', {
       date: '2026-07-15',
       summary: 'x',

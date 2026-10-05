@@ -1,5 +1,5 @@
 import { expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
@@ -8,13 +8,16 @@ import { runPhaseExtractAtoms, countExtractAtomsBacklog, discoverExtractablePage
 import { disposePersistenceConsumer, waitForWrite } from '../../src/core/persistence/service.ts';
 import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts';
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
+import { isPhysicalRootMetadata } from '../../src/core/persistence/physical-root.ts';
+import { __setMaintenanceWriteWaitForTests } from '../../src/core/persistence/maintenance-wait.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration, type LocalGrant } from '../../src/core/persistence/identity.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { retryManagedAtomBatch } from '../../src/core/persistence/atom-retry.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { withSubmissionAuthority } from '../../src/core/minions/submission-authority.ts';
 import { serializePageToMarkdown } from '../../src/core/markdown.ts';
-import { sha256 } from '../../src/core/persistence/digest.ts';
+import { digest, sha256 } from '../../src/core/persistence/digest.ts';
 import { purgeStaleCheckpoints } from '../../src/core/op-checkpoint.ts';
 import { __setChatTransportForTests } from '../../src/core/ai/gateway.ts';
 import { MinionWorker } from '../../src/core/minions/worker.ts';
@@ -22,12 +25,14 @@ import { registerBuiltinHandlers } from '../../src/commands/jobs.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
 import { withEnv } from './with-env.ts';
 
-export const atomContractCases = ['publication', 'zero_yield', 'revision', 'removal', 'deferred', 'unavailable', 'source_replaced', 'malformed', 'malformed_retry', 'malformed_retry_failure', 'malformed_retry_revision', 'publication_retry', 'pagination', 'transcript', 'transcript_changed'] as const;
+export const atomContractCases = ['publication', 'zero_yield', 'revision', 'removal', 'deferred', 'unavailable', 'source_replaced', 'malformed', 'malformed_retry', 'malformed_retry_failure', 'malformed_retry_revision', 'publication_retry', 'pagination', 'transcript', 'transcript_changed', 'connector', 'connector_claimed'] as const;
 type Case = typeof atomContractCases[number];
 
 export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-atoms-'));
   const sourceId = `atoms-${scenario.replaceAll('_', '-')}`;
+  // The deferred case only needs a pending publish; keep its wait at the pre-#5854 5 s.
+  if (scenario === 'deferred') __setMaintenanceWriteWaitForTests(5_000);
   try {
     await withEnv({ GBRAIN_HOME: home }, async () => {
       await disposePersistenceConsumer(engine);
@@ -51,6 +56,26 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         await registerLocalWriter(engine, 'cli');
         binding = await claimWorktree(engine, sourceId, root);
       }
+      // #5856: a Google source's local_path is the connector's state directory, not a canonical checkout.
+      const connectorDir = scenario.startsWith('connector') ? join(home, 'clones', `${sourceId}-google`) : undefined;
+      // Its content files: the manifest skips the fence and owner markers a registered or claimed root carries.
+      const connectorFiles = (): Record<string, string> => {
+        const files: Record<string, string> = {};
+        const visit = (dir: string, prefix: string) => {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            if (entry.name === '.git' || entry.name === '.gbrain-managed' || isPhysicalRootMetadata(entry.name)) continue;
+            const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+            if (entry.isDirectory()) visit(join(dir, entry.name), rel);
+            else files[rel] = readFileSync(join(dir, entry.name), 'utf8');
+          }
+        };
+        visit(connectorDir!, '');
+        return files;
+      };
+      if (connectorDir) {
+        mkdirSync(connectorDir, { recursive: true });
+        await engine.executeRaw("UPDATE sources SET local_path=$2, config=jsonb_build_object('kind','google') WHERE id=$1", [sourceId, connectorDir]);
+      }
       await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
       if (scenario === 'unavailable') await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding!.worktree_id]);
       let calls = 0;
@@ -70,6 +95,12 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         });
         if (scenario === 'deferred') await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding!.worktree_id]);
         if (scenario === 'transcript_changed') writeFileSync(transcript!, 'Changed while extraction was running.');
+        if (scenario === 'connector_claimed') {
+          // The owner claims the connector source after the atom preflight, before admission.
+          await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+          await claimWorktree(engine, sourceId, connectorDir!);
+          await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        }
         if (scenario === 'publication_retry') {
           const path = join(root!, 'atoms', new Date().toISOString().slice(0, 10));
           mkdirSync(path, { recursive: true });
@@ -114,7 +145,7 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         // its explicit retry leaves the atom input unchanged.
         if (scenario === 'malformed_retry_revision') {
           const before = (await engine.readPageSnapshot(page.slug, { sourceId }))!;
-          await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.addTag(page.slug, 'reviewed', { sourceId })));
+          await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.addTag(page.slug, 'reviewed', { sourceId }), TEST_WRITE_ATTRIBUTION));
           const after = (await engine.readPageSnapshot(page.slug, { sourceId }))!;
           expect(after.revision).not.toBe(before.revision);
           expect(after.page.content_hash).toBe(page.content_hash);
@@ -153,14 +184,24 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         expect(await discoverExtractablePages(engine, sourceId)).toEqual([]);
         return;
       }
-      if (scenario === 'revision' || scenario === 'removal' || scenario === 'source_replaced' || scenario === 'transcript_changed') {
+      if (scenario === 'revision' || scenario === 'removal' || scenario === 'source_replaced' || scenario === 'transcript_changed' || scenario === 'connector_claimed') {
         expect(calls).toBe(1);
         expect(first.status).toBe('warn');
         expect(first.details?.atoms_extracted).toBe(0);
+        if (connectorDir) expect(connectorFiles()).toEqual({});
         expect(await engine.executeRaw("SELECT id FROM pages WHERE source_id=$1 AND type='atom'", [sourceId])).toHaveLength(0);
         expect(await engine.executeRaw("SELECT fingerprint FROM op_checkpoints WHERE op='managed-atoms' AND completed_keys->0->>'sourceId'=$1", [sourceId])).toHaveLength(0);
         if (scenario === 'revision') expect((await engine.getPage(page.slug, { sourceId }))?.compiled_truth).toContain('A concurrent edit.');
         if (scenario === 'removal') expect(await engine.getPage(page.slug, { sourceId })).toBeNull();
+        if (scenario === 'connector_claimed') {
+          // The next run extracts through the new owner instead of replaying the refused database-only batch.
+          await disposePersistenceConsumer(engine);
+          expect((await runPhaseExtractAtoms(engine, opts)).status).toBe('ok');
+          expect(calls).toBe(2);
+          const [atom] = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND type='atom'", [sourceId]);
+          expect(Object.keys(connectorFiles())).toEqual([`${atom.slug}.md`]);
+          expect(await countExtractAtomsBacklog(engine, sourceId)).toBe(0);
+        }
         return;
       }
       if (scenario === 'pagination') {
@@ -210,6 +251,12 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         if (!transcript) expect(await engine.executeRaw('SELECT l.id FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id WHERE f.source_id=$1 AND t.source_id=$1 AND f.slug=$2 AND t.slug=$3', [sourceId, page.slug, atoms[0].slug])).toHaveLength(1);
         if (root) expect(readFileSync(join(root, `${atoms[0].slug}.md`), 'utf8')).toContain('visibility: private');
       }
+      if (connectorDir) {
+        // Database-only, exactly as the connector's own sync publishes: no file lands in its state directory.
+        expect(connectorFiles()).toEqual({});
+        expect(await engine.executeRaw("SELECT DISTINCT authority->>'databaseOnlyReason' AS reason FROM persistence_requests WHERE source_id=$1", [sourceId]))
+          .toEqual([{ reason: 'connector_database' }]);
+      }
       if (scenario !== 'malformed' && !transcript) expect(await countExtractAtomsBacklog(engine, sourceId)).toBe(0);
       expect((await engine.getPage(page.slug, { sourceId }))?.frontmatter).not.toHaveProperty('atoms_scan_hash');
       if (scenario === 'zero_yield' || scenario === 'malformed') {
@@ -221,7 +268,255 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         expect(state).toEqual([{ content_hash: page.content_hash!, fail_count: scenario === 'malformed' ? 1 : 0, tombstoned: scenario === 'zero_yield' }]);
       }
     });
-  } finally { await disposePersistenceConsumer(engine); await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); __setChatTransportForTests(null); rmSync(home, { recursive: true, force: true }); }
+  } finally { __setMaintenanceWriteWaitForTests(null); await disposePersistenceConsumer(engine); await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); __setChatTransportForTests(null); rmSync(home, { recursive: true, force: true }); }
+}
+
+export async function exerciseManagedAtomReconciliation(engine: BrainEngine): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-atom-reconcile-'));
+  const root = join(home, 'repo');
+  const sourceId = 'managed-atom-reconcile';
+  const slug = 'notes/example';
+  try {
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [sourceId, root]);
+      const writeSource = async (revision: number) => {
+        const page = await engine.putPage(slug, { type: 'source', title: 'Example', compiled_truth: `A careful project record at revision ${revision}. `.repeat(40) }, { sourceId });
+        mkdirSync(join(root, 'notes'), { recursive: true });
+        writeFileSync(join(root, `${slug}.md`), serializePageToMarkdown(page, []));
+        return page;
+      };
+      let page = await writeSource(1);
+      await registerLocalWriter(engine, 'cli');
+      await claimWorktree(engine, sourceId, root);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      let titles = ['Patience compounds', 'Hire slowly'];
+      let calls = 0;
+      const chat = async (): Promise<ChatResult> => {
+        calls++;
+        return {
+          text: JSON.stringify(titles.map(title => ({ title, atom_type: 'insight', body: `Body for ${title}.` }))),
+          blocks: [], stopReason: 'end',
+          usage: { input_tokens: 10, output_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic',
+        };
+      };
+      const extract = () => runPhaseExtractAtoms(engine, { sourceId, _transcripts: [],
+        _pages: [{ slug, content: page.compiled_truth, contentHash: page.content_hash! }], _chat: chat });
+      expect((await extract()).status).toBe('ok');
+      const first = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND type='atom' AND deleted_at IS NULL ORDER BY slug", [sourceId]);
+      expect(first).toHaveLength(2);
+      const retired = first.find(atom => atom.slug.includes('/patience-compounds-'))!;
+      for (const atom of first) {
+        const path = join(root, `${atom.slug}.md`);
+        expect(existsSync(path)).toBe(true);
+        rmSync(path);
+      }
+      writeFileSync(join(root, `${retired.slug}.md`), 'Uncoordinated operator content.');
+
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+      page = await writeSource(2);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      titles = ['Patience compounds over years', 'Hire slowly'];
+      const failed = await extract();
+      expect(failed.status).toBe('warn');
+      expect(calls).toBe(2);
+      const completion = (failed.details?.write_requests as Array<{ request_id: string }>).at(-1)!;
+      rmSync(join(root, `${retired.slug}.md`));
+      await disposePersistenceConsumer(engine);
+      expect(await retryManagedAtomBatch(engine, sourceId, completion.request_id, 'reviewed-retirement')).toMatchObject({ status: 'completed', model_rerun: false });
+      expect(calls).toBe(2);
+
+      const second = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND type='atom' AND deleted_at IS NULL ORDER BY slug", [sourceId]);
+      expect(second).toHaveLength(2);
+      for (const atom of second) expect(existsSync(join(root, `${atom.slug}.md`))).toBe(true);
+      expect(second.map(atom => atom.slug)).not.toContain(retired.slug);
+      expect(existsSync(join(root, `${retired.slug}.md`))).toBe(false);
+      expect((await engine.getPage(retired.slug, { sourceId, includeDeleted: true }))?.deleted_at).not.toBeNull();
+    });
+  } finally {
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+export const atomRetirementCases = ['marker_and_republish', 'edit_back', 'user_deleted', 'prefix_pin', 'generation_key_and_purge', 'partial_retry', 'partial_then_revert'] as const;
+
+/** #5770 / ENG-O7: retirement markers, republication of retired slugs, the regeneration generation and its purge exclusion. */
+export async function exerciseManagedAtomRetirement(engine: BrainEngine, scenario: typeof atomRetirementCases[number]): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-atom-retire-'));
+  const root = join(home, 'repo');
+  const sourceId = `atom-retire-${scenario.replaceAll('_', '-')}`;
+  const slug = 'notes/example';
+  const bodies = ['A careful project record at revision one. ', 'A careful project record at revision two. ', 'A careful project record at revision three. ']
+    .map(line => line.repeat(40));
+  const unmanaged = async <T>(fn: () => Promise<T>): Promise<T> => {
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    try { return await fn(); } finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1'); }
+  };
+  const atomsOf = async () => engine.executeRaw<{ slug: string; deleted: boolean; frontmatter: Record<string, unknown> }>(
+    `SELECT slug, deleted_at IS NOT NULL AS deleted, frontmatter FROM pages WHERE source_id=$1 AND type='atom' ORDER BY slug`, [sourceId]);
+  const atom = async (title: string) => (await atomsOf()).find(row => row.slug.includes(`/${title}-`));
+  try {
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+      await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [sourceId, root]);
+      const writeSource = async (body: string) => {
+        const written = await engine.putPage(slug, { type: 'source', title: 'Example', compiled_truth: body }, { sourceId });
+        mkdirSync(join(root, 'notes'), { recursive: true });
+        writeFileSync(join(root, `${slug}.md`), serializePageToMarkdown(written, []));
+        return written;
+      };
+      let page = await writeSource(bodies[0]);
+      await registerLocalWriter(engine, 'cli');
+      await claimWorktree(engine, sourceId, root);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      let titles = ['Patience compounds', 'Hire slowly'];
+      let calls = 0;
+      const chat = async (): Promise<ChatResult> => {
+        calls++;
+        return { text: JSON.stringify(titles.map(title => ({ title, atom_type: 'insight', body: `Body for ${title}.` }))),
+          blocks: [], stopReason: 'end', usage: { input_tokens: 10, output_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'anthropic:claude-haiku-4-5', providerId: 'anthropic' };
+      };
+      const extract = () => runPhaseExtractAtoms(engine, { sourceId, _transcripts: [],
+        _pages: [{ slug, content: page.compiled_truth, contentHash: page.content_hash! }], _chat: chat });
+      const edit = async (body: string, next: string[]) => { page = await unmanaged(() => writeSource(body)); titles = next; };
+      expect((await extract()).status).toBe('ok');
+      const [{ incarnation }] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]);
+      const settledState = async (requestId: string) => {
+        for (let attempt = 0; attempt < 300; attempt++) {
+          const [row] = await engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE request_id=$1::uuid', [requestId]);
+          if (row && !['queued', 'running', 'recovering'].includes(row.state)) return row.state;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        throw new Error(`request ${requestId} did not settle`);
+      };
+      const generation = async () => (await engine.executeRaw<{ generation: string }>(
+        "SELECT completed_keys->0->>'generation' AS generation FROM op_checkpoints WHERE op='managed-atoms-generation' AND fingerprint=$1", [String(page.id)]))[0]?.generation;
+
+      if (scenario === 'marker_and_republish') {
+        await edit(bodies[1], ['Patience compounds over years', 'Hire slowly']);
+        expect((await extract()).status).toBe('ok');
+        const retired = (await atom('patience-compounds'))!;
+        expect(retired.deleted).toBe(true);
+        expect(retired.frontmatter.retired_by).toBe('managed-reextract');
+        expect(Number.isNaN(Date.parse(String(retired.frontmatter.retired_at)))).toBe(false);
+        expect(existsSync(join(root, `${retired.slug}.md`))).toBe(false);
+        await edit(bodies[2], ['Patience compounds', 'Hire slowly']);
+        expect((await extract()).status).toBe('ok');
+        const restored = (await atom('patience-compounds'))!;
+        expect(restored.slug).toBe(retired.slug);
+        expect(restored.deleted).toBe(false);
+        expect(restored.frontmatter).not.toHaveProperty('retired_by');
+        expect(existsSync(join(root, `${restored.slug}.md`))).toBe(true);
+        expect((await atom('patience-compounds-over-years'))?.deleted).toBe(true);
+        expect(calls).toBe(3);
+      }
+
+      if (scenario === 'edit_back') {
+        const first = (await atom('patience-compounds'))!;
+        await edit(bodies[1], ['Patience compounds over years', 'Hire slowly']);
+        expect((await extract()).status).toBe('ok');
+        expect((await atom('patience-compounds'))?.deleted).toBe(true);
+        expect(await generation()).toBe('1');
+        await edit(bodies[0], ['Patience compounds', 'Hire slowly']);
+        expect((await discoverExtractablePages(engine, sourceId)).map(item => item.slug)).toEqual([slug]);
+        expect((await extract()).status).toBe('ok');
+        expect(calls).toBe(3);
+        const back = (await atom('patience-compounds'))!;
+        expect(back).toMatchObject({ slug: first.slug, deleted: false });
+        expect((await atom('patience-compounds-over-years'))?.deleted).toBe(true);
+        expect(await discoverExtractablePages(engine, sourceId)).toEqual([]);
+      }
+
+      if (scenario === 'user_deleted') {
+        const removed = (await atom('patience-compounds'))!;
+        await unmanaged(() => engine.softDeletePage(removed.slug, { sourceId }));
+        await edit(bodies[1], ['Patience compounds', 'Hire slowly']);
+        expect((await extract()).status).not.toBe('ok');
+        const after = (await atom('patience-compounds'))!;
+        expect(after.deleted).toBe(true);
+        expect(after.frontmatter).not.toHaveProperty('retired_by');
+      }
+
+      if (scenario === 'prefix_pin') {
+        const next = await unmanaged(async () => {
+          const written = await writeSource(bodies[1]);
+          for (const [name, hash] of [['legacy-prefix', written.content_hash!.slice(0, 16)], ['legacy-full', written.content_hash!]] as const) {
+            await engine.putPage(`atoms/2026-01-01/${name}`, { type: 'atom', title: name, compiled_truth: `Legacy atom ${name}.`,
+              frontmatter: { source_slug: slug, source_hash: hash } }, { sourceId });
+          }
+          return written;
+        });
+        page = next;
+        titles = ['Patience compounds', 'Hire slowly'];
+        expect((await extract()).status).toBe('ok');
+        expect((await atomsOf()).find(row => row.slug.endsWith('/legacy-prefix'))?.deleted).toBe(false);
+        expect((await atomsOf()).find(row => row.slug.endsWith('/legacy-full'))?.deleted).toBe(true);
+      }
+
+      if (scenario === 'partial_retry') {
+        await edit(bodies[1], ['Patience compounds', 'Queue patiently', 'Hire slowly']);
+        expect((await extract()).status).toBe('ok');
+        const queued = (await atom('queue-patiently'))!;
+        await edit(bodies[2], ['Patience compounds over years', 'Hire slowly']);
+        writeFileSync(join(root, `${queued.slug}.md`), 'Uncoordinated operator content.');
+        const failed = await extract();
+        const completion = (failed.details?.write_requests as Array<{ request_id: string }>).at(-1)!;
+        expect(await settledState(completion.request_id)).not.toBe('committed');
+        expect((await atom('patience-compounds'))).toMatchObject({ deleted: true, frontmatter: { retired_by: 'managed-reextract' } });
+        expect((await atom('queue-patiently'))?.deleted).toBe(false);
+        rmSync(join(root, `${queued.slug}.md`));
+        await disposePersistenceConsumer(engine);
+        expect(await retryManagedAtomBatch(engine, sourceId, completion.request_id, 'reviewed-retirement')).toMatchObject({ status: 'completed', model_rerun: false });
+        expect(await retryManagedAtomBatch(engine, sourceId, completion.request_id, 'reviewed-retirement')).toMatchObject({ status: 'completed', replayed: true, model_rerun: false });
+        expect(calls).toBe(3);
+        expect((await atom('queue-patiently'))).toMatchObject({ deleted: true, frontmatter: { retired_by: 'managed-reextract' } });
+        expect((await atom('patience-compounds'))?.deleted).toBe(true);
+      }
+
+      if (scenario === 'partial_then_revert') {
+        await edit(bodies[1], ['Patience compounds', 'Queue patiently', 'Hire slowly']);
+        expect((await extract()).status).toBe('ok');
+        const queued = (await atom('queue-patiently'))!;
+        await edit(bodies[2], ['Patience compounds over years', 'Hire slowly']);
+        writeFileSync(join(root, `${queued.slug}.md`), 'Uncoordinated operator content.');
+        const failed = await extract();
+        expect(await settledState((failed.details?.write_requests as Array<{ request_id: string }>).at(-1)!.request_id)).not.toBe('committed');
+        expect((await atom('patience-compounds'))?.deleted).toBe(true);
+        rmSync(join(root, `${queued.slug}.md`));
+        await disposePersistenceConsumer(engine);
+        await extract();
+        expect(calls).toBe(3);
+        await edit(bodies[1], ['Patience compounds', 'Queue patiently', 'Hire slowly']);
+        expect((await discoverExtractablePages(engine, sourceId)).map(item => item.slug)).toEqual([slug]);
+        expect((await extract()).status).toBe('ok');
+        expect(calls).toBe(4);
+        expect((await atom('patience-compounds'))?.deleted).toBe(false);
+        expect((await atom('patience-compounds-over-years'))?.deleted).toBe(true);
+      }
+
+      if (scenario === 'generation_key_and_purge') {
+        const legacyKey = digest(['managed-atoms-v1', incarnation, 'page', slug, page.id, page.content_hash]);
+        expect((await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-atoms' AND fingerprint=$1", [legacyKey]))).toHaveLength(1);
+        expect(await generation()).toBeUndefined();
+        await edit(bodies[1], ['Patience compounds over years', 'Hire slowly']);
+        expect((await extract()).status).toBe('ok');
+        expect(await generation()).toBe('1');
+        await engine.executeRaw("UPDATE op_checkpoints SET updated_at=now() - interval '30 days' WHERE op IN ('managed-atoms-generation','managed-atoms')");
+        await purgeStaleCheckpoints(engine, 7);
+        expect(await generation()).toBe('1');
+      }
+    });
+  } finally {
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 export const atomBatchCases = ['partial_publication', 'missing_after_provenance', 'changed_after_provenance', 'completion_rollback'] as const;
@@ -284,7 +579,7 @@ export async function exerciseManagedAtomBatch(engine: BrainEngine, scenario: ty
                   const atom = (await tx.getPage(slugs[1], { sourceId }))!;
                   await tx.putPage(slugs[1], { ...atom, compiled_truth: `${atom.compiled_truth}\nAn independent correction.` }, { sourceId });
                 }
-              }));
+              }, TEST_WRITE_ATTRIBUTION));
             }
             return result;
           };
@@ -360,7 +655,7 @@ export async function exerciseManagedAtomBatch(engine: BrainEngine, scenario: ty
   }
 }
 
-export const atomAuthorityCases = ['remote_job', 'stdio', 'missing_source', 'archived_source', 'missing_owner', 'inactive_owner', 'foreign_owner', 'revoked_writer', 'source_grant', 'read_only_grant', 'operation_grant', 'slug_grant'] as const;
+export const atomAuthorityCases = ['remote_job', 'stdio', 'missing_source', 'archived_source', 'missing_owner', 'inactive_owner', 'foreign_owner', 'revoked_writer', 'source_grant', 'read_only_grant', 'operation_grant', 'delete_operation_grant', 'slug_grant'] as const;
 
 export async function exerciseManagedAtomAuthority(engine: BrainEngine, scenario: typeof atomAuthorityCases[number]): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-atom-authority-'));
@@ -372,7 +667,7 @@ export async function exerciseManagedAtomAuthority(engine: BrainEngine, scenario
       await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
       await engine.putPage('notes/example', { type: 'source', title: 'Example', compiled_truth: 'A project record. '.repeat(40) }, { sourceId });
       const page = (await engine.getPage('notes/example', { sourceId }))!;
-      const grant: LocalGrant = { sourceIds: scenario === 'source_grant' ? ['another-source'] : ['*'], operations: scenario === 'operation_grant' ? ['submit_job'] : null,
+      const grant: LocalGrant = { sourceIds: scenario === 'source_grant' ? ['another-source'] : ['*'], operations: scenario === 'operation_grant' ? ['submit_job'] : scenario === 'delete_operation_grant' ? ['submit_job', 'put_page'] : null,
         scopes: scenario === 'read_only_grant' ? ['read'] : ['read', 'write'], slugPrefixes: scenario === 'slug_grant' ? ['atoms/'] : null };
       const registration = await registerLocalWriter(engine, scenario === 'stdio' ? 'stdio' : 'cli', grant);
       if (scenario.endsWith('_owner')) {

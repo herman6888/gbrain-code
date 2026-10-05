@@ -47,6 +47,10 @@ import type { GBrainConfig } from '../config.ts';
 import { isAvailable } from '../ai/gateway.ts';
 import { withAIInvocationPreflight } from '../ai/invocation-guard.ts';
 import { decideSingleFact } from './single-prepare.ts';
+import { cosineVerdict, dedupCapturedFacts, withCaptureDrops } from './capture-dedup.ts';
+import { appendContextNote, type InferredVia } from './subject-infer.ts';
+import { inferenceNote, inferMissingSubjects } from './subject-infer-write.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /**
  * Notability-filter vocabulary shared by the durable facts-absorb payload
@@ -71,10 +75,12 @@ export function coerceNotabilityFilter(v: unknown): FactNotabilityFilter {
 function annotateUnverifiedResolution(
   context: string | null,
   resolutionSource: ResolutionSource | null,
+  inferred?: InferredVia,
 ): string | null {
+  // #5836: a write-time inferred subject says so, in the DB row and the fence cell alike.
+  if (inferred) return appendContextNote(context, inferenceNote(inferred));
   if (resolutionSource !== 'prefix_expansion') return context;
-  const note = 'entity matched by bare name only (prefix expansion) — unverified, please confirm';
-  return context ? `${context} — ${note}` : note;
+  return appendContextNote(context, 'entity matched by bare name only (prefix expansion) — unverified, please confirm');
 }
 
 export interface FactsBackstopCtx {
@@ -97,8 +103,10 @@ export interface FactsBackstopCtx {
    *   - 'code_import'        — code import path
    *   - 'hook:compact'       — compaction-boundary checkpoint harvest (cathedral 5)
    *   - 'hook:writeback'     — ambient-writeback Stop-hook backstop (WP4)
+   *   - 'sweep:corpus'       — the sweep's session-corpus pass
+   * The last three are capture lanes (capture-dedup.ts, #5888).
    */
-  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact' | 'hook:writeback';
+  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact' | 'hook:writeback' | 'sweep:corpus';
   /** Execution mode — D8. Default 'queue' (fire-and-forget). */
   mode?: 'queue' | 'inline';
   /** Notability filter — D4. Default 'all'; sync uses 'high-only'; the
@@ -126,6 +134,8 @@ export interface FactsBackstopCtx {
    * context_pack / delta projections surface the provenance.
    */
   sourceSlug?: string;
+  /** #5888: when the source turn happened, for the capture-lane dedup window (default: now). */
+  turnAt?: Date;
 }
 
 /** Discriminated return shape based on FactsBackstopCtx.mode. */
@@ -154,14 +164,6 @@ interface ParsedPageInput {
   compiled_truth: string;
   frontmatter: Record<string, unknown>;
 }
-
-/**
- * Cosine similarity threshold for the dedup fast-path. Matches the existing
- * extract_facts op behavior at operations.ts:2460. Higher = stricter
- * dedup (more rows kept distinct); lower = looser (more rows treated as
- * duplicates of older ones).
- */
-const DEDUP_THRESHOLD = 0.95;
 
 /** k for findCandidateDuplicates — ceiling on candidates considered. */
 const DEDUP_CANDIDATE_LIMIT = 5;
@@ -649,18 +651,18 @@ async function runPipelineBodyInner(
     return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [], skipped_reason: outcome.reason };
   }
 
-  const facts = outcome.facts;
-
   // [ENG-8] Explicit ctx.visibility wins; unset resolves the operator-set
   // facts.default_visibility (fail-closed to 'private').
   const { resolveDefaultVisibility } = await import('./visibility.ts');
   const visibility = ctx.visibility ?? (await resolveDefaultVisibility(ctx.engine));
-  if (managed) return publishManagedFacts(ctx.engine, managed, ctx, facts, visibility, input.pageSlug);
+  // #5888: one exact-duplicate check for the capture lanes, before either writer.
+  const { facts, dropped } = await dedupCapturedFacts(ctx, await inferMissingSubjects(ctx, outcome.facts, visibility, input.pageSlug, managed), visibility, resolveEntitySlugWithSource);
+  if (managed) return withCaptureDrops(dropped, facts.length || !dropped.length ? await publishManagedFacts(ctx.engine, managed, ctx, facts, visibility, input.pageSlug) : null);
 
   let inserted = 0;
-  let duplicate = 0;
+  let duplicate = dropped.length;
   let superseded = 0;
-  const fact_ids: number[] = [];
+  const fact_ids: number[] = [...dropped];
   // Cathedral 5: slugs whose fence-write actually inserted a fact this run.
   const fencedSlugs = new Set<string>();
 
@@ -692,25 +694,24 @@ async function runPipelineBodyInner(
 
     // Dedup against DB candidates (correct per Codex Q7: fence rows
     // have no embeddings; FS lock + sync invariant means DB == fence
-    // at write time). Threshold 0.95 unchanged.
+    // at write time). cosineVerdict: 0.95 for explicit lanes; capture lanes never drop by cosine (#5888).
     const exact = resolvedSlug ? await decideSingleFact(ctx.engine, ctx.sourceId, { entity_slug: resolvedSlug, fact: f.fact, kind: f.kind ?? 'fact', visibility }, null) : null;
     let matchedExistingId: number | null = exact?.candidate?.id ?? null;
-    if (matchedExistingId === null && resolvedSlug && f.embedding) {
+    if (matchedExistingId === null && resolvedSlug && f.embedding && !f.entity_inferred) {
       const candidates = await ctx.engine.findCandidateDuplicates(
         ctx.sourceId,
         resolvedSlug,
         f.fact,
         { embedding: f.embedding, embeddingModel: f.embedding_model, k: DEDUP_CANDIDATE_LIMIT },
       );
-      let topId: number | null = null;
-      let topScore = -1;
+      let top: { id: number; score: number; fact: string } | null = null;
       for (const c of candidates) {
         if (!c.embedding) continue;
         const s = cosineSimilarity(f.embedding, c.embedding);
-        if (s > topScore) { topScore = s; topId = c.id; }
+        if (!top || s > top.score) top = { id: c.id, score: s, fact: c.fact };
       }
-      if (topId !== null && topScore >= DEDUP_THRESHOLD) {
-        matchedExistingId = topId;
+      if (top && cosineVerdict(ctx.source, top.score, f.fact, top.fact) === 'duplicate') {
+        matchedExistingId = top.id;
       }
     }
 
@@ -791,9 +792,9 @@ async function runPipelineBodyInner(
       // DB-only row has no fence to name the page it came from, so the page
       // path's slug fills context when the caller passed no sourceSlug.
       valid_from: f.valid_from ?? ctx.validFrom,
-      context: annotateUnverifiedResolution(ctx.sourceSlug ?? input.pageSlug ?? null, resolutionSource),
+      context: annotateUnverifiedResolution(ctx.sourceSlug ?? input.pageSlug ?? null, resolutionSource, f.entity_inferred),
     };
-    const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
+    const result = await maintenanceTransaction(ctx.engine, tx => tx.insertFact(newFact, { source_id: ctx.sourceId })); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
     fact_ids.push(result.id);
     if (result.status === 'inserted') inserted += 1;
     else if ((result.status as FactInsertStatus) === 'duplicate') duplicate += 1;
@@ -819,7 +820,7 @@ async function runPipelineBodyInner(
       source: f.source,
       // #4206: the caller's source_slug (which page/transcript the turn came
       // from) lands in the fence context cell — visible in recall projections.
-      context: annotateUnverifiedResolution(ctx.sourceSlug ?? null, resolutionSource),
+      context: annotateUnverifiedResolution(ctx.sourceSlug ?? null, resolutionSource, f.entity_inferred),
       visibility,
       confidence: f.confidence,
       // #4206: extractor-derived date wins; then the caller's event time
@@ -868,7 +869,7 @@ async function runPipelineBodyInner(
         const newFact: NewFact = {
           fact: f.fact,
           kind: f.kind,
-          entity_slug: slug,
+          entity_slug: f.entity_inferred ? null : slug,
           visibility,
           notability: f.notability,
           source: f.source,
@@ -880,7 +881,7 @@ async function runPipelineBodyInner(
           valid_from: f.valid_from ?? ctx.validFrom,
           context: ctx.sourceSlug ?? input.pageSlug ?? null,
         };
-        const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: stub-guard / unresolvable-target fallback for unprefixed or fallback-resolved entity slugs (no fenceable page or usable tree)
+        const legacyResult = await maintenanceTransaction(ctx.engine, tx => tx.insertFact(newFact, { source_id: ctx.sourceId })); // gbrain-allow-direct-insert: stub-guard / unresolvable-target fallback for unprefixed or fallback-resolved entity slugs (no fenceable page or usable tree)
         fact_ids.push(legacyResult.id);
         if (legacyResult.status === 'inserted') inserted += 1;
         else if ((legacyResult.status as FactInsertStatus) === 'duplicate') duplicate += 1;
@@ -901,7 +902,7 @@ async function runPipelineBodyInner(
         const newFact: NewFact = {
           fact: f.fact,
           kind: f.kind,
-          entity_slug: slug,
+          entity_slug: f.entity_inferred ? null : slug,
           visibility,
           notability: f.notability,
           source: f.source,
@@ -913,7 +914,7 @@ async function runPipelineBodyInner(
           valid_from: f.valid_from ?? ctx.validFrom,
           context: ctx.sourceSlug ?? input.pageSlug ?? null,
         };
-        const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: DB-only fallback when the fence lane declined the write (write_through opt-out race / localPath echo)
+        const legacyResult = await maintenanceTransaction(ctx.engine, tx => tx.insertFact(newFact, { source_id: ctx.sourceId })); // gbrain-allow-direct-insert: DB-only fallback when the fence lane declined the write (write_through opt-out race / localPath echo)
         fact_ids.push(legacyResult.id);
         if (legacyResult.status === 'inserted') inserted += 1;
         else if ((legacyResult.status as FactInsertStatus) === 'duplicate') duplicate += 1;

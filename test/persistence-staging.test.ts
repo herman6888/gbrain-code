@@ -15,6 +15,7 @@ import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, claimNextWrite, completeWrite, clearResolvedRecovery, getWriteRequestById, prepareRecovery } from '../src/core/persistence/journal.ts';
 import { publishMutation, recoverPublication } from '../src/core/persistence/coordinator.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { reserveEffectRecovery, recoverEffectPublication } from '../src/core/persistence/effect-recovery.ts';
 import type { EffectRecovery, PersistenceEffect } from '../src/core/persistence/effect-model.ts';
 import { recoveryStagingFile } from '../src/core/persistence/staging.ts';
@@ -250,7 +251,7 @@ test('withdrawal mirror staging preserves unexpected bytes and only finishes for
   for (const cases of fixtures) {
     const f = cases[5]; const { row } = await accepted(f);
     await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.putPage('page',
-      { type: 'note', title: 'Withdrawn example', compiled_truth: 'Current sanitized content.', frontmatter: {} }, { sourceId: f.sourceId })));
+      { type: 'note', title: 'Withdrawn example', compiled_truth: 'Current sanitized content.', frontmatter: {} }, { sourceId: f.sourceId }), TEST_WRITE_ATTRIBUTION));
     const snapshot = (await f.engine.readPageSnapshot('page', { sourceId: f.sourceId }))!;
     await f.engine.transaction(tx => completeWrite(tx, row, 'committed', { revision: snapshot.revision }));
     const [effect] = await f.engine.executeRaw<PersistenceEffect>(`INSERT INTO persistence_effects

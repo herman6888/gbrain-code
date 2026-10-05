@@ -31,6 +31,12 @@ export const E2E_EXCLUSIONS = new Set([
   'test/e2e/skills.test.ts',
   'test/e2e/voyage-rerank-live.test.ts',
   'test/e2e/voyage-multimodal.test.ts',
+  // Engine graduation: run once by tier1's graduation step (direct Postgres + PgBouncer).
+  'test/e2e/graduation-cli.test.ts',
+  'test/e2e/graduation-clients.test.ts',
+  'test/e2e/graduation-crash.test.ts',
+  'test/e2e/graduation-faults.test.ts',
+  'test/e2e/graduation-legacy-copy.test.ts',
   ...PERSISTENCE_VALIDATION_OWNED,
 ]);
 export interface E2ERow { shard: number; files: string[]; empty: boolean }

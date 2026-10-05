@@ -143,6 +143,8 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'grade_takes',                // v0.36.1.0
   'calibration_profile',        // v0.36.1.0
   'drift',                       // #2653 — drift detection (default OFF, report-only)
+  'chronicle',                   // #5876 — Life Chronicle events (default ON)
+  'facts_drain',                 // GBRA-40 Lane D — automatic facts drain (PGLite)
   'conversation_facts_backfill', // v0.41.11.0 — opt-in conversation backfill
   'enrich_thin',                 // v0.41.39 (#1700) — brain-internal stub enrichment (default OFF)
   'skillopt',                    // v0.42.0.0 — self-evolving skills (default OFF)

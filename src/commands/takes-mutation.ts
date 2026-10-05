@@ -7,6 +7,7 @@ import { isThinClient, loadConfig, type GBrainConfig } from '../core/config.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { parseMutationPrecondition } from '../core/persistence/preconditions.ts';
 import { isWriteReceipt } from '../core/persistence/types.ts';
+import { currentCliWriteWait } from '../core/persistence/write-wait.ts';
 import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
@@ -87,7 +88,7 @@ export async function runTakesMutation(engine: BrainEngine | (() => Promise<Brai
     if (isThinClient(config)) {
       if (args.some(arg => arg === '--outcome' || arg.startsWith('--outcome='))) console.error('[deprecated] --outcome is the v0.28 alias for --quality. Prefer --quality correct|incorrect|partial in new scripts.');
       if (cli.brain || parsed.sourceId || params.local_dir !== undefined) throw invalid('--brain, --source-id, and --dir require a local brain host; the remote credential selects its source.');
-      result = unpackToolResult(await callRemoteTool(config!, operation, params, { timeoutMs: cli.timeoutMs ?? 30_000 }));
+      result = unpackToolResult(await callRemoteTool(config!, operation, params, { timeoutMs: cli.timeoutMs ?? 30_000, writeWaitMs: currentCliWriteWait().waitMs }));
     } else {
       const delegated = await maybeDelegateLocalOperation(operation, params, config, {
         brain: cli.brain, source: parsed.sourceId ?? null, timeoutMs: cli.timeoutMs ?? undefined,
@@ -98,7 +99,7 @@ export async function runTakesMutation(engine: BrainEngine | (() => Promise<Brai
         const { operations } = await import('../core/operations.ts');
         const op = operations.find(candidate => candidate.name === operation)!;
         result = await op.handler({ engine: connected, config: config ?? { engine: 'pglite' }, remote: false,
-          sourceId: await resolveSourceId(connected, parsed.sourceId ?? null), dryRun: false,
+          sourceId: await resolveSourceId(connected, parsed.sourceId ?? null), dryRun: false, writeWaitMs: currentCliWriteWait().waitMs,
           logger: { info: message => console.error(message), warn: message => console.error(message), error: message => console.error(message) },
         }, params) as Record<string, unknown>;
       }

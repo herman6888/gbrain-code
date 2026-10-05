@@ -276,6 +276,52 @@ uncommitted edits included; see "Ubicloud fan-out" in
 Fail-closed selector: an unmapped `src/` change runs ALL E2E files. Hand-tune
 narrower mappings via `scripts/e2e-test-map.ts`.
 
+### Local graduation smoke (PGLite → Postgres)
+
+A five-minute end-to-end check of `gbrain migrate --to postgres` on the E2E
+container conventions from [`docs/TESTING.md`](docs/TESTING.md) (pinned
+`pgvector/pgvector:pg16`, a database name carrying "test", tear down when done).
+It uses its own container name and port so it never touches `gbrain-test-pg`,
+and an isolated `GBRAIN_HOME` so it never touches your brain. Unset
+`DATABASE_URL` and `GBRAIN_DATABASE_URL` first: the plan lists either one as a
+blocker when it points anywhere but the target.
+
+```bash
+# 1. Target database
+docker run -d --name gbrain-graduation-pg \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=gbrain_graduation_test \
+  -p 5436:5432 pgvector/pgvector:pg16
+until docker exec gbrain-graduation-pg pg_isready -U postgres; do sleep 1; done
+
+# 2. Source brain with write history, in a throwaway home
+export GBRAIN_HOME="$(mktemp -d)"
+bun run src/cli.ts init --pglite --no-embedding
+echo "Alice Example runs the acme-example pilot." | bun run src/cli.ts put people/alice-example
+
+# 3. Plan (exit 3, nothing changes), then run with the plan hash
+export GBRAIN_TARGET_URL=postgresql://postgres:postgres@localhost:5436/gbrain_graduation_test
+bun run src/cli.ts migrate --to postgres --url-env GBRAIN_TARGET_URL --json > plan.json; echo "exit $?"
+bun run src/cli.ts migrate --to postgres --url-env GBRAIN_TARGET_URL --yes --expect "$(jq -r .plan_hash plan.json)"
+
+# 4. The brain answers from Postgres
+bun run src/cli.ts doctor --no-migrate --json
+bun run src/cli.ts get people/alice-example
+bun run src/cli.ts migrate --status --json
+
+# 5. Clean up (always, pass or fail)
+docker rm -f gbrain-graduation-pg
+rm -rf "$GBRAIN_HOME" plan.json
+unset GBRAIN_HOME GBRAIN_TARGET_URL
+```
+
+Expected: step 3 prints `exit 3` and then a run that ends with the target's
+doctor result, `get` returns the page, and `ls "$GBRAIN_HOME/.gbrain"` before
+cleanup shows `brain.pglite` as a tombstone file next to the retained
+`brain.pglite.graduated-<run_id>` copy. For rollback,
+run `bun run src/cli.ts migrate --rollback-to-source` before step 5 and check
+that `get` answers from PGLite again.
+
 ### PR-side security checks
 
 Besides the test gate, PRs may trigger three security workflows: Semgrep CE

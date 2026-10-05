@@ -431,7 +431,7 @@ export const ABORT_REASON_TIMEOUT = 'timeout';
 
 // --- Errors ---
 
-export { UnrecoverableError } from './errors.ts';
+export { JobDeferredError, UnrecoverableError } from './errors.ts';
 
 // --- Row Mapping ---
 

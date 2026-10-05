@@ -411,6 +411,34 @@ rather than assuming it shares a `connect` installation's receipt path.
 | `revision_conflict` / `local_conflict` | Preserve both edits and inspect current revisions/ownership receipts before retrying. |
 | `restart_required` | Restart the harness and record actual new-conversation evidence. Files alone do not clear this check. |
 | `left_with_retained_files` | Preserve the reported edits, disable native cached instructions through the harness controls, and restart. |
+| `membership_inactive` | The receipt's enrollment epoch was left or superseded. See [membership inactive after a re-enrollment](#membership-inactive-after-a-re-enrollment). |
+
+### Membership inactive after a re-enrollment
+
+**Say to your agent:** *"My shared skills say membership inactive; refresh them."*
+The agent runs `gbrain bootstrap harness --refresh-skills` on the harness host.
+
+A `leave_brain` then `join_brain` by the same principal (for example to bind a
+follow policy the owner approved later) moves the server's enrollment epoch
+on, while the receipt and native router keep the old one, so the router's
+`sync_brain_skills` call answers `membership_inactive`. For a
+bootstrap-managed installation:
+
+```bash
+gbrain bootstrap harness --refresh-skills
+gbrain bootstrap harness --status
+```
+
+`--refresh-skills` re-joins each live entry under its recorded credential
+and follow policy, so the receipt and router adopt the current epoch; no
+token is minted or revoked. `--status` prints each entry's receipt epoch, and
+`gbrain doctor` warns `bootstrap_harness_health` (code
+`shared_skills_epoch_superseded`) when the receipt epoch differs from the
+brain's membership row. A refresh whose recorded policy is wider than the
+active membership answers `follow_approval_required`: leave and re-run
+`gbrain bootstrap harness` after owner approval. A rotation leave whose own
+epoch was superseded completes locally (`remote_membership_reason:
+superseded`) so the previous token can be revoked.
 
 `leave_brain` stops this principal's membership. The managed adapter's leave
 path also removes unchanged owned files; changed files are retained. Neither

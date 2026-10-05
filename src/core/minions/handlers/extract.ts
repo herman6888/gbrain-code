@@ -55,6 +55,9 @@ export function makeExtractHandler(engine: BrainEngine): MinionHandler {
     // drops every row on a non-'default' brain (silent "created 0"), and the
     // full-walk watermark stamp targets the wrong source.
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
-    return await runExtractCore(engine, { mode, dir, dryRun: !!job.data.dryRun, sourceId });
+    const result = await runExtractCore(engine, { mode, dir, dryRun: !!job.data.dryRun, sourceId });
+    // #5904: refused timeline writes fail the job instead of completing over rows that were never written.
+    if (result.timeline_refused) throw new Error(`extract: ${result.timeline_refused} timeline write(s) refused; nothing written for them. Run gbrain extract --stale.`);
+    return result;
   };
 }

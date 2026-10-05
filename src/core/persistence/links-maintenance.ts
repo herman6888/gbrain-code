@@ -2,6 +2,7 @@ import type { BrainEngine } from '../engine.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../link-extraction.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { maintenanceAttribution } from './attribution.ts';
 import { unrecordedCanonicalTimeline } from './canonical-projections.ts';
 
 export interface ManagedLinkExtraction { pages: number; created: number; removed: number; timeline: number; skipped: number; remaining: number; }
@@ -51,6 +52,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
   const maxPages = opts.maxPages ?? Infinity;
   const done = new Set<string>();
+  const attribution = await maintenanceAttribution(engine);
   const derive = async (slug: string, sourceId: string, stamp?: string) => {
     opts.signal?.throwIfAborted();
     done.add(`${sourceId}\0${slug}`);
@@ -73,7 +75,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       const at = stamp ?? new Date().toISOString();
       await tx.markPagesExtractedBatch([{ slug, source_id: sourceId, extractedAt: at }], at);
       return { ...written, timeline: added };
-    }));
+    }, attribution));
     if (!outcome) { result.skipped++; return; }
     result.pages++;
     result.created += outcome.created;

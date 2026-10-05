@@ -11,6 +11,12 @@
  * page write whose embedding effect the persistence consumer runs (outside
  * this process, not affected by `--no-embed`); `inline` kinds embed in this
  * process unless `--no-embed` is given.
+ *
+ * `explicit_only` kinds run only when the operator names them
+ * (`gbrain repair <kind>`): `--all`, the remediation plan and run, and the
+ * post-upgrade banner list them with their preview command
+ * (`explicit_kind_required`) but never run them, and `runRepair` refuses one
+ * that was not named, so a supplied remediation step cannot run it either.
  */
 import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
@@ -23,8 +29,21 @@ import { contextualModeRepair } from './contextual-mode.ts';
 import { connectorCheckpointsRepair } from './connector-checkpoints.ts';
 import { requestIndexesRepair } from './request-indexes.ts';
 import { connectorFencesRepair } from './connector-fences.ts';
+import { takeSupersessionRepair } from './take-supersession.ts';
 import { orphanBindingsRepair } from './orphan-bindings.ts';
 import { embeddingEffectsRepair } from './embedding-effects.ts';
+import { googleFileModesRepair } from './google-file-modes.ts';
+import { staleAtomsRepair } from './stale-atoms.ts';
+import { extractorFactsRepair } from './extractor-facts.ts';
+import { capturedFactsRepair } from './captured-facts.ts';
+import { loopFactsRepair } from './loop-facts.ts';
+import { orphanChildrenRepair } from './orphan-children.ts';
+import { failedWritesRepair } from './failed-writes.ts';
+import { frontmatterRepair } from './frontmatter.ts';
+import { attributionBackfillRepair } from './attribution-backfill.ts';
+import { plannerStatsRepair } from './planner-stats.ts';
+import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
+import type { OperationError } from '../ops/contract.ts';
 
 export interface RepairKindSpec {
   kind: RepairKind;
@@ -35,6 +54,10 @@ export interface RepairKindSpec {
   embeds: 'effect' | 'inline' | 'none';
   /** Doctor check ids whose findings this kind clears. */
   checks: string[];
+  /** Runs only when named on the command line; never from `--all`, the remediation plan or a supplied step. */
+  explicit_only?: true;
+  /** `destructive`: the apply rewrites user files, so it also needs the user's consent (`--yes` with the preview hash, or a terminal prompt). */
+  consent?: 'destructive';
 }
 
 const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
@@ -72,6 +95,14 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'carry them instead of refusing with connector_fence_below_timeline (fix wave 4). Ambiguous fences are kept and counted for a manual edit. '
       + 'Each repaired page is re-embedded by its publication.',
   },
+  'take-supersession': {
+    handler: takeSupersessionRepair, embeds: 'effect', checks: [],
+    summary: 'Rebuild takes.superseded_by for supersession chains written before the pointer moved onto the old fence row (#5886). Each struck row is linked '
+      + 'to the row that replaced it only from evidence: a committed takes_supersede receipt, a stored superseded_by, or a row carrying the old '
+      + '`superseded by #<own row>` pointer with exactly one possible predecessor. The pointer is written onto the old row and stale self-pointers are '
+      + 'dropped through a revision-bound put_page; a page whose fence is right but whose stored pointers differ is reprojected. Ambiguous pages are '
+      + 'listed with the manual edit and never changed.',
+  },
   'orphan-bindings': {
     handler: orphanBindingsRepair, embeds: 'none', checks: ['orphan_persistence_bindings'],
     summary: 'Delete persistence source bindings whose source or source incarnation no longer exists (#5732), so a source re-added under the same id can be claimed again. '
@@ -83,6 +114,74 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'Each effect is reconciled (current vectors pass the effect verifier), superseded (page deleted, or a newer revision owns its own effect), '
       + 'retry_queued for its owner (paid; a consumed retry allowance gets one new bounded cycle per explicit run) or blocked with the reason. Never drops an obligation.',
   },
+  'attribution-backfill': {
+    handler: attributionBackfillRepair, embeds: 'none', checks: [],
+    summary: 'Fill write attribution (who wrote it) on pages, page versions and facts written before attribution was recorded, only where exactly one '
+      + 'committed request in the write journal proves the writer: the page mutation whose outcome revision is the row\'s revision, or the remember '
+      + 'that inserted the fact. Fills NULLs only, in committed batches of 1,000 that resume after an interruption. Everything else stays NULL and reads '
+      + 'as unrecorded. Bookkeeping only; no journal admission, no content or revision change.',
+  },
+  'google-file-modes': {
+    handler: googleFileModesRepair, embeds: 'none', checks: ['google_file_modes'], explicit_only: true,
+    summary: 'Clear group and other permission bits on files and directories gbrain wrote under a Google source directory outside ~/.gbrain '
+      + '(cursor state, mail/calendar/contact pages and the subdirectories gbrain laid out), written before this release with the default umask. '
+      + 'Never the directory you chose, never through a symlink, never another user\'s file. Filesystem only; runs only when named (`gbrain repair google-file-modes`).',
+  },
+  'stale-atoms': {
+    handler: staleAtomsRepair, embeds: 'none', checks: ['atom_provenance_drift'], explicit_only: true,
+    summary: 'Retire, by soft delete, page-bound atoms whose source page is gone, or whose source page changed after its current text was already extracted (#5770). '
+      + 'Preview-bound: --apply --expect <hash> retires exactly the previewed set; an atom that changed since reports changed_since_preview and is kept. '
+      + 'A later extraction that produces a retired atom again restores it. Never touches imported or file-bound atoms.',
+  },
+  'extractor-facts': {
+    handler: extractorFactsRepair, embeds: 'none', checks: ['extractor_facts_expired'], explicit_only: true,
+    summary: 'Restore conversation-extractor facts that the pre-v0.60.11.0 canonical projection expired (#5731). Restores only facts with receipt evidence '
+      + '(a committed write of the page completed in the same transaction, by an older consumer); --include-ambiguous widens the hashed set to facts '
+      + 'without that evidence. Preview-bound: --apply --expect <hash> restores exactly the previewed set; a fact that changed since reports '
+      + 'changed_since_preview and stays expired. Superseded, withdrawn and duplicated facts are never restored. Database-only; no page is rewritten.',
+  },
+  'captured-facts': {
+    handler: capturedFactsRepair, embeds: 'effect', checks: ['captured_facts_active'], explicit_only: true,
+    summary: 'Expire facts the capture lanes (writeback, compact, corpus sweep) extracted before v0.60.30.0 from gbrain\'s own claude-cli sessions '
+      + '(evidence: a scratch-project harness transcript or a quarantined corpus file). Paste-derived facts are found by a heuristic over the retained '
+      + 'corpus file and expire only with --include-ambiguous. A claim that also has an active copy from another lane is kept. Preview-bound: --apply '
+      + '--expect <hash> expires exactly the previewed set; a fact that changed since reports changed_since_preview. Rows are expired, never withdrawn, '
+      + 'so remember can save the same claim again; fenced rows are struck in their page, which is re-embedded by its publication.',
+  },
+  'loop-facts': {
+    handler: loopFactsRepair, embeds: 'effect', checks: ['loop_facts_drift'], explicit_only: true,
+    summary: 'Retire the commitment facts of loops closed before this release (#5869): expires each fact and strikes its fence row in one coordinated write, '
+      + 'only when no open loop shares the fact. Preview-bound: --apply --expect <hash> retires exactly the previewed set; a loop or fact that changed since '
+      + 'reports changed_since_preview and is kept. Never writes a withdrawal, so the same promise made again is stored normally.',
+  },
+  'orphan-children': {
+    handler: orphanChildrenRepair, embeds: 'none', checks: ['child_table_orphans'], explicit_only: true,
+    summary: 'Delete rows of page child tables (chunks, versions, tags, takes, raw data, timeline, links) whose page no longer exists, and clear dangling '
+      + 'links.origin_page_id and files.page_id references (#5216, #4738). The preview also probes every page body and reports torn TOAST rows '
+      + '(SQLSTATE XX000) as torn_pages without changing them. Bookkeeping only; no journal admission. Brain-wide; runs only when named.',
+  },
+  'failed-writes': {
+    handler: failedWritesRepair, embeds: 'effect', checks: [], explicit_only: true,
+    summary: 'Resubmit caller writes (put_page, add_timeline_entry, remember) that the managed writer guard refused before v0.60.38.0 (#5983), from the '
+      + 'intent their failed receipt retains until receipt compaction. A write is kept when a later request with the same intent committed (already_written) '
+      + 'or is pending (duplicate), or a later write or delete of the page committed (superseded). Writes gbrain itself produced (sync and file imports, '
+      + 'reconcile, relink, maintenance) are counted with the command that produces them again. Preview-bound: --apply --expect <hash> replays exactly '
+      + 'the previewed set under new request ids, after re-checking each write\'s original authority; the failed receipts stay as history.',
+  },
+  frontmatter: {
+    handler: frontmatterRepair, embeds: 'effect', checks: ['git_held_files', 'frontmatter_repairable'], explicit_only: true, consent: 'destructive',
+    summary: 'Fix files whose YAML frontmatter gbrain holds or reads only by guessing (#5988), and pages an older import stored wrong: per file the minimal '
+      + 'line change (safe: quoting a value as gbrain already reads it, NUL bytes, nested quotes; interpretive with --include-ambiguous: folded lines, '
+      + 'duplicate keys, #-leading titles, a missing closing fence, a conflicting slug line, re-imports and rename re-binds). --only/--skip <path> '
+      + 'select files. Preview-bound: --apply --expect <hash> --yes writes exactly the previewed bytes, imports them and clears the hold (managed '
+      + 'sources commit through the Git effect; legacy sources back up first and print the commit step). Files no rule fixes are listed with the exact manual fix.',
+  },
+  'planner-stats': {
+    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'],
+    summary: 'ANALYZE the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale (F4b), '
+      + 'so search and graph reads stop planning as slow nested loops. PGLite also resets each table\'s pending row count; Postgres runs each '
+      + 'ANALYZE with a 60 s statement and 2 s lock timeout. No journal admission and no user data changes. Brain-wide.',
+  },
 };
 
 export const REPAIR_REGISTRY: readonly RepairKindSpec[] = REPAIR_KINDS.map(kind => ({ kind, ...SPECS[kind] }));
@@ -92,8 +191,33 @@ export function repairMaySpend(spec: RepairKindSpec, noEmbed?: boolean): boolean
   return spec.embeds === 'effect' || (spec.embeds === 'inline' && !noEmbed);
 }
 
+/** The kinds `--all`, the remediation plan and `gbrain repair` with no kind run, in dependency order. */
+export const AUTO_REPAIR_REGISTRY: readonly RepairKindSpec[] = REPAIR_REGISTRY.filter(spec => !spec.explicit_only);
+
+/** The explicit-only kinds, listed by those surfaces with their preview command but never run by them. */
+export const EXPLICIT_REPAIR_REGISTRY: readonly RepairKindSpec[] = REPAIR_REGISTRY.filter(spec => spec.explicit_only);
+
 export function repairSpec(kind: RepairKind): RepairKindSpec {
   return REPAIR_REGISTRY.find(spec => spec.kind === kind)!;
+}
+
+/** `gbrain repair <kind> [--source <id>]`, the read-only preview of one kind. */
+export function repairPreviewCommand(kind: RepairKind, opts: { source?: string } = {}): string {
+  return `gbrain repair ${kind}${opts.source ? ` --source ${opts.source}` : ''}`;
+}
+
+/** How `--all`, the remediation plan and the banner report an explicit-only kind instead of running it. */
+export interface ExplicitRepairNotice { kind: RepairKind; code: 'explicit_kind_required'; preview_command: string; docs: string }
+
+export function explicitRepairNotices(opts: { source?: string } = {}): ExplicitRepairNotice[] {
+  return EXPLICIT_REPAIR_REGISTRY.map(spec => ({ kind: spec.kind, code: 'explicit_kind_required' as const,
+    preview_command: repairPreviewCommand(spec.kind, opts), docs: ERROR_CATALOGUE.explicit_kind_required.docs }));
+}
+
+/** `explicit_kind_required`: an explicit-only kind reached a runner without being named. */
+export function explicitKindRequired(kind: RepairKind): OperationError {
+  return catalogueError('explicit_kind_required', `gbrain repair ${kind} is explicit-only and runs only when named, never from --all or a remediation step.`,
+    `Preview it on the brain host: ${repairPreviewCommand(kind)}`);
 }
 
 /** The registered kind that clears a doctor check's findings, if any. */
@@ -118,11 +242,13 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
   const logger = opts.logger ?? { info: console.error, warn: console.error, error: console.error };
   return {
     embeddingModel,
-    async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string } = {}): Promise<RepairResult> {
+    /** `explicit`: the operator named `kind`; required for explicit-only kinds. */
+    async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string; explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[] } = {}): Promise<RepairResult> {
       const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0] } as OperationContext;
       const spec = repairSpec(kind);
       return runRepair(ctx, spec.handler, scope, { apply: opts.apply, limit: run.limit, embeddingModel, sourceFlag: run.sourceFlag,
-        embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : [] });
+        embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : [],
+        explicit: run.explicit, expect: run.expect, includeAmbiguous: run.includeAmbiguous, only: run.only, skip: run.skip });
     },
   };
 }

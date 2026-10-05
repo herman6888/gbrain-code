@@ -77,6 +77,17 @@ suppresses writes for that turn, including when standing capture is enabled.
 > connection test, use only a harmless synthetic `visibility: "world"` fixture
 > with the user's test authorization, retain its ID, and withdraw it afterward.
 >
+> **`<REDACTED:pattern>` in a result** (for example `<REDACTED:url_credentials>`
+> or `<REDACTED:high_entropy_assignment>`) means the brain holds a
+> credential-shaped value there and withheld it from this response; the stored
+> page is unchanged. Tell the user which kind of value was withheld and that it
+> is readable on the brain host. Do not retry other operations to recover it,
+> and do not echo a guess. A credential the user asked you to `remember` is
+> withheld from remote recall by design: every MCP caller, including stdio, and
+> a thin CLI connected to MCP is remote, so only `gbrain recall` run on the
+> brain host shows it as written. Docs:
+> `docs/guides/write-refusals.md#secret-scan-refusals-and-redaction`.
+>
 > **Keyless brains:** when `extract_facts` returns `skipped:
 > extraction_unavailable`, YOU are the extractor — pull the facts from the turn
 > yourself and write each one via `remember` with `kind` set (event | preference
@@ -235,6 +246,15 @@ Rules:
 If a search result has `source_id: "gstack"` and `slug: "plans/foo"`,
 the citation is `[gstack:plans/foo]`. That's the whole rule.
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `put_page` returns `revision_conflict`: re-read the page, merge your change into the new text, and save with the new revision. `write_pending` (exit 10): poll `get_write_request` (`gbrain write-request <request_id>`) before claiming the write landed.
+- A write is refused by the secret scan or a slug fence (`permission_denied`): do not strip or rename to dodge it; tell the user what was refused and why (see `docs/guides/write-refusals.md`).
+- `recall` / `search` returns nothing with a degraded notice or `search_degraded`: say the brain is searching keywords only right now, not that nothing is saved.
+- `insufficient_scope` / `scope_denied` over MCP: the connection lacks that scope. Tell the user; never ask for a broader token just to make a write pass.
+
 ## Anti-Patterns
 
 - Answering questions about people/companies without checking the brain first
@@ -255,3 +275,13 @@ the citation is `[gstack:plans/foo]`. That's the whole rule.
 - `add_timeline_entry` — record events
 - `get_backlinks` — check who references an entity
 - `sync_brain` — sync changes to the index
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, run its gbrain CLI equivalent instead:
+
+- `add_link` → `gbrain link`
+- `sync_brain` → `gbrain sync`
+
+Or widen this machine's plugin surface with GBRAIN_SURFACE=full (new sessions pick it up).

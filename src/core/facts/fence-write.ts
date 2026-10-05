@@ -41,6 +41,7 @@ import { dirname, isAbsolute, relative } from 'node:path';
 import type { BrainEngine, NewFact, FactVisibility, FactKind } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
 import { inferTypeFromPack, parseMarkdown } from '../markdown.ts';
+import { yamlScalar } from '../frontmatter-inference.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
@@ -54,6 +55,7 @@ import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -160,9 +162,9 @@ function recordWriteFailure(slug: string, sourceId: string, warnings: string[], 
   }
 }
 
-type FactFenceGitPathState = 'clean' | 'self_dirty' | 'foreign_dirty' | 'unknown';
+export type FactFenceGitPathState = 'clean' | 'self_dirty' | 'foreign_dirty' | 'unknown';
 
-function gitPathState(repoPath: string, filePath: string): FactFenceGitPathState {
+export function gitPathState(repoPath: string, filePath: string): FactFenceGitPathState {
   try {
     const rel = relative(repoPath, filePath);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return 'unknown';
@@ -190,7 +192,7 @@ function gitPathState(repoPath: string, filePath: string): FactFenceGitPathState
   }
 }
 
-async function commitFactFenceFile(
+export async function commitFactFenceFile(
   repoPath: string,
   filePath: string,
   slug: string,
@@ -235,7 +237,7 @@ async function commitFactFenceFile(
  * (e.g. `people/alice` → 'person'); unknown prefixes fall back to
  * 'concept' which is the most permissive PageType.
  */
-function stubEntityPage(
+export function stubEntityPage(
   slug: string,
   pack: Parameters<typeof inferTypeFromPack>[1] | null,
 ): string {
@@ -257,7 +259,7 @@ function stubEntityPage(
   const title = tail
     .replace(/[-_/]+/g, ' ')
     .replace(/\b\w/g, c => c.toUpperCase()) || slug;
-  return `---\ntype: ${type}\ntitle: ${title}\nslug: ${slug}\n---\n\n# ${title}\n`;
+  return `---\ntype: ${yamlScalar(type)}\ntitle: ${yamlScalar(title)}\nslug: ${yamlScalar(slug)}\n---\n\n# ${title}\n`;
 }
 
 /**
@@ -518,9 +520,9 @@ export async function writeFactsToFence(
         const reparsed = parseMarkdown(tmpBody, `${target.slug}.md`);
         const existing = await engine.getPage(target.slug, { sourceId: target.sourceId });
         if (existing) {
-          await engine.refreshPageBody(target.slug, target.sourceId,
+          await maintenanceTransaction(engine, tx => tx.refreshPageBody(target.slug, target.sourceId,
             sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
-            existing.content_hash || contentHash(existing));
+            existing.content_hash || contentHash(existing)));
         }
       } catch (err) {
         // The file is committed; the page cache stays stale until the next
@@ -549,7 +551,7 @@ export async function writeFactsToFence(
         source_session: facts[i].sessionId,
       }));
 
-      const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
+      const result = await maintenanceTransaction(engine, tx => tx.insertFacts(enriched, { source_id: target.sourceId })); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
       // v0.46 (#3014) — an unresolvable `superseded by #N` reference (self
       // / dangling / struck target) leaves superseded_by NULL; log it rather
       // than swallow it. The row still lands (expired_at set for struck

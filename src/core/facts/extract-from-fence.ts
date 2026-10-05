@@ -71,6 +71,25 @@ export type FenceExtractedFact = NewFact & {
  */
 export const FENCE_SOURCE_DEFAULT = 'fence:reconcile';
 
+/**
+ * #1781: duplicate ACTIVE fence rows (same claim and source) index once.
+ * Returns the row numbers of the later copies, which extract_facts leaves
+ * out of the index. A struck history row never collapses with an active row
+ * that carries the same text, so a claim that reverts to an earlier value
+ * stays active.
+ */
+export function duplicateActiveFenceRows(facts: ParsedFact[]): Set<number> {
+  const seen = new Set<string>();
+  const duplicates = new Set<number>();
+  for (const f of facts) {
+    if (!f.active) continue;
+    const key = `${f.claim}\u0000${f.source ?? FENCE_SOURCE_DEFAULT}`;
+    if (seen.has(key)) duplicates.add(f.rowNum);
+    else seen.add(key);
+  }
+  return duplicates;
+}
+
 function parseValidDate(s: string | undefined): Date | undefined {
   if (!s) return undefined;
   // Be lenient on date shape — accept 'YYYY-MM-DD' or full ISO.

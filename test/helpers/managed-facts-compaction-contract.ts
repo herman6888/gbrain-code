@@ -14,6 +14,7 @@ import { localHostId, registerLocalWriter } from '../../src/core/persistence/ide
 import { claimNextWrite, compactWriteReceipts } from '../../src/core/persistence/journal.ts';
 import { publishMutation } from '../../src/core/persistence/coordinator.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { declarePersistenceProtocol } from '../../src/core/persistence/protocol.ts';
 import { prepareManagedFactsMutation } from '../../src/core/persistence/facts-prepare.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
@@ -84,7 +85,7 @@ export async function exerciseFactCompaction(engine: BrainEngine, scenario: Case
         const shouldConflict = i < 2 && (scenario.endsWith('_failed') || scenario.endsWith('_partial') && i === 1);
         if (shouldConflict) await engine.transaction(async tx => {
           await declarePersistenceProtocol(tx);
-          await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('UPDATE pages SET knowledge_revision=gen_random_uuid() WHERE source_id=$1 AND slug=$2', [sourceId, row.slug]));
+          await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('UPDATE pages SET knowledge_revision=gen_random_uuid() WHERE source_id=$1 AND slug=$2', [sourceId, row.slug]), TEST_WRITE_ATTRIBUTION);
         });
         const done = await publishMutation(engine, row, prepared, localHostId());
         expect(done.state).toBe(shouldConflict || i === 2 && !scenario.endsWith('_success') ? 'conflict' : 'committed');

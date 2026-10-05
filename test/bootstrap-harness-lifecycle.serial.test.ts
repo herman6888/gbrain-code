@@ -210,7 +210,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     expect(result).toBe(0);
     // real smoke against the live serve — identity round-tripped over bearer
     expect(out).toMatch(/smoke test:/);
-    expect(out).toMatch(/"engine": "pglite"/);
+    expect(out).toMatch(/"engine":"pglite"/); // C2: tool results are compact JSON
     // the sandbox held: nothing touched the operator's real user scope
     expect(out).not.toContain(`${process.env.HOME}/.claude/settings.json`);
 

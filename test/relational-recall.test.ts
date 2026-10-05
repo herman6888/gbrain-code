@@ -45,6 +45,14 @@ beforeAll(async () => {
   await installFixtureChunks(eng, 'people/mallory-secret', [{ chunk_index: 0, chunk_source: 'compiled_truth',
     chunk_text: 'Mallory runs a stealth family office in Zurich.' }]);
   await eng.addLink('people/mallory-secret', 'companies/widget-co', '', 'invested_in', 'manual');
+
+  // N9-5 (gbrain-evals world-v1): "Acme" collides with "Acme Labs" under
+  // bare-name prefix expansion; the page titled exactly "Acme" is the seed.
+  await eng.putPage('companies/acme-0', { type: 'company', title: 'Acme', compiled_truth: 'A robotics company.', timeline: '' });
+  await eng.putPage('companies/acme-labs-50', { type: 'company', title: 'Acme Labs', compiled_truth: 'A research lab.', timeline: '' });
+  await eng.putPage('people/bea-example', { type: 'person', title: 'Bea Example', compiled_truth: 'Bea is an engineer.', timeline: '' });
+  await installFixtureChunks(eng, 'people/bea-example', [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Bea is an engineer.' }]);
+  await eng.addLink('people/bea-example', 'companies/acme-0', '', 'works_at', 'manual');
 }, 60_000);
 
 afterAll(async () => { await eng.disconnect(); });
@@ -59,6 +67,13 @@ describe('buildRelationalArm', () => {
     expect(alice!.relational_seed).toBe('companies/widget-co');
     // chunk-backed page → reinforces a REAL chunk id (not synthetic 0).
     expect(alice!.chunk_id).toBeGreaterThan(0);
+  });
+
+  test('N9-5: a bare company name that collides under prefix expansion seeds from its exact-title page', async () => {
+    const list = await buildRelationalArm(eng, 'Who works at Acme?');
+    const bea = list.find(r => r.slug === 'people/bea-example');
+    expect(bea).toBeDefined();
+    expect(bea!.relational_seed).toBe('companies/acme-0');
   });
 
   test('non-relational query is a pure no-op', async () => {

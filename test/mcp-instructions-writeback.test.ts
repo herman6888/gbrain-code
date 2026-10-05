@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 
 import { buildAmbientWritebackSection } from '../src/core/facts/writeback-instructions.ts';
 import { GBRAIN_MCP_INSTRUCTIONS, buildMcpInstructions } from '../src/mcp/instructions.ts';
+import { contractFor } from './helpers/instructions-parity.ts';
 import { startHttpTransport } from '../src/mcp/http-transport.ts';
 import { RateLimiter } from '../src/mcp/rate-limit.ts';
 
@@ -132,7 +133,7 @@ describe('legacy bearer transport serves the shared builder output (parity)', ()
       kind: 'postgres',
       executeRaw: async (sql: string, params?: unknown[]) => {
         const norm = sql.replace(/\s+/g, ' ').trim().toLowerCase();
-        if (norm.startsWith('select id, name')) {
+        if (norm.startsWith('select id, name') || norm.startsWith('select * from access_tokens')) {
           const row = validTokens.get(params?.[0] as string);
           return row ? [{ ...row, permissions: { takes_holders: ['world'] } }] : [];
         }
@@ -165,9 +166,14 @@ describe('legacy bearer transport serves the shared builder output (parity)', ()
       return body.result?.instructions;
     };
 
-    const expected = buildMcpInstructions({
-      writeback: { mode: 'salient', transientTtl: '12h', visibility: 'private', extractFactsAvailable: true },
-    });
+    // F1: the contract is generated for this token's tools/list.
+    const listed = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    }).then(r => r.json() as Promise<{ result: { tools: Array<{ name: string }> } }>);
+    const expected = contractFor(listed.result.tools.map(t => t.name),
+      { mode: 'salient', transientTtl: '12h', visibility: 'private', extractFactsAvailable: true });
     expect(await init()).toBe(expected);
 
     // Mid-session config blip: the FULL last-known-good bundle keeps serving

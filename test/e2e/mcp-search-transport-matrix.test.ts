@@ -45,7 +45,8 @@ async function stop(child: ChildProcess): Promise<void> {
 }
 
 async function search(client: Client, query: string, source_id?: string) {
-  const result = await client.callTool({ name: 'search', arguments: { query, ...(source_id ? { source_id } : {}) } });
+  // fields: 'full' — this matrix reads ranking diagnostics (cosine), which remote rows omit by default.
+  const result = await client.callTool({ name: 'search', arguments: { query, fields: 'full', ...(source_id ? { source_id } : {}) } });
   expect(result.isError, toolDiagnostic('search', result)).not.toBe(true);
   const content = result.content as Array<{ type: string; text: string }>;
   const rows = JSON.parse(content[0]!.text) as Array<{ slug: string; source_id: string; cosine?: number }>;

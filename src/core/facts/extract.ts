@@ -226,7 +226,11 @@ export interface ExtractInput {
 }
 
 /** A pre-INSERT fact ready for the engine.insertFact path. */
-export type ExtractedFact = NewFact & { entity_slug: string | null };
+export type ExtractedFact = NewFact & {
+  entity_slug: string | null;
+  /** #5836: the subject was inferred at write time (subject-infer-write.ts), not named by the extractor. */
+  entity_inferred?: 'page' | 'mention';
+};
 
 /**
  * Unknown/anonymous-speaker attribution gate.
@@ -345,7 +349,8 @@ export function buildExtractorSystem(admitsLow: boolean): string {
   return admitsLow ? EXTRACTOR_SYSTEM_ADMITS_LOW : EXTRACTOR_SYSTEM_SKIPS_LOW;
 }
 
-const MAX_TURN_TEXT_CHARS = 8000;
+/** Extractor input ceiling; corpus windows (context/corpus-windows.ts) are cut to fit it. */
+export const MAX_TURN_TEXT_CHARS = 8000;
 
 /**
  * #4863 — JSON Schema for the extractor reply, sent as `responseSchema` on

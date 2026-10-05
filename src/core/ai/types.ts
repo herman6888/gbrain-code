@@ -493,9 +493,9 @@ export interface AIGatewayConfig {
 
   reranker_model?: string;
   /**
-   * Optional silent-refusal fallback chain ("provider:modelId" entries).
-   * Plumbed for `chatWithFallback()` (commit 3). Blocked from critic/judge/
-   * synthesize flows in their respective handlers.
+   * Optional chat fallback chain ("provider:modelId" entries), walked by
+   * `chatWithFallback()` (chat-fallback.ts) when a chat call fails or refuses.
+   * Judge, critic and eval call sites opt out with `allowFallback: false`.
    */
   chat_fallback_chain?: string[];
   /** Optional per-provider base URL override (openai-compatible variants). */

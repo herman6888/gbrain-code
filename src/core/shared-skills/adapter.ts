@@ -264,9 +264,14 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
         receipt.remote_membership_pending = false;
         delete receipt.remote_membership_reason;
       } catch (error) {
-        receipt.remote_membership_pending = true;
-        receipt.remote_membership_reason = error instanceof OperationError ? error.code : 'remote_unavailable';
-        receipt.next_action += ' Remote membership deactivation is pending; retry leave when the host can acknowledge it.';
+        if (error instanceof OperationError && error.code === 'membership_inactive') {
+          receipt.remote_membership_pending = false;
+          receipt.remote_membership_reason = 'superseded';
+        } else {
+          receipt.remote_membership_pending = true;
+          receipt.remote_membership_reason = error instanceof OperationError ? error.code : 'remote_unavailable';
+          receipt.next_action += ' Remote membership deactivation is pending; retry leave when the host can acknowledge it.';
+        }
       }
       save(receipt);
       return receipt;

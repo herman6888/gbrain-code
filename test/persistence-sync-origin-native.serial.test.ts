@@ -9,6 +9,7 @@ import type { SyncOpts } from '../src/commands/sync.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
+import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { resolveSlugForPath } from '../src/core/sync.ts';
 import { claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
@@ -19,6 +20,7 @@ import { admitWrite, claimNextWrite, getWriteRequest } from '../src/core/persist
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { computeSyncDelta } from '../src/core/sync-delta.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -243,7 +245,7 @@ for (const alias of [false, true]) check(`native historical ${alias ? 'alias' : 
   if (process.platform !== 'win32') files[literal] = content;
   const f = await fixture(engine, literal, alias ? 'legacy-example' : 'notes/example', files);
   const history = await engine.getVersions(f.slug, { sourceId: f.id });
-  await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head])));
+  await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head]), TEST_WRITE_ATTRIBUTION));
   const revised = content.replace('title: Example note', 'title: "Example note"');
   writeFileSync(join(f.root, 'notes/example.md'), revised);
   execFileSync('git', ['-C', f.root, 'add', 'notes/example.md']);
@@ -286,9 +288,75 @@ for (const alias of [false, true]) check(`native historical ${alias ? 'alias' : 
   if (process.platform !== 'win32') expect(readFileSync(join(f.root, literal), 'utf8')).toBe(content);
 });
 
+check('deleting an unowned filename preserves the live or tombstoned foreign-origin page', async engine => {
+  for (const deleted of [false, true]) {
+    const f = await fixture(engine, 'notes/recorded.md', 'notes/example', {
+      'notes/recorded.md': content, 'notes/example.md': content,
+    });
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], async () => {
+      await tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head]);
+      if (deleted) await tx.softDeletePage(f.slug, { sourceId: f.id });
+    }, TEST_WRITE_ATTRIBUTION));
+    const before = await engine.readPageSnapshot(f.slug, { sourceId: f.id, includeDeleted: true });
+    const history = await engine.getVersions(f.slug, { sourceId: f.id });
+    unlinkSync(join(f.root, 'notes/example.md'));
+    execFileSync('git', ['-C', f.root, 'add', '-A']);
+    execFileSync('git', ['-C', f.root, 'commit', '-qm', 'Remove only an unowned duplicate']);
+    const target = execFileSync('git', ['-C', f.root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const opts = { ...f.opts, full: false };
+    expect(await performManagedSync(engine, { ...opts, dryRun: true })).toMatchObject({ status: 'dry_run' });
+    expect(await performManagedSync(engine, opts)).toMatchObject({ status: 'synced', deleted: 0, filesImported: 1, toCommit: target });
+    expect(await engine.readPageSnapshot(f.slug, { sourceId: f.id, includeDeleted: true })).toEqual(before);
+    expect(await engine.getVersions(f.slug, { sourceId: f.id })).toEqual(history);
+    expect(readFileSync(join(f.root, 'notes/recorded.md'), 'utf8')).toBe(content);
+    const [receipt] = await engine.executeRaw<{ state: string; outcome: unknown }>(
+      "SELECT state,outcome FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_delete'", [f.id]);
+    expect(receipt).toMatchObject({ state: 'committed', outcome: { noop: true, reason: 'unowned_deleted_path' } });
+    expect((await engine.executeRaw('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(target);
+  }
+});
+
+check('unowned deletion rechecks absent ownership and file bytes at publication', async engine => {
+  for (const change of ['origin', 'file']) {
+    const f = await fixture(engine, 'notes/recorded.md', 'notes/example', {
+      'notes/recorded.md': content, 'notes/example.md': content,
+    });
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () =>
+      tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head]), TEST_WRITE_ATTRIBUTION));
+    unlinkSync(join(f.root, 'notes/example.md'));
+    execFileSync('git', ['-C', f.root, 'add', '-A']);
+    execFileSync('git', ['-C', f.root, 'commit', '-qm', 'Remove the unowned duplicate']);
+    expect((await interruptAfterSyncDiscovery(engine, { ...f.opts, full: false })).status).toBe('partial');
+    const [stored] = await engine.executeRaw<{ fingerprint: string; completed_keys: any[] }>(
+      "SELECT fingerprint,completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [f.id]);
+    const cursor = stored.completed_keys[0], requestId = randomUUID();
+    const intent: SyncIntent = { kind: 'managed_sync_delete', expected_revision: f.snapshot.revision,
+      sourcePath: 'notes/example.md', path: 'notes/example.md', rawHash: null, content: null, unownedDeletion: true, working: false,
+      ownerEpoch: String(cursor.binding.owner_epoch), syncAuthority: cursor.authority, cursorKey: stored.fingerprint,
+      runId: cursor.runId, index: 0, total: 1, from: cursor.from, target: cursor.target, slugMode: cursor.slugMode };
+    cursor.pending = { requestId, slug: f.slug, pageId: f.snapshot.page.id, intent };
+    await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb WHERE op='managed-sync' AND fingerprint=$1",
+      [stored.fingerprint, JSON.stringify([cursor])]);
+    const accepted = await admitWrite(engine, { requestId, operation: 'submit_job', sourceId: f.id, sourceIncarnation: cursor.incarnation,
+      slug: f.slug, pageId: f.snapshot.page.id, worktreeId: cursor.binding.worktree_id, topologyGeneration: cursor.binding.topology_generation,
+      principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: intent, intent });
+    const row = (await claimNextWrite(engine, localHostId()))!;
+    expect(row.id).toBe(accepted.id);
+    const prepared = await prepareManagedSyncMutation(engine, row, { engine: engine.kind });
+    expect(prepared.noop).toBe(true);
+    if (change === 'origin') await engine.executeRaw('UPDATE pages SET source_path=$2 WHERE id=$1', [f.snapshot.page.id, 'notes/example.md']);
+    else writeFileSync(join(f.root, 'notes/example.md'), content);
+    const published = await publishMutation(engine, row, prepared);
+    expect(published.state).not.toBe('committed');
+    expect(published.error_code).toBe(change === 'origin' ? 'page_identity_changed' : 'source_changed');
+    expect((await engine.readPageSnapshot(f.slug, { sourceId: f.id }))?.revision).toBe(f.snapshot.revision);
+    expect((await engine.executeRaw('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
+  }
+});
+
 check('a genuine committed Git deletion commits one deletion and the exact checkpoint', async engine => {
   const f = await fixture(engine);
-  await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head])));
+  await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head]), TEST_WRITE_ATTRIBUTION));
   const history = await engine.getVersions(f.slug, { sourceId: f.id });
   unlinkSync(join(f.root, 'notes/example.md'));
   execFileSync('git', ['-C', f.root, 'add', '-A']);
@@ -429,4 +497,25 @@ check('publication revalidates a recreated working-tree deletion and activation 
     expect((await getWriteRequest(engine, admission.principal, requestId))?.intent).toEqual(intent);
     expect((await engine.executeRaw('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBeNull();
   }
+});
+
+check('an exact recorded origin retains its existing slug on every native platform', async engine => {
+  const f = await fixture(engine, 'notes/recorded.md', 'notes/example', { 'notes/recorded.md': content });
+  const canonical = serializePageToMarkdown(f.snapshot.page, f.snapshot.tags).replace(/^---\n/, '---\nslug: notes/example\n');
+  writeFileSync(join(f.root, 'notes/recorded.md'), canonical);
+  execFileSync('git', ['-C', f.root, 'add', '-A']);
+  execFileSync('git', ['-C', f.root, 'commit', '-qm', 'Export existing canonical identity']);
+  const history = await engine.getVersions(f.slug, { sourceId: f.id });
+  expect(await performManagedSync(engine, f.opts)).toMatchObject({ status: 'first_sync', added: 0, modified: 0, deleted: 0 });
+  expect(await engine.readPageSnapshot(f.slug, { sourceId: f.id })).toEqual(f.snapshot);
+  expect(await engine.getVersions(f.slug, { sourceId: f.id })).toEqual(history);
+  expect(readFileSync(join(f.root, 'notes/recorded.md'), 'utf8')).toBe(canonical);
+  writeFileSync(join(f.root, 'notes/recorded.md'), canonical.replace('slug: notes/example', 'slug: notes/impostor'));
+  execFileSync('git', ['-C', f.root, 'add', '-A']);
+  execFileSync('git', ['-C', f.root, 'commit', '-qm', 'Attempt a different canonical identity']);
+  // #5988: the conflicting identity is held, never imported, instead of blocking the sync.
+  const held = await performManagedSync(engine, { ...f.opts, full: false });
+  expect(held.held?.map(item => [item.path, item.code])).toEqual([['notes/recorded.md', 'frontmatter_slug_conflict']]);
+  expect(await engine.readPageSnapshot(f.slug, { sourceId: f.id })).toEqual(f.snapshot);
+  expect(await engine.getPage('notes/impostor', { sourceId: f.id })).toBeNull();
 });

@@ -9,7 +9,7 @@ import { execFileSync } from 'child_process';
 import type { BrainEngine } from '../../core/engine.ts';
 import { LATEST_VERSION } from '../../core/migrate.ts';
 // Agent-bootstrap doctor group (plan B2/B4/ENG-4 + one-live-serve note).
-import { readHarnessReceiptState, readReceipt } from '../../core/bootstrap/format.ts';
+import { readHarnessReceiptState, readReceipt, type HarnessReceipt } from '../../core/bootstrap/format.ts';
 import { probeLivePgliteHolder, resolveBrainDataDir } from '../../core/bootstrap/uninstall.ts';
 import { readRunbookStamp, hooksInstalled, listVerifyRuns } from '../../core/bootstrap/status.ts';
 import { resolveGbrainHome } from '../../core/gbrain-home.ts';
@@ -24,6 +24,22 @@ import type { Check } from '../doctor.ts';
  * `gbrain bootstrap` get ZERO checks from this group. Every probe is
  * fail-soft: a broken telemetry file degrades to a warn, never a throw.
  */
+/** #5878: warn when a shared-skills receipt epoch differs from this brain's membership row; true when it pushed. */
+async function pushSupersededEnrollmentCheck(checks: Check[], engine: BrainEngine | null, hr: HarnessReceipt): Promise<boolean> {
+  if (!engine) return false;
+  const { supersededEnrollments, SKILLS_REFRESH_COMMAND, SKILLS_EPOCH_DOCS } = await import('../../core/bootstrap/harness-skills.ts');
+  const superseded = await supersededEnrollments(engine, hr).catch(() => []);
+  if (superseded.length === 0) return false;
+  checks.push({
+    name: 'bootstrap_harness_health',
+    status: 'warn',
+    message: `shared skills enrollment superseded: ${superseded.map(e => `${e.host} receipt epoch ${e.local_epoch}, server epoch ${e.server_epoch}${e.active ? '' : ' (inactive)'}`).join('; ')} ` +
+      `— sessions get membership_inactive. Fix: ${SKILLS_REFRESH_COMMAND} (${SKILLS_EPOCH_DOCS}).`,
+    details: { code: 'shared_skills_epoch_superseded', fix: SKILLS_REFRESH_COMMAND, docs: SKILLS_EPOCH_DOCS, enrollments: superseded },
+  });
+  return true;
+}
+
 export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise<Check[]> {
   const checks: Check[] = [];
   let home: string;
@@ -93,7 +109,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
 
   const receipt = readReceipt(home);
   // One reader for every push-status surface [D8]; per-root files [D13].
-  const { readPushStatuses, pushStatusFilesExist } = await import('../../core/workspace-push.ts');
+  const { readPushStatuses, pushStatusFilesExist, pushStatusForWorkspace } = await import('../../core/workspace-push.ts');
   const pushStatuses = readPushStatuses();
   const statusFilesOnDisk = pushStatusFilesExist();
   const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
@@ -143,7 +159,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
         status: 'fail',
         message: `harness removal pending: host wiring removed but the minted token (id ${hr.token.id}) is not yet revoked — stop the serve and re-run \`gbrain bootstrap harness\` with the remove flag, or run \`gbrain auth revoke\` with the id flag.`,
       });
-    } else {
+    } else if (!(await pushSupersededEnrollmentCheck(checks, engine, hr))) {
       try {
         const base = hr.url.replace(/\/mcp$/, '');
         const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(3000) });
@@ -320,11 +336,11 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
             }
           } catch { dirty = false; known = false; }
         }
-        if (stale && dirty) {
+        if (dirty && ws && Date.now() - Date.parse(pushStatusForWorkspace(pushStatuses, ws)?.ts ?? '') > PUSH_STALE_MS) { // #5432: this root's own receipt
           checks.push({
             name: 'bootstrap_push_health',
             status: 'fail',
-            message: `last successful push ${staleIso} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
+            message: `last successful push ${pushStatusForWorkspace(pushStatuses, ws)?.ts} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
           });
         } else if (stale && !targetMatchesWs) {
           // Multiple tracked push targets (or the one target names a
@@ -437,7 +453,7 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   try {
     const dataDir = resolveBrainDataDir(home);
     const holder = probeLivePgliteHolder(dataDir);
-    if (holder) {
+    if (holder && !holder.isSelf) {
       checks.push({
         name: 'bootstrap_serve_lock',
         status: holder.serve ? 'ok' : 'warn',

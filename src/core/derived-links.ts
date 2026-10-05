@@ -56,7 +56,7 @@ export async function replaceDerivedLinks(
   const unique = new Map<string, LinkBatchInput>();
   for (const link of links) {
     const producer = link.link_source ?? 'markdown';
-    if (!producers.includes(producer)) throw new TypeError('Only selected derived link producers can be replaced');
+    if (!producers.includes(producer)) throw new TypeError(`Only selected derived link producers can be replaced (got: ${JSON.stringify(producer)}, allowed: ${producers.join(', ')})`);
     if ((link.origin_slug && link.origin_slug !== origin.slug)
       || (link.origin_source_id && link.origin_source_id !== origin.sourceId)) {
       throw new TypeError('Derived link origin does not match the replacement scope');

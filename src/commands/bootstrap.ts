@@ -29,12 +29,13 @@
 
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { VERSION } from '../version.ts';
 import { loadConfig, loadConfigFileOnly, saveConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { resolveGbrainHome } from '../core/gbrain-home.ts';
+import { resolveGbrainBin } from '../core/gbrain-bin.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
 import { loadQuestionBank } from '../core/bootstrap/assets.ts';
@@ -57,6 +58,7 @@ import { uninstallWorkspace } from '../core/bootstrap/uninstall.ts';
 import {
   registerClaudeMcp,
   registerCodexMcp,
+  parseSeatFlags,
   writeClaudeHooks,
   writeCommittedClaudeHooks,
   removeClaudeHooks,
@@ -83,6 +85,7 @@ import {
   type HarnessDeps,
   type HarnessDetectOverrides,
 } from '../core/bootstrap/harness.ts';
+import { refreshHarnessSkills } from '../core/bootstrap/harness-skills.ts';
 import { claudeUserSettingsPath, codexConfigPath, opencodeConfigDir, opencodeGlobalConfigPath, opencodeProjectConfigPath } from '../core/bootstrap/host-specs.ts';
 import {
   opencodeEntryKind,
@@ -94,6 +97,7 @@ import {
   writeOpencodeMcpEntry,
 } from '../core/bootstrap/opencode-json.ts';
 import { promptLine } from '../core/cli-util.ts';
+import { isInteractive } from '../core/interaction.ts';
 import {
   appendInstallLog,
   gitOriginUrl,
@@ -123,12 +127,15 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
   contract [--repair]             Audit the same-turn GBrain write-back contract.
                                   --repair appends it additively and backs up AGENTS.md.
   hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]
+        [--seat <label> | --no-seat]
                                   Register MCP (+ per-turn hooks on Claude Code,
                                   ON by default; --no-hooks opts out, GBRAIN_HOOKS=0
                                   disables at runtime). opencode registrations are
                                   written directly into its JSONC config (user-global
                                   by default; MCP_SCOPE=project is an explicit opt-in
-                                  with a sharing warning).
+                                  with a sharing warning). --seat credits captured
+                                  sessions to this agent seat (kept on re-install;
+                                  --no-seat clears it; --seat off records none).
   repo                            Create the dedicated PRIVATE GitHub repo (or adopt
                                   an EMPTY private repo you created under your own
                                   account), verify the privacy bit via the API, push.
@@ -137,7 +144,8 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
   attach [--harness H]            Machine two: adopt a cloned agent workspace.
   harness [--harness claude-code|codex|opencode|all] [--url U | --port N] [--source ID]
           [--token-name NAME | --token TOK] [--name MCPNAME] [--project DIR]...
-          [--no-hooks] [--no-capture] [--force] [--status] [--remove] [--yes] [--json]
+          [--no-hooks] [--no-capture] [--force] [--status] [--remove] [--refresh-skills] [--yes] [--json]
+          [--seat <label> | --no-seat]
                                   Wire framework-spawned Claude Code / Codex / opencode
                                   sessions to a RUNNING \`gbrain serve --http\` on this box
                                   (#4043): scoped bearer token, user-scope MCP + headless
@@ -147,6 +155,9 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
                                   --source ID: the source the hooks + token bind to
                                   (default: sources.default, else the sole populated
                                   non-default source, else default).
+                                  --refresh-skills: re-join shared skills under the
+                                  recorded credential so the router adopts the current
+                                  enrollment epoch (no token rotation).
                                   (--local is an accepted no-op alias.)
   cloud-setup-script              Print the paste-ready cloud environment setup
                                   script (installs the gbrain binary into the
@@ -190,7 +201,9 @@ const SUBCOMMAND_HELP: Record<string, string> = {
     '  under your own account), verify the privacy bit via the API, push.',
   hooks:
     'gbrain bootstrap hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]\n' +
-    '  Register MCP (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).',
+    '                       [--seat <label> | --no-seat]\n' +
+    '  Register MCP (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n' +
+    '  --seat credits captured sessions to this agent seat (kept on re-install; --no-seat clears it; --seat off records none).',
   verify:
     'gbrain bootstrap verify [--json]\n' +
     '  The whole install contract (round-trip, graph floor, magic moment, scans, hooks smoke). Exit 0 or not done.',
@@ -203,6 +216,18 @@ const SUBCOMMAND_HELP: Record<string, string> = {
   interview:
     'gbrain bootstrap interview --init | --set KEY "value" | --skip KEY | --status | --show | --confirm <hash>\n' +
     '  Create/record/read interview state. See `gbrain bootstrap --help` for the per-flag description.',
+  // #5488: `gbrain bootstrap harness --help` previously fell through into the
+  // real apply because harness was missing from SUBCOMMAND_HELP. Without this
+  // entry the dispatch's `Object.hasOwn(SUBCOMMAND_HELP, sub)` guard was
+  // false, so `--help` after the subcommand name ran the harness apply path.
+  harness:
+    'gbrain bootstrap harness [--harness claude-code|codex|opencode|all] [--url U | --port N] [--source ID]\n' +
+    '                       [--token-name NAME | --token TOK] [--name MCPNAME] [--project DIR]...\n' +
+    '                       [--no-hooks] [--no-capture] [--force] [--status] [--remove] [--yes] [--json]\n' +
+    '                       [--seat <label> | --no-seat]\n' +
+    '  Wire framework-spawned Claude Code / Codex / opencode sessions to a RUNNING `gbrain serve --http`\n' +
+    '  on this box (#4043). Idempotent; --remove tears it down. (--local is an accepted no-op alias.)\n' +
+    '  See `gbrain bootstrap --help` for the per-flag description.',
 };
 
 /**
@@ -348,20 +373,6 @@ export function detectHarness(env: Record<string, string | undefined> = process.
   if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return 'claude-code';
   if (env.CODEX_HOME || env.CODEX_SANDBOX || env.CODEX_CI) return 'codex';
   if (env.OPENCODE || env.OPENCODE_PID) return 'opencode';
-  return null;
-}
-
-/** Absolute gbrain binary path for registrations/hook commands [CX-P1.4].
- * GUI hosts inherit no PATH, so a bare name is never acceptable. */
-function resolveGbrainBin(): string | null {
-  try {
-    const which = Bun.which('gbrain');
-    if (which && isAbsolute(which)) return which;
-  } catch {
-    /* fall through */
-  }
-  // Compiled-binary case: this process IS the gbrain binary.
-  if (basename(process.execPath).startsWith('gbrain')) return process.execPath;
   return null;
 }
 
@@ -1064,6 +1075,9 @@ async function runHooks(
   // `--no-hooks` is the explicit install-time opt-out; `GBRAIN_HOOKS=0` and
   // `uninstall` are the runtime/after off-ramps.
   const noHooks = rest.includes('--no-hooks');
+  const seatFlags = parseSeatFlags(rest, harness);
+  if (seatFlags.error || seatFlags.note) console.error(seatFlags.error ?? seatFlags.note);
+  if (seatFlags.error) return 2;
   // Plugin-lane override: detection reads the plugin-ENABLE config entry,
   // which is not a health signal — a plugin whose launcher can't find the
   // gbrain binary still matches. This flag forces the hand-wired MCP
@@ -1530,7 +1544,7 @@ async function runHooks(
         // installs keep the gitignored settings.local.json with the absolute
         // binary path. The writers enforce that one event never fires from
         // both files.
-        const hookEnv = { GBRAIN_SOURCE: sourceId, ...(gbrainHome ? { GBRAIN_HOME: gbrainHome } : {}) };
+        const hookEnv = { GBRAIN_SOURCE: sourceId, ...(gbrainHome ? { GBRAIN_HOME: gbrainHome } : {}), GBRAIN_SEAT: seatFlags.seat };
         const cloudCarrier = detectExecutionEnvironment() === 'cloud-sandbox';
         let r: ReturnType<typeof writeClaudeHooks> | ReturnType<typeof writeCommittedClaudeHooks>;
         try {
@@ -1733,7 +1747,9 @@ async function runHarness(rest: string[], home: string, runner: ExecRunner, dete
     // Fallback only — the flag itself is parsed (and error-checked) once, by
     // parseHarnessArgs; flags.gbrainBin wins inside applyHarness.
     gbrainBin: resolveGbrainBin(),
-    isTTY: process.stdout.isTTY === true,
+    // C6: a prompt only when a human can answer it (agent markers, CI and
+    // GBRAIN_NON_INTERACTIVE count as no human); promptLine reads EOF as ''.
+    isTTY: isInteractive(),
     prompt: promptLine,
     ...harnessDetectDeps(detect),
   };
@@ -1744,6 +1760,7 @@ async function runHarness(rest: string[], home: string, runner: ExecRunner, dete
   }
   ensureHarnessHome(home);
   return withLock(home, async () => {
+    if (flags.refreshSkills) return refreshHarnessSkills(deps);
     if (flags.remove) {
       const code = await removeHarness(flags, deps);
       abortIfInjected('harness');

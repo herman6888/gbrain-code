@@ -25,6 +25,7 @@ import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -34,7 +35,8 @@ import { isUndefinedTableError } from '../utils.ts';
  *      exact pages.slug row in this source), return it untouched. A mention
  *      that is exactly one live page's own name (slug basename) resolves to
  *      it next, before any other page's alias.
- *   2. Resolve a bare name only when prefix expansion finds one candidate.
+ *   2. Resolve a bare name only when prefix expansion finds one candidate,
+ *      or one candidate whose title is exactly that name.
  *   3. For multi-token input, take a fuzzy candidate within the source only
  *      when it carries the same name tokens (sameEntityName).
  *   4. Fall back to a deterministic slugify: lowercase-no-spaces with
@@ -84,7 +86,7 @@ export async function resolveEntitySlug(
   //    `"Alice"` → `people/alice-example` before we phantom-stub a bare
   //    `people/alice.md`.
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, trimmed);
     if (expanded) return expanded;
   } else {
     // 3. Fuzzy match against existing pages within the source. Bare names
@@ -126,7 +128,7 @@ const FACT_ENTITY_TYPES = new Set(['concept', 'project', 'deal']);
 const FACT_ENTITY_DIRS = ['hosts/', 'projects/', 'concepts/', 'deals/'];
 
 /** Pages a fuzzy fact attribution may land on: entities, never meetings, notes or other documents. */
-function isFactEntityPage(slug: string, type: string | null): boolean {
+export function isFactEntityPage(slug: string, type: string | null): boolean {
   return isIdentityEntity(slug, type) || (type != null && FACT_ENTITY_TYPES.has(type))
     || FACT_ENTITY_DIRS.some(dir => slug.startsWith(dir));
 }
@@ -278,7 +280,7 @@ export async function resolveEntitySlugWithSource(
   if (basenames.length > 1) return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
 
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, trimmed);
     if (expanded) return { slug: expanded, source: 'prefix_expansion' };
   } else {
     const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
@@ -286,6 +288,95 @@ export async function resolveEntitySlugWithSource(
   }
 
   return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+}
+
+/**
+ * How a strict reference resolution found its page. `basename` is the
+ * unique-slug-basename arm and `same_name` the trigram arm restricted to
+ * pages carrying the same name tokens (both are `fuzzy_match` in
+ * resolveEntitySlugWithSource).
+ */
+export type StrictResolutionArm = 'exact_page' | 'alias_exact' | 'basename' | 'same_name';
+
+/**
+ * A strict resolution miss: `ambiguous` (two live pages qualify),
+ * `unverified` (only a bare-name prefix guess exists), `not_entity` (the
+ * reference names a live page that is not a fact entity, e.g. a meeting) or
+ * `no_page`.
+ */
+export type StrictResolution =
+  | { slug: string; arm: StrictResolutionArm }
+  | { slug: null; miss: 'ambiguous' | 'unverified' | 'not_entity' | 'no_page' };
+
+/**
+ * Resolve a name to a live fact-entity page using only identity evidence:
+ * exact slug, unique slug basename, unique alias and, with `sameName`, the
+ * same-name trigram arm. Never guesses from a bare-name prefix and never
+ * falls back to a slugified name. With `excludePrivate`, private pages are
+ * removed before uniqueness is counted, so an unreadable namesake can neither
+ * be returned nor change the outcome for a remote caller.
+ */
+export async function resolveStrictEntityReference(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+  opts: { sameName?: boolean; excludePrivate?: boolean } = {},
+): Promise<StrictResolution> {
+  const trimmed = raw.trim();
+  if (!trimmed) return { slug: null, miss: 'no_page' };
+  const privacy = opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+  const live = async (slugs: string[]) => slugs.length === 0 ? [] : engine.executeRaw<{ slug: string; type: string | null }>(
+    `SELECT p.slug, p.type FROM pages p
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.slug = ANY($2::text[]) ${privacy}`,
+    [source_id, [...new Set(slugs)]],
+  );
+  const pick = (rows: Array<{ slug: string; type: string | null }>, arm: StrictResolutionArm): StrictResolution | null => {
+    if (rows.length > 1) return { slug: null, miss: 'ambiguous' };
+    if (rows.length === 0) return null;
+    return isFactEntityPage(rows[0].slug, rows[0].type) ? { slug: rows[0].slug, arm } : { slug: null, miss: 'not_entity' };
+  };
+
+  if (looksLikeSlug(trimmed)) {
+    const exact = pick(await live([trimmed]), 'exact_page');
+    if (exact) return exact;
+  }
+  const token = slugify(trimmed);
+  if (!trimmed.includes('/') && token.includes('-')) {
+    const basename = pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
+    if (basename) return basename;
+  }
+  const norm = normalizeAlias(trimmed);
+  if (norm) {
+    try {
+      const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
+      const aliased = pick(await live(hits.map(h => h.slug)), 'alias_exact');
+      if (aliased) return aliased;
+    } catch (err) {
+      if (!isUndefinedTableError(err)) throw err;
+    }
+  }
+  if (opts.sameName && !isBareName(trimmed)) {
+    try {
+      const rows = await engine.executeRaw<{ slug: string; title: string; type: string | null }>(
+        `SELECT p.slug, p.title, p.type FROM pages p
+          WHERE p.source_id = $1 AND p.deleted_at IS NULL ${privacy}
+            AND (lower(p.title) % $2 OR p.slug ILIKE '%' || $3 || '%')
+          ORDER BY GREATEST(similarity(lower(p.title), $2), similarity(p.slug, $3)) DESC, p.slug ASC
+          LIMIT 5`,
+        [source_id, trimmed.toLowerCase(), token],
+      );
+      const named = pick(rows.filter(row => isFactEntityPage(row.slug, row.type) && sameEntityName(trimmed, row.title, row.slug)), 'same_name');
+      if (named) return named;
+    } catch (err) {
+      if (!isMissingTrigramError(err)) throw err;
+    }
+  }
+  if (isBareName(trimmed) && token) {
+    const prefixed = (await findPrefixCandidates(engine, source_id, token)).map(c => c.slug);
+    // Readable scope applies here too, so a private namesake never changes a remote outcome.
+    if ((opts.excludePrivate ? await live(prefixed) : prefixed).length > 0) return { slug: null, miss: 'unverified' };
+  }
+  return { slug: null, miss: 'no_page' };
 }
 
 /**
@@ -386,13 +477,43 @@ export async function findPrefixCandidates(
   }
 }
 
+/**
+ * The sole prefix candidate, or, when every candidate sits in one entity
+ * directory, the one page whose title is exactly the bare name: "Acme" is
+ * `companies/acme-0` titled "Acme", not `companies/acme-labs-50` titled
+ * "Acme Labs" (gbrain-evals N9-5). A collision across directories (a person
+ * and a host) or two exact titles stays ambiguous.
+ */
 async function tryUnambiguousPrefixExpansion(
   engine: BrainEngine,
   source_id: string,
-  token: string,
+  raw: string,
 ): Promise<string | null> {
+  const token = slugify(raw);
   const candidates = await findPrefixCandidates(engine, source_id, token);
-  return candidates.length === 1 ? candidates[0].slug : null;
+  if (candidates.length === 1) return candidates[0].slug;
+  if (candidates.length === 0) return null;
+  const patterns = PREFIX_EXPANSION_DIRS.flatMap(dir => [`${dir}/${token}`, `${dir}/${token}-%`]);
+  try {
+    const dirs = await engine.executeRaw<{ dir: string }>(
+      `SELECT DISTINCT split_part(slug, '/', 1) AS dir FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE ANY($2::text[])
+        LIMIT 2`,
+      [source_id, patterns],
+    );
+    if (dirs.length !== 1) return null;
+    const rows = await engine.executeRaw<{ slug: string; title: string | null }>(
+      `SELECT slug, title FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL
+          AND slug LIKE ANY($2::text[]) AND lower(title) = lower($3)
+        LIMIT 3`,
+      [source_id, patterns, raw.trim()],
+    );
+    const exact = rows.filter(r => sameEntityName(raw, r.title, r.slug));
+    return exact.length === 1 ? exact[0].slug : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -463,7 +584,7 @@ async function tryPrefixExpansion(
   return null;
 }
 
-function looksLikeSlug(s: string): boolean {
+export function looksLikeSlug(s: string): boolean {
   // Slug shape: lowercase letters/digits with at least one slash OR matches
   // [a-z0-9-]+ exactly. Anything with whitespace or capital letters fails.
   if (/\s/.test(s)) return false;

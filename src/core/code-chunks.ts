@@ -3,11 +3,12 @@ import type { ChunkInput, CodeEdgeInput } from './types.ts';
 import { chunkCodeTextFull } from './chunkers/code.ts';
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { sanitizeRemoteBody } from './remote-body.ts';
+import { credentialSafeProjection } from './credential-projection.ts';
 import { isEmbedSkipped } from './embed-skip.ts';
 import { isQuarantined } from './quarantine.ts';
 
 export async function prepareCodeChunks(page: { compiled_truth: string; frontmatter?: Record<string, unknown> | null }, path: string) {
-  const content = sanitizeRemoteBody(page.compiled_truth);
+  const content = credentialSafeProjection(sanitizeRemoteBody(page.compiled_truth));
   const prepared = isEmbedSkipped(page.frontmatter) || isQuarantined(page.frontmatter)
     ? { chunks: [], edges: [] } : await chunkCodeTextFull(content, path);
   const chunks: ChunkInput[] = prepared.chunks.map((c, i) => ({
@@ -36,7 +37,8 @@ export async function installCodeChunkEdges(engine: BrainEngine, slug: string, s
     const from = index === null ? undefined : ranges[index];
     if (!from?.symbol_name_qualified) continue;
     edges.push({ from_chunk_id: from.id, to_chunk_id: null, from_symbol_qualified: from.symbol_name_qualified,
-      to_symbol_qualified: edge.toSymbol, edge_type: edge.edgeType, source_id: sourceId });
+      to_symbol_qualified: edge.toSymbol, edge_type: edge.edgeType, source_id: sourceId,
+      ...(edge.memberCall ? { edge_metadata: { member_call: true } } : {}) });
   }
   if (edges.length) await engine.addCodeEdges(edges);
 }

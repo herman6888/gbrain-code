@@ -103,6 +103,12 @@ check('legacy company consent retry preserves the approved manifest and original
     principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: intent, intent };
   await admitWrite(engine, admission);
   expect(await performSync(engine, { sourceId: f.sourceId })).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_request: { request_id: requestId } } });
+  // #5988: a company-profile source never holds or converts a content refusal; it keeps blocking.
+  const message = (await getWriteRequest(engine, admission.principal, requestId))!.error_message;
+  await engine.executeRaw('UPDATE persistence_requests SET error_message=$2 WHERE request_id=$1::uuid', [requestId, 'Invalid YAML frontmatter: bad indentation of a mapping entry (3:1)']);
+  expect(await performSync(engine, { sourceId: f.sourceId })).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_request: { request_id: requestId } } });
+  expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='sync-hold' AND fingerprint LIKE $1", [`${f.sourceId}:%`])).toEqual([]);
+  await engine.executeRaw('UPDATE persistence_requests SET error_message=$2 WHERE request_id=$1::uuid', [requestId, message]);
   const failed = (await getWriteRequest(engine, admission.principal, requestId))!;
   expect(failed.error_code).toBe('invalid_params');
   expect(await performSync(engine, { sourceId: f.sourceId, retryFailed: true })).toMatchObject({ status: 'synced' });

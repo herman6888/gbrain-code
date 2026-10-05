@@ -28,6 +28,7 @@ import { parseTakesFence, TAKES_FENCE_BEGIN, type ParsedTake } from '../takes-fe
 import { walkMarkdownFiles } from '../../commands/extract.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { maintenanceAttribution, maintenanceTransaction } from '../persistence/attribution.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 
 export interface ExtractTakesOpts {
@@ -130,7 +131,7 @@ async function flushBatch(
   if (dryRun) {
     result.takesUpserted += buffer.length;
   } else {
-    const inserted = await engine.addTakesBatch(buffer);
+    const inserted = await maintenanceTransaction(engine, tx => tx.addTakesBatch(buffer));
     result.takesUpserted += inserted;
   }
   buffer.length = 0;
@@ -297,6 +298,7 @@ async function reextractCoordinated(
   rebuild: boolean,
   result: ExtractTakesResult,
 ): Promise<void> {
+  const attribution = await maintenanceAttribution(engine);
   await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
     await tx.lockPageKeys([{ sourceId, slug }]);
     const [page] = await tx.executeRaw<{ id: number; compiled_truth: string | null; timeline: string | null }>(
@@ -306,7 +308,7 @@ async function reextractCoordinated(
     const takes = await reconcilePageTakes(tx, page, slug, rebuild, false, result);
     if (takes.length === 0) return;
     result.takesUpserted += await tx.addTakesBatch(takes.map(t => takesPreparation.toCanonicalBatchInput(page.id, t)));
-  }));
+  }, attribution));
 }
 
 /** Single-entry dispatch for `gbrain extract takes` and the v0_28_0 orchestrator. */

@@ -19,7 +19,8 @@ Any of these commands stream events when `--progress-json` is set:
 - `gbrain extract [links|timeline|all]` (fs or db source)
 - `gbrain import`
 - `gbrain sync`
-- `gbrain migrate --to …`
+- `gbrain migrate --to …` (graduation reports one phase per step and ticks per
+  table and batch; the legacy copier reports the `migrate.copy_*` phases below)
 - `gbrain repair-jsonb`
 - `gbrain check-backlinks`
 - `gbrain lint`

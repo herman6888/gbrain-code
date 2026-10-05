@@ -61,6 +61,10 @@ CHECKS=(
   # true orphans (unreachable from every entrypoint AND every test) and any
   # test-only module without a reasoned PERMITTED_TEST_ONLY entry. ~1s.
   "check:orphan-modules"
+  # agent contract v1 (A2): generated docs/guides/error-codes.md matches the registry
+  "check:error-codes"
+  # agent contract v1 scanner (B9): shrink-only per-rule baselines
+  "check:agent-contract"
   # No-op placeholder assertions (expect(true).toBe(true) and friends) in
   # test/**/*.test.ts; TypeScript AST scan, ~3s over the full corpus.
   "check:test-placeholders"
@@ -131,6 +135,9 @@ CHECKS=(
   # EO10 (refactor wave 1): engine-sql/ and schema-migrations/ never import
   # back up into the engine façades or migrate.ts (ESM TDZ cycles).
   "check:layering"
+  # #5595/#5475: no fsync of a read-only descriptor outside src/core/fs-durable.ts
+  # (Windows refuses it with EPERM).
+  "check:durable-flush"
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"

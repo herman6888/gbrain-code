@@ -229,13 +229,13 @@ title: 旧数据
   });
 });
 
-describe('migration v187 idempotency', () => {
-  test('v187 exists, is marked idempotent, and re-runs cleanly', async () => {
+describe('migration v204 idempotency', () => {
+  test('v204 exists, is marked idempotent, and re-runs cleanly', async () => {
     // Renumbered from v150 during the v0.60.25.0 merge (upstream claimed v150).
-    const v187 = MIGRATIONS.find(m => m.version === 187);
-    expect(v187).toBeDefined();
-    expect(v187!.name).toBe('cjk_bigram_fts');
-    expect(v187!.idempotent).toBe(true);
+    const v204 = MIGRATIONS.find(m => m.version === 204);
+    expect(v204).toBeDefined();
+    expect(v204!.name).toBe('cjk_bigram_fts');
+    expect(v204!.idempotent).toBe(true);
 
     // Seed a row so the backfill UPDATE has work to do, then run the
     // migration SQL twice. Both runs must succeed and the row must stay
@@ -248,8 +248,8 @@ title: 迁移幂等
 负责人延期交付，验证迁移可重跑。`;
     await importFromContent(engine, 'originals/cjk-migrate-idem', md, { noEmbed: true });
 
-    await engine.runMigration(187, v187!.sql!);
-    await engine.runMigration(187, v187!.sql!);
+    await engine.runMigration(204, v204!.sql!);
+    await engine.runMigration(204, v204!.sql!);
 
     const hits = await engine.searchKeyword('延期');
     expect(hits.length).toBeGreaterThan(0);

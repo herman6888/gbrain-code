@@ -6,49 +6,10 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
-import { loadConfig, type GBrainConfig } from '../../../core/config.ts';
 // Leaf module (no flag surface of its own) — see that file for why this
 // isn't imported from extract-conversation-facts.ts directly (#4135).
-import { ALLOWED_TYPES } from '../../../core/facts/conversation-types.ts';
-
-function hasNonEmptyChatFallbackChain(value: unknown): boolean {
-  if (Array.isArray(value)) {
-    return value.some((entry) => typeof entry === 'string' && entry.trim().length > 0);
-  }
-  if (typeof value !== 'string' || value.trim().length === 0) return false;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (Array.isArray(parsed)) {
-      return parsed.some((entry) => typeof entry === 'string' && entry.trim().length > 0);
-    }
-  } catch {
-    // `config set` stores raw strings; any non-empty non-JSON value is set.
-  }
-  return true;
-}
-
-/**
- * `chat_fallback_chain` is accepted by config and reaches the gateway config,
- * but no production chat path consumes it. Keep the warning in doctor rather
- * than config loading so ordinary commands stay quiet. Returning null for an
- * empty value keeps clean doctor reports silent instead of adding an OK line.
- */
-export async function checkChatFallbackChainInert(
-  engine: BrainEngine,
-  effectiveConfig: Pick<GBrainConfig, 'chat_fallback_chain'> | null = loadConfig(),
-): Promise<Check | null> {
-  const fileOrEnvSet = hasNonEmptyChatFallbackChain(effectiveConfig?.chat_fallback_chain);
-  const dbValue = await engine.getConfig('chat_fallback_chain').catch(() => null);
-  if (!fileOrEnvSet && !hasNonEmptyChatFallbackChain(dbValue)) return null;
-  return {
-    name: 'chat_fallback_chain_inert',
-    status: 'warn',
-    message:
-      '`chat_fallback_chain` is set but currently has no effect: no production chat path consumes it. ' +
-      'If you set it expecting fallback behavior, clear it from every plane that still holds a value: ' +
-      'the DB (`gbrain config unset chat_fallback_chain`), `~/.gbrain/config.json`, and `GBRAIN_CHAT_FALLBACK_CHAIN`.',
-  };
-}
+import { ALLOWED_TYPES, conversationFactsEligibleSql, pageTypesForAllowed, isConversationFactsEligiblePage, requireParseableConversationFlag } from '../../../core/facts/conversation-types.ts';
+import { checkError } from '../check-fix.ts';
 
 /**
  * v0.32.3 [CDX-20]: surface mode + per-key override drift.
@@ -291,7 +252,11 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
           status: 'warn',
           message:
             `${source} is "${resolved}" but that provider/model lacks native tool calling. ` +
-            `The subagent loop cannot run on this model — runtime will fall back to claude-sonnet-4-6. ` +
+            `The subagent loop cannot run on this model — ` +
+            // #5432: an explicit models.subagent is not swapped; dispatch refuses it.
+            (source === 'models.subagent'
+              ? `jobs are refused at dispatch. `
+              : `runtime will fall back to claude-sonnet-4-6. `) +
             `Fix: \`gbrain config set ${source} <provider>:<model-with-tools>\` (e.g. anthropic:claude-sonnet-4-6 or openai:gpt-5.2).`,
         };
       }
@@ -388,11 +353,7 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
         : `Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability`,
     };
   } catch (e) {
-    return {
-      name: 'subagent_capability',
-      status: 'warn',
-      message: `Could not check subagent capability: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('subagent_capability', 'check subagent capability', e);
   }
 }
 
@@ -560,6 +521,9 @@ export async function computeConversationFactsBacklogCheck(
       }
     }
 
+    // #5330: the extractor's eligibility rule (aliases + conversation_parseable), not type alone.
+    const concreteTypes = pageTypesForAllowed(types as Parameters<typeof pageTypesForAllowed>[0]);
+    const strict = await requireParseableConversationFlag(engine);
     const rows = await engine.executeRaw<{
       backlog: string | number;
       completed: string | number;
@@ -583,7 +547,7 @@ export async function computeConversationFactsBacklogCheck(
           AND f.source_session = f.source || ':' || p.slug || ':page-' ||
             p.content_hash || '-' ||
             COALESCE(TO_CHAR(p.effective_date AT TIME ZONE 'UTC', 'YYYY-MM-DD'), 'none')
-         WHERE p.type = ANY($1::text[])
+         WHERE ${conversationFactsEligibleSql('p', '$1', strict)}
            AND p.deleted_at IS NULL
            AND COALESCE(BTRIM(p.frontmatter->>'raw_transcript'), '') = ''
            AND p.content_hash IS NOT NULL
@@ -594,7 +558,7 @@ export async function computeConversationFactsBacklogCheck(
          COALESCE(SUM(completed), 0) AS completed,
          COALESCE(SUM(CASE WHEN completed = 0 THEN non_extractable ELSE 0 END), 0) AS non_extractable
        FROM outcomes`,
-      [types],
+      [concreteTypes],
     );
 
     let backlog = Number(rows[0]?.backlog ?? 0);
@@ -610,17 +574,17 @@ export async function computeConversationFactsBacklogCheck(
     const verifierSources = await engine.executeRaw<{ source_id: string }>(
       `SELECT DISTINCT source_id
          FROM pages
-        WHERE type = ANY($1::text[])
+        WHERE ${conversationFactsEligibleSql('pages', '$1', strict)}
           AND deleted_at IS NULL
           AND (
             COALESCE(BTRIM(frontmatter->>'raw_transcript'), '') <> ''
             OR content_hash IS NULL
           )
         ORDER BY source_id`,
-      [types],
+      [concreteTypes],
     );
     for (const { source_id: sourceId } of verifierSources) {
-      for (const type of types) {
+      for (const type of concreteTypes) {
         let offset = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -632,6 +596,7 @@ export async function computeConversationFactsBacklogCheck(
           });
           if (batch.length === 0) break;
           const verifyInProcess = batch.filter((page) => {
+            if (!isConversationFactsEligiblePage(page, concreteTypes, strict)) return false;
             const raw = page.frontmatter?.raw_transcript;
             return (typeof raw === 'string' && raw.trim().length > 0) ||
               page.content_hash == null;

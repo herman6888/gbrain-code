@@ -65,6 +65,31 @@ beforeEach(() => {
 });
 
 describe('gbrain#5607 — local recall --grep filters in SQL before LIMIT', () => {
+  test('rejects malformed --limit values and accepts a positive integer', async () => {
+    const originalExit = process.exit;
+    const originalStderr = process.stderr.write;
+    const refused: string[] = [];
+    process.exit = ((code?: number) => { refused.push(String(code)); throw new Error('exit intercepted'); }) as typeof process.exit;
+    process.stderr.write = ((chunk: string | Uint8Array) => { captured += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString(); return true; }) as typeof process.stderr.write;
+    try {
+      for (const value of ['3x', 'abc', '0']) {
+        let exited = false;
+        try { await runRecall(engine, ['--limit', value]); } catch (error) { exited = (error as Error).message === 'exit intercepted'; }
+        expect(exited).toBe(true);
+        expect(refused.at(-1)).toBe('2');
+        expect(captured).toContain(`got "${value}"`);
+        captured = '';
+      }
+    } finally {
+      process.exit = originalExit;
+      process.stderr.write = originalStderr;
+    }
+    const needle = await seed({ entity: 'g5607-limit-valid' });
+    const out = await recallJson(['--grep', needle, '--limit', '3']);
+    expect(out.facts.map(f => f.fact)).toEqual([needle]);
+    await engine.executeRaw(`DELETE FROM facts WHERE entity_slug='g5607-limit-valid'`);
+  });
+
   test('needle older than the newest-N window is still found (no-filter arm)', async () => {
     const needle = await seed({ entity: 'g5607-a' });
     const out = await recallJson(['--grep', 'g5607 needle', '--limit', String(LIMIT)]);

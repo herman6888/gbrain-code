@@ -53,8 +53,11 @@ import {
 import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
 import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
 import { bundledPackPath } from '../core/schema-pack/bundled-assets.ts';
-import { gbrainPath, loadConfig, configPath, toEngineConfig, type GBrainConfig } from '../core/config.ts';
+import { gbrainPath, loadConfig, configPath, toEngineConfig, isThinClient, type GBrainConfig } from '../core/config.ts';
+import { opError } from '../core/ops/contract.ts';
 import { readDbSchemaPack } from '../core/schema-pack/best-effort.ts';
+import { sanitizeTypeForDisplay } from '../core/schema-pack/type-usage.ts';
+import { yamlScalar } from '../core/frontmatter-inference.ts';
 
 export async function runSchema(args: string[]): Promise<void> {
   const sub = args[0];
@@ -466,7 +469,14 @@ function parseFlags(args: string[]): ParsedFlags {
 
 async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
   const { createEngine } = await import('../core/engine-factory.ts');
-  const cfg = loadConfig() ?? { engine: 'pglite' as const };
+  const cfg: GBrainConfig = loadConfig() ?? { engine: 'pglite' };
+  // A thin client has no local database: refuse rather than die with "No
+  // database URL" or read an empty in-memory PGLite (#5102).
+  if (isThinClient(cfg) && !cfg.database_url) {
+    throw opError('requires_local_engine',
+      'This `gbrain schema` subcommand reads the brain database, which lives on the brain host; it is not routable from a thin client.',
+      'Use the matching schema_* MCP tool (e.g. `schema_stats`) from your agent, or run it on the brain host.');
+  }
   // PR #1321 (closed) defensive fix retained: build the EngineConfig once and
   // pass it to BOTH createEngine and engine.connect. The factory captures
   // config at construction; explicit re-pass at connect() is defense in depth
@@ -596,7 +606,7 @@ async function runInitCmd(args: string[]): Promise<void> {
   };
   const yaml = `# Stub pack — extends gbrain-base by default. Add your own page_types below.
 api_version: ${stub.api_version}
-name: ${stub.name}
+name: ${yamlScalar(stub.name)}
 version: ${stub.version}
 gbrain_min_version: ${stub.gbrain_min_version}
 extends: gbrain-base
@@ -845,9 +855,13 @@ async function runReviewOrphansCmd(args: string[]): Promise<void> {
     console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
     return;
   }
-  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`);
+  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`
+    + (result.pack ? ` (pack ${result.pack})` : ' (no active pack resolved: only untyped pages checked)'));
+  for (const u of result.undeclared_types) {
+    console.log(`  type '${sanitizeTypeForDisplay(u.type)}' is not declared in the pack: ${u.count} page(s)`);
+  }
   for (const o of result.orphans.slice(0, 20)) {
-    console.log(`  ${o.slug}`);
+    console.log(`  ${o.slug}${o.reason === 'undeclared' ? ` (type ${sanitizeTypeForDisplay(o.type)})` : ' (untyped)'}`);
   }
   if (result.orphan_count > 20) {
     console.log(`  ... and ${result.orphan_count - 20} more (use --json to see all)`);
@@ -1005,8 +1019,11 @@ async function runStatsCmd(args: string[]): Promise<void> {
     }
     console.log(`Pack: ${result.pack_identity ?? '(no pack loaded)'}`);
     console.log(`Total pages: ${result.aggregate.total_pages}`);
-    console.log(`Typed: ${result.aggregate.typed_pages} (${(result.aggregate.coverage * 100).toFixed(1)}%)`);
+    console.log(`Typed: ${result.aggregate.typed_pages}; matching the active pack: ${(result.aggregate.coverage * 100).toFixed(1)}%`);
     console.log(`Untyped: ${result.aggregate.untyped_pages}`);
+    if (result.aggregate.undeclared_pages > 0) {
+      console.log(`Undeclared type: ${result.aggregate.undeclared_pages} (not a page type or alias of the active pack; list them with \`gbrain schema review-orphans\`)`);
+    }
     if (result.aggregate.by_type.length > 0) {
       console.log(`\nBy type:`);
       for (const t of result.aggregate.by_type) {

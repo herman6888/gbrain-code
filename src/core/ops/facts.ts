@@ -18,12 +18,14 @@ import { readHolders } from './context.ts';
 
 import type { Operation, OperationContext } from './contract.ts';
 import { OperationError, verbError } from './contract.ts';
+import { invalidParam, paramUse } from './op-fix.ts';
 import { assertExplicitSourceLive, federatedSearchScope, parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { packToBudget, estimateTokens, resultTokens } from '../search/token-budget.ts';
+import { redactRetrievalOutput } from '../search/output-redaction.ts';
 import { isAvailable } from '../ai/gateway.ts';
 // #4209: the named entity-hints cap — surfaced in the extract_facts param
 // description and the entity_hints_used/_dropped response fields.
@@ -40,8 +42,10 @@ import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 
 const extract_facts: Operation = {
   name: 'extract_facts',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description:
-    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
+    'Extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
   params: {
     request_id: { ...WRITE_REQUEST_PARAM, description: `${WRITE_REQUEST_PARAM.description} Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior.` },
     turn_text: { type: 'string', required: true, description: 'The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.' },
@@ -98,10 +102,9 @@ const extract_facts: Operation = {
     if (p.valid_from !== undefined && p.valid_from !== null) {
       const d = new Date(p.valid_from as string);
       if (!Number.isFinite(d.getTime())) {
-        throw new OperationError(
-          'invalid_params',
+        throw invalidParam(ctx, 'extract_facts', 'valid_from',
           `invalid valid_from: "${String(p.valid_from)}" — expected a parseable ISO 8601 datetime`,
-        );
+          { def: extract_facts.params.valid_from, example: '2026-08-11T00:00:00Z' });
       }
       validFrom = d;
     }
@@ -199,23 +202,25 @@ function recallEvidencePlan(ctx: OperationContext, p: Record<string, unknown>): 
 
 const recall: Operation = {
   name: 'recall',
-  description:
-    'MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. Filters hot-memory facts by entity / since / session_id; pass `query` to ALSO run hybrid search over pages (results[] arm); pass `budget_tokens` for server-side packing (response reports budget_used + dropped_count — never trims client-side). Remote callers see visibility=world facts only. Routing: for ONE known person/company/project card use `entity` (zero LLM); for broad questions needing reasoning use `synthesize` (expensive). Branch on structured fields (status/kind/evidence), never on prose. Every response carries protocol_version.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
+  description: 'MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.',
   params: {
-    entity: { type: 'string', description: 'Entity slug (canonical). Returns facts about this entity newest first, each labelled with its source_id. Across several granted sources, same-slug entities that no entity-identity group links are different entities: facts comes back empty and ambiguous_entity names each (source_id, entity_slug); pass source_id to read one.' },
-    query: { type: 'string', description: 'MEMORY_VERBS v1: free-text retrieval over pages (hybrid search arm). Response adds results[] (slug, title, chunk, evidence, create_safety, provenance). Combinable with entity (both arms run). Degrades to keyword-only search when no embedding provider is configured (search_degraded notes it; never an error).' },
-    budget_tokens: { type: 'number', description: 'MEMORY_VERBS v1: server-side token budget (char/4 estimate). Facts pack first, then results. Response adds budget_tokens, budget_used, dropped_count.' },
-    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Optional packing order. facts_first preserves legacy behavior (default). query_first packs the ranked page prefix before facts only with a nonblank query and positive finite budget; a positive budget below one token keeps neither arm. No query or inactive budget preserves legacy behavior. Neither policy skips oversized items or truncates. Supplying this option adds budget_packing accounting. Keep fact-focused/entity-filtered questions on facts_first.' },
-    source_id: { type: 'string', description: 'Optional concrete source id for both facts and page results. Narrows the caller’s authorized scope, including an explicit default; a denied, missing, or archived source fails rather than widening. Omit to preserve the existing context/grant scope.' },
-    since: { type: 'string', description: 'ISO 8601 datetime or duration shorthand (e.g. "8 hours ago"). Filters the FACTS arm only, on event time (valid_from, falling back to created_at); composes with `entity` and `session_id`. An unparseable value is rejected (invalid_params).' },
-    session_id: { type: 'string', description: 'Source session id (e.g. topic-A). Returns facts captured in that session.' },
-    include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
-    supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (facts with superseded_by set), newest first by COALESCE(expired_at, valid_until).' },
-    limit: { type: 'number', description: 'Per-arm cap: max fact rows AND max search results. Default 50, cap 100.' },
-    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied in SQL before the limit, so matches on high-cardinality entities are found even outside the newest-N window.' },
-    include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
-    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: "Evidence unit for the results[] arm (needs `query`; default config search.return_unit = 'auto'). 'window' adds neighbor chunks, 'section' the enclosing section or conversation rounds, 'page' the whole page/session (best for multi-session questions), 'auto' the whole page for conversation pages and the ranked chunk unchanged for everything else (budget_tokens or budget_policy without return_unit keeps chunk packing). Non-chunk units return one result per page with `delivered` metadata and a top-level `delivery` block; the evidence is budgeted by budget_tokens (default 6000, auto 24000) and then packed by recall's usual rules." },
-    return_window: { type: 'number', description: "Neighbor chunks on each side for return_unit 'window' (integer 1-3, default 1)." },
+    entity: { type: 'string', description: 'Entity slug; facts about it, newest first.' },
+    query: { type: 'string', description: 'Also search pages (results[] arm).' },
+    budget_tokens: { type: 'number', description: 'Token budget; facts pack first.' },
+    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'facts_first (default) or query_first.' },
+    source_id: { type: 'string', description: 'Narrow to one source you may read.' },
+    since: { type: 'string', description: 'Facts since (ISO 8601 or "8 hours ago").' },
+    session_id: { type: 'string', description: 'Facts captured in this session.' },
+    include_expired: { type: 'boolean', description: 'Include expired facts.' },
+    supersessions: { type: 'boolean', description: 'Only the supersession audit log.' },
+    limit: { type: 'number', description: 'Per-arm max (default 50, cap 100).' },
+    grep: { type: 'string', description: 'Substring of the fact text.' },
+    include_pending: { type: 'boolean', description: 'Add pending count.' },
+    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'Evidence unit for results[] (see search).' },
+    return_window: { type: 'number', description: 'Window size 1-3.' },
   },
   scope: 'read',
   verb: true,
@@ -228,7 +233,7 @@ const recall: Operation = {
 
     // Federated grants (cathedral-6): the fact arms honor the SAME scope
     // ladder as every other read-side op — federated array > scalar >
-    // default — via sourceScopeOpts, never a hand-rolled filter. The engine
+    // default — via federatedSearchScope, never a hand-rolled filter. The engine
     // fact APIs are scalar-source, so a federated grant fans out per granted
     // source and merges newest-first; a single-source caller takes exactly
     // the pre-v1 single-query path. A trusted-local `__all__` ({}) has no
@@ -237,7 +242,9 @@ const recall: Operation = {
     let scope: ReturnType<typeof sourceScopeOpts>;
     try {
       sourceIdParam = parseSourceIdParam(p.source_id, 'recall');
-      scope = sourceIdParam === undefined ? sourceScopeOpts(ctx) : federatedSearchScope(ctx, sourceIdParam);
+      // The facts arms widen an unqualified no-grant caller across the transport-computed
+      // federated set, exactly like the page-search arm below and every sibling read op.
+      scope = federatedSearchScope(ctx, sourceIdParam);
       await assertExplicitSourceLive(ctx, sourceIdParam);
     } catch (error) {
       if (!(error instanceof OperationError) || p.source_id === undefined || p.source_id === null) throw error;
@@ -245,9 +252,9 @@ const recall: Operation = {
         : error.code === 'unknown_source' ? 'not_found'
           : error.code === 'invalid_params' ? 'invalid_params' : null;
       if (code === null) throw error;
-      throw verbError(code, error.message,
+      throw Object.assign(verbError(code, error.message,
         error.suggestion ?? 'Choose a permitted active source, or omit source_id to use your existing scope.',
-        error.detail ?? error.code);
+        error.detail ?? error.code), error.fix ? { fix: error.fix } : {});
     }
     // Set-dedupe: a grant carrying a repeated id (or the scalar source again)
     // must not fan out the same source twice into the merge.
@@ -457,6 +464,11 @@ const recall: Operation = {
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
     }
 
+    // Pack what is delivered: results redacted for all; facts for remote only (localVerbatim).
+    const view = redactRetrievalOutput([{ facts: rows.map(r => ({ fact: r.fact, context: r.context, source: r.source })), results: searchResults }], {}).results[0];
+    searchResults = view.results;
+    if (ctx.remote !== false) rows = rows.map((r, i) => ({ ...r, ...view.facts[i] }));
+
     let packedFacts = rows;
     let packedResults = searchResults;
     let budgetUsed: number | undefined;
@@ -597,14 +609,16 @@ const dropAll = <T>(items: T[]) => ({ items: [] as T[], meta: { budget: 0, used:
 
 const context_pack: Operation = {
   name: 'context_pack',
-  description:
-    'MEMORY VERB (v1): budget-packed session-boundary bundle for a set of standing entities — entity cards + open threads + hot facts, zero-LLM, sub-second. Call at session start (warm cold context) and after compaction (rehydrate what the summary lost). WORLD-ONLY by default; pass include_private (honored for LOCAL trusted callers only) to widen all arms. budget_tokens packs server-side (response reports budget_used + dropped_count; cards pack first, then facts). Branch on structured fields, never prose. protocol_version rides every response.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
+  description: 'MEMORY VERB (v1): budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. Call at session start and after compaction.',
   params: {
-    entities: { type: 'string', required: true, description: 'Comma-separated entity names/slugs to bundle. Capped at 8.' },
-    budget_tokens: { type: 'number', description: 'Server-side token budget (char/4). Cards pack first, then facts; each item costs its rendered line and the envelope + section headers are reserved, so `text` fits the budget. Response adds budget_tokens, budget_used (tokens of `text`), dropped_count.' },
-    since: { type: 'string', description: 'ISO 8601 datetime. When set, open-thread events are filtered to those after this cursor.' },
-    session_id: { type: 'string', description: 'Opaque session id; keys the hot-memory cache and (on the push path) the session cursor.' },
-    include_private: { type: 'boolean', description: 'Local trusted callers only: widen ALL arms to include private facts. Ignored (world-only) for remote callers. Default false.' },
+    entities: { type: 'string', required: true, description: 'Comma-separated names or slugs (max 8).' },
+    budget_tokens: { type: 'number', description: 'Token budget; cards pack first.' },
+    since: { type: 'string', description: 'Only open-thread events after this ISO time.' },
+    session_id: { type: 'string', description: 'Opaque session id.' },
+    include_private: { type: 'boolean', description: 'Local trusted callers only.' },
   },
   scope: 'read',
   verb: true,
@@ -619,7 +633,7 @@ const context_pack: Operation = {
       throw verbError(
         'invalid_params',
         `context_pack: since is not a parseable timestamp: "${rawSince.slice(0, 60)}"`,
-        'Pass an ISO 8601 datetime, e.g. since: "2026-08-11T00:00:00Z".',
+        `Pass an ISO 8601 datetime, e.g. ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
       );
     }
     // Normalize to ISO (red-team F4): the filter + rendered text use it.
@@ -644,8 +658,12 @@ const context_pack: Operation = {
       maxEntities: PACK_DEFAULT_MAX_ENTITIES,
     });
 
-    let cards = res.cards ?? [];
-    let facts = res.facts ?? [];
+    // Pack, price and render the redacted presentation sets (one echo
+    // dictionary); local callers get the delivered facts back raw below.
+    const rawFacts = res.facts ?? [];
+    const view = redactRetrievalOutput([{ cards: res.cards ?? [], facts: rawFacts }], {}).results[0];
+    let cards = view.cards;
+    let facts = view.facts;
     // The SAME since filter the assembler applied (pre-landing review: the raw
     // flatMap silently dropped the documented `since` contract from the
     // structured array whenever budget packing ran) — shared with the card
@@ -687,7 +705,7 @@ const context_pack: Operation = {
         backlink_count: c.backlink_count,
       })),
       open_threads,
-      facts: facts.map((f) => ({
+      facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
         fact: f.fact,
         kind: f.kind,
         entity_slug: f.entity_slug,
@@ -707,15 +725,17 @@ const context_pack: Operation = {
 
 const delta: Operation = {
   name: 'delta',
-  description:
-    'MEMORY VERB (v1): "what changed since T" for heartbeats — pages updated after `since` + hot facts newer than `since` + open-thread events after `since`, zero-LLM. Lets a periodic wake maintain warm state in O(changes) instead of re-deriving. Optionally scope thread deltas to `entities`. WORLD-ONLY by default; include_private honored for local trusted callers only. budget_tokens packs server-side (pages first, then facts; threads are never dropped). protocol_version rides every response.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
+  description: 'MEMORY VERB (v1): what changed since a time (pages, facts, thread events), zero LLM. Keep a cursor with session_id, or pass since.',
   params: {
-    since: { type: 'string', description: 'ISO 8601 cursor. Returns pages/facts/thread-events newer than this timestamp. Optional when session_id carries an established cursor.' },
-    since_slug: { type: 'string', description: 'Stateless keyset resume: pass back `next_cursor.slug` from the previous response (paired with `since`=next_cursor.since) to page through pages sharing one timestamp. Ignored when session_id is set (the session cursor carries it).' },
-    entities: { type: 'string', description: 'Optional comma-separated entity scope for thread-event deltas. Capped at 8.' },
-    budget_tokens: { type: 'number', description: 'Server-side token budget (char/4). Pages pack first, then facts; each item costs its rendered line and the envelope + section headers + every thread line are reserved, so `text` fits the budget. Threads are never dropped (budget_used can exceed the budget only when the header + threads alone do). Response adds budget_tokens, budget_used (tokens of `text`), dropped_count.' },
-    session_id: { type: 'string', description: 'Opaque session id. Drives the per-session cursor: the first call establishes it, each call advances it to the newest DELIVERED change (at-least-once — with has_more:true the undelivered tail returns on the next wake). Without it, pass an explicit `since` for a stateless delta.' },
-    include_private: { type: 'boolean', description: 'Local trusted callers only: widen ALL arms to include private facts. Ignored (world-only) for remote callers. Default false.' },
+    since: { type: 'string', description: 'ISO 8601 cursor (or use session_id).' },
+    since_slug: { type: 'string', description: 'next_cursor.slug from the previous response.' },
+    entities: { type: 'string', description: 'Entity scope for thread events (max 8).' },
+    budget_tokens: { type: 'number', description: 'Token budget; pages pack first.' },
+    session_id: { type: 'string', description: 'Opaque session id; keeps a cursor.' },
+    include_private: { type: 'boolean', description: 'Local trusted callers only.' },
   },
   scope: 'read',
   verb: true,
@@ -731,7 +751,7 @@ const delta: Operation = {
       throw verbError(
         'invalid_params',
         `delta: since is not a parseable timestamp: "${rawSince.slice(0, 60)}"`,
-        'Pass an ISO 8601 datetime, e.g. since: "2026-08-11T00:00:00Z".',
+        `Pass an ISO 8601 datetime, e.g. ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
       );
     }
     // NORMALIZE to ISO immediately (red-team F4): the raw string is echoed
@@ -740,18 +760,18 @@ const delta: Operation = {
     // canonical microsecond shape `listPages` projects (`next_cursor.since`
     // passed back) is kept verbatim: rounding it through a JS Date would
     // re-select every same-millisecond row on the resumed wake.
-    // The verbatim passthrough must round-trip: a calendar-invalid but
-    // Date.parse-able value (2026-02-31T…) would otherwise reach the
-    // ::timestamptz cast raw and surface as an engine error, not invalid_params.
-    if (
-      rawSince !== null &&
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(rawSince) &&
-      new Date(rawSince).toISOString().slice(0, 19) !== rawSince.slice(0, 19)
-    ) {
+    // Date.parse normalizes dates such as Feb 31 into March. Check the ISO
+    // calendar date before normalization, including cursors without the
+    // microsecond passthrough shape.
+    const isoDate = rawSince?.match(/^(\d{4})-(\d{2})-(\d{2})T/);
+    const [year, month, day] = isoDate?.slice(1).map(Number) ?? [];
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (rawSince !== null && isoDate && (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1])) {
       throw verbError(
         'invalid_params',
         `delta: since is not a valid ISO 8601 calendar timestamp: "${rawSince.slice(0, 60)}"`,
-        'Pass a real calendar datetime, e.g. since: "2026-08-11T00:00:00Z".',
+        `Pass a real calendar datetime, e.g. ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')}.`,
       );
     }
     const explicitSince =
@@ -781,7 +801,7 @@ const delta: Operation = {
         throw verbError(
           'invalid_params',
           'delta requires `since` (ISO 8601) or a `session_id` with an established cursor.',
-          'Pass since ("2026-08-11T00:00:00Z") for a stateless delta, or a stable session_id — the first call establishes the cursor and later calls return only newer changes.',
+          `Pass ${paramUse(ctx, 'since', '2026-08-11T00:00:00Z')} for a stateless delta, or a stable ${paramUse(ctx, 'session_id', 'agent-main')} — the first call establishes the cursor and later calls return only newer changes.`,
         );
       }
       // First wake for this session: establish the cursor at now and report an
@@ -830,11 +850,17 @@ const delta: Operation = {
 
     // Pages arrive OLDEST first by (updated_at, slug) — no client-side dedup
     // needed; the keyset already excludes everything at/before the cursor.
-    let pages = res.deltaPages ?? [];
-    let facts = res.facts ?? [];
+    // Pack, price and render the redacted presentation sets (one echo
+    // dictionary). The cursor reads the raw page at the delivered index and
+    // local callers get the delivered facts back raw below.
+    const rawPages = res.deltaPages ?? [];
+    const rawFacts = res.facts ?? [];
+    const view = redactRetrievalOutput([{ pages: rawPages, facts: rawFacts, threads: res.openThreads ?? [] }], {}).results[0];
+    let pages = view.pages;
+    let facts = view.facts;
     // Threads are NEVER budget-dropped: they are the commitments a heartbeat
     // must not miss, and they have no keyset of their own to resume from.
-    const threads = res.openThreads ?? [];
+    const threads = view.threads;
     let droppedCount: number | undefined;
     let factsDropped = 0;
     const fetchedPages = pages.length;
@@ -874,7 +900,7 @@ const delta: Operation = {
     // NOT advance (deliver-before-advance; a too-small budget must not eat it).
     const nextCursor =
       pages.length > 0
-        ? { since: pages[pages.length - 1].updated_at, slug: pages[pages.length - 1].slug }
+        ? { since: rawPages[pages.length - 1].updated_at, slug: rawPages[pages.length - 1].slug }
         : { since: effectiveSince, slug: sinceSlug ?? '' };
     if (sessionId) {
       if (pages.length > 0) {
@@ -902,7 +928,7 @@ const delta: Operation = {
       protocol_version: MEMORY_VERBS_VERSION,
       since: effectiveSince,
       pages,
-      facts: facts.map((f) => ({
+      facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
         fact: f.fact,
         kind: f.kind,
         entity_slug: f.entity_slug,
@@ -927,6 +953,8 @@ const delta: Operation = {
 
 const forget_fact: Operation = {
   name: 'forget_fact',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description: 'Forget a fact by recording a durable withdrawal in its source and visibility. Strikes the Markdown facts fence when writable; otherwise keeps the withdrawal in the database. Stale imports cannot reactivate the same normalized claim. This retracts memory; original prose, files and backups may retain the text. Idempotent on already-expired or unknown ids.',
   params: {
     request_id: WRITE_REQUEST_PARAM,

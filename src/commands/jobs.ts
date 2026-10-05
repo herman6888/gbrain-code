@@ -99,7 +99,7 @@ export async function refreshGatewayForJob(engine: BrainEngine): Promise<void> {
 // pins this set against the registerBuiltinJob call sites — a gateway-using
 // handler registered via bare worker.register() runs with a stale gateway
 // (the #3387 chronicle_extract silent-no_events class).
-const GATEWAY_REFRESH_JOB_NAMES = new Set([
+export const GATEWAY_REFRESH_JOB_NAMES = new Set([
   'embed',
   'extract-conversation-facts',
   'enrich',
@@ -154,6 +154,7 @@ const JOBS_HELP = `gbrain jobs — Minions job queue
 
 USAGE
   gbrain jobs authorize-legacy --ids 12,34 [--expect <snapshot_digest> --yes] [--json]
+  gbrain jobs authorize-legacy --select "status=waiting|paused,name=synthesize" [--expect <hash> --yes] [--json]
   gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
                             [--delay Nms] [--max-attempts N] [--max-stalled N]
                             [--max-waiting N]
@@ -166,6 +167,7 @@ USAGE
   gbrain jobs list [--status S] [--queue Q] [--limit N] [--json]
   gbrain jobs get <id> [--json]
   gbrain jobs cancel <id>
+  gbrain jobs cancel --select "status=waiting|paused,name=synthesize" [--expect <hash> --yes] [--json]
   gbrain jobs retry <id>
   gbrain jobs prune [--older-than 30d] [--dry-run]
   gbrain jobs delete <id>
@@ -248,7 +250,7 @@ Other subcommands are fully described above.
  * without an entry fall back to JOBS_HELP, which documents them fully.
  */
 const JOBS_SUBCOMMAND_HELP: Record<string, string> = {
-  work: `gbrain jobs work — start a worker daemon (Postgres only)
+  work: `gbrain jobs work — start a worker daemon (PGLite: drain the queue and exit)
 
 USAGE
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
@@ -285,8 +287,9 @@ OPTIONS
                        Negative values need root.
 
 NOTES
-  Requires the Postgres engine — PGLite's exclusive file lock cannot host
-  a long-lived daemon. For crash-resilient operation prefer:
+  PGLite's exclusive file lock cannot host a long-lived daemon: there it runs
+  the waiting jobs in the foreground and exits once the queue is drained
+  (stop any running \`gbrain serve\` first). On Postgres prefer:
     gbrain jobs supervisor start --detach --json
 `,
   supervisor: `gbrain jobs supervisor — auto-restarting wrapper around 'gbrain jobs work'
@@ -335,14 +338,15 @@ USAGE
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
                             [--lock-duration-ms Nms]
-                            [--idempotency-key K] [--queue Q] [--dry-run]
-                            [--redact-secrets]
+                            [--idempotency-key K] [--queue Q] [--queue-only]
+                            [--dry-run] [--redact-secrets]
 
 OPTIONS
   --params JSON        Job payload (handler-specific; see HANDLER TYPES in
                        'gbrain jobs --help')
-  --follow             Run inline and stream progress (constructs a real
-                       worker; works on both engines)
+  --follow             Run inline and stream progress (works on both engines;
+                       required on PGLite, which has no background worker)
+  --queue-only         PGLite: queue without running (\`gbrain jobs work\` drains)
   --priority N         Lower runs first (default 0)
   --delay Nms          Delay before the job becomes claimable (default 0)
   --max-attempts N     Retry budget (default 3)
@@ -376,10 +380,31 @@ OPTIONS
 USAGE
   gbrain jobs authorize-legacy --ids 12,34 --json
   gbrain jobs authorize-legacy --ids 12,34 --expect <snapshot_digest> --yes --json
+  gbrain jobs authorize-legacy --select "status=waiting|paused,name=synthesize|ingest_capture" [--json]
+  gbrain jobs authorize-legacy --select "status=waiting|paused,name=synthesize|ingest_capture" --expect <hash> --yes
 
-Stop producers and workers and drain active jobs first. The first command only
-previews; apply requires the exact reviewed snapshot digest and --yes. Dependencies
-are shown but never implicitly authorized. IDs, data, schedule and retries persist.
+Stop producers (gbrain serve, gbrain autopilot) and workers and cancel active jobs
+first. A command without --yes only previews; apply requires the exact reviewed hash
+and --yes. --select keys: status (waiting, delayed, waiting-children, paused,
+completed, failed) and name, each taking | alternatives. The --select preview lists
+counts by job name and status, the first 20 ids and the preview hash, and the apply
+authorizes exactly the previewed set. Dependencies are shown but never implicitly
+authorized. IDs, data, schedule and retries persist.
+`,
+  cancel: `gbrain jobs cancel — cancel a job, or preview-bound bulk cancel of legacy jobs
+
+USAGE
+  gbrain jobs cancel <id>
+  gbrain jobs cancel --select "status=waiting|paused,name=synthesize" [--json]
+  gbrain jobs cancel --select "status=waiting|paused,name=synthesize" --expect <hash> --yes
+
+--select picks live jobs whose submission authority is missing or unsupported
+(the rows that block workers after an upgrade across v0.50). Keys: status
+(waiting, delayed, waiting-children, paused) and name, each taking | alternatives.
+Without --yes it only previews: counts by job name and status, the first 20 ids,
+parents that return to waiting, and the preview hash. The apply cancels exactly
+the previewed set; a selection that would cascade to a job outside it refuses.
+Stop producers and workers and cancel active jobs (gbrain jobs cancel <id>) first.
 `,
   prune: `gbrain jobs prune — delete old terminal jobs
 

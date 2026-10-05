@@ -29,7 +29,7 @@ import { carryLegacyFailCounts } from '../connectors/item-holds.ts';
  * sources.config, which stores only the account pointer.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fchmodSync, lstatSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
@@ -41,7 +41,7 @@ import { credentialId, openVault, type CredentialEntry, type CredentialVault } f
 import { createProgress, startHeartbeat } from '../progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../cli-options.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
-import { atomicWriteFileSync } from '../atomic-write.ts';
+import { atomicWriteFileSync, mkdirPrivate } from '../atomic-write.ts';
 import {
   CalendarClient,
   GmailClient,
@@ -66,6 +66,8 @@ import {
   type GoogleSourceState,
 } from './types.ts';
 import { LOOPS_EXTRACT_WINDOW_DAYS, loopExtractionEligibility } from './loops-extract.ts';
+import type { ThreadLoopVerdict } from './loop-detect.ts';
+import { pendingLoopsExtractDepth, recordGraceVerdict, runLoopsCatchup, seedGraceBackfill, settleDueGraceHolds, type LoopsEnqueueReport } from './loop-catchup.ts';
 
 export type { GoogleSourceConfig } from './types.ts';
 export { runGoogleAttachmentBackfill } from './attachment-backfill.ts';
@@ -109,22 +111,70 @@ export function readGoogleState(dir: string): GoogleSourceState {
     // A CORRUPT existing state file is not a fresh install: silently
     // returning emptyState() would re-run the entire backfill with zero
     // diagnostic. Quarantine for forensics and say so loudly.
+    const quarantine = `${file}.corrupt`;
+    let failure: { step: 'chmod' | 'rename'; path: string; error: unknown } | null = null;
     try {
-      renameSync(file, `${file}.corrupt`);
-    } catch { /* best-effort */ }
+      chmodSync(file, 0o600);
+    } catch (error) {
+      failure = { step: 'chmod', path: file, error };
+    }
+    try {
+      renameSync(file, quarantine);
+      if (failure) failure.path = quarantine;
+    } catch (error) {
+      failure ??= { step: 'rename', path: file, error };
+    }
     process.stderr.write(
       `[google] state file ${file} was corrupt (${e instanceof Error ? e.message : String(e)}); ` +
         `quarantined to .corrupt — cursors reset, the next sync re-anchors and resumes.\n`,
     );
+    if (failure) {
+      process.stderr.write(
+        `[google] could not secure the quarantined state file ${failure.path}: ${failure.step} failed ` +
+          `(${failure.error instanceof Error ? failure.error.message : String(failure.error)}). ` +
+          `It may be readable by other local users; run chmod 600 ${failure.path} or delete it.\n`,
+      );
+    }
     return emptyState();
   }
 }
 
 function writeGoogleState(dir: string, state: GoogleSourceState): void {
-  mkdirSync(dir, { recursive: true });
+  mkdirPrivate(dir);
   // Atomic (tmp+fsync+rename): this file is written once per backfill batch;
   // a torn write would silently reset every cursor (full re-backfill).
-  atomicWriteFileSync(googleStateFile(dir), JSON.stringify(state, null, 2));
+  // 0600 is reasserted on every write, so a legacy 0644 file tightens.
+  atomicWriteFileSync(googleStateFile(dir), JSON.stringify(state, null, 2), { mode: 0o600 });
+}
+
+/**
+ * Write a page's temp file privately: a stale `.tmp` left by a crash is
+ * removed first (never followed), then the temp file is created exclusively at
+ * 0600 and fchmod-ed past the umask before any byte lands. Renaming it over
+ * the page makes new and rewritten pages 0600.
+ */
+function writePrivateTemp(tmpPath: string, markdown: string): void {
+  let stale: ReturnType<typeof lstatSync> | null = null;
+  try { stale = lstatSync(tmpPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (stale?.isDirectory()) {
+    throw new Error(`Stale temporary path ${tmpPath} is a directory; remove it and re-run the sync.`);
+  }
+  if (stale) unlinkSync(tmpPath);
+  const buf = Buffer.from(markdown, 'utf-8');
+  const fd = openSync(tmpPath, 'wx', 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    let off = 0;
+    while (off < buf.length) {
+      const n = writeSync(fd, buf, off, buf.length - off);
+      if (n <= 0) throw new Error(`Short write to ${tmpPath} at offset ${off}/${buf.length}`);
+      off += n;
+    }
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The "my addresses" identity set: account + Gmail sendAs aliases. */
@@ -169,6 +219,10 @@ interface GoogleSyncDeps {
   /** Threads whose newest message falls in the recent window — LLM
    *  extraction candidates, enqueued (capped) after the sweep. */
   extractCandidates: Array<{ slug: string; threadId: string; newestMs: number }>;
+  /** #5868: the run's state (grace holds are recorded on it) and the threads detection ran on. */
+  loopState?: GoogleSourceState;
+  processedThreads: Set<string>;
+  graceBackfillSeeded?: boolean;
 }
 
 type ActivePack = { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
@@ -176,6 +230,12 @@ type ActivePack = { page_types: ReadonlyArray<{ name: string; path_prefixes: Rea
 async function saveGoogleState(deps: GoogleSyncDeps, state: GoogleSourceState): Promise<void> {
   if (deps.managed) await deps.managed.saveState(state);
   else writeGoogleState(deps.cfg.dir, state);
+}
+
+/** #5867/#5868 state a partial managed run still publishes (E20): never the Gmail cursor. */
+function loopRecoveryState(state: GoogleSourceState): Record<string, unknown> {
+  const fields = { loop_grace_holds: state.loop_grace_holds, loop_grace_backfill_done: state.loop_grace_backfill_done, loops_catchup: state.loops_catchup };
+  return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 }
 
 function assertContained(dir: string, path: string): void {
@@ -208,12 +268,12 @@ async function importRendered(
   }
   const filePath = join(deps.cfg.dir, relPath);
   assertContained(deps.cfg.dir, filePath);
-  mkdirSync(dirname(filePath), { recursive: true });
+  mkdirPrivate(dirname(filePath), deps.cfg.dir);
   const before = existsSync(filePath);
   // Temp-write → import → rename: a failed import never destroys the
   // previously-good page (github-source pattern).
   const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, markdown, 'utf-8');
+  writePrivateTemp(tmpPath, markdown);
   try {
     const { importFile } = await import('../import-file.ts');
     const result = await importFile(deps.engine, tmpPath, relPath, {
@@ -486,7 +546,9 @@ async function processThread(
     const state = message.attachmentInspection?.state ?? 'not_inspected';
     summary.attachmentInspection[state] = (summary.attachmentInspection[state] ?? 0) + 1;
   }
-  await applyLoopDetection(deps, thread, slug);
+  deps.processedThreads.add(thread.threadId);
+  const verdict = await applyLoopDetection(deps, thread, slug);
+  if (verdict && deps.loopState) recordGraceVerdict(deps.loopState, thread, verdict, slug, myAddressSet(deps.entry), deps.log);
   // LLM extraction candidates: trickle + the bounded recent window only —
   // the deep historical backfill is never extracted (spend honesty, F9).
   const newestMs = thread.messages[thread.messages.length - 1]?.internalDateMs ?? 0;
@@ -505,12 +567,23 @@ async function processThread(
   return thread;
 }
 
-/** Enqueue loops_extract jobs for every eligible candidate in this sweep. */
-async function enqueueLoopsExtraction(deps: GoogleSyncDeps): Promise<void> {
-  if (deps.extractCandidates.length === 0) return;
+/**
+ * Enqueue loops_extract jobs for every eligible candidate in this sweep, in
+ * both persistence modes (#5867: `--no-extract` gates only the inline
+ * link/timeline extract). Every skip logs its reason.
+ */
+async function enqueueLoopsExtraction(deps: GoogleSyncDeps): Promise<LoopsEnqueueReport> {
+  const report: LoopsEnqueueReport = { enqueued: 0, deferred: 0, skipped_reason: null };
+  if (deps.extractCandidates.length === 0) {
+    deps.log('[google] loops_extract: no eligible thread in this sweep; nothing to enqueue');
+    return { ...report, skipped_reason: 'no_candidates' };
+  }
   try {
     const { isLoopsExtractionEnabled, LOOPS_EXTRACT_JOB, LOOPS_EXTRACT_ENQUEUE_CEILING } = await import('./loops-extract.ts');
-    if (!(await isLoopsExtractionEnabled(deps.engine))) return;
+    if (!(await isLoopsExtractionEnabled(deps.engine))) {
+      deps.log(`[google] loops_extract: extraction disabled (loops.extraction_enabled) — skipped enqueue of ${deps.extractCandidates.length} eligible thread(s)`);
+      return { ...report, skipped_reason: 'extraction_disabled' };
+    }
     // No chat provider (keyless install, outage) → enqueue NOTHING. A job the
     // handler cannot run would fail-and-die and burn its revision-keyed
     // idempotency slot for nothing; the eligible threads stay unconsumed and
@@ -523,7 +596,7 @@ async function enqueueLoopsExtraction(deps: GoogleSyncDeps): Promise<void> {
           `skipped enqueue of ${deps.extractCandidates.length} eligible thread(s); they are queued on ` +
           `their next touch (or \`gbrain sync --source ${deps.sourceId} --full\`) once a provider is configured`,
       );
-      return;
+      return { ...report, skipped_reason: 'chat_unavailable' };
     }
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(deps.engine);
@@ -551,22 +624,14 @@ async function enqueueLoopsExtraction(deps: GoogleSyncDeps): Promise<void> {
     // The depth is PER SOURCE (payload `sourceId`, the key this enqueue
     // writes): a brain-wide count let one Google account's stalled backlog
     // pin every other source's budget at 0 forever.
-    const ordered = [...deps.extractCandidates].sort((a, b) => b.newestMs - a.newestMs);
+    // One candidate per page revision: a thread re-landed in one sweep is queued once.
+    const ordered = [...new Map(deps.extractCandidates.map((c) => [`${c.slug}:${c.newestMs}`, c])).values()].sort((a, b) => b.newestMs - a.newestMs);
     // Depth = every PENDING row, not just 'waiting': during a provider outage
     // each claimed job fails and parks as 'delayed' (retry backoff), and rows
     // in flight are 'active'. Counting 'waiting' alone read ~0 mid-outage and
     // let every sweep stack another ceiling's worth of jobs on the backlog.
-    let waitingDepth = 0;
-    try {
-      const rows = await deps.engine.executeRaw<{ n: string }>(
-        `SELECT count(*)::text AS n FROM minion_jobs
-          WHERE name = $1 AND status IN ('waiting', 'delayed', 'active') AND data->>'sourceId' = $2`,
-        [LOOPS_EXTRACT_JOB, deps.sourceId],
-      );
-      waitingDepth = parseInt(rows[0]?.n ?? '0', 10) || 0;
-    } catch {
-      // Fail-open: a missing table / transient error must never block enqueue.
-    }
+    // Fail-open: a missing table / transient error must never block enqueue.
+    const waitingDepth = await pendingLoopsExtractDepth(deps.engine, deps.sourceId);
     const budget = Math.max(0, LOOPS_EXTRACT_ENQUEUE_CEILING - waitingDepth);
     const picked = ordered.slice(0, budget);
     const dropped = ordered.length - picked.length;
@@ -581,7 +646,7 @@ async function enqueueLoopsExtraction(deps: GoogleSyncDeps): Promise<void> {
     for (const c of picked) {
       await queue.add(
         LOOPS_EXTRACT_JOB,
-        { slug: c.slug, sourceId: deps.sourceId, threadId: c.threadId },
+        { slug: c.slug, sourceId: deps.sourceId, threadId: c.threadId, newestMs: c.newestMs },
         {
           priority: 5,
           // Page-revision keyed: a re-sweep of an unchanged thread is a no-op,
@@ -592,8 +657,10 @@ async function enqueueLoopsExtraction(deps: GoogleSyncDeps): Promise<void> {
       );
     }
     deps.log(`[google] loops_extract: enqueued ${picked.length} eligible thread(s)`);
+    return { enqueued: picked.length, deferred: dropped, skipped_reason: null };
   } catch (e) {
     deps.log(`[google] loops_extract enqueue failed: ${e instanceof Error ? e.message : String(e)}`);
+    return { ...report, skipped_reason: 'enqueue_failed' };
   }
 }
 
@@ -602,13 +669,14 @@ async function applyLoopDetection(
   deps: GoogleSyncDeps,
   thread: GmailThreadData,
   pageSlug: string,
-): Promise<void> {
+): Promise<ThreadLoopVerdict | null> {
   try {
     const { applyThreadLoopVerdict } = await import('./loop-detect.ts');
-    await applyThreadLoopVerdict(deps.engine, deps.sourceId, thread, myAddressSet(deps.entry), pageSlug);
+    return await applyThreadLoopVerdict(deps.engine, deps.sourceId, thread, myAddressSet(deps.entry), pageSlug);
   } catch (e) {
     // Detection must never fail a sync; it re-runs on the next touch.
     deps.log(`[google] loop detection failed for ${thread.threadId}: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
   }
 }
 
@@ -820,6 +888,7 @@ async function sweepGmail(g: GmailSweep, onCurrent?: () => Promise<void>): Promi
     if (deps.opts.signal?.aborted) return false;
     await attemptThread(g, tid, null);
   }
+  if (await settleGraceHolds(g) === 'aborted') return false;
   const isCurrent = (): boolean => {
     if (delta !== 'done' || state.gmail_gap_floor_ms != null) return false;
     if (state.gmail_backfill_done) return true;
@@ -842,6 +911,34 @@ async function sweepGmail(g: GmailSweep, onCurrent?: () => Promise<void>): Promi
     }
   }
   return isCurrent();
+}
+
+/**
+ * #5868: seeds the one-shot grace backfill, then settles due grace holds.
+ * A re-fetch goes straight through processThread (never the item holds), so
+ * a failed grace re-fetch keeps the grace hold and is not an item failure.
+ */
+async function settleGraceHolds(g: GmailSweep): Promise<'aborted' | void> {
+  const { deps, state } = g;
+  try {
+    await seedGraceBackfill(deps.engine, deps.sourceId, state, deps.log);
+    deps.graceBackfillSeeded = true;
+  } catch (e) {
+    deps.log(`[google] loop grace backfill failed (retried next sweep): ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const settled = await settleDueGraceHolds({ engine: deps.engine, sourceId: deps.sourceId, state, log: deps.log, signal: deps.opts.signal,
+    processed: deps.processedThreads, refetch: async (tid) => {
+      try {
+        await processThread(deps, g.gmail, tid, g.activePack, g.summary, g.countedSlugs);
+        return 'ok';
+      } catch (e) {
+        if (e instanceof GoogleCursorExpiredError && e.status === 404) return 'gone';
+        if (deps.managed) rethrowConnectorWriteError(e);
+        deps.log(`[google] grace re-check of thread ${tid} failed (kept for the next sweep): ${e instanceof Error ? e.message : String(e)}`);
+        return 'failed';
+      }
+    } });
+  if (settled === 'aborted') return 'aborted';
 }
 
 /** Opens (or widens) the gap window `[after, floor)` that the floor walk drains newest→oldest. */
@@ -1107,7 +1204,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
   const gmail = new GmailClient(...clientArgs);
   const calendar = new CalendarClient(...clientArgs);
   const people = new PeopleClient(...clientArgs);
-  const deps: GoogleSyncDeps = { engine, sourceId, cfg, opts, entry, log, extractCandidates: [], managed };
+  const deps: GoogleSyncDeps = { engine, sourceId, cfg, opts, entry, log, extractCandidates: [], managed, processedThreads: new Set() };
 
   const summary: GoogleSyncSummary = {
     status: 'synced',
@@ -1159,6 +1256,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
   }
 
   const state = managed ? managed.state(emptyState()) : readGoogleState(cfg.dir);
+  deps.loopState = state;
   const firstRun = !state.gmail_backfill_done && state.gmail_history_id === null;
   // Fix wave 4: the Gmail poison ledger is read once and carried into the item holds.
   const holds = await ConnectorHoldSession.open(engine, sourceId, managed, emptyState() as unknown as Record<string, unknown>,
@@ -1232,21 +1330,42 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
     if (opts.signal?.aborted) summary.status = 'partial';
     if (opts.full && summary.status === 'synced') state.last_full_at = new Date().toISOString();
 
+    // #5867 managed-only 30-day catch-up and the #5868 one-shot backfill marker; never on an aborted sweep.
+    let catchup: LoopsEnqueueReport | null = null;
+    if (activeServices.includes('gmail') && !opts.signal?.aborted) {
+      if (deps.graceBackfillSeeded) state.loop_grace_backfill_done = true;
+      if (managed) {
+        try {
+          catchup = await runLoopsCatchup({ engine, sourceId, state, log, signal: opts.signal, myAddresses: myAddressSet(entry),
+            inFlight: new Set(deps.extractCandidates.map(c => c.slug)),
+            fetchThread: async (tid) => {
+              try { return await gmail.getThread(tid, cfg.account, opts.signal ? { signal: opts.signal } : {}); }
+              catch (e) { if (e instanceof GoogleCursorExpiredError && e.status === 404) return null; throw e; }
+            } });
+        } catch (e) {
+          log(`[google] loops catch-up failed (retried next sweep): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+
     // Per-service cursors were advanced in-place only on success; persist.
     // Throws connector_holds_exhausted before any save, so the cursor stays.
     state.item_holds = holds.finish();
     if (managed) {
       if (summary.status !== 'partial' && gmailSweepOk) await managed.saveState(state, true, new Date(state.gmail_newest_ms ?? Date.now()).toISOString());
-      // A partial run keeps the cursor its mid-run checkpoints committed and publishes only changed holds.
-      else if (!opts.signal?.aborted) await managed.publishHolds(emptyState() as unknown as Record<string, unknown>, state.item_holds);
+      // A partial run keeps the cursor its mid-run checkpoints committed and publishes changed holds plus the loop recovery state (#5867/#5868).
+      else if (!opts.signal?.aborted) await managed.publishHolds(emptyState() as unknown as Record<string, unknown>, state.item_holds, loopRecoveryState(state));
     } else writeGoogleState(cfg.dir, state);
     await holds.complete();
     // An aborted run (wall-clock budget, serve-delegation timeout) skips the
     // extract/embed/extraction tails — the deferred backfill machinery picks
     // them up on the next full run instead of overshooting the budget.
+    let loopsEnqueue: LoopsEnqueueReport | undefined;
     if (!opts.signal?.aborted) {
       await runExtractAndEmbed(deps, summary);
-      if (!managed || !opts.noExtract) await enqueueLoopsExtraction(deps);
+      const enqueued = await enqueueLoopsExtraction(deps);
+      loopsEnqueue = catchup ? { enqueued: enqueued.enqueued + catchup.enqueued, deferred: enqueued.deferred + catchup.deferred,
+        skipped_reason: enqueued.skipped_reason } : enqueued;
       // Auditable per-reason counts (loopExtractionEligibility) — no
       // addresses, subjects or body text ever reach the log.
       if (Object.keys(summary.extractEligibility).length > 0) {
@@ -1301,6 +1420,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
       embedded: summary.embedded,
       pagesAffected: summary.pagesAffected,
       ...(summary.failedFiles > 0 ? { failedFiles: summary.failedFiles } : {}),
+      ...(loopsEnqueue ? { loops_enqueue: loopsEnqueue } : {}),
       ...connectorHoldsResult(sourceId, holds.summary()),
     };
   } finally {

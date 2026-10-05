@@ -113,6 +113,18 @@ export function isWriteReceipt(value: unknown): value is WriteReceipt {
   return true;
 }
 
+/**
+ * #5249/#5232: the receipt of an admitted write still in flight. Keyed on the
+ * receipt's non-terminal state, never on an error code alone: a pre-admission
+ * refusal carries no receipt and is a failure (O-ENG-1).
+ */
+export function admittedPendingReceipt(envelope: unknown): WriteReceipt | null {
+  // Frozen memory verbs carry `error: 'unavailable'` with `write_error: 'write_pending'`.
+  if (!isRecord(envelope) || (envelope.error !== 'write_pending' && envelope.write_error !== 'write_pending')
+    || !isWriteReceipt(envelope.write_request)) return null;
+  return isTerminalWriteState(envelope.write_request.state) ? null : envelope.write_request;
+}
+
 /** Select public fields explicitly so internal journal columns cannot ride error envelopes. */
 export function publicWriteReceipt(receipt: WriteReceipt): WriteReceipt {
   return {

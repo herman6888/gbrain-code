@@ -376,8 +376,10 @@ export function formatRunSummary(outcome: RunSkillOptOutcome, receipt: RunReceip
     const detail = receipt.abort_detail ?? '(no detail captured)';
     lines.push(`[skillopt] Failure reason: ${receipt.abort_reason ?? 'unknown'}`);
     lines.push(`[skillopt] Detail: ${detail}`);
-    if (detail.includes('no_pricing')) {
-      lines.push(`[skillopt] Hint: model has no pricing entry; pass --no-max-cost (or --max-cost-usd 0) to run uncapped with a warn-once.`);
+    if (receipt.no_pricing) {
+      lines.push(`[skillopt] Hint: ${receipt.no_pricing.lookup} Register it with: ${receipt.no_pricing.register_command} — then retry; or pass --no-max-cost (or --max-cost-usd 0) to run uncapped with a warn-once.`);
+    } else if (detail.includes('no_pricing')) {
+      lines.push(`[skillopt] Hint: gbrain has no price for the model, so the cap can't be enforced. Look up its per-token price and register it with \`gbrain pricing set\` (see the detail above), then retry; or pass --no-max-cost (or --max-cost-usd 0) to run uncapped with a warn-once.`);
     }
   }
   if (receipt.stop_reason === 'early_stop_unusable_output') {

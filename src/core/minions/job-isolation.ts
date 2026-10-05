@@ -36,7 +36,7 @@
 import { accessSync, constants, readdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
-import { UnrecoverableError } from './types.ts';
+import { JobDeferredError, UnrecoverableError } from './types.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 import { basename, delimiter, resolve } from 'node:path';
@@ -90,7 +90,7 @@ export function childConfigurationError(reason: typeof CHILD_CONFIGURATION_REASO
   return new LocalConfigurationError(reason, `${messages[reason]} Verify worker and child readiness, then restart. See docs/guides/minions-fix.md#configuration-blocked.`);
 }
 
-export type ChildErrorKind = 'unrecoverable' | 'rate_lease' | 'generic' | 'local_configuration';
+export type ChildErrorKind = 'unrecoverable' | 'rate_lease' | 'deferred' | 'generic' | 'local_configuration';
 
 export type ChildOutcome =
   | { outcome: 'success'; result: unknown }
@@ -100,6 +100,7 @@ export type ChildOutcome =
       message: string;
       stack?: string;
       lease?: { key: string; active: number; max: number };
+      deferral?: { reason: string; retryInMs: number };
       protocolVersion?: number;
       reasonCode?: typeof CHILD_CONFIGURATION_REASONS[number];
     };
@@ -121,6 +122,9 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       message: err.message,
       lease: { key: err.key, active: err.active, max: err.max },
     };
+  }
+  if (err instanceof JobDeferredError) {
+    return { outcome: 'error', errorKind: 'deferred', message: err.message, deferral: { reason: err.reason, retryInMs: err.retryInMs } };
   }
   if (err instanceof UnrecoverableError) {
     return {
@@ -150,6 +154,9 @@ export function reconstructHandlerError(o: Extract<ChildOutcome, { outcome: 'err
   }
   if (o.errorKind === 'unrecoverable') {
     return new UnrecoverableError(o.message);
+  }
+  if (o.errorKind === 'deferred' && o.deferral && Number.isFinite(o.deferral.retryInMs)) {
+    return new JobDeferredError(String(o.deferral.reason), o.message, o.deferral.retryInMs);
   }
   const err = new Error(o.message);
   if (o.stack) {
@@ -205,9 +212,12 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
       Number.isFinite(rawLease.max as number);
     // rate_lease without a valid lease payload degrades to generic — same
     // policy as the errorKind whitelist.
+    const rawDeferral = (o as { deferral?: unknown }).deferral as { reason?: unknown; retryInMs?: unknown } | undefined;
+    const deferralValid = rawDeferral != null && typeof rawDeferral.reason === 'string' && Number.isFinite(rawDeferral.retryInMs as number);
     const errorKind =
       kind === 'unrecoverable' ? 'unrecoverable'
       : kind === 'rate_lease' && leaseValid ? 'rate_lease'
+      : kind === 'deferred' && deferralValid ? 'deferred'
       : 'generic';
     return {
       outcome: 'error',
@@ -218,6 +228,9 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
         : {}),
       ...(errorKind === 'rate_lease' && leaseValid
         ? { lease: { key: rawLease.key as string, active: rawLease.active as number, max: rawLease.max as number } }
+        : {}),
+      ...(errorKind === 'deferred' && deferralValid
+        ? { deferral: { reason: rawDeferral.reason as string, retryInMs: rawDeferral.retryInMs as number } }
         : {}),
     };
   }

@@ -38,8 +38,11 @@ import { preserveCanonicalFences } from '../core/cycle/concept-publication.ts';
 import type { WriteReceipt } from '../core/persistence/types.ts';
 import type { OperationContext } from '../core/operations.ts';
 import { configureGatewayIfUninitialized, isAvailable, chat, getChatModel, withBudgetTracker } from '../core/ai/gateway.ts';
-import { BudgetTracker, BudgetExhausted, loadPricingOverrides, type BudgetReason } from '../core/budget/budget-tracker.ts';
+import { BudgetTracker, BudgetExhausted, loadPricingOverrides, type BudgetReason, type NoPricingGuidance } from '../core/budget/budget-tracker.ts';
+import { noPricingSteps } from '../core/budget/no-pricing.ts';
+import { ERROR_CATALOGUE } from '../core/error-catalogue.ts';
 import { hybridSearch } from '../core/search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../core/search/internal-breadth.ts';
 import { serializeMarkdown } from '../core/markdown.ts';
 import { listSources } from '../core/sources-ops.ts';
 import {
@@ -50,6 +53,7 @@ import {
   type OpCheckpointKey,
 } from '../core/op-checkpoint.ts';
 import { createProgress } from '../core/progress.ts';
+import { consentGateOrExit, engineConsentEnv, tokenmaxUncappedEnv } from '../core/consent-cli.ts';
 import { getCliOptions, cliOptsToProgressOptions, maybeBackground } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
 import { runSlidingPool } from '../core/worker-pool.ts';
@@ -168,6 +172,8 @@ export interface EnrichResult {
   budget_exhausted_reason?: BudgetReason;
   /** Model that triggered a no_pricing abort, when the tracker knew it (#4032). */
   budget_exhausted_model?: string;
+  /** no_pricing abort: the lookup-and-register guidance (model, provider, kind, units, command, docs). */
+  budget_exhausted_pricing?: NoPricingGuidance;
   /** #2504 — first pool failure ('slug: message'), so pages_failed > 0 always
    *  carries a WHY (pool.failures was previously write-only). */
   first_failure?: string;
@@ -307,6 +313,7 @@ async function retrieveEvidence(
   // 3. Hybrid search on the entity name — pages that mention it.
   try {
     const hits = await hybridSearch(engine, title || slug, {
+      ...INTERNAL_BREADTH_SEARCH_OPTS,
       limit: HYBRID_SEARCH_LIMIT,
       sourceId,
     });
@@ -664,6 +671,7 @@ export async function runEnrichCore(
       // branch its advice instead of collapsing every abort into "raise the cap".
       result.budget_exhausted_reason = err.reason;
       if (err.modelId) result.budget_exhausted_model = err.modelId;
+      if (err.pricing) result.budget_exhausted_pricing = err.pricing;
       return result; // partial run; caller surfaces it (NOT a thrown failure)
     }
     throw err;
@@ -907,6 +915,7 @@ function addInto(agg: EnrichResult, r: EnrichResult): void {
   ) {
     agg.budget_exhausted_reason = r.budget_exhausted_reason;
     agg.budget_exhausted_model = r.budget_exhausted_model;
+    agg.budget_exhausted_pricing = r.budget_exhausted_pricing;
   }
   // #2504 — first failure seen across sources sticks (a sample, not a log).
   if (r.first_failure && agg.first_failure === undefined) {
@@ -920,13 +929,13 @@ function addInto(agg: EnrichResult, r: EnrichResult): void {
  * A no_pricing TX2 hard-fail is not a cost overrun — "raise --max-usd"
  * sends the operator after the wrong knob. Exported for tests.
  */
-export function budgetExhaustedMessage(reason?: BudgetReason, modelId?: string): string {
+export function budgetExhaustedMessage(reason?: BudgetReason, modelId?: string, pricing?: NoPricingGuidance): string {
   if (reason === 'no_pricing') {
     const m = modelId ? ` for ${modelId}` : '';
-    return (
-      `  No pricing${m} — the cost cap cannot be enforced. ` +
-      'Add a pricing entry for the model, or re-run uncapped (--max-usd off).'
-    );
+    const steps = pricing
+      ? noPricingSteps(pricing)
+      : `Look up the model's per-token price and register it with \`gbrain pricing set\` (see ${ERROR_CATALOGUE.no_pricing.docs}), then retry.`;
+    return `  No pricing${m} — the cost cap cannot be enforced. ${steps} Or re-run uncapped (--max-usd off).`;
   }
   return '  Budget cap reached. Re-run with a higher --max-usd to continue.';
 }
@@ -995,37 +1004,37 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
     process.exit(1);
   }
 
-  // v0.42.42.0 (#2139, D15A): enrich runs UNCAPPED when the operator says cost
-  // isn't the constraint — either explicit `--max-usd off` (parsed to Infinity)
-  // or `spend.posture=tokenmax` with no per-call cap. Uncapped → the missing-cap
-  // refusals lift AND runEnrichCore passes no ceiling to the BudgetTracker (spend
-  // still ledgered; posture removes the ceiling, not the accounting). An explicit
-  // finite --max-usd always wins (precedence: per-call > posture).
-  const explicitOff = parsed.maxCostUsd === Infinity;
-  const { resolveSpendPosture } = await import('../core/spend-posture.ts');
-  const posture = parsed.dryRun ? 'gated' : await resolveSpendPosture(engine);
-  const uncapped =
-    !parsed.dryRun && (explicitOff || (parsed.maxCostUsd === undefined && posture === 'tokenmax'));
-  if (uncapped) {
-    console.error(`${explicitOff ? '--max-usd off' : 'spend.posture=tokenmax'}: running uncapped, spend ledgered. docs: docs/operations/spend-controls.md`);
-  }
-
-  // Non-TTY execute without --max-usd or --yes is refused (cost guardrail).
-  if (!parsed.dryRun && parsed.maxCostUsd === undefined && !parsed.yes && !process.stdout.isTTY && !uncapped) {
-    console.error('Refusing to spend without a cap in a non-interactive context. Pass --max-usd <FLOAT> (or `off`), --yes, or set spend.posture=tokenmax.');
-    process.exit(1);
-  }
-
   const sourceIds: string[] = parsed.sourceId
     ? [parsed.sourceId]
     : (await listSources(engine)).map((s) => s.id);
 
-  // Dry-run cost preview (TTY) before spending.
-  if (!parsed.dryRun && process.stdout.isTTY && !parsed.yes && parsed.maxCostUsd === undefined && !uncapped) {
+  // A4 consent before spending. `--max-usd <usd>`, `--yes` (derived cap: the
+  // estimate x1.5), a per-run preapproval or spend.posture=tokenmax authorize
+  // it; `--max-usd off` is the explicit uncapped choice. tokenmax keeps its
+  // documented meaning here (D15A: the ceiling is removed, spend is still
+  // ledgered), so unattended tokenmax runs do not flip to a derived-cap stop.
+  // Without authorization: a TTY prompt, else exit 3 with the consent payload.
+  const explicitOff = parsed.maxCostUsd === Infinity;
+  let maxCostUsd = parsed.maxCostUsd;
+  if (!parsed.dryRun && !explicitOff) {
     const limit = parsed.limit ?? DEFAULT_LIMIT;
-    const est = (limit * sourceIds.length * COST_ESTIMATE_PER_PAGE_USD).toFixed(2);
-    console.error(`About to enrich up to ${limit} page(s) per source across ${sourceIds.length} source(s), est. ~$${est}. Re-run with --max-usd or --yes to confirm.`);
-    process.exit(2);
+    const estUsd = Math.ceil(limit * sourceIds.length * COST_ESTIMATE_PER_PAGE_USD * 100) / 100;
+    const auth = await consentGateOrExit({
+      command: 'enrich', effects: ['paid'], actor: 'agent',
+      what: `Enrich up to ${limit} page(s) per source across ${sourceIds.length} source(s)`,
+      why: 'Fills thin person and company pages with model-written summaries from the brain\'s own evidence.',
+      risk: `Spends about $${estUsd.toFixed(2)} with the chat model provider; pages gain model-written text (each write is attributed and can be reviewed).`,
+      user_message: `Enrich up to ${limit} thin page(s) per source across ${sourceIds.length} source(s) for about $${estUsd.toFixed(2)}?`,
+      argv: ['gbrain', 'enrich', ...args.filter(a => a !== '--yes')],
+      preview_argv: ['gbrain', 'enrich', ...args.filter(a => a !== '--yes' && a !== '--json'), '--dry-run'],
+      est_usd: estUsd,
+      args,
+    }, { json: parsed.json === true, env: engineConsentEnv(engine, await tokenmaxUncappedEnv(engine, parsed.maxCostUsd !== undefined)) });
+    if (maxCostUsd === undefined && auth.cap_usd !== null) maxCostUsd = auth.cap_usd;
+  }
+  const uncapped = !parsed.dryRun && maxCostUsd === Infinity;
+  if (uncapped) {
+    console.error(`${explicitOff ? '--max-usd off' : 'spend.posture=tokenmax'}: running uncapped, spend ledgered. docs: docs/operations/spend-controls.md`);
   }
 
   const aggregate = emptyAgg();
@@ -1045,7 +1054,7 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
         model: parsed.model,
         // uncapped (off / tokenmax) → Infinity sentinel; runEnrichCore maps it
         // to "no BudgetTracker ceiling".
-        maxCostUsd: uncapped ? Infinity : parsed.maxCostUsd,
+        maxCostUsd,
         minContextChars: parsed.minContextChars,
         thinThreshold: parsed.thinThreshold,
         reenrichAfterMs: parsed.reenrichAfterMs,
@@ -1086,7 +1095,7 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
     );
     if (anyBudgetExhausted) {
       console.log(
-        budgetExhaustedMessage(aggregate.budget_exhausted_reason, aggregate.budget_exhausted_model),
+        budgetExhaustedMessage(aggregate.budget_exhausted_reason, aggregate.budget_exhausted_model, aggregate.budget_exhausted_pricing),
       );
     }
   }

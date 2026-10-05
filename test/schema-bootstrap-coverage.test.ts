@@ -868,6 +868,11 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // migration block. Fresh installs and upgrades both get the column + index
   // from the migration chain, never from the bootstrap.
   'takes.embedding',
+  // takes vector provenance (#5885, take_embedding_identity): same migration-only
+  // table, no schema-blob reference; fresh installs and upgrades get both
+  // columns from the migration chain.
+  'takes.embedding_model',
+  'takes.embedded_text_hash',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so
@@ -894,6 +899,11 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'minion_jobs.quiet_hours',
   'minion_jobs.stagger_key',
   'sources.chunker_version',
+  // #5255/#5176: the upstream observation columns follow the same chain (PGLite
+  // gets them from migration sources_upstream_observation; no index uses them).
+  'sources.upstream_checked_at',
+  'sources.upstream_commit',
+  'sources.upstream_behind',
   'access_tokens.permissions',
   'takes.resolved_quality',
   'pages.emotional_weight_recomputed_at',
@@ -1012,6 +1022,10 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'persistence_requests.consumer_host_id',
   'persistence_requests.published_at',
   'persistence_brain.writer_version_cutoff',
+  // #5974 (migration v198) — structured publication failure detail. Same
+  // posture as v178: persistence_requests is migration-created on PGLite, no
+  // index references the column, and every reader treats NULL as no detail.
+  'persistence_requests.error_detail',
   // #5455 (migration v183) — managed mode epoch. persistence_brain is
   // migration-created on PGLite; no index in either blob references it, and
   // pre-migration readers go through to_jsonb(persistence_brain)->'mode_epoch'.

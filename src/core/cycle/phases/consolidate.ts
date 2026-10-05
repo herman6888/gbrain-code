@@ -29,6 +29,7 @@ import { createHash } from 'node:crypto';
 import { isAborted } from '../../abort-check.ts';
 import { maintenancePreflight, submitMaintenanceConsolidation } from '../../persistence/prepared-maintenance.ts';
 import { managedPersistenceEnabled } from '../../persistence/ownership.ts';
+import { maintenanceTransaction } from '../../persistence/attribution.ts';
 
 export interface ConsolidatePhaseOpts {
   dryRun?: boolean;
@@ -225,13 +226,13 @@ export async function runPhaseConsolidate(
         // would bypass that guard. Reuse its id so the facts still consolidate
         // into it, but leave the row untouched.
         if (existing[0].resolved_at === null) {
-          await engine.executeRaw(
+          await maintenanceTransaction(engine, tx => tx.executeRaw(
             `UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`,
             [sources.slice(0, 200), takeId],
-          );
+          ));
         }
       } else {
-        const inserted = await engine.addTakesBatch([{
+        const inserted = await maintenanceTransaction(engine, tx => tx.addTakesBatch([{
           page_id: pageId,
           row_num: nextRowNum,
           claim: best.fact,
@@ -241,7 +242,7 @@ export async function runPhaseConsolidate(
           since_date: sinceISO,
           source: sources.slice(0, 200),
           active: true,
-        }]);
+        }]));
         if (inserted < 1) continue;
 
         const idRows = await engine.executeRaw<{ id: number }>(
@@ -258,10 +259,10 @@ export async function runPhaseConsolidate(
       }
 
       // Mark all contributing facts consolidated.
-      for (const f of cluster) {
-        await engine.consolidateFact(f.id, takeId);
-        factsConsolidated += 1;
-      }
+      await maintenanceTransaction(engine, async tx => {
+        for (const f of cluster) await tx.consolidateFact(f.id, takeId);
+      });
+      factsConsolidated += cluster.length;
 
       // v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
       // Sort the cluster by (valid_from ASC, id ASC); walk consecutive
@@ -279,20 +280,22 @@ export async function runPhaseConsolidate(
         if (t !== 0) return t;
         return a.id - b.id;
       });
-      for (let i = 0; i < chronological.length - 1; i++) {
-        const older = chronological[i];
-        const newer = chronological[i + 1];
-        await engine.executeRaw(
-          // Only UPDATE when the new value would actually change. Avoids
-          // touching updated_at on no-op rewrites and keeps idempotency
-          // observable in the DB (zero affected rows on stable re-run).
-          `UPDATE facts
-             SET valid_until = $1
-           WHERE id = $2
-             AND (valid_until IS DISTINCT FROM $1)`,
-          [newer.valid_from, older.id],
-        );
-      }
+      await maintenanceTransaction(engine, async tx => {
+        for (let i = 0; i < chronological.length - 1; i++) {
+          const older = chronological[i];
+          const newer = chronological[i + 1];
+          await tx.executeRaw(
+            // Only UPDATE when the new value would actually change. Avoids
+            // touching updated_at on no-op rewrites and keeps idempotency
+            // observable in the DB (zero affected rows on stable re-run).
+            `UPDATE facts
+               SET valid_until = $1
+             WHERE id = $2
+               AND (valid_until IS DISTINCT FROM $1)`,
+            [newer.valid_from, older.id],
+          );
+        }
+      });
     }
   }
 

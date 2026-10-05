@@ -18,8 +18,9 @@ async function runHarness(
   deadlineMs: number,
   graceMs: number,
   hardCapMs: number,
+  progressWindowMs?: number,
 ): Promise<{ exitCode: number | null; signalled: boolean; elapsedMs: number; stdout: string; stderr: string; killedByTest: boolean }> {
-  const proc = Bun.spawn(['bun', HARNESS, mode, String(deadlineMs), String(graceMs)], {
+  const proc = Bun.spawn(['bun', HARNESS, mode, String(deadlineMs), String(graceMs), ...(progressWindowMs === undefined ? [] : [String(progressWindowMs)])], {
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -63,6 +64,31 @@ describe('process-watchdog integration (Bun-pinned)', () => {
     expect(r.exitCode).toBe(0);
     expect(r.killedByTest).toBe(false);
     expect(r.stdout).toContain('DISPOSED');
+    expect(r.elapsedMs).toBeLessThan(4000);
+  }, 15000);
+});
+
+// Large-brain ceiling (F4d): a 52k-document sync outlived the default hour
+// while still importing and was killed mid-run. The progress-aware deadline
+// extends while noteForwardProgress keeps arriving and stops the run only
+// after a full window without progress.
+describe('progress-aware deadline integration (Bun-pinned)', () => {
+  test('a run that keeps progressing past the deadline is never stopped', async () => {
+    const r = await runHarness('progress-with', 300, 150, 6000, 400);
+    expect(r.killedByTest).toBe(false);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('COMPLETED');
+    expect(r.stdout).not.toContain('STOP-NOTICE');
+    expect(r.stderr).toContain('still progressing');
+  }, 15000);
+
+  test('a run that stops progressing is stopped one window later, with the stop notice on stdout', async () => {
+    const r = await runHarness('progress-stalls', 300, 150, 6000, 400);
+    expect(r.killedByTest).toBe(false);
+    expect(r.signalled).toBe(true);
+    expect(r.stdout).toContain('STOP-NOTICE');
+    expect(r.stdout).not.toContain('SURVIVED');
+    expect(r.stderr).toContain('no progress for');
     expect(r.elapsedMs).toBeLessThan(4000);
   }, 15000);
 });

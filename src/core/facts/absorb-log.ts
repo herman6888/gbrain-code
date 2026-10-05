@@ -21,6 +21,7 @@
  *   - 'gateway_auth'    — provider authentication/authorization failed.
  *   - 'gateway_billing' — provider credit, quota, or billing hard limit failed.
  *   - 'gateway_rate_limit' — provider rate limit; retry policy remains with the caller.
+ *   - 'write_refused'   — the write path refused the facts write (an OperationError); the detail starts with its code.
  *   - eligibility_skip is intentionally NOT logged (high cardinality, low signal).
  *
  * The writer is best-effort — a failure to log SHOULDN'T blow up the
@@ -52,7 +53,24 @@ export const FACTS_ABSORB_REASONS = [
   'gateway_auth',
   'gateway_billing',
   'gateway_rate_limit',
+  'write_refused',
 ] as const;
+
+/**
+ * #5362: write-path refusals that no retry can change until an operator acts
+ * (a claimed canonical worktree before activation, a missing grant, a bad
+ * request, an unregistered writer). The facts-absorb job dead-letters them on
+ * the first attempt instead of re-running inference before the same refusal.
+ */
+export const DETERMINISTIC_WRITE_REFUSALS: readonly string[] = [
+  'writer_coordinator_required', 'permission_denied', 'invalid_params', 'writer_registration_required',
+];
+
+/** The OperationError code of a write-path refusal, or null. Name check keeps this module import-light. */
+export function writeRefusalCode(err: unknown): string | null {
+  const code = (err as { code?: unknown } | null)?.code;
+  return err instanceof Error && err.name === 'OperationError' && typeof code === 'string' ? code : null;
+}
 
 // v0.39.3.0 WARN-4 + CV13 — module-scoped flag so the first-occurrence
 // diagnostic log fires ONCE per process. Subsequent occurrences of the
@@ -134,9 +152,10 @@ export async function writeFactsAbsorbLog(
 }
 
 /**
- * Persist a provider failure without copying provider response bodies, keys,
- * or request payloads into ingest_log. Global failures get stable typed
- * reason codes; all other failures retain the existing classifier.
+ * Persist an extraction failure without copying provider response bodies,
+ * keys, or request payloads into ingest_log. A write-path refusal records its
+ * own code (`write_refused`); global provider failures get stable typed reason
+ * codes; all other failures retain the existing classifier.
  */
 export async function writeFactsAbsorbFailure(
   engine: BrainEngine,
@@ -144,6 +163,12 @@ export async function writeFactsAbsorbFailure(
   err: unknown,
   sourceId: string = 'default',
 ): Promise<void> {
+  const errorType = err instanceof Error && err.name ? err.name : 'Error';
+  const refusal = writeRefusalCode(err);
+  if (refusal) {
+    await writeFactsAbsorbLog(engine, ref, 'write_refused', `${refusal} (${errorType}): ${(err as Error).message}`, sourceId);
+    return;
+  }
   const globalClass = classifyGlobalLlmError(err);
   const reason: FactsAbsorbReason = globalClass === 'auth'
     ? 'gateway_auth'
@@ -152,8 +177,7 @@ export async function writeFactsAbsorbFailure(
       : globalClass === 'rate_limit'
         ? 'gateway_rate_limit'
         : classifyFactsAbsorbError(err);
-  const errorType = err instanceof Error && err.name ? err.name : 'Error';
-  await writeFactsAbsorbLog(engine, ref, reason, `provider request failed (${errorType})`, sourceId);
+  await writeFactsAbsorbLog(engine, ref, reason, `${reason.startsWith('gateway_') ? 'provider request failed' : 'extraction failed'} (${errorType})`, sourceId);
 }
 
 /**

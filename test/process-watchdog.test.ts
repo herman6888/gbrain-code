@@ -6,6 +6,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   watchdogDecision,
+  progressDeadlineDecision,
   installProcessWatchdog,
   clampWatchdogTimers,
   MAX_WATCHDOG_TIMER_MS,
@@ -301,5 +302,23 @@ describe('installLoopStallWatchdog (handle contract)', () => {
     const h = installLoopStallWatchdog({ stallMs: 60_000, label: "evil'; \n process.exit(1) //" });
     expect(h.active).toBe(true);
     h.dispose();
+  });
+});
+
+describe('progressDeadlineDecision (large-brain ceiling: never stop a progressing run)', () => {
+  test('waits before the deadline whatever the progress age', () => {
+    expect(progressDeadlineDecision(999, 1000, 10_000, 500)).toBe('wait');
+  });
+
+  test('past the deadline, recent progress extends', () => {
+    expect(progressDeadlineDecision(5000, 1000, 499, 500)).toBe('extend');
+  });
+
+  test('past the deadline, a full window without progress stops (inclusive)', () => {
+    expect(progressDeadlineDecision(5000, 1000, 500, 500)).toBe('stop');
+  });
+
+  test('a zero window keeps the strict wall-clock deadline', () => {
+    expect(progressDeadlineDecision(1000, 1000, 0, 0)).toBe('stop');
   });
 });

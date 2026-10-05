@@ -226,8 +226,25 @@ describe('data-safety native CI coverage', () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout.toString().trim().split('\n')).toEqual([
         '--no-env-file', 'scripts/persistence/validate.ts', '--engine=pglite',
-        `--operations=${operations}`, '--manifest=.context/persistence-manifest.json',
+        `--operations=${operations}`, '--robot-seconds=0', '--manifest=.context/persistence-manifest.json',
       ]);
     }
+  });
+
+  test('the crash robot runs beside the soak: 150 s on pull requests, 600 s elsewhere, Postgres through PgBouncer', () => {
+    const persistence = safeLoad(readFileSync(join(import.meta.dir, '../../.github/workflows/persistence-validation.yml'), 'utf8')) as {
+      jobs: { 'crash-robot': { steps: Step[]; services: Record<string, { env?: Record<string, string> }> } };
+    };
+    const job = persistence.jobs['crash-robot'];
+    expect(job.services.pgbouncer?.env?.POOL_MODE).toBe('transaction');
+    const step = job.steps.find(entry => entry.run?.includes('scripts/persistence/validate.ts'));
+    expect(step?.env?.ROBOT_SECONDS).toBe("${{ github.event_name == 'pull_request' && '150' || '600' }}");
+    expect(step?.env?.GBRAIN_PGBOUNCER_URL).toContain(':55433/');
+    const result = Bun.spawnSync(['bash', '-e', '-o', 'pipefail', '-c', `
+      bun() { printf '%s\\n' "$@"; }
+      ${step!.run!.replaceAll('${{ matrix.engine }}', 'postgres')}
+    `], { env: { PATH: process.env.PATH ?? '', ROBOT_SECONDS: '150' } });
+    expect(result.stdout.toString().trim().split('\n')).toEqual(['--no-env-file', 'scripts/persistence/validate.ts', '--engine=postgres',
+      '--schedules=0', '--operations=0', '--no-crashes', '--robot-seconds=150', '--manifest=.context/persistence-robot.json']);
   });
 });

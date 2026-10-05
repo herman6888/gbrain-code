@@ -35,6 +35,10 @@ Ingest meetings, articles, media, documents, and conversations into the brain.
 - Raw sources are preserved for provenance via `gbrain files upload-raw` with automatic size routing.
 - State sections are rewritten with current best understanding, never appended to.
 - Entity detection fires on every inbound message; notable entities get pages or updates.
+- Notability gate before any new entity page: existing pages are updated, and a NEW page is
+  created only for a notable entity and only with meaningful content from web search or
+  existing brain context — no stubs. A non-notable mention stays an inline reference on the
+  page that mentions it.
 
 > **Convention:** See `skills/conventions/quality.md` for Iron Law back-linking.
 
@@ -272,6 +276,14 @@ up 100 bad pages is enormous.
 - Source attribution: every timeline entry includes [Source: ...] citation
 - Back-links: every entity mention creates a back-link (Iron Law)
 - Filing: file by primary subject, not format or source (see filing rules)
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- The sub-skill this routes to fails: report which one and why, using that skill's own failure guidance; do not silently re-route to a generic page write.
+- `put_page` returns `write_pending` (exit 10) or `revision_conflict`: poll `gbrain write-request <request_id>`, or re-read and merge; never write a duplicate page.
+- `gbrain files upload-raw` is refused for size or path: store a pointer and tell the user the raw file was not uploaded.
 
 ## Anti-Patterns
 

@@ -18,6 +18,7 @@ import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import type { ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { ensureGbrainHome, resolveGbrainHome } from '../gbrain-home.ts';
+import { seatReasonHint } from './seat.ts';
 
 /** Heartbeat file line cap [S3#7]. */
 export const HEARTBEAT_MAX_LINES = 5000;
@@ -46,6 +47,8 @@ export interface HookHeartbeatEntry {
   inserted?: number;
   duplicate?: number;
   superseded?: number;
+  /** #5888 — `writeback_dedup` shadow count: near duplicates kept, never dropped (counts only). */
+  near_duplicate?: number;
   /**
    * Cathedral 5 — the compact hook's harvest-schedule ACK code
    * (`scheduled` / `skip_queue_full` / `skip_not_found` / `skip_bad_basename`
@@ -56,13 +59,32 @@ export interface HookHeartbeatEntry {
   flush?: string;
   /** Cathedral 5 — checkpoint-harvest verified-link COUNT (never slugs) [S3#7]. */
   links?: number;
+  /** Secret-scan pattern NAME behind a refusal (scanner vocabulary, never the value). */
+  pattern?: string;
+  /** `sha256:<hex16>` fingerprint of the refused value (never the value). */
+  fingerprint?: string;
+  /** Fixed recovery hint for the refusal reason (constant text, never content). */
+  hint?: string;
 }
 
 /** The FULL key allowlist — CI greps the fixture against this [S3#7]. */
 export const HEARTBEAT_ALLOWED_KEYS = [
   'ts', 'event', 'outcome', 'reason', 'duration_ms', 'turns', 'bytes', 'redactions',
-  'segment', 'inserted', 'duplicate', 'superseded', 'links', 'flush',
+  'segment', 'inserted', 'duplicate', 'superseded', 'near_duplicate', 'links', 'flush',
+  'pattern', 'fingerprint', 'hint',
 ] as const;
+
+/**
+ * The heartbeat line for a relay refused by the high-entropy re-scan: reason
+ * code, scanner pattern name, value fingerprint and a fixed recovery hint.
+ */
+export function relayRefusalHeartbeat(hit: { pattern: string; fingerprint: string }): HookHeartbeatEntry {
+  return {
+    ts: new Date().toISOString(), event: 'relay', outcome: 'degraded', reason: 'secret_scan_refused',
+    duration_ms: 0, pattern: hit.pattern, fingerprint: hit.fingerprint,
+    hint: 'receipt and relay skipped for this compaction window only; the checkpoint is banked and the next window is re-scanned',
+  };
+}
 
 /** Gbrain home resolver: the S3#10 choke point (create-or-resolve, fail-open). */
 async function resolveHome(): Promise<string> {
@@ -139,8 +161,13 @@ export async function writeHeartbeat(
       ...(entry.segment !== undefined ? { segment: entry.segment } : {}),
       ...(entry.inserted !== undefined ? { inserted: entry.inserted } : {}),
       ...(entry.duplicate !== undefined ? { duplicate: entry.duplicate } : {}),
+      ...(entry.near_duplicate !== undefined ? { near_duplicate: entry.near_duplicate } : {}),
       ...(entry.links !== undefined ? { links: entry.links } : {}),
       ...(entry.flush !== undefined ? { flush: entry.flush } : {}),
+      ...(entry.pattern !== undefined ? { pattern: entry.pattern } : {}),
+      ...(entry.fingerprint !== undefined ? { fingerprint: entry.fingerprint } : {}),
+      // A seat reason carries its fixed recovery hint even when the writer did not attach one.
+      ...((entry.hint ?? seatReasonHint(entry.reason)) !== undefined ? { hint: entry.hint ?? seatReasonHint(entry.reason) } : {}),
     });
     appendFileSync(p, line + '\n', { mode: 0o600 });
     if (opts?.trim === false) return;

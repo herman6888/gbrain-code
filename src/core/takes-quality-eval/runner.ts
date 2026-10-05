@@ -126,6 +126,7 @@ async function callOneModel(
       messages: [{ role: 'user', content: systemPrompt }],
       maxTokens: 2000,
       abortSignal,
+      allowFallback: false,
     });
     try {
       const parsed = parseModelJSON(result.text);

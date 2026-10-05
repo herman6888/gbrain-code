@@ -644,6 +644,8 @@ export async function probeModel(modelStr: string, touchpoint: 'chat' | 'expansi
     try {
       await chat({
         model: modelStr,
+        // A probe reports on this model; a chain hop would answer for another.
+        allowFallback: false,
         messages: [{ role: 'user', content: '.' }],
         // OpenAI rejects max_output_tokens below 16 ("Invalid
         // 'max_output_tokens': integer below minimum value. Expected a value

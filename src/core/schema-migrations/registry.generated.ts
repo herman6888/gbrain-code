@@ -187,7 +187,24 @@ import { v183 } from './v183-persistence-mode-epoch.ts';
 import { v184 } from './v184-decision-receipts.ts';
 import { v185 } from './v185-decide-calibrations.ts';
 import { v186 } from './v186-decide-proposals.ts';
-import { v187 } from './v187-cjk-bigram-fts.ts';
+import { v187 } from './v187-fact-relink-attempts.ts';
+import { v188 } from './v188-facts-ontology-stint-dedup.ts';
+import { v189 } from './v189-pages-credential-projection-pending.ts';
+import { v190 } from './v190-sources-upstream-observation.ts';
+import { v191 } from './v191-alias-source-cascade.ts';
+import { v192 } from './v192-take-embedding-identity.ts';
+import { v193 } from './v193-f1-write-attribution.ts';
+import { v194 } from './v194-f0-worktree-refreshes.ts';
+import { v195 } from './v195-f3-access-token-grants.ts';
+import { v196 } from './v196-f4-planner-stats.ts';
+import { v197 } from './v197-managed-guard-null-source-fallback.ts';
+import { v198 } from './v198-publication-failure-detail.ts';
+import { v199 } from './v199-chronicle-page-state.ts';
+import { v200 } from './v200-sync-hold-page-index.ts';
+import { v201 } from './v201-persistence-graduation.ts';
+import { v202 } from './v202-legacy-token-grant-conversion.ts';
+import { v203 } from './v203-oauth-client-grant-axes.ts';
+import { v204 } from './v204-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -374,4 +391,21 @@ export const MIGRATIONS: Migration[] = [
   v185,
   v186,
   v187,
+  v188,
+  v189,
+  v190,
+  v191,
+  v192,
+  v193,
+  v194,
+  v195,
+  v196,
+  v197,
+  v198,
+  v199,
+  v200,
+  v201,
+  v202,
+  v203,
+  v204,
 ];

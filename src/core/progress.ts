@@ -26,6 +26,8 @@
  * See docs/progress-events.md for the full reference.
  */
 
+import { noteForwardProgress } from './forward-progress.ts';
+
 export type ProgressMode = 'auto' | 'human' | 'json' | 'quiet';
 
 export interface ProgressOptions {
@@ -284,6 +286,7 @@ class Reporter implements ReporterInternal {
     const s = this.state;
     if (!s) return;
     s.done += n;
+    noteForwardProgress();
 
     if (this.renderMode === 'quiet') return;
 

@@ -6,6 +6,10 @@
  * and tests are unchanged.
  */
 
+import { shellQuote } from './shell-quote.ts';
+
+export { shellQuote };
+
 export const REDACTED = '***';
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
@@ -149,16 +153,6 @@ export function buildCodexMcpAddArgv(p: { name: string; url: string; envVar: str
  */
 export function buildOpencodeMcpAddArgv(p: { name: string; url: string; envVar: string }): string[] {
   return ['mcp', 'add', p.name, '--url', p.url, '--header', `Authorization=Bearer {env:${p.envVar}}`];
-}
-
-/**
- * POSIX single-quote any arg that isn't already shell-safe, so `$()`, backticks,
- * etc. in a token are inert literals when the block is pasted into a shell
- * (double-quoting would still allow command substitution).
- */
-export function shellQuote(arg: string): string {
-  if (/^[A-Za-z0-9_.:/@-]+$/.test(arg)) return arg;
-  return `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
 /** Render `<binary> <argv...>` as a copy-pasteable, shell-safe command string. */

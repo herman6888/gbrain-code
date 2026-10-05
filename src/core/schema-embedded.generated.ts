@@ -725,7 +725,11 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   grant_profile           TEXT NULL,
   grant_revision          INTEGER NOT NULL DEFAULT 0,
   grant_repair_reasons    TEXT[] NOT NULL DEFAULT '{}',
-  created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Explicit no-source grant ('none') and per-client takes holders (NULL =
+  -- ['world']); upgrades add both through src/core/grants/oauth-client-axes-schema.ts.
+  source_grant            TEXT NULL CHECK (source_grant IN ('none')),
+  takes_holders           TEXT[] NULL
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the write-source scope;
 -- federated_read is the read-source array. Migrations v60-v65 land both
@@ -815,6 +819,9 @@ CREATE TABLE IF NOT EXISTS op_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
   ON op_checkpoints (updated_at);
+-- #5988: read paths find the Git hold of a page by its id (migration v200).
+CREATE INDEX IF NOT EXISTS op_checkpoints_sync_hold_page_idx
+  ON op_checkpoints ((completed_keys->0->>'page_id')) WHERE op = 'sync-hold';
 
 -- #1794: append-only delta storage. One row per completed path; sync's
 -- appendCompleted INSERTs only the delta instead of rewriting the whole
@@ -1728,9 +1735,31 @@ END \$\$;
 
 -- Canonical page state (migration 150).
 -- BEGIN GENERATED from src/core/page-state/schema.ts (PAGE_STATE_SCHEMA_SQL). Edit that file, then run: bun run build:schema
-ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID NOT NULL DEFAULT gen_random_uuid();
+DO \$do\$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attisdropped) THEN
+      ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND atthasdef) THEN
+      ALTER TABLE sources ALTER COLUMN incarnation SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attnotnull) THEN
+      UPDATE sources SET incarnation = gen_random_uuid() WHERE incarnation IS NULL;
+      ALTER TABLE sources ALTER COLUMN incarnation SET NOT NULL;
+    END IF;
+  END \$do\$;
 CREATE UNIQUE INDEX IF NOT EXISTS sources_incarnation_key ON sources(incarnation);
-ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID NOT NULL DEFAULT gen_random_uuid();
+DO \$do\$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attisdropped) THEN
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND atthasdef) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attnotnull)
+       AND NOT EXISTS (SELECT 1 FROM pages) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET NOT NULL;
+    END IF;
+  END \$do\$;
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS text_projection_revision UUID;
 ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
 ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS timeline TEXT;
@@ -1745,6 +1774,11 @@ CREATE TABLE IF NOT EXISTS page_write_guards (
   );
 CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql AS \$fn\$
     BEGIN
+      IF OLD.knowledge_revision IS NULL THEN
+        NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
+        NEW.text_projection_revision := NULL;
+        RETURN NEW;
+      END IF;
       IF (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.compiled_truth,
           NEW.timeline, NEW.frontmatter, NEW.deleted_at)
          IS DISTINCT FROM
@@ -1800,6 +1834,42 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+-- #5876 (migration chronicle_page_state): Life Chronicle ledger, the durable
+-- record of each page content's automatic-extraction decision and outcome.
+CREATE TABLE IF NOT EXISTS chronicle_page_state (
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  extractor_version INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','skipped','extracted','failed')),
+  reason TEXT,
+  trigger TEXT NOT NULL CHECK (trigger IN ('auto','backfill')),
+  principal_kind TEXT,
+  principal_id TEXT,
+  request_id UUID,
+  no_extract BOOLEAN NOT NULL DEFAULT false,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at TIMESTAMPTZ,
+  cost_usd NUMERIC,
+  unpriced BOOLEAN NOT NULL DEFAULT false,
+  event_slugs TEXT[] NOT NULL DEFAULT '{}',
+  event_hashes TEXT[] NOT NULL DEFAULT '{}',
+  decided_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, page_id, content_hash, extractor_version)
+);
+CREATE INDEX IF NOT EXISTS chronicle_page_state_work_idx
+  ON chronicle_page_state (source_id, state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS chronicle_page_state_page_idx ON chronicle_page_state (page_id);
+CREATE TABLE IF NOT EXISTS chronicle_judge_reservations (
+  id BIGSERIAL PRIMARY KEY,
+  reserved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_id TEXT NOT NULL,
+  page_id INTEGER NOT NULL,
+  content_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chronicle_judge_reservations_at_idx ON chronicle_judge_reservations (reserved_at);
 -- Durable record that a transcript was synthesized; survives minion_jobs pruning.
 CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
   source_id TEXT NOT NULL,
@@ -1927,37 +1997,46 @@ BEGIN
         IS NOT DISTINCT FROM (OLD.last_commit,OLD.last_sync_at,OLD.newest_content_at) THEN RETURN NEW; END IF;
       allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
       IF NOT (allowed ? NEW.id) THEN
-        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication';
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:checkpoint',
+          DETAIL=jsonb_build_object('op',TG_OP,'relationship','checkpoint_outside_owner','target_source',NEW.id,'old_source',OLD.id,'allowed',allowed)::text;
       END IF;
       RETURN NEW;
     END IF;
     IF COALESCE(current_setting('gbrain.topology_change',true),'') <> 'on' THEN
-      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration';
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:topology',
+        DETAIL=jsonb_build_object('op',TG_OP,'relationship','topology_outside_administration','target_source',row_data->>'id','old_source',old_data->>'id')::text;
     END IF;
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
-    IF TG_TABLE_NAME='facts' THEN
-      row_data := row_data - ARRAY['embedding_model','embedded_text_hash'];
-      old_data := old_data - ARRAY['embedding_model','embedded_text_hash'];
-    END IF;
-    -- Embedding completion and retrieval telemetry are physical projections.
+    row_data := row_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    old_data := old_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    -- Embedding completion, retrieval telemetry and write attribution
+    -- (attribution-schema.ts; a journal backfill fills it) are physical projections.
     IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
       = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
   END IF;
-  IF row_data ? 'source_id' THEN target_source := row_data->>'source_id';
-  ELSE SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
-  IF TG_OP='UPDATE' THEN
-    IF old_data ? 'source_id' THEN old_source := old_data->>'source_id';
-    ELSE SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer; END IF;
+  IF TG_TABLE_NAME NOT IN ('tags','timeline_entries','takes') THEN
+    target_source := row_data->>'source_id'; old_source := old_data->>'source_id';
+  END IF;
+  IF target_source IS NULL THEN SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
+  IF TG_OP='UPDATE' AND old_source IS NULL THEN
+    SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer;
   END IF;
   -- Cascaded projection removal after the already-guarded parent deletion.
   IF target_source IS NULL AND TG_OP='DELETE' THEN RETURN OLD; END IF;
   allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
   IF target_source IS NULL OR NOT (allowed ? target_source) OR (old_source IS NOT NULL AND NOT (allowed ? old_source)) THEN
-    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator';
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:allowlist',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship',CASE WHEN target_source IS NULL THEN 'missing_source'
+        WHEN NOT (allowed ? target_source) THEN 'different_source' ELSE 'old_source_outside' END,
+        'target_source',target_source,'old_source',old_source,'allowed',allowed)::text;
   END IF;
   IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END \$fn\$;
+
 DO \$body\$
 DECLARE target text;
 BEGIN
@@ -2034,6 +2113,29 @@ CREATE TABLE IF NOT EXISTS persistence_topology_changes (
 ALTER TABLE persistence_topology_changes ADD COLUMN IF NOT EXISTS intent_bytes bigint NOT NULL DEFAULT 0 CHECK(intent_bytes>=0);
 CREATE INDEX IF NOT EXISTS persistence_topology_recovering ON persistence_topology_changes(created_at) WHERE state='recovering';
 -- END GENERATED from src/core/persistence/topology-schema.ts (PERSISTENCE_TOPOLOGY_SCHEMA_SQL)
+
+-- BEGIN GENERATED from src/core/persistence/worktree-refresh-schema.ts (WORKTREE_REFRESH_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS persistence_worktree_refreshes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  worktree_id uuid NOT NULL REFERENCES persistence_worktrees(id),
+  source_ids text[] NOT NULL,
+  principal_id uuid NOT NULL,
+  owner_epoch bigint NOT NULL,
+  topology_generation bigint NOT NULL,
+  state text NOT NULL CHECK (state IN ('draining','fenced','merged','syncing','completed','aborted','recovery_required')),
+  old_head text NOT NULL,
+  target_head text NOT NULL,
+  upstream_ref text NOT NULL,
+  preserved_uncommitted text[] NOT NULL DEFAULT '{}',
+  outcome jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS persistence_worktree_refreshes_active
+  ON persistence_worktree_refreshes(worktree_id)
+  WHERE state IN ('draining','fenced','merged','syncing','recovery_required');
+-- END GENERATED from src/core/persistence/worktree-refresh-schema.ts (WORKTREE_REFRESH_SCHEMA_SQL)
 
 -- BEGIN GENERATED from src/core/company-brain/receipt-schema.ts (SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL). Edit that file, then run: bun run build:schema
 CREATE TABLE IF NOT EXISTS source_ingestion_receipts (
@@ -2457,4 +2559,35 @@ DO \$rls\$ BEGIN
   END IF;
 END \$rls\$;
 -- END GENERATED from src/core/ai/decide/schema.ts (DECIDE_SCHEMA_SQL)
+
+-- gbrain facts relink attempts and journal (#5836).
+-- BEGIN GENERATED from src/core/facts/relink-schema.ts (FACT_RELINK_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS fact_relink_attempts (
+  source_id       TEXT NOT NULL,
+  fact_id         BIGINT NOT NULL,
+  outcome         TEXT NOT NULL,
+  reason          TEXT,
+  tier            TEXT,
+  model           TEXT,
+  target_slug     TEXT,
+  run_id          TEXT,
+  attempted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, fact_id)
+);
+CREATE INDEX IF NOT EXISTS fact_relink_attempts_outcome_idx ON fact_relink_attempts (source_id, outcome, attempted_at);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE fact_relink_attempts ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+-- END GENERATED from src/core/facts/relink-schema.ts (FACT_RELINK_SCHEMA_SQL)
+
+-- #5255/#5176 (O-DX-8): last upstream observation per source, recorded by sync
+-- from the checkout's Git state (upstream ref, its last fetch/push time, commits
+-- the synced commit lacks); doctor sync_freshness reads it with no subprocess.
+-- Added last so a fresh install has the column order an upgraded brain gets.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_checked_at TIMESTAMPTZ;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_commit TEXT;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_behind INTEGER;
+
 `;

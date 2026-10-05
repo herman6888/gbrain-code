@@ -734,11 +734,29 @@ are in [CHATGPT.md](CHATGPT.md#troubleshooting).
 
 **A claude.ai connector can search but not save**
 The `/mcp` challenge hints `read write`, and each token is capped to the
-client's registered scope. A connector approved before v0.60.5.0 was
-approved with the old `read` hint and keeps a read-only grant. Remove and
+client's registered scope. A connector approved before v0.60.5.0 received a
+`read`-only hint and keeps a read-only grant. Remove and
 re-add the connector, and approve `write` on the consent screen. If the
 client is registered with `read` only, widen it first
 ([ADMIN.md](ADMIN.md#inspect-clients-and-edit-access)).
+
+<a id="stall-watchdog"></a>**`serve --http` stops answering and spins at full CPU**
+Turn on the loop-stall watchdog so a wedged process exits instead of
+spinning until the host runs out of memory:
+`export GBRAIN_SERVE_STALL_WATCHDOG_MS=60000` in the serve process's
+environment (systemd `Environment=`, launchd `EnvironmentVariables`), then
+restart `gbrain serve --http`. A watchdog thread checks the main event loop;
+when the loop has not answered for that many milliseconds, it logs and sends
+SIGTERM, and 30 seconds later, if the loop is still stuck, SIGKILL, so a
+supervisor restarts the server. It is off by default (unset or `0`); values
+below 15000 are raised to 15000. Large PGLite brains pause the loop for tens of
+seconds during checkpoints, so keep 60000 or more there. The watchdog covers
+`serve --http` only; stdio `serve` exits with its client. Before every tool
+call, `serve --http` writes `[gbrain-serve] dispatch op=<name>
+args_sha256=<16 hex>` to stderr, so the last such line before a stall names the
+request that caused it. The digest is a SHA-256 of the call's JSON arguments
+(compute it on the client to match); the arguments themselves are never
+logged.
 
 **Claude Desktop doesn't connect**
 Remote servers must be added via Settings > Integrations, NOT

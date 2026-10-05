@@ -64,14 +64,20 @@ import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { chat as gatewayChat, withBudgetTracker, isAvailable } from '../ai/gateway.ts';
-import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
+import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8 } from '../text-safe.ts';
+import { corpusTextForExtraction } from '../context/corpus-segments.ts';
+import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
-import { resolveExtractAtomsCostGate, resolveEmbedModelForCostGate } from './extract-atoms-cost-gate.ts';
+import type { MaintenanceWriteWait } from '../persistence/maintenance-wait.ts';
+import { connectorAtomExclusionSql } from './connector-atoms.ts';
+import { resolveExtractAtomsCostGate, resolveEmbedModelForCostGate, settleExtractAtomsCostGate } from './extract-atoms-cost-gate.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
-import { upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { abortableSleep } from '../retry.ts';
+import { throwIfAborted } from '../abort-check.ts';
 import { createHash } from 'crypto';
 import { slugifySegment } from '../sync.ts';
 import { resolveTierDefault } from '../model-config.ts';
@@ -85,6 +91,7 @@ import { OperationError } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { AtomPageStateError, completeAtomReceipts, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
@@ -97,7 +104,7 @@ export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096;
 
 /**
  * gbrain#4148: consecutive same-content failures of a content-deterministic
- * class (malformed model output) before the page is tombstoned so the
+ * class (malformed model output or provider content block) before the page is tombstoned so the
  * backlog floor can clear. A content edit resets the streak.
  */
 export const MAX_DETERMINISTIC_FAILURES = 3;
@@ -214,6 +221,22 @@ export interface ExtractAtomsOpts {
    * `heartbeat()` on the passed reporter.
    */
   progress?: ProgressReporter;
+  /**
+   * #5809/#5832: hard stop (the drain's job + cycle-lock + deadline signals,
+   * or the routine cycle's signal). Passed to the chat call and the pacing
+   * pause, checked before each item and before each item's commit. Once
+   * aborted the run writes nothing more: the interrupted item takes no
+   * failure strike and the receipt/rollup writes are skipped.
+   */
+  signal?: AbortSignal;
+  /**
+   * Soft stop (the drain window): checked only before an item starts, so an
+   * in-flight item and its paid call finish and commit. Booked as an expected
+   * limit in the rollup, like a budget stop.
+   */
+  stopSignal?: AbortSignal;
+  /** #5856/#5854: one drain attempt's state shared by its batches: the first batch's BudgetTracker (one cap per attempt) and one publish wait. */
+  attempt?: { budgetTracker?: BudgetTracker; writeWait?: MaintenanceWriteWait };
 }
 
 interface ExtractedAtom {
@@ -373,6 +396,7 @@ export async function discoverExtractablePages(
   limit: number = PAGE_DISCOVERY_BUDGET,
 ): Promise<AtomPageInput[]> {
   const hasFilter = Array.isArray(affectedSlugs) && affectedSlugs.length > 0;
+  const connectorExclusion = await connectorAtomExclusionSql(engine);
   const sql = `
     SELECT p.id, p.knowledge_revision,
            (SELECT s.incarnation FROM sources s WHERE s.id=p.source_id) AS source_incarnation,
@@ -390,6 +414,7 @@ export async function discoverExtractablePages(
       AND length(COALESCE(p.compiled_truth, '')) >= $3
       ${MANAGED_ATOM_DISCOVERY_SQL}
       ${PAGE_SCAN_STATE_EXCLUSION_SQL}
+      ${connectorExclusion}
       ${hasFilter ? "AND p.slug = ANY($5::text[])" : ''}
       AND NOT EXISTS (
         SELECT 1
@@ -446,11 +471,13 @@ export async function discoverExtractablePages(
  * at runtime; this count covers DB pages only. Callers label that caveat.
  *
  * Fail-soft: returns null on error so the doctor check can report a warn
- * (query failed) rather than a misleading 0.
+ * (query failed) rather than a misleading 0. `opts.signal` cancels the query
+ * (the drain bounds it by its remaining deadline); a cancelled count is null.
  */
 export async function countExtractAtomsBacklog(
   engine: BrainEngine,
   sourceId?: string,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<number | null> {
   try {
     // Two modes: scoped (the phase's per-source `remaining`) vs brain-wide
@@ -458,6 +485,7 @@ export async function countExtractAtomsBacklog(
     // The atom must live in the SAME source as the page either way, so the
     // brain-wide form keys the NOT EXISTS on `atom.source_id = p.source_id`.
     const scoped = sourceId !== undefined;
+    const connectorExclusion = await connectorAtomExclusionSql(engine);
     const sql = scoped
       ? `SELECT COUNT(*) AS cnt FROM pages p
          WHERE p.source_id = $1
@@ -470,6 +498,7 @@ export async function countExtractAtomsBacklog(
            AND length(COALESCE(p.compiled_truth, '')) >= $3
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
+           ${connectorExclusion}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
              WHERE atom.type = 'atom' AND atom.source_id = $1
@@ -487,6 +516,7 @@ export async function countExtractAtomsBacklog(
            AND length(COALESCE(p.compiled_truth, '')) >= $2
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
+           ${connectorExclusion}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
              WHERE atom.type = 'atom' AND atom.source_id = p.source_id
@@ -498,7 +528,7 @@ export async function countExtractAtomsBacklog(
     const params = scoped
       ? [sourceId, extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION]
       : [extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION];
-    const rows = await engine.executeRaw<{ cnt: string | number }>(sql, params);
+    const rows = await engine.executeRaw<{ cnt: string | number }>(sql, params, { signal: opts.signal });
     return Number(rows[0]?.cnt ?? 0);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -660,7 +690,7 @@ export async function runPhaseExtractAtoms(
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
-  const managed = await managedAtomSession(engine, sourceId, opts._managedRetry);
+  const managed = await managedAtomSession(engine, sourceId, opts._managedRetry, opts.attempt?.writeWait);
   const writeRequests: WriteReceipt[] = [];
 
   // 1a. Get transcripts (test seam OR production discovery).
@@ -689,7 +719,7 @@ export async function runPhaseExtractAtoms(
       if (corpusDir !== undefined) {
         const discovered = discoverTranscripts({
           corpusDir,
-          meetingTranscriptsDir: meetingDir,
+          meetingTranscriptsDir: meetingDir, selfCaptureSessionIds: claudeCliSelfSessionIds(), // #5820, as synthesize
         });
         transcripts = discovered.map((d) => ({
           filePath: d.filePath,
@@ -905,55 +935,20 @@ export async function runPhaseExtractAtoms(
     // Keep safe defaults on any config-read failure: key-aware utility-tier
     // model, $0.30 cap, default input cap (max_input_chars).
   }
-  // A cost cap is only meaningful when the tracker can price EVERY call made
-  // under it. BudgetTracker.reserve() hard-fails with
-  // BudgetExhausted(reason:'no_pricing') when a model is absent from the pricing
-  // maps AND a cap is set; with no cap it warns once and proceeds. Because this
-  // phase always set a cap, every non-Anthropic chat model tripped that
-  // hard-fail on the first item, latched `budgetExhausted`, and skipped the
-  // entire workload while reporting ok.
-  //
-  // The chat model is not the only call under this tracker: the atom write
-  // site below goes through importFromContent, which chunks AND embeds inside
-  // the same withBudgetTracker scope. So the embedding model must be priceable
-  // too. Pre-fix, a $0 local chat model (ollama/llama-server) kept the cap on
-  // while an unpriced embedding route (e.g. `litellm:*`, which is deliberately
-  // NOT assumed free because a proxy can front a paid provider) threw
-  // no_pricing on the FIRST atom import — 0 atoms, `budget_exhausted: true`,
-  // $0 spent, on every run. The operator escape hatch the error message
-  // advertises (`pricing.overrides`, #4312) was also never loaded here, unlike
-  // enrich / ingest-facts / extract-conversation-facts.
-  //
-  // Only a DEFAULT cap may be dropped that way. When the operator set
-  // `cycle.extract_atoms.budget_usd` they asked for a ceiling; the gate keeps
-  // it and bills the unpriced embed route at $0 (warned once, below).
+  // A cap is enforceable only when the tracker can price every call under it:
+  // the extraction chat model AND the embed route importFromContent calls.
+  // A default cap is dropped for an unpriced route (warn and run); a cap the
+  // operator set refuses the run with no_pricing guidance (cost-gate module).
   const pricingOverrides = await loadPricingOverrides(engine);
-  const costGate = resolveExtractAtomsCostGate(
-    extractModel,
-    resolveEmbedModelForCostGate(),
-    pricingOverrides,
-    { explicitBudget },
-  );
-  if (!costGate.enforceCap) {
-    console.error(
-      `[extract_atoms] ${costGate.unpricedKind} model "${costGate.unpricedModel}" is not in the pricing maps; ` +
-        `running without a cost gate (a cap cannot be enforced on an unpriced model). ` +
-        `Declare an operator rate to restore the cap: ` +
-        `gbrain config set pricing.overrides '{"${costGate.unpricedModel}": <usd-per-1M-tokens>}' (0 for local inference).`,
-    );
-  } else if (costGate.zeroPricedEmbedModel) {
-    console.error(
-      `[extract_atoms] embed model "${costGate.zeroPricedEmbedModel}" is not in the pricing maps; ` +
-        `cycle.extract_atoms.budget_usd is set, so the $${budgetCap.toFixed(2)} cap stays enforced and embeds bill at $0 under it. ` +
-        `Declare its real rate to meter them: ` +
-        `gbrain config set pricing.overrides '{"${costGate.zeroPricedEmbedModel}": <usd-per-1M-tokens>}'.`,
-    );
-  }
-  const budgetTracker = new BudgetTracker({
+  const costGate = resolveExtractAtomsCostGate(extractModel, resolveEmbedModelForCostGate(), pricingOverrides, { explicitBudget });
+  const refused = await settleExtractAtomsCostGate(engine, sourceId, costGate, { budgetCap, extractModel, dryRun: opts.dryRun ?? false });
+  if (refused) return refused;
+  const budgetTracker = opts.attempt?.budgetTracker ?? new BudgetTracker({
     maxCostUsd: costGate.enforceCap ? budgetCap : undefined,
     label: 'cycle.extract_atoms',
-    pricingOverrides: costGate.pricingOverrides ?? pricingOverrides,
+    pricingOverrides,
   });
+  if (opts.attempt) opts.attempt.budgetTracker = budgetTracker;
 
   // v0.41.19.0 (T3): throttled yield helper. Fires `opts.yieldDuringPhase`
   // every 30s. Cycle.ts threads `buildYieldDuringPhase(lock, outer)` so
@@ -1073,8 +1068,25 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  // gbrain#4148 content-deterministic classes: hash-keyed bounded tombstone (v146: transcripts too).
+  async function recordDeterministicFailure(item: WorkItem, source: string, error: string): Promise<void> {
+    hardFailureCount++;
+    const failCount = await recordItemFailureCount(item);
+    failures.push({ source, error: error + (failCount != null ? ` (consecutive failure ${failCount} on this content)` : '') });
+    if (failCount == null || failCount < MAX_DETERMINISTIC_FAILURES || opts.dryRun) return;
+    if (item.kind === 'page') {
+      await stampAtomsScanHash(item);
+      tombstonedForFailures.push(item.slug);
+    } else {
+      await stampTranscriptTombstone(item.filePath, item.contentHash);
+      tombstonedTranscripts.push(item.filePath);
+    }
+  }
+
+  let stoppedEarly = false;
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
+    if (opts.signal?.aborted || opts.stopSignal?.aborted) { stoppedEarly = true; break; }
     await maybeYield();
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1087,12 +1099,13 @@ export async function runPhaseExtractAtoms(
     // and quote provenance is verified against THIS rather than the full
     // item, so a quote can only verify against text the model actually saw.
     // #4529/#4540: configurable input cap, cut UTF-8-safely (a bare .slice()
-    // can split a surrogate pair at the boundary).
-    const promptContent = truncateUtf8(item.content, maxInputChars);
+    // can split a surrogate pair at the boundary); #5812 strips pastes first.
+    const promptContent = truncateUtf8(item.kind === 'transcript' ? corpusTextForExtraction(item.filePath, item.content) : item.content, maxInputChars);
     try {
       const origin: AtomOrigin | null = managed ? await readAtomOrigin(engine, managed, item) : null;
       const visibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
         : { kind: 'page', page: await engine.getPage(item.slug, { sourceId }) });
+      throwIfAborted(opts.signal, 'extract_atoms');
       if (!opts.dryRun && managed && origin && await resumeManagedAtoms(engine, managed, origin)) {
         duplicatesSkipped++;
         continue;
@@ -1107,6 +1120,7 @@ export async function runPhaseExtractAtoms(
           },
         ],
         maxTokens: maxOutputTokens, responseSchema: ATOMS_RESPONSE_SCHEMA,
+        abortSignal: opts.signal,
       });
       // Post-await yield: closes the "long LLM call past TTL" hazard
       // codex flagged. The 30s throttle inside maybeYield bounds the
@@ -1115,7 +1129,8 @@ export async function runPhaseExtractAtoms(
       llmHalt.reset();
       // #4540: optional per-item pacing between successful LLM calls.
       // setTimeout (not setImmediate) so the lock-refresh interval fires.
-      if (pacingMs > 0) await new Promise<void>((r) => setTimeout(r, pacingMs));
+      if (pacingMs > 0) await abortableSleep(pacingMs, opts.signal);
+      throwIfAborted(opts.signal, 'extract_atoms');
 
       estimatedSpendUsd = budgetTracker.totalSpent;
 
@@ -1124,29 +1139,8 @@ export async function runPhaseExtractAtoms(
       const parseOutcome = parseAtomsOutcome(result.text);
       if (!parseOutcome.ok) {
         malformedOutputs++;
-        hardFailureCount++;
         if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
-        const failCount = await recordItemFailureCount(item);
-        failures.push({
-          source: originLabel,
-          error: `malformed model output: ${parseOutcome.reason}` +
-            (failCount != null ? ` (consecutive failure ${failCount} on this content)` : ''),
-        });
-        // Content-deterministic class: the same prose reliably produces
-        // unparseable output. After N consecutive failures on the SAME
-        // content hash, tombstone so the backlog floor clears; a content
-        // edit re-eligibilizes (stamp is hash-keyed). Transient provider
-        // errors never reach here — they throw and take the catch path.
-        // v146: transcripts get the identical bound, via their own store.
-        if (failCount != null && failCount >= MAX_DETERMINISTIC_FAILURES && !opts.dryRun) {
-          if (item.kind === 'page') {
-            await stampAtomsScanHash(item);
-            tombstonedForFailures.push(item.slug);
-          } else {
-            await stampTranscriptTombstone(item.filePath, item.contentHash);
-            tombstonedTranscripts.push(item.filePath);
-          }
-        }
+        await recordDeterministicFailure(item, originLabel, `malformed model output: ${parseOutcome.reason}`);
         continue;
       }
       const atoms = parseOutcome.atoms;
@@ -1306,6 +1300,7 @@ export async function runPhaseExtractAtoms(
         // the deterministic slugs make the retry converge.
         if (managed && origin) {
           for (const atom of managedAtoms) atom.links = provenanceLinks.filter(link => link.to_slug === atom.slug);
+          throwIfAborted(opts.signal, 'extract_atoms');
           const published = await publishManagedAtoms(engine, managed, origin, managedAtoms);
           writeRequests.push(...published);
           if (published.some(receipt => receipt.state !== 'committed')) writesPending++;
@@ -1318,6 +1313,7 @@ export async function runPhaseExtractAtoms(
         // after every atom AND provenance edge persisted), then stamp the
         // source page. A crash between flip and stamp degrades to the legacy
         // atom-rows-mean-done semantics — safe, not lossy.
+        throwIfAborted(opts.signal, 'extract_atoms');
         await completeAtomReceipts(engine, sourceId, importedSlugs, hash16, item.kind === 'page' ? item : undefined);
         // C-14: atoms are keyed by LLM-chosen titles, which drift between
         // extractions. Once this extraction is complete, retire the atoms an
@@ -1339,6 +1335,11 @@ export async function runPhaseExtractAtoms(
     } catch (err) {
       if (err instanceof OperationError && err.writeRequest) writeRequests.push(err.writeRequest);
       if (acceptedPendingReceipt(err)) { writesPending++; continue; }
+      if (opts.signal?.aborted) {
+        stoppedEarly = true;
+        console.error(`[extract_atoms] ${originLabel}: stopped by abort (${err instanceof Error ? err.message : String(err)})`);
+        break;
+      }
       if (err instanceof BudgetExhausted) {
         budgetExhausted = true;
         if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1347,11 +1348,17 @@ export async function runPhaseExtractAtoms(
       }
       // gbrain#4148: classify. Transient provider/infra errors (timeouts,
       // rate limits, 5xx, network) stay retryable and are NOT counted toward
-      // any tombstone. Everything else gets a durable count for
-      // observability, but only the malformed-output class (handled above)
-      // ever tombstones — an unknown error class must never permanently
-      // suppress a page's atoms.
+      // any tombstone. A provider content block (prompt-level refusal) is
+      // content-deterministic: it takes the bounded tombstone path before the
+      // outage check. Everything else gets a durable count for observability,
+      // but an unknown error class must never permanently suppress a page's atoms.
       const message = err instanceof Error ? err.message : String(err);
+      const blockReason = providerContentBlockReason(err);
+      if (blockReason) {
+        llmHalt.reset();
+        await recordDeterministicFailure(item, originLabel, `provider blocked content: ${blockReason}`);
+        continue;
+      }
       // #3044: a whole-run LLM outage halts the phase. No
       // recordItemFailureCount here — a global outage says nothing about the
       // content, so it must not pre-charge the per-page tombstone counter.
@@ -1383,7 +1390,8 @@ export async function runPhaseExtractAtoms(
   // v0.42 Wave B2: write extract receipt + rollup row when the phase
   // actually extracted atoms. Both are best-effort per F-OUT-19 —
   // audit-trail / search-visibility surfaces don't block the phase result.
-  if (!opts.dryRun && !managed && totalAtomsExtracted > 0) {
+  const hardStopped = opts.signal?.aborted === true;
+  if (!opts.dryRun && !managed && totalAtomsExtracted > 0 && !hardStopped) {
     const runId = `atoms-${Date.now().toString(36)}-${sourceId.slice(0, 4)}`;
     try {
       await writeReceipt(engine, {
@@ -1402,7 +1410,7 @@ export async function runPhaseExtractAtoms(
       console.error(`[extract_atoms] receipt write failed: ${(err as Error).message}`);
     }
   }
-  if (!opts.dryRun) {
+  if (!opts.dryRun && !hardStopped) {
     // gbrain#4148 / TRANSIENT_EXTRACT_ERROR_RE: transient provider/infra
     // failures (rate limits, timeouts, 5xx, network) are "retryable, never
     // counted" by design — count only hardFailureCount here, not
@@ -1413,8 +1421,7 @@ export async function runPhaseExtractAtoms(
       kind: 'atoms',
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: hardFailureCount === 0 ? 1 : 0,
-      halt_delta: hardFailureCount > 0 ? 1 : 0,
+      ...classifyRunStop({ deadline_hit: stoppedEarly, error: hardFailureCount > 0 }),
     });
   }
 
@@ -1664,7 +1671,7 @@ async function retireStaleAtoms(
       [sourceId, origin.value, hash16, currentSlugs],
     );
     const stale = rows.map(r => r.slug);
-    for (let i = 0; i < stale.length; i += 500) await engine.softDeletePages(stale.slice(i, i + 500), { sourceId });
+    for (let i = 0; i < stale.length; i += 500) await maintenanceTransaction(engine, tx => tx.softDeletePages(stale.slice(i, i + 500), { sourceId }));
   } catch (err) {
     console.error(`[extract_atoms] stale atom cleanup failed for ${origin.value} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
   }

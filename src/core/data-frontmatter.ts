@@ -27,7 +27,7 @@ const calendarTimestamp = new Type('tag:yaml.org,2002:timestamp', {
   instanceOf: Date,
   represent: baseTimestamp.represent,
 });
-const FRONTMATTER_SCHEMA = new Schema({ include: [DEFAULT_SAFE_SCHEMA], implicit: [calendarTimestamp] });
+export const FRONTMATTER_SCHEMA = new Schema({ include: [DEFAULT_SAFE_SCHEMA], implicit: [calendarTimestamp] });
 
 export interface DataFrontmatter {
   data: Record<string, unknown>;

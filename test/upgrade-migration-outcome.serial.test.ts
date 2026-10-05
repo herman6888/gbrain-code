@@ -27,7 +27,7 @@ function runUpgradeHarness(opts: { bunExit?: number; postUpgradeExit?: number; c
   opts.setup?.(home);
   writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'gbrain', repository: { url: 'https://github.com/garrytan/gbrain' } }));
   const driver = join(pkg, 'src', 'cli.ts');
-  writeFileSync(driver, `const { runUpgrade } = await import(${JSON.stringify(join(REPO, 'src/commands/upgrade.ts'))});\nawait runUpgrade([]);\n`);
+  writeFileSync(driver, `const { runUpgrade } = await import(${JSON.stringify(join(REPO, 'src/commands/upgrade.ts'))});\nawait runUpgrade(['--no-bun-floor-check']);\n`);
   writeFileSync(join(bin, 'bun'), `#!/bin/sh\nprintf 'bun:%s:owns=%s\\n' "$*" "$GBRAIN_UPGRADE_OWNS_MIGRATIONS" >> "$HOME/calls.log"\n${JSON.stringify(process.execPath)} ${JSON.stringify(join(REPO, 'scripts/postinstall.ts'))}\nexit ${opts.bunExit ?? 0}\n`, { mode: 0o755 });
   writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\nprintf 'gbrain:%s\\n' "$*" >> "$HOME/calls.log"\nif [ "$1" = '--version' ]; then echo 'gbrain ${NEWER}'; fi\nif [ "$1" = 'post-upgrade' ]; then exit ${opts.postUpgradeExit ?? 0}; fi\nexit 0\n`, { mode: 0o755 });
   const result = spawnSync(process.execPath, ['--no-env-file', driver], {

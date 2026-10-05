@@ -45,18 +45,22 @@
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync, realpathSync } from 'fs';
 import { join } from 'path';
-import { gbrainPath } from './config.ts';
+import { gbrainPath, loadConfig } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
-import { tryAcquireDbLock, reapDeadHolderLocks, LockStolenError, type DbLockHandle } from './db-lock.ts';
+import { tryAcquireDbLock, reapDeadHolderLocks, inspectLock, LockStolenError, type DbLockHandle } from './db-lock.ts';
 import { timeContainedPhase } from './cycle/phase-containment.ts';
 import { isManagedBrain } from './cycle/phase-table.ts';
+import { managedPullWarning, type UpstreamRefresh } from './sync-upstream.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts';
+import { anyAbortSignal } from './abort-signals.ts';
+import { maybeRefreshPlannerStats } from './planner-stats.ts';
 
 export { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
+export { anyAbortSignal } from './abort-signals.ts';
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -76,6 +80,10 @@ export type CyclePhase =
   // soft-band takes against recent timeline evidence; report-only in v1
   // (writes reports/drift-<date>; auto_update mutates nothing).
   | 'drift'
+  // #5876 — Life Chronicle events from meeting/conversation/calendar pages (default ON).
+  | 'chronicle'
+  // Lane D — runs queued facts-absorb jobs on PGLite (no job worker there); bounded per run and per day.
+  | 'facts_drain'
   | 'embed' | 'orphans' | 'purge'
   // v0.39 T12: schema-suggest passive trigger (D3 + D4 plan-eng-review).
   // Wraps runSuggest() — same library the CLI verb + EIIRP call.
@@ -165,6 +173,10 @@ export const ALL_PHASES: CyclePhase[] = [
   // the calibration trio (fresh take resolutions) and BEFORE embed so the
   // drift report page gets embedded same-cycle. Report-only in v1.
   'drift',
+  // #5876 — Life Chronicle events (global). BEFORE embed so event pages embed same-cycle.
+  'chronicle',
+  // Lane D — automatic facts drain (PGLite). BEFORE embed so new facts embed same-cycle.
+  'facts_drain',
   // v0.41.11.0 — opt-in conversation-facts backfill. Default OFF; reads
   // cycle.conversation_facts_backfill.enabled gate inside the wrapper.
   // Ordered AFTER calibration_profile (matches the runCycle dispatch
@@ -323,6 +335,10 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'calibration_profile',
   // #2653 — writes the reports/drift-<date> page.
   'drift',
+  // #5876 — writes event pages, projections and the chronicle ledger.
+  'chronicle',
+  // Lane D — writes facts (fence + index) through facts-absorb jobs.
+  'facts_drain',
   // v0.41 T9 — extract_atoms writes atom-typed pages via put_page;
   // synthesize_concepts writes concept-typed pages + tier updates. Both
   // mutate DB state and need the lock.
@@ -363,6 +379,8 @@ export interface PhaseResult {
   summary: string;
   details: Record<string, unknown>;
   error?: PhaseError;
+  code?: string; // agent contract v1: canonical registry code for `error` (sibling, additive)
+  fix?: import('./agent-output.ts').RenderedAction; // agent contract v1: the next step for `error`
 }
 
 export type CycleStatus = 'ok' | 'clean' | 'partial' | 'skipped' | 'failed';
@@ -383,6 +401,8 @@ export interface CycleReport {
   status: CycleStatus;
   /** Present when status = 'skipped'. E.g., 'cycle_already_running' or 'no_database'. Also 'aborted' when the cycle was cancelled mid-flight (#1972), or 'stamp_write_failed' (#3504). */
   reason?: string;
+  /** `cycle_already_running` on the DB lock: who holds it and for how long (best effort). */
+  lock_holder?: { id: string; holder_pid: number; holder_host: string; age_ms: number };
   /**
    * #3504: the cycle ran, but persisting `last_source_cycle_at` /
    * `last_full_cycle_at` threw. Set ONLY on a real write error — never for a
@@ -791,49 +811,6 @@ function acquireFileLock(lockPath = getLockFilePathDefault()): LockHandle | null
  * Returns `undefined` when there's no lock AND no outer hook so phases
  * short-circuit via their `if (!opts.yieldDuringPhase) return;` guard.
  */
-/**
- * W0 fix-wave: combine abort signals (external caller signal + the internal
- * lock-steal controller) into one REAL AbortSignal.
- *
- * Deliberately NOT AbortSignal.any: CycleOpts.signal has always been duck-
- * typed in practice (test stubs pass `{ aborted: false }` and flip the flag;
- * pre-W0 the raw object flowed straight into checkAborted, which only reads
- * `.aborted`/`.reason`). AbortSignal.any throws ERR_INVALID_ARG_TYPE on
- * those. Manual fan-in: real signals propagate via listener; listener-less
- * stubs are polled at 50ms — semantically the flip is seen within a tick,
- * and the RETURNED signal is a genuine AbortSignal so phases can hand it to
- * fetch/timers safely.
- *
- * ALWAYS call dispose() when the consuming scope ends (runCycle's finally):
- * the forward listeners live on the CALLER's signals, and long-lived callers
- * (the autopilot daemon passes its daemon-lifetime shutdown signal into
- * every cycle tick) would otherwise accumulate one listener + captured
- * controller per invocation forever (ship-review perf catch).
- */
-export function anyAbortSignal(signals: AbortSignal[]): { signal: AbortSignal; dispose: () => void } {
-  const c = new AbortController();
-  const cleanups: Array<() => void> = [];
-  const forward = (s: AbortSignal) => { if (!c.signal.aborted) c.abort(s.reason); };
-  for (const s of signals) {
-    if (!s) continue;
-    if (s.aborted) { forward(s); break; }
-    if (typeof (s as Partial<AbortSignal>).addEventListener === 'function') {
-      const listener = () => forward(s);
-      s.addEventListener('abort', listener, { once: true });
-      cleanups.push(() => s.removeEventListener('abort', listener));
-    } else {
-      const t = setInterval(() => { if (s.aborted) { forward(s); clearInterval(t); } }, 50);
-      (t as unknown as { unref?: () => void }).unref?.();
-      c.signal.addEventListener('abort', () => clearInterval(t), { once: true });
-      cleanups.push(() => clearInterval(t));
-    }
-  }
-  return {
-    signal: c.signal,
-    dispose: () => { for (const fn of cleanups) { try { fn(); } catch { /* best effort */ } } },
-  };
-}
-
 export function buildYieldDuringPhase(
   lock: LockHandle | null,
   outer?: () => Promise<void>,
@@ -978,7 +955,7 @@ function resolveCycleLockRefreshMs(): number {
  * throw-out contract even if a steal races it.
  *
  * Takes minimal structural types rather than AbortSignal so it stays callable
- * with the duck-typed stubs this file already documents (see anyAbortSignal)
+ * with the duck-typed stubs this file already documents (see anyAbortSignal in abort-signals.ts)
  * — and so the reason-dropped case is reachable in a test at all, since
  * `abort()` / `abort(undefined)` both yield a DOMException, never `undefined`.
  */
@@ -1041,7 +1018,7 @@ function checkAborted(signal?: AbortSignal): void {
 // keyword is the minimal seam that lets behavioral tests drive the
 // wrapper's result-mapping (counter → status enum + summary) without
 // going through runCycle's full setup cost.
-export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal): Promise<PhaseResult> {
+export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal, sourceId?: string): Promise<PhaseResult> {
   try {
     const { runLintCore } = await import('../commands/lint.ts');
     // issue #1678: pass the cycle's live engine so lint's content-sanity
@@ -1049,7 +1026,7 @@ export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: B
     // competing module-style engine that nulls the shared db singleton
     // mid-cycle (which broke every phase after lint with a misleading
     // "connect() has not been called").
-    const result = await runLintCore({ target: brainDir, fix: !(engine && await isManagedBrain(engine)), dryRun, engine: engine ?? undefined, signal });
+    const result = await runLintCore({ target: brainDir, fix: true, dryRun, engine: engine ?? undefined, signal, sourceId }); // #5180: sourceId scopes the managed-brain coordinator write path
     const issues = result.total_issues ?? 0;
     const fixed = result.total_fixed ?? 0;
     const remaining = Math.max(0, issues - fixed);
@@ -1066,7 +1043,7 @@ export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: B
       summary: dryRun
         ? `${issues} issue(s) found (dry-run, no writes)`
         : `${fixed} fix(es) applied, ${remaining} remaining`,
-      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun },
+      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun, write_path: result.write_path, fix_pending: result.fix_pending },
     };
   } catch (e) {
     return {
@@ -1261,11 +1238,13 @@ async function runPhaseSync(
     // instead of the global config key. The global key can drift out of
     // git history (force push, GC) causing a full reimport of all files.
     const sourceId = await resolveSourceForDir(engine, brainDir);
+    // #5255: managed sync refuses `git pull`; a cycle syncs local HEAD and reports it (explicit sync keeps refusing).
+    const managedPullSkipped = pull && await isManagedBrain(engine);
     const result = await performSync(engine, {
       repoPath: brainDir,
       sourceId,
       dryRun,
-      noPull: !pull,
+      noPull: !pull || managedPullSkipped,
       noEmbed: true,                       // embed is a separate phase
       noExtract: willRunExtractPhase,      // dedupe ONLY when cycle's extract phase will also run.
                                            // If extract isn't scheduled (e.g. `gbrain dream --phase sync`),
@@ -1288,16 +1267,20 @@ async function runPhaseSync(
     const uncommittedNote = uncommittedTotal > 0
       ? `; ${uncommittedTotal} uncommitted file(s) invisible to commit-driven sync — commit them or set sync.include_working_tree=true`
       : '';
+    const upstreamRefresh: UpstreamRefresh = !pull ? 'not_requested' : managedPullSkipped ? 'skipped_managed' : pullFailedPartial ? 'failed' : 'pulled';
+    const warning = managedPullSkipped ? managedPullWarning(sourceId ?? 'default', brainDir) : undefined;
+    const upstreamNote = warning ? `; upstream not refreshed (${warning.code}): ${warning.fix} (${warning.docs})` : '';
     return {
       phase: 'sync',
-      status: result.status === 'blocked_by_failures' || pullFailedPartial || uncommittedTotal > 0 ? 'warn' : 'ok',
+      status: result.status === 'blocked_by_failures' || pullFailedPartial || uncommittedTotal > 0 || warning ? 'warn' : 'ok',
       duration_ms: 0,
       summary: dryRun
         ? `${syncedCount} page(s) would sync, ${result.deleted} would delete`
         : pullFailedPartial
           ? `git pull failed, nothing imported — source may be behind its remote (sync anchor unchanged)`
-          : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted${uncommittedNote}`,
+          : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted${uncommittedNote}${upstreamNote}`,
       details: {
+        source_id: sourceId ?? 'default', upstream_refresh: upstreamRefresh, ...(warning ? { warning } : {}),
         added: result.added,
         modified: result.modified,
         deleted: result.deleted,
@@ -1319,13 +1302,10 @@ async function runPhaseSync(
     // sync overruns into the next cron tick. Report it as a skip.
     const { SyncLockBusyError } = await import('../commands/sync.ts');
     if (e instanceof SyncLockBusyError) {
-      return {
-        phase: 'sync',
-        status: 'skipped',
-        duration_ms: 0,
-        summary: 'sync already in progress elsewhere — skipped',
-        details: { syncStatus: 'lock_busy' },
-      };
+      return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: 'sync already in progress elsewhere — skipped', details: { syncStatus: 'lock_busy' } };
+    }
+    if ((e as { code?: unknown } | null)?.code === 'sync_not_applicable') {
+      return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_not_applicable' } };
     }
     return {
       phase: 'sync',
@@ -1466,20 +1446,18 @@ async function runPhaseExtractFacts(
       signal,
     });
 
-    // Empty-fence guard: pre-v51 legacy rows pending the v0_32_2 backfill.
-    // Surface as 'warn' so doctor + the cycle report can see it; don't fail
-    // the cycle because the workaround is well-defined (run apply-migrations).
+    // Empty-fence guard: unfenced rows the phase's own fence step could not
+    // fence this run. Surface as 'warn' so doctor + the cycle report can see
+    // it; the warnings name each page and why.
     if (result.guardTriggered) {
       return {
         phase: 'extract_facts',
         status: 'warn',
         duration_ms: 0,
-        summary: `extract_facts skipped: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
+        summary: `extract_facts skipped: ${result.legacyRowsPending} unfenced fact row(s) could not be fenced`,
         details: {
           legacyRowsPending: result.legacyRowsPending,
-          // A bare `apply-migrations --yes` no-ops once the v0.32.2 ledger
-          // entry is complete; the retry marker is what re-runs Phase B.
-          hint: 'gbrain apply-migrations --force-retry 0.32.2 && gbrain apply-migrations --yes',
+          unfencedRowsFenced: result.unfencedRowsFenced,
           warnings: result.warnings,
         },
       };
@@ -1521,6 +1499,7 @@ async function runPhaseExtractFacts(
         pagesWithFacts: result.pagesWithFacts,
         factsInserted: result.factsInserted,
         factsDeleted: result.factsDeleted,
+        unfencedRowsFenced: result.unfencedRowsFenced,
         pagesFailed: result.pagesFailed,
         warnings: result.warnings.slice(0, 5),
         // v0.35.5: phantom counters surfaced so extractTotals() can lift
@@ -1616,6 +1595,9 @@ async function runPhaseResolveSymbolEdges(
 
 async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: AbortSignal): Promise<PhaseResult> {
   try {
+    if (!dryRun && (loadConfig()?.embedding_disabled === true || await engine.getConfig('embedding_disabled') === 'true')) {
+      return { phase: 'embed', status: 'skipped', duration_ms: 0, summary: 'embeddings disabled; no provider call made', details: { reason: 'embedding_disabled' } };
+    }
     const { runEmbedCore } = await import('../commands/embed.ts');
     // #1737: thread the cycle's abort signal so the embed phase (the long,
     // 10-15 min one) bails within a batch instead of running to completion
@@ -1774,7 +1756,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       duration_ms: 0,
       summary:
         `purged ${purgedSources.length} source(s)` +
-        (purgeResult.blocked.length > 0 ? ` (${purgeResult.blocked.length} FK-blocked, see details)` : '') +
+        (purgeResult.blocked.length > 0 ? ` (${purgeResult.blocked.length} blocked, see details)` : '') +
         `, ${purgedPages.count} page(s), ` +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
@@ -1997,12 +1979,14 @@ export async function runCycle(
         if (pgliteFileLock) {
           try { await pgliteFileLock.release(); } catch { /* best effort */ }
         }
+        const holder = await inspectLock(engine, cycleLockIdFor(opts.sourceId)).catch(() => null);
         return {
           schema_version: '1',
           timestamp,
           duration_ms: Math.round(performance.now() - start),
           status: 'skipped',
           reason: 'cycle_already_running',
+          ...(holder ? { lock_holder: { id: holder.id, holder_pid: holder.holder_pid, holder_host: holder.holder_host, age_ms: holder.age_ms } } : {}),
           brain_dir: opts.brainDir,
           phases: [],
           totals: emptyTotals(),
@@ -2167,7 +2151,7 @@ export async function runCycle(
         phaseResults.push(skipNoBrainDir('lint'));
       } else {
         progress.start('cycle.lint');
-        const { result, duration_ms } = await timePhase(() => runPhaseLint(brainDir, dryRun, engine, cycleSignal), 'lint');
+        const { result, duration_ms } = await timePhase(() => runPhaseLint(brainDir, dryRun, engine, cycleSignal, cycleSourceId), 'lint');
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -2298,9 +2282,9 @@ export async function runCycle(
           details: { reason: 'no_database' },
         });
       } else if (brainDir === null) {
-        phaseResults.push(skipNoBrainDir('extract'));
+        const { result, duration_ms } = await timePhase(async () => (await import('./cycle/connector-extract.ts')).runPhaseExtractDatabaseOnly(engine, { dryRun, sourceId: cycleSourceId, timeBudgetMs: CYCLE_STALE_DRAIN_BUDGET_MS }), 'extract');
+        phaseResults.push({ ...result, duration_ms });
       } else {
-        // Pass changed slugs from sync for incremental extract.
         // If sync didn't run (phases exclude it) or failed, syncPagesAffected
         // is undefined → extract falls back to full walk (safe default).
         progress.start('cycle.extract');
@@ -2316,9 +2300,9 @@ export async function runCycle(
     // Reconcile DB facts index from the `## Facts` fence on every
     // affected entity page. Runs AFTER extract (link/timeline
     // materialization) and BEFORE patterns/recompute_emotional_weight
-    // so downstream phases see fresh DB facts. Empty-fence guard
-    // refuses to run while v0.31 legacy facts are pending the
-    // v0_32_2 backfill (Codex R2-#7).
+    // so downstream phases see fresh DB facts. The phase first fences
+    // unfenced (`row_num IS NULL`) rows itself; rows it could not fence
+    // still skip reconciliation (Codex R2-#7, #5299).
     if (phases.includes('extract_facts')) {
       checkAborted(cycleSignal);
       if (!engine) {
@@ -2360,6 +2344,10 @@ export async function runCycle(
       }
       await safeYield(opts.yieldBetweenPhases);
     }
+
+    // F4b: the freshness phases above write links, timeline and facts in bulk; on PGLite (no autovacuum)
+    // refresh the stale planner statistics before the heavier graph phases read them. Best-effort.
+    if (engine && !dryRun) await maybeRefreshPlannerStats(engine, 'cycle').catch(() => undefined);
 
     // ── v0.41 T9: extract_atoms (per-source, pack-gated) ──────────
     // Orchestrator-level pack gate: consults the active pack's `phases:`
@@ -2410,6 +2398,10 @@ export async function runCycle(
                 ...(synthesizeWrittenSlugs ?? []),
               ]
             : undefined;
+        // #5833: a real signal (cycleSignal can be the raw duck-typed
+        // opts.signal) so a timeout or lock steal stops the phase at its next
+        // item instead of extracting on after the race below has returned.
+        const xaSignal = cycleSignal ? anyAbortSignal([cycleSignal]) : null;
         const { result, duration_ms } = await racedTimePhase(() => runPhaseExtractAtoms(engine, {
           brainDir: brainDir ?? undefined,
           sourceId: xaSourceId,
@@ -2420,7 +2412,8 @@ export async function runCycle(
           // v0.41.19.0 (T4): pass same reporter (not a child — cycle.ts
           // owns start/finish; phase only ticks).
           progress,
-        }), 'extract_atoms');
+          signal: xaSignal?.signal,
+        }), 'extract_atoms').finally(() => xaSignal?.dispose());
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -2752,6 +2745,26 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
+    // #5876 Life Chronicle (default ON): executes write-time ledger decisions and backfill rows, bounded per run.
+    if (phases.includes('chronicle')) {
+      checkAborted(cycleSignal);
+      if (!engine) phaseResults.push({ phase: 'chronicle', status: 'skipped', duration_ms: 0, summary: 'no database connected', details: { reason: 'no_database' } });
+      else {
+        progress.start('cycle.chronicle');
+        const { runPhaseChronicle } = await import('./cycle/chronicle.ts');
+        const { result, duration_ms } = await timePhase(() => runPhaseChronicle(engine, { dryRun, signal: cycleSignal,
+          yieldDuringPhase: opts.yieldDuringPhase, deadlineAtMs: opts.deadlineAtMs ?? null }), 'chronicle');
+        result.duration_ms = duration_ms; phaseResults.push(result); progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    if (phases.includes('facts_drain')) { // Lane D: queued facts-absorb jobs on PGLite (src/core/cycle/facts-drain.ts)
+      checkAborted(cycleSignal);
+      const { result, duration_ms } = await timePhase(async () => (await import('./cycle/facts-drain.ts')).runPhaseFactsDrain(engine, { dryRun, signal: cycleSignal, deadlineAtMs: opts.deadlineAtMs ?? null }), 'facts_drain');
+      phaseResults.push({ ...result, duration_ms }); await safeYield(opts.yieldBetweenPhases);
+    }
+
     // ── v0.41.11.0: conversation_facts_backfill ─────────────────
     // Opt-in (default OFF). Walks long-form conversation/meeting/slack/
     // email pages, segments by 30-min gap, runs facts extractor with a
@@ -3012,6 +3025,7 @@ export async function runCycle(
   // work it never actually did. Treat an aborted signal as a non-success run:
   // skip the freshness stamp and report status 'partial' with reason 'aborted'.
   const aborted = cycleSignal?.aborted === true;
+  if (aborted && isLockStolenAbort(stolen?.signal, externalSignal)) lockStolenAbort = true;
 
   // #1972 (Decision 7A gating): attribute force-evicts. The minion worker
   // force-evicts a job 30s after abort and logs "handler ignored abort signal";

@@ -57,9 +57,14 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
   'atom_provenance_drift',
+  'captured_facts_active',
   'connector_checkpoints',
   'connector_held_items',
+  'git_held_files',
+  'credential_projection_pending',
   'derived_visibility',
+  'extractor_facts_expired',
+  'loop_facts_drift',
   'orphan_persistence_bindings',
   'safe_index_pending',
   'self_capture',
@@ -67,6 +72,11 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'calibration_freshness',
   'child_table_orphans',
   'chronicle_projection_health',
+  'auto_chronicle',
+  'auto_chronicle_default_on',
+  'chronicle_config_invalid',
+  'facts_drain',
+  'fact_take_vectors',
   'code_chunk_metadata',
   'content_hash_duplicates',
   'content_sanity_audit_recent',
@@ -85,6 +95,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'embed_staleness',
   'embedding_column_registry',
   'embedding_env_override',
+  // #5137: an env provider key shadowing a different config key.
+  'embedding_key_source',
   'embedding_migration_state',
   'embedding_provider',
   // #5691: query-instruction advisory for instruction-style embedding models.
@@ -99,6 +111,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'facts_extraction_health',
   'facts_health',
   'frontmatter_integrity',
+  'frontmatter_repairable',
   'malformed_path_pages',
   'memory_writeback',
   'grade_confidence_drift',
@@ -132,9 +145,13 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stale_mentions',
   'stub_guard_24h',
   'sync_failures',
+  // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
+  'managed_sync_backlog',
   'sync_freshness',
   'takes_count',
   'takes_weight_grid',
+  // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).
+  'unlinked_facts',
   'text_projection_readiness',
   'timeline_coverage',
   'timeline_orphans',
@@ -174,6 +191,11 @@ export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
  * Infrastructure liveness signals. DB, workers, OAuth, RLS, locks, providers.
  */
 export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // Agent operator wave: is an agent harness wired to this brain (registration read; --only adds the smoke test).
+  'harness_wiring',
+  'frontmatter_hook',
+  // F4b: PGLite row-delta planner statistics / Postgres autovacuum ANALYZE lag on the hot tables.
+  'planner_stats_stale',
   'alternative_providers',
   'autopilot_fanout_concurrency',
   'autopilot_lock_scope',
@@ -192,10 +214,10 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'brainstorm_health',
   'connectors',
   'dream_paid_loop',
-  'chat_fallback_chain_inert',
   'connection',
   'db_only_collector_collision',
   'federation_health',
+  'google_file_modes',
   'google_oauth',
   'home_dir_in_worktree',
   'index_audit',
@@ -204,9 +226,13 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'oauth_confidential_client_health',
   'orphan_clones',
   'persistence_capacity',
+  'worktree_refresh_stuck',
+  'managed_guard_schema_drift',
+  'publication_refusals',
   'persistence_request_growth',
   'persistence_request_indexes',
   'stale_embedding_effects',
+  'vector_plan',
   'writer_version',
   'pgbouncer_prepare',
   'pglite_data_dir',
@@ -214,12 +240,23 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'pglite_scale',
   'db_repair_recurrence',
   'pglite_leftovers',
+  // Engine graduation (PGLite -> Postgres) interrupted / split brain.
+  'graduation_interrupted',
   'pgvector',
   'postgres_cancellation_driver',
   'plugin_lane_collision',
   'pool_budget',
   'progressive_batch_audit_health',
   'queue_health',
+  // #4578: brain-wide maintenance jobs dying at their deadline.
+  'global_maintenance_timeouts',
+  // #5157: queued jobs from before the v0.50 authority cutover block every worker.
+  'legacy_job_authority',
+  // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).
+  'legacy_token_grant_shape',
+  'legacy_token_grant_drift',
+  // Lane E: tokens minted without scopes (grandfathered read+write+admin).
+  'legacy_token_null_scope',
   'reranker_health',
   'rls',
   'rls_event_trigger',
@@ -245,6 +282,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
  * housekeeping. Default category for unknown names (with stderr warn).
  */
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // Agent operator wave E11: recent agent dead ends from the agent-contract event log.
+  'agent_contract',
   'cycle_phase_scope',
   'default_source_local_path',
   'eval_capture',
@@ -258,6 +297,8 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   // coherence healed by `gbrain apply-migrations` (sibling of
   // timeline_dedup_index / schema_version).
   'pages_upsert_arbiter',
+  // #5216: the resumable pages.knowledge_revision backfill (resumed by apply-migrations --force-schema).
+  'revision_backfill',
   'schema_columns',
   'schema_pack_active',
   'schema_pack_consistency',

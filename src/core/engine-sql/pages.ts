@@ -380,8 +380,12 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const sortKey = filters?.sort && PAGE_SORT_SQL[filters.sort] ? filters.sort : 'updated_desc';
     const orderBy = trustedSql(PAGE_SORT_SQL[sortKey]);
 
+    const columns = filters?.listColumnsOnly === true
+      ? sqlFragment`p.id, p.source_id, p.slug, p.type, p.page_kind, p.title, p.created_at, p.updated_at, p.deleted_at,
+          p.effective_date, p.effective_date_source, ''::text AS compiled_truth, ''::text AS timeline, '{}'::jsonb AS frontmatter`
+      : sqlFragment`p.*`;
       const { rows } = await exec.run(sqlFragment`
-        SELECT p.*, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
+        SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
         WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
@@ -756,6 +760,15 @@ export async function getPageTimestamps(exec: LegacyUnscopedRead, slugs: string[
     return new Map(rows.map(r => [r.slug, new Date(r.ts as string)]));
   }
 
+/**
+ * `get_versions` columns. Explicit, so the write attribution columns on
+ * page_versions (who wrote and who archived each snapshot) never reach a
+ * plain `read` caller; trusted and admin callers get them through
+ * `get_write_attribution`'s resolver in `ops/attribution.ts`.
+ */
+const PAGE_VERSION_COLUMNS = trustedSql('pv.id, pv.page_id, pv.compiled_truth, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
+  + 'pv.timeline, pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
+
 export async function getVersions(
   exec: LegacyUnscopedRead,
   slug: string,
@@ -765,7 +778,7 @@ export async function getVersions(
       ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}`) : sqlFragment``;
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT pv.* FROM page_versions pv
+        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
         JOIN pages p ON p.id = pv.page_id
         WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
           ${privacy}
@@ -775,7 +788,7 @@ export async function getVersions(
     }
     if (opts?.sourceId) {
       const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT pv.* FROM page_versions pv
+        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
         JOIN pages p ON p.id = pv.page_id
         WHERE p.slug = ${slug} AND p.source_id = ${opts.sourceId}
           ${privacy}
@@ -784,7 +797,7 @@ export async function getVersions(
       return rows;
     }
     const { rows } = await exec.run<PageVersion>(sqlFragment`
-      SELECT pv.* FROM page_versions pv
+      SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
       WHERE p.slug = ${slug}
         ${privacy}

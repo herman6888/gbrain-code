@@ -5,7 +5,6 @@
 # added here in a reviewer-visible diff. Removing lines (by mapping the
 # file) is always safe. Enforced by test/scripts/e2e-wiring.test.ts.
 test/e2e/anomalies-pglite.test.ts
-test/e2e/auth-permissions.test.ts
 test/e2e/auth-takes-holders-pglite.test.ts
 test/e2e/autopilot-cooldown-parity.test.ts
 test/e2e/autopilot-fanout-postgres.test.ts
@@ -53,7 +52,6 @@ test/e2e/eval-replay-column.test.ts
 test/e2e/eval-takes-quality.test.ts
 test/e2e/extract-atoms-discovery-sql.test.ts
 test/e2e/extraction-review-postgres.test.ts
-test/e2e/facts-context-injection-postgres.test.ts
 test/e2e/facts-cross-source-isolation.test.ts
 test/e2e/facts-forget.test.ts
 test/e2e/facts-notability-roundtrip.test.ts
@@ -97,7 +95,6 @@ test/e2e/salience-pglite.test.ts
 test/e2e/schema-cathedral.test.ts
 test/e2e/self-upgrade-binary-swap.test.ts
 test/e2e/self-upgrade-marker.test.ts
-test/e2e/serve-http-meta.test.ts
 test/e2e/serve-http-takes-holders.test.ts
 test/e2e/skill-brain-first.test.ts
 test/e2e/skillpack-third-party.test.ts

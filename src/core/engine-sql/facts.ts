@@ -383,7 +383,7 @@ export async function listFactsSince(
     const excludeAuditRows = opts?.excludeAuditRows === true;
     const grepPat = grepPattern(opts);
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
-      SELECT * FROM facts
+      SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
         AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}
         ${entitySlug ? sqlFragment`AND entity_slug = ${entitySlug}` : sqlFragment``}
@@ -415,7 +415,7 @@ export async function listFactsBySession(
     const excludeAuditRows = opts?.excludeAuditRows === true;
     const grepPat = grepPattern(opts);
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
-      SELECT * FROM facts
+      SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
         AND source_session = ${sessionId}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
@@ -462,9 +462,11 @@ export async function countUnconsolidatedFacts(exec: LegacyUnscopedRead, source_
     // Validity-lapsed rows are excluded too: the consolidator reads via
     // listFactsByEntity(activeOnly), which filters them at read time — counting
     // them here would report a backlog the consolidator can never drain.
+    // So are facts with no entity: consolidate reads (source, entity) buckets only (#5831).
     const rows = (await exec.run<{ count: number }>(sqlFragment`
       SELECT COUNT(*)::int AS count FROM facts
       WHERE source_id = ${source_id}
+        AND entity_slug IS NOT NULL
         AND consolidated_at IS NULL
         AND expired_at IS NULL
         AND (valid_until IS NULL OR valid_until > now())
@@ -654,6 +656,7 @@ interface FactRowSqlShape {
   embedded_text_hash?: string | null;
   embedded_at: Date | null;
   created_at: Date;
+  fact_fingerprint?: string | null;
 }
 
 /**
@@ -705,6 +708,7 @@ function rowToFact(raw: FactRowSqlShape): FactRow {
     embedded_text_hash: row.embedded_text_hash ?? null,
     embedded_at: row.embedded_at,
     created_at: row.created_at,
+    ...(row.fact_fingerprint ? { fact_fingerprint: row.fact_fingerprint } : {}),
   };
 }
 

@@ -44,6 +44,7 @@ ALLOWED=(
   "src/core/grants/profiles.ts"                 # snapshots eligible remote ops with !op.localOnly; grant validation never exposes local-only operations
   "src/core/bootstrap/harness.ts"              # trusted owner provisioning; filters localOnly and scopes before minting explicit follow operation snapshots
   "src/core/token-mint.ts"                     # trusted token creation validates explicit snapshots against public scope-compatible operations
+  "src/core/grants/legacy-token.ts"             # trusted local rescope-token; validates and refreshes snapshots against !op.localOnly scope-compatible operations
   "src/core/shared-skills/tool-access.ts"       # skill usability intersects locality, scopes, snapshots, source fences, surface and publication gates
   "src/mcp/skill-resources.ts"                  # resources map only catalog reads through equivalent scope/snapshot/surface/gate checks and shared dispatch
   "src/core/harness/capabilities.ts"            # introspection applies !op.localOnly plus effective surface, scope, fence, snapshot and publish-gate filters

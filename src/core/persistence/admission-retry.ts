@@ -18,6 +18,7 @@ export async function retryWriteAdmission<T>(requestId: string, attempt: (remain
         const unavailable = new OperationError('storage_error', 'Write admission is temporarily blocked by database contention.',
           `Retry the same operation, arguments, and request_id ${requestId}. No queued receipt has been confirmed.`);
         unavailable.writeError = 'storage_error';
+        unavailable.detail = 'database_contention';
         throw unavailable;
       }
       // The transaction has rolled back and released its connection before any

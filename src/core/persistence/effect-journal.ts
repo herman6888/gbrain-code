@@ -6,13 +6,17 @@ import { OperationError } from '../ops/contract.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { sha256 } from './digest.ts';
 import { PARK_AFTER_FAILURES, type EffectKind, type PersistenceEffect, type EffectRequest } from './effect-model.ts';
-import type { SqlEngine } from './model.ts';
+import type { SqlEngine, WriteRequest } from './model.ts';
+import { recordChronicleDecision } from '../chronicle/ledger.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
+import { loadConfig } from '../config.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
 import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { refreshFenceClear } from './worktree-refresh-schema.ts';
+import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
 
 /** `snapshot` is the publication's final read of the page, including deleted rows, in this transaction. */
-export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest, snapshot: PageSnapshot | null,
+export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest & Partial<Pick<WriteRequest, 'operation' | 'intent' | 'authority' | 'principal_kind' | 'principal_id'>>, snapshot: PageSnapshot | null,
   outcome: Record<string, unknown>, prepared?: PreparedMutation): Promise<void> {
   if (prepared?.noop || prepared?.target === 'skill_bundle') return;
   await declarePersistenceProtocol(tx);
@@ -32,22 +36,36 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
   }
   if (snapshot && !snapshot.page.deleted_at) {
     if (!prepared?.deferEmbedding) await queue('embedding');
-    outcome.embedding_state = prepared?.deferEmbedding ? 'deferred' : 'queued';
+    outcome.embedding_state = await embeddingDisabled(tx) ? 'disabled' : prepared?.deferEmbedding ? 'deferred' : 'queued';
     if ((outcome.facts_backstop as { queued?: boolean } | undefined)?.queued) {
       if (!(await isFactsExtractionEnabled(tx))) outcome.facts_backstop = { skipped: 'extraction_disabled' };
       else await queue('facts-backstop', { visibility: await resolveDefaultVisibility(tx) });
     }
+    // #5876: the Life Chronicle decision is a ledger row, not an effect; the `chronicle` cycle phase executes it.
+    await recordChronicleDecision(tx, row, snapshot, outcome);
   }
 }
 
-/** Claims release their database connection before waiting for a filesystem lock/provider. */
+/**
+ * A keyless brain (`init --no-embedding`: `embedding_disabled` on the file or
+ * DB plane, the same pair the embedding effect refuses on) reports
+ * `embedding_state: "disabled"` (agent-first operator wave E5): its
+ * embedding effect settles as skipped, so "queued" would promise vectors that
+ * never arrive.
+ */
+async function embeddingDisabled(tx: BrainEngine): Promise<boolean> {
+  if (loadConfig()?.embedding_disabled === true) return true;
+  return (await tx.getConfig('embedding_disabled')) === 'true';
+}
+
+/** Claims release their database connection before waiting for a filesystem lock/provider. Nothing on a refresh-fenced worktree is claimed. */
 export async function claimPersistenceEffect(engine: BrainEngine, hostId: string): Promise<PersistenceEffect | null> {
   return engine.transactionDirect(async tx => {
     await declarePersistenceProtocol(tx);
     const [candidate] = await tx.executeRaw<PersistenceEffect>(`SELECT e.* FROM persistence_effects e
       LEFT JOIN persistence_worktrees w ON w.id=e.worktree_id
       WHERE (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
-      AND (e.worktree_id IS NULL OR w.owner_host_id=$1::uuid)
+      AND (e.worktree_id IS NULL OR w.owner_host_id=$1::uuid) AND (e.worktree_id IS NULL OR ${refreshFenceClear('e')})
       AND e.recovery IS NULL AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked
         WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
       AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked
@@ -82,6 +100,7 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
       WHERE e.worktree_id=$2::uuid AND e.kind='git' AND e.data ? 'relative_path'
       AND NOT (e.data ? 'targets') AND NOT (e.data ? 'source_scan') AND NOT (e.data ? 'version')
       AND (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
+      AND ${refreshFenceClear('e')}
       AND e.recovery IS NULL AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked
         WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
       AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked
@@ -94,6 +113,25 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
       FROM ready WHERE p.id=ready.id RETURNING p.*`, [hostId, worktreeId, limit]);
   });
   return rows.sort((a, b) => Number(a.id) - Number(b.id));
+}
+
+/**
+ * PGLite only: the datastore admits one process, and this one opened it at
+ * `processStartedAt`, so a claim last written before then was held by an owner
+ * that has exited (a crash or SIGKILL). Release those claims now instead of
+ * waiting out their leases (effects 2 minutes, requests 30 s); a withdrawal
+ * mirror left running would otherwise also hold back writes to its pages.
+ * Claims with a recovery record stay with the recovery path.
+ */
+export async function releaseAbandonedClaims(engine: BrainEngine, processStartedAt: Date): Promise<number> {
+  if (engine.kind !== 'pglite') return 0;
+  const effects = await engine.executeRaw(`UPDATE persistence_effects SET state='queued',execution_token=NULL,claim_expires_at=NULL,
+    next_attempt_at=LEAST(next_attempt_at,now()) WHERE state='running' AND recovery IS NULL AND updated_at<$1::timestamptz
+    AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
+  const requests = await engine.executeRaw(`UPDATE persistence_requests SET state='queued',execution_token=NULL,claim_expires_at=NULL
+    WHERE state='running' AND recovery IS NULL AND publication_started=false AND updated_at<$1::timestamptz
+    AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
+  return effects.length + requests.length;
 }
 
 export async function renewPersistenceEffectClaim(engine: SqlEngine, effect: PersistenceEffect): Promise<boolean> {
@@ -121,6 +159,7 @@ export async function advanceEffectCursor(engine: SqlEngine, effect: Persistence
 
 /** An effect with parked targets finishes as failed (`targets_parked`), never as committed. */
 export async function completeEffect(engine: SqlEngine, effect: PersistenceEffect, outcome: Record<string, unknown> = {}): Promise<void> {
+  await faultPoint(EFFECT_FAULT_POINTS[effect.kind], { effectId: effect.id, requestId: effect.request_id, sourceId: effect.source_id });
   await engine.executeRaw(`UPDATE persistence_effects SET
     state=CASE WHEN jsonb_array_length(COALESCE(data->'parked','[]'::jsonb))>0 THEN 'failed' ELSE 'committed' END,
     error_code=CASE WHEN jsonb_array_length(COALESCE(data->'parked','[]'::jsonb))>0 THEN 'targets_parked' END,
