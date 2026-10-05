@@ -1,4 +1,5 @@
 import { parseSubmissionAuthority, type SubmissionAuthority } from './submission-authority.ts';
+import { parseSpendAuthorization, type JobSpendContext, type SpendAuthorization } from './spend-record.ts';
 /**
  * Minions — BullMQ-inspired Postgres-native job queue for GBrain.
  *
@@ -42,6 +43,10 @@ export interface MinionJob {
   data: Record<string, unknown>;
   /** Internal authority column; never accepted from job data or remote options. */
   submission_authority?: SubmissionAuthority | null;
+  /** Submit-time spend authorization (spend-authorization.ts); never read from job data. */
+  spend_authorization?: SpendAuthorization | null;
+  /** The column holds a value the strict parser rejects; the worker refuses to run the job. */
+  spend_authorization_invalid?: true;
 
   // Retry
   max_attempts: number;
@@ -269,6 +274,8 @@ export interface MinionJobContext {
   data: Record<string, unknown>;
   /** Internal authority column; never accepted from job data or remote options. */
   submission_authority?: SubmissionAuthority | null;
+  /** Set by runWithJobSpend for a spend-authorized job: its group record and meter key. */
+  spend?: JobSpendContext;
   attempts_made: number;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
@@ -435,6 +442,11 @@ export { JobDeferredError, UnrecoverableError } from './errors.ts';
 
 // --- Row Mapping ---
 
+function spendAuthorizationFields(raw: unknown): Pick<MinionJob, 'spend_authorization' | 'spend_authorization_invalid'> {
+  try { return { spend_authorization: parseSpendAuthorization(raw) }; }
+  catch { return { spend_authorization: null, spend_authorization_invalid: true }; }
+}
+
 export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
   return {
     id: row.id as number,
@@ -443,6 +455,7 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     status: row.status as MinionJobStatus,
     priority: row.priority as number,
     submission_authority: parseSubmissionAuthority(row.submission_authority),
+    ...spendAuthorizationFields(row.spend_authorization),
     data: (typeof row.data === 'string' ? JSON.parse(row.data) : row.data ?? {}) as Record<string, unknown>,
     max_attempts: row.max_attempts as number,
     attempts_made: row.attempts_made as number,

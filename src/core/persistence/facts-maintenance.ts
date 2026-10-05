@@ -20,6 +20,7 @@ import { getWorktreeBinding, managedPersistenceEnabled, probeWorktreeWriter, typ
 import { authorizeFactsBackstop } from './effect-facts.ts';
 import { admitWriteInTransaction, getWriteRequest, getWriteRequestById, receiptFor } from './journal.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
+import { maintenancePublishWaitMs } from './maintenance-wait.ts';
 import { digest, requireUuid, sha256 } from './digest.ts';
 import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
@@ -236,7 +237,7 @@ async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSes
       `Request ${row.request_id} in source ${row.source_id} was accepted for different extraction input, so this extraction was not merged into it. Give this extraction a new request_id; read the receipt to see the original.`,
       { fix: receiptFix(row.request_id) });
     await authorizeStoredRequest(engine, row);
-    const finished = await waitForWrite(engine, row, session.config);
+    const finished = await waitForWrite(engine, row, session.config, maintenancePublishWaitMs());
     writeResponse(finished);
     result.write_requests.push(receiptFor(finished));
     if ((row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_entity') {

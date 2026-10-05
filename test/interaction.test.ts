@@ -3,7 +3,7 @@
  * isInteractive decision table, agentProcessMarker, and readLine /
  * readStdinBounded against injected streams with short timeouts. The real
  * process-stdin cases (natural exit, 8 s slow first byte, /dev/null, the
- * one-per-process stderr line) live in test/interaction-stdin.serial.test.ts.
+ * one-per-process stderr line) live in test/interaction-stdin.test.ts.
  */
 import { describe, expect, test } from 'bun:test';
 import { PassThrough, Readable } from 'node:stream';

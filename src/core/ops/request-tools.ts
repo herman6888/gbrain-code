@@ -114,11 +114,51 @@ async function visibleOpsForCaller(
   );
 }
 
+/**
+ * Stdio branch of the {surface} call: widen this session's allow-set (the
+ * one tools/list and dispatch share), never past `--access read-only` or
+ * GBRAIN_MCP_FORCE_SURFACE, then answer with the newly allowed tools'
+ * schemas so a client that ignores `tools/list_changed` can call them by
+ * name. Nothing is written; a new session starts at the registered surface.
+ */
+async function widenStdioSession(ctx: OperationContext, requested: 'verbs' | 'starter' | 'full'): Promise<Record<string, unknown>> {
+  const session = ctx.stdioSurface!;
+  const { clampSurface, sessionWidenAllowed, surfaceWiderThan } = await import('../../mcp/surface.ts');
+  session.widenAllowed = await sessionWidenAllowed(ctx.engine, ctx.config);
+  const persistent = `For a lasting change, set GBRAIN_SURFACE=${requested} in the env of this harness's MCP server entry for gbrain (or re-register the server with --surface ${requested}) and start a new session.`;
+  if (!session.widenAllowed) {
+    throw opError('permission_denied',
+      'Session widening is off on this brain (mcp.allow_session_widen is false), so request_tools cannot add tools to this stdio session.',
+      `${persistent} The user can turn session widening back on with \`gbrain config set mcp.allow_session_widen true\`.`,
+      { fix: hostFix(ctx, ['gbrain', 'config', 'set', 'mcp.allow_session_widen', 'true'],
+        `Turns stdio session widening back on (the brain owner turned it off). ${persistent}`) });
+  }
+  const target = clampSurface(requested);
+  if (!surfaceWiderThan(target, session.surface)) {
+    return { persisted: false, scope: 'session', surface: session.surface, widened: false,
+      note: target !== requested
+        ? `GBRAIN_MCP_FORCE_SURFACE caps this server at '${target}', so this session stays at '${session.surface}'.`
+        : `This session already serves '${session.surface}', which includes everything in '${requested}'.` };
+  }
+  if (ctx.dryRun) return { persisted: false, scope: 'session', dry_run: true, surface: target, previous: session.surface };
+  const change = session.widen(target);
+  const added = new Set(change.added);
+  const { buildToolDefs } = await import('../../mcp/tool-defs.ts');
+  const { resolveStrictParamsMode } = await import('../../mcp/validate-params.ts');
+  const strictParams = (await resolveStrictParamsMode(ctx.engine, ctx.config)) === 'reject';
+  const visible = (await visibleOpsForCaller(ctx, target)).filter(op => added.has(op.name));
+  return {
+    persisted: false, scope: 'session', surface: target, previous: change.from,
+    tools: buildToolDefs(visible, { strictParams }),
+    note: `This session now serves '${target}' (tools/list_changed was sent). Call the new tools by name now; their schemas are above. A new session starts at the registered surface. ${persistent}`,
+  };
+}
+
 const request_tools: Operation = {
   name: 'request_tools',
   idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} persists a wider surface for your OAuth client.',
+  description: 'More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client; stdio: this session).',
   area: 'discovery',
   // FOV-4: callable by read OR agent scope — discovery for every token class.
   agentCallable: true,
@@ -131,7 +171,7 @@ const request_tools: Operation = {
     surface: {
       type: 'string',
       enum: ['verbs', 'starter', 'full'],
-      description: 'Surface to persist for your client.',
+      description: 'Surface to widen to (stdio: this session only).',
     },
   },
   scope: 'read',
@@ -141,7 +181,7 @@ const request_tools: Operation = {
   // self-enforces ceiling + operator lock + scopes + rate limit.
   mutating: true,
   handler: async (ctx, p) => {
-    const { surfaceWiderThan, isMcpSurface } = await import('../../mcp/surface.ts');
+    const { surfaceWiderThan, isMcpSurface, clampSurface } = await import('../../mcp/surface.ts');
     // Unset ceiling (local CLI / direct dispatch) = 'full' — trusted-local
     // callers were never surface-bounded.
     const ceiling = ctx.surfaceCeiling ?? 'full';
@@ -166,8 +206,9 @@ const request_tools: Operation = {
         throw invalidParam(ctx, 'request_tools', 'surface', 'surface must be one of: verbs, starter, full (got an unrecognized value)', { choices: ['verbs', 'starter', 'full'] });
       }
       const clientId = ctx.auth?.clientId;
+      if (!clientId && ctx.transport === 'stdio' && ctx.stdioSurface) return widenStdioSession(ctx, requested);
       if (!clientId) {
-        // stdio has no per-token identity; a surface persist has nowhere to land.
+        // No per-token identity and no stdio session: a surface persist has nowhere to land.
         return { persisted: false, reason: NO_CLIENT_SURFACE };
       }
       if (surfaceWiderThan(requested, ceiling)) {
@@ -248,7 +289,10 @@ const request_tools: Operation = {
       return { persisted: true, surface: requested, note: 're-issue tools/list to see the new catalog' };
     }
 
-    const visible = await visibleOpsForCaller(ctx, ceiling);
+    // A widenable stdio session lists what request_tools {surface} can add, not only what it serves now.
+    const session = ctx.transport === 'stdio' ? ctx.stdioSurface : undefined;
+    const catalogCeiling = session && session.widenAllowed && !session.readOnly ? clampSurface('full') : ceiling;
+    const visible = await visibleOpsForCaller(ctx, catalogCeiling);
 
     // ── descriptor branch (D5: read-only) ───────────────────────────────
     if (p.tools !== undefined) {
@@ -283,7 +327,9 @@ const request_tools: Operation = {
     return {
       catalog,
       total_tools: visible.length,
-      note: 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to persist a wider tool surface (within the server ceiling), then re-issue tools/list.',
+      note: session
+        ? 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to add those tools to this session (nothing is written).'
+        : 'Call request_tools {tools: ["name", ...]} for full schemas, or {surface: "starter"|"full"} to persist a wider tool surface for your OAuth client (within the server ceiling), then re-issue tools/list.',
     };
   },
 };

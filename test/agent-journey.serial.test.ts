@@ -46,6 +46,8 @@ import {
 const MARKER = 'quokka-journey-marker';
 const PAGES = 3;
 const timings: Record<string, number> = {};
+/** The background onboarding refresh races these calls; test/mcp-onboarding.test.ts owns those notices, this journey pins the degraded one. */
+const QUIET_ONBOARDING = { GBRAIN_NO_ONBOARD_NUDGE: '1' };
 
 function brainPath(home: string): string { return join(home, '.gbrain', 'brain.pglite'); }
 
@@ -227,7 +229,7 @@ describe('H1a keyless MCP journey (stdio)', () => {
   });
 
   test('surface verbs: remember/recall, the degraded notice block, a caller mistake with a runnable fix, status-only second serve', async () => {
-    const verbs = await mcp(home, ['--surface', 'verbs']);
+    const verbs = await mcp(home, ['--surface', 'verbs'], { env: QUIET_ONBOARDING });
     open.push(verbs);
     timings.initialize_ms = verbs.initMs;
     const tools = (await verbs.client.listTools()).tools.map(t => t.name);
@@ -289,7 +291,7 @@ describe('H1a keyless MCP journey (stdio)', () => {
   }, 240_000);
 
   test('surface full: search carries the degraded notice; a list_pages caller mistake carries a fix that runs', async () => {
-    const full = await mcp(home, ['--surface', 'full']);
+    const full = await mcp(home, ['--surface', 'full'], { env: QUIET_ONBOARDING });
     open.push(full);
     const tools = (await full.client.listTools()).tools.map(t => t.name);
     expect(tools).toEqual(expect.arrayContaining(['search', 'query', 'list_pages', 'get_page', 'recall']));

@@ -5,9 +5,12 @@
 ```bash
 git clone https://github.com/garrytan/gbrain.git
 cd gbrain
-bun install
-bun test
+bun install --frozen-lockfile && bun run test && bun run verify
 ```
+
+`bun run test` is the parallel unit loop; `bun run verify` is CI's guard
+battery. [`docs/TESTING.md`](docs/TESTING.md#quick-start) covers E2E, failure
+logs and the lanes.
 
 Requires Bun 1.4.0 or newer, matching `package.json`.
 
@@ -159,7 +162,7 @@ in one-shot with `GBRAIN_E2E_ALLOW_DB=<name>`.
 
 Changes to durable persistence also require the native/runtime, process-crash,
 soak, deployment-matrix and read-latency gates in
-[`docs/TESTING.md`](docs/TESTING.md#durable-persistence-schedules-and-process-crashes).
+[`scripts/persistence/README.md`](scripts/persistence/README.md#test-suites).
 `test:full` alone does not execute those complete platform and runtime matrices.
 Keep each result tied to its tested revision and disclose skipped cells.
 
@@ -178,8 +181,8 @@ loop" below), silent fallback to recursive chunking in the compiled binary
 manifest; coverage ratchets up from the `todo` rows) can actually fail by
 running it against known-bad fixtures — a new `scripts/check-*` guard must be
 registered in the manifest or the build fails. There is no `check:all` script; the
-trailing-newline, exports-count, and no-legacy-getconnection checks run in
-`verify` with everything else.
+trailing-newline and no-legacy-getconnection checks run in `verify` with
+everything else, and `test/public-exports.test.ts` owns the package export map.
 
 ### Writing tests that survive the parallel loop
 
@@ -255,10 +258,10 @@ the authoring gate. See [Source reads in tests](docs/TESTING.md#source-reads-in-
 
 ```bash
 bun run ci:local         # full gate: gitleaks + guards/typecheck + 4-shard parallel unit + E2E
-bun run ci:local:diff    # gate with diff-aware E2E selector
-bun run ci:select-e2e    # print which E2E files the selector would run
+bun run ci:local:diff    # doc-only diff: gitleaks + doc checks; otherwise the full gate
+bun run ci:select-e2e    # print the E2E files the diff selects (nothing for doc-only, else all)
 bun run ci:ubicloud      # the same gate fanned out across ephemeral Ubicloud VMs (~5 min)
-bun run ci:ubicloud:diff # Ubicloud gate with the diff-aware E2E selector
+bun run ci:ubicloud:diff # Ubicloud gate with the same doc-only fast path
 ```
 
 `ci:local` spins up four pgvector services plus a transaction-mode PgBouncer via
@@ -273,8 +276,11 @@ on host (`brew install gitleaks`). Override the postgres host port with
 uncommitted edits included; see "Ubicloud fan-out" in
 [`docs/TESTING.md`](docs/TESTING.md).
 
-Fail-closed selector: an unmapped `src/` change runs ALL E2E files. Hand-tune
-narrower mappings via `scripts/e2e-test-map.ts`.
+E2E selection runs every E2E file for any change that is not doc-only; diff
+narrowing is retired because a typical E2E file imports most of `src/`. A
+doc-only diff still runs llms freshness, the KEY_FILES byte caps, documented
+paths, skill references and the privacy guards (`scripts/ci-doc-checks.sh`).
+See [E2E selection](docs/TESTING.md#e2e-selection).
 
 ### Local graduation smoke (PGLite → Postgres)
 

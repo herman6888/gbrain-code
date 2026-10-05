@@ -48,7 +48,9 @@ export interface DrainReport {
   retry_after_ms?: number;
   stall?: DrainStall;
   /** DX-A5: whether pages were published in bulk groups, and why not when they were not. */
-  bulk?: { enabled: boolean; reason: string | null; groups: number; grouped_pages: number; largest_group: number };
+  bulk?: { enabled: boolean; reason: string | null; groups: number; grouped_pages: number; largest_group: number;
+    /** #5984 admit-ahead: groups admitted while the previous group was still publishing. */
+    admitted_ahead: number };
 }
 
 const TERMINAL_STATUSES = new Set(['synced', 'first_sync', 'up_to_date', 'dry_run']);
@@ -158,7 +160,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
   const coop = cooperativeDeadline();
   const signal = coop.signal && input.signal ? AbortSignal.any([input.signal, coop.signal]) : coop.signal ?? input.signal;
   let passes = 0, attempt = 0, readFailures = 0, refreshWaitedMs = 0, written = 0, waived = 0, index = 0, total: number | null = null;
-  let announcedStart = false, lastLine = 0, groups = 0, groupedPages = 0, largestGroup = 0;
+  let announcedStart = false, lastLine = 0, groups = 0, groupedPages = 0, largestGroup = 0, admittedAhead = 0;
   let stall: { key: string; since: number; passes: number } | null = null;
   const remaining = () => total === null ? null : Math.max(0, total - index);
   const onProgress: NonNullable<SyncOpts['onProgress']> = event => {
@@ -171,6 +173,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
         + (input.bulk?.enabled ? 'publishing in bulk groups (each page keeps its own request).' : `one write request per page${input.bulk?.reason ? ` (bulk off: ${input.bulk.reason})` : ''}.`));
     }
     if (event.phase === 'managed_sync.group' && typeof event.group === 'number') { groups++; groupedPages += event.group; largestGroup = Math.max(largestGroup, event.group); }
+    if (event.phase === 'managed_sync.group_ahead') admittedAhead++;
     if (event.phase !== 'managed_sync.page_committed') return;
     if (event.waived) waived++; else written++;
     noteForwardProgress();
@@ -187,7 +190,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     if (stopReason === 'deadline' && continues(result)) result = { ...result, reason: 'timeout' };
     return { ...result, drain: { outcome, ...(stopReason ? { stop_reason: stopReason } : {}), passes, processed: written + waived, written, waived,
       remaining: left, ...drainEstimate(left, written + waived, Date.now() - startedAt),
-      ...(input.bulk ? { bulk: { ...input.bulk, groups, grouped_pages: groupedPages, largest_group: largestGroup } } : {}), ...extra } };
+      ...(input.bulk ? { bulk: { ...input.bulk, groups, grouped_pages: groupedPages, largest_group: largestGroup, admitted_ahead: admittedAhead } } : {}), ...extra } };
   };
   try {
     for (;;) {

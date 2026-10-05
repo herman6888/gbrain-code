@@ -755,13 +755,6 @@ export function noteRenderedErrorCode(code: string): void {
   lastRenderedErrorCode = code;
 }
 
-/** Test seam. */
-export function _resetJsonGuardForTests(): void {
-  jsonGuardMode = null;
-  jsonDocumentWritten = false;
-  lastRenderedErrorCode = undefined;
-}
-
 function writeJsonFallbackIfMissing(exitCode: number): void {
   if (!jsonGuardMode || jsonDocumentWritten) return;
   if (exitCode === 0) {

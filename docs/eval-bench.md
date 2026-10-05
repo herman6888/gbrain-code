@@ -109,7 +109,8 @@ check:eval-canary` is the on-demand package script (it is deliberately not
 in the `verify` battery — the unit-matrix twin already gates it). Honest
 scope: semantic-embedding regressions remain the keyed eval suites' job.
 Reproduce locally with `bun run scripts/run-eval-canary.ts` (`--record`
-appends to the `.gbrain-evals/eval-results.jsonl` ledger).
+appends to the `.gbrain-evals/eval-results.jsonl` ledger, a local file that is
+gitignored; `gbrain eval compare` reads it).
 
 ### `.qrels.json` shape
 
@@ -1158,3 +1159,48 @@ Observability:
 Real expected cost: ~$0.35 per nightly run (5 questions x 3 slots x 1 cycle
 x ~$0.02/call) ≈ $10.50/month. Worst-case under the default budget cap:
 $150/month. Opt-in default prevents discovering this in your card statement.
+
+## Local benchmark scripts
+
+Three deterministic, keyless benchmarks run an in-process PGLite brain and
+print a report (`--json` for machine-readable output). They are not collected
+by any test runner; run them when touching the code they measure.
+
+### Graph quality benchmark (`scripts/bench-graph-quality.ts`)
+
+80 fictional pages (people, companies, meetings, concepts) seeded with the
+current extraction contract: meeting attendance from the meeting's
+frontmatter `attendees:` (edges person -> meeting, type `attended`), founders
+from the person's frontmatter `founded:`, and employment, advising and
+investment from prose links. After `gbrain extract links --source db
+--include-frontmatter` and `extract timeline`, it scores link recall and
+precision, type accuracy, timeline recall and precision, typed and relational
+traversal, idempotent re-extraction, multi-hop traversal, a top-N aggregate,
+a two-type intersection, and keyword ranking with the backlink boost, each
+against a grep-over-page-text baseline (A). It exits 1 when a threshold fails
+(link recall 0.85, link precision 0.95, timeline recall 0.85 and precision
+0.95, type accuracy 0.80, relational recall 0.80, both idempotency checks).
+
+Last recorded run (2026-10-04, v0.60.48.0): every threshold passes at 100%
+(90 links, 95 timeline rows); the grep baseline reaches the same relational
+recall with 45.5% precision; multi-hop recall is 10/10 against 0/10 for grep.
+In the ranking section the boost leaves unlinked pages where they were (avg
+rank 27.5) and does not lift the four most-linked startups above the other
+linked startups (avg rank 12.5 without, 13.25 with); the order of equal
+keyword scores is not stable between runs.
+
+### Knowledge runtime benchmark (`scripts/bench-knowledge-runtime.ts`)
+
+Three checks with mocked resolvers: timeline rows are queryable right after
+`put_page` with `auto_timeline` on and off (they are a canonical projection
+that commits with the page, so both arms read 100%); the bare-tweet repair
+buckets under a 70/20/10 resolver confidence mix (35 repaired, 10 to review, 5
+skipped of 50); and doctor's integrity scan surfacing planted issues (last
+run: 5 of 6, with 2 of 3 bare tweets caught).
+
+### put_page latency (`scripts/bench-put-page-latency.ts`)
+
+200 `put_page` operation calls against 10 target pages, half carrying three
+timeline bullets. Reports mean, p50, p95, p99 and max latency and the timeline
+rows committed (300 expected). Last run on one Capy cloud machine: p50 21 ms,
+p95 42 ms, p99 142 ms.

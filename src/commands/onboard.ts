@@ -125,11 +125,15 @@ export async function runOnboard(engine: BrainEngine, args: string[]): Promise<v
   if (check && !auto) {
     const plan = await computeRemediationPlan(engine, { targetScore, extraRemediations });
     const report = buildOnboardReport(plan);
+    const { mutedFirstRunDecisionsNotice } = await import('../core/onboard/mcp-onboarding.ts');
+    const muted = await mutedFirstRunDecisionsNotice(engine).catch(() => null);
     if (jsonOutput) {
-      process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+      const { cliRenderContext, renderNotice } = await import('../core/agent-output.ts');
+      process.stdout.write(JSON.stringify(muted ? { ...report, notices: [renderNotice(muted, cliRenderContext())] } : report, null, 2) + '\n');
       return;
     }
     process.stdout.write(renderHuman(report) + '\n');
+    if (muted) (await import('../core/interop-notices.ts')).writeCliNotices([muted]);
     // v0.42 (T16): --explain extension. Per-cluster narrative for the
     // pack_upgrade_available recommendation. Runs unify-types in dry-run
     // mode and renders the per-rule diff. No-op when no pack upgrade

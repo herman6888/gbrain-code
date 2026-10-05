@@ -5,7 +5,8 @@ import { loadMounts } from '../core/brain-registry.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { resolveSourceIdEngineFree } from '../core/source-resolver.ts';
 import { inspectLockHolder } from '../core/pglite-lock.ts';
-import { OperationError } from '../core/ops/contract.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
 import { maybeDelegateLocalAdministration, persistenceConfigForBrain } from '../core/persistence/local-client.ts';
 import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
 import { SYNC_BOOLEAN_FLAGS, SYNC_VALUE_FLAGS, validateSyncWireParams } from '../core/persistence/sync-wire.ts';
@@ -20,6 +21,9 @@ import { runDrain, drainJsonFields, formatDrainSummary, syncOutcome } from '../c
 import { resolveStallAbortSeconds, resolveSyncHardDeadline, syncResumeCommand } from '../core/sync-reconcile.ts';
 import { noteForwardProgress } from '../core/forward-progress.ts';
 
+const invalid=(message:string,suggestion:string)=>opError('invalid_params',message,suggestion,
+  {fix:readFix('Prints the gbrain sync flags.',{argv:['gbrain','sync','--help']})});
+
 export async function parsePersistenceSyncArgs(args:string[],cwd=process.cwd()) {
   const options:Record<string,unknown>={};
   for(let i=0;i<args.length;i++) {
@@ -27,15 +31,18 @@ export async function parsePersistenceSyncArgs(args:string[],cwd=process.cwd()) 
     const boolean=SYNC_BOOLEAN_FLAGS[arg as keyof typeof SYNC_BOOLEAN_FLAGS];
     if(boolean){options[boolean]=true;continue;}
     if(['--json','--yes','--no-hard-deadline'].includes(arg))continue;
-    if(['--timeout','--hard-deadline'].includes(arg)){if(!args[++i]||args[i].startsWith('--'))throw new OperationError('invalid_params',`${arg} requires a value.`);continue;}
+    if(['--timeout','--hard-deadline'].includes(arg)){if(!args[++i]||args[i].startsWith('--'))throw invalid(`${arg} requires a value.`,`Give ${arg} a duration right after it, e.g. ${arg} 10m.`);continue;}
     const key=SYNC_VALUE_FLAGS[arg as keyof typeof SYNC_VALUE_FLAGS];
-    if(!key)throw new OperationError('invalid_params',`Unsupported owner-delegated sync option: ${arg}.`);
-    const value=args[++i];if(!value||value.startsWith('--'))throw new OperationError('invalid_params',`${arg} requires a value.`);
+    if(!key)throw invalid(`Unsupported owner-delegated sync option: ${arg.split('=')[0]}.`,
+      `Remove ${arg.split('=')[0]}; while the running serve holds the brain, sync runs inside it and accepts ${[...Object.keys(SYNC_BOOLEAN_FLAGS),...Object.keys(SYNC_VALUE_FLAGS),'--timeout','--hard-deadline','--json','--yes'].join(', ')}.`);
+    const value=args[++i];if(!value||value.startsWith('--'))throw invalid(`${arg} requires a value.`,`Give ${arg} its value right after it, as ${arg} VALUE.`);
     if(key==='exclude'||key==='includeHidden')options[key]=[...(options[key] as string[]??[]),value];
     else options[key]=key==='repoPath'?resolve(cwd,value):value;
   }
   const source=resolveSourceIdEngineFree(typeof options.sourceId==='string'?options.sourceId:null,cwd);
-  if(source==='__all__')throw new OperationError('invalid_params','Owner-delegated sync requires one explicit source.');
+  if(source==='__all__')throw opError('invalid_params','Owner-delegated sync requires one explicit source.',
+    'Name one source with --source while the running serve holds the brain (repeat the command per source); gbrain sources list --json lists them.',
+    {fix:readFix('Lists the source ids to sync one at a time, read-only.',{argv:['gbrain','sources','list','--json']})});
   if(source)options.sourceId=source;
   const softTimeout=parseDurationSeconds(args.find((_,i)=>args[i-1]==='--timeout'),'--timeout');
   const hardTimeout=await deriveDelegatedTimeoutSeconds(args);
@@ -122,7 +129,8 @@ export async function maybeDelegateSyncToPersistence(hostConfig:GBrainConfig|nul
         const sliceSeconds=deadline.sliceSeconds(params.timeoutSeconds);
         const delegated=await maybeDelegateLocalAdministration('writer_sync',{...params,timeoutSeconds:sliceSeconds} as unknown as Record<string,unknown>,config,
           {timeoutMs:sliceSeconds>0?Math.min(86_400_000,Math.max(30_000,sliceSeconds*1000+30_000)):86_400_000});
-        if(!delegated.handled)throw new OperationError('owner_unavailable','The observed PGLite owner stopped before sync admission.','Retry the same sync options to resume its durable cursor.');
+        if(!delegated.handled)throw opError('owner_unavailable','The observed PGLite owner stopped before sync admission.','Retry the same sync options to resume its durable cursor.',
+          {fix:{argv:['gbrain','sync',...args],consent:[],actor:'agent',requires_exclusive:false,why:'The owner stopped before admission; the same options resume the durable cursor.'}});
         const slice=delegated.result as SyncResult;
         deadline.noteCursor(slice.managedCursor?.index);
         return slice;

@@ -20,6 +20,11 @@ import { safeCompare, driftLevel, loadPromptState } from './thin-client-upgrade-
 import { VERSION } from '../version.ts';
 import { writeJsonDocument } from './cli-force-exit.ts';
 
+/** A status-only host's envelope on a failed check: the code, its fix and the words to relay. */
+function statusOnlyDetail(env: Record<string, unknown> | undefined): Record<string, unknown> {
+  return env ? { code: 'serve_status_only', fix: env.fix, user_message: env.user_message, retry_after_s: env.retry_after_s } : {};
+}
+
 export interface RemoteCheck {
   name: string;
   status: 'ok' | 'warn' | 'fail';
@@ -158,7 +163,7 @@ export async function collectRemoteDoctorReport(
       name: 'oauth_discovery',
       status: 'fail',
       message: disco.message,
-      detail: { reason: disco.reason, ...(disco.status ? { status: disco.status } : {}) },
+      detail: { reason: disco.reason, ...(disco.status ? { status: disco.status } : {}), ...statusOnlyDetail(disco.status_only) },
     });
     return finalize(remote, checks);
   }
@@ -177,7 +182,7 @@ export async function collectRemoteDoctorReport(
       message: tokenRes.message,
       detail: {
         reason: tokenRes.reason, ...(tokenRes.status ? { status: tokenRes.status } : {}),
-        ...(tokenRes.retry_after_s !== undefined ? { retry_after_s: tokenRes.retry_after_s } : {}),
+        ...(tokenRes.retry_after_s !== undefined ? { retry_after_s: tokenRes.retry_after_s } : {}), ...statusOnlyDetail(tokenRes.status_only),
       },
     });
     return finalize(remote, checks);

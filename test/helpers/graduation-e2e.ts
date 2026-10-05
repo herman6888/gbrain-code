@@ -32,9 +32,19 @@ export const DATABASE_URL = process.env.DATABASE_URL;
 
 export interface BoundaryEvent { event: 'boundary' | 'paused' | 'released'; boundary: string; detail: Record<string, unknown>; pid: number; at: number; ordinal?: number }
 
+/**
+ * Events written so far. The child appends while the parent polls, so the text after the last
+ * newline may be a half-written line: it is left for the next poll. Every newline-terminated
+ * line must parse; a malformed one is a real failure.
+ */
 export function readEvents(path: string): BoundaryEvent[] {
   if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const lines = readFileSync(path, 'utf8').split('\n');
+  lines.pop();
+  return lines.filter(Boolean).map((line, i) => {
+    try { return JSON.parse(line) as BoundaryEvent; }
+    catch (error) { throw new Error(`${path} line ${i + 1} is not a JSON event (${(error as Error).message}): ${line.slice(0, 200)}`); }
+  });
 }
 
 /** Wait for a `paused` event (or any event matching `match`) while the child lives. */

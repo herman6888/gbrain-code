@@ -64,7 +64,7 @@ export async function searchWithoutEmbeddings(
   if (relationalList.length > 0) {
     const r = ensureRelationalEvidenceSlot(noEmbedGated, relationalList, limit, offset, {
       cosineFloor: resolvedMode.evidence_cosine_floor,
-    });
+    }, resolvedMode.relational_chain_slots);
     noEmbedPool = r.pool;
     noEmbedRelSlot = r.decision;
   }
@@ -156,7 +156,16 @@ export async function searchVectorFallback(
   stampEvidence(kwHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
   // System One S3 evidence gate (no-op when the slot is off), at the fused path's position.
   const kwGated = await applyEvidenceGate(req.decide, query, kwHopped);
-  const kwSliced = kwGated.slice(offset, offset + limit);
+  // #3995 — the same guaranteed page-1 relational evidence as the other two
+  // return paths: a vector failure must not drop a fired arm's answer.
+  let kwPool = kwGated;
+  let kwRelSlot: RelationalEvidenceSlotDecision | undefined;
+  if (relationalList.length > 0) {
+    const r = ensureRelationalEvidenceSlot(kwGated, relationalList, limit, offset, { cosineFloor: resolvedMode.evidence_cosine_floor }, resolvedMode.relational_chain_slots);
+    kwPool = r.pool;
+    kwRelSlot = r.decision;
+  }
+  const kwSliced = kwPool.slice(offset, offset + limit);
   // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
   const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
   await stampContentFlags(engine, kwBudgeted, opts);
@@ -181,6 +190,7 @@ export async function searchVectorFallback(
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: kwBudgetMeta }
       : {}),
+    ...(kwRelSlot ? { relational_evidence_slot: kwRelSlot } : {}),
   });
   return kwBudgeted;
 }

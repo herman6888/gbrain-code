@@ -29,6 +29,7 @@ Repo: https://github.com/garrytan/gbrain
 
 ## Configuration
 
+- [docs/guides/multi-hop.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/multi-hop.md): Multi-hop relationship questions: typed hop chains over links (search planner + traverse_graph hops), evidence edges, refusals, notices, settings.
 - [docs/ENGINES.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/ENGINES.md): PGLite vs Postgres trade-off and when to migrate.
 - [docs/guides/move-to-postgres.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/move-to-postgres.md): Move a PGLite brain to Postgres with its history: --url-env target setup, plan (exit 3) then --yes --expect, status/resume/rollback, what moves vs stays on this computer, recovery by error code.
 - [docs/GBRAIN_RECOMMENDED_SCHEMA.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/GBRAIN_RECOMMENDED_SCHEMA.md): MECE directory structure (people/, companies/, concepts/).

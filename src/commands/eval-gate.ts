@@ -461,11 +461,12 @@ export async function runEvalGate(engine: BrainEngine, args: string[]): Promise<
   }
 
   const json = jsonRequested(args);
-  const usage: (message: string, suggestion?: string) => never = (message, suggestion = 'Example: gbrain eval gate --qrels Y.qrels.json --json') =>
+  const usage: (message: string, suggestion: string) => never = (message, suggestion) =>
     process.exit(writeCliRefusal(usageError(message, suggestion), 'eval', { json }));
   if (!opts.baseline && !opts.qrels) {
     printHelp();
-    usage('Error: at least one of --baseline or --qrels must be set');
+    usage('Error: at least one of --baseline or --qrels must be set',
+      'Pass --qrels with a qrels fixture for the correctness gate (gbrain eval gate --qrels Y.qrels.json --json), --baseline with a published baseline for the regression gate, or both.');
   }
 
   if (opts.baseline && !existsSync(opts.baseline)) usage(`Error: baseline file not found: ${opts.baseline}`, 'Pass an existing --baseline file (write one with `gbrain bench publish`).');

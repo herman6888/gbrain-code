@@ -89,10 +89,14 @@ export async function assertLifetimeIdHeadroom(engine: SqlEngine, principal: Pri
   }
 }
 /** Creates and locks the counter rows in key order: two statements for any number of keys (#5984 round-trip diet). */
+/** Creates missing counter rows; takes no lock on existing ones. Keys sorted. */
+export const ENSURE_COUNTERS_SQL = 'INSERT INTO persistence_counters(key) SELECT k FROM unnest($1::text[]) WITH ORDINALITY AS u(k,n) ORDER BY n ON CONFLICT DO NOTHING';
+/** Locks counter rows in one global order (deadlock avoidance). */
+export const LOCK_COUNTERS_SQL = 'SELECT * FROM persistence_counters WHERE key=ANY($1::text[]) ORDER BY key COLLATE "C" FOR UPDATE';
 export async function lockCounters(tx: SqlEngine, keys: string[]): Promise<Counter[]> {
   const sorted = [...new Set(keys)].sort();
-  await tx.executeRaw('INSERT INTO persistence_counters(key) SELECT k FROM unnest($1::text[]) WITH ORDINALITY AS u(k,n) ORDER BY n ON CONFLICT DO NOTHING', [sorted]);
-  return tx.executeRaw<Counter>('SELECT * FROM persistence_counters WHERE key=ANY($1::text[]) ORDER BY key COLLATE "C" FOR UPDATE', [sorted]);
+  await tx.executeRaw(ENSURE_COUNTERS_SQL, [sorted]);
+  return tx.executeRaw<Counter>(LOCK_COUNTERS_SQL, [sorted]);
 }
 export async function getWriteRequest(engine: SqlEngine, principal: Principal, requestId: string): Promise<WriteRequest | null> {
   const [row] = await engine.executeRaw<WriteRequest>(

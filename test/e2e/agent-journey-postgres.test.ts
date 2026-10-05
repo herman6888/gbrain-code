@@ -161,7 +161,7 @@ describeE2E('H4: keyless agent journey on Postgres', () => {
     db = await scratchDatabase();
     h = makeDoctorHome('agent-journey-pg');
     homes.push(h);
-    // A first install has no skills workspace in HOME (test/doctor-day-zero.serial.test.ts does the same).
+    // A first install has no skills workspace in HOME (test/doctor-day-zero.test.ts does the same).
     rmSync(h.skillsDir, { recursive: true, force: true });
     const started = Date.now();
     const init = await runGbrain(h, ['init', '--non-interactive', '--url', db.url, '--no-embedding', '--json'], {}, 120_000);

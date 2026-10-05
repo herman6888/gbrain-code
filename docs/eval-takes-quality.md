@@ -87,9 +87,11 @@ receipt file from disk and re-renders it. The other modes need the brain.
 - `verdict` — `pass` if every dim mean >= 7 AND every dim min across
   contributing models >= 5; `fail` otherwise; `inconclusive` if fewer than
   2/3 models contributed complete scores.
-- `cost_usd` — sum of per-call cost via `pricing.ts`. Unknown models when
-  `--budget-usd` is set produce a `PricingNotFoundError` before any call
-  fires.
+- `cost_usd` — sum of per-call cost via `pricing.ts` (a rate registered with
+  `gbrain pricing set`, else the canonical table). An unpriced model with
+  `--budget-usd` set refuses with `no_pricing` before any call fires; its fix
+  is `gbrain pricing set <model> --input <usd/1M> --output <usd/1M> --source
+  <url>`. Without a cap it runs with a warning and its spend is not counted.
 
 ## Receipt persistence
 

@@ -14,6 +14,7 @@ import { REPAIR_KINDS } from '../src/core/repair/core.ts';
 import { REPAIR_HELP, runRepairCommand } from '../src/commands/repair.ts';
 import { AUTO_REPAIR_REGISTRY } from '../src/core/repair/registry.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 let engine: PGLiteEngine;
 const home = mkdtempSync(join(tmpdir(), 'gbrain-repair-flags-'));
@@ -67,6 +68,20 @@ describe('gbrain repair flags', () => {
     const error = await refusal(['timeline', 'extra']);
     expect(error.code).toBe('invalid_params');
     expect(error.message).toContain('extra');
+  });
+
+  test('usage refusals name the exact usage and offer the read-only preview', async () => {
+    expectFunnelSuggestions('src/commands/repair.ts', 'invalid', 7);
+    const both = envelopeFor(await refusal(['timeline', '--all']));
+    expect(both).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'repair', 'timeline', '--json'], next: 'run' } });
+    expect(both.suggestion).toContain('Drop --all to repair only timeline');
+    const yes = envelopeFor(await refusal(['timeline', '--yes']));
+    expect(yes).toMatchObject({ fix: { argv: ['gbrain', 'repair', 'timeline', '--json'] } });
+    expect(yes.suggestion).toContain('--apply instead of --yes');
+    const limit = envelopeFor(await refusal(['timeline', '--limit', '0']));
+    expect(limit.suggestion).toContain('--limit 50');
+    const applyAll = envelopeFor(await refusal(['--apply']));
+    expect(applyAll).toMatchObject({ fix: { argv: ['gbrain', 'repair', '--json'], next: 'run' } });
   });
 
   test('help names every registered kind', () => {

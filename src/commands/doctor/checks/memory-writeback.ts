@@ -38,6 +38,7 @@ import { readVerbUsage } from '../../../core/verbs/usage-log.ts';
 import { readClientOpUsage } from '../../../core/mcp-usage.ts';
 import { readHeartbeatTail } from '../../../core/context/hook-heartbeat.ts';
 import { readHarnessReceiptState } from '../../../core/bootstrap/format.ts';
+import { mutedFirstRunDecisionsNotice } from '../../../core/onboard/mcp-onboarding.ts';
 import {
   probeAmbientBlock,
   renderAmbientInstructionBlock,
@@ -316,12 +317,15 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
       };
     } catch { /* heartbeat unreadable — counters stay absent */ }
 
+    const mutedDecisions = await mutedFirstRunDecisionsNotice(engine).catch(() => null);
+    if (mutedDecisions) details.first_run_decisions_muted = { why: mutedDecisions.why, unmute: mutedDecisions.fix?.argv };
     return {
       name: MEMORY_WRITEBACK_CHECK_NAME,
       status: problems.length ? 'warn' : 'ok',
-      message: problems.length
+      message: (problems.length
         ? `ambient writeback ${wb.mode}: ${problems.join('; ')}`
-        : `ambient writeback ${wb.mode} (ttl ${wb.transient_ttl}, template visibility ${wb.visibility}, audience ${audience.audience})`,
+        : `ambient writeback ${wb.mode} (ttl ${wb.transient_ttl}, template visibility ${wb.visibility}, audience ${audience.audience})`)
+        + (mutedDecisions ? '; first-run decisions are open but muted (`gbrain notices unmute first_run_decisions` shows them again)' : ''),
       details,
       ...(problems.some((p) => p.includes('gbrain bootstrap harness'))
         ? { fix: {

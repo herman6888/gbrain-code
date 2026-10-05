@@ -25,12 +25,12 @@
       },
       "addLinksBatch#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -2483,7 +2483,8 @@
       },
       "replaceDerivedLinks#default": {
         "flagOffLanes": [
-          "tx"
+          "tx",
+          "tx>sp"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
@@ -3431,6 +3432,7 @@
         "reconnect": "none",
         "refreshPageBody": "none",
         "registerBeforeDisconnect": "none",
+        "relationalChainHop": "none",
         "relationalFanout": "none",
         "removeLink": "none",
         "removeLinksByPagesAndSource": "none",

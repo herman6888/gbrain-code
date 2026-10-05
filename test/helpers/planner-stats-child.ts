@@ -1,5 +1,5 @@
 /**
- * Child process for test/planner-stats-restart.serial.test.ts (F4b, O-CEO-17).
+ * Child process for test/planner-stats-restart.test.ts (F4b, O-CEO-17).
  *
  *   bun test/helpers/planner-stats-child.ts <data-dir> insert <n>        insert n facts, disconnect
  *   bun test/helpers/planner-stats-child.ts <data-dir> insert-crash <n>  insert n facts, SIGKILL itself right after the commit

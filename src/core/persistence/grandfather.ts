@@ -12,6 +12,7 @@ import { admitWrite, assertLifetimeIdHeadroom, assertReplayIntent, getWriteReque
 import { getWorktreeBinding } from './ownership.ts';
 import { digest, requireUuid } from './digest.ts';
 import { waitForWrite, writeResponse } from './service.ts';
+import { maintenancePublishWaitMs } from './maintenance-wait.ts';
 import { databaseOnlyPublication, prepareFileTarget } from './page-prepare.ts';
 import type { WriteRequest } from './model.ts';
 import type { PreparedMutation } from './coordinator.ts';
@@ -82,7 +83,7 @@ export async function admitCanonicalGrandfather(engine: BrainEngine, selected: G
   } catch (error) { return settleFailure(error); }
   return { status: 'admitted', complete: async () => {
     try {
-      const committed = writeResponse(await waitForWrite(engine, request, ctx.config));
+      const committed = writeResponse(await waitForWrite(engine, request, ctx.config, maintenancePublishWaitMs()));
       await engine.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [op, fingerprint, JSON.stringify([requestId])]);
       // The publication revision lets verification tell a later rewrite from a lost grandfather.
       return { status: 'touched', revision: typeof committed.revision === 'string' ? committed.revision : null };

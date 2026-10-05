@@ -38,6 +38,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { JobDeferredError, UnrecoverableError } from './types.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
+import { SpendGroupRefusedError, type SpendRefusalEnvelope } from './spend-authorization.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 import { basename, delimiter, resolve } from 'node:path';
 
@@ -99,7 +100,9 @@ export type ChildOutcome =
       errorKind: ChildErrorKind;
       message: string;
       stack?: string;
-      lease?: { key: string; active: number; max: number };
+      lease?: { key: string; active: number; max: number; retryInMs?: number };
+      /** A group spend refusal's envelope (code, fix, group amounts). */
+      spend?: SpendRefusalEnvelope;
       deferral?: { reason: string; retryInMs: number };
       protocolVersion?: number;
       reasonCode?: typeof CHILD_CONFIGURATION_REASONS[number];
@@ -120,7 +123,7 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       outcome: 'error',
       errorKind: 'rate_lease',
       message: err.message,
-      lease: { key: err.key, active: err.active, max: err.max },
+      lease: { key: err.key, active: err.active, max: err.max, ...(err.retryInMs !== undefined ? { retryInMs: err.retryInMs } : {}) },
     };
   }
   if (err instanceof JobDeferredError) {
@@ -132,6 +135,7 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       errorKind: 'unrecoverable',
       message: err.message,
       ...(err.stack ? { stack: err.stack } : {}),
+      ...(err instanceof SpendGroupRefusedError ? { spend: err.envelope } : {}),
     };
   }
   const message = err instanceof Error ? err.message : String(err);
@@ -150,10 +154,10 @@ export function reconstructHandlerError(o: Extract<ChildOutcome, { outcome: 'err
     return childConfigurationError(o.reasonCode);
   }
   if (o.errorKind === 'rate_lease' && o.lease) {
-    return new RateLeaseUnavailableError(o.lease.key, o.lease.active, o.lease.max);
+    return new RateLeaseUnavailableError(o.lease.key, o.lease.active, o.lease.max, o.lease.retryInMs);
   }
   if (o.errorKind === 'unrecoverable') {
-    return new UnrecoverableError(o.message);
+    return o.spend ? new SpendGroupRefusedError(o.spend) : new UnrecoverableError(o.message);
   }
   if (o.errorKind === 'deferred' && o.deferral && Number.isFinite(o.deferral.retryInMs)) {
     return new JobDeferredError(String(o.deferral.reason), o.message, o.deferral.retryInMs);
@@ -203,8 +207,11 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
       return encodeHandlerError(childConfigurationError(o.reasonCode));
     }
     const rawLease = (o as { lease?: unknown }).lease as
-      | { key?: unknown; active?: unknown; max?: unknown }
+      | { key?: unknown; active?: unknown; max?: unknown; retryInMs?: unknown }
       | undefined;
+    const rawSpend = (o as { spend?: unknown }).spend as { code?: unknown; message?: unknown; group?: unknown } | undefined;
+    const spendValid = rawSpend != null && typeof rawSpend === 'object' && typeof rawSpend.code === 'string'
+      && typeof rawSpend.message === 'string' && rawSpend.group != null && typeof rawSpend.group === 'object';
     const leaseValid =
       rawLease != null &&
       typeof rawLease.key === 'string' &&
@@ -227,8 +234,10 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
         ? { stack: (o as { stack: string }).stack }
         : {}),
       ...(errorKind === 'rate_lease' && leaseValid
-        ? { lease: { key: rawLease.key as string, active: rawLease.active as number, max: rawLease.max as number } }
+        ? { lease: { key: rawLease.key as string, active: rawLease.active as number, max: rawLease.max as number,
+          ...(Number.isFinite(rawLease.retryInMs as number) && (rawLease.retryInMs as number) >= 0 ? { retryInMs: rawLease.retryInMs as number } : {}) } }
         : {}),
+      ...(errorKind === 'unrecoverable' && spendValid ? { spend: rawSpend as SpendRefusalEnvelope } : {}),
       ...(errorKind === 'deferred' && deferralValid
         ? { deferral: { reason: rawDeferral.reason as string, retryInMs: rawDeferral.retryInMs as number } }
         : {}),

@@ -203,14 +203,14 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 Easiest path: `bun run ci:local` runs the full CI gate inside Docker (gitleaks,
 guards + typecheck, then 4-shard parallel unit + E2E against four pgvector
 containers plus a transaction-mode PgBouncer; unit phase keeps `DATABASE_URL`
-unset) and tears down. Use `bun run ci:local:diff` for the
-diff-aware subset during fast iteration on a focused branch. Requires Docker
+unset) and tears down. `bun run ci:local:diff` checks a doc-only diff in
+seconds (gitleaks plus the doc checks) and runs the full gate otherwise. Requires Docker
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
 
 Fastest path, with a Ubicloud token (`UBICLOUD_API_KEY` or
 `UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across ten
 ephemeral VMs in about five minutes, uncommitted edits included
-(`ci:ubicloud:diff` for the diff-aware subset). See "Ubicloud fan-out" in
+(`ci:ubicloud:diff` for the doc-only fast path). See "Ubicloud fan-out" in
 [`docs/TESTING.md`](./docs/TESTING.md).
 
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin

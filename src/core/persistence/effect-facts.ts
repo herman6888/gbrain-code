@@ -3,7 +3,8 @@ import type { ParsedPage } from '../import-file.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { MinionQueue } from '../minions/queue.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
@@ -15,17 +16,22 @@ export type FactsBackstopStatus = { queued: true } | { skipped: string };
 
 export async function authorizeFactsBackstop(engine: BrainEngine, row: WriteRequest, lock = false): Promise<void> {
   if (derivedExtractionSkip(row.authority) === 'slug_bound_client') {
-    throw new OperationError('permission_denied', 'A confined writer cannot extract into unnamed entity pages.');
+    throw opError('permission_denied', 'A confined writer cannot extract into unnamed entity pages.',
+      `The write of ${row.slug} came from a slug-bound client, so facts are not extracted into entity pages outside its prefixes; the page itself is written. Widening that client's grant is the brain host operator's decision.`);
   }
   await authorizeStoredRequest(engine, row, lock);
   await authorizeWrite(engine, row.authority, 'extract_facts', row.slug, lock);
   // A grant may have become confined while the page itself remains in scope.
   if (row.principal_kind === 'oauth_client') {
     const [current] = await engine.executeRaw<{ bound_slug_prefixes: unknown }>('SELECT bound_slug_prefixes FROM oauth_clients WHERE client_id=$1', [row.principal_id]);
-    if (current?.bound_slug_prefixes != null) throw new OperationError('permission_denied', 'The current writer grant is confined.');
+    if (current?.bound_slug_prefixes != null) throw opError('permission_denied', 'The current writer grant is confined.',
+      `OAuth client ${row.principal_id} is now bound to slug prefixes, so facts from ${row.slug} are not extracted; the page itself is written. Widening the grant is the brain host operator's decision.`,
+      { fix: readFix('Lists the OAuth clients with their bound slug prefixes, read-only.', { argv: ['gbrain', 'auth', 'clients', '--json'] }) });
   } else if (row.principal_kind === 'local_cli' || row.principal_kind === 'local_stdio') {
     const [current] = await engine.executeRaw<{ prefixes: unknown }>("SELECT grant_ceiling->'slugPrefixes' AS prefixes FROM persistence_local_writers WHERE id=$1::uuid", [row.principal_id]);
-    if (current?.prefixes != null) throw new OperationError('permission_denied', 'The current writer grant is confined.');
+    if (current?.prefixes != null) throw opError('permission_denied', 'The current writer grant is confined.',
+      `Local writer ${row.principal_id} now has slug prefixes, so facts from ${row.slug} are not extracted; the page itself is written. Replacing the grant is the user's decision.`,
+      { fix: readFix('Lists the local writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   }
 }
 

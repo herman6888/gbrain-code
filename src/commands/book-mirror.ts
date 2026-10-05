@@ -41,13 +41,14 @@
 
 import * as fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { OperationError } from '../core/ops/contract.ts';
+import { opError } from '../core/ops/contract.ts';
 import { isWriteReceipt } from '../core/persistence/types.ts';
 import * as path from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../core/minions/wait-for-completion.ts';
-import type { MinionJobInput, SubagentHandlerData } from '../core/minions/types.ts';
+import type { MinionJob, MinionJobInput, SubagentHandlerData } from '../core/minions/types.ts';
+import { jobSpendAuthorization, spendSubmitSummary } from '../core/minions/spend-authorization.ts';
 import { operations } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
 import { getCliOptions } from '../core/cli-options.ts';
@@ -349,11 +350,20 @@ export async function prepareBookMirrorPublication(engine: BrainEngine, slug: st
       cliOpts: getCliOptions(), sourceId: 'default' }, {
       slug, content, request_id: requestId, ...(snapshot ? { expected_revision: snapshot.revision } : {}),
     });
-    if (!isWriteReceipt(receipt)) throw new OperationError('storage_error', 'Book publication returned no durable write receipt.');
+    if (!isWriteReceipt(receipt)) {
+      throw opError('storage_error', `Publishing ${slug} returned no durable write receipt, so whether the page was written is unknown.`,
+        `Read the page to see whether it was written; if it is missing or stale, run the same book-mirror command again (completed chapters are reused).`,
+        { why: 'A publication is confirmed only by its write receipt; without one the page may or may not hold the new mirror.',
+          fix: { argv: ['gbrain', 'get', '--source', 'default', '--', slug], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Shows the page as stored now, so you can tell whether the publication landed.' } });
+    }
     if (receipt.state !== 'committed') {
       const code = ['queued', 'running', 'recovering'].includes(receipt.state) ? 'write_pending' : 'storage_error';
-      const error = new OperationError(code, `Book publication is ${receipt.state}.`,
-        `Inspect get_write_request with request_id '${requestId}' before repeating publication.`);
+      const error = opError(code, `Publishing ${slug} is ${receipt.state}; the page may not hold the new mirror yet.`,
+        `Read write request ${requestId} (gbrain write-request -- ${requestId}) and wait for it to settle before repeating publication; a repeat with a new request could write the page twice.`,
+        { why: 'The publication was handed to the brain\'s write path but has not committed; its durable receipt says whether it will.',
+          fix: { argv: ['gbrain', 'write-request', '--', requestId], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Reads the publication\'s durable write receipt, read-only.' } });
       error.writeRequest = receipt;
       error.writeError = code;
       throw error;
@@ -417,17 +427,20 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
   // tokenmax or a per-run preapproval authorize it; otherwise a TTY prompt
   // (interaction.readLine: EOF/timeout = decline, never a hang) or exit 3
   // with the consent payload. Nothing is submitted before consent.
-  await consentGateOrExit({
+  const consentArgv = ['gbrain', 'book-mirror', ...args.filter(a => a !== '--yes' && a !== '--no-confirm')];
+  const auth = await consentGateOrExit({
     command: 'book-mirror', effects: ['paid'], actor: 'agent',
     what: `Run ${chapters.length} chapter subagent(s) for ${targetSlug}`,
     why: `Writes a personalized two-column mirror of "${bookTitle}" from the brain's context, one ${flags.model} subagent per chapter.`,
-    risk: `Spends about $${estimateUsd.toFixed(2)} (~$${(estimateUsd / chapters.length).toFixed(2)} per chapter) with the model provider. Subagents are read-only; the result is one new page.`,
+    risk: `Spends about $${estimateUsd.toFixed(2)} (~$${(estimateUsd / chapters.length).toFixed(2)} per chapter) with the model provider. Subagents are read-only; the result is one new page. Without --max-usd, a model with no known price runs unmetered under the derived or default cap.`,
     user_message: `Spend about $${estimateUsd.toFixed(2)} to mirror ${chapters.length} chapter(s) of "${bookTitle}" against your brain?`,
-    argv: ['gbrain', 'book-mirror', ...args.filter(a => a !== '--yes' && a !== '--no-confirm')],
-    preview_argv: ['gbrain', 'book-mirror', ...args.filter(a => a !== '--yes' && a !== '--no-confirm'), '--dry-run'],
+    argv: consentArgv,
+    preview_argv: [...consentArgv, '--dry-run'],
     est_usd: estimateUsd,
     args: flags.noConfirm ? [...args, '--yes'] : args,
   }, { json: false, env: engineConsentEnv(engine) });
+  // One approved total for every chapter subagent (the worker enforces it across the group).
+  const spend = jobSpendAuthorization(auth, { command: 'book-mirror', est_usd: estimateUsd, of: chapters.length, argv: consentArgv });
 
   const publish = await prepareBookMirrorPublication(engine, targetSlug);
 
@@ -436,6 +449,7 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
   // tool-allowlist layer rather than at allowedSlugPrefixes scope.
   const queue = new MinionQueue(engine);
   const childIds: number[] = [];
+  const children: MinionJob[] = [];
   for (const ch of chapters) {
     const data: SubagentHandlerData = {
       prompt: buildChapterPrompt(ch, chapters.length, bookTitle, flags.author, contextPack),
@@ -456,14 +470,16 @@ export async function runBookMirrorCmd(engine: BrainEngine, args: string[]): Pro
       'subagent',
       data as unknown as Record<string, unknown>,
       submitOpts,
-      { allowProtectedSubmit: true },
+      { allowProtectedSubmit: true, spendAuthorization: spend },
     );
     childIds.push(job.id);
+    children.push(job);
   }
 
   process.stderr.write(
     `submitted: ${childIds.length} subagent jobs (${childIds[0]}..${childIds[childIds.length - 1]})\n`
   );
+  for (const line of spendSubmitSummary(spend, children, consentArgv).lines) process.stderr.write(`${line}\n`);
 
   if (!flags.follow) {
     process.stdout.write(JSON.stringify({ child_ids: childIds, slug: targetSlug }) + '\n');

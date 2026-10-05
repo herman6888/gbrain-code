@@ -182,17 +182,18 @@ describe('keyless answers ask before spending (F8/F9)', () => {
 });
 
 describe('F6 hidden-tool hint (owner stdio only)', () => {
-  test('a tool outside the stdio surface names itself, its CLI equivalent and GBRAIN_SURFACE=full', async () => {
+  test('a tool outside the stdio surface names itself, the request_tools widen, its CLI equivalent and GBRAIN_SURFACE=full', async () => {
     // A1: the CLI fix names the served brain explicitly.
     const { STARTER_OPS } = await import('../src/mcp/surface.ts');
     const allowedOps = new Set(STARTER_OPS);
     const stdio = await dispatchToolCall(engine as any, 'get_health', {}, { remote: true, transport: 'stdio', sourceId: 'default', allowedOps, surface: 'starter' });
     const env = JSON.parse(stdio.content[0].text);
     expect(env.code).toBe('unknown_tool');
-    expect(env.suggestion).toContain('get_health exists, but this server runs the starter tool surface');
+    expect(env.suggestion).toContain('get_health exists, but this session serves the starter tool surface');
     expect(env.suggestion).toContain('GBRAIN_SURFACE=full');
+    expect(env.fix.mcp).toEqual({ tool: 'request_tools', arguments: { surface: 'full' } });
     expect(env.fix.command).toBe('gbrain doctor --json --brain host');
-    expect(env.fix.next).toBe('tell_user_to_run');
+    expect(env.fix.next).toBe('run');
     // HTTP keeps the opaque envelope (no existence oracle).
     const http = await dispatchToolCall(engine as any, 'get_health', {}, { remote: true, transport: 'http', sourceId: 'default', allowedOps, surface: 'starter' });
     const opaque = JSON.parse(http.content[0].text);
@@ -239,6 +240,42 @@ describe('F7 coaching reaches agents', () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
       __resetPostUpgradeNoticeForTests();
+    }
+  });
+});
+
+describe('onboarding notices on the stdio channel', () => {
+  test('an onboard_* notice renders as a prefixed block and in _meta.gbrain_notices; first_run_decisions carries its decisions', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { __resetMcpOnboardingForTests, __warmOnboardingCacheForTests } = await import('../src/core/onboard/mcp-onboarding.ts');
+    const home = mkdtempSync(join(tmpdir(), 'gb-notice-onboard-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home, GBRAIN_NO_ONBOARD_NUDGE: undefined }, async () => {
+        __resetMcpOnboardingForTests();
+        __resetBackupNoticeForTests();
+        for (const p of ['alice-example', 'bob-example', 'charlie-example']) {
+          await engine.putPage(`people/${p}`, { type: 'person', title: p, compiled_truth: `${p} notes.` });
+        }
+        await __warmOnboardingCacheForTests(engine as never);
+        const opts = { remote: true, transport: 'stdio' as const, sourceId: 'default' };
+        const first = await dispatchToolCall(engine as never, 'get_backlinks', { slug: 'people/alice-example' }, opts);
+        const block = first.content.map(c => c.text).find(t => t.startsWith('[gbrain notice onboard_link_coverage kind=coaching]'));
+        expect(block).toBeDefined();
+        expect(block).toContain('fix: get_health {}');
+        expect(block).toContain('user_message: ');
+        const meta = (first._meta?.gbrain_notices as Array<{ code: string; contract_version: number }>).find(n => n.code === 'onboard_link_coverage');
+        expect(meta?.contract_version).toBe(1);
+        const second = await dispatchToolCall(engine as never, 'list_pages', {}, opts);
+        const ask = (second._meta?.gbrain_notices as Array<{ code: string; decisions?: Array<{ id: string; options: Array<{ argv?: string[] }> }> }>).find(n => n.code === 'first_run_decisions');
+        const writeback = ask?.decisions?.find(d => d.id === 'writeback');
+        expect(writeback?.options.map(o => o.argv)).toContainEqual(['gbrain', 'config', 'set', 'memory.auto_writeback', 'salient']);
+        expect(second.content.some(c => c.text.startsWith('[gbrain notice first_run_decisions kind=ask]'))).toBe(true);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      __resetMcpOnboardingForTests();
     }
   });
 });

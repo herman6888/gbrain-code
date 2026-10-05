@@ -99,6 +99,7 @@ describe('pull-request CI scope', () => {
       expect(run('schedule', 'exit 1')).toBe('native=full');
       expect(run('workflow_dispatch', 'exit 1')).toBe('native=full');
       expect(run('pull_request', 'exit 1')).toBe('native=primary');
+      expect(run('merge_group', 'exit 1')).toBe('native=primary');
       expect(run('pull_request', "printf 'docs/a.md\\n'")).toBe('native=smoke');
       expect(run('pull_request', "printf 'src/core/pglite-lock.ts\\n'")).toBe('native=primary');
       for (const count of ['', 'invalid', '3000', '4230', '99999']) {
@@ -118,18 +119,52 @@ describe('pull-request CI scope', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test('security and persistence matrices drop only the oldest Bun version on pull requests', () => {
+  test('a release-style version-only package.json diff does not widen the native scope (C11)', () => {
+    const step = load('test.yml').jobs.changes.steps!.find(entry => entry.id === 'scope')!;
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-ci-scope-c11-'));
+    try {
+      const run = (files: string[], headPkg: Record<string, unknown>) => {
+        writeFileSync(join(dir, 'files'), files.join('\n') + '\n');
+        writeFileSync(join(dir, 'base.json'), JSON.stringify({ name: 'gbrain', version: '1', scripts: { a: 'x' } }));
+        writeFileSync(join(dir, 'head.json'), JSON.stringify(headPkg));
+        writeFileSync(join(dir, 'gh'), `#!/usr/bin/env bash
+case "$*" in
+  *pulls/*/files*) cat '${join(dir, 'files')}' ;;
+  *ref=base*) cat '${join(dir, 'base.json')}' ;;
+  *ref=head*) cat '${join(dir, 'head.json')}' ;;
+  *) exit 1 ;;
+esac
+`);
+        chmodSync(join(dir, 'gh'), 0o755);
+        const output = join(dir, 'out');
+        writeFileSync(output, '');
+        const result = spawnSync('bash', ['-c', step.run!], { cwd: root, encoding: 'utf8',
+          env: { PATH: `${dir}:${process.env.PATH}`, EVENT: 'pull_request', PR: '7', REPO: 'example/repo', CHANGED_FILES: String(files.length),
+            BASE_SHA: 'base', HEAD_SHA: 'head', GITHUB_OUTPUT: output } });
+        expect(result.status, result.stderr).toBe(0);
+        return readFileSync(output, 'utf8').trim();
+      };
+      expect(run(['CHANGELOG.md', 'package.json'], { name: 'gbrain', version: '2', scripts: { a: 'x' } })).toBe('native=smoke');
+      expect(run(['package.json'], { name: 'gbrain', version: '2', scripts: { a: 'x' } })).toBe('native=smoke');
+      expect(run(['CHANGELOG.md', 'package.json'], { name: 'gbrain', version: '2', scripts: { a: 'y' } })).toBe('native=primary');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('security and persistence matrices drop only the oldest Bun version on pull requests and merge-queue runs', () => {
+    const queue = { github: { event_name: 'merge_group' } };
     const pr = { github: { event_name: 'pull_request' } };
     const push = { github: { event_name: 'push' } };
     const security = load('test.yml').jobs['security-regressions'];
     expect(cells(security, push)).toHaveLength(6);
     expect(cells(security, pr)).toEqual(['ubuntu-latest/1.4.2', 'macos-26/1.4.2', 'windows-latest/1.4.2']);
+    expect(cells(security, queue)).toEqual(cells(security, pr));
     const persistence = load('persistence-validation.yml').jobs;
     for (const name of ['read-performance', 'deployment-matrix', 'invariants', 'reconciliation']) {
       const full = cells(persistence[name], push);
       const primary = cells(persistence[name], pr);
       expect(full.filter(cell => cell.endsWith(MINIMUM_BUN_VERSION)).length, name).toBe(full.length / 2);
       expect(primary, name).toEqual(full.filter(cell => cell.endsWith('1.4.2')));
+      expect(cells(persistence[name], queue), name).toEqual(primary);
     }
   });
 
@@ -137,6 +172,7 @@ describe('pull-request CI scope', () => {
     const step = load('test.yml').jobs['slow-entity-resolve-perf'].steps!.find(entry => entry.run?.includes('test/export-scale.slow.test.ts'))!;
     const expression = step.env!.GBRAIN_TEST_EXPORT_SCALE_PAGES!;
     expect(evaluate(expression, { github: { event_name: 'pull_request' } })).toBe('10001');
+    expect(evaluate(expression, { github: { event_name: 'merge_group' } })).toBe('10001');
     for (const event_name of ['push', 'schedule', 'workflow_dispatch']) expect(evaluate(expression, { github: { event_name } })).toBe('100001');
   });
 
@@ -158,7 +194,7 @@ describe('pull-request CI scope', () => {
     expect(/GBRAIN_E2E_BUN_IMAGE:-oven\/bun:([^}]+)\}/.exec(read('tests/docker/bootstrap-e2e.sh'))?.[1]).toBe(primary);
     const matrices = [load('test.yml').jobs['security-regressions'], ...Object.values(load('persistence-validation.yml').jobs)]
       .map(job => job.strategy?.matrix.bun).filter(Boolean);
-    expect(matrices).toHaveLength(6);
+    expect(matrices).toHaveLength(7);
     for (const bun of matrices) expect(bun).toEqual([MINIMUM_BUN_VERSION, primary]);
     for (const job of ['native', 'musl', 'windows-backup-console', 'windows-backup-dotnet']) {
       expect(native[job].strategy!.matrix.bun).toEqual([MINIMUM_BUN_VERSION, primary]);

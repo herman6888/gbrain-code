@@ -41,11 +41,18 @@ transaction, and the writer publishes the group in one transaction. Every
 page still gets its own write request, receipt, attribution and failure
 report; if one page fails, the pages before it commit, that page is reported,
 and the pages after it are cancelled and re-frozen once it is fixed. Group size
-adapts so a group takes about `sync.bulk_max_txn_ms` (default 15 s); a
-foreground write waits behind at most one group. Turn bulk off with
+adapts so a group takes about `sync.bulk_max_txn_ms` (default 15 s). While a
+group publishes, the drain freezes and admits the next one, so the writer
+starts it as soon as the current group commits. Nothing is admitted ahead
+while foreground writes are recent (one was queued in the last minute), so a
+foreground write waits behind at most the group that is publishing. If a page fails, the group admitted ahead of it is
+cancelled with the reason "An earlier page of the same sync did not commit"
+and re-frozen once the failure is fixed. Turn bulk off with
 `--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
 final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
-`largest_group`). PGLite publishes without network round trips and does not
+`largest_group`, `admitted_ahead`). Finish a drain before downgrading gbrain:
+an older version refuses a group this version admitted ahead, and the sync
+stops there instead of publishing a page twice. PGLite publishes without network round trips and does not
 use bulk groups.
 
 *Written* pages published a change. *Waived* entries needed no write (an

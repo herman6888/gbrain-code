@@ -12,6 +12,7 @@ import { currentVerifiedLocalWriter, registerLocalWriter } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled } from './ownership.ts';
 import { admitWrite } from './journal.ts';
 import { waitForWrite, writeResponse } from './service.ts';
+import { maintenancePublishWaitMs } from './maintenance-wait.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
 
@@ -57,7 +58,7 @@ export async function reindexCodeProjection(engine: BrainEngine, slug: string, s
       sourceIncarnation: snapshot.snapshot.sourceIncarnation, slug, pageId: snapshot.snapshot.page.id,
       principal: authority.principal, authority, callerIntent: intent, intent,
       worktreeId: binding?.worktree_id, topologyGeneration: binding?.topology_generation });
-    const done = await waitForWrite(engine, row, loadConfig() ?? { engine: engine.kind }, 5000);
+    const done = await waitForWrite(engine, row, loadConfig() ?? { engine: engine.kind }, maintenancePublishWaitMs());
     writeResponse(done);
     result = done.outcome as typeof result;
   } else if (!opts.force && snapshot.snapshot.page.text_projection_revision === snapshot.snapshot.revision) {

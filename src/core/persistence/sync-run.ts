@@ -31,6 +31,7 @@ import type { WriteRequest } from './model.ts';
 import { assertManagedSyncAllowed } from './worktree-refresh.ts';
 import type { GBrainConfig } from '../config.ts';
 import { admitGroup, freezeFollowers, groupableIntent, nextGroupSize, type BulkSettings } from './sync-group.ts';
+import { cancelWindow } from './sync-window.ts';
 import { isContentRefusal } from '../import-screen.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, pinnedBlob, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
@@ -71,7 +72,13 @@ interface Cursor extends SyncDiscovery { runId: string; index: number; authority
   /** #5984: the active drain window (reset when a new drain starts), so a backlog ETA never counts downtime. */
   progress?: CursorProgress;
   /** #5984 bulk: the frozen head (also `pending`) and the members admitted with it, in manifest order. */
-  group?: Pending[]; }
+  group?: Pending[];
+  /**
+   * #5984 admit-ahead: groups frozen and admitted after `group` while it publishes, in manifest order
+   * (at most one today). Each member's intent names the previous group's last request (`after`); a
+   * window group publishes only after that request committed, and is cancelled when it did not.
+   */
+  window?: Pending[][]; }
 export interface CursorProgress { startedAt: number; startIndex: number; lastAt: number; lastIndex: number }
 /** #5984: the cursor's progress after advancing to `index`, in the drain window that started at `drainStartedAt`. */
 function stampProgress(prior: CursorProgress | undefined, fromIndex: number, index: number, drainStartedAt: number): CursorProgress {
@@ -430,14 +437,71 @@ function countCommitted(counts: Cursor['counts'], pending: Pending, outcome: Wri
   if ((outcome?.recovered_frontmatter || outcome?.comment_value) && pending.intent.path) counts.recovered = addRecovered(counts.recovered,
     { paths: outcome.recovered_frontmatter ? [pending.intent.path] : [], commentValues: outcome.comment_value ? 1 : 0 });
 }
-interface BulkPass { settings: BulkSettings; perMemberMs: number | null }
+interface BulkPass { settings: BulkSettings; perMemberMs: number | null;
+  /** #5984 admit-ahead: when this pass last saw a foreground write queued on the worktree. */
+  foregroundAt?: number }
+/** While foreground writes are recent, nothing is admitted ahead, so a new foreground write waits behind at most the publishing group. */
+const FOREGROUND_RECENT_MS = 60_000;
+type FreezeAt = (base: Cursor) => (index: number) => Promise<Pending | null>;
+
+/** #5984 bulk: freezes the followers of an eligible head and records them with it as the cursor's group. */
+async function formGroup(engine: BrainEngine, head: Cursor, pending: Pending, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
+  assertActive: () => void): Promise<Cursor> {
+  const followers = await freezeFollowers(engine, head, config, nextGroupSize(bulk.settings, bulk.perMemberMs) - 1, freezeAt(head));
+  if (!followers.length) return head;
+  // Members name their group (the head's request ID), so a consumer can claim them together.
+  const members = [pending, ...followers].map(member => ({ ...member, intent: { ...member.intent, group: pending.requestId } }));
+  return saveCursor(engine, key, head, { ...head, pending: members[0], group: members }, false, assertActive);
+}
+
+/**
+ * #5984 admit-ahead (one lane, window depth 2): while the cursor's group publishes, freeze and admit the
+ * next group so it is queued behind it (per-worktree FIFO) and the consumer claims it as soon as the group
+ * commits. Nothing is admitted ahead while foreground writes are recent (one was queued on the worktree in
+ * the last minute), or when the next
+ * entry is not groupable (renames, holds, waivers, the checkpoint and overtaken entries stay on the single path).
+ */
+async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
+  assertActive: () => void): Promise<Cursor> {
+  if (!bulk.settings.enabled || !cursor.group?.length) return cursor;
+  let current = cursor;
+  if (!current.window?.length) {
+    const start = cursor.index + cursor.group.length;
+    if (start >= cursor.entries.length) return cursor;
+    const [foreground] = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE worktree_id=$1::uuid
+      AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [cursor.binding.worktree_id]);
+    if (foreground) bulk.foregroundAt = performance.now();
+    if (bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) return cursor;
+    const base: Cursor = { ...cursor, index: start - 1 };
+    // A freeze refusal here is left for the single path to raise in order, after the publishing group.
+    const frozen = await freezeFollowers(engine, base, config, nextGroupSize(bulk.settings, bulk.perMemberMs), freezeAt(base)).catch(() => []);
+    if (!frozen.length) return cursor;
+    const after = cursor.group.at(-1)!.requestId;
+    const members = frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after } }));
+    current = await saveCursor(engine, key, cursor, { ...cursor, window: [members] }, false, assertActive);
+  }
+  const members = current.window?.[0];
+  if (!members?.length) return current;
+  const principal = current.authority.writer.principal;
+  const admitted = await engine.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=ANY($3::uuid[])',
+    [principal.kind, principal.id, members.map(member => member.requestId)]);
+  if ((admitted[0]?.n ?? 0) < members.length) {
+    // An admission that fails here is retried when the group becomes the cursor's group.
+    await admitGroup(engine, members, current, async tx => {
+      const [held] = await tx.executeRaw<{ request_id: string | null }>(`SELECT completed_keys->0->'window'->0->0->>'requestId' AS request_id FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key]);
+      return held?.request_id === members[0]!.requestId;
+    }).catch(() => null);
+  }
+  assertActive();
+  return current;
+}
 /**
  * #5984 bulk: admits the cursor's group, waits for it and advances over the
  * committed prefix. A terminal failure leaves that member as the single
  * pending entry, so the single path records and reports it.
  */
 async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk: BulkPass, config: GBrainConfig, wait: { waitMs: number; signal?: AbortSignal },
-  drainStartedAt: number, onProgress: SyncOpts['onProgress']): Promise<{ cursor: Cursor } | { result: SyncResult }> {
+  drainStartedAt: number, onProgress: SyncOpts['onProgress'], ahead?: (cursor: Cursor) => Promise<Cursor>): Promise<{ cursor: Cursor } | { result: SyncResult }> {
   const signal = wait.signal;
   const members = cursor.group!;
   const principal = cursor.authority.writer.principal;
@@ -455,6 +519,12 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
   onProgress?.({ phase: 'managed_sync.group', bankedFiles: cursor.index, total: cursor.entries.length, group: members.length });
   await validateSyncAuthority(engine, cursor.authority, members[0]!.slug);
   assertSyncDispatchActive();
+  if (ahead) {
+    const before = cursor.window?.[0]?.[0]?.requestId;
+    cursor = await ahead(cursor);
+    const formed = cursor.window?.[0];
+    if (formed?.length && formed[0]!.requestId !== before) onProgress?.({ phase: 'managed_sync.group_ahead', bankedFiles: cursor.index, total: cursor.entries.length, group: formed.length });
+  }
   const last = rows.find(row => row.request_id === members.at(-1)!.requestId)!;
   const waited = await awaitWrite(engine, last, config, wait);
   assertSyncDispatchActive();
@@ -472,9 +542,16 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
   if (committed) next.progress = stampProgress(cursor.progress, cursor.index, next.index, drainStartedAt);
   const stuck = members[committed];
   const stuckRow = stuck ? states.get(stuck.requestId) : undefined;
-  if (!stuck) { delete next.pending; delete next.group; }
-  else { next.pending = stuck; if (stuckRow && isTerminalWriteState(stuckRow.state)) delete next.group; else next.group = members.slice(committed); }
-  const saved = committed || next.group?.length !== members.length ? await saveCursor(engine, key, cursor, next) : cursor;
+  const failed = !!stuck && !!stuckRow && isTerminalWriteState(stuckRow.state);
+  if (!stuck) {
+    // The window's first group becomes the cursor's group; its requests are already admitted and queued.
+    const [promoted, ...rest] = next.window ?? [];
+    if (promoted) { next.pending = promoted[0]; next.group = promoted; } else { delete next.pending; delete next.group; }
+    if (rest.length) next.window = rest; else delete next.window;
+  } else { next.pending = stuck; if (failed) delete next.group; else next.group = members.slice(committed); }
+  // A failed page stops the run: groups admitted ahead of it are cancelled, never published after it.
+  if (failed && next.window) { await cancelWindow(engine, next.window, principal); delete next.window; }
+  const saved = committed || failed || next.group?.length !== members.length ? await saveCursor(engine, key, cursor, next) : cursor;
   for (let index = cursor.index + 1; index <= saved.index && index <= next.index; index++) onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: index, total: cursor.entries.length });
   if (stuck && stuckRow && !isTerminalWriteState(stuckRow.state) && saved.index === next.index) {
     return { result: { ...result(saved, 'partial', signal?.aborted ? 'timeout' : 'writer_pending'), ...(cursor.authority.writer.remote ? {} : {
@@ -665,7 +742,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         const [foreground] = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE worktree_id=$1::uuid
           AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [cursor.binding.worktree_id]);
         assertActive();
-        foregroundQueued = Boolean(foreground);
+        if ((foregroundQueued = Boolean(foreground))) bulk.foregroundAt = performance.now();
         if (foreground && creditedPages === 0) {
           startPersistenceConsumer(engine, config);
           if (!foregroundWaitStart) {
@@ -708,16 +785,11 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         if (slice && (cursor.index - sliceFirstIndex >= slice.maxPages || performance.now() - sliceStarted >= slice.maxMs)) return result(cursor, 'partial', 'writer_yield');
         continue;
       }
-      if (bulk.settings.enabled && !foregroundQueued && !prior && !cursor.group && !pending.rebound && groupableIntent(pending.intent)) {
-        const head: Cursor = cursor;
-        const followers = await freezeFollowers(engine, head, config, nextGroupSize(bulk.settings, bulk.perMemberMs) - 1,
-          async index => { const frozen = await freezeEntry(engine, { ...head, index }, key, assertActive, frozenRun); return 'hold' in frozen ? null : frozen; });
-        // Members name their group (the head's request ID), so a consumer can claim them together.
-        const members = [pending, ...followers].map(member => ({ ...member, intent: { ...member.intent, group: pending.requestId } }));
-        if (followers.length) cursor = await saveCursor(engine, key, head, { ...head, pending: members[0], group: members }, false, assertActive);
-      }
+      const freezeAt: FreezeAt = base => async index => { const frozen = await freezeEntry(engine, { ...base, index }, key, assertActive, frozenRun); return 'hold' in frozen ? null : frozen; };
+      if (bulk.settings.enabled && !foregroundQueued && !prior && !cursor.group && !pending.rebound && groupableIntent(pending.intent)) cursor = await formGroup(engine, cursor, pending, key, bulk, config, freezeAt, assertActive);
       if (cursor.group?.[0]?.requestId === pending.requestId && cursor.pending?.requestId === pending.requestId) {
-        const step = await groupStep(engine, cursor, key, bulk, config, opts.drainStartedAt ? { waitMs: 30_000, signal } : { waitMs: 5000 }, drainStartedAt, opts.onProgress);
+        const step = await groupStep(engine, cursor, key, bulk, config, opts.drainStartedAt ? { waitMs: 30_000, signal } : { waitMs: 5000 }, drainStartedAt, opts.onProgress,
+          opts.drainStartedAt ? next => admitAhead(engine, next, key, bulk, config, freezeAt, assertActive) : undefined);
         if ('result' in step) return step.result;
         cursor = step.cursor;
         assertActive();

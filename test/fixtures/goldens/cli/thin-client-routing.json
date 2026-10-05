@@ -25,7 +25,8 @@
       "argv": "takes add alice-example",
       "exitCode": 1,
       "stderr": [
-        "Error [invalid_params]: Missing --claim."
+        "Error [invalid_params]: Missing --claim.",
+        "Fix: takes add needs --claim \"...\" --kind fact|take|bet|hunch --who HOLDER: gbrain takes add alice-example --claim \"...\" --kind fact|take|bet|hunch --who HOLDER."
       ],
       "stdout": []
     },

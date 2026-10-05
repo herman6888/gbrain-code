@@ -23,7 +23,7 @@ import { applyAliasHop } from '../alias-hop.ts';
 import { effectiveRrfK } from '../intent-weights.ts';
 import { enforceTokenBudget } from '../token-budget.ts';
 import { expandAnchors, hydrateChunks } from '../two-pass.ts';
-import { parseRelationalQuery } from '../relational-intent.ts';
+import { isRelationalQuery } from '../relational-plan.ts';
 import { pushDegraded, stampBudgetStage } from './degraded.ts';
 import { requiresSafeChunks } from '../safe-chunks.ts';
 import { stampEvidence } from '../evidence.ts';
@@ -119,7 +119,7 @@ export async function fuseArms(
     titleFusionList,
     relationalList,
     includeRelational: effectiveModality !== 'image',
-    relationalQuery: parseRelationalQuery(query) !== null,
+    relationalQuery: isRelationalQuery(query, resolvedMode.relational_planner),
     onKeywordArmConfidence: (d) => { keywordArmConfidence = d; },
     ks: { vectorK, textRrfK, imageRrfK, keywordK, baseRrfK },
     knobs: {
@@ -417,7 +417,7 @@ export async function sizeReturnPool(
   if (relationalList.length > 0 && effectiveModality !== 'image') {
     const r = ensureRelationalEvidenceSlot(returnPool, relationalList, limit, offset, {
       cosineFloor: resolvedMode.evidence_cosine_floor,
-    });
+    }, resolvedMode.relational_chain_slots);
     returnPool = r.pool;
     relationalSlotDecision = r.decision;
   }

@@ -23,7 +23,7 @@
  *     only CODEX_HOME set keeps the consent prompt; CLAUDECODE and CI force
  *     non-interactive with exactly one stderr line naming the cause and
  *     GBRAIN_INTERACTIVE=1 (units: test/interaction.test.ts,
- *     test/interaction-stdin.serial.test.ts drive interaction.ts directly).
+ *     test/interaction-stdin.test.ts drive interaction.ts directly).
  *
  * Serial: spawns the CLI (some under a PTY), runs an in-process serve-http.
  */

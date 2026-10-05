@@ -7,7 +7,7 @@
  *   1. Every `--json` stdout parses: the journey's commands, the doctor family,
  *      every read op the CLI exposes (mutating:false, no required params), and
  *      every command a fix or plan names. (json-declared commands' success and
- *      failure shapes: test/cli-contract.serial.test.ts D5.)
+ *      failure shapes: test/cli-contract.test.ts D5.)
  *   2. Zero WARNs without an executable fix, and every runnable fix runs: each
  *      doctor WARN/FAIL carries fix.argv; fixes the agent may run itself
  *      (consent [], actor agent, no inputs) are executed, and each fix.verify.
@@ -28,7 +28,7 @@
  *      refusal is the two-step plan (stop the owner, then the same command),
  *      and following it succeeds.
  *
- * Existing lane coverage this builds on: D5 test/cli-contract.serial.test.ts,
+ * Existing lane coverage this builds on: D5 test/cli-contract.test.ts,
  * E1 test/doctor-status-set.test.ts, A7 test/readiness-embedding-enablement.serial.test.ts
  * (the enable argv runs), F1 test/mcp-initialize-instructions.test.ts,
  * F6 test/mcp-notice-channels.test.ts, A2 test/callable-predicate.test.ts,

@@ -221,12 +221,22 @@ jobs:
       - id: gate
         name: Gate on PAT + vendored template tree
         run: |
+          # A skip here is visible (warning + step summary), never a silent
+          # green: this release did not publish the agent template (D-10).
           if [ -z "$TEMPLATE_REPO_PAT" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "SKIP: TEMPLATE_REPO_PAT secret not configured — template-repo publishing disabled."
+            echo "::warning::Agent template NOT published to $TEMPLATE_REPO — the TEMPLATE_REPO_PAT secret is empty. Why: only the repo owner can set secrets. Fix (owner-only): gh secret set TEMPLATE_REPO_PAT (fine-grained PAT with contents: write on $TEMPLATE_REPO), then re-run this release workflow."
+            {
+              echo "## Agent template not published"
+              echo "The TEMPLATE_REPO_PAT secret is empty, so \`$TEMPLATE_REPO\` did not get this release's \`templates/bootstrap/template-repo/\` tree."
+              echo ""
+              echo "- Why: only the repo owner can set secrets."
+              echo "- Fix (owner-only): \`gh secret set TEMPLATE_REPO_PAT\` (fine-grained PAT, contents: write on \`$TEMPLATE_REPO\`), then re-run this workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
           elif [ ! -d templates/bootstrap/template-repo ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "SKIP: templates/bootstrap/template-repo/ not vendored yet — nothing to publish."
+            echo "::warning::Agent template NOT published — templates/bootstrap/template-repo/ is missing from this checkout. Fix: restore the vendored tree, then re-run this release workflow."
+            echo "## Agent template not published: templates/bootstrap/template-repo/ is missing" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi

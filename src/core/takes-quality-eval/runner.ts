@@ -7,10 +7,11 @@
  * incomplete dim scores (codex review #5), aggregates, and stops early on
  * PASS or INCONCLUSIVE.
  *
- * Budget enforcement (codex review #4 fail-closed): if --budget-usd is set,
- * the runner aborts BEFORE the next call's projected cost would exceed the
- * cap. Pricing comes from pricing.ts; unknown model → loud abort, never
- * silent zero.
+ * Budget enforcement: if --budget-usd is set, the runner aborts BEFORE the
+ * next call's projected cost would exceed the cap. Pricing comes from
+ * pricing.ts (registered overrides, then the canonical table). An unpriced
+ * model refuses up front under a cap (`no_pricing`, fix: register the rate)
+ * and runs with a warning without one.
  *
  * NB: this module is engine-aware (samples takes from DB) but the runner
  * itself doesn't write the receipt — that's `runEval()`'s caller's job
@@ -30,13 +31,14 @@ import {
   modelSetSha8,
 } from './receipt-name.ts';
 import type { TakesQualityReceipt } from './receipt.ts';
-import { estimateCost, getPricing, PricingNotFoundError } from './pricing.ts';
+import { estimateCost, getPricing, unpricedUnderCapError, unpricedWarning } from './pricing.ts';
+import { loadPricingOverrides } from '../budget/budget-tracker.ts';
 import { DEFAULT_CYCLES_NONTTY } from '../eval/cycle-default.ts';
 
 /**
  * Three distinct providers (uncorrelated judge blind spots). Every entry MUST
- * be listed in its recipe's chat touchpoint AND in the SUPPORTED_MODELS
- * pricing allowlist — pinned by test/default-model-panels.test.ts.
+ * be listed in its recipe's chat touchpoint AND priced for takes-quality
+ * (pricing.ts) — pinned by test/default-model-panels.test.ts.
  * google:gemini-1.5-pro (retired by Google) and openai:gpt-4o (dropped from
  * the OpenAI recipe's chat list) sat here dead until #3510; gemini-2.0-flash
  * replaced the former and was itself retired before it was ever swept.
@@ -167,16 +169,12 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
     throw new Error('fs source not yet wired in v0.32; use --source db');
   }
 
-  // Pre-flight pricing check (codex review #4 fail-closed): every requested
-  // model must be in the pricing table when --budget-usd is set, otherwise
-  // budget enforcement is meaningless.
-  if (budgetUsd !== null) {
-    for (const m of models) {
-      try { getPricing(m); } catch (e) {
-        if (e instanceof PricingNotFoundError) throw e;
-        throw e;
-      }
-    }
+  // Pre-flight pricing: a cap is enforceable only when every model is priced.
+  const overrides = await loadPricingOverrides(engine);
+  for (const m of models) {
+    if (getPricing(m, overrides)) continue;
+    if (budgetUsd !== null) throw unpricedUnderCapError(m, budgetUsd);
+    process.stderr.write(`${unpricedWarning(m)}\n`);
   }
 
   // Sample the corpus.
@@ -209,7 +207,7 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
     if (budgetUsd !== null) {
       let projected = 0;
       for (const m of models) {
-        try { projected += estimateCost(m, 5000, 2000); } catch { /* unreachable: pre-flight checked */ }
+        projected += estimateCost(m, 5000, 2000, overrides) ?? 0;
       }
       if (cumulativeCost + projected > budgetUsd) {
         process.stderr.write(
@@ -231,8 +229,7 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
       if (s.status === 'fulfilled') {
         const r = s.value as SlotResult & { _usage?: { input_tokens: number; output_tokens: number } };
         if (r._usage) {
-          try { cumulativeCost += estimateCost(m, r._usage.input_tokens, r._usage.output_tokens); }
-          catch { /* unknown model + no budget cap → skip cost addition */ }
+          cumulativeCost += estimateCost(m, r._usage.input_tokens, r._usage.output_tokens, overrides) ?? 0;
         }
         slots.push(r);
       } else {

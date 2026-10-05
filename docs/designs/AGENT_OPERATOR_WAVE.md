@@ -985,7 +985,8 @@ Heading: `## Agent-first operator wave follow-ups (filed 2026-10-03, GBRA-42 pla
 4. P3 Ratchet burn-down of suggestion-less sites (record the post-wave baseline count).
 5. P2 Tier 3 carry-over if the collector misses its date (list what shipped and what moved).
 6. P2 Exit 3 for `mcp expose` and `google` under contract v2.
-7. P2 Unify MCP surfaces across wiring paths (`bootstrap hooks` registers `full`, `bootstrap.ts:~1282`).
+7. Closed by `docs/designs/AGENT_OPERATOR_FOLLOWUP_WAVE.md` Item 2: every stdio registration gbrain writes pins
+   `starter` through `src/core/mcp-registration.ts` (the OpenClaw manifest stays a bare `serve`).
 8. P2 Make `gbrain bootstrap verify` read-only, then mark it `read_only`.
 9. P3 Harness-author community channel linked from `AGENT_OPERATOR_v1.md`.
 10. P3 Recall relevance on tiny keyless brains (measure first).

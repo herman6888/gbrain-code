@@ -2,6 +2,8 @@ import type { BrainEngine, LinkBatchInput } from './engine.ts';
 import { assertPageRevision } from './page-state/types.ts';
 import { executeRawJsonb } from './sql-query.ts';
 import { sanitizeForJsonb } from './batch-rows.ts';
+import { applyTemporalEvidence, relationshipKeysForOrigin } from './link-temporal-apply.ts';
+import { primeRelationSemantics } from './link-semantics-pack.ts';
 
 export interface DerivedLinkOrigin {
   slug: string;
@@ -78,6 +80,7 @@ export async function replaceDerivedLinks(
   }
   const rows = [...unique.values()];
   return engine.transaction(async tx => {
+    await primeRelationSemantics(tx);
     await tx.lockPageKeys([{ sourceId: origin.sourceId, slug: origin.slug }, ...rows.flatMap(row => [
       { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
     ])]);
@@ -87,6 +90,13 @@ export async function replaceDerivedLinks(
       throw new Error('Derived link origin changed or was deleted');
     }
     const id = snapshot.page.id;
+    // Temporal evidence (tense, dated transitions, relationship state) is part
+    // of the same derived projection: captured before, replaced after.
+    const temporalKeysBefore = await relationshipKeysForOrigin(tx, Number(id));
+    const withTemporal = async (result: { created: number; removed: number }) => {
+      await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore);
+      return result;
+    };
     if (opts.includeFrontmatter !== false && !opts.preserveExisting) {
       const ambiguous = await tx.executeRaw(`SELECT 1 FROM links WHERE link_source='frontmatter'
         AND origin_page_id IS NULL AND (from_page_id=$1 OR to_page_id=$1) LIMIT 1`, [id]);
@@ -151,13 +161,13 @@ export async function replaceDerivedLinks(
       const additions = rows.filter(row => !retained.has(identity(row)));
       const created = additions.length ? await tx.addLinksBatch(additions, { auditSite: 'addLinksBatch' }) : 0;
       if (created !== additions.length) throw new Error('Derived link replacement did not persist every candidate');
-      return { created, removed: obsolete.length };
+      return withTemporal({ created, removed: obsolete.length });
     }
     const removed = await tx.executeRaw(`DELETE FROM links WHERE link_source=ANY($2::text[])
       AND (origin_page_id=$1 OR (origin_page_id IS NULL AND from_page_id=$1
         AND link_source IN ('markdown','wikilink-resolved'))) RETURNING id`, [id, producers]);
     const created = await tx.addLinksBatch(rows, { auditSite: 'addLinksBatch' });
     if (created !== rows.length) throw new Error('Derived link replacement did not persist every candidate');
-    return { created, removed: removed.length };
+    return withTemporal({ created, removed: removed.length });
   });
 }

@@ -9,7 +9,7 @@ export const help: CliHelpSpec = {
   ].join('\n'),
   flags: [
     { name: '--http', type: 'boolean', desc: 'Serve over HTTP with OAuth 2.1, the admin dashboard and per-token scopes.' },
-    { name: '--surface', type: 'enum', values: ['verbs', 'starter', 'full'], desc: 'Tool surface: the 7 memory verbs, the ~20 daily-driver ops, or every operation (default: config mcp_surface, else full).' },
+    { name: '--surface', type: 'enum', values: ['verbs', 'starter', 'full'], desc: 'Tool surface: the 7 memory verbs, the daily-driver ops, or every operation. stdio: env GBRAIN_SURFACE > --surface > config mcp_surface > full; --http ignores GBRAIN_SURFACE.' },
     { name: '--access', type: 'enum', values: ['full', 'read-only'], desc: 'stdio only: read-only exposes read-scoped, non-mutating operations.' },
     { name: '--source-guard', type: 'boolean', desc: 'stdio only: refuse writes unless the source binding is deliberate or unambiguous.' },
     { name: '--stdio-idle-timeout', type: 'number', desc: 'stdio only: exit after this many idle seconds (0 = never).' },

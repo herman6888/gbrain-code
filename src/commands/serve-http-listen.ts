@@ -4,11 +4,19 @@
  * server announcing itself and holding the brain lock while serving nothing
  * (Bun runs a listen callback with `listening: false` and then emits `error`
  * to no listener). Resolves only once the socket really listens.
+ *
+ * `adopt`: a listener the status-only serve already bound on this port
+ * (serve-http-status.ts). Recovery hands the full app to it as the request
+ * handler instead of binding again, so the port is never released.
  */
-import type { Server } from 'node:http';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { opError } from '../core/ops/contract.ts';
 
-export async function listenOrRefuse(app: { listen(port: number, host: string): Server }, port: number, bind: string): Promise<Server> {
+export type HttpRequestHandler = (req: IncomingMessage, res: ServerResponse) => void;
+export interface AdoptableServer { server: Server; adopt(handler: HttpRequestHandler): void }
+
+export async function listenOrRefuse(app: HttpRequestHandler & { listen(port: number, host: string): Server }, port: number, bind: string, adopt?: AdoptableServer): Promise<Server> {
+  if (adopt) { adopt.adopt(app); return adopt.server; }
   const server = app.listen(port, bind);
   const failure = await new Promise<Error | null>(resolve => {
     if (server.listening) return resolve(null);

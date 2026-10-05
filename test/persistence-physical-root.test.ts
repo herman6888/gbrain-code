@@ -16,8 +16,12 @@ import { withEnv } from './helpers/with-env.ts';
 
 const directory = mkdtempSync(join(tmpdir(), 'gbrain-physical-root-'));
 let engine: PGLiteEngine;
-beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 120_000);
-afterAll(async () => { await engine.disconnect(); rmSync(directory, { recursive: true, force: true }); });
+let otherBrain: PGLiteEngine;
+beforeAll(async () => {
+  engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
+  otherBrain = new PGLiteEngine(); await otherBrain.connect({}); await otherBrain.initSchema();
+}, 120_000);
+afterAll(async () => { await engine.disconnect(); await otherBrain.disconnect(); rmSync(directory, { recursive: true, force: true }); });
 async function fixture() {
   const base = join(directory, randomUUID()); mkdirSync(base);
   const root = join(base, 'canonical'); mkdirSync(root); writeFileSync(join(root, 'page.md'), 'Canonical example');
@@ -89,6 +93,20 @@ test('an overlapping ancestor claim is refused across homes and retains the orig
     await expect(claimWorktree(engine, f.sources[1], f.root, f.hosts[1])).rejects.toMatchObject({ code: 'recovery_required' });
   });
   expect(await getWorktreeBinding(engine, f.sources[1], f.hosts[1])).toBeNull();
+  const lock = await acquireWorktree(binding); expect(lock).not.toBeNull(); await lock?.release();
+});
+
+test('another brain\'s reservation under the checkout\'s .git refuses the outer claim', async () => {
+  const f = await fixture();
+  const nested = join(f.root, '.git', 'child'); mkdirSync(nested, { recursive: true });
+  const source = `physical-${randomUUID()}`;
+  await otherBrain.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [source, nested]);
+  const binding = await withEnv({ GBRAIN_HOME: f.homes[1] }, () => claimWorktree(otherBrain, source, nested, f.hosts[1]));
+  expect(readPhysicalRootReservation(nested)?.worktreeId).toBe(binding.worktree_id);
+  await withEnv({ GBRAIN_HOME: f.homes[0] }, async () => {
+    await expect(claimWorktree(engine, f.sources[0], f.root, f.hosts[0])).rejects.toMatchObject({ code: 'recovery_required' });
+  });
+  expect(await getWorktreeBinding(engine, f.sources[0], f.hosts[0])).toBeNull();
   const lock = await acquireWorktree(binding); expect(lock).not.toBeNull(); await lock?.release();
 });
 

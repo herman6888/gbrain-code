@@ -62,7 +62,8 @@ const whoami: Operation = {
         const verified = await verifyLocalWriter(ctx.engine, await readLocalWriter(ctx.engine, 'stdio'));
         if (verified.remote) scopes = verified.grant.scopes;
       } catch { /* no registration: no scopes */ }
-      return { transport: 'stdio', scopes, readiness: readiness('stdio') };
+      const session = ctx.stdioSurface;
+      return { transport: 'stdio', scopes, ...(session ? { surface: session.surface, surface_source: session.source } : {}), readiness: readiness('stdio') };
     }
     if (!ctx.auth) {
       throw opError(

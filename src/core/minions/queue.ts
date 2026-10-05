@@ -16,6 +16,7 @@ import type {
 } from './types.ts';
 import { rowToMinionJob, rowToInboxMessage, rowToAttachment } from './types.ts';
 import { coalesceOnIdempotencyKey, decideCoalesce, insertOrCoalesce } from './idempotency-coalesce.ts';
+import { adoptSpendAuthorization, legacyDefaultClaimSetSql, legacyDefaultClaimParams, type SpendAuthorization } from './spend-authorization.ts';
 import { validateAttachment } from './attachments.ts';
 import { isProtectedJobName } from './protected-names.ts';
 import { assertEmbedBackfillQueueAdmission } from './embed-backfill-admission.ts';
@@ -49,6 +50,8 @@ export interface TrustedSubmitOpts {
   allowPgliteInlineWorker?: boolean;
   /** Authenticated submit_agent identity, never read from agent job parameters. */
   delegatedClientId?: string;
+  /** Consent-gated CLI producers only: the user's spend authorization (spend-authorization.ts). */
+  spendAuthorization?: SpendAuthorization;
 }
 
 const MIGRATION_VERSION = 7;
@@ -594,11 +597,11 @@ export class MinionQueue {
       const baseCols = `name, queue, status, priority, data, max_attempts, backoff_type,
             backoff_delay, backoff_jitter, delay_until, parent_job_id, on_child_fail,
             depth, max_children, timeout_ms, lock_duration_ms, remove_on_complete, remove_on_fail, idempotency_key,
-            quiet_hours, stagger_key, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until, submission_authority`;
+            quiet_hours, stagger_key, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until, submission_authority, spend_authorization`;
       const baseVals = `$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21`;
-      const baseValsWithOwner = `${baseVals}, $22, $23, $24, $25::jsonb`;
+      const baseValsWithOwner = `${baseVals}, $22, $23, $24, $25::jsonb, $26::text::jsonb`;
       const cols = hasMaxStalled ? `${baseCols}, max_stalled` : baseCols;
-      const vals = hasMaxStalled ? `${baseValsWithOwner}, $26` : baseValsWithOwner;
+      const vals = hasMaxStalled ? `${baseValsWithOwner}, $27` : baseValsWithOwner;
 
       const insertSql = opts?.idempotency_key
         ? `INSERT INTO minion_jobs (${cols})
@@ -645,6 +648,7 @@ export class MinionQueue {
         opts?.private_queue_owner_token ?? null,
         privateQueueLeaseUntil,
         authority,
+        trusted?.spendAuthorization ? JSON.stringify(trusted.spendAuthorization) : null,
       ];
       if (hasMaxStalled) params.push(clampedMaxStalled);
 
@@ -678,7 +682,7 @@ export class MinionQueue {
       } catch { /* audit failures never block submission */ }
     }
 
-    return result;
+    return trusted?.spendAuthorization && result.coalesced ? adoptSpendAuthorization(this.engine, result, trusted.spendAuthorization) : result;
   }
 
   /** Get a job by ID. Returns null if not found. */
@@ -1459,6 +1463,7 @@ export class MinionQueue {
       `UPDATE minion_jobs SET
         status = 'active',
         claim_generation = claim_generation + 1,
+        ${legacyDefaultClaimSetSql('$7', '$8')},
         lock_token = $1,
         lock_until = now() + ((CASE WHEN COALESCE(lock_duration_ms, ($6::jsonb ->> name)::int) IS NULL THEN $2
                                     ELSE LEAST(GREATEST(COALESCE(lock_duration_ms, ($6::jsonb ->> name)::int), 5000), 3600000) END)::double precision * interval '1 millisecond'),
@@ -1479,7 +1484,7 @@ export class MinionQueue {
          LIMIT 1
        )
        RETURNING *`,
-      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS]
+      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS, ...legacyDefaultClaimParams()]
     );
     return rows.length > 0 ? rowToMinionJob(rows[0]) : null;
   }

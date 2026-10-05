@@ -428,6 +428,22 @@ export async function copyPageLinksToTarget(
     );
     copied++;
   }
+  // Temporal typed edges: manual dated statements (add_link valid_from /
+  // valid_until) exist only in the database, so they travel with the page.
+  // Statements derived from page content re-derive on the target's next
+  // extract pass.
+  const manual = await source.executeRaw<{ to_slug: string; to_source_id: string; link_type: string; kind: string; occurred_on: string }>(
+    `SELECT t.slug AS to_slug, t.source_id AS to_source_id, lt.link_type, lt.kind, lt.occurred_on::text AS occurred_on
+       FROM link_transitions lt JOIN pages f ON f.id = lt.from_page_id JOIN pages t ON t.id = lt.to_page_id
+      WHERE f.slug = $1 AND f.source_id = $2 AND lt.producer = 'manual'`, [page.slug, page.source_id]).catch(() => []);
+  if (manual.length) {
+    const { writeManualTransitions } = await import('../core/link-temporal-apply.ts');
+    for (const m of manual) {
+      if (failedKeys.has(makeManifestKey(m.to_source_id, m.to_slug))) continue;
+      await writeManualTransitions(target, { from: page.slug, to: m.to_slug, linkType: m.link_type, sourceId: page.source_id },
+        m.kind === 'start' ? { validFrom: m.occurred_on.slice(0, 10) } : { validUntil: m.occurred_on.slice(0, 10) });
+    }
+  }
   return copied;
 }
 

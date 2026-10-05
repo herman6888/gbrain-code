@@ -22,7 +22,7 @@ import { retainReconcileBackup } from '../src/core/persistence/reconcile-backup.
 import { prepareReconcileMutation } from '../src/core/persistence/reconcile-prepare.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
-import { parseFactsFence, upsertFactRow } from '../src/core/facts-fence.ts';
+import { parseFactsFence, renderFactsTable, upsertFactRow } from '../src/core/facts-fence.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { operationsByName } from '../src/core/operations.ts';
@@ -671,3 +671,26 @@ test.each(['notes/example.md', 'notes/example.md.md'])('reconciliation preserves
       expect(await engine.getPage('notes/other', { sourceId: f.id })).toBeNull();
     });
   }), 120_000);
+
+test('a fact withdrawn between reconciliation preparation and publication leaves the canonical file and page unchanged', async () => isolated(async engine => {
+  for (const enabled of [false, true]) {
+    const claim = 'withdrawn between reconciliation preparation and publication';
+    const fence = renderFactsTable([{ rowNum: 1, claim, kind: 'fact', confidence: 1, visibility: 'world', notability: 'medium', active: true, context: 'test evidence' }]);
+    const f = await fixture(engine, enabled, `Facts: ${fence}`), originalBytes = readFileSync(f.file);
+    await local(engine, f.registration, async () => {
+      const repair = await preparedRepair(engine, f);
+      expect(String(repair.prepared.file?.content)).toContain(claim);
+      // The withdrawal row alone: a full forget would also rewrite this page and trip the revision check first.
+      // Either the preview's withdrawals pin or the prepared import's validation must refuse it.
+      await engine.executeRaw("INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash) VALUES($1,'world','*',gbrain_fact_fingerprint($2))", [f.id, claim]);
+      const boundaries: string[] = [];
+      const result = await publishMutation(engine, repair.row, repair.prepared, localHostId(), {
+        boundary: async name => { boundaries.push(name); }, fileBoundary: name => { boundaries.push(name); } });
+      expect(result.state).toBe('conflict');
+      expect(boundaries).not.toContain('before_publication');
+      expect(boundaries).not.toContain('before_file');
+      expect(readFileSync(f.file)).toEqual(originalBytes);
+      expect((await engine.readPageSnapshot(f.slug, { sourceId: f.id }))?.revision).toBe(f.snapshot.revision);
+    });
+  }
+}), 120_000);

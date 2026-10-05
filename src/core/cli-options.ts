@@ -423,6 +423,7 @@ export function childGlobalFlags(cliOpts?: CliOptions): string {
 // ============================================================
 
 import type { BrainEngine } from './engine.ts';
+import type { SpendAuthorization } from './minions/spend-record.ts';
 import { createHash } from 'crypto';
 
 export interface MaybeBackgroundOpts {
@@ -432,6 +433,8 @@ export interface MaybeBackgroundOpts {
   paramBuilder: (args: string[]) => Record<string, unknown>;
   /** Source id for the idempotency key namespace. Default 'cli'. */
   source?: string;
+  /** The user's spend authorization for a consent-gated paid job (stored on the row, never in data). */
+  spendAuthorization?: SpendAuthorization;
 }
 
 let lastBackgroundJobId: number | null = null;
@@ -477,8 +480,12 @@ export async function maybeBackground(opts: MaybeBackgroundOpts): Promise<boolea
       queue: 'default',
       idempotency_key,
       max_attempts: 2,
-    });
+    }, opts.spendAuthorization ? { spendAuthorization: opts.spendAuthorization } : undefined);
     process.stdout.write(`job_id=${job.id}\n`);
+    if (opts.spendAuthorization) {
+      const { spendSubmitSummary } = await import('./minions/spend-authorization.ts');
+      for (const line of spendSubmitSummary(opts.spendAuthorization, [job], opts.spendAuthorization.argv ?? []).lines) process.stderr.write(`${line}\n`);
+    }
     lastBackgroundJobId = job.id;
 
     if (follow) {

@@ -1,5 +1,5 @@
 /**
- * Fixture for test/process-watchdog.serial.test.ts. Spawned via `bun`.
+ * Fixture for test/process-watchdog-harness.test.ts. Spawned via `bun`.
  *
  * Usage: bun watchdog-harness.ts <mode> <deadlineMs> <graceMs>
  *   starve-with    — install the watchdog, then starve the event loop forever.

@@ -22,7 +22,7 @@
  *     and orphans warn on the one-page seed brain, never 'failed', and
  *     `gbrain dream` exits 1 only on 'failed' or a failed phase (src/commands/dream.ts).
  *
- * Test shape mirrors test/agent-scheduler-contract.serial.test.ts (keyless
+ * Test shape mirrors test/agent-scheduler-contract.test.ts (keyless
  * PGLite brain, real CLI spawn, exit-code assertions). Non-serial on
  * purpose: no process.env mutation — the child env is built from an
  * ALLOWLIST, so every provider credential the canonical fold recognizes
@@ -40,7 +40,7 @@ import { spawnSync, execFileSync } from 'child_process';
 
 const REPO = resolve(import.meta.dir, '..');
 const CLI = join(REPO, 'src', 'cli.ts');
-const SKIP = process.env.GBRAIN_SKIP_SUBPROCESS_TESTS === '1';
+const SKIP = process.env.GBRAIN_TEST_SKIP_SUBPROCESS === '1';
 
 interface PhaseResultish {
   phase: string;

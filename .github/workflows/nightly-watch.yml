@@ -1,0 +1,78 @@
+name: Nightly watch
+
+# Keeps one `nightly-red` issue per scheduled workflow (scripts/nightly-issue.ts;
+# owner and 24-hour response: docs/RELEASING.md#nightly-red-issues). Opens it on
+# a red scheduled run, updates it while red, reopens it on a flap, and closes
+# it only when a later scheduled run is green and every previously failing job
+# executed. Cells listed in .github/nightly-known-red.tsv keep the issue open
+# with the `known-red` label instead of counting as green.
+#
+# Security: runs only for scheduled runs of this repository, checks out the
+# default branch (never the triggering run's code), passes every event field
+# through env (no expression interpolation inside run:), and holds only
+# issues: write, actions: read and checks: read (for error annotations).
+#
+# Every workflow with a schedule trigger must be listed below
+# (test/scripts/nightly-issue.test.ts enforces it). A new workflow file can
+# only be dispatched from the default branch, so `run_id` dispatch is for
+# post-merge checks: gh workflow run nightly-watch.yml -f run_id=<scheduled run id>
+
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - E2E Tests
+      - Heavy Tests
+      - Scale tier
+      - macOS 26 validation
+      - Semgrep
+      - OSV-Scanner
+      - CI health
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Scheduled run id to evaluate
+        required: true
+        type: string
+      dry_run:
+        description: Print the issue it would write instead of writing it
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One group per watched workflow, queued (never cancelled), so two runs of the
+# same workflow cannot race on its issue.
+concurrency:
+  group: nightly-watch-${{ github.event.workflow_run.workflow_id || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'schedule' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            .github/nightly-known-red.tsv
+            TODOS.md
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.2
+      - name: Upsert the nightly-red issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          # shellcheck disable=SC2086 # DRY_RUN is empty or one flag
+          bun scripts/nightly-issue.ts --run-id "$RUN_ID" --repo "$GITHUB_REPOSITORY" $DRY_RUN

@@ -14,13 +14,13 @@
  *  - D11 preflight: explicit bad --embedding-dimensions refuses BEFORE touching disk
  *
  * Picker interactive flow (real TTY) is covered by the real-PTY serial test
- * at test/init-picker-pty.serial.test.ts (keyless provider choice plus a
+ * at test/init-picker-pty.test.ts (keyless provider choice plus a
  * non-default search mode, driven through a true pseudo-terminal). This file
  * stays piped-stdin on purpose: it exercises the NON-TTY branches.
  *
  * Lane: slow. Run: `bash scripts/run-slow-tests.sh test/init-fresh-pglite.slow.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';

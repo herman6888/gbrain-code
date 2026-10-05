@@ -153,3 +153,35 @@ describe('runInitNudge — agents get the nudge too (F7)', () => {
     expect(out).toContain('gbrain onboard --check');
   });
 });
+
+describe('shared collector (collectOnboardOpportunities)', () => {
+  test('init output is byte-identical to the pre-collector nudge', async () => {
+    const full = await withEnv({ GBRAIN_NON_INTERACTIVE: '1', GBRAIN_INTERACTIVE: undefined }, () => runNudgeCaptured(
+      stubEngine({ stale: 3, entities: 10, linked: 5, timeline: 2, takes: 0, pages: 20 })));
+    expect(full).toBe("[AGENT]\nwhy: [onboard_opportunities] Brain has opportunities: 3 stale chunks, link coverage 50%, timeline coverage 20%, 0 takes. Run 'gbrain onboard --check' to see the plan.\nactor: agent\nnext: run: gbrain onboard --check\n[/AGENT]\n");
+    const partial = await withEnv({ GBRAIN_NON_INTERACTIVE: '1', GBRAIN_INTERACTIVE: undefined }, () => runNudgeCaptured(
+      stubEngine({ stale: 0, entities: 4, linked: new Error('linked probe failed'), timeline: 4, takes: 2, pages: 9 })));
+    expect(partial).toBe("[AGENT]\nwhy: [onboard_opportunities] Brain has opportunities: link coverage 0%. Run 'gbrain onboard --check' to see the plan. (5/6 checks complete; run gbrain onboard --check for full recommendations)\nactor: agent\nnext: run: gbrain onboard --check\n[/AGENT]\n");
+  });
+
+  test('sequential (background refresh) and parallel (init) runs return the same counts; a failed probe is null, never a gap', async () => {
+    const { collectOnboardOpportunities, onboardGaps } = await import('../src/core/onboard/mcp-onboarding.ts');
+    const engine = stubEngine({ stale: 3, entities: 10, linked: new Error('linked probe failed'), timeline: 2, takes: 0, pages: 20 });
+    let yields = 0;
+    const parallel = await collectOnboardOpportunities(engine, new AbortController().signal);
+    const sequential = await collectOnboardOpportunities(engine, new AbortController().signal, async () => { yields++; });
+    expect(sequential).toEqual(parallel);
+    expect(yields).toBe(6);
+    expect(parallel).toMatchObject({ staleChunks: 3, entities: 10, linkedEntities: null, linkCoverage: null, timelineCoverage: 0.2, takes: 0, pages: 20, partial: true, checksRan: 5, checksAttempted: 6 });
+    expect(onboardGaps(parallel)).toEqual({ stale_chunks: true, link_coverage: false, timeline_coverage: true, no_takes: true });
+  });
+
+  test('an aborted sequential run stops issuing counts', async () => {
+    const { collectOnboardOpportunities } = await import('../src/core/onboard/mcp-onboarding.ts');
+    const controller = new AbortController();
+    controller.abort();
+    const counts = await collectOnboardOpportunities(stubEngine({ stale: 1, pages: 2 }), controller.signal, async () => {});
+    expect(counts.checksRan).toBe(0);
+    expect(counts.partial).toBe(true);
+  });
+});

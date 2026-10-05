@@ -142,6 +142,7 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'propose_takes',              // v0.36.1.0 — hindsight calibration wave
   'grade_takes',                // v0.36.1.0
   'calibration_profile',        // v0.36.1.0
+  'edge_contradictions',        // temporal typed edges (proposals by default)
   'drift',                       // #2653 — drift detection (default OFF, report-only)
   'chronicle',                   // #5876 — Life Chronicle events (default ON)
   'facts_drain',                 // GBRA-40 Lane D — automatic facts drain (PGLite)

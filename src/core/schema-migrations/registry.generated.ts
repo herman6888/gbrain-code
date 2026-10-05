@@ -204,7 +204,9 @@ import { v200 } from './v200-sync-hold-page-index.ts';
 import { v201 } from './v201-persistence-graduation.ts';
 import { v202 } from './v202-legacy-token-grant-conversion.ts';
 import { v203 } from './v203-oauth-client-grant-axes.ts';
-import { v204 } from './v204-cjk-bigram-fts.ts';
+import { v204 } from './v204-links-temporal-state.ts';
+import { v205 } from './v205-minion-spend-authorization.ts';
+import { v206 } from './v206-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -408,4 +410,6 @@ export const MIGRATIONS: Migration[] = [
   v202,
   v203,
   v204,
+  v205,
+  v206,
 ];

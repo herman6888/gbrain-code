@@ -404,6 +404,13 @@ brains mint fine while the server runs: `gbrain bootstrap harness --yes --port 3
 
 ## Troubleshooting
 
+A served `gbrain serve --http` that cannot open its brain stays up in
+[status-only mode](../mcp/DEPLOY.md#status-only-mode): `/health` answers 503
+with `Retry-After: 5`, remote clients get a `serve_status_only` envelope whose
+fix is `gbrain doctor` on this host, and the server opens the brain on the same
+port once the cause is fixed. `--fail-fast` (or `GBRAIN_SERVE_FAIL_FAST=1`)
+exits instead.
+
 `gbrain mcp expose --status` re-runs the probes; `--json` names the failing
 check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
 
@@ -439,6 +446,7 @@ check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
 | An interrupted `gbrain mcp expose` (no receipt, but a handler / service / wrapper is left behind) — `gbrain mcp expose --status` reports `leftovers_without_receipt` (exit 1) naming each artifact | Run the command `--status` prints: `gbrain mcp expose --remove --yes` (add `--port N` if you published a non-default port; `--force` when only a handler stands) recovers without a receipt: it removes the service, the wrapper and the `:443` handler proxying that port, and leaves the admin token. A handler with no wrapper, unit or service next to it is left in place until you add `--force`. See [`--remove`](#--remove). | agent, after the user agrees | none | `gbrain mcp expose --status --json` |
 | `handler_not_removed` (exit 1) — "--remove" stopped with "the tailscale handler for port <port> is still present" (or "could not be confirmed gone") | `tailscale serve --https=443 --set-path=/ off` ran but the re-read still shows gbrain's handler (or the serve status could not be re-read). The service was already uninstalled; the receipt and the wrapper were kept on purpose so the re-run finds everything. Run `tailscale serve status`, fix what it reports (operator, daemon), then `gbrain mcp expose --remove --yes` again. | user | none | `gbrain mcp expose --status --json` |
 | `foreign_serve_config` — "tailscale serve already proxies :443 to <target>. Re-run with --force to take it over, or pick another local port for that service." | A `/` handler on `:443` (a background config, another terminal's foreground `tailscale serve` session, or a raw TCP forward) already points somewhere else. Inspect it with `tailscale serve status` (the suggested next action), move that service, or — for a background handler only — re-run with `--force`; a foreground session must be stopped in its own terminal. | user | none | `gbrain mcp expose --status --json` |
+| `verify.local` warn — "status-only (<reason>): the server runs but cannot open its brain" (publish exit 2; `--status` exit 1) | The served `gbrain serve --http` is up on the port but in [status-only mode](../mcp/DEPLOY.md#status-only-mode): `/health` answers 503 and clients get the `serve_status_only` envelope. `gbrain doctor --only harness_wiring` names the reason's fix (for `lock_held`, stop the other process holding the PGLite brain). The server opens the brain within 5 s of the fix; no restart. | brain host | none | `gbrain mcp expose --status --json` |
 | `verify.local` warn / `local_health_timeout` (exit 2) | The service was installed but `http://127.0.0.1:<port>/health` did not answer within 20s; `verify.tailnet` is skipped. Read `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status`. | brain host | none | `gbrain mcp expose --status --json` |
 | `service: manual` (cloud sandbox, ephemeral container, no user bus) | There is no supervisor to keep the server alive. Run the printed foreground command, or the `nohup ~/.gbrain/serve/gbrain-serve.sh &` line, and re-run `--status`. On Linux without a user bus, `loginctl enable-linger $USER` may enable one. | brain host | none | `gbrain mcp expose --status --json` |
 | `thin_client` (exit 1) — "run on the brain host" | This install is a thin client; `expose` publishes the machine that holds the database. Run it there. | brain host | none | run `--status --json` on the brain host |

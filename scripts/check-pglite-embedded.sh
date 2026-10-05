@@ -55,6 +55,7 @@ if ! (cd "$BUILD_DIR" && bun build --compile --no-compile-autoload-bunfig --outf
   # e2e — so local dev without compile support isn't blocked. CI has compile.
   if grep -qiE 'not (found|available)|permission denied|Could not download|ETIMEDOUT|network' "$BUILD_DIR/compile.log"; then
     echo "[check-pglite-embedded] SKIP: bun build --compile unavailable in this sandbox." >&2
+    echo "GBRAIN_CHECK_SKIPPED: bun build --compile unavailable"
     sed -n '1,20p' "$BUILD_DIR/compile.log" >&2 || true
     exit 0
   fi

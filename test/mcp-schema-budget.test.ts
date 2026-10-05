@@ -40,22 +40,22 @@ import { cl100kAvailable, estimateTokens } from '../src/core/chunkers/token-esti
 
 const SERVED_STARTER_MAX_CHARS = 25_000;
 const SERVED_STARTER_MAX_TOKENS = 5_700;
-/** The whole tools/list JSON, annotations included (25,735 measured at v0.60.46.0). */
-const SERVED_STARTER_MAX_JSON_CHARS = 26_000;
+/** The whole tools/list JSON, annotations included (25,735 measured at v0.60.46.0; traverse_graph's `hops` is full-surface-only, 25,941 measured; 26,402 once mute_notice, the dismissal for the coaching notices starter sessions receive, joined starter). */
+const SERVED_STARTER_MAX_JSON_CHARS = 26_450;
 /** 4,042 at the cost wave + 586 for the operator contract's error protocol, notice prefix and memory loop (F1); no schema guidance moved here. */
 const INSTRUCTIONS_MAX_CHARS = 4_628;
 const DESCRIPTION_HARD_CAP = 1_200;
 const PARAM_DESCRIPTION_HARD_CAP = 200;
 
-/** Per-tool budget: JSON.stringify of the served tool definition. */
+/** Per-tool budget: JSON.stringify of the served tool definition. get_backlinks / traverse_graph carry the temporal status + as_of params (live relationships by default). */
 const TOOL_BUDGETS: Record<string, number> = {
   add_timeline_entry: 640, cancel_job: 270, cancel_write_request: 350, capture: 1250, context_pack: 760,
   delete_skill: 810, delta: 830, edit_page: 1090, entity: 460, find_anomalies: 520, forget: 560, get_agent_job: 270,
-  get_backlinks: 430, get_ingest_log: 280, get_page: 930, get_recent_salience: 660, get_skill: 910,
+  get_backlinks: 550, get_ingest_log: 280, get_page: 930, get_recent_salience: 660, get_skill: 910,
   get_skill_asset: 790, get_write_request: 330, join_brain: 560, leave_brain: 540, list_brain_skillpack: 230,
   list_link_sources: 220, list_pages: 1090, list_skills: 670, list_write_requests: 450, put_page: 1320,
-  put_skill: 1420, query: 3250, recall: 1590, remember: 1370, request_tools: 560, resolve_slugs: 410, search: 1760,
-  submit_agent: 750, sync_brain_skills: 770, synthesize: 550, traverse_graph: 680, whoami: 230,
+  mute_notice: 460, put_skill: 1420, query: 3250, recall: 1590, remember: 1370, request_tools: 560, resolve_slugs: 410, search: 1760,
+  submit_agent: 750, sync_brain_skills: 770, synthesize: 550, traverse_graph: 810, whoami: 230,
 };
 
 /** DX-14: phrases each tool's description must keep. */
@@ -107,10 +107,10 @@ async function served(publishSkills: boolean): Promise<Operation[]> {
 }
 
 describe('served starter tool list (Cat 40 configuration)', () => {
-  test('publish_skills on (the fresh-init default): 34 tools within 25,000 characters', async () => {
+  test('publish_skills on (the fresh-init default): 35 tools within 25,000 characters', async () => {
     const ops = await served(true);
     expect(ops.map(o => o.name)).toContain('get_skill');
-    expect(ops.length).toBe(34);
+    expect(ops.length).toBe(35);
     expect(size(ops)).toBeLessThanOrEqual(SERVED_STARTER_MAX_CHARS);
     expect(json(ops)).toBeLessThanOrEqual(SERVED_STARTER_MAX_JSON_CHARS);
   });
@@ -138,7 +138,7 @@ describe('per-tool schema budgets', () => {
     expect(starter.map(o => o.name).sort()).toEqual(Object.keys(TOOL_BUDGETS).sort());
   });
 
-  for (const op of operations.filter(o => STARTER_OPS.has(o.name))) {
+  for (const op of filterOpsForSurface(operations, 'starter')) {
     test(`${op.name} fits its budget and the hard caps`, () => {
       const [def] = buildToolDefs([op]);
       expect(JSON.stringify(def).length).toBeLessThanOrEqual(TOOL_BUDGETS[op.name]);

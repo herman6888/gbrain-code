@@ -11,6 +11,7 @@ import { disposePersistenceConsumer, startPersistenceConsumer, waitForWrite } fr
 import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
+import { testWaitMs } from './helpers/wait-for.ts';
 
 // #5601: an atom batch the owner accepted but has not published yet is
 // progress. extract_atoms reports it as pending, counts no failure and no
@@ -18,12 +19,13 @@ import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maint
 
 let engine: PGLiteEngine;
 const home = mkdtempSync(join(tmpdir(), 'gbrain-atoms-pending-'));
+let restoreWriteWait: () => void = () => {};
 beforeAll(async () => {
-  __setMaintenanceWriteWaitForTests(5_000);
+  restoreWriteWait = __setMaintenanceWriteWaitForTests(testWaitMs(250));
   configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: {} });
   engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
 }, 60_000);
-afterAll(async () => { __setMaintenanceWriteWaitForTests(null); await disposePersistenceConsumer(engine); await engine.disconnect(); resetGateway(); rmSync(home, { recursive: true, force: true }); });
+afterAll(async () => { restoreWriteWait(); await disposePersistenceConsumer(engine); await engine.disconnect(); resetGateway(); rmSync(home, { recursive: true, force: true }); });
 
 test('#5601: extract_atoms with a slow owner reports accepted-pending, not failed, and resumes without a second model call', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   const sourceId = 'atoms-pending';

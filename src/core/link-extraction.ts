@@ -91,8 +91,8 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // PRE-wave code after this date reads as fresh and won't re-extract until
 // the page is next edited; no fixed watermark can cover code that keeps
 // running past it.
-// 2026-10-02: normalizeBasename collapses hyphen runs (#5623), so [[Backlog - vault]] resolves; re-extract.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-10-02T00:00:00Z';
+// 2026-10-02: hyphen-run basenames resolve (#5623); 2026-10-05: temporal edges derive dated evidence on extraction. Re-extract.
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-05T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 

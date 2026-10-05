@@ -464,7 +464,8 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // #2653: 23 phases (added `drift` between calibration_profile and
     // conversation_facts_backfill). #5876: 24 (added `chronicle` after drift).
     // GBRA-40 Lane D: 25 (added `facts_drain` after chronicle).
-    expect(hookCalls).toBe(25);
+    // Temporal typed edges: 26 (added `edge_contradictions` after calibration_profile).
+    expect(hookCalls).toBe(26);
   });
 
   test('hook exceptions do not abort the cycle', async () => {
@@ -479,8 +480,8 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.39.0.0: 17 phases (T12 schema-suggest phase between orphans and purge).
     // v0.41.11.0: 20 phases (+extract_atoms, +synthesize_concepts, +conversation_facts_backfill).
     // v0.41.39 (#1700) + v0.42.0.0: 22 phases (+enrich_thin, +skillopt).
-    // #2653: 23 phases (+drift). #5876: 24 (+chronicle). GBRA-40 Lane D: 25 (+facts_drain).
-    expect(report.phases.length).toBe(25);
+    // #2653: 23 phases (+drift). #5876: 24 (+chronicle). GBRA-40 Lane D: 25 (+facts_drain). Temporal typed edges: 26 (+edge_contradictions).
+    expect(report.phases.length).toBe(26);
   });
 });
 

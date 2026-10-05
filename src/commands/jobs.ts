@@ -162,11 +162,13 @@ USAGE
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
                             [--lock-duration-ms Nms]
                             [--idempotency-key K] [--queue Q] [--dry-run]
+                            [--yes] [--max-usd USD|off]  (enrich, subagent: paid)
                             [--redact-secrets]   (shell only; scrubs inherit
                                                   values from stdout/stderr)
   gbrain jobs list [--status S] [--queue Q] [--limit N] [--json]
+  gbrain jobs list --group SPEND_GROUP [--json]
   gbrain jobs get <id> [--json]
-  gbrain jobs cancel <id>
+  gbrain jobs cancel <id> | --group SPEND_GROUP
   gbrain jobs cancel --select "status=waiting|paused,name=synthesize" [--expect <hash> --yes] [--json]
   gbrain jobs retry <id>
   gbrain jobs prune [--older-than 30d] [--dry-run]
@@ -394,7 +396,7 @@ authorized. IDs, data, schedule and retries persist.
   cancel: `gbrain jobs cancel — cancel a job, or preview-bound bulk cancel of legacy jobs
 
 USAGE
-  gbrain jobs cancel <id>
+  gbrain jobs cancel <id> | --group SPEND_GROUP   (--group: every unfinished job of one paid command's approval)
   gbrain jobs cancel --select "status=waiting|paused,name=synthesize" [--json]
   gbrain jobs cancel --select "status=waiting|paused,name=synthesize" --expect <hash> --yes
 

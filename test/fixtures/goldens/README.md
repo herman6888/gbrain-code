@@ -93,7 +93,7 @@ reproduce byte for byte. Each file is written by `test/helpers/golden.ts` as
 ## CLI goldens (A16b / EO5 / EO13)
 
 - `cli/*.json` (`test/cli-goldens.test.ts`, `test/cli-dispatch-phase.test.ts`,
-  `test/cli-thin-client-refusal-matrix.test.ts`, `test/cli-engine-free-db-down.serial.test.ts`):
+  `test/cli-thin-client-refusal-matrix.test.ts`, `test/cli-engine-free-db-down.test.ts`):
   `--help` / `--version` / `--tools-json` / unknown command, membership sets and alias
   table, per-command dispatch phase and thin-client mode (AST,
   `test/helpers/cli-dispatch-extract.ts`), literal command imports, the thin-client

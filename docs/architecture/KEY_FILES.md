@@ -46,7 +46,7 @@ boundary and add its link here rather than raising the cap.
 | [Core Persistence (continued)](key-files/core-persistence-continued.md) | `src/core/persistence/connector-*.ts`, `src/core/connectors/item-holds*.ts`, checkpoint validation, no-op kernel and accepted-pending receipts |
 | [Core Persistence (engine graduation)](key-files/core-persistence-graduation.md) | `engine-graduation*.ts`, `graduation-*.ts`, `src/commands/migrate-graduation.ts`, the graduation doctor finding |
 | [Core Search (1/2)](key-files/core-search-1.md) | `src/core/search/` through `src/core/search/rerank.ts` |
-| [Core Search (2/2)](key-files/core-search-2.md) | `src/core/search/return-policy.ts` through `src/core/search/vector-pool.ts` |
+| [Core Search (2/2)](key-files/core-search-2.md) | `src/core/search/return-policy.ts` through `src/core/search/vector-pool.ts`, plus the relational arm and multi-hop chain modules (`relational-recall.ts`, `relational-rerank-pin.ts`, `relational-chain.ts`, `relational-plan.ts`, `hub-dampening.ts`) |
 | [Core Services (1/3)](key-files/core-services-1.md) | `src/core/advisor/{types,run,render,recommended-set,history,apply,collect-*}.ts` through `src/core/connectors/` |
 | [Core Services (1/3, continued)](key-files/core-services-1-continued.md) | `src/core/context/` through `src/core/context/ipc-path.ts` |
 | [Core Services (2/3)](key-files/core-services-2.md) | `src/core/conversation-parser/` through `src/core/progressive-batch/`, except `src/core/persistence/` |
@@ -67,6 +67,7 @@ boundary and add its link here rather than raising the cap.
 | [Shared brain skills](key-files/shared-skills.md) | Canonical catalog, enrollment, migration, publication and harness integration |
 | [Skills](key-files/skills.md) | `src/core/audit-skill-brain-first.ts` through `src/core/skills-integrity.ts` |
 | [Tooling And Tests](key-files/tooling-and-tests.md) | `.github/workflows/test.yml` through `test/remote-privacy-sweep.test.ts` |
+| [CI Health And Test Guards](key-files/ci-health-and-test-guards.md) | `.github/workflows/nightly-watch.yml` through `scripts/check-image-decoders-embedded.sh` |
 | [BrainBench — in a sibling repo](key-files/brainbench.md) | Cross-file subsystem contract |
 | [Hindsight calibration (key files cluster)](key-files/hindsight.md) | Cross-file subsystem contract |
 | [Schema packs: mutation surface (key files cluster)](key-files/schema-mutation.md) | Cross-file subsystem contract |

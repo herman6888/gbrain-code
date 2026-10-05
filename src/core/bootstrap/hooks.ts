@@ -29,6 +29,8 @@ import { isAbsolute, join } from 'node:path';
 import { atomicWriteTextFile } from './atomic-write.ts';
 import { normalizeSeatLabel } from '../context/seat.ts';
 import { detectExecutionEnvironment } from '../execution-env.ts';
+import { stdioServeArgv } from '../mcp-registration.ts';
+import type { McpSurface } from '../../mcp/surface.ts';
 import {
   CLAUDE_COMMITTED_SETTINGS_FILE_RELPATH,
   CLAUDE_HOOK_DEFAULT_TIMEOUT_SECS,
@@ -875,6 +877,8 @@ export interface ClaudeMcpRegistration {
   sourceId: string;
   /** PARENT dir for --isolated installs (config appends `.gbrain`) [CX2-8]. */
   gbrainHome?: string;
+  /** The serve surface; default REGISTRATION_SURFACE, `null` = bare `serve` (never-narrow carry-over). */
+  surface?: McpSurface | null;
 }
 
 export type CodexMcpRegistration = Omit<ClaudeMcpRegistration, 'scope'>;
@@ -884,9 +888,11 @@ export type CodexMcpRegistration = Omit<ClaudeMcpRegistration, 'scope'>;
  * (binary first) — the dispatcher execs them; nothing here touches the
  * filesystem or the network. Shape per TARGETS['claude-code-2026-08'].
  *
- * The serve argv pins `--surface full`: bootstrap's contract (put_page,
- * get_page, timeline, …) needs the full op surface, and a pre-existing
- * `mcp_surface: verbs` config row must not silently narrow the registration.
+ * The serve argv comes from `stdioServeArgv`: `--surface starter` by default
+ * (bootstrap's contract — put_page, get_page, add_timeline_entry, search,
+ * query — is in it, and a pre-existing `mcp_surface: verbs` config row cannot
+ * narrow a pinned registration); `surface` carries an existing entry's form
+ * over on replacement or applies `--surface`.
  */
 export function registerClaudeMcp(p: ClaudeMcpRegistration): string[][] {
   if (!isAbsolute(p.gbrainBin)) {
@@ -899,15 +905,15 @@ export function registerClaudeMcp(p: ClaudeMcpRegistration): string[][] {
     '-e', `GBRAIN_SOURCE=${p.sourceId}`,
   ];
   if (p.gbrainHome) argv.push('-e', `GBRAIN_HOME=${p.gbrainHome}`);
-  argv.push('--', p.gbrainBin, 'serve', '--surface', 'full');
+  argv.push('--', ...stdioServeArgv(p.gbrainBin, p.surface));
   return [argv];
 }
 
 /**
  * `codex mcp add` argv for a LOCAL stdio serve (writes ~/.codex/config.toml
  * itself — no TOML writer needed in v1, see TARGETS['codex-2026-08']).
- * Codex registrations are user-global; there is no scope flag.
- * `--surface full` pins the full op surface (see registerClaudeMcp).
+ * Codex registrations are user-global; there is no scope flag. The serve
+ * argv comes from `stdioServeArgv` (see registerClaudeMcp).
  */
 export function registerCodexMcp(p: CodexMcpRegistration): string[][] {
   if (!isAbsolute(p.gbrainBin)) {
@@ -916,6 +922,6 @@ export function registerCodexMcp(p: CodexMcpRegistration): string[][] {
   const name = p.name ?? 'gbrain';
   const argv = ['codex', 'mcp', 'add', name, '--env', `GBRAIN_SOURCE=${p.sourceId}`];
   if (p.gbrainHome) argv.push('--env', `GBRAIN_HOME=${p.gbrainHome}`);
-  argv.push('--', p.gbrainBin, 'serve', '--surface', 'full');
+  argv.push('--', ...stdioServeArgv(p.gbrainBin, p.surface));
   return [argv];
 }

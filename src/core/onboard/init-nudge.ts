@@ -15,6 +15,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { writeCliNotices } from '../interop-notices.ts';
+import { collectOnboardOpportunities, LINK_COVERAGE_MIN, TIMELINE_COVERAGE_MIN } from './mcp-onboarding.ts';
 
 const NUDGE_BUDGET_MS = 3000;
 
@@ -38,77 +39,18 @@ export async function runInitNudge(engine: BrainEngine): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), NUDGE_BUDGET_MS);
 
-    let totalStale = 0;
-    let totalEntities = 0;
-    let linkedCount = 0;
-    let timelineCount = 0;
-    let takesCount = 0;
-    // -1 = the page-count probe failed: fail-open sentinel, treat as non-empty
-    // so current behavior is preserved when the count is unknown.
-    let totalPages = -1;
-    let checksRan = 0;
-    let checksAttempted = 0;
-    let partial = false;
-
-    // Run 4 cheap counts in parallel against the 3s budget.
-    const results = await Promise.allSettled([
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM content_chunks WHERE embedding IS NULL`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages
-           WHERE type IN ('person', 'company', 'organization', 'entity')
-             AND deleted_at IS NULL`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages p
-           WHERE p.type IN ('person', 'company', 'organization', 'entity')
-             AND p.deleted_at IS NULL
-             AND EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages p
-           WHERE p.type IN ('person', 'company', 'organization', 'entity')
-             AND p.deleted_at IS NULL
-             AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id = p.id)`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM takes`,
-        [],
-        { signal: controller.signal },
-      ),
-      engine.executeRaw<{ count: string | number }>(
-        `SELECT COUNT(*) AS count FROM pages WHERE deleted_at IS NULL`,
-        [],
-        { signal: controller.signal },
-      ),
-    ]);
+    const counts = await collectOnboardOpportunities(engine, controller.signal);
     clearTimeout(timer);
 
-    checksAttempted = results.length;
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r.status === 'rejected') {
-        partial = true;
-        continue;
-      }
-      checksRan++;
-      const n = r.value.length > 0 ? Number(r.value[0].count) : 0;
-      if (i === 0) totalStale = n;
-      else if (i === 1) totalEntities = n;
-      else if (i === 2) linkedCount = n;
-      else if (i === 3) timelineCount = n;
-      else if (i === 4) takesCount = n;
-      else if (i === 5) totalPages = n;
-    }
+    const totalStale = counts.staleChunks ?? 0;
+    const totalEntities = counts.entities ?? 0;
+    const linkedCount = counts.linkedEntities ?? 0;
+    const timelineCount = counts.timelineEntities ?? 0;
+    const takesCount = counts.takes ?? 0;
+    // -1 = the page-count probe failed: fail-open sentinel, treat as non-empty
+    // so current behavior is preserved when the count is unknown.
+    const totalPages = counts.pages ?? -1;
+    const { checksRan, checksAttempted, partial } = counts;
 
     // A brand-new EMPTY brain has no "opportunities" — telling a fresh user
     // "0 takes" at the end of their first init is jargon-noise on the
@@ -122,18 +64,18 @@ export async function runInitNudge(engine: BrainEngine): Promise<void> {
     const timelineCoverage = totalEntities > 0 ? timelineCount / totalEntities : 1;
     const hasRecommendations =
       totalStale > 0
-      || (totalEntities > 0 && linkCoverage < 0.7)
-      || (totalEntities > 0 && timelineCoverage < 0.9)
+      || (totalEntities > 0 && linkCoverage < LINK_COVERAGE_MIN)
+      || (totalEntities > 0 && timelineCoverage < TIMELINE_COVERAGE_MIN)
       || takesCount === 0;
     if (!hasRecommendations && !partial) return;
 
     // Emit one-line nudge. Be terse — init is the activation surface.
     const parts: string[] = [];
     if (totalStale > 0) parts.push(`${totalStale} stale chunks`);
-    if (totalEntities > 0 && linkCoverage < 0.7) {
+    if (totalEntities > 0 && linkCoverage < LINK_COVERAGE_MIN) {
       parts.push(`link coverage ${Math.round(linkCoverage * 100)}%`);
     }
-    if (totalEntities > 0 && timelineCoverage < 0.9) {
+    if (totalEntities > 0 && timelineCoverage < TIMELINE_COVERAGE_MIN) {
       parts.push(`timeline coverage ${Math.round(timelineCoverage * 100)}%`);
     }
     if (takesCount === 0) parts.push('0 takes');

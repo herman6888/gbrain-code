@@ -1,7 +1,8 @@
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
 import type { ParsedPage } from '../import-file.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { stableJson } from '../persistence/digest.ts';
 import { assertPageRevision, type PageSnapshot } from './types.ts';
 
@@ -10,7 +11,9 @@ export async function assertImportBase(tx: BrainEngine, slug: string, sourceId: 
   await tx.lockPageKeys([{ sourceId, slug }]);
   const current = await tx.getPage(slug, { sourceId, includeDeleted: true });
   if ((current?.id ?? null) !== (existing?.id ?? null)) {
-    throw new OperationError('page_identity_changed', 'The imported page was deleted or recreated during preparation.');
+    throw opError('page_identity_changed', 'The imported page was deleted or recreated during preparation.',
+      `Page ${slug} in source ${sourceId} was deleted or recreated while its import was prepared, so the import did not write it. Read the page that holds the slug now, then import the file again.`,
+      { fix: readFix(`Shows which page holds ${slug} now and its revision.`, { argv: ['gbrain', 'get', '--source', sourceId, '--', slug], mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId } } }) });
   }
   assertPageRevision(current ? { revision: current.knowledge_revision! } : null, existing ? { expectedRevision: existing.knowledge_revision } : {});
 }

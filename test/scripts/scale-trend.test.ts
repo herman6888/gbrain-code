@@ -44,3 +44,8 @@ test('nightly sizes: 10k + 20k until the 20k rate gate passes five nights in a r
   expect(nightlyTiers(oneFailed)).toMatchObject({ tiers: [10_000, 20_000], reason: expect.stringContaining('4 of the last 5') });
   expect(nightlyTiers(runs(1, () => [report('pglite', 50_000, 1, 1)])).tiers).toEqual([50_000]);
 });
+
+test('a 20k cell with no report (killed or cancelled) blocks promotion to 50k', () => {
+  const pgliteMissing = runs(5, () => [report('postgres', 20_000, 1, 1)]);
+  expect(nightlyTiers(pgliteMissing)).toMatchObject({ tiers: [10_000, 20_000], reason: expect.stringContaining('0 of the last 5') });
+});

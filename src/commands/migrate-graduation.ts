@@ -88,7 +88,7 @@ const MODE_FLAGS: ReadonlyArray<[string, GraduationMode]> = [
   ['--plan', 'plan'], ['--dry-run', 'plan'], ['--status', 'status'], ['--resume', 'resume'], ['--rollback-to-source', 'rollback'],
 ];
 
-function usage(message: string, suggestion = `Run \`gbrain migrate --help\` for the accepted forms.`): OperationError {
+function usage(message: string, suggestion: string): OperationError {
   return opError('invalid_params', message, suggestion, {
     fix: { argv: ['gbrain', 'migrate', '--help'], consent: [], actor: 'agent', requires_exclusive: false, why: 'The help lists every graduation flag.' },
   });
@@ -98,7 +98,7 @@ function flagValue(args: readonly string[], name: string): string | undefined {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === name) {
       const v = args[i + 1];
-      if (v === undefined || (v.startsWith('--') && v !== '-')) throw usage(`${name} needs a value.`);
+      if (v === undefined || (v.startsWith('--') && v !== '-')) throw usage(`${name} needs a value.`, `Give ${name} its value right after it, as ${name} VALUE or ${name}=VALUE.`);
       return v;
     }
     if (args[i]!.startsWith(`${name}=`)) return args[i]!.slice(name.length + 1);
@@ -108,14 +108,15 @@ function flagValue(args: readonly string[], name: string): string | undefined {
 
 function positiveInt(raw: string | undefined, name: string): number | undefined {
   if (raw === undefined) return undefined;
-  if (!/^\d+$/.test(raw) || Number(raw) <= 0 || !Number.isSafeInteger(Number(raw))) throw usage(`${name} must be a positive whole number (got "${raw}").`);
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0 || !Number.isSafeInteger(Number(raw))) throw usage(`${name} must be a positive whole number (got "${raw}").`, `Pass ${name} as a positive whole number, e.g. ${name} ${name === '--batch-size' ? 500 : 60}.`);
   return Number(raw);
 }
 
 export function parseGraduationArgs(args: readonly string[]): GraduationArgs {
   const modes = MODE_FLAGS.filter(([f]) => args.includes(f));
   const distinct = [...new Set(modes.map(([, m]) => m))];
-  if (distinct.length > 1) throw usage(`${modes.map(([f]) => f).join(' and ')} cannot be combined; pick one.`);
+  if (distinct.length > 1) throw usage(`${modes.map(([f]) => f).join(' and ')} cannot be combined; pick one.`,
+    'Run one mode per command: preview with --plan, then the run itself with --yes --expect PLAN_HASH; --status, --resume and --rollback-to-source each run alone.');
   const mode: GraduationMode = distinct[0] ?? 'run';
   const toRaw = flagValue(args, '--to');
   if (toRaw !== undefined && toRaw !== 'postgres' && toRaw !== 'supabase') {
@@ -124,13 +125,16 @@ export function parseGraduationArgs(args: readonly string[]): GraduationArgs {
         ? 'A Postgres -> PGLite move uses the legacy copier and has no plan, status, resume or rollback: run `gbrain migrate --to pglite` without them.'
         : 'Use --to postgres (alias supabase).');
   }
-  if ((mode === 'plan' || mode === 'run') && toRaw === undefined) throw usage('Name the target engine: --to postgres (alias supabase).');
+  if ((mode === 'plan' || mode === 'run') && toRaw === undefined) throw usage('Name the target engine: --to postgres (alias supabase).',
+    `Preview first with gbrain migrate --to postgres --url-env ${DEFAULT_TARGET_URL_ENV} --plan.`);
   const urlRaw = flagValue(args, '--url');
   const urlEnv = flagValue(args, '--url-env');
-  if (urlRaw !== undefined && urlEnv !== undefined) throw usage('--url and --url-env cannot be combined; prefer --url-env so the URL never appears in a command line.');
-  if (mode === 'status' && (args.includes('--yes') || args.includes('--force'))) throw usage('--status is read-only; it takes no --yes or --force.');
+  if (urlRaw !== undefined && urlEnv !== undefined) throw usage('--url and --url-env cannot be combined; prefer --url-env so the URL never appears in a command line.',
+    `Keep --url-env (e.g. --url-env ${DEFAULT_TARGET_URL_ENV}) and drop --url.`);
+  if (mode === 'status' && (args.includes('--yes') || args.includes('--force'))) throw usage('--status is read-only; it takes no --yes or --force.', 'Run gbrain migrate --status (add --json for the machine form) without --yes or --force.');
   const bypass = flagValue(args, '--trigger-bypass');
-  if (bypass !== undefined && bypass !== 'replica' && bypass !== 'disable-trigger') throw usage(`--trigger-bypass takes replica or disable-trigger (got "${bypass}").`);
+  if (bypass !== undefined && bypass !== 'replica' && bypass !== 'disable-trigger') throw usage(`--trigger-bypass takes replica or disable-trigger (got "${bypass}").`,
+    'Pass --trigger-bypass replica or --trigger-bypass disable-trigger, or omit the flag.');
   const drain = positiveInt(flagValue(args, '--drain-timeout'), '--drain-timeout');
   return {
     mode,

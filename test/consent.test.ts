@@ -191,13 +191,9 @@ describe('--non-interactive maps explicitly to effects', () => {
     expect(isConsentRefusal(e)).toBe(true);
   });
 
-  test("the post-upgrade apply-migrations call authorizes exactly apply-migrations' install", async () => {
-    // test-reads-source-ok[structural]: the internal upgrade caller's literal argv is the input under test (pinned by upgrade-no-autopilot too).
-    const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'upgrade.ts'), 'utf8');
-    const m = src.match(/(?:runApplyMigrations|applyMigrations)\(\[([^\]]*?)(?:,\s*\.\.\.|\])/);
-    expect(m).not.toBeNull();
-    const args = [...m![1].matchAll(/'([^']+)'/g)].map(x => x[1]);
-    expect(args).toEqual(['--yes', '--non-interactive']);
+  test("the post-upgrade apply-migrations argv authorizes exactly apply-migrations' install", async () => {
+    // The argv post-upgrade passes at runtime is asserted in upgrade-no-autopilot.serial.test.ts.
+    const args = ['--yes', '--non-interactive'];
     const auth = await requireConsent(req([...NON_INTERACTIVE_AUTHORIZES['apply-migrations']], args, { command: 'apply-migrations' }), env());
     expect(auth.consented_effects).toEqual(['persistent_install']);
     expect(auth.cap_usd).toBeNull();

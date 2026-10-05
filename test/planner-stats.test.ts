@@ -1,7 +1,7 @@
 /**
  * F4b (spec 5.3, O-ENG-12): transactional planner-statistics accounting and
  * row-delta ANALYZE on PGLite. In-memory PGLite ($0). Restart and crash cases
- * live in test/planner-stats-restart.serial.test.ts, the 2,000-page import in
+ * live in test/planner-stats-restart.test.ts, the 2,000-page import in
  * test/planner-stats-import.slow.test.ts, Postgres in
  * test/e2e/planner-stats-postgres.test.ts.
  */

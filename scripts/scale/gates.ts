@@ -84,6 +84,8 @@ export interface ScaleReport {
   planner: { hot_table_stat_rows: Record<string, number>; hot_table_rows: Record<string, number>; probed_after: string };
   ops: OpResult[];
   data: DataCheck[];
+  /** F4d operational-ceiling measurements by check (scripts/scale/f4d.ts). */
+  f4d?: Record<string, Record<string, unknown>>;
   phases_ms: Record<string, number>;
   budgets_ms?: Record<string, number>;
 }

@@ -35,7 +35,7 @@ import {
   type CommandResult, type CommandRunner, type ServeHandler, type ServeStatusView, type TailscaleStatus,
 } from '../core/tailscale.ts';
 import {
-  defaultLookup, defaultTcpProbe, pollHealth, probeHealth, probeOccupied, tryFetch, unresolvedDetail,
+  defaultLookup, defaultTcpProbe, pollHealth, probeHealth, probeOccupied, statusOnlyHealthDetail, tryFetch, unresolvedDetail,
   type FetchOutcome, type HostLookup, type ProbeFetch, type TcpProbe,
 } from './mcp-expose-probe.ts';
 // The probes were peeled into `mcp-expose-probe.ts`; the default TCP probe keeps its import site here.
@@ -964,7 +964,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
       s.check('verify.local', 'skipped', 'manual service: start the wrapper, then run --status');
     } else {
       localHealth = (await pollHealth(d, localHealthUrl, d.localHealthMs)).ok ? 'ok' : 'timeout';
-      s.check('verify.local', localHealth === 'ok' ? 'ok' : 'warn', `${localHealthUrl}: ${localHealth}`);
+      s.check('verify.local', localHealth === 'ok' ? 'ok' : 'warn', `${localHealthUrl}: ${localHealth === 'ok' ? localHealth : statusOnlyHealthDetail(opts.port) ?? localHealth}`);
     }
     if (!opts.noTailscale && localHealth === 'ok') {
       const tn = await pollHealth(d, `${publicUrl}/health`, d.tailnetHealthMs);
@@ -1104,7 +1104,8 @@ async function runStatus(d: Resolved, s: Session, opts: ExposeOptions): Promise<
   }
   // health
   if (!localOk) allOk = false;
-  s.check('verify.local', localOk ? 'ok' : 'fail', `${localUrl}: ${localOk ? 'ok' : 'no answer'}`);
+  const statusOnly = localOk ? null : statusOnlyHealthDetail(receipt.port);
+  s.check('verify.local', localOk ? 'ok' : statusOnly ? 'warn' : 'fail', `${localUrl}: ${localOk ? 'ok' : statusOnly ?? 'no answer'}`);
   if (tailnetUrl && tailnet) {
     if (tailnet.res?.ok) s.check('verify.tailnet', 'ok', `${tailnetUrl}: ok`);
     else if (tailnet.unresolved) s.check('verify.tailnet', 'warn', `${tailnetUrl}: ${unresolvedDetail(receipt.tailscale.dns_name ?? receipt.public_url.slice('https://'.length))}`);

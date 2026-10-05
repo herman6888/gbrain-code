@@ -1,3 +1,5 @@
+import type { RelationalPlanMeta } from '../search/relational-recall.ts';
+import type { Notice } from '../agent-output.ts';
 import { readHolders } from './context.ts';
 /**
  * Search operation cluster (search + query) — pure move from operations.ts
@@ -38,7 +40,7 @@ import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-description
 import { heldFilesNotice, stampHeldHits } from '../persistence/held-reads.ts';
 import { opError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
-import { invalidParam, paramUse } from './op-fix.ts';
+import { invalidParam, paramUse, readFix } from './op-fix.ts';
 import {
   assertExplicitSourceLive,
   federatedSearchScope,
@@ -434,6 +436,8 @@ async function buildRetrievalResponseMeta(
   if (readiness.status !== 'ready') {
     degraded.push({ stage: readiness.status === 'projection_pending' ? 'projection_pending' : 'projection_status_unknown' });
   }
+  const planNotice = relationalPlanNotice(m?.relational_plan);
+  if (planNotice) ctx.emitNotice?.(planNotice);
   return {
     returned_count: results.length,
     retrieved_count: m?.retrieved_count ?? results.length,
@@ -446,6 +450,7 @@ async function buildRetrievalResponseMeta(
       ...(m.decide ? { decide: m.decide } : {}),
       ...(m.rerank ? { rerank: m.rerank } : {}),
       ...(m.answerability ? { answerability: m.answerability } : {}),
+      ...(m.relational_plan ? { relational_plan: m.relational_plan } : {}),
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
@@ -1082,8 +1087,8 @@ const assemble_evidence: Operation = {
     if (!Array.isArray(hits) || hits.some(h => typeof h !== 'object' || h === null
       || typeof (h as Record<string, unknown>).source_id !== 'string' || typeof (h as Record<string, unknown>).slug !== 'string'
       || !Number.isInteger((h as Record<string, unknown>).chunk_id))) {
-      throw opError('invalid_params', 'hits must be an array of { source_id: string, slug: string, chunk_id: integer }.',
-        'Pass the source_id, slug and chunk_id of each search hit. Example: {"hits": [{"source_id": "default", "slug": "chat/session-0412", "chunk_id": 8812}], "return_unit": "page"}');
+      throw invalidParam(ctx, 'assemble_evidence', 'hits', 'hits must be an array of { source_id: string, slug: string, chunk_id: integer }.',
+        { def: assemble_evidence.params.hits, example: [{ source_id: 'default', slug: 'chat/session-0412', chunk_id: 8812 }] });
     }
     const scope = federatedSearchScope(ctx);
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
@@ -1231,3 +1236,27 @@ const cache_stats: Operation = {
 export const searchOperations: Operation[] = [
   search, query, assemble_evidence, search_stats, search_modes, search_tune, cache_stats,
 ];
+
+/**
+ * A multi-relation question whose chain did not produce answers gets a
+ * notice naming why and the next call, so the agent never reads ordinary
+ * results as "the graph has no answer".
+ */
+function relationalPlanNotice(plan: RelationalPlanMeta | undefined): Notice | null {
+  if (!plan || plan.status === 'fired') return null;
+  if (plan.status === 'unsupported') {
+    return { code: 'relational_chain', kind: 'degraded', why: `This question chains relationships in a way the planner does not run (${plan.reason ?? 'unsupported'}), so no graph answer is included; split it into one-relationship questions, or call traverse_graph with explicit hops.` };
+  }
+  if (plan.status === 'anchor_not_found') {
+    const anchor = plan.anchor ?? '';
+    return { code: 'relational_chain', kind: 'degraded', why: `No page matches "${anchor}" in the searched sources, so the relationship chain did not run; the results are ordinary text matches.`,
+      fix: readFix('Find the entity page first, then ask again with its exact name (or call traverse_graph with its slug and explicit hops).', { argv: ['gbrain', 'search', anchor], mcp: { tool: 'search', arguments: { query: anchor } } }) };
+  }
+  if (plan.status === 'truncated') {
+    return { code: 'relational_chain', kind: 'info', why: `The relationship chain hit its ${plan.cap_hit?.cap ?? ''} cap at hop ${plan.cap_hit?.hop ?? '?'}, so lower-ranked answers were dropped; narrow the question or start from a more specific entity.` };
+  }
+  const hop = plan.empty_hop ?? 1;
+  const slug = plan.anchor_slugs?.[0];
+  return { code: 'relational_chain', kind: 'degraded', why: `Hop ${hop} of the relationship chain found no typed links${hop === 1 ? ` from "${plan.anchor ?? ''}"` : ''}; the relationship may only be written as plain mentions. The results are ordinary text matches.`,
+    ...(slug ? { fix: readFix('A depth-1 walk shows what the start page is linked to.', { argv: ['gbrain', 'graph-query', slug, `--${'depth'}`, '1'], mcp: { tool: 'traverse_graph', arguments: { slug, depth: 1 } } }) } : {}) };
+}

@@ -11,6 +11,8 @@ import { performSync } from '../src/commands/sync/perform.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { nextGroupSize, resolveBulkSettings } from '../src/core/persistence/sync-group.ts';
 import { withEnv } from './helpers/with-env.ts';
+import type { WriteRequest } from '../src/core/persistence/model.ts';
+import { WINDOW_CANCEL_MESSAGE, cancelOrphanedWindowGroup, windowPredecessor, windowPredecessorCommitted } from '../src/core/persistence/sync-window.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-bulk-'));
 let engine: BrainEngine | undefined;
@@ -115,6 +117,67 @@ test('a held file ends the group before it: it is held without a request and eve
   expect(states.every(row => row.state === 'committed')).toBe(true);
   expect(states).toHaveLength(9);
   expect(await engine.getPage('notes/n3', { sourceId: f.id })).toBeNull();
+}), 300_000);
+
+test('a draining sync admits the next group while the current one publishes; every page commits in manifest order', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  if (!engine) return;
+  const f = await fixture(engine, notes(20));
+  const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true });
+  expect(result.drain).toMatchObject({ outcome: 'synced' });
+  const rows = await engine.executeRaw<{ slug: string; state: string; after: string | null; published: string; sequence: string }>(
+    `SELECT slug,state,intent->>'after' AS after,published_at::text AS published,sequence::text FROM persistence_requests
+     WHERE source_id=$1 AND intent->>'kind'='managed_sync_import' ORDER BY sequence`, [f.id]);
+  expect(rows).toHaveLength(20);
+  expect(rows.every(row => row.state === 'committed')).toBe(true);
+  // At least one group was admitted ahead, naming the request it waits for.
+  const ahead = rows.filter(row => row.after);
+  expect(ahead.length).toBeGreaterThan(0);
+  const ids = await engine.executeRaw<{ request_id: string; slug: string }>(`SELECT request_id::text,slug FROM persistence_requests WHERE source_id=$1`, [f.id]);
+  const slugOf = new Map(ids.map(row => [row.request_id, row.slug]));
+  for (const row of ahead) expect(rows.findIndex(r => r.slug === slugOf.get(row.after!))).toBeLessThan(rows.findIndex(r => r.slug === row.slug));
+  // Publication order follows manifest (admission) order.
+  const published = rows.map(row => row.published);
+  expect([...published].sort()).toEqual(published);
+  const [cursor] = await engine.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM op_checkpoints WHERE op='managed-sync' AND (completed_keys->0 ? 'window' OR completed_keys->0 ? 'group')");
+  expect(cursor!.n).toBe(0);
+}), 300_000);
+
+test('a failed page cancels the group admitted ahead of it; nothing after the failure publishes', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+  if (!engine) return;
+  const f = await fixture(engine, notes(40, i => i === 2 ? '---\ntitle: Conflict\nslug: notes/other\n---\nA conflicting identity must not be imported.\n' : null));
+  await engine.setConfig('sync.holds', 'fail');
+  const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true })
+    .finally(() => engine!.unsetConfig('sync.holds'));
+  expect(result.drain).toMatchObject({ outcome: 'blocked' });
+  expect(result.managedWrite?.slug).toBe('notes/n2');
+  const rows = await engine.executeRaw<{ slug: string; state: string; after: string | null; grp: string | null; error_message: string | null }>(
+    `SELECT slug,state,intent->>'after' AS after,intent->>'group' AS grp,error_message FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_import' ORDER BY sequence`, [f.id]);
+  // Rows are in manifest (admission) order: every page before the failure committed, every page after it was cancelled.
+  const failedAt = rows.findIndex(row => row.slug === 'notes/n2');
+  expect(rows[failedAt]!.state).toBe('failed');
+  expect(rows.slice(0, failedAt).every(row => row.state === 'committed')).toBe(true);
+  expect(rows.slice(failedAt + 1).every(row => row.state === 'cancelled')).toBe(true);
+  for (const row of rows.slice(failedAt)) expect(await engine.getPage(row.slug, { sourceId: f.id })).toBeNull();
+  // The group admitted ahead of the failed one is cancelled with the window reason.
+  const ahead = rows.slice(failedAt + 1).filter(row => row.after && row.grp !== rows[failedAt]!.grp);
+  expect(ahead.length).toBeGreaterThan(0);
+  for (const row of ahead) expect(row).toMatchObject({ state: 'cancelled', error_message: WINDOW_CANCEL_MESSAGE });
+  const [cursor] = await engine.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0 ? 'window' AND completed_keys->0->>'sourceId'=$1", [f.id]);
+  expect(cursor!.n).toBe(0);
+}), 300_000);
+
+test('a claimed window group whose predecessor did not commit is cancelled by the consumer, not published', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  if (!engine) return;
+  const f = await fixture(engine, notes(1));
+  const [worktree] = await engine.executeRaw<{ worktree_id: string }>('SELECT worktree_id FROM persistence_source_bindings WHERE source_id=$1', [f.id]);
+  const missing = randomUUID();
+  const head = { id: randomUUID(), request_id: randomUUID(), worktree_id: worktree!.worktree_id, principal_kind: 'local_cli', principal_id: randomUUID(),
+    execution_token: null, state: 'queued', intent: { kind: 'managed_sync_import', after: missing } } as unknown as WriteRequest;
+  expect(windowPredecessor(head)).toBe(missing);
+  expect(await windowPredecessorCommitted(engine, head)).toBe(false);
+  expect(await windowPredecessorCommitted(engine, { ...head, intent: { kind: 'managed_sync_import' } } as unknown as WriteRequest)).toBe(true);
+  // A row that does not exist settles nothing and publishes nothing.
+  expect(await cancelOrphanedWindowGroup(engine, head)).toEqual([]);
 }), 300_000);
 
 test('--no-bulk publishes one page per transaction', async () => withEnv({ GBRAIN_HOME: home }, async () => {

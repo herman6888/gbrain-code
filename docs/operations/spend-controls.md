@@ -74,6 +74,34 @@ What authorizes paid work, and the cap it runs under:
   [Registering a model price](#registering-a-model-price)), then retry the
   same command.
 
+## Queued paid work
+
+Paid commands that queue jobs carry the approval onto the jobs, and the
+worker enforces it:
+
+| Producer | Jobs | Basis stored | Budget the worker enforces |
+|---|---|---|---|
+| `book-mirror` | one `subagent` per chapter | `authorized`, one group | the approved total, shared by the chapters |
+| `enrich --background` (Postgres) | one `enrich` per source | `authorized`, one group | the approved total, shared by the sources |
+| `jobs submit enrich\|subagent` | one | `authorized` | the approved cap |
+| jobs of those commands queued before submit-time authorization | as above | `legacy_default`, one group per job | `enrich`: the job's `--max-usd`, else $5; `subagent`: $5 |
+| everything else (`agent run`, MCP `submit_agent`/`submit_job`, `doctor --remediate`, autopilot and dream phases, `skillopt`, `import`, `reindex`, `sync`, embedding backfills) | various | none (`unrecorded`) | the producer's own budget: client daily budget, cycle budget, embedding caps, write-path embedding as configured, `--max-usd` for remediation |
+
+Each provider attempt reserves its maximum cost against the group in the
+durable spend meter and settles its measured usage; an attempt that never
+reports usage stays charged. When other jobs' attempts are in flight the job
+waits (delayed, no attempt burned, at most 6 times); when settled spend
+reaches the cap the job dies with `derived_cap_exhausted` or
+`cost_cap_exceeded`, the group amounts and the rerun command. `--max-usd off`
+(or `spend.posture=tokenmax` on `enrich`) stores an uncapped approval: nothing
+is reserved and spend is still ledgered. Group controls:
+`gbrain jobs list --group <id> --json`, `gbrain jobs cancel --group <id>`.
+
+Spend-authorized jobs need upgraded workers: an older worker cannot claim
+them (and stops claiming at the first one in its queue order), so restart
+every worker after upgrading. Rolling the binary back leaves those queued rows
+unclaimable; cancel them first (`gbrain jobs cancel --group <id>`).
+
 ## Off switches (`off` / `unlimited` / `none`)
 
 The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to mean

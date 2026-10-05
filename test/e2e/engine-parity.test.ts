@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { linkFamily, resolveChainAnchors, runRelationalChain } from '../../src/core/search/relational-chain.ts';
 import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { getSessionContextState, upsertSessionContextState } from '../../src/core/context/session-state.ts';
@@ -1403,6 +1404,21 @@ describeBoth('Engine parity — relationalFanout', () => {
     const pg = await pgEngine.relationalFanout(seeds, { direction: 'both' });
     const pglite = await pgliteEngine.relationalFanout(seeds, { direction: 'both' });
     expect(shape(pg)).toEqual(shape(pglite));
+  });
+
+  test('multi-hop chain (relationalChainHop + runRelationalChain) identical across engines', async () => {
+    await pgEngine.addLink('companies/ep-widget', 'people/ep-emp-c', 'founded by c', 'founded', 'markdown');
+    await pgliteEngine.addLink('companies/ep-widget', 'people/ep-emp-c', 'founded by c', 'founded', 'markdown');
+    const plan = { hops: [{ linkTypes: linkFamily('invested_in'), toward: 'object' as const }, { linkTypes: ['founded'], toward: 'subject' as const }], excludeAnchor: false };
+    const run = async (eng: BrainEngine) => {
+      const anchors = await resolveChainAnchors(eng, 'people/ep-inv-a', {});
+      const { rows, diagnostics } = await runRelationalChain(eng, anchors, plan, {});
+      return { rows: rows.map(r => ({ ...r, page_id: 0, canonical_chunk_id: r.canonical_chunk_id != null })), diagnostics };
+    };
+    const pg = await run(pgEngine);
+    const pglite = await run(pgliteEngine);
+    expect(pg).toEqual(pglite);
+    expect(pg.rows.filter(r => r.role === 'answer').map(r => r.slug)).toEqual(['people/ep-emp-c']);
   });
 });
 

@@ -44,7 +44,7 @@
             "next": "report",
             "requires_exclusive": false,
             "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-            "why": "Register `<absolute path to gbrain> serve --surface verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+            "why": "Register `<absolute path to gbrain> serve --surface starter` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
           },
           "message": "pglite — serve IPC socket not present; enabled but NO resolve path exists right now: the IPC socket is only bound by a running `gbrain serve` (stdio or --http) — until one is up, hooks/reflex degrade to no_serve on this brain (host capability may still supply pointers; policy skill carries otherwise) — policy skill not installed; run `gbrain integrations install retrieval-reflex --target <host-repo>`",
           "name": "retrieval_reflex_health",
@@ -381,7 +381,7 @@
             "next": "report",
             "requires_exclusive": false,
             "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-            "why": "Register `<absolute path to gbrain> serve --surface verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+            "why": "Register `<absolute path to gbrain> serve --surface starter` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
           },
           "message": "No agent harness was detected. Wire one when the user picks an agent app.",
           "name": "harness_wiring",
@@ -510,13 +510,13 @@
         },
         {
           "category": "meta",
-          "message": "Version 203 (latest: 203)",
+          "message": "Version 205 (latest: 205)",
           "name": "schema_version",
           "status": "ok"
         },
         {
           "category": "meta",
-          "message": "853 column(s) verified against live schema",
+          "message": "901 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -1173,6 +1173,11 @@
             "authorizable_total": 0,
             "docs": "docs/guides/repair.md#legacy-job-authority",
             "live": 0,
+            "queued_spend": {
+              "by_basis": {},
+              "long_waiting": 0,
+              "long_waiting_ids": []
+            },
             "terminal_keyed": {},
             "terminal_keyed_total": 0,
             "unsupported": 0,
@@ -1388,6 +1393,24 @@
           },
           "message": "No active facts yet; nothing to link.",
           "name": "unlinked_facts",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "contradiction_mode": "propose (default)",
+            "lagging": 0,
+            "proposals": {
+              "applied": 0,
+              "proposed": 0,
+              "undated": 0
+            },
+            "read_policy": "on",
+            "relationships": {},
+            "stale_assertions": []
+          },
+          "message": "relationships: none yet; read policy on; contradiction mode propose (default)",
+          "name": "edge_validity",
           "status": "ok"
         },
         {
@@ -1775,7 +1798,7 @@
           "category": "meta",
           "details": {
             "counts": {
-              "global": 11,
+              "global": 12,
               "mixed": 2,
               "source": 12
             },
@@ -1786,6 +1809,7 @@
               "consolidate": "source",
               "conversation_facts_backfill": "source",
               "drift": "global",
+              "edge_contradictions": "global",
               "embed": "global",
               "enrich_thin": "source",
               "extract": "source",
@@ -1807,7 +1831,7 @@
               "synthesize_concepts": "global"
             }
           },
-          "message": "Phase taxonomy: 12 source-scoped, 11 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, drift, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+          "message": "Phase taxonomy: 12 source-scoped, 12 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
           "name": "cycle_phase_scope",
           "status": "ok"
         },

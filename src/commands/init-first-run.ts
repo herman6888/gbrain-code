@@ -20,6 +20,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { resolveGbrainBin } from '../core/gbrain-bin.ts';
 import { configReadiness, embeddingEnablement, harnessWiringEntry } from '../core/readiness.ts';
 import type { SearchMode } from '../core/search/mode.ts';
+import type { McpSurface } from '../mcp/surface.ts';
 
 export interface InitFirstRunInputs {
   /** The search mode init applied and why (from the install-time picker). */
@@ -30,6 +31,8 @@ export interface InitFirstRunInputs {
   writeback?: boolean;
   /** Recommended skills missing from the agent workspace (`initSkillsScaffold`). */
   skillsScaffold?: { missing: string[]; argv: string[] } | null;
+  /** `gbrain init --surface`: the surface the harness registration pins (default REGISTRATION_SURFACE). */
+  surface?: McpSurface;
 }
 
 const SEARCH_MODE_COST =
@@ -47,8 +50,8 @@ function searchModeDecision(applied: { mode: SearchMode; reason: string }): Deci
   };
 }
 
-function harnessWiringDecision(config: GBrainConfig): Decision | null {
-  const entry = configReadiness(config, { transport: 'cli' }).entries.find(e => e.capability === 'harness_wiring');
+function harnessWiringDecision(config: GBrainConfig, surface?: McpSurface): Decision | null {
+  const entry = configReadiness(config, { transport: 'cli', ...(surface ? { surface } : {}) }).entries.find(e => e.capability === 'harness_wiring');
   if (!entry?.fix || entry.state === 'ok') return null;
   return {
     id: 'harness_wiring',
@@ -98,7 +101,7 @@ export function buildInitFirstRunNotices(inputs: InitFirstRunInputs): Notice[] {
   if (inputs.searchMode) decisions.push(searchModeDecision(inputs.searchMode));
   if (inputs.writeback) decisions.push(writebackDecision());
   if (inputs.config) {
-    const wiring = harnessWiringDecision(inputs.config);
+    const wiring = harnessWiringDecision(inputs.config, inputs.surface);
     if (wiring) decisions.push(wiring);
   }
   if (inputs.skillsScaffold?.missing.length) decisions.push(skillsScaffoldDecision(inputs.skillsScaffold));
@@ -125,10 +128,10 @@ export function deferredEmbeddingHint(cfg: GBrainConfig): string {
 }
 
 /** init's bundle for this brain: reads the writeback gate and the agent workspace's missing skills. */
-export async function firstRunBundle(engine: BrainEngine, searchMode: { mode: SearchMode; reason: string } | undefined): Promise<Notice[]> {
+export async function firstRunBundle(engine: BrainEngine, searchMode: { mode: SearchMode; reason: string } | undefined, surface?: McpSurface): Promise<Notice[]> {
   const { writebackAskApplies } = await import('../core/onboard/writeback-nudge.ts');
   const { initSkillsScaffold } = await import('../core/skillpack/post-install-advisory.ts');
-  return buildInitFirstRunNotices({ searchMode, config: loadConfig(), writeback: await writebackAskApplies(engine), skillsScaffold: initSkillsScaffold() });
+  return buildInitFirstRunNotices({ searchMode, config: loadConfig(), writeback: await writebackAskApplies(engine), skillsScaffold: initSkillsScaffold(), surface });
 }
 
 /** D2/G5: the bundle rendered into init's --json document (`notices`, empty → omitted). */
@@ -139,14 +142,15 @@ export function firstRunJson(bundle: Notice[]): { notices?: unknown[]; contract_
 
 /**
  * The harness registration line for init's quickstart: the readiness
- * `harness_wiring` fix (absolute binary, `--surface verbs`) for the detected
- * harness, else the Claude Code registration built the same way. Null when
- * the gbrain binary has no absolute path (never registered bare).
+ * `harness_wiring` fix (absolute binary, `--surface starter` unless
+ * `gbrain init --surface` names another) for the detected harness, else the
+ * Claude Code registration built the same way. Null when the gbrain binary
+ * has no absolute path (never registered bare).
  */
-export function harnessRegistrationCommand(): string | null {
+export function harnessRegistrationCommand(surface?: McpSurface): string | null {
   const cfg = loadConfig();
-  const detected = cfg ? configReadiness(cfg, { transport: 'cli' }).entries.find(e => e.capability === 'harness_wiring')?.fix : undefined;
+  const detected = cfg ? configReadiness(cfg, { transport: 'cli', ...(surface ? { surface } : {}) }).entries.find(e => e.capability === 'harness_wiring')?.fix : undefined;
   if (detected?.argv) return shellQuote(detected.argv);
-  const claude = harnessWiringEntry({ transport: 'cli', harnesses: ['claude-code'], lockOwner: null, gbrainBin: resolveGbrainBin() }).fix;
+  const claude = harnessWiringEntry({ transport: 'cli', harnesses: ['claude-code'], lockOwner: null, gbrainBin: resolveGbrainBin(), ...(surface ? { surface } : {}) }).fix;
   return claude?.argv ? shellQuote(claude.argv) : null;
 }

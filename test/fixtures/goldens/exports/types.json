@@ -68,7 +68,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
-          "createVersion: (slug: string, opts?: { sourceId?: string; }) => Promise<PageVersion>",
+          "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
           "deleteEvalCandidatesBefore: (date: Date) => Promise<number>",
@@ -91,7 +91,7 @@
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
           "getBacklinkCounts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, number>>",
-          "getBacklinks: (slug: string, opts?: PageReadScope) => Promise<Link[]>",
+          "getBacklinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getCalibrationCurve: (opts: CalibrationCurveOpts, allowList: string[] | undefined) => Promise<CalibrationBucket[]>",
           "getCalleesOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean; }) => Promise<CodeEdgeResult[]>",
           "getCallersOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; }) => Promise<CodeEdgeResult[]>",
@@ -110,7 +110,7 @@
           "getHealth: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<BrainHealth>",
           "getIngestLog: (opts?: { limit?: number; sourceIds?: string[]; }) => Promise<IngestLogEntry[]>",
           "getLastSeen: (entitySlug: string, opts?: PageReadScope & { asof?: string; }) => Promise<LastSeenResult>",
-          "getLinks: (slug: string, opts?: PageReadScope) => Promise<Link[]>",
+          "getLinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getOnThisDay: (opts?: PageReadScope & { date?: string; limit?: number; }) => Promise<ChronicleTimelineRow[]>",
           "getOntology: (entitySlug: string, opts?: OntologyReadOpts) => Promise<OntologyValue[]>",
           "getPage: (slug: string, opts?: GetPageOpts) => Promise<Page | null>",
@@ -172,6 +172,7 @@
           "reconnect: (ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
           "registerBeforeDisconnect: (stop: () => Promise<void>) => () => void",
+          "relationalChainHop: (frontierPageIds: number[], opts: ChainHopOpts) => Promise<ChainHopEdge[]>",
           "relationalFanout: (seeds: string[], opts?: RelationalFanoutOpts) => Promise<RelationalFanoutRow[]>",
           "removeLink: (from: string, to: string, linkType?: string, linkSource?: string, opts?: { fromSourceId?: string; toSourceId?: string; }) => Promise<number>",
           "removeLinksByPagesAndSource: (pages: Array<{ slug: string; source_id: string; }>, opts: { linkSource: string; keepTypedNerPairs?: Array<{ from_slug: string; from_source_id: string; to_slug: string; to_source_id: string; }>; }) => Promise<number>",
@@ -207,14 +208,14 @@
           "transactionDirect: <T>(fn: (engine: BrainEngine) => Promise<T>) => Promise<T>",
           "traverseGraph: (slug: string, depth?: number, opts?: TraverseGraphOpts) => Promise<GraphNode[]>",
           "traversePaths: (slug: string, opts?: PageReadScope & { depth?: number; linkType?: string; direction?: \"in\" | \"out\" | \"both\"; }) => Promise<GraphPath[]>",
-          "traversePathsDetailed: (slug: string, opts?: PageReadScope & { depth?: number; linkType?: string; direction?: \"in\" | \"out\" | \"both\"; }) => Promise<{ paths: GraphPath[]; truncated: boolean; }>",
+          "traversePathsDetailed: (slug: string, opts?: LinkReadScope & { depth?: number; linkType?: string; direction?: \"in\" | \"out\" | \"both\"; }) => Promise<{ paths: GraphPath[]; truncated: boolean; }>",
           "unsetConfig: (key: string) => Promise<number>",
           "updatePageContextualRetrievalState: (slug: string, sourceId: string, mode: string, corpusGeneration: string | null) => Promise<void>",
           "updateSlug: (oldSlug: string, newSlug: string, opts?: { sourceId?: string; }) => Promise<number>",
           "updateSourceConfig: (sourceId: string, patch: Record<string, unknown>) => Promise<boolean>",
           "updateTake: (pageId: number, rowNum: number, fields: { weight?: number; since_date?: string; source?: string; }) => Promise<void>",
           "updateTakeEmbeddings: (rows: TakeEmbeddingInput[], opts?: BatchOpts) => Promise<number>",
-          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; } & BatchOpts) => Promise<void>",
+          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; } & BatchOpts) => Promise<void>",
           "upsertEventProjection: (opts: { depthSlug: string; eventSlug: string; date: string; summary: string; detail?: string; sourceId?: string; }) => Promise<{ projected: boolean; }>",
           "upsertFile: (spec: FileSpec) => Promise<{ id: number; created: boolean; }>",
           "withReservedConnection: <T>(fn: (conn: ReservedConnection) => Promise<T>, opts?: { route?: \"ordinary\"; }) => Promise<T>",
@@ -273,6 +274,46 @@
         "signature": [
           "readonly [\"none\", \"title\", \"per_chunk_synopsis\"]"
         ]
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "canonical_chunk_id: number | null",
+          "context: string | null",
+          "from_degree: number",
+          "from_page_id: number",
+          "link_ids: number[]",
+          "link_type: string",
+          "neighbor_cap_hit: boolean",
+          "orientation: \"canonical\" | \"stored\" | \"flipped\" | \"uncertain\"",
+          "origin_page_id: number | null",
+          "origin_slug: string | null",
+          "source_id: string",
+          "stored_from_slug: string",
+          "stored_to_slug: string",
+          "to_page_id: number",
+          "to_slug: string",
+          "to_type: string"
+        ],
+        "name": "ChainHopEdge"
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "degreeLinkTypes: string[]",
+          "excludePrivate?: boolean | undefined",
+          "linkTypes: string[]",
+          "neighborCap: number",
+          "objectTypes: string[]",
+          "requireSafeChunks?: boolean | undefined",
+          "sourceId?: string | undefined",
+          "sourceIds?: string[] | undefined",
+          "subjectTypes: string[]",
+          "takesHoldersAllowList?: string[] | undefined",
+          "temporal?: EdgeTemporalOpts | undefined",
+          "toward: \"object\" | \"subject\""
+        ],
+        "name": "ChainHopOpts"
       },
       {
         "kind": "interface",
@@ -676,6 +717,7 @@
           "metadata_boost_gate?: MetadataBoostGateDecision | undefined",
           "mode?: \"conservative\" | \"balanced\" | \"tokenmax\" | undefined",
           "relational_evidence_slot?: RelationalEvidenceSlotDecision | undefined",
+          "relational_plan?: RelationalPlanMeta | undefined",
           "relational_rerank_pin?: RelationalRerankPinDecision | undefined",
           "relaxed_dropped?: number | undefined",
           "rerank?: { model_resolved: string; } | undefined",
@@ -971,7 +1013,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
-          "createVersion: (slug: string, opts?: { sourceId?: string; }) => Promise<PageVersion>",
+          "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
           "deleteEvalCandidatesBefore: (date: Date) => Promise<number>",
@@ -995,7 +1037,7 @@
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
           "getBacklinkCounts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, number>>",
-          "getBacklinks: (slug: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; }) => Promise<Link[]>",
+          "getBacklinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getCalibrationCurve: (opts: CalibrationCurveOpts, allowList: string[] | undefined) => Promise<CalibrationBucket[]>",
           "getCalleesOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean; }) => Promise<CodeEdgeResult[]>",
           "getCallersOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; }) => Promise<CodeEdgeResult[]>",
@@ -1014,7 +1056,7 @@
           "getHealth: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<BrainHealth>",
           "getIngestLog: (opts?: { limit?: number; sourceIds?: string[]; }) => Promise<IngestLogEntry[]>",
           "getLastSeen: (entitySlug: string, opts?: PageReadScope & { asof?: string; }) => Promise<LastSeenResult>",
-          "getLinks: (slug: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; }) => Promise<Link[]>",
+          "getLinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getOnThisDay: (opts?: PageReadScope & { date?: string; limit?: number; }) => Promise<ChronicleTimelineRow[]>",
           "getOntology: (entitySlug: string, opts?: OntologyReadOpts) => Promise<OntologyValue[]>",
           "getPage: (slug: string, opts?: PageSnapshotOptions) => Promise<Page | null>",
@@ -1111,6 +1153,7 @@
           "reconnect: (ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
           "registerBeforeDisconnect: (stop: () => Promise<void>) => () => void",
+          "relationalChainHop: (frontierPageIds: number[], opts: ChainHopOpts) => Promise<ChainHopEdge[]>",
           "relationalFanout: (seeds: string[], opts?: RelationalFanoutOpts) => Promise<RelationalFanoutRow[]>",
           "removeLink: (from: string, to: string, linkType?: string, linkSource?: string, opts?: { fromSourceId?: string; toSourceId?: string; }) => Promise<number>",
           "removeLinksByPagesAndSource: (pages: Array<{ slug: string; source_id: string; }>, opts: { linkSource: string; keepTypedNerPairs?: Array<{ from_slug: string; from_source_id: string; to_slug: string; to_source_id: string; }>; }) => Promise<number>",
@@ -1154,7 +1197,7 @@
           "updateSourceConfig: (sourceId: string, patch: Record<string, unknown>) => Promise<boolean>",
           "updateTake: (pageId: number, rowNum: number, fields: { weight?: number; since_date?: string; source?: string; }) => Promise<void>",
           "updateTakeEmbeddings: (rowsIn: TakeEmbeddingInput[], opts?: BatchOpts) => Promise<number>",
-          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; } & BatchOpts) => Promise<void>",
+          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; } & BatchOpts) => Promise<void>",
           "upsertEventProjection: (opts: { depthSlug: string; eventSlug: string; date: string; summary: string; detail?: string; sourceId?: string; }) => Promise<{ projected: boolean; }>",
           "upsertFile: (spec: FileSpec) => Promise<{ id: number; created: boolean; }>",
           "withReservedConnection: <T>(fn: (conn: ReservedConnection) => Promise<T>, opts?: { route?: \"ordinary\"; }) => Promise<T>",
@@ -1185,6 +1228,17 @@
       {
         "kind": "interface",
         "members": [
+          "edges: { link_type: string; stored_from: string; stored_to: string; orientation: \"canonical\" | \"stored\" | \"flipped\" | \"uncertain\"; context: string | null; origin: string | null; }[]",
+          "hop: number",
+          "path_count: number",
+          "role: \"answer\" | \"support\" | \"origin\"",
+          "seed: string"
+        ],
+        "name": "RelationalEvidence"
+      },
+      {
+        "kind": "interface",
+        "members": [
           "depth?: number | undefined",
           "direction?: \"both\" | \"in\" | \"out\" | undefined",
           "excludePrivate?: boolean | undefined",
@@ -1195,7 +1249,8 @@
           "seedRefs?: { source_id: string; slug: string; }[] | undefined",
           "sourceId?: string | undefined",
           "sourceIds?: string[] | undefined",
-          "takesHoldersAllowList?: string[] | undefined"
+          "takesHoldersAllowList?: string[] | undefined",
+          "temporal?: EdgeTemporalOpts | undefined"
         ],
         "name": "RelationalFanoutOpts"
       },
@@ -1279,6 +1334,9 @@
           "orFallback?: boolean | undefined",
           "recency?: \"on\" | \"off\" | \"strong\" | undefined",
           "recencyBoost?: 0 | 1 | 2 | undefined",
+          "relationalChainSlots?: number | undefined",
+          "relationalOrientOneHop?: boolean | undefined",
+          "relationalPlanner?: boolean | undefined",
           "relationalRerankPin?: number | undefined",
           "relationalRetrieval?: boolean | undefined",
           "relationalRetrievalDepth?: number | undefined",
@@ -1337,6 +1395,7 @@
           "modality?: \"image\" | \"text\" | undefined",
           "page_id: number",
           "recency_boost?: number | undefined",
+          "relational?: RelationalEvidence | undefined",
           "relational_hop?: number | undefined",
           "relational_path?: string[] | undefined",
           "relational_pinned?: boolean | undefined",
@@ -2473,7 +2532,7 @@
           "hooks?: { stop_push_debounce_min?: number | string; } | undefined",
           "integrations?: { memorable?: { enabled?: boolean; }; } | undefined",
           "litellm_api_key?: string | undefined",
-          "mcp?: { instructions?: string; publish_skills?: boolean; publish_advisor?: boolean; skills_dir?: string; strict_params?: \"warn\" | \"reject\"; default_surface_dcr?: \"verbs\" | \"starter\" | \"full\"; result_rows?: \"lean\" | \"full\"; } | undefined",
+          "mcp?: { instructions?: string; publish_skills?: boolean; publish_advisor?: boolean; skills_dir?: string; strict_params?: \"warn\" | \"reject\"; default_surface_dcr?: \"verbs\" | \"starter\" | \"full\"; result_rows?: \"lean\" | \"full\"; allow_session_widen?: boolean | string; } | undefined",
           "mcp_surface?: \"verbs\" | \"starter\" | \"full\" | undefined",
           "memory?: { auto_writeback?: string; auto_writeback_transient_ttl?: string; visibility_posture?: string; } | undefined",
           "migrate?: { graduation?: boolean; } | undefined",
@@ -3057,7 +3116,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
-          "createVersion: (slug: string, opts?: { sourceId?: string; }) => Promise<PageVersion>",
+          "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
           "deleteEvalCandidatesBefore: (date: Date) => Promise<number>",
@@ -3080,7 +3139,7 @@
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
           "getBacklinkCounts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, number>>",
-          "getBacklinks: (slug: string, opts?: PageReadScope) => Promise<Link[]>",
+          "getBacklinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getCalibrationCurve: (opts: CalibrationCurveOpts, allowList: string[] | undefined) => Promise<CalibrationBucket[]>",
           "getCalleesOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean; }) => Promise<CodeEdgeResult[]>",
           "getCallersOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; }) => Promise<CodeEdgeResult[]>",
@@ -3099,7 +3158,7 @@
           "getHealth: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<BrainHealth>",
           "getIngestLog: (opts?: { limit?: number; sourceIds?: string[]; }) => Promise<IngestLogEntry[]>",
           "getLastSeen: (entitySlug: string, opts?: PageReadScope & { asof?: string; }) => Promise<LastSeenResult>",
-          "getLinks: (slug: string, opts?: PageReadScope) => Promise<Link[]>",
+          "getLinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getOnThisDay: (opts?: PageReadScope & { date?: string; limit?: number; }) => Promise<ChronicleTimelineRow[]>",
           "getOntology: (entitySlug: string, opts?: OntologyReadOpts) => Promise<OntologyValue[]>",
           "getPage: (slug: string, opts?: GetPageOpts) => Promise<Page | null>",
@@ -3161,6 +3220,7 @@
           "reconnect: (ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
           "registerBeforeDisconnect: (stop: () => Promise<void>) => () => void",
+          "relationalChainHop: (frontierPageIds: number[], opts: ChainHopOpts) => Promise<ChainHopEdge[]>",
           "relationalFanout: (seeds: string[], opts?: RelationalFanoutOpts) => Promise<RelationalFanoutRow[]>",
           "removeLink: (from: string, to: string, linkType?: string, linkSource?: string, opts?: { fromSourceId?: string; toSourceId?: string; }) => Promise<number>",
           "removeLinksByPagesAndSource: (pages: Array<{ slug: string; source_id: string; }>, opts: { linkSource: string; keepTypedNerPairs?: Array<{ from_slug: string; from_source_id: string; to_slug: string; to_source_id: string; }>; }) => Promise<number>",
@@ -3196,14 +3256,14 @@
           "transactionDirect: <T>(fn: (engine: BrainEngine) => Promise<T>) => Promise<T>",
           "traverseGraph: (slug: string, depth?: number, opts?: TraverseGraphOpts) => Promise<GraphNode[]>",
           "traversePaths: (slug: string, opts?: PageReadScope & { depth?: number; linkType?: string; direction?: \"in\" | \"out\" | \"both\"; }) => Promise<GraphPath[]>",
-          "traversePathsDetailed: (slug: string, opts?: PageReadScope & { depth?: number; linkType?: string; direction?: \"in\" | \"out\" | \"both\"; }) => Promise<{ paths: GraphPath[]; truncated: boolean; }>",
+          "traversePathsDetailed: (slug: string, opts?: LinkReadScope & { depth?: number; linkType?: string; direction?: \"in\" | \"out\" | \"both\"; }) => Promise<{ paths: GraphPath[]; truncated: boolean; }>",
           "unsetConfig: (key: string) => Promise<number>",
           "updatePageContextualRetrievalState: (slug: string, sourceId: string, mode: string, corpusGeneration: string | null) => Promise<void>",
           "updateSlug: (oldSlug: string, newSlug: string, opts?: { sourceId?: string; }) => Promise<number>",
           "updateSourceConfig: (sourceId: string, patch: Record<string, unknown>) => Promise<boolean>",
           "updateTake: (pageId: number, rowNum: number, fields: { weight?: number; since_date?: string; source?: string; }) => Promise<void>",
           "updateTakeEmbeddings: (rows: TakeEmbeddingInput[], opts?: BatchOpts) => Promise<number>",
-          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; } & BatchOpts) => Promise<void>",
+          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; } & BatchOpts) => Promise<void>",
           "upsertEventProjection: (opts: { depthSlug: string; eventSlug: string; date: string; summary: string; detail?: string; sourceId?: string; }) => Promise<{ projected: boolean; }>",
           "upsertFile: (spec: FileSpec) => Promise<{ id: number; created: boolean; }>",
           "withReservedConnection: <T>(fn: (conn: ReservedConnection) => Promise<T>, opts?: { route?: \"ordinary\"; }) => Promise<T>",
@@ -3739,7 +3799,8 @@
           "frontierCap?: number | undefined",
           "requireSafeChunks?: boolean | undefined",
           "sourceId?: string | undefined",
-          "sourceIds?: string[] | undefined"
+          "sourceIds?: string[] | undefined",
+          "temporal?: EdgeTemporalOpts | undefined"
         ],
         "name": "TraverseGraphOpts"
       },
@@ -4283,7 +4344,7 @@
         "kind": "function",
         "name": "importFromContent",
         "signature": [
-          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; allowEmptyOverwrite?: boolean; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; coordinated?: boolean; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; allowEmptyOverwrite?: boolean; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; }) => Promise<ImportResult>"
         ]
       },
       {
@@ -4319,6 +4380,13 @@
         "name": "slugConflictHoldMessage",
         "signature": [
           "(relativePath: string, expectedSlug: string) => string"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "verifyPageReadable",
+        "signature": [
+          "(engine: BrainEngine, slug: string, expectedHash: string, sourceId: string | undefined, caller: string, read?: Pick<Page, \"content_hash\"> | null) => Promise<void>"
         ]
       },
       {
@@ -4549,7 +4617,7 @@
         "kind": "variable",
         "name": "LINK_EXTRACTOR_VERSION_TS",
         "signature": [
-          "\"2026-10-02T00:00:00Z\""
+          "\"2026-10-05T00:00:00Z\""
         ]
       },
       {
@@ -4571,7 +4639,7 @@
         "kind": "type",
         "name": "LinkExtractionPack",
         "signature": [
-          "Pick<{ api_version: \"gbrain-schema-pack-v1\"; name: string; version: string; description: string; gbrain_min_version: string; extends: string | null; borrow_from: { pack: string; types?: string[] | undefined; link_types?: string[] | undefined; }[]; page_types: { name: string; primitive: \"entity\" | \"temporal\" | \"concept\" | \"media\" | \"annotation\"; path_prefixes: string[]; aliases: string[]; extractable: boolean | { eval_dimensions: string[]; prompt_template?: string | undefined; fixture_corpus?: string | undefined; benchmark_min_recall?: number | undefined; verifier_path?: string | undefined; }; expert_routing: boolean; subtypes?: { name: string; when: { path_pattern?: string | undefined; frontmatter_field?: string | undefined; frontmatter_value?: string | number | boolean | undefined; }; }[] | undefined; }[]; link_types: { name: string; inverse?: string | undefined; inference?: { regex?: string | undefined; page_type?: string | undefined; target_type?: string | undefined; ner_only?: boolean | undefined; } | undefined; }[]; frontmatter_links: { page_type: string; fields: string[]; link_type: string; }[]; takes_kinds: string[]; enrichable_types: { type: string; rubric?: string | undefined; }[]; filing_rules: { kind: string; directory: string; examples: string[]; description?: string | undefined; }[]; author?: string | undefined; license?: string | undefined; homepage?: string | undefined; phases?: string[] | undefined; calibration_domains?: { name: string; aggregator: \"scalar_brier\" | \"weighted_brier\" | \"count_based\" | \"cluster_summary\"; page_types: string[]; }[] | undefined; migration_from?: { pack: string; version: string; } | undefined; mapping_rules?: ({ kind: \"retype\"; from_type: string; to_type: string; subtype_field: \"kind\" | \"format\" | \"subtype\" | \"legacy_type\" | \"origin\" | \"period\" | \"domain\"; subtype?: string | undefined; path_filter?: string | undefined; slug_filter?: string | undefined; } | { kind: \"page_to_link\"; from_type: string; link_type: string; source_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; target_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; inverse?: string | undefined; preserve_notes?: boolean | undefined; } | { kind: \"page_to_alias\"; from_type: string; canonical_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; alias_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; notes_from?: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; } | undefined; })[] | undefined; }, \"link_types\" | \"frontmatter_links\"> & Partial<Pick<{ api_version: \"gbrain-schema-pack-v1\"; name: string; version: string; description: string; gbrain_min_version: string; extends: string | null; borrow_from: { pack: string; types?: string[] | undefined; link_types?: string[] | undefined; }[]; page_types: { name: string; primitive: \"entity\" | \"temporal\" | \"concept\" | \"media\" | \"annotation\"; path_prefixes: string[]; aliases: string[]; extractable: boolean | { eval_dimensions: string[]; prompt_template?: string | undefined; fixture_corpus?: string | undefined; benchmark_min_recall?: number | undefined; verifier_path?: string | undefined; }; expert_routing: boolean; subtypes?: { name: string; when: { path_pattern?: string | undefined; frontmatter_field?: string | undefined; frontmatter_value?: string | number | boolean | undefined; }; }[] | undefined; }[]; link_types: { name: string; inverse?: string | undefined; inference?: { regex?: string | undefined; page_type?: string | undefined; target_type?: string | undefined; ner_only?: boolean | undefined; } | undefined; }[]; frontmatter_links: { page_type: string; fields: string[]; link_type: string; }[]; takes_kinds: string[]; enrichable_types: { type: string; rubric?: string | undefined; }[]; filing_rules: { kind: string; directory: string; examples: string[]; description?: string | undefined; }[]; author?: string | undefined; license?: string | undefined; homepage?: string | undefined; phases?: string[] | undefined; calibration_domains?: { name: string; aggregator: \"scalar_brier\" | \"weighted_brier\" | \"count_based\" | \"cluster_summary\"; page_types: string[]; }[] | undefined; migration_from?: { pack: string; version: string; } | undefined; mapping_rules?: ({ kind: \"retype\"; from_type: string; to_type: string; subtype_field: \"kind\" | \"format\" | \"subtype\" | \"legacy_type\" | \"origin\" | \"period\" | \"domain\"; subtype?: string | undefined; path_filter?: string | undefined; slug_filter?: string | undefined; } | { kind: \"page_to_link\"; from_type: string; link_type: string; source_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; target_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; inverse?: string | undefined; preserve_notes?: boolean | undefined; } | { kind: \"page_to_alias\"; from_type: string; canonical_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; alias_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; notes_from?: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; } | undefined; })[] | undefined; }, \"page_types\">>"
+          "Pick<{ api_version: \"gbrain-schema-pack-v1\"; name: string; version: string; description: string; gbrain_min_version: string; extends: string | null; borrow_from: { pack: string; types?: string[] | undefined; link_types?: string[] | undefined; }[]; page_types: { name: string; primitive: \"entity\" | \"temporal\" | \"concept\" | \"media\" | \"annotation\"; path_prefixes: string[]; aliases: string[]; extractable: boolean | { eval_dimensions: string[]; prompt_template?: string | undefined; fixture_corpus?: string | undefined; benchmark_min_recall?: number | undefined; verifier_path?: string | undefined; }; expert_routing: boolean; subtypes?: { name: string; when: { path_pattern?: string | undefined; frontmatter_field?: string | undefined; frontmatter_value?: string | number | boolean | undefined; }; }[] | undefined; }[]; link_types: { name: string; inverse?: string | undefined; inference?: { regex?: string | undefined; page_type?: string | undefined; target_type?: string | undefined; ner_only?: boolean | undefined; } | undefined; temporal?: \"event\" | \"state\" | undefined; }[]; frontmatter_links: { page_type: string; fields: string[]; link_type: string; }[]; takes_kinds: string[]; enrichable_types: { type: string; rubric?: string | undefined; }[]; filing_rules: { kind: string; directory: string; examples: string[]; description?: string | undefined; }[]; author?: string | undefined; license?: string | undefined; homepage?: string | undefined; phases?: string[] | undefined; calibration_domains?: { name: string; aggregator: \"scalar_brier\" | \"weighted_brier\" | \"count_based\" | \"cluster_summary\"; page_types: string[]; }[] | undefined; migration_from?: { pack: string; version: string; } | undefined; mapping_rules?: ({ kind: \"retype\"; from_type: string; to_type: string; subtype_field: \"kind\" | \"origin\" | \"format\" | \"subtype\" | \"legacy_type\" | \"period\" | \"domain\"; subtype?: string | undefined; path_filter?: string | undefined; slug_filter?: string | undefined; } | { kind: \"page_to_link\"; from_type: string; link_type: string; source_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; target_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; inverse?: string | undefined; preserve_notes?: boolean | undefined; } | { kind: \"page_to_alias\"; from_type: string; canonical_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; alias_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; notes_from?: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; } | undefined; })[] | undefined; }, \"link_types\" | \"frontmatter_links\"> & Partial<Pick<{ api_version: \"gbrain-schema-pack-v1\"; name: string; version: string; description: string; gbrain_min_version: string; extends: string | null; borrow_from: { pack: string; types?: string[] | undefined; link_types?: string[] | undefined; }[]; page_types: { name: string; primitive: \"entity\" | \"temporal\" | \"concept\" | \"media\" | \"annotation\"; path_prefixes: string[]; aliases: string[]; extractable: boolean | { eval_dimensions: string[]; prompt_template?: string | undefined; fixture_corpus?: string | undefined; benchmark_min_recall?: number | undefined; verifier_path?: string | undefined; }; expert_routing: boolean; subtypes?: { name: string; when: { path_pattern?: string | undefined; frontmatter_field?: string | undefined; frontmatter_value?: string | number | boolean | undefined; }; }[] | undefined; }[]; link_types: { name: string; inverse?: string | undefined; inference?: { regex?: string | undefined; page_type?: string | undefined; target_type?: string | undefined; ner_only?: boolean | undefined; } | undefined; temporal?: \"event\" | \"state\" | undefined; }[]; frontmatter_links: { page_type: string; fields: string[]; link_type: string; }[]; takes_kinds: string[]; enrichable_types: { type: string; rubric?: string | undefined; }[]; filing_rules: { kind: string; directory: string; examples: string[]; description?: string | undefined; }[]; author?: string | undefined; license?: string | undefined; homepage?: string | undefined; phases?: string[] | undefined; calibration_domains?: { name: string; aggregator: \"scalar_brier\" | \"weighted_brier\" | \"count_based\" | \"cluster_summary\"; page_types: string[]; }[] | undefined; migration_from?: { pack: string; version: string; } | undefined; mapping_rules?: ({ kind: \"retype\"; from_type: string; to_type: string; subtype_field: \"kind\" | \"origin\" | \"format\" | \"subtype\" | \"legacy_type\" | \"period\" | \"domain\"; subtype?: string | undefined; path_filter?: string | undefined; slug_filter?: string | undefined; } | { kind: \"page_to_link\"; from_type: string; link_type: string; source_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; target_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; inverse?: string | undefined; preserve_notes?: boolean | undefined; } | { kind: \"page_to_alias\"; from_type: string; canonical_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; alias_slug_from: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; }; notes_from?: \"slug\" | \"frontmatter\" | \"body_first_link\" | \"body_excerpt\" | { frontmatter_field: string; } | undefined; })[] | undefined; }, \"page_types\">>"
         ]
       },
       {
@@ -5202,6 +5270,8 @@
           "remove_on_complete: boolean",
           "remove_on_fail: boolean",
           "result: Record<string, unknown> | null",
+          "spend_authorization?: SpendAuthorization | null | undefined",
+          "spend_authorization_invalid?: true | undefined",
           "stacktrace: string[]",
           "stagger_key: string | null",
           "stalled_counter: number",
@@ -5230,6 +5300,7 @@
           "readInbox: () => Promise<InboxMessage[]>",
           "shutdownSignal: AbortSignal",
           "signal: AbortSignal",
+          "spend?: JobSpendContext | undefined",
           "submission_authority?: SubmissionAuthority | null | undefined",
           "updateProgress: (progress: unknown) => Promise<void>",
           "updateTokens: (tokens: TokenUpdate) => Promise<void>"
@@ -5619,6 +5690,7 @@
           "resultRows?: \"full\" | \"lean\" | undefined",
           "sessionId?: string | undefined",
           "sourceId: string",
+          "stdioSurface?: StdioSurfaceState | undefined",
           "subagentId?: number | undefined",
           "surfaceCeiling?: \"verbs\" | \"starter\" | \"full\" | undefined",
           "takesHoldersAllowList?: string[] | undefined",
@@ -5631,7 +5703,7 @@
       {
         "kind": "class",
         "members": [
-          "canonical?: \"unknown\" | \"projection_pending\" | \"timeout\" | \"writer_lock_unavailable\" | \"writer_pool_capacity\" | \"owner_unavailable\" | \"recovery_required\" | \"queue_capacity\" | \"revision_required\" | \"revision_conflict\" | \"idempotency_conflict\" | \"source_changed\" | \"write_pending\" | \"storage_error\" | \"cancelled\" | \"permission_denied\" | \"scope_denied\" | \"invalid_params\" | \"not_found\" | \"page_not_found\" | \"page_identity_changed\" | \"write_claim_lost\" | \"request_too_large\" | \"response_too_large\" | \"writer_registration_required\" | \"writer_identity_invalid\" | \"writer_not_initialized\" | \"writer_coordinator_required\" | \"fact_already_expired\" | \"source_writeback_required\" | \"unsupported_mutation_protocol\" | \"writer_upgrade_required\" | \"writer_not_quiesced\" | \"skill_bundle_required\" | \"take_row_collision\" | \"invalid_source_uri\" | \"writer_admin_locked\" | \"connector_account_changed\" | \"connector_intent_outdated\" | \"checkpoint_validation_timeout\" | \"invalid_connector_text\" | \"connector_holds_exhausted\" | \"connector_fence_below_timeline\" | \"embedding_failed\" | \"bucket_not_found\" | \"database_error\" | \"unknown_transport\" | \"rate_limited\" | \"extraction_failed\" | \"fact_not_found\" | \"provenance_required\" | \"unavailable\" | \"budget_unsatisfiable\" | \"embedding_budget_below_worst_case\" | \"access_command_failed\" | \"access_denied_test_user\" | \"access_env_missing\" | \"acknowledgment_unavailable\" | \"admin_policy_enforced\" | \"ambiguous_id\" | \"ambiguous_skill\" | \"api_not_enabled\" | \"approval_required\" | \"autopilot_job_owned_by_other_brain\" | \"benchmark_duplicate_task_id\" | \"benchmark_empty\" | \"benchmark_exists\" | \"benchmark_judge_llm_no_rubric\" | \"benchmark_judge_qrels_no_expected\" | \"benchmark_judge_rule_no_checks\" | \"benchmark_judge_unknown_kind\" | \"benchmark_malformed\" | \"benchmark_missing_judge\" | \"benchmark_missing_task\" | \"benchmark_missing_task_id\" | \"benchmark_not_found\" | \"benchmark_rule_check_bad_arg\" | \"benchmark_rule_check_malformed\" | \"benchmark_rule_check_unknown_op\" | \"bootstrap_empty\" | \"bootstrap_pending_review\" | \"bridge_ownership_conflict\" | \"catalog_unavailable\" | \"changed_since_preview\" | \"chronicle_skipped\" | \"no_pricing\" | \"checkpoint_missing\" | \"claim_already_used\" | \"client_json_unreadable\" | \"client_json_wrong_type\" | \"client_shape_invalid\" | \"code_callees_requires_symbol\" | \"code_callers_requires_symbol\" | \"code_def_requires_symbol\" | \"code_refs_requires_symbol\" | \"code_reused\" | \"colon_slug_windows_write_through\" | \"command_failed\" | \"config_error\" | \"confirmation_required\" | \"conflicting_source_scope\" | \"consent_timeout\" | \"content_rejected\" | \"cost_cap_exceeded\" | \"cost_preview_requires_yes\" | \"cycle_failed\" | \"d_sel_too_small\" | \"demo_graph_failed\" | \"demo_import_failed\" | \"demo_verification_failed\" | \"derived_cap_exhausted\" | \"destination_not_ready\" | \"dirty_tree\" | \"effect_not_failed\" | \"embedding_auth_failed\" | \"embedding_configuration\" | \"embedding_disabled\" | \"embedding_model_mismatch\" | \"embedding_plane_split\" | \"embedding_storage_unavailable\" | \"embedding_unavailable\" | \"embedding_unconfigured\" | \"embedding_width_mismatch\" | \"engine_graduated\" | \"export_limit\" | \"extractor_identity_mismatch\" | \"facts_absorb_write_refused\" | \"facts_drain_deferred\" | \"facts_drain_job_failed\" | \"facts_payload_expired\" | \"fetch_failed\" | \"file_too_large\" | \"frontmatter_slug_conflict\" | \"full_resync_required\" | \"gate_failed\" | \"git_index_locked\" | \"git_index_stale\" | \"git_push_unavailable\" | \"git_target_unsafe\" | \"git_unavailable\" | \"graduation_drain_timeout\" | \"graduation_embedding_dimension_mismatch\" | \"graduation_foreign_host_binding\" | \"graduation_in_progress\" | \"graduation_interrupted\" | \"graduation_rollback_writes_lost\" | \"graduation_source_writer_held\" | \"graduation_split_brain\" | \"graduation_target_auth_failed\" | \"graduation_target_ddl_unreachable\" | \"graduation_target_not_empty\" | \"graduation_target_unsupported\" | \"graduation_unclassified_table\" | \"graduation_unsupported_platform\" | \"graduation_verify_failed\" | \"graph_incomplete\" | \"held_out_overlaps_benchmark\" | \"held_out_required_for_bundled\" | \"independent_principal_required\" | \"insufficient_scope\" | \"internal\" | \"internal_error\" | \"interrupted\" | \"invalid_client\" | \"invalid_frontmatter\" | \"invalid_grant_clock_skew\" | \"invalid_grant_revoked\" | \"invalid_grant_testing_expiry\" | \"invalid_request\" | \"invalid_source\" | \"invalid_source_pin\" | \"invalid_token\" | \"invalid_write_wait\" | \"legacy_job_selection_invalid\" | \"legacy_jobs_active\" | \"local_conflict\" | \"lock_busy\" | \"managed_pull_skipped\" | \"method_not_allowed\" | \"migration_failed\" | \"migrations_pending\" | \"migrations_running\" | \"missing_source_scope\" | \"missing_source_value\" | \"models_strict_violation\" | \"no_refresh_token\" | \"no_routing_eval\" | \"no_skill_md\" | \"no_worker\" | \"no_worker_surface\" | \"not_a_git_repo\" | \"not_connected\" | \"no_brain\" | \"overlapping_path\" | \"parse_error\" | \"parser_regression\" | \"pasted_wrong_url\" | \"payload_too_large\" | \"pending_writes\" | \"pglite_busy\" | \"plan_output_failed\" | \"plan_stale\" | \"port_in_use\" | \"preview_changed\" | \"profile_incompatible\" | \"projection_owner_resident\" | \"publication_pending\" | \"redirect_uri_mismatch\" | \"refresh_dirty\" | \"refresh_diverged\" | \"refresh_drain_timeout\" | \"refresh_no_upstream\" | \"refresh_not_managed\" | \"refresh_not_owner\" | \"refresh_source_changed\" | \"relay_disabled\" | \"relay_session_expired\" | \"relay_unreachable\" | \"rename_held\" | \"request_already_submitted\" | \"requirements_changed\" | \"requires_local_engine\" | \"resume_spec_mismatch\" | \"revision_unavailable\" | \"scope_missing\" | \"serve_port_in_use\" | \"serve_status_only\" | \"shared_skills_unavailable\" | \"shared_skills_unsupported\" | \"skill_asset_not_found\" | \"skill_candidate_invalid\" | \"skill_not_found\" | \"skill_retention_capacity\" | \"source_binding_required\" | \"source_id_taken\" | \"source_not_ready\" | \"source_profile_no_backfill\" | \"source_referenced\" | \"source_root_conflict\" | \"split_bad_ratio\" | \"split_unparseable\" | \"state_mismatch\" | \"sync_not_applicable\" | \"sync_in_progress\" | \"sync_parser_regression\" | \"target_escape\" | \"topology_change_required\" | \"trusted_local_only\" | \"unexpected_file_bytes\" | \"unexpected_staging_bytes\" | \"unknown_command\" | \"unknown_flag\" | \"unknown_method\" | \"unknown_source\" | \"unknown_tool\" | \"unmanaged_path\" | \"unsupported_export_data\" | \"upstream\" | \"verification_failed\" | \"withdrawal_capacity\" | \"withdrawal_provenance\" | \"writer_admin_intent_required\" | \"writer_admin_state_changed\" | \"writer_busy\" | \"writer_identity_publish_failed\" | \"writer_manifest_mismatch\" | \"writer_manifest_unsafe\" | \"writer_regrant_required\" | \"writer_transfer_conflict\" | \"writer_transfer_required\" | \"wrong_account_consented\" | undefined",
+          "canonical?: \"unknown\" | \"projection_pending\" | \"timeout\" | \"writer_lock_unavailable\" | \"writer_pool_capacity\" | \"owner_unavailable\" | \"recovery_required\" | \"queue_capacity\" | \"revision_required\" | \"revision_conflict\" | \"idempotency_conflict\" | \"source_changed\" | \"write_pending\" | \"storage_error\" | \"cancelled\" | \"permission_denied\" | \"scope_denied\" | \"invalid_params\" | \"not_found\" | \"page_not_found\" | \"page_identity_changed\" | \"write_claim_lost\" | \"request_too_large\" | \"response_too_large\" | \"writer_registration_required\" | \"writer_identity_invalid\" | \"writer_not_initialized\" | \"writer_coordinator_required\" | \"fact_already_expired\" | \"source_writeback_required\" | \"unsupported_mutation_protocol\" | \"writer_upgrade_required\" | \"writer_not_quiesced\" | \"skill_bundle_required\" | \"take_row_collision\" | \"invalid_source_uri\" | \"writer_admin_locked\" | \"connector_account_changed\" | \"connector_intent_outdated\" | \"checkpoint_validation_timeout\" | \"invalid_connector_text\" | \"connector_holds_exhausted\" | \"connector_fence_below_timeline\" | \"embedding_failed\" | \"bucket_not_found\" | \"database_error\" | \"unknown_transport\" | \"rate_limited\" | \"extraction_failed\" | \"fact_not_found\" | \"provenance_required\" | \"unavailable\" | \"budget_unsatisfiable\" | \"embedding_budget_below_worst_case\" | \"access_command_failed\" | \"access_denied_test_user\" | \"access_env_missing\" | \"acknowledgment_unavailable\" | \"admin_policy_enforced\" | \"ambiguous_id\" | \"ambiguous_skill\" | \"api_not_enabled\" | \"approval_required\" | \"autopilot_job_owned_by_other_brain\" | \"benchmark_duplicate_task_id\" | \"benchmark_empty\" | \"benchmark_exists\" | \"benchmark_judge_llm_no_rubric\" | \"benchmark_judge_qrels_no_expected\" | \"benchmark_judge_rule_no_checks\" | \"benchmark_judge_unknown_kind\" | \"benchmark_malformed\" | \"benchmark_missing_judge\" | \"benchmark_missing_task\" | \"benchmark_missing_task_id\" | \"benchmark_not_found\" | \"benchmark_rule_check_bad_arg\" | \"benchmark_rule_check_malformed\" | \"benchmark_rule_check_unknown_op\" | \"bootstrap_empty\" | \"bootstrap_pending_review\" | \"bridge_ownership_conflict\" | \"cache_quota_exceeded\" | \"catalog_capacity_exceeded\" | \"catalog_unavailable\" | \"changed_since_preview\" | \"chronicle_skipped\" | \"no_pricing\" | \"checkpoint_missing\" | \"claim_already_used\" | \"client_json_unreadable\" | \"client_json_wrong_type\" | \"client_shape_invalid\" | \"code_callees_requires_symbol\" | \"code_callers_requires_symbol\" | \"code_def_requires_symbol\" | \"code_refs_requires_symbol\" | \"code_reused\" | \"colon_slug_windows_write_through\" | \"command_failed\" | \"config_error\" | \"confirmation_required\" | \"conflicting_source_scope\" | \"consent_timeout\" | \"content_rejected\" | \"cost_cap_exceeded\" | \"cost_preview_requires_yes\" | \"cycle_failed\" | \"d_sel_too_small\" | \"demo_graph_failed\" | \"demo_import_failed\" | \"demo_verification_failed\" | \"derived_cap_exhausted\" | \"destination_not_ready\" | \"dirty_tree\" | \"effect_not_failed\" | \"embedding_auth_failed\" | \"embedding_configuration\" | \"embedding_disabled\" | \"embedding_model_mismatch\" | \"embedding_plane_split\" | \"embedding_storage_unavailable\" | \"embedding_unavailable\" | \"embedding_unconfigured\" | \"embedding_width_mismatch\" | \"engine_graduated\" | \"eval_suite_unwired\" | \"export_limit\" | \"extractor_identity_mismatch\" | \"facts_absorb_write_refused\" | \"facts_drain_deferred\" | \"facts_drain_job_failed\" | \"facts_payload_expired\" | \"fetch_failed\" | \"file_too_large\" | \"follow_approval_required\" | \"frontmatter_slug_conflict\" | \"full_resync_required\" | \"gate_failed\" | \"git_index_locked\" | \"git_index_stale\" | \"git_push_unavailable\" | \"git_target_unsafe\" | \"git_unavailable\" | \"graduation_drain_timeout\" | \"graduation_embedding_dimension_mismatch\" | \"graduation_foreign_host_binding\" | \"graduation_in_progress\" | \"graduation_interrupted\" | \"graduation_rollback_writes_lost\" | \"graduation_source_writer_held\" | \"graduation_split_brain\" | \"graduation_target_auth_failed\" | \"graduation_target_ddl_unreachable\" | \"graduation_target_not_empty\" | \"graduation_target_unsupported\" | \"graduation_unclassified_table\" | \"graduation_unsupported_platform\" | \"graduation_verify_failed\" | \"graph_incomplete\" | \"held_out_overlaps_benchmark\" | \"held_out_required_for_bundled\" | \"independent_principal_required\" | \"insufficient_scope\" | \"internal\" | \"internal_error\" | \"interrupted\" | \"invalid_acknowledgment\" | \"invalid_client\" | \"invalid_frontmatter\" | \"invalid_grant_clock_skew\" | \"invalid_grant_revoked\" | \"invalid_grant_testing_expiry\" | \"invalid_receipt\" | \"invalid_receipt_transition\" | \"invalid_request\" | \"invalid_source\" | \"invalid_source_pin\" | \"invalid_token\" | \"invalid_write_wait\" | \"legacy_job_selection_invalid\" | \"legacy_jobs_active\" | \"local_conflict\" | \"lock_busy\" | \"managed_pull_skipped\" | \"membership_inactive\" | \"membership_not_found\" | \"method_not_allowed\" | \"migration_failed\" | \"migrations_pending\" | \"migrations_running\" | \"missing_source_scope\" | \"missing_source_value\" | \"models_strict_violation\" | \"no_refresh_token\" | \"no_routing_eval\" | \"no_skill_md\" | \"no_worker\" | \"no_worker_surface\" | \"not_a_git_repo\" | \"not_connected\" | \"no_brain\" | \"overlapping_path\" | \"parse_error\" | \"parser_regression\" | \"pasted_wrong_url\" | \"payload_too_large\" | \"pending_writes\" | \"pglite_busy\" | \"plan_output_failed\" | \"plan_stale\" | \"port_in_use\" | \"preview_changed\" | \"profile_incompatible\" | \"projection_owner_resident\" | \"publication_pending\" | \"receipt_conflict\" | \"receipt_fence_changed\" | \"receipt_fence_required\" | \"receipt_identity_mismatch\" | \"redirect_uri_mismatch\" | \"refresh_dirty\" | \"refresh_diverged\" | \"refresh_drain_timeout\" | \"refresh_no_upstream\" | \"refresh_not_managed\" | \"refresh_not_owner\" | \"refresh_source_changed\" | \"relay_disabled\" | \"relay_session_expired\" | \"relay_unreachable\" | \"rename_held\" | \"request_already_submitted\" | \"requirements_changed\" | \"requires_local_engine\" | \"resume_spec_mismatch\" | \"revision_unavailable\" | \"scope_missing\" | \"serve_port_in_use\" | \"serve_status_only\" | \"shared_skills_unavailable\" | \"shared_skills_unsupported\" | \"skill_asset_not_found\" | \"skill_candidate_invalid\" | \"skill_not_found\" | \"skill_retention_capacity\" | \"skill_unavailable\" | \"source_binding_required\" | \"source_id_taken\" | \"source_not_ready\" | \"source_profile_no_backfill\" | \"source_referenced\" | \"source_root_conflict\" | \"split_bad_ratio\" | \"split_unparseable\" | \"stale_unavailable\" | \"state_mismatch\" | \"sync_not_applicable\" | \"sync_in_progress\" | \"sync_parser_regression\" | \"target_escape\" | \"topology_change_required\" | \"trusted_local_only\" | \"unexpected_file_bytes\" | \"unexpected_staging_bytes\" | \"unknown_command\" | \"unknown_flag\" | \"unknown_method\" | \"unknown_source\" | \"unknown_tool\" | \"unmanaged_path\" | \"unsupported_export_data\" | \"upstream\" | \"verification_failed\" | \"withdrawal_capacity\" | \"withdrawal_provenance\" | \"writer_admin_intent_required\" | \"writer_admin_state_changed\" | \"writer_busy\" | \"writer_identity_publish_failed\" | \"writer_manifest_mismatch\" | \"writer_manifest_unsafe\" | \"writer_regrant_required\" | \"writer_transfer_conflict\" | \"writer_transfer_required\" | \"wrong_account_consented\" | undefined",
           "canonicalCode: string",
           "cause?: unknown",
           "code: ErrorCode",
@@ -5670,6 +5742,7 @@
           "default?: unknown",
           "description?: string | undefined",
           "enum?: string[] | undefined",
+          "fullSurfaceOnly?: boolean | undefined",
           "items?: ParamDef | undefined",
           "properties?: Record<string, ParamDef> | undefined",
           "required?: boolean | undefined",
@@ -5848,7 +5921,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
-          "createVersion: (slug: string, opts?: { sourceId?: string; }) => Promise<PageVersion>",
+          "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "db: PGlite",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
@@ -5872,7 +5945,7 @@
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
           "getBacklinkCounts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, number>>",
-          "getBacklinks: (slug: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; }) => Promise<Link[]>",
+          "getBacklinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getCalibrationCurve: (opts: CalibrationCurveOpts, allowList: string[] | undefined) => Promise<CalibrationBucket[]>",
           "getCalleesOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean; }) => Promise<CodeEdgeResult[]>",
           "getCallersOf: (qualifiedName: string, opts?: { sourceId?: string; allSources?: boolean; limit?: number; }) => Promise<CodeEdgeResult[]>",
@@ -5891,7 +5964,7 @@
           "getHealth: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<BrainHealth>",
           "getIngestLog: (opts?: { limit?: number; sourceIds?: string[]; }) => Promise<IngestLogEntry[]>",
           "getLastSeen: (entitySlug: string, opts?: PageReadScope & { asof?: string; }) => Promise<LastSeenResult>",
-          "getLinks: (slug: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; }) => Promise<Link[]>",
+          "getLinks: (slug: string, opts?: LinkReadScope) => Promise<Link[]>",
           "getOnThisDay: (opts?: PageReadScope & { date?: string; limit?: number; }) => Promise<ChronicleTimelineRow[]>",
           "getOntology: (entitySlug: string, opts?: OntologyReadOpts) => Promise<OntologyValue[]>",
           "getPage: (slug: string, opts?: PageSnapshotOptions) => Promise<Page | null>",
@@ -5984,6 +6057,7 @@
           "reconnect: (_ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
           "registerBeforeDisconnect: (stop: () => Promise<void>) => () => void",
+          "relationalChainHop: (frontierPageIds: number[], opts: ChainHopOpts) => Promise<ChainHopEdge[]>",
           "relationalFanout: (seeds: string[], opts?: RelationalFanoutOpts) => Promise<RelationalFanoutRow[]>",
           "removeLink: (from: string, to: string, linkType?: string, linkSource?: string, opts?: { fromSourceId?: string; toSourceId?: string; }) => Promise<number>",
           "removeLinksByPagesAndSource: (pages: Array<{ slug: string; source_id: string; }>, opts: { linkSource: string; keepTypedNerPairs?: Array<{ from_slug: string; from_source_id: string; to_slug: string; to_source_id: string; }>; }) => Promise<number>",
@@ -6026,7 +6100,7 @@
           "updateSourceConfig: (sourceId: string, patch: Record<string, unknown>) => Promise<boolean>",
           "updateTake: (pageId: number, rowNum: number, fields: { weight?: number; since_date?: string; source?: string; }) => Promise<void>",
           "updateTakeEmbeddings: (rowsIn: TakeEmbeddingInput[], opts?: BatchOpts) => Promise<number>",
-          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; } & BatchOpts) => Promise<void>",
+          "upsertChunks: (slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; } & BatchOpts) => Promise<void>",
           "upsertEventProjection: (opts: { depthSlug: string; eventSlug: string; date: string; summary: string; detail?: string; sourceId?: string; }) => Promise<{ projected: boolean; }>",
           "upsertFile: (spec: FileSpec) => Promise<{ id: number; created: boolean; }>",
           "walRepairReceipt: WalRepairReceipt | null",
@@ -6787,6 +6861,9 @@
           "queryEmbedFn?: ((text: string) => Float32Array | Promise<Float32Array>) | undefined",
           "recency?: \"on\" | \"off\" | \"strong\" | undefined",
           "recencyBoost?: 0 | 1 | 2 | undefined",
+          "relationalChainSlots?: number | undefined",
+          "relationalOrientOneHop?: boolean | undefined",
+          "relationalPlanner?: boolean | undefined",
           "relationalRerankPin?: number | undefined",
           "relationalRetrieval?: boolean | undefined",
           "relationalRetrievalDepth?: number | undefined",
@@ -7399,6 +7476,46 @@
       {
         "kind": "interface",
         "members": [
+          "canonical_chunk_id: number | null",
+          "context: string | null",
+          "from_degree: number",
+          "from_page_id: number",
+          "link_ids: number[]",
+          "link_type: string",
+          "neighbor_cap_hit: boolean",
+          "orientation: \"canonical\" | \"stored\" | \"flipped\" | \"uncertain\"",
+          "origin_page_id: number | null",
+          "origin_slug: string | null",
+          "source_id: string",
+          "stored_from_slug: string",
+          "stored_to_slug: string",
+          "to_page_id: number",
+          "to_slug: string",
+          "to_type: string"
+        ],
+        "name": "ChainHopEdge"
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "degreeLinkTypes: string[]",
+          "excludePrivate?: boolean | undefined",
+          "linkTypes: string[]",
+          "neighborCap: number",
+          "objectTypes: string[]",
+          "requireSafeChunks?: boolean | undefined",
+          "sourceId?: string | undefined",
+          "sourceIds?: string[] | undefined",
+          "subjectTypes: string[]",
+          "takesHoldersAllowList?: string[] | undefined",
+          "temporal?: EdgeTemporalOpts | undefined",
+          "toward: \"object\" | \"subject\""
+        ],
+        "name": "ChainHopOpts"
+      },
+      {
+        "kind": "interface",
+        "members": [
           "excludePrivate?: boolean | undefined",
           "kind?: string | undefined",
           "limit?: number | undefined",
@@ -7798,6 +7915,7 @@
           "metadata_boost_gate?: MetadataBoostGateDecision | undefined",
           "mode?: \"conservative\" | \"balanced\" | \"tokenmax\" | undefined",
           "relational_evidence_slot?: RelationalEvidenceSlotDecision | undefined",
+          "relational_plan?: RelationalPlanMeta | undefined",
           "relational_rerank_pin?: RelationalRerankPinDecision | undefined",
           "relaxed_dropped?: number | undefined",
           "rerank?: { model_resolved: string; } | undefined",
@@ -8092,6 +8210,17 @@
       {
         "kind": "interface",
         "members": [
+          "edges: { link_type: string; stored_from: string; stored_to: string; orientation: \"canonical\" | \"stored\" | \"flipped\" | \"uncertain\"; context: string | null; origin: string | null; }[]",
+          "hop: number",
+          "path_count: number",
+          "role: \"answer\" | \"support\" | \"origin\"",
+          "seed: string"
+        ],
+        "name": "RelationalEvidence"
+      },
+      {
+        "kind": "interface",
+        "members": [
           "depth?: number | undefined",
           "direction?: \"both\" | \"in\" | \"out\" | undefined",
           "excludePrivate?: boolean | undefined",
@@ -8102,7 +8231,8 @@
           "seedRefs?: { source_id: string; slug: string; }[] | undefined",
           "sourceId?: string | undefined",
           "sourceIds?: string[] | undefined",
-          "takesHoldersAllowList?: string[] | undefined"
+          "takesHoldersAllowList?: string[] | undefined",
+          "temporal?: EdgeTemporalOpts | undefined"
         ],
         "name": "RelationalFanoutOpts"
       },
@@ -8186,6 +8316,9 @@
           "orFallback?: boolean | undefined",
           "recency?: \"on\" | \"off\" | \"strong\" | undefined",
           "recencyBoost?: 0 | 1 | 2 | undefined",
+          "relationalChainSlots?: number | undefined",
+          "relationalOrientOneHop?: boolean | undefined",
+          "relationalPlanner?: boolean | undefined",
           "relationalRerankPin?: number | undefined",
           "relationalRetrieval?: boolean | undefined",
           "relationalRetrievalDepth?: number | undefined",
@@ -8244,6 +8377,7 @@
           "modality?: \"image\" | \"text\" | undefined",
           "page_id: number",
           "recency_boost?: number | undefined",
+          "relational?: RelationalEvidence | undefined",
           "relational_hop?: number | undefined",
           "relational_path?: string[] | undefined",
           "relational_pinned?: boolean | undefined",

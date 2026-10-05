@@ -194,7 +194,9 @@ hybrid recall + fusion:
    ├── vector  (HNSW on chunk embeddings, per-page max-pool)
    ├── keyword (BM25 via tsvector)
    ├── title-phrase arm
-   ├── relational (typed-edge recall arm — relational queries only)
+   ├── relational (typed-edge recall arm — relational queries only; 2-3
+   │      relationship questions walk typed hop chains when
+   │      search.relational_planner is on)
    ├── source-aware re-rank (CASE in SQL)
    ├── role-tagged arms; variant/clause lists weighted by search.expansion_variant_budget INSIDE the fusion (fusion-lists.ts)
    └── page-grain RRF fusion → cosine re-score → post-fusion boosts
@@ -314,6 +316,44 @@ fail-open runs. The pin trusts the arm: a false-positive arm puts as many edge
 pages at the top as the pin allows, where an unpinned run would place one at
 `limit`. Turn it off per brain with `gbrain config set search.relational_rerank_pin off`.
 The knob folds into the query-cache key (`rrp=`).
+
+### Multi-hop relationship chains
+
+A question that chains two or three relationships ("who founded the companies
+Alice invested in?") is planned by `parseRelationalPlan`
+(`src/core/search/relational-plan.ts`): a bounded lexer, a fixed relationship
+vocabulary, exactly one named entity, hops ordered from that entity outward
+(the main-clause verb is outermost), page types checked along the chain.
+Coordination, negation, time constraints, counting, quoted names and
+multi-entity questions are refused with a reason; single-relationship
+questions stay on `parseRelationalQuery`. With `search.relational_planner` on,
+the relational arm resolves the entity, runs `runRelationalChain`
+(`src/core/search/relational-chain.ts`) and emits answers first, then the
+intermediate and origin pages of every retained path, each row carrying a
+`relational` evidence field (role, seed, hop, path count, up to three edges).
+Up to `search.relational_chain_slots` (default 10) chain rows lead page 1.
+A chain that finds nothing falls back to the one-hop path; a refused question
+runs no relational arm. `meta.relational_plan` and a `relational_chain`
+notice report the outcome.
+
+Execution is one bounded query per hop (`BrainEngine.relationalChainHop`, SQL
+in `src/core/search/read-enrichment.ts`): at most 50 frontier pages, 100
+logical edges per page (lowest link id first) and 10 retained paths per page.
+Links are read by each relationship's page-type signature (`stored`,
+`flipped`, `uncertain` at half weight; canonical frontmatter, manual and
+attendance-section links keep stored direction), duplicate rows between a
+pair collapse into one logical edge, and every endpoint, origin and degree
+contributor passes the read policy before scoring. Path weight is the product
+of hub weights of the intermediate pages (`hubWeight`,
+`src/core/search/hub-dampening.ts`; degree saturates at 300 link rows);
+ties order by source and slug. The same executor serves `traverse_graph`
+`hops` and `gbrain graph-query --hop`.
+
+Chain evidence is page-level through fusion: whichever chunk of a page
+survives carries the page's `relational` field. Only answers count toward the
+relational re-pin and the page-1 evidence slot; intermediate and origin pages
+never claim them. The planner keys fold into the query-cache key only when on
+(`rp=1`, `ro=1`). Guide: [multi-hop relationship questions](../guides/multi-hop.md).
 
 ### Metadata boost gate: vector-only voters keep the vector order
 

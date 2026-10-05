@@ -10,6 +10,7 @@ import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
 import { readLocalWriter, currentVerifiedLocalWriter, verifyLocalWriter, type LocalGrant } from './identity.ts';
 import type { Principal, SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
 import { authorizePageVisibility, excludesPrivateWrites } from './page-visibility.ts';
+import { transactionMemo } from '../page-state/transactions.ts';
 
 function deny(message: string): never { throw new OperationError('permission_denied', message, 'Inspect the current writer registration and source/operation grants.'); }
 function strings(value: unknown): value is string[] { return Array.isArray(value) && value.every(v => typeof v === 'string'); }
@@ -92,8 +93,11 @@ export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, opera
     return;
   }
   if (a.principal.kind === 'local_cli' || a.principal.kind === 'local_stdio') {
-    const [row] = await engine.executeRaw<{ lane: string; revoked_at: unknown; grant_ceiling: LocalGrant }>(
-      `SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid${suffix}`, [a.principal.id]);
+    // #5984: one local-writer read per transaction; a FOR SHARE read also answers a plain one.
+    const key = `local-writer:${a.principal.id}`;
+    const [row] = await transactionMemo(engine, lock ? [`${key}:share`] : [key, `${key}:share`],
+      () => engine.executeRaw<{ lane: string; revoked_at: unknown; grant_ceiling: LocalGrant }>(
+        `SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid${suffix}`, [a.principal.id]));
     const lane = a.principal.kind === 'local_cli' ? 'cli' : 'stdio';
     if (!row || row.revoked_at != null || row.lane !== lane || a.remote !== (lane === 'stdio')) deny('The local writer is revoked or its trust lane changed.');
     const g = row.grant_ceiling;
@@ -105,8 +109,9 @@ export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, opera
   deny('Application authority is unavailable through submitted write requests.');
 }
 export async function authorizeStoredRequest(engine: SqlEngine, row: WriteRequest, lock = false): Promise<void> {
-  const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean }>(
-    `SELECT incarnation,archived FROM sources WHERE id=$1${lock ? ' FOR SHARE' : ''}`, [row.source_id]);
+  // #5984: one membership read per source per transaction; a FOR SHARE read also answers a plain one.
+  const [source] = await transactionMemo(engine, lock ? [`source-membership:${row.source_id}:share`] : [`source-membership:${row.source_id}`, `source-membership:${row.source_id}:share`],
+    () => engine.executeRaw<{ incarnation: string; archived: boolean }>(`SELECT incarnation,archived FROM sources WHERE id=$1${lock ? ' FOR SHARE' : ''}`, [row.source_id]));
   if (!source || source.archived || source.incarnation !== row.source_incarnation) {
     throw opError('source_changed', 'The accepted source is no longer active.',
       `Source ${row.source_id} was archived, removed, or recreated after request ${row.request_id} was accepted, so it will not be applied. Check the source's writer status; a new write must target the current source.`,

@@ -1,8 +1,7 @@
 {
   "golden": {
     "commandAgnosticConnectBranches": [
-      "readOnlyTimeoutMs !== null",
-      "preConnectReason"
+      "readOnlyTimeoutMs !== null"
     ],
     "commands": {
       "advisor": {
@@ -548,6 +547,13 @@
             ]
           }
         ],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "edge-proposals": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },

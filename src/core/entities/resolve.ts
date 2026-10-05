@@ -401,20 +401,53 @@ export async function resolvePhantomCanonical(
   engine: BrainEngine,
   source_id: string,
   phantomSlug: string,
+  opts: { type?: string | null } = {},
 ): Promise<string | null> {
   if (!phantomSlug) return null;
   const trimmed = phantomSlug.trim();
   if (!trimmed) return null;
+  // Type guard: a phantom that declares an entity type only merges into a page
+  // of that type's directory (a company phantom never lands on people/…).
+  const allowedDirs = opts.type ? PHANTOM_TYPE_DIRS[opts.type] : undefined;
+  const typeOk = (slug: string) => !allowedDirs || allowedDirs.some(dir => slug.startsWith(`${dir}/`));
   // The phantom slug is the input; we treat it as the search term too,
   // because phantom slugs ARE the lowercased bare name a fuzzy / prefix
-  // lookup would naturally target.
-  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, false);
-  if (fuzzy && fuzzy !== phantomSlug && fuzzy.includes('/')) return fuzzy;
+  // lookup would naturally target. Short or repetitive names carry too little
+  // signal for a trigram match, so they skip the fuzzy tier.
+  if (hasNameSignal(trimmed.replace(/-/g, ' '))) {
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, false);
+    if (fuzzy && fuzzy !== phantomSlug && fuzzy.includes('/') && typeOk(fuzzy)) return fuzzy;
+  }
 
   const expanded = await tryPrefixExpansion(engine, source_id, slugify(trimmed));
-  if (expanded && expanded !== phantomSlug && expanded.includes('/')) return expanded;
+  if (expanded && expanded !== phantomSlug && expanded.includes('/') && typeOk(expanded)) return expanded;
 
   return null;
+}
+
+/** Entity types whose phantoms may only merge into their own directories. */
+const PHANTOM_TYPE_DIRS: Readonly<Record<string, readonly string[]>> = {
+  person: ['people'],
+  company: ['companies'],
+  project: ['projects'],
+  host: ['hosts'],
+};
+
+/**
+ * Name-specificity gate for fuzzy phantom merges: at least 6 characters or two
+ * tokens, and Shannon character entropy of at least 1.5 bits. Short or
+ * repetitive names ("ai", "aaaa") defer to the stricter prefix tier.
+ */
+export function hasNameSignal(name: string): boolean {
+  const normalized = name.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normalized.length < 6 && normalized.split(' ').length < 2) return false;
+  const chars = normalized.replace(/ /g, '');
+  if (!chars) return false;
+  const counts = new Map<string, number>();
+  for (const c of chars) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let entropy = 0;
+  for (const n of counts.values()) { const p = n / chars.length; entropy -= p * Math.log2(p); }
+  return entropy >= 1.5;
 }
 
 /**

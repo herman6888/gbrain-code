@@ -1,17 +1,19 @@
 /**
- * Status-only stdio serve entry (agent operator contract v1, F4): cli.ts
- * hands over a `gbrain serve` whose brain cannot be opened (lock held by a
- * live holder, no brain, unreadable config). The server completes the MCP
- * handshake with one `gbrain_status` tool instead of exiting; a later tool
- * call recovers in place through the gated lazy engine (src/mcp/status-mode.ts).
+ * Status-only serve entry (agent operator contract v1, F4): cli.ts hands over
+ * a `gbrain serve` (stdio or `--http`) whose brain cannot be opened (lock held
+ * by a live holder, no brain, a missing or repair-failed brain, unreadable
+ * config). `runStatusModeServe` is the one entry point for both transports and
+ * `reprobe` (src/mcp/status-mode.ts) the one re-probe: stdio answers the MCP
+ * handshake with one `gbrain_status` tool and re-probes inside tool calls
+ * through the gated lazy engine; `--http` serves the status listener
+ * (serve-http-status.ts) and re-probes on a 5 s background tick.
  *
- * Not for `--http` (an HTTP serve is a supervised daemon; its contention is
- * the bind/lock error), and skipped under `--fail-fast` /
- * GBRAIN_SERVE_FAIL_FAST=1 so supervisors keep a non-zero exit (C10).
+ * Skipped under `--fail-fast` / GBRAIN_SERVE_FAIL_FAST=1 so supervisors keep
+ * a non-zero exit (C10).
  */
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig } from '../core/config.ts';
-import { gatedReconnect, initialStatusState, markStatusModeEngine, probeStatus, statusHeadline, type StatusReason } from '../mcp/status-mode.ts';
+import { initialStatusState, markStatusModeEngine, probeStatus, reprobe, statusHeadline, statusReconnect, type StatusModeState, type StatusReason, type StatusTransport } from '../mcp/status-mode.ts';
 
 export function serveFailFast(args: readonly string[]): boolean {
   return args.includes('--fail-fast') || process.env.GBRAIN_SERVE_FAIL_FAST === '1';
@@ -19,7 +21,7 @@ export function serveFailFast(args: readonly string[]): boolean {
 
 /** Whether this `serve` invocation takes the status-only path on a startup failure. */
 export function statusModeEligible(args: readonly string[], hostBrain: boolean): boolean {
-  return hostBrain && !args.includes('--http') && !serveFailFast(args);
+  return hostBrain && !serveFailFast(args);
 }
 
 /**
@@ -41,22 +43,41 @@ export function statusReasonForError(e: unknown): StatusReason | null {
   return null;
 }
 
-/** Run the stdio server over a gated lazy engine; resolves when serve's lifecycle does. */
+/** One structured stderr line per status-mode transition (host-local: the detailed reason is safe here). */
+export function logStatusTransition(event: 'serve_status_mode_enter' | 'serve_status_mode_recovered', state: StatusModeState, transport: StatusTransport, enteredAt: number): void {
+  try { process.stderr.write(`${JSON.stringify({ event, reason: state.reason, transport, elapsed_ms: Date.now() - enteredAt })}\n`); } catch { /* stderr gone */ }
+}
+
+/**
+ * Serve in status-only mode until the brain opens; resolves when serve's
+ * lifecycle does. `connect` is throw-only (src/core/engine-connect.ts).
+ */
 export async function runStatusModeServe(
   reason: StatusReason, initialError: unknown, args: string[], connect: () => Promise<BrainEngine>,
 ): Promise<void> {
   const state = initialStatusState(reason);
-  const { createDegradedEngine } = await import('../core/degraded-engine.ts');
-  // Engine graduation (§6.4): re-resolve config on each reconnect and exit for relaunch on an engine change.
+  const transport: StatusTransport = args.includes('--http') ? 'http' : 'stdio';
+  const enteredAt = Date.now();
+  logStatusTransition('serve_status_mode_enter', state, transport, enteredAt);
+  // Engine graduation (§6.4): re-resolve config on each re-probe and exit for relaunch on an engine change.
   const { engineIdentity, exitOnEngineIdentityChange } = await import('../core/persistence/graduation-serve-guard.ts');
   const startIdentity = engineIdentity();
+  // The one re-probe both transports run; a check that must run on every re-probe hooks here.
+  const probeAgain = async (): Promise<BrainEngine | null> => {
+    exitOnEngineIdentityChange(startIdentity, { startedGraduated: state.reason === 'engine_graduated' });
+    const engine = await reprobe(state, connect);
+    if (engine) logStatusTransition('serve_status_mode_recovered', state, transport, enteredAt);
+    return engine;
+  };
+  if (transport === 'http') {
+    const { runHttpStatusServe } = await import('./serve-http-status.ts');
+    return runHttpStatusServe(state, args, probeAgain);
+  }
+  const { createDegradedEngine } = await import('../core/degraded-engine.ts');
   const kind = loadConfig()?.engine === 'postgres' ? 'postgres' : 'pglite';
   const engine = markStatusModeEngine(createDegradedEngine({
     initialError: initialError ?? new Error(statusHeadline(state)),
-    reconnect: () => {
-      exitOnEngineIdentityChange(startIdentity, { startedGraduated: state.reason === 'engine_graduated' });
-      return gatedReconnect(state, connect);
-    },
+    reconnect: () => statusReconnect(state, probeAgain),
     // A PGLite open + pending migrations can take longer than the degraded default.
     callerWaitMs: 20_000,
     kind,

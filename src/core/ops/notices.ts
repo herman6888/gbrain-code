@@ -6,19 +6,19 @@
 import type { Operation } from './contract.ts';
 import { opError } from './contract.ts';
 import { NOTICE_CODES } from '../error-registry.ts';
-import { setNoticeMuted } from '../notice-ledger.ts';
+import { MUTEABLE_ASK_CODES, setNoticeMuted } from '../notice-ledger.ts';
 
-const MUTEABLE = Object.entries(NOTICE_CODES).filter(([, e]) => e.kind === 'coaching' || e.kind === 'info').map(([c]) => c).sort();
+const MUTEABLE = Object.entries(NOTICE_CODES)
+  .filter(([c, e]) => e.kind === 'coaching' || e.kind === 'info' || MUTEABLE_ASK_CODES.has(c)).map(([c]) => c).sort();
 
 const mute_notice: Operation = {
   name: 'mute_notice',
   mutating: true,
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Stop a coaching or info notice from appearing for this client (or unmute it with muted: false). '
-    + 'Safety, degraded and ask notices cannot be muted.',
+  description: 'Stop a coaching or info notice (or first_run_decisions) from appearing for this client; muted: false unmutes.',
   params: {
-    code: { type: 'string', required: true, description: 'Notice code, the word after `[gbrain notice` in the block.', enum: MUTEABLE },
+    code: { type: 'string', required: true, description: 'Notice code, the word after `[gbrain notice` in the block.' },
     muted: { type: 'boolean', description: 'false unmutes. Default true.' },
   },
   scope: 'write',
@@ -26,7 +26,7 @@ const mute_notice: Operation = {
     const code = String(p.code ?? '');
     if (!MUTEABLE.includes(code)) {
       throw opError('invalid_params', `Notice ${code || '(empty)'} cannot be muted.`,
-        `Mute one of: ${MUTEABLE.join(', ')}. Safety, degraded and ask notices always show.`);
+        `Mute one of: ${MUTEABLE.join(', ')}. Safety, degraded and ask notices always show (first_run_decisions is the one muteable ask).`);
     }
     const principal = ctx.remote === false ? undefined : ctx.auth?.clientId ?? 'stdio';
     const muted = p.muted !== false;

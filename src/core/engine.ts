@@ -1,4 +1,5 @@
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
+import type { LinkReadScope } from './link-validity.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
 import type { DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
 export type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions, PageMutationPrecondition, PageWithdrawal } from './page-state/types.ts';
@@ -6,7 +7,7 @@ import type {
   Page, PageInput, PageFilters, GetPageOpts, PageReadScope, PageReadPolicy,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
   SearchResult, SearchOpts, ResolvedColumn,
-  Link, GraphNode, GraphPath, RelationalFanoutRow, RelationalFanoutOpts,
+  Link, GraphNode, GraphPath, RelationalFanoutRow, RelationalFanoutOpts, ChainHopOpts, ChainHopEdge,
   TimelineEntry, TimelineInput, TimelineOpts,
   ChronicleTimelineRow, ChronicleTimelineOpts, LastSeenResult,
   OntologyObservationInput, OntologyMergeResult, OntologyValue, OntologyDimensionStat,
@@ -65,7 +66,7 @@ export interface SourceRow {
   config: Record<string, unknown>;
 }
 
-export interface TraverseGraphOpts extends PageReadScope {
+export interface TraverseGraphOpts extends LinkReadScope {
   sourceId?: string;
   sourceIds?: string[];
   frontierCap?: number;
@@ -1151,8 +1152,11 @@ export interface BrainEngine {
    * resolveWriteColumnFromConfigRows — the same registry the read side
    * searches — falling back to the legacy `embedding`::vector column on
    * pre-registry brains. `embedding_image` routing is unaffected.
+   * `sealChunkerVersion` (#5984): the caller deleted every chunk of the page
+   * earlier in this transaction; the stale-row work is skipped and the page is
+   * sealed at that chunker version after the insert.
    */
-  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string } & BatchOpts): Promise<void>;
+  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number } & BatchOpts): Promise<void>;
   /**
    * Read every chunk for a page. Scope precedence mirrors getPage (#2555):
    * a federated grant (`sourceIds[]`) wins over scalar `sourceId`; with
@@ -1458,13 +1462,13 @@ export interface BrainEngine {
    * grant); the scalar branch is internal/CLI and keeps cross-source visibility
    * (reconcileLinks + back-link validators depend on it).
    */
-  getLinks(slug: string, opts?: PageReadScope): Promise<Link[]>;
+  getLinks(slug: string, opts?: LinkReadScope): Promise<Link[]>;
   /**
    * v0.31.8 (D12 + D16): same `opts.sourceId` semantics as `getLinks`,
    * applied to the to-page side of the join. #2200: `opts.sourceIds` federated
    * grant constrains both endpoints (see `getLinks`).
    */
-  getBacklinks(slug: string, opts?: PageReadScope): Promise<Link[]>;
+  getBacklinks(slug: string, opts?: LinkReadScope): Promise<Link[]>;
   /**
    * v114 (#1941): distinct link_source provenances with edge counts, for
    * `gbrain link-sources`. Source-scoped via `{sourceId?, sourceIds?}` (both
@@ -1541,7 +1545,7 @@ export interface BrainEngine {
    */
   traversePathsDetailed(
     slug: string,
-    opts?: PageReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
+    opts?: LinkReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
   ): Promise<{ paths: GraphPath[]; truncated: boolean }>;
   /**
    * Typed-edge relational fan-out for the relational recall arm (v0.43).
@@ -1567,6 +1571,16 @@ export interface BrainEngine {
     seeds: string[],
     opts?: RelationalFanoutOpts,
   ): Promise<RelationalFanoutRow[]>;
+  /**
+   * One oriented expansion step of a multi-hop relational chain from up to a
+   * few dozen frontier page ids. Returns logical edges whose frontier side is
+   * the relation's subject (`toward: 'object'`) or object (`toward:
+   * 'subject'`), with every endpoint and origin authorized by the read policy
+   * BEFORE the caller scores anything, at most `neighborCap` edges per frontier
+   * node, same-source edges only, mentions excluded. Deterministic order:
+   * frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
+   */
+  relationalChainHop(frontierPageIds: number[], opts: ChainHopOpts): Promise<ChainHopEdge[]>;
   /**
    * For a list of page ids, return how many inbound links each has.
    * Used by hybrid search backlink boost. Single SQL query, not N+1.
@@ -2272,7 +2286,8 @@ export interface BrainEngine {
    * without it the bare-slug lookup snapshots whichever row Postgres returns
    * first when the slug exists across multiple sources.
    */
-  createVersion(slug: string, opts?: { sourceId?: string }): Promise<PageVersion>;
+  /** `preimage` (#5984): the caller's own read of the page under its page guard in this transaction; versioned without a re-read. */
+  createVersion(slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot }): Promise<PageVersion>;
   /**
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the page-id lookup.
    * When omitted, returns versions for every same-slug page across sources

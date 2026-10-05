@@ -19,7 +19,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -301,4 +301,53 @@ describe('status-only serve: the shared-HTTP transition fails midway (H2)', () =
     const again = await relaunched.client.callTool({ name: 'search', arguments: { query: MARKER } });
     expect(JSON.stringify(body(again))).toContain(MARKER);
   }, 300_000);
+});
+
+describe('status-only serve: one re-probe for both transports; Postgres keeps the degraded path', () => {
+  let home: string;
+  let env: Record<string, string>;
+  const opened: Array<{ client: Client; transport: StdioClientTransport }> = [];
+
+  beforeAll(() => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-status-reprobe-'));
+    env = envFor(home);
+    expect(cli(['init', '--pglite', '--no-embedding', '--non-interactive'], env).status).toBe(0);
+  }, 120_000);
+
+  afterAll(async () => {
+    for (const c of opened) { try { await c.client.close(); } catch { /* best-effort */ } }
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test('stdio enters and recovers through the shared re-probe (the same transition lines serve --http writes)', async () => {
+    const owner = await connect(env);
+    opened.push(owner);
+    const transport = new StdioClientTransport({ command: 'bun', args: ['--no-env-file', 'run', 'src/cli.ts', 'serve'], cwd: process.cwd(), env, stderr: 'pipe' });
+    let stderr = '';
+    transport.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    const second = { client: new Client({ name: 'status-reprobe', version: '1' }, { capabilities: {} }), transport };
+    await second.client.connect(transport);
+    opened.push(second);
+    expect(body(await second.client.callTool({ name: 'gbrain_status', arguments: {} })).reason).toBe('lock_held');
+    expect(stderr).toContain('"event":"serve_status_mode_enter","reason":"lock_held","transport":"stdio"');
+    await owner.client.close();
+    opened.shift();
+    expect(await waitFor(async () => body(await second.client.callTool({ name: 'gbrain_status', arguments: {} })).status === 'recovered')).toBe(true);
+    expect(stderr).toContain('"event":"serve_status_mode_recovered","reason":"lock_held","transport":"stdio"');
+  }, 180_000);
+
+  test('a Postgres connect failure on --http takes the degraded-engine path, not status-only mode', () => {
+    const pgHome = mkdtempSync(join(tmpdir(), 'gbrain-status-pg-'));
+    try {
+      mkdirSync(join(pgHome, '.gbrain'), { recursive: true });
+      writeFileSync(join(pgHome, '.gbrain', 'config.json'), JSON.stringify({ engine: 'postgres', database_url: 'postgresql://127.0.0.1:1/gbrain' }));
+      const r = spawnSync('bun', ['--no-env-file', 'run', 'src/cli.ts', 'serve', '--http', '--bind', '127.0.0.1', '--port', String(46000 + Math.floor(Math.random() * 2000))],
+        { cwd: process.cwd(), env: { ...envFor(pgHome), GBRAIN_NO_RETRY_CONNECT: '1' }, encoding: 'utf8', timeout: 60_000, input: '' });
+      expect(r.stderr).toContain('GBRAIN_DB_ACCESS');
+      expect(r.stderr).not.toContain('serve_status_mode_enter');
+      expect(readdirSync(join(pgHome, '.gbrain')).some(n => n.startsWith('serve-http-status-'))).toBe(false);
+    } finally {
+      rmSync(pgHome, { recursive: true, force: true });
+    }
+  }, 90_000);
 });

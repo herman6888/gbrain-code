@@ -720,7 +720,9 @@
         "  <to>                       Slug of the page the link points to, e.g. 'companies/acme-example'. (required)",
         "  --link-type                Link type (e.g., invested_in, works_at). When the active schema pack declares a link vocabulary, an explicit link_type must be one of its declared verbs (undeclared verbs are rejected, also under dry_run). Omitted = untyped edge.",
         "  --context                  Context for the link",
-        "  --link-source              Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected."
+        "  --link-source              Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected.",
+        "  --valid-from               When the relationship started (YYYY-MM-DD), for dated relations such as works_at or invested_in.",
+        "  --valid-until              When it ended (YYYY-MM-DD, exclusive). Re-run add_link with valid_until to record that a relationship ended."
       ]
     },
     {

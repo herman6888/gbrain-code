@@ -15,7 +15,7 @@
  * is re-exported below.
  */
 
-import { listenOrRefuse } from './serve-http-listen.ts';
+import { listenOrRefuse, type AdoptableServer } from './serve-http-listen.ts';
 import express from 'express';
 import type { Socket } from 'net';
 import type { Request, RequestHandler, CookieOptions } from 'express';
@@ -404,6 +404,8 @@ interface ServeHttpOptions {
    * captured to a non-interactive log and accept the leak.
    */
   printAdminToken?: boolean;
+  /** A status-only serve's bound listener: recovery swaps its handler to this app instead of binding (serve-http-listen.ts). */
+  adoptServer?: AdoptableServer;
 }
 
 /**
@@ -848,7 +850,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
 
-  const httpServer = await listenOrRefuse(app, port, bind);
+  const httpServer = await listenOrRefuse(app, port, bind, options.adoptServer);
   console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║  GBrain MCP Server v${VERSION.padEnd(37)}║

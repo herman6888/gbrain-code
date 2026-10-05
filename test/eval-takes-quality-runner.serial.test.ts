@@ -7,8 +7,11 @@
  *   - happy path: 3 model successes → PASS receipt with all dim scores
  *   - mixed: 1 success, 2 errors → INCONCLUSIVE
  *   - budget cap fires mid-run → budgetAborted=true; receipt still produced
+ *   - pricing gate: canonically priced models pass under a cap; an unpriced
+ *     model refuses under a cap (no_pricing, fix registers the rate), runs
+ *     with a warning without one, and passes once its rate is registered
  */
-import { describe, test, expect, beforeAll, afterAll, mock } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, mock, spyOn } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 // Stub gateway.chat BEFORE importing the runner so the runner picks up
@@ -176,8 +179,6 @@ describe('runner — budget cap (codex review #4)', () => {
     const r = await runEval(engine, {
       limit: 5,
       cycles: 3,
-      // gemini-2.5-flash (not the retired 1.5-pro or 2.0 family) — the
-      // budget path pre-flights getPricing, which is allowlist-gated (#3510).
       models: ['openai:gpt-4o', 'anthropic:claude-opus-4-7', 'google:gemini-2.5-flash'],
       budgetUsd: 0.05, // tighter than projected per-cycle cost (~$0.109)
     });
@@ -209,5 +210,67 @@ describe('runner — budget cap (codex review #4)', () => {
     // contributing (need >=2). That's fine for this test — we're verifying
     // the cycle ran, not the verdict.
     expect(r.receipt.cycles_run).toBe(1);
+  });
+});
+
+describe('runner — pricing gate (new models must run)', () => {
+  const scored = async () => ({
+    text: fullScoreJson(8),
+    blocks: [],
+    stopReason: 'end',
+    usage: { input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    model: 'stub',
+    providerId: 'stub',
+  });
+
+  test('canonically priced models outside the old allowlist pass the gate under a cap', async () => {
+    chatHandler = scored;
+    const r = await runEval(engine, {
+      limit: 5, cycles: 1, models: ['anthropic:claude-fable-5', 'openai:gpt-5.6-sol'], budgetUsd: 100,
+    });
+    expect(r.receipt.cycles_run).toBe(1);
+    expect(r.receipt.cost_usd).toBeGreaterThan(0);
+  });
+
+  test('an unpriced model under a user cap refuses with no_pricing before any call', async () => {
+    chatHandler = async () => { throw new Error('chat must not run when the cap cannot be enforced'); };
+    let err: unknown;
+    try {
+      await runEval(engine, { limit: 5, cycles: 1, models: ['openai:gpt-4o', 'vendor:brand-new-model'], budgetUsd: 1 });
+    } catch (e) { err = e; }
+    expect(err).toMatchObject({ code: 'no_pricing' });
+    const fix = (err as { fix: { argv: string[]; actor: string } }).fix;
+    expect(fix.argv.slice(0, 4)).toEqual(['gbrain', 'pricing', 'set', 'vendor:brand-new-model']);
+    expect(fix.argv).toContain('--input');
+    expect(fix.argv).toContain('--output');
+    expect(fix.actor).toBe('agent');
+    expect((err as Error).message).toContain('$1.00 cost cap');
+  });
+
+  test('an unpriced model without a cap warns and runs; its spend is not counted', async () => {
+    chatHandler = scored;
+    const lines: string[] = [];
+    const spy = spyOn(process.stderr, 'write').mockImplementation((c: string | Uint8Array) => { lines.push(String(c)); return true; });
+    let r;
+    try {
+      r = await runEval(engine, { limit: 5, cycles: 1, models: ['vendor:brand-new-model'], budgetUsd: null });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r.receipt.cycles_run).toBe(1);
+    expect(r.receipt.cost_usd).toBe(0);
+    expect(lines.join('')).toContain('gbrain pricing set vendor:brand-new-model');
+  });
+
+  test('a rate registered in pricing.overrides prices the model under a cap', async () => {
+    chatHandler = scored;
+    await engine.setConfig('pricing.overrides', JSON.stringify({ 'vendor:brand-new-model': { input: 1, output: 2 } }));
+    try {
+      const r = await runEval(engine, { limit: 5, cycles: 1, models: ['vendor:brand-new-model'], budgetUsd: 100 });
+      expect(r.receipt.cycles_run).toBe(1);
+      expect(r.receipt.cost_usd).toBeCloseTo((100 * 1 + 50 * 2) / 1_000_000, 10);
+    } finally {
+      await engine.setConfig('pricing.overrides', '');
+    }
   });
 });

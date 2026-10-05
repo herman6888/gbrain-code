@@ -21,7 +21,7 @@ import {
   ANTHROPIC_CACHE_WRITE_5M_MULT,
 } from '../src/core/model-pricing.ts';
 import { ANTHROPIC_PRICING } from '../src/core/anthropic-pricing.ts';
-import { MODEL_PRICING } from '../src/core/takes-quality-eval/pricing.ts';
+import { getPricing as takesQualityPricing } from '../src/core/takes-quality-eval/pricing.ts';
 import { estimateAnthropicCost } from '../src/core/brain-score-recommendations.ts';
 
 describe('CANONICAL_PRICING — table integrity', () => {
@@ -188,12 +188,9 @@ describe('DRIFT GUARD — derived views stay equal to canonical (re-hardcode tri
     }
   });
 
-  test('takes-quality MODEL_PRICING equals canonical for every allowlisted key', () => {
-    for (const [key, p] of Object.entries(MODEL_PRICING)) {
-      const c = canonicalLookup(key);
-      expect(c).toBeDefined();
-      expect(p.input_per_1m).toBe(c!.input);
-      expect(p.output_per_1m).toBe(c!.output);
+  test('takes-quality pricing equals canonical for every canonical key', () => {
+    for (const [key, c] of Object.entries(CANONICAL_PRICING)) {
+      expect({ key, p: takesQualityPricing(key) }).toEqual({ key, p: { input_per_1m: c.input, output_per_1m: c.output } });
     }
   });
 

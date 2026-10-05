@@ -16,6 +16,9 @@ With the drain loop, the diet and bulk publication (v0.60.48.0), one
 backlog in about 11 h instead of 49 h) and 775 pages/min near the
 database, with foreground writes unharmed. See
 [Results on the #5984 branch](#results-on-the-5984-branch-v060480).
+The second round-trip diet brings a page's publication inside a group
+to about 17 round trips (from 48) and the 57 ms rate to 24.5 pages/min;
+see [Round-trip diet 2](#round-trip-diet-2-150-pagesmin-plan-phases-0-and-1).
 
 This page is the research and decision record for the #5984 plan
 (CEO-A1, A2, A3, A4, A6, A17, A19, A25, A26, A27, A29; ENG-A5, A9,
@@ -36,6 +39,12 @@ bun scripts/bench/managed-sync-catchup.ts --files 500 --deletes 34 --rtt 57,0 \
 # issue-sized row: 10k files, 300-word pages, 300 pages of existing receipt history
 bun scripts/bench/managed-sync-catchup.ts --files 10000 --deletes 34 --receipt-history 300 --pad-words 300 \
   --rtt 57,0 --rows cli --max-minutes 15 --label <branch>-10k
+
+# re-print the critical-path, publication and counter-hold tables of a kept trace (--keep)
+bun scripts/bench/managed-sync-catchup.ts --analyze <home>/sql-trace.jsonl
+
+# pipelining spike: direct Postgres (prepare true/false) and transaction-mode PgBouncer
+bun scripts/bench/managed-sync-pipeline-spike.ts --rtt 57
 ```
 
 Rows run in sequence by default. Rows at 57 ms are latency-bound and
@@ -157,6 +166,10 @@ has:
 | `cli_is_owner_host` | ENG-A9. |
 | `foreground_idle`, `foreground_during_catchup` | `foreground` row: writes, p50/p95 ms, failures, lock_timeouts, failure codes (ENG-A5). |
 | `effects_backlog_at_cli_exit`, `readiness`, `retrieval_ready`, `retrieval_ready_after_sync_s`, `embedding_stub` | `effects` row (CEO-A17, ENG-A18). Ready = no unembedded chunks for the source, no queued or running effects, no pending minion jobs, and no page with stale link extraction. |
+| `trace.critical_path` | Sync-process phases (`publication (group)`, `publication (single)`, `freeze`, `admission`, `cursor`, `claim`, `prepare`, `wait`, `commit_gap`, `background`): occurrences, wall ms total and p50, statements, waves, describes, per page; `wave_check`; `rules`. |
+| `trace.publication` | Group transactions: members, `fit` (waves and statements = fixed + per member), `steady_member_chain`, `first_member_chain`, `completion_per_member`, `per_page_publication_round_trips` / `_statements`, `counter_hold` (statements, waves, ms; from the counter row lock to commit), `by_members[]`, `transactions[]`, `rules`. |
+| `effects`, `effects_backlog` | Effects per group and by kind (with `needs_worktree_lock`), and the queued/running backlog sampled every 2 s during the run. |
+| `foreground_*.round_trips` | Per `put_page`: write transactions, their statements and waves, and the whole write window (p50, p95). |
 | `e1_cold_start_to_first_progress_ms`, `e1_cold_start_to_first_stderr_ms`, `e1_wall_ms`, `newcomer_sync_runs`, `newcomer_to_search_hit_s`, `search_hit` | `newcomer` row (DX-A12). |
 
 ## Baseline (master `f4739fff`, v0.60.39.0, 2026-10-04)
@@ -487,3 +500,190 @@ the target, and both need their own design approval:
 The worktree fence + bulk import + reconcile alternative (CEO-A27) stays
 unbuilt: it measures 51 pages/min as unmanaged sync but gives up
 per-page receipts and effects during the import.
+
+## Round-trip diet 2 (150 pages/min plan, Phases 0 and 1)
+
+The 150 pages/min plan starts with a measured floor and a second
+round-trip diet. The bench reports where the sync process spends its
+time (`trace.critical_path`), what one bulk group costs
+(`trace.publication`), the effects each group queues (`effects`,
+`effects_backlog`) and the round trips of each foreground `put_page`
+(`foreground_*.round_trips`). A **round trip** here is a wave: records
+on one connection whose time spans overlap count once, so pipelined
+statements count as one, and every describe counts as its own wave.
+At 57 ms the wave count times the RTT matches the wall time (61 ms per
+wave against a 59.5 ms proxy RTT). `--analyze <trace.jsonl>` prints the
+same tables for a kept trace.
+
+### Pipelining spike
+
+`scripts/bench/managed-sync-pipeline-spike.ts` (57 ms, toxiproxy)
+issues `tx.executeRaw` calls inside one gbrain `engine.transaction`
+without awaiting between them, on direct Postgres and through
+transaction-mode PgBouncer (`edoburu/pgbouncer`, `MAX_PREPARED_STATEMENTS=0`).
+Wall times include `BEGIN` and `COMMIT`.
+
+| Case | prepare=true | prepare=false | PgBouncer txn mode (prepare=false) |
+|---|---|---|---|
+| 2 dependent statements, awaited one by one (warm) | 2 round trips, 240 ms | 4, 358 ms | 4, 360 ms |
+| same 2, issued without await (warm) | **1 round trip, 180 ms**; the read sees the write | 4, 359 ms | 4, 359 ms |
+| 5 inserts without await (first one cold) | 5 round trips, ids in issue order | 12, 837 ms | 12, 837 ms |
+| failure first, then 2 statements, without await | 1 round trip; `23505`, then `25P02`, `25P02` | `23505`, `25P02`, `25P02` | same |
+| 3 unparameterized statements without await | 1 round trip | 1 | 1 |
+| new statement text per call, without await | 6 round trips (3 describes) | 6 | 6 |
+
+postgres.js pipelines statements issued back to back on the
+transaction's connection and keeps their order, and after a failure the
+first error is the real one while later statements fail with `25P02`.
+Only statements already prepared on that connection pipeline: a
+parameterized statement the connection has not prepared waits for its
+describe round trip and holds back the statements behind it. With
+`prepare: false` (and therefore under transaction-mode PgBouncer) every
+parameterized statement pays a describe and an execute and nothing
+pipelines; unparameterized statements still do. So the spike passes for
+direct Postgres, which the gates below are measured on, and fails for
+transaction-mode poolers, where the diet's statement cuts still apply
+but pipelining gives nothing.
+
+### What one page costs now
+
+Each member of a bulk group reads its page twice: the **preimage**
+under the page guard (identity, revision check, the version row on
+update and delete) and the **postimage** after apply (read-back check,
+projection target, text-projection seal, receipt revision, effects).
+Configuration rows, the local writer and source membership are read
+once per transaction (`transactionMemo`, `src/core/page-state/transactions.ts`).
+The chunk insert binds its rows as one JSON document, so its text is
+stable per brain and prepared; a complete replacement seals
+`chunker_version` in the statement that also locks the page row. The
+text projection is sealed once per page. Group completion is set-based
+(`completeGroup`, `src/core/persistence/group-publish.ts`): each
+member's queued effect bytes are read before the counters are locked,
+then the counter lock and one `UPDATE persistence_requests ... FROM
+unnest(...) RETURNING` that checks every member's claim and terminal
+reservation are pipelined, and a short `RETURNING` rolls the group back
+to the single path, where `completeWrite` gives each member its own
+code.
+
+Statements of the steady member chain after the diet (a page import,
+bench fixture), by dependency:
+
+| Statements | Depends on | Sent |
+|---|---|---|
+| attribution `set_config` | member boundary | alone (never pipelined across) |
+| `savepoint`, page `INSERT`/`UPDATE`, contextual-retrieval `UPDATE`, chunk `DELETE` | nothing returned earlier (independent) | one by one: engine calls with their own savepoint |
+| chunker seal `UPDATE ... RETURNING id` | nothing (produces the page id) | alone |
+| chunk `INSERT` | page id (data-dependent) | alone |
+| alias `savepoint` + `DELETE` | independent | one by one (savepoint) |
+| `source_path` repair | independent | alone |
+| postimage read | must follow every page write (produces id, revision, timeline) | alone |
+| facts expiry, take collision check, take delete, timeline delete/inserts/refresh | postimage page id; independent of each other | **one pipeline** (`insertFacts`/`addTakesBatch` end it) |
+| text-projection seal, hold check, import provenance | postimage; independent of each other | **one pipeline** |
+| chronicle check (effects) | postimage | alone |
+| next member's preimage | must precede its validation and apply | alone |
+| sync-origin check (validation) | independent | alone |
+
+### Effects per group
+
+With `--no-embed` (the `cli` rows) a database-only group queues no
+effects: the embedding is deferred and no file is written. Without it,
+each live page queues one `embedding` effect, which does not take the
+worktree lock; `git` effects, which do, come only from file-backed
+writes (each foreground `put_page` queues `embedding` + `git`). The
+effects backlog during the catch-up stayed at 0 to 2.
+
+### Before and after
+
+Master `6622a119` (v0.60.48.0) against this diet, same host and bench
+(500 files, 34 no-op deletes, 57 ms rows time-boxed at 10 min):
+
+| Measure | Master | Diet | Gate |
+|---|---|---|---|
+| Per-page publication, round trips (describes counted), 57 ms | 48.1 (42 statements) | **16.7** (23 statements) | ≤ 22 with pipelining (≤ 24 without): pass, −65% |
+| Per-page publication, ~0 ms | 44.7 (43 statements) | 17.6 (24 statements) | pass |
+| Counter hold, lock to commit | 12 round trips p50, 20 max (3 + 3 statements per member; 0.72 s at 57 ms) | **2 p50**, 5 max (3 statements for any group size; 0.12 s) | ≤ 3 with pipelining: pass at p50; the max is a connection that has not prepared the two statements yet (2 describes), within the 5-round-trip bound without pipelining |
+| `cli` pages/min, 57 ms (10 min) | 10.6 | **24.5** | measured (2.3x) |
+| `cli` pages/min, ~0 ms (3 runs) | 496 (493 to 512) | 504 (471 to 530) | not regressed |
+| Idle foreground `put_page` round trips, 57 ms (3 runs, 15 writes) | 151 p50, 166 p95 (102 statements) | **146 p50, 156 p95** (99 statements) | no worse: pass |
+| Idle foreground `put_page` wall, 57 ms (median of run p50 / p95) | 12.6 s / 15.4 s | 12.8 s / 15.0 s | within noise (+1% p50, −3% p95) |
+| Foreground during catch-up, 57 ms | p95 22.2 s, 1 failure | p95 14.7 s, 0 failures, 0 lock timeouts | |
+
+A warm foreground publication transaction is 61 statements with no
+describe (master: 66 with 2). Golden SQL (regenerated only for the chunk
+insert and the export surface), attribution and engine-parity suites pass
+on both engines.
+
+Per-phase critical path of the sync process, 57 ms `cli` row (p50 per
+occurrence; the group size adapts to the 15 s budget, so groups grew
+from 3 to 7 to 9 pages):
+
+| Phase | Master wall / waves | Diet wall / waves |
+|---|---|---|
+| publication transaction | 9.3 s / 155 (3 pages) | 10.8 s / 179 (9 pages) |
+| freeze | 0.66 s / 12 | 1.08 s / 30 |
+| admission | 1.14 s / 19 | 1.02 s / 17 |
+| cursor save | 0.36 s / 6 | 0.36 s / 6 |
+| claim | 0.30 s / 5 | 0.30 s / 5 |
+| prepare | 1.15 s / 48 | 2.33 s / 126 |
+| gap between group commits | 14.4 s | 18.1 s |
+
+Per committed page the diet's sync process spends 21.6 publication
+waves (master: 54.3), 16.2 prepare, 5.2 cursor, 4.6 freeze, 2.5
+admission and 1.4 claim waves. Between two group commits about 7 s is
+freeze, admission, cursor saves, claim and prepare, all strictly after
+the previous commit; that is the gap Phase 1.5 (the cursor window)
+targets.
+
+## Admit-ahead (150 pages/min plan, Phase 1.5)
+
+While a bulk group publishes, the drain freezes and admits the next group
+and records it in the cursor's `window` (`src/core/persistence/sync-window.ts`).
+The per-worktree FIFO claim is unchanged: the window group waits queued
+behind the publishing group, and the consumer claims it as soon as that
+group commits. Window members name the previous group's last request
+(`intent.after`); the consumer cancels a window group whose predecessor
+did not commit, publication re-checks the predecessor, and the drain
+cancels the window after a failed page, so no page publishes after an
+earlier page of the same sync failed. Publication reads the cursor
+`FOR KEY SHARE` and accepts `pending`, `group` and `window` members, so
+the drain's cursor saves no longer wait for the publishing group (the
+`FOR SHARE` read they used to wait on would have serialized admit-ahead
+behind publication). Nothing is admitted ahead while foreground writes
+are recent (one was queued on the worktree in the last minute).
+
+Same host and bench as the diet table above, 57 ms rows time-boxed at
+10 min (the 10k row at 15 min):
+
+| Measure | Master `6622a119` | Admit-ahead only | Diet only | Diet + admit-ahead |
+|---|---|---|---|---|
+| `cli` pages/min, 57 ms | 10.6 | 13.4 | 24.5 | **28.8** |
+| Gap between group publications, 57 ms (p50) | about 5.6 s | 2.2 s | about 7 s | 3.7 s (claim + prepare of an 8 to 9 page group) |
+| Pages per group (steady state) | 3 to 4 | 4 | 7 to 9 | 8 to 9 |
+| `cli` 10k files, 300-word pages, 300 receipts, 57 ms | 3.4 pages/min on v0.60.39 (about 49 h); 15.7 on v0.60.48 (about 10.7 h) | | | **30.9 pages/min, about 5.4 h** |
+| `cli` pages/min, ~0 ms | 527 | 514 | 504 (3-run median) | 545 |
+| Foreground `put_page` p95 at 57 ms, idle / during catch-up | 15.5 s / 18.2 s, 0 failures | 15.3 s / 17.7 s, 0 failures | 15.0 s / 14.7 s, 0 failures | **14.9 s / 15.1 s, 0 failures, 0 lock timeouts** |
+| Catch-up while a `put_page` arrives every second, 57 ms | 3.9 pages/min | 3.8 | | 4.4 |
+
+The foreground idle figure comes from 5 writes per run, so single-run p95
+values carry about ±1 s of noise; master on this host shows the same
+during-catch-up excess as admit-ahead alone.
+
+Per-phase critical path with both changes (57 ms `cli` row, p50 per
+occurrence): publication 10.9 s (180 waves, 21.8 per page), prepare 2.5 s
+(144 waves, 17.7 per page), freeze 1.2 s, admission 1.1 s, claim 0.36 s,
+cursor save 0.37 s. Freeze and admission of the next group now overlap the
+publishing group; claim and prepare still run strictly between two group
+commits (15.0 s from commit to commit, p50).
+
+### Against the 150 pages/min target
+
+With both changes one sync catches up at about 29 to 31 pages/min at 57 ms
+(about 2.7 times master, about 5.4 h for the 10k backlog). The plan's
+forecast for these phases was 36 to 40; the difference is prepare, which
+grew with group size (17.7 waves per page) and still sits between commits.
+Reaching 150 needs parallel publication (Phase 2, lanes), which waits for
+the owner's decision. A cheaper step that stays single-lane is to prepare
+the window group's members while the current group publishes (prepare is
+read-only and its results are re-validated in the publication
+transaction); at the measured costs that would remove about 2.5 s of the
+15 s cycle, for roughly 33 to 35 pages/min.

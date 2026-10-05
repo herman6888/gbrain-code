@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { sha256 } from './digest.ts';
 import { PARK_AFTER_FAILURES, type EffectKind, type PersistenceEffect, type EffectRequest } from './effect-model.ts';
@@ -29,7 +30,9 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
   if (prepared?.file && row.worktree_id) {
     const [binding] = await tx.executeRaw<{ local_path: string }>(`SELECT h.local_path FROM persistence_host_bindings h
       JOIN persistence_worktrees w ON w.id=h.worktree_id AND w.owner_host_id=h.host_id WHERE w.id=$1::uuid`, [row.worktree_id]);
-    if (!binding?.local_path) throw new OperationError('owner_unavailable', 'Cannot record the canonical Git target without its owner binding.');
+    if (!binding?.local_path) throw opError('owner_unavailable', 'Cannot record the canonical Git target without its owner binding.',
+      `Worktree ${row.worktree_id} of source ${row.source_id} has no host binding for its owner, so request ${row.id} could not record its Git target. Read the request's receipt; the owner host's binding is restored by its claim or transfer.`,
+      row.principal_kind === 'local_cli' ? { fix: readFix(`Reads request ${row.id}'s durable receipt, read-only.`, { argv: ['gbrain', 'write-request', '--', row.id] }) } : {});
     await queue('git', { relative_path: relative(binding.local_path, prepared.file.path).split(sep).join('/'),
       expected_hash: prepared.file.content === null ? null : sha256(prepared.file.content) });
     if (outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });

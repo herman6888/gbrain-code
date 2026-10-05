@@ -493,7 +493,7 @@ export async function tryRedirectPhantom(
   }
 
   // Codex #1: phantom-specific resolver bypasses exact-self-match.
-  const canonical = await resolvePhantomCanonical(engine, sourceId, page.slug);
+  const canonical = await resolvePhantomCanonical(engine, sourceId, page.slug, { type: page.type });
   if (!canonical) {
     logPhantomEvent({
       phantom_slug: page.slug,

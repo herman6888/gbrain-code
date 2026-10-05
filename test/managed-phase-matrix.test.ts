@@ -281,6 +281,23 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect((await engine.getPage(slug!, { sourceId: 'default' }))?.compiled_truth).toContain('DRIFTED — notes/drift-example');
     },
   },
+  edge_contradictions: {
+    config: { 'dream.edge_contradictions.mode': 'apply', 'models.dream.edge_contradictions': 'anthropic:claude-sonnet-4-6' },
+    seed: async ({ engine, sourceId }) => {
+      await put(engine, sourceId, 'companies/acme-example', page('company', 'Acme', 'A company.'));
+      await put(engine, sourceId, 'companies/widget-co', page('company', 'Widget', 'A company.'));
+      await put(engine, sourceId, 'people/edge-example', page('person', 'Edge Example',
+        'Works at [Acme](../companies/acme-example) and at [Widget](../companies/widget-co).\n\n## Timeline\n\n' +
+        '- **2019-02-01** | test — joined [Acme](../companies/acme-example)\n- **2024-05-01** | test — joined [Widget](../companies/widget-co)'));
+    },
+    reply: () => JSON.stringify({ pairs: [{ a: 1, b: 2, conflict: true, confidence: 0.9 }] }),
+    assert: async ({ engine, sourceId, result }) => {
+      expect(result.details).toMatchObject({ proposed: 1, applied: 1 });
+      const ops = await committed(engine, sourceId, 'people/edge-example');
+      expect(ops.some(o => (o as { operation: string }).operation === 'add_timeline_entry')).toBe(true);
+      expect((await engine.getPage('people/edge-example', { sourceId }))?.timeline).toContain('Ended works_at [[companies/acme-example]]');
+    },
+  },
   chronicle: {
     seed: async ({ engine, sourceId }) => {
       await put(engine, sourceId, 'meetings/chronicle-example', page('meeting', 'Weekly sync',

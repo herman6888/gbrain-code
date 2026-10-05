@@ -134,7 +134,7 @@ export const DOMAIN_OF: Record<string, string> = {
 
   // out of scope
   'searchTitles': OOS.search, 'searchVector': OOS.search, 'explainVectorSearch': OOS.search,
-  'relationalFanout': OOS.enrichment, 'getBacklinkCounts': OOS.enrichment, 'getAdjacencyBoosts': OOS.enrichment,
+  'relationalFanout': OOS.enrichment, 'relationalChainHop': OOS.enrichment, 'getBacklinkCounts': OOS.enrichment, 'getAdjacencyBoosts': OOS.enrichment,
   'getContentFlagsByPageIds': OOS.enrichment, 'getUnverifiedExtractionPageIds': OOS.enrichment,
   'getEffectiveDates': OOS.enrichment, 'getSalienceScores': OOS.enrichment, 'resolveAliases': OOS.enrichment,
   'getStats': OOS.stats, 'getHealth': OOS.stats,

@@ -617,7 +617,7 @@ safe ones."* or *"After the upgrade my notes source was blocked by one broken
 file. Get it syncing again."*
 
 The session below is real output (volatile ids, hashes and times shown as
-`<id>`, `<hash>`, `<time>`; `test/held-files-walkthrough.serial.test.ts` runs
+`<id>`, `<hash>`, `<time>`; `test/held-files-walkthrough.test.ts` runs
 these commands and checks every line shown). Before the upgrade, a generator
 committed three notes to the `notes` source: `notes/standup.md` with a title
 that continues on an unquoted line, a new `notes/digest.md` with `title:`

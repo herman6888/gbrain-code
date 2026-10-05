@@ -4,11 +4,13 @@
  * and the read-only preview; nothing on a clean brain; never an applying
  * command. The banner runs the full wave checks, not doctor --fast.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { postUpgradeRecoveryBanner } from '../src/commands/doctor/upgrade-banner.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import { upsertOpenLoop } from '../src/core/loops/loops-store.ts';
 import { managedBrain } from './helpers/managed-brain.ts';
@@ -78,10 +80,45 @@ describe('post-upgrade recovery banner', () => {
     });
   }, 180_000);
 
-  test('post-upgrade prints the banner and no longer prints an applying safe-chunk advisory', () => {
-    // test-reads-source-ok[structural]: runPostUpgrade needs a configured brain plus a full migration run; this pins that it calls the banner and no longer prints the applying advisory.
-    const source = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'upgrade.ts'), 'utf8');
-    expect(source).toContain('postUpgradeRecoveryBanner(engine');
-    expect(source).not.toContain('safeChunkUpgradeAdvisory');
+});
+
+describe('gbrain post-upgrade', () => {
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-banner-cli-'));
+  const claude = selfCaptureHost();
+  const cli = async (...args: string[]) => {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'src', 'cli.ts'), ...args], {
+      cwd: home, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
+      env: { PATH: process.env.PATH, HOME: home, GBRAIN_HOME: home, CLAUDE_CONFIG_DIR: claude, GBRAIN_DISABLE_UPDATE_CHECK: '1', GBRAIN_SKIP_REFERENCE_SWEEP: '1' },
+    });
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { stdout, stderr, code };
+  };
+
+  beforeAll(async () => {
+    const init = await cli('init', '--pglite', '--no-embedding');
+    expect(init.code, init.stderr).toBe(0);
+    const { database_path } = JSON.parse(readFileSync(join(home, '.gbrain', 'config.json'), 'utf8'));
+    await withEnv({ GBRAIN_HOME: home, CLAUDE_CONFIG_DIR: claude }, async () => {
+      const engine = new PGLiteEngine();
+      await engine.connect({ database_path });
+      try {
+        for (const fact of ['Alice Example prefers Rust for systems work', 'Alice Example ships on Fridays']) {
+          await writeSingleFact(engine, 'default', { fact, entity: 'people/alice-example', provenance: 'hook:writeback', sessionId: 'sess-self' });
+        }
+      } finally { await disposePersistenceConsumer(engine); await engine.disconnect(); }
+    });
+  }, 180_000);
+  afterAll(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
   });
+
+  test('relays the recovery banner for a brain with findings and never an applying advisory', async () => {
+    const upgraded = await cli('post-upgrade', '--no-autopilot-install');
+    expect(upgraded.code, upgraded.stderr).toBe(0);
+    expect(upgraded.stdout).toContain('[AGENT] Relay this to your operator');
+    expect(upgraded.stdout).toContain('[AGENT]   captured_facts_active: 2 (explicit_kind_required; preview with: gbrain repair captured-facts)');
+    expect(`${upgraded.stdout}${upgraded.stderr}`).not.toMatch(/safe[- ]chunk/i);
+    expect(upgraded.stdout).not.toContain('--apply');
+  }, 180_000);
 });

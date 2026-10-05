@@ -64,6 +64,8 @@ import {
   removeClaudeHooks,
 } from '../core/bootstrap/hooks.ts';
 import { removeCodexHooks, writeCodexHooks } from '../core/bootstrap/codex-hooks.ts';
+import { isRegistrationSurface, registeredSurface, stdioServeArgv } from '../core/mcp-registration.ts';
+import type { McpSurface } from '../mcp/surface.ts';
 import {
   guardReceiptOverwrite,
   readHarnessReceiptState,
@@ -201,8 +203,8 @@ const SUBCOMMAND_HELP: Record<string, string> = {
     '  under your own account), verify the privacy bit via the API, push.',
   hooks:
     'gbrain bootstrap hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]\n' +
-    '                       [--seat <label> | --no-seat]\n' +
-    '  Register MCP (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n' +
+    '                       [--seat <label> | --no-seat] [--surface verbs|starter|full]\n' +
+    '  Register MCP (--surface starter unless given; a replaced entry keeps its surface) (+ per-turn hooks on Claude Code, ON by default; --no-hooks opts out).\n' +
     '  --seat credits captured sessions to this agent seat (kept on re-install; --no-seat clears it; --seat off records none).',
   verify:
     'gbrain bootstrap verify [--json]\n' +
@@ -385,7 +387,8 @@ export function detectHarness(env: Record<string, string | undefined> = process.
  *
  * Returns 'match' (ours), 'mismatch' (points elsewhere — caller re-registers or
  * warns), or 'unknown' (the host has no `mcp get` / empty output — inconclusive,
- * never silently blessed).
+ * never silently blessed), plus the registration's surface form
+ * (`registeredSurface`) so a replacement never narrows it.
  */
 async function verifyMcpTargetsWorkspace(
   runner: ExecRunner,
@@ -393,7 +396,7 @@ async function verifyMcpTargetsWorkspace(
   name: string,
   gbrainBin: string,
   sourceId: string,
-): Promise<'match' | 'mismatch' | 'unknown'> {
+): Promise<{ verdict: 'match' | 'mismatch' | 'unknown'; surface?: McpSurface | null }> {
   // Exec-lane harnesses only. opencode registrations go through the direct
   // JSONC writer whose 4-state fingerprint IS the [FIX7] check (structural,
   // no exec) — it never routes here; 'unknown' keeps a stray call honest.
@@ -403,19 +406,19 @@ async function verifyMcpTargetsWorkspace(
     opencode: null,
   } as const satisfies Record<Harness, string | null>;
   const bin = EXEC_HARNESS_BIN[harness];
-  if (bin === null) return 'unknown';
+  if (bin === null) return { verdict: 'unknown' };
   let res;
   try {
     res = await runner([bin, 'mcp', 'get', name]);
   } catch {
-    return 'unknown';
+    return { verdict: 'unknown' };
   }
-  if (res.code !== 0) return 'unknown';
+  if (res.code !== 0) return { verdict: 'unknown' };
   const out = `${res.stdout}\n${res.stderr}`;
-  if (out.trim() === '') return 'unknown';
+  if (out.trim() === '') return { verdict: 'unknown' };
   const hasBin = out.includes(gbrainBin);
   const hasSource = out.includes(`GBRAIN_SOURCE=${sourceId}`);
-  return hasBin && hasSource ? 'match' : 'mismatch';
+  return { verdict: hasBin && hasSource ? 'match' : 'mismatch', surface: registeredSurface(out) };
 }
 
 /** Wall-clock cap on the best-effort `opencode mcp list` probe: `mcp list`
@@ -1083,6 +1086,9 @@ async function runHooks(
   // gbrain binary still matches. This flag forces the hand-wired MCP
   // registration through anyway.
   const mcpEvenIfPlugin = rest.includes('--mcp-even-if-plugin');
+  const surfaceArg = rest.includes('--surface') ? flagValue(rest, '--surface') ?? '' : undefined;
+  if (surfaceArg !== undefined && !isRegistrationSurface(surfaceArg)) { console.error(`unknown --surface '${surfaceArg}' — pass --surface verbs, starter, or full`); return 2; }
+  const surfaceFlag = surfaceArg ?? null;
 
   const state = readManifest(ws);
   if (state.state !== 'initialized') {
@@ -1265,10 +1271,7 @@ async function runHooks(
       // no absolute machine paths in a file that travels, and no fail-open
       // analog exists — the sharing warning below is the mitigation).
       const configPath = mcpScope === 'project' ? opencodeProjectConfigPath(ws) : opencodeGlobalConfigPath();
-      const command =
-        mcpScope === 'project'
-          ? ['gbrain', 'serve', '--surface', 'full']
-          : [gbrainBin, 'serve', '--surface', 'full'];
+      const command = stdioServeArgv(mcpScope === 'project' ? 'gbrain' : gbrainBin, surfaceFlag ?? undefined);
       const entry = {
         kind: 'local' as const,
         name: 'gbrain',
@@ -1295,11 +1298,11 @@ async function runHooks(
           // pre-check parse carries the same paste-by-hand snippet the writer
           // uses so a corrupt config never strands the user.
           const existingText = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
-          const existingKind = opencodeEntryKind(
-            parseOpencodeConfig(existingText, configPath, opencodeEntrySnippet(entry)),
-            'gbrain',
-            { sourceId },
-          );
+          const existing = parseOpencodeConfig(existingText, configPath, opencodeEntrySnippet(entry));
+          const existingKind = opencodeEntryKind(existing, 'gbrain', { sourceId });
+          const priorCommand = ((existing.mcp as Record<string, { command?: unknown }> | undefined)?.gbrain)?.command;
+          const prior = existingKind !== 'absent' && !surfaceFlag && Array.isArray(priorCommand) ? registeredSurface(priorCommand.join(' ')) : undefined;
+          if (prior !== undefined) entry.command = stdioServeArgv(command[0], prior);
           if (existingKind === 'ours-other-source') {
             console.error(`existing 'gbrain' opencode entry targets a DIFFERENT workspace — replacing it.`);
           }
@@ -1420,11 +1423,10 @@ async function runHooks(
           'workspace-bound registration with `--mcp-even-if-plugin`.',
       );
     }
-    const argvs = mcpPluginOwned
-      ? []
-      : harness === 'claude-code'
-        ? registerClaudeMcp({ gbrainBin, scope: mcpScope, sourceId, ...(gbrainHome ? { gbrainHome } : {}) })
-        : registerCodexMcp({ gbrainBin, sourceId, ...(gbrainHome ? { gbrainHome } : {}) });
+    const buildArgvs = (surface?: McpSurface | null) => harness === 'claude-code'
+      ? registerClaudeMcp({ gbrainBin, scope: mcpScope, sourceId, surface, ...(gbrainHome ? { gbrainHome } : {}) })
+      : registerCodexMcp({ gbrainBin, sourceId, surface, ...(gbrainHome ? { gbrainHome } : {}) });
+    const argvs = mcpPluginOwned ? [] : buildArgvs(surfaceFlag ?? undefined);
     for (const argv of argvs) {
       const mcpName = argv[3] ?? 'gbrain'; // ['<host>','mcp','add',<name>,…]
       const res = await runner(argv);
@@ -1446,7 +1448,7 @@ async function runHooks(
         // [FIX7] "already registered" is NOT proof the registration is OURS.
         // Verify it targets this workspace's serve; if it points elsewhere,
         // remove + re-add rather than blessing a foreign/stale registration.
-        const verdict = await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId);
+        const { verdict, surface: priorSurface } = await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId);
         if (verdict === 'match') {
           console.log('MCP server already registered for this workspace — kept.');
         } else if (verdict === 'mismatch') {
@@ -1472,7 +1474,7 @@ async function runHooks(
             );
             return 1;
           }
-          const re = await runner(argv);
+          const re = await runner(surfaceFlag || priorSurface === undefined ? argv : buildArgvs(priorSurface)[0]);
           if (re.code !== 0 && !/already exists|already registered/i.test(re.stderr + re.stdout)) {
             console.error(`MCP re-registration failed (${argv.join(' ')}): ${re.stderr.trim() || `exit ${re.code}`}`);
             return 1;
@@ -1482,7 +1484,7 @@ async function runHooks(
           // is NOT ours. Re-verify and abort rather than bless a foreign
           // endpoint that would intercept memory ops. (Only the recorded
           // warn-then-continue step-2 smoke did this before; here it's fatal.)
-          const post = await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId);
+          const post = (await verifyMcpTargetsWorkspace(runner, harness, mcpName, gbrainBin, sourceId)).verdict;
           if (post === 'mismatch') {
             console.error(
               `after replacing '${mcpName}', it STILL targets a different workspace/binary — ` +
@@ -1509,7 +1511,7 @@ async function runHooks(
     if (!mcpSkipped && !mcpPluginOwned) try {
       const listBin = harness === 'claude-code' ? 'claude' : 'codex';
       const scopeLabel = harness === 'claude-code' ? mcpScope : 'user-global';
-      const verdict = await verifyMcpTargetsWorkspace(runner, harness, 'gbrain', gbrainBin, sourceId);
+      const { verdict } = await verifyMcpTargetsWorkspace(runner, harness, 'gbrain', gbrainBin, sourceId);
       if (verdict === 'match') {
         console.log(`MCP registered with ${harness} (scope: ${scopeLabel}) — verified targeting this workspace.`);
       } else if (verdict === 'mismatch') {

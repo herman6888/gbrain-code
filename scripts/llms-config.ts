@@ -106,6 +106,12 @@ export const SECTIONS: DocSection[] = [
     heading: "Configuration",
     entries: [
       {
+        title: "docs/guides/multi-hop.md",
+        description: "Multi-hop relationship questions: typed hop chains over links (search planner + traverse_graph hops), evidence edges, refusals, notices, settings.",
+        path: "docs/guides/multi-hop.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/ENGINES.md",
         description: "PGLite vs Postgres trade-off and when to migrate.",
         path: "docs/ENGINES.md",

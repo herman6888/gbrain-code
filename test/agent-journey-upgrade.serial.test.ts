@@ -25,7 +25,7 @@
  *   budget stop 3 → 11 (`embed --stale`, `dream --drain`)                    → test/embed.serial.test.ts, test/embed-exit-code-3037.serial.test.ts,
  *                                                                              test/dream-drain-failure-summary.serial.test.ts
  *   consent table: every gated command non-TTY exits 3 and mutates nothing   → test/consent-table.serial.test.ts (C9)
- *   absolute `serve --surface verbs` Claude registration smoke, live owner   → test/doctor-harness-smoke.serial.test.ts
+ *   absolute `serve --surface verbs` Claude registration smoke, live owner   → test/doctor-harness-smoke.test.ts
  *   #5157 pre-cutover jobs (no submission authority) need review first       → test/minions-legacy-journey.test.ts,
  *                                                                              test/e2e/minions-legacy-journey-postgres.test.ts
  *   Postgres parity of the H1 journey                                        → test/e2e/agent-journey-postgres.test.ts

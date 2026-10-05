@@ -653,11 +653,6 @@ export const PER_PAGE_LOCK_TTL_MINUTES = 2;
  */
 const _lockBusyLogCache = new Map<string, number>();
 
-/** Test seam: clear the rate-limit cache so re-runs emit again. */
-export function _resetLockBusyLogCacheForTest(): void {
-  _lockBusyLogCache.clear();
-}
-
 function logLockBusyRateLimited(sourceId: string, slug: string): void {
   const minuteBucket = Math.floor(Date.now() / 60_000);
   const key = `${sourceId}:${minuteBucket}`;

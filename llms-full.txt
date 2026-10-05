@@ -417,6 +417,13 @@ brains mint fine while the server runs: `gbrain bootstrap harness --yes --port 3
 
 ## Troubleshooting
 
+A served `gbrain serve --http` that cannot open its brain stays up in
+[status-only mode](../mcp/DEPLOY.md#status-only-mode): `/health` answers 503
+with `Retry-After: 5`, remote clients get a `serve_status_only` envelope whose
+fix is `gbrain doctor` on this host, and the server opens the brain on the same
+port once the cause is fixed. `--fail-fast` (or `GBRAIN_SERVE_FAIL_FAST=1`)
+exits instead.
+
 `gbrain mcp expose --status` re-runs the probes; `--json` names the failing
 check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
 
@@ -452,6 +459,7 @@ check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
 | An interrupted `gbrain mcp expose` (no receipt, but a handler / service / wrapper is left behind) — `gbrain mcp expose --status` reports `leftovers_without_receipt` (exit 1) naming each artifact | Run the command `--status` prints: `gbrain mcp expose --remove --yes` (add `--port N` if you published a non-default port; `--force` when only a handler stands) recovers without a receipt: it removes the service, the wrapper and the `:443` handler proxying that port, and leaves the admin token. A handler with no wrapper, unit or service next to it is left in place until you add `--force`. See [`--remove`](#--remove). | agent, after the user agrees | none | `gbrain mcp expose --status --json` |
 | `handler_not_removed` (exit 1) — "--remove" stopped with "the tailscale handler for port <port> is still present" (or "could not be confirmed gone") | `tailscale serve --https=443 --set-path=/ off` ran but the re-read still shows gbrain's handler (or the serve status could not be re-read). The service was already uninstalled; the receipt and the wrapper were kept on purpose so the re-run finds everything. Run `tailscale serve status`, fix what it reports (operator, daemon), then `gbrain mcp expose --remove --yes` again. | user | none | `gbrain mcp expose --status --json` |
 | `foreign_serve_config` — "tailscale serve already proxies :443 to <target>. Re-run with --force to take it over, or pick another local port for that service." | A `/` handler on `:443` (a background config, another terminal's foreground `tailscale serve` session, or a raw TCP forward) already points somewhere else. Inspect it with `tailscale serve status` (the suggested next action), move that service, or — for a background handler only — re-run with `--force`; a foreground session must be stopped in its own terminal. | user | none | `gbrain mcp expose --status --json` |
+| `verify.local` warn — "status-only (<reason>): the server runs but cannot open its brain" (publish exit 2; `--status` exit 1) | The served `gbrain serve --http` is up on the port but in [status-only mode](../mcp/DEPLOY.md#status-only-mode): `/health` answers 503 and clients get the `serve_status_only` envelope. `gbrain doctor --only harness_wiring` names the reason's fix (for `lock_held`, stop the other process holding the PGLite brain). The server opens the brain within 5 s of the fix; no restart. | brain host | none | `gbrain mcp expose --status --json` |
 | `verify.local` warn / `local_health_timeout` (exit 2) | The service was installed but `http://127.0.0.1:<port>/health` did not answer within 20s; `verify.tailnet` is skipped. Read `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status`. | brain host | none | `gbrain mcp expose --status --json` |
 | `service: manual` (cloud sandbox, ephemeral container, no user bus) | There is no supervisor to keep the server alive. Run the printed foreground command, or the `nohup ~/.gbrain/serve/gbrain-serve.sh &` line, and re-run `--status`. On Linux without a user bus, `loginctl enable-linger $USER` may enable one. | brain host | none | `gbrain mcp expose --status --json` |
 | `thin_client` (exit 1) — "run on the brain host" | This install is a thin client; `expose` publishes the machine that holds the database. Run it there. | brain host | none | run `--status --json` on the brain host |
@@ -1844,14 +1852,14 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 Easiest path: `bun run ci:local` runs the full CI gate inside Docker (gitleaks,
 guards + typecheck, then 4-shard parallel unit + E2E against four pgvector
 containers plus a transaction-mode PgBouncer; unit phase keeps `DATABASE_URL`
-unset) and tears down. Use `bun run ci:local:diff` for the
-diff-aware subset during fast iteration on a focused branch. Requires Docker
+unset) and tears down. `bun run ci:local:diff` checks a doc-only diff in
+seconds (gitleaks plus the doc checks) and runs the full gate otherwise. Requires Docker
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
 
 Fastest path, with a Ubicloud token (`UBICLOUD_API_KEY` or
 `UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across ten
 ephemeral VMs in about five minutes, uncommitted edits included
-(`ci:ubicloud:diff` for the diff-aware subset). See "Ubicloud fan-out" in
+(`ci:ubicloud:diff` for the doc-only fast path). See "Ubicloud fan-out" in
 [`docs/TESTING.md`](./docs/TESTING.md).
 
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
@@ -1989,11 +1997,10 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
   reverse-writes on the composite key; `validateSourceId` before any `source_id` path join.
 - **One canonical chat-pricing table.** All paid-cloud chat/completion prices live ONCE in
   `src/core/model-pricing.ts` (`CANONICAL_PRICING` + `canonicalLookup`). Every other table
-  (`anthropic-pricing.ts`'s `ANTHROPIC_PRICING`, `takes-quality-eval/pricing.ts`'s
-  `MODEL_PRICING`, the contradictions/cross-modal/skillopt cost views) is a DERIVED view, never
-  a hand-copied duplicate — so cross-table price drift is structurally impossible. Update a
-  price in `model-pricing.ts` only; each consumer keeps its own key allowlist + miss policy
-  (fail-closed vs warn-only vs null), not its own numbers. Pinned by `test/model-pricing.test.ts`
+  (`anthropic-pricing.ts`'s `ANTHROPIC_PRICING`, the contradictions/cross-modal/skillopt cost
+  views) is a DERIVED view, never a hand-copied duplicate — so cross-table price drift is
+  structurally impossible (takes-quality reads `pricing.overrides`, then canonical). Update a
+  price in `model-pricing.ts` only; each consumer keeps its own miss policy, not its own numbers. Pinned by `test/model-pricing.test.ts`
   (drift guard asserts each view equals canonical). Embeddings price separately in
   `embedding-pricing.ts` (different unit).
 - **Module-size ratchet.** `scripts/module-size-limits.tsv` pins per-file line ceilings
@@ -3444,7 +3451,7 @@ stdout (`--json`):
           "options": [
             {
               "id": "wire",
-              "label": "Register `<absolute path to gbrain> serve --surface verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+              "label": "Register `<absolute path to gbrain> serve --surface starter` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
             },
             {
               "id": "skip",
@@ -3623,7 +3630,9 @@ gbrain returns these content blocks:
     }
   },
   "checked_at": "2026-10-03T16:20:00.000Z",
-  "contract_version": 1
+  "contract_version": 1,
+  "surface": "full",
+  "surface_source": "default"
 }
 ```
 
@@ -3831,10 +3840,65 @@ is stateless, so dedupe is per authenticated client and session, and
 `coaching` notices per session. Notices that describe one call's result
 (`empty_retrieval`, `unknown_param`, `listing_truncated`) are never deduped.
 
-**Mute.** Only `coaching` and `info` notices can be muted. The brain's owner
+**Mute.** `coaching` and `info` notices can be muted, plus one `ask`:
+`first_run_decisions`, so an unanswered first-run bundle stays dismissible.
+Every other safety, degraded and ask notice always shows. The brain's owner
 runs `gbrain notices mute <code>` (global; `gbrain notices list` shows the
-muted and muteable codes); a remote client calls `mute_notice {code}` (write
-scope; that client only). Safety, degraded and ask notices always show.
+muted and muteable codes). An MCP client calls `mute_notice {code}` (write
+scope): over HTTP it mutes for that client only; over the owner's stdio pipe
+it mutes for every stdio session on this machine. `gbrain notices unmute
+<code>` clears both the owner's mute and the stdio mute. Under `serve --access
+read-only`, `mute_notice` is not callable, so notice text names the CLI mute
+instead.
+
+**Notices by transport.**
+
+| Notice | stdio MCP (owner's pipe) | HTTP MCP | CLI |
+|---|---|---|---|
+| `onboard_stale_chunks`, `onboard_link_coverage`, `onboard_timeline_coverage`, `onboard_no_takes` | on a call whose result shows the gap (below) | never | `gbrain init` prints `onboard_opportunities`; `gbrain onboard --check` lists every remedy |
+| `features_auto_fix` | on `get_backlinks` / `traverse_graph` while the link graph is empty | never | `gbrain features` |
+| `first_run_decisions` | on the second successful call of a session while a decision is open | never | `gbrain init` |
+| `post_upgrade` | the first session after an upgrade | never | `gbrain post-upgrade` |
+| `backup_coverage` | once per process | never | the CLI startup rail |
+| `degraded_recall`, `empty_retrieval`, `source_binding_narrowed` and the other per-call notices | every affected call | every affected call (redacted) | the command's own notices |
+
+HTTP gets no onboarding coaching because the counts are brain-wide (they cross
+source-scoped grants) and every remedy runs on the brain host, which a remote
+client cannot see. The owner gets the same coaching on stdio, the CLI and
+`gbrain doctor`.
+
+**Onboarding coaching on stdio.** The stdio serve keeps the counts behind
+init's nudge in a per-brain cache (`GBRAIN_HOME/onboard-counts-<brain>.json`,
+6 h TTL) and refreshes them in the background only while no request is in
+flight; a call that arrives while the cache is cold gets no onboarding notice.
+Each opportunity class has its own code, and attaches only to a call whose own
+result shows the limitation:
+
+| Code | Calls | Evidence on the call |
+|---|---|---|
+| `onboard_stale_chunks` | `search`, `query`, `recall`, `context_pack` | the vector arm ran and the brain has unembedded chunks (never on a keyless brain) |
+| `onboard_link_coverage` | `get_backlinks`, `traverse_graph`, `entity` | under 70% of people/company pages have an incoming link (`entity`: this card has no backlinks) |
+| `onboard_timeline_coverage` | `get_timeline`, `entity`, `get_page` | under 90% of people/company pages have timeline entries, and this people/company page has none |
+| `onboard_no_takes` | `think`, `takes_list`, `recall`, `context_pack` | the brain holds no takes |
+
+Each notice names its remedy and its cost in `why` and `user_message` (the
+embedding backfill and takes extraction are paid and need the user's consent;
+link and timeline extraction are local). Its `fix` is a read-only preview:
+`get_health` where that tool is on the session's surface (`next: run`),
+otherwise `gbrain onboard --check` rendered `tell_user_to_run`. CLI remedies
+take the brain lock the stdio serve holds, so run them after the session ends
+or through the running server. An empty brain and `GBRAIN_NO_ONBOARD_NUDGE=1`
+emit nothing.
+
+**First-run decisions on stdio.** An MCP-only agent gets the `writeback` and
+`skills_scaffold` decisions (never `search_mode` or `harness_wiring`) on the
+second successful call of a session, never the first, so the user's own request
+comes first. Finish it, then relay the bundle. Delivering the bundle records
+nothing; it returns in the next session until the decision is answered
+(`memory.auto_writeback` set, the skills scaffolded) or the user mutes
+`first_run_decisions`. `gbrain doctor` (the `memory_writeback` check) and
+`gbrain onboard --check` list decisions that are open but muted, with the
+`gbrain notices unmute first_run_decisions` command.
 
 ## Consent and preapproval
 
@@ -3897,8 +3961,10 @@ model's per-token rates (for example by web search) and register them with
   for consent. To keep writes text-only, use `--no-embed` where the command has
   it, or a keyless brain.
 - **Unattended library paths keep their authorization.** Autopilot, dream
-  cycles and queued jobs keep running under their configured budget; the
-  gates above apply to the explicit CLI invocations only.
+  cycles and other queued jobs keep running under their configured budget;
+  the gates above apply to the explicit CLI invocations only. Consent-gated
+  commands that queue paid jobs carry the user's approval onto every job
+  (next section).
 - **Looking never spends.** Plain `gbrain doctor`, `doctor --only`,
   `--remediation-plan`, MCP `run_doctor`, readiness, `features` without
   `--auto-fix` and `onboard --check` make no provider call: the embedding
@@ -3907,6 +3973,39 @@ model's per-token rates (for example by web search) and register them with
   `consent: ["paid", "egress"]`; one tiny request). Run it only after the
   user agrees. Local providers that bill nothing (ollama, llama-server,
   LM Studio) need no consent for either.
+
+### Queued paid jobs
+
+`gbrain book-mirror`, `gbrain enrich --background` and
+`gbrain jobs submit enrich|subagent` ask for consent before they queue
+anything (exit 3 with the consent payload; `--dry-run` queues nothing and
+needs none). The approval is stored on every job the command queues, never
+in job data, and all of them share one approved total (a spend group). The
+`enrich --background` payload's `fix` already carries `--yes --max-usd
+<derived cap>`, so it runs verbatim once the user agrees.
+
+The worker enforces the group's total on every provider attempt. What you
+see:
+
+| Situation | Outcome |
+|---|---|
+| Sibling jobs' calls in flight fill the group | the job is delayed (no attempt burned) and retried; after 6 retries it dies like exhaustion |
+| The group's settled spend reaches its cap | the job dies with `derived_cap_exhausted` (derived cap) or `cost_cap_exceeded`; its `result.spend_refusal` envelope carries the group's spent, reserved and remaining amounts and a `fix` that reruns the command with twice the cap (`next: ask_user`) |
+| A model with no known price, derived or default cap | runs unmetered and warns `BUDGET_TRACKER_NO_PRICING` |
+| A model with no known price, user cap | dies with `no_pricing` before the provider call; register the rate with `gbrain pricing set` and rerun |
+
+A rerun queues the unfinished work under a new group: completed jobs are
+reused, dead ones are replaced, and still-queued jobs keep their earlier
+approval (the command prints the `gbrain jobs cancel --group <id>` to use
+first if the user wants the new cap to apply). Inspect a group with
+`gbrain jobs list --group <id> --json`; `gbrain jobs get <id> --json` shows
+`spend_basis` (`authorized`, `legacy_default`, `unrecorded`), `spend_why`
+and the group amounts. Jobs of these commands queued before submit-time
+authorization run as `legacy_default` under the $5 default cap (or the
+job's own `--max-usd`); every other job is `unrecorded` and runs under its
+producer's own budget. Spend-authorized jobs run only on upgraded workers:
+an older worker cannot claim them, and `gbrain doctor` warns when such jobs
+wait while workers run.
 
 ### A brain whose automatic repair failed
 
@@ -4071,6 +4170,33 @@ swaps in the full catalog. Harness support varies by version:
 If a tool the fix names is not in your tool list after a recovery, restart the
 gbrain MCP server in the harness (or start a new session).
 
+## A shared HTTP server that cannot open its brain
+
+`gbrain serve --http` whose brain is locked, missing, damaged or unconfigured
+stays up on its port in status-only mode instead of exiting:
+
+- `GET /health` answers `503` with `Retry-After: 5` and the payload
+  `{status, reason, why, fix, user_message, retry_after_s, contract_version, instance}`.
+- `POST /mcp` lists exactly `gbrain_status`; any other tool returns one
+  `serve_status_only` error block. OAuth discovery, `/token`, `/authorize`,
+  `/register` and `/admin*` answer `503` with the `serve_status_only` envelope.
+- Every response is unauthenticated, so `reason` is always `unavailable` and
+  no path, PID or host detail appears. The fix is `gbrain doctor --json` for
+  `actor: host_admin` (`next: tell_user_to_run`): relay `user_message` to the
+  user. The detailed reason is on the brain host: stderr, the marker
+  `GBRAIN_HOME/serve-http-status-<port>.json`, and `gbrain doctor`, whose
+  `harness_wiring` check reports `serve_status_only` (`transport: http`) with
+  the reason's fix.
+- The server re-checks every 5 s and opens the brain in place on the same
+  port. HTTP cannot push `tools/list_changed` to these clients: re-list tools
+  or reconnect. A client that connected during status mode gets `401` with
+  `WWW-Authenticate` and signs in again; an authenticated `gbrain_status` on
+  the recovered server answers `status: recovered`.
+- A thin client (`gbrain` with `remote_mcp`) reports the host's
+  `serve_status_only` envelope from discovery or `/token`, with the same fix.
+- `--fail-fast` or `GBRAIN_SERVE_FAIL_FAST=1` exits non-zero instead, for
+  supervisors and container health checks that must restart the process.
+
 ## First run
 
 `gbrain init` emits one decision bundle instead of scattered prompts: an
@@ -4088,8 +4214,9 @@ Relay the bundle's one `user_message` ("Reply 'defaults' to accept …"); apply
 each answer with the decision's `argv`. Then:
 
 1. Register gbrain with the harness using the `harness_wiring` fix. The
-   registration always uses the absolute gbrain path and `--surface verbs`
-   (for example `claude mcp add gbrain -- /abs/path/gbrain serve --surface verbs`).
+   registration always uses the absolute gbrain path and `--surface starter`
+   (for example `claude mcp add gbrain -- /abs/path/gbrain serve --surface starter`;
+   `gbrain init --surface <verbs|starter|full>` changes the surface it prints).
 2. Run `gbrain doctor --only harness_wiring --json`, a read-only smoke check:
    it reads the registration, then either finds the registered server already
    running or starts it and runs initialize, tools/list and one `recall`.
@@ -4121,8 +4248,14 @@ each with a `fix`.
 - **Backup.** Repo backups exclude database-only pages and facts. When the
   `backup_coverage` notice fires, tell the user what is unprotected.
 - **Surface.** `--surface verbs` (memory verbs), `starter` or `full` decides
-  which tools you see. If a fix names a tool you cannot call, the fix is
-  rendered as `tell_user_to_run` with the CLI command instead.
+  which tools you see; every stdio registration gbrain writes pins `starter`.
+  When you call a real tool outside the session's surface, the `unknown_tool`
+  fix is `request_tools {"surface":"full"}` (`next: run`): it widens this
+  session only, sends `tools/list_changed` and returns the new tools' schemas,
+  so call them by name. Where `request_tools` is not callable (the `verbs`
+  surface, `--access read-only`, or `mcp.allow_session_widen` off), the fix is
+  the CLI equivalent rendered `tell_user_to_run`, and its `why` names the
+  lasting route: `GBRAIN_SURFACE=full` in the env of the harness's MCP server entry for gbrain.
 
 Coach at most once per topic, at a natural point, and never about something
 the user turned off on purpose.
@@ -4189,7 +4322,7 @@ off until the user opts in, and paid enrichment is a separate choice.
 | "validate frontmatter", "check frontmatter", "fix frontmatter", "frontmatter audit", "brain lint" | `skills/frontmatter-guard/SKILL.md` |
 | "what search mode", "is my cache hot", "tune my retrieval", "compare search modes", "clear search overrides" | `gbrain search modes/stats/tune` directly. See `skills/conventions/search-modes.md` |
 | "turn on System One", "enable Jev", "TypeSafe decide", "why is the evidence gate inactive", "turn System One off" | `gbrain decide probe/status/enable/disable` directly (brain host only). See `docs/guides/system-one.md` |
-| "eval results", "search benchmark", "haters-immune methodology", "regression check on retrieval" | `gbrain eval run-all` / `gbrain eval compare`. See `docs/eval/SEARCH_MODE_METHODOLOGY.md` |
+| "eval results", "search benchmark", "haters-immune methodology", "regression check on retrieval" | `gbrain eval longmemeval <dataset.jsonl> --mode <mode> --record` per mode, `gbrain eval run-all` (BrainBench), then `gbrain eval compare`. See `docs/eval/SEARCH_MODE_METHODOLOGY.md` |
 | "bulk delete", "wipe the", "rm -rf", "purge the", "bulk forget" | `skills/data-loss-gate/SKILL.md` |
 | "fact check", "fact-check", "verify the facts", "check the claims" | `skills/fact-check/SKILL.md` |
 | "resolve before asking", "before asking the user", "unidentified contact", "unknown relationship" | `skills/resolve-before-asking/SKILL.md` |
@@ -6030,11 +6163,18 @@ transaction, and the writer publishes the group in one transaction. Every
 page still gets its own write request, receipt, attribution and failure
 report; if one page fails, the pages before it commit, that page is reported,
 and the pages after it are cancelled and re-frozen once it is fixed. Group size
-adapts so a group takes about `sync.bulk_max_txn_ms` (default 15 s); a
-foreground write waits behind at most one group. Turn bulk off with
+adapts so a group takes about `sync.bulk_max_txn_ms` (default 15 s). While a
+group publishes, the drain freezes and admits the next one, so the writer
+starts it as soon as the current group commits. Nothing is admitted ahead
+while foreground writes are recent (one was queued in the last minute), so a
+foreground write waits behind at most the group that is publishing. If a page fails, the group admitted ahead of it is
+cancelled with the reason "An earlier page of the same sync did not commit"
+and re-frozen once the failure is fixed. Turn bulk off with
 `--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
 final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
-`largest_group`). PGLite publishes without network round trips and does not
+`largest_group`, `admitted_ahead`). Finish a drain before downgrading gbrain:
+an older version refuses a group this version admitted ahead, and the sync
+stops there instead of publishing a page twice. PGLite publishes without network round trips and does not
 use bulk groups.
 
 *Written* pages published a change. *Waived* entries needed no write (an
@@ -8352,6 +8492,44 @@ allowlist-validated (alphanumeric + hyphens; no control chars, RTL overrides,
 or backslashes). Local CLI callers (`gbrain files upload ...`) keep
 unrestricted filesystem access since the user owns the machine.
 
+## Status-only mode
+
+A `gbrain serve --http` that cannot open its brain (another serve holds the
+PGLite lock, no brain is configured yet, the brain is missing or damaged, or
+the config is unreadable) keeps its port and answers in status-only mode
+instead of exiting, so a supervisor does not crash-loop it and every client
+sees the cause:
+
+```text
+$ curl -i localhost:3131/health
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Retry-After: 5
+
+{"status":"unavailable","reason":"unavailable","why":"This gbrain server cannot open its brain; its host operator can see why with `gbrain doctor`.","fix":{"argv":["gbrain","doctor","--json"],"command":"gbrain doctor --json","consent":[],"actor":"host_admin","next":"tell_user_to_run",...},"user_message":"The gbrain memory server is running but cannot open its brain, so memory is offline. ...","retry_after_s":5,"contract_version":1,"instance":"<nonce>"}
+```
+
+- `/mcp` offers only `gbrain_status`; OAuth and admin routes answer `503` with
+  the `serve_status_only` envelope. Responses never name the reason, a path or
+  a PID: Tailscale Funnel delivers public requests from a loopback address, so
+  every request is treated as remote.
+- On the host, stderr prints the reason and its fix ("Re-checking every 5 s;
+  Ctrl-C to stop; `--fail-fast` to exit instead"), the marker
+  `GBRAIN_HOME/serve-http-status-<port>.json` records it, and
+  `gbrain doctor --only harness_wiring` reports `serve_status_only` with the
+  fix. `gbrain mcp expose` reports `verify.local` as status-only with the
+  reason.
+- The server re-checks every 5 s and, once the brain opens, serves the full app
+  on the same port. Clients reconnect: a client that connected during status
+  mode receives `401` with `WWW-Authenticate` resource metadata and completes
+  OAuth again.
+- Container health checks that probe `/health` treat the `503` as unhealthy and
+  restart the container. Pass `--fail-fast` (or set `GBRAIN_SERVE_FAIL_FAST=1`)
+  there so the process exits non-zero with the classified envelope on stderr.
+- A second `gbrain serve --http` on a port another server already holds exits
+  with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
+  path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).
+
 ## Deployment Options
 
 Tailscale via `gbrain mcp expose` is the recommended shape for a brain on your
@@ -8572,7 +8750,7 @@ the same registry.
 
 ```bash
 gbrain init --pglite                                      # 2-second local brain
-claude mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs     # the memory-verb surface
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface starter   # the verbs plus page tools
 gbrain remember "gbrain install check" --provenance install-check
 gbrain recall --query "gbrain install check"              # …now ask your agent in a NEW session
 ```
@@ -8587,21 +8765,21 @@ If `claude` is not found: install Claude Code first, or use a block below.
 
 **Codex**
 ```bash
-codex mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs
+codex mcp add gbrain -- "$(command -v gbrain)" serve --surface starter
 ```
 
 **Grok Build** (verify with `grok mcp doctor gbrain` — the add is lazy)
 ```bash
-grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface verbs
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface starter
 ```
 
 **opencode** (verify with `opencode mcp list` — the add is lazy, and list SPAWNS the server)
 ```bash
-opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface verbs
+opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface starter
 ```
 
 **OpenClaw / any stdio MCP host** — register the server command
-`gbrain serve --surface verbs`. Remote brains: `gbrain serve --http` on the
+`gbrain serve --surface starter`. Remote brains: `gbrain serve --http` on the
 host, then `gbrain connect https://host/mcp --token gbrain_xxx --install` on
 each client.
 
@@ -8613,10 +8791,15 @@ verbs plus the daily brain-tool slice, the agent lane, `whoami`, `capture`, and 
 `request_tools` discovery meta-op (re-derivable from production usage via
 `scripts/derive-starter-ops.ts`). Monotonic by construction: verbs ⊆ starter ⊆ full
 (pinned by test) — starter extends the ladder ABOVE verbs and never changes
-verb semantics. `--surface full` (the default) exposes every operation,
-verbs included. Why default full: verbs/starter are for agents and
-quickstarts; full preserves existing advanced tooling. Persist a default
-with `gbrain config set mcp_surface verbs`.
+verb semantics. `--surface full` (the default for a bare `serve`) exposes
+every operation, verbs included. Every stdio registration gbrain writes
+(`gbrain init`'s quickstart, readiness, `gbrain bootstrap hooks`, the plugins)
+pins `starter`, because `verbs` lacks the page reads and writes bootstrap's
+instructions use and `full` puts the whole catalogue in front of the model.
+Persist a default for bare `serve` with `gbrain config set mcp_surface verbs`.
+On stdio, `GBRAIN_SURFACE` in the server's env overrides `--surface`; a
+session widens itself with `request_tools {"surface":"full"}` (see
+`docs/operations/mcp-surface-runbook.md`).
 
 **Ceiling semantics (OAuth HTTP transport):** the server-resolved surface
 is a CEILING, not the final answer. Each request resolves
@@ -8848,7 +9031,7 @@ pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
 All five are absent on threads not backed by a loop row and on servers that
 do not implement them; a server that omits them still certifies. Same propagation to the
 per-entity cards and top-level `open_threads` of `context_pack`.
-- `edges`: top ~10 typed edges, mentions excluded, out-edges first.
+- `edges`: top ~10 typed edges, mentions excluded, out-edges first, live relationships first. Additive fields: `status` (`live`, `ended`, `ended_unknown_date`, `event`, …), `since` / `until` (latest stint). `relationship_note` (additive) summarizes current and ended relationships and flags a summary that still names an ended one ([temporal edges](../guides/temporal-edges.md)).
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
   on a 20K-page corpus. 200K validation recipe below.
 
@@ -9630,6 +9813,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | Symptom | Next step | Who acts | Consent | Verify |
 |---|---|---|---|---|
 | A gbrain call failed with a code you don't recognize | follow `fix.next` ([protocol](../protocol/AGENT_OPERATOR_v1.md)); `gbrain errors <code>` | agent | as the fix's `consent` | the fix's `verify` |
+| A graph read omits a relationship you know existed, or says someone still works somewhere they left | the default read returns relationships true today: repeat with `status: "all"` or `as_of`; to record an end, add a dated timeline line (`Ended works_at [[companies/x]]`) or `add_link ... valid_until` ([temporal edges](temporal-edges.md)) | agent | none | `gbrain doctor --only edge_validity --json` |
 | A command exited 3 (`confirmation_required`) | relay `user_message`; run `fix.command` only after the user agrees | agent, after the user agrees | the payload's `effects` | the fix's `verify` |
 | [Database unreachable or `GBRAIN_DB_ACCESS <reason>`](#database-unreachable) | `gbrain engine status --probe`, then `gbrain db-repair` (diagnose); `gbrain db-repair --yes` applies safe fixes | agent; `--yes` after the user agrees | none to diagnose; `--apply-rewrites` rewrites the config URL (undoable) | `gbrain engine status --probe --json` |
 | [PGLite `RuntimeError: Aborted()` at startup](#pglite-aborted) | automatic repair on the next command; else `gbrain pglite-repair --dry-run`, then `gbrain pglite-repair --yes` | agent; `--yes` after the user agrees | `destructive` (a WAL backup is kept and the restore command printed) | `gbrain doctor --only connection --json` |
@@ -11102,7 +11286,7 @@ safe ones."* or *"After the upgrade my notes source was blocked by one broken
 file. Get it syncing again."*
 
 The session below is real output (volatile ids, hashes and times shown as
-`<id>`, `<hash>`, `<time>`; `test/held-files-walkthrough.serial.test.ts` runs
+`<id>`, `<hash>`, `<time>`; `test/held-files-walkthrough.test.ts` runs
 these commands and checks every line shown). Before the upgrade, a generator
 committed three notes to the `notes` source: `notes/standup.md` with a title
 that continues on an unquoted line, a new `notes/digest.md` with `title:`

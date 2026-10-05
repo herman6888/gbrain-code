@@ -7,6 +7,11 @@
  *     [--rtt 57,0] [--rows cli,reentry,unmanaged,serve,effects,foreground,all,newcomer]
  *     [--max-minutes 20] [--stall-iterations 8] [--pad-words 0] [--receipt-history 0] [--seed 1] [--label <name>] [--out <file.json>]
  *     [--database-url <admin url>] [--pg-port 55432] [--proxy-port 55433] [--api-port 58474] [--keep]
+ *   bun scripts/bench/managed-sync-catchup.ts --analyze <sql-trace.jsonl> [--out <file.json>]
+ *
+ * `--analyze` re-runs the critical-path, group publication and counter-hold
+ * analysis (managed-sync-catchup-phases.ts) on a kept trace, without Docker;
+ * `foreground-{idle,busy}.json` beside the trace add per-put_page round trips.
  *
  * Starts (or reuses) a pgvector Postgres with pg_stat_statements in Docker and
  * a toxiproxy in front of it with `--rtt` milliseconds of round trip split
@@ -45,9 +50,10 @@ import postgres from '#postgres';
 import { generateScaleFixture } from '../scale/fixture.ts';
 import { DEFAULT_JOURNAL_LIMITS } from '../../src/core/persistence/model.ts';
 import {
-  BENCH_SQL, classify, family, flatSql, isTxnControl, groupStatements, measureRtt, pct, readPgStatStatements, readTrace, round1, startEmbeddingStub, startHarness, startLockSampler, sum,
-  normalizeSql, type Harness, type LockSample, type TraceRecord,
+  BENCH_SQL, classify, family, flatSql, isTxnControl, groupStatements, measureRtt, pct, readEffects, readPgStatStatements, readTrace, round1, startEffectsSampler, startEmbeddingStub,
+  startHarness, startLockSampler, sum, normalizeSql, type Harness, type LockSample, type TraceRecord,
 } from './managed-sync-catchup-lib.ts';
+import { criticalPath, foregroundRoundTrips, publicationBreakdown, publishedPages, renderAnalysis } from './managed-sync-catchup-phases.ts';
 
 const REPO = resolve(import.meta.dir, '../..');
 const CLI = join(REPO, 'src/cli.ts');
@@ -57,6 +63,25 @@ function flag(name: string, fallback: string): string {
 }
 const worker = flag('worker', '');
 if (worker) await runWorker(worker);
+const analyze = flag('analyze', '');
+if (analyze) analyzeTrace(resolve(analyze), flag('out', ''));
+
+/** `--analyze`: the trace analysis of a kept row, printed as markdown (and written as JSON with --out). */
+function analyzeTrace(file: string, out: string): never {
+  if (!existsSync(file)) { console.error(`trace not found: ${file}`); process.exit(2); }
+  const records = readTrace(file, r => r.label !== 'setup');
+  const cp = criticalPath(records, publishedPages(records) || null);
+  const pub = publicationBreakdown(records);
+  const foreground: Record<string, unknown> = {};
+  for (const tag of ['idle', 'busy']) {
+    const results = join(dirname(file), `foreground-${tag}.json`);
+    if (existsSync(results)) foreground[tag] = foregroundRoundTrips(records, JSON.parse(readFileSync(results, 'utf8')));
+  }
+  console.log(renderAnalysis(cp, pub));
+  for (const [tag, rt] of Object.entries(foreground)) console.log(`\nForeground ${tag} per put_page: ${JSON.stringify(rt)}`);
+  if (out) { mkdirSync(dirname(resolve(out)), { recursive: true }); writeFileSync(resolve(out), JSON.stringify({ trace: file, critical_path: cp, publication: pub, foreground }, null, 2) + '\n'); }
+  process.exit(0);
+}
 
 const FILES = Number(flag('files', '500'));
 const DELETES = Number(flag('deletes', '34'));
@@ -469,6 +494,8 @@ async function collect(row: RowContext, driven: Driven, locks: LockSample[], mea
       errors: Object.fromEntries([...new Set(records.flatMap(r => r.err ? [`${family(r.label)}:${r.err}`] : []))].map(e => [e, records.filter(r => r.err && `${family(r.label)}:${r.err}` === e).length])),
       top_statements: groupStatements(records, pages, 40),
       re_entry: processBreakdown(records),
+      critical_path: criticalPath(records, pages || null),
+      publication: publicationBreakdown(records),
       pg_stat_statements_calls_ex_txn: pss.calls_ex_txn, traced_executions_ex_txn: traced,
       reconciliation_pct: pss.available && pss.calls_ex_txn ? round1(100 * (traced - pss.calls_ex_txn) / pss.calls_ex_txn) : null,
     },
@@ -507,12 +534,24 @@ async function measure(row: RowContext, drive: () => Promise<Driven>, extra: () 
   await admin(sql => sql.unsafe(BENCH_SQL + ' SELECT pg_stat_statements_reset(0, (SELECT oid FROM pg_database WHERE datname=$1), 0)', [row.db]).catch(() => undefined));
   const measuredRtt = await measureRtt(row.proxyUrl);
   const sampler = startLockSampler(harness.adminUrl, row.db);
+  const effectsSampler = startEffectsSampler(row.directUrl);
   const start = new Date();
   log(`${row.name}@${row.rtt}: measuring (proxy RTT ${measuredRtt} ms, backlog ${row.backlog})`);
   const driven = await drive();
   const more = await extra();
   const locks = await sampler.stop();
-  const result = await collect(row, driven, locks, start, { rtt_measured_ms: measuredRtt, ...more });
+  const backlog = await effectsSampler.stop();
+  const effects = await admin(async sql => ({ ...await readEffects(sql, start),
+    final_backlog: Number((await sql.unsafe(`${BENCH_SQL} SELECT count(*) FILTER (WHERE state IN ('queued','running'))::int AS n FROM persistence_effects`))[0]!.n) }), row.db);
+  const result = await collect(row, driven, locks, start, { rtt_measured_ms: measuredRtt, ...more, effects,
+    effects_backlog: { samples: backlog.length, sample_every_ms: 2000, max: pct(backlog, 100), p50: pct(backlog, 50), final: effects.final_backlog } });
+  const trace = result.trace as { critical_path: Record<string, unknown>; publication: Record<string, unknown> };
+  console.error(renderAnalysis(trace.critical_path, trace.publication));
+  for (const key of ['foreground_idle', 'foreground_during_catchup']) {
+    const fg = result[key] as { round_trips?: unknown } | undefined;
+    if (fg?.round_trips) console.error(`${key} per put_page: ${JSON.stringify(fg.round_trips)}`);
+  }
+  console.error(`effects: ${JSON.stringify(effects)}; backlog ${JSON.stringify(result.effects_backlog)}`);
   const committed = result.entries_committed as number;
   result.db_growth_bytes_per_page = committed ? Math.round(((result.db_size_bytes as number) - sizeBefore) / committed) : null;
   result.cli_is_owner_host = await ownerHost(row);
@@ -587,7 +626,8 @@ async function runRow(name: string, rtt: number): Promise<Record<string, unknown
     let busy: Awaited<ReturnType<typeof foregroundWriter>> | undefined;
     return measure(row, async () => { busy = await foregroundWriter(row, 'busy'); return driveCli(row, syncArgs); }, async () => {
       const busyResults = await busy!.stop();
-      const summarize = (rs: typeof idleResults) => ({ writes: rs.length, p50_ms: pct(rs.map(r => r.ms), 50), p95_ms: pct(rs.map(r => r.ms), 95), failures: rs.filter(r => !r.ok).length,
+      const fgRecords = readTrace(row.trace, r => family(r.label) === 'foreground');
+      const summarize = (rs: typeof idleResults) => ({ writes: rs.length, round_trips: foregroundRoundTrips(fgRecords, rs), p50_ms: pct(rs.map(r => r.ms), 50), p95_ms: pct(rs.map(r => r.ms), 95), failures: rs.filter(r => !r.ok).length,
         lock_timeouts: rs.filter(r => r.code === '55P03' || /lock_timeout|lock timeout/i.test(r.state ?? '')).length,
         failure_codes: Object.fromEntries([...new Set(rs.filter(r => !r.ok).map(r => r.code ?? r.state ?? '?'))].map(c => [c, rs.filter(r => !r.ok && (r.code ?? r.state ?? '?') === c).length])) });
       return { foreground_idle: summarize(idleResults), foreground_during_catchup: summarize(busyResults) };

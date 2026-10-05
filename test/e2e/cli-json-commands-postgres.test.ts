@@ -2,7 +2,7 @@
  * Agent contract v1 (D2): the --json successes that need Postgres — a
  * healthy `db-repair --json` report and `jobs supervisor start --detach
  * --json` (one document naming the detached pid, pid file, status and log).
- * The failure shapes run keyless in test/cli-json-commands.serial.test.ts.
+ * The failure shapes run keyless in test/cli-json-commands.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';

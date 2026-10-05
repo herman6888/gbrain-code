@@ -8,7 +8,7 @@
  * three resolution arms (alias hit / exact title / slug-suffix) + misses.
  *
  * Two gates:
- *   1. HARD ABSOLUTE — p99 < 100ms × GBRAIN_PERF_BUDGET_MULTIPLIER (default 1;
+ *   1. HARD ABSOLUTE — p99 < 100ms × GBRAIN_TEST_PERF_BUDGET_MULTIPLIER (default 1;
  *      loosen in CI only with evidence of runner noise). The protocol DOC
  *      promises this number; the bound is op-layer latency (transport
  *      excluded, as documented).
@@ -58,10 +58,10 @@ const WARMUP = 20;
 const MEASURED = 200;
 const TARGET_ENTITIES = 50; // pages the measured calls rotate over
 
-const P99_BUDGET_MS = 100 * (Number(process.env.GBRAIN_PERF_BUDGET_MULTIPLIER) || 1);
+const P99_BUDGET_MS = 100 * (Number(process.env.GBRAIN_TEST_PERF_BUDGET_MULTIPLIER) || 1);
 // v0.45.7 boundary verbs — MEMORY_VERBS_v1.md promises "zero-LLM, sub-second"
 // for context_pack and delta; same multiplier convention as the entity gate.
-const BOUNDARY_P99_BUDGET_MS = 1000 * (Number(process.env.GBRAIN_PERF_BUDGET_MULTIPLIER) || 1);
+const BOUNDARY_P99_BUDGET_MS = 1000 * (Number(process.env.GBRAIN_TEST_PERF_BUDGET_MULTIPLIER) || 1);
 const BOUNDARY_WARMUP = 10;
 const BOUNDARY_MEASURED = 100; // p99 index 98 — second-largest, not the raw max
 const DELTA_CHANGED_PAGES = 150; // realistic heartbeat slice (spec: ~50-200 changed)

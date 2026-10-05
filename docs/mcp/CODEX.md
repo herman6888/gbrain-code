@@ -50,8 +50,9 @@ sanctioned install location is preferred over PATH so a stray `gbrain` earlier
 on PATH can't shadow it).
 `starter` is the daily-driver surface (the seven memory verbs + daily
 brain ops) — the curated skills drive everything else through the `gbrain`
-CLI. Widen a machine without editing the snapshot: `GBRAIN_SURFACE=full` in
-the env that launches Codex (new sessions pick it up), or use the bootstrap
+CLI. Widen one session with `request_tools {"surface":"full"}` (no restart,
+nothing is written), or every new session on this machine with
+`GBRAIN_SURFACE=full` in the env that launches Codex, or use the bootstrap
 lane below. Unlike the OpenClaw bundle, the plugin ships the host-side skills
 too (setup, migrate, smoke-test, gbrain-upgrade, schema authoring) — a plugin
 user IS the brain host.
@@ -188,9 +189,11 @@ codex mcp remove gbrain
 - The token is a long-lived, full-access secret. Keep `GBRAIN_REMOTE_TOKEN` out of
   version control and prefer a scoped token if your host supports one.
 - Local stdio also works if you run the brain on the same machine:
-  `codex mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs` — the memory-verb
-  protocol ([MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)); drop the flag
-  for the full operation catalog.
+  `codex mcp add gbrain -- "$(command -v gbrain)" serve --surface starter` — the
+  memory verbs ([MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) plus page,
+  timeline-write and skill tools, the surface every registration gbrain writes
+  pins; `--surface full` for the whole operation catalog. A `GBRAIN_SURFACE`
+  value in the Codex server entry's `env` table overrides the flag.
 - **PGLite brains are single-process.** PGLite is a single-writer embedded
   Postgres: the first running `gbrain serve` (the plugin's, or a stdio
   registration) owns the brain's data directory via the data-dir lock. A

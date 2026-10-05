@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { PostgresEngine } from '../src/core/postgres-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { operationsByName } from '../src/core/operations.ts';
@@ -18,9 +17,10 @@ import { waitFor } from './helpers/wait-for.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
-import { assertSafeE2eDatabaseUrl } from './helpers/db-guard.ts';
+import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 
 const engines: BrainEngine[] = [];
+let closePostgres: (() => Promise<void>) | undefined;
 const sourceId = 'managed-memory-concurrency-test';
 const context = (engine: BrainEngine, remote = false): OperationContext => ({ engine, remote, sourceId,
   config: { engine: engine.kind }, dryRun: false, logger: { info() {}, warn() {}, error() {} } });
@@ -36,8 +36,7 @@ beforeAll(async () => {
   configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
   const lite = new PGLiteEngine(); await lite.connect({}); await lite.initSchema(); engines.push(lite);
   if (process.env.DATABASE_URL) {
-    assertSafeE2eDatabaseUrl(process.env.DATABASE_URL);
-    const pg = new PostgresEngine(); await pg.connect({ database_url: process.env.DATABASE_URL, poolSize: 4 }); await pg.initSchema(); engines.push(pg);
+    const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL); engines.push(pg.engine); closePostgres = pg.close;
   }
   for (const engine of engines) {
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
@@ -54,6 +53,7 @@ afterAll(async () => {
     await engine.executeRaw('DELETE FROM sources WHERE id=$1', [sourceId]);
     await engine.disconnect();
   }
+  await closePostgres?.();
   resetGateway();
 });
 

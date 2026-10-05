@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
+import type { PageSnapshot } from '../page-state/types.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
@@ -42,8 +43,18 @@ interface PreparedMutationBase {
   deferEmbedding?: boolean;
   /** Why a page write bound to a worktree publishes no file (receipt `write_through.skipped`). */
   databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only';
-  /** Must perform only transaction-composable database work. */
-  apply(tx: BrainEngine): Promise<Record<string, unknown>>;
+  /**
+   * Must perform only transaction-composable database work. `preimage` (#5984)
+   * is the publisher's read of the page under its page guard, after the revision
+   * check; apply may use it instead of reading the page again.
+   */
+  apply(tx: BrainEngine, preimage?: PageSnapshot | null): Promise<Record<string, unknown>>;
+  /**
+   * #5984: set by apply to its own read of the page (including deleted rows)
+   * after its last write to the page; the publisher takes the receipt revision
+   * and effects from it instead of reading the page again.
+   */
+  postimage?: PageSnapshot | null;
   validate?(tx: BrainEngine): Promise<void>;
 }
 /** A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700. */
@@ -122,6 +133,16 @@ export async function finishUnpublishedFailure(engine: BrainEngine, row: WriteRe
     return (await getWriteRequestById(engine, row.id))!;
   }
   return engine.transaction(tx => completeWrite(tx, row, conflictCode(failure.code) ? 'conflict' : 'failed', {}, failure));
+}
+
+/**
+ * #5984: the page after apply, for the receipt revision and effects: apply's own
+ * read when it kept one and nothing reclassified the page since, else a fresh read.
+ */
+export async function publicationPostimage(tx: BrainEngine, row: WriteRequest, prepared: PreparedMutation): Promise<PageSnapshot | null> {
+  const reclassified = row.authority.databaseOnlyReason === 'unbound_source' || prepared.databaseOnlyReason === 'mirror_read_only';
+  if (prepared.postimage !== undefined && !reclassified) return prepared.postimage;
+  return tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
 }
 
 /** The receipt fields every committed publication carries: revision, persistence mode and write-through. */
@@ -254,11 +275,12 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       if (!current || current.execution_token !== row.execution_token || current.state !== 'running') throw opError('write_claim_lost', 'Execution claim changed before publication.',
         `Another worker took over request ${row.request_id} (its execution claim expired or was reassigned) before this attempt published, so this attempt wrote nothing and the current holder decides the outcome. Inspect the request rather than resubmitting it.`,
         { fix: requestFix(row) });
+      let snapshot: PageSnapshot | null = null;
       if (skill) await assertSharedSkillPersistence(tx, row.source_id);
       else {
         await assertKnowledgePublicationAllowed(tx, row, prepared.file);
         await tx.lockPageKeys([{ sourceId: row.source_id, slug: row.slug },...(prepared.additionalPageKeys??[])]);
-        const snapshot = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+        snapshot = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
         await authorizePageVisibility(tx, row.authority, row.slug);
         if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted page was deleted or recreated.');
         await assertUnboundPublication(tx, row, snapshot?.page.source_path);
@@ -294,10 +316,11 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         });
         await hooks.boundary?.('after_publication', row);
       }
-      const outcome = await withCoordinatedWrite(tx, [row.source_id], () => prepared.apply(tx), requestAttribution(row));
+      prepared.postimage = undefined;
+      const outcome = await withCoordinatedWrite(tx, [row.source_id], () => prepared.apply(tx, snapshot), requestAttribution(row));
       if (!skill) await classifyUnboundPage(tx, row);
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
-      const final = skill ? null : await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+      const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
       await queuePublicationEffects(tx, row, final, outcome, prepared);
       await hooks.boundary?.('before_commit', row);

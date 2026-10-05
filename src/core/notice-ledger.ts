@@ -21,7 +21,9 @@ const MAX_KEYS = 10_000;
 const TTL_MS = 24 * 60 * 60 * 1000;
 export const COACHING_BUDGET_PER_SESSION = 2;
 /** Notices that describe THIS call's result (never deduped): the diagnosis must ride every affected call. */
-export const PER_CALL_NOTICE_CODES: ReadonlySet<string> = new Set(['empty_retrieval', 'unknown_param', 'listing_truncated', 'source_binding_narrowed', 'local_transcripts', 'held_files']);
+/** The one muteable `ask`: an unanswered first-run bundle must stay dismissible. Every other ask always shows. */
+export const MUTEABLE_ASK_CODES: ReadonlySet<string> = new Set(['first_run_decisions']);
+export const PER_CALL_NOTICE_CODES: ReadonlySet<string> = new Set(['empty_retrieval', 'unknown_param', 'listing_truncated', 'former_relationships_hidden', 'source_binding_narrowed', 'local_transcripts', 'held_files', 'relational_chain']);
 
 export interface NoticeAudience {
   transport: Transport;
@@ -54,7 +56,7 @@ export class NoticeLedger {
     const out: Notice[] = [];
     const session = this.session(audience);
     for (const n of notices) {
-      if ((n.kind === 'coaching' || n.kind === 'info') && muted.has(n.code)) continue;
+      if ((n.kind === 'coaching' || n.kind === 'info' || MUTEABLE_ASK_CODES.has(n.code)) && muted.has(n.code)) continue;
       const always = PER_CALL_NOTICE_CODES.has(n.code)
         || (audience.transport === 'http' && (n.kind === 'degraded' || n.kind === 'safety'));
       const key = `${session}|${n.code}`;
@@ -115,10 +117,27 @@ export function setNoticeMuted(code: string, muted: boolean, principal?: string)
   if (muted) list.add(code); else list.delete(code);
   const sorted = [...list].sort();
   if (principal) f.clients[principal] = sorted; else f.global = sorted;
+  writeMuteFile(f);
+  return sorted;
+}
+
+/**
+ * The owner's unmute: clears the code from the global list and from the
+ * stdio MCP pipe's list (`mute_notice` over stdio stores under `stdio`).
+ * Returns the owner's remaining muted codes across both.
+ */
+export function unmuteNoticeForOwner(code: string): string[] {
+  const f = readMuteFile();
+  f.global = f.global.filter(c => c !== code);
+  if (f.clients.stdio) f.clients.stdio = f.clients.stdio.filter(c => c !== code);
+  writeMuteFile(f);
+  return [...new Set([...f.global, ...(f.clients.stdio ?? [])])].sort();
+}
+
+function writeMuteFile(f: MuteFile): void {
   const path = noticeMutePath();
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, `${JSON.stringify(f, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, path);
-  return sorted;
 }

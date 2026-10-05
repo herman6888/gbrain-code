@@ -176,7 +176,7 @@ describe('nightly E2E scheduling', () => {
         writeFileSync(join(bin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         writeFileSync(join(bin, 'bun'), `#!/bin/sh
 case "$*" in
-  "scripts/select-e2e.ts") echo test/e2e/selected.test.ts ;;
+  "scripts/select-e2e.ts --changed-files "*) echo test/e2e/selected.test.ts ;;
   "scripts/e2e-matrix.ts prepare") cat > "$RUNNER_TEMP/received-selection"; echo '{}' ;;
   *) exit 2 ;;
 esac

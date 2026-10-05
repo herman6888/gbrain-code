@@ -12,8 +12,8 @@
 #
 # Determinism: codegen output is sorted lex-stable per primitive and per
 # field. Re-running `bun scripts/generate-gbrain-base.ts` must produce
-# byte-identical output. CI-pinned via
-# test/regressions/gbrain-base-codegen-determinism.test.ts.
+# byte-identical output; `bun scripts/generate-gbrain-base.ts --check`
+# reports drift.
 #
 # Aliases: empty by default. v0.38 ships gbrain-base with NO alias graph
 # edges so existing search behavior is unchanged. Users opt into alias

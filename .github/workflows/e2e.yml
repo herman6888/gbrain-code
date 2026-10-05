@@ -5,6 +5,10 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  # Merge queue (inert until the queue is enabled on master): the PR profile.
+  # prepare-e2e classifies the queued change from the compare API (base_sha...
+  # head_sha). docs/RELEASING.md#merge-queue.
+  merge_group:
   schedule:
     - cron: '0 6 * * *'  # Nightly at 6am UTC
   workflow_dispatch:
@@ -98,24 +102,39 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           # #3485 preload guard: this job intentionally tests against a DB.
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
         # --timeout also raises bun's 5s default hook budget (beforeAll/afterAll
         # do NOT inherit a test's third-arg timeout; verified on bun 1.3.x).
         # Every runner script in scripts/ passes it; bare invocations must too.
         # phantom-redirect rides this job: its Postgres arm is the other
         # engine-parity backstop and no other CI lane carries DATABASE_URL to it
         # (the unit wrappers strip the URL per #3485).
-        run: bun test --timeout=60000 test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts test/phantom-redirect-engine-parity.test.ts
+        run: bash scripts/run-with-receipt.sh jsonb-parity guard -- bun test --timeout=60000 test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts test/phantom-redirect-engine-parity.test.ts
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-jsonb-parity
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
   # Freeze selection before setup; each worker owns a separate Postgres service.
+  # A doc-only pull request selects nothing; every other change selects the
+  # whole corpus minus E2E_EXCLUSIONS (diff narrowing is retired, C6). The
+  # changed files come from the GitHub API, so the checkout stays shallow; an
+  # incomplete list fails closed to the whole corpus.
   prepare-e2e:
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
@@ -124,13 +143,22 @@ jobs:
         shell: bash
         env:
           FULL_CORPUS: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_corpus) }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
           if [ "$FULL_CORPUS" = "true" ]; then
             # Full-profile coverage carries the complete E2E corpus separately.
             : > "$RUNNER_TEMP/selected.txt"
+          elif bash scripts/ci-changed-files.sh > "$RUNNER_TEMP/changed-files.txt"; then
+            bun scripts/select-e2e.ts --changed-files "$RUNNER_TEMP/changed-files.txt" > "$RUNNER_TEMP/selected.txt"
           else
-            git fetch origin master --quiet
-            bun scripts/select-e2e.ts > "$RUNNER_TEMP/selected.txt"
+            echo "Changed-file list incomplete; selecting the full E2E corpus (fail closed)."
+            bun scripts/select-e2e.ts --changed-files /dev/null > "$RUNNER_TEMP/selected.txt"
           fi
           matrix=$(bun scripts/e2e-matrix.ts prepare < "$RUNNER_TEMP/selected.txt")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -149,7 +177,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare-e2e.outputs.matrix) }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    # 2 vCPUs, up to 8 shards (C1): run-e2e.sh runs one bun process at a time,
+    # and a 25-file sample took 442s on 2 cores vs 455s on 4.
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 60
     services:
       postgres:
@@ -191,7 +221,28 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
           E2E_MATRIX_ROW: ${{ toJSON(matrix) }}
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
         run: bun scripts/capture-test-log.ts --job 'Selected E2E (diff-relevant) ${{ matrix.shard }}' --out "$RUNNER_TEMP/e2e.log" -- bun scripts/e2e-matrix.ts run
+      # An empty (doc-only) selection launches nothing; record that the lane
+      # was declared empty so the identity ledger does not read it as missing.
+      - name: Record declared-empty selection
+        if: ${{ matrix.empty }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/receipts"
+          printf '%s\n' version=1 lane=e2e kind=primary tag=declared-empty shard= of= arm= "sha=$GITHUB_SHA" \
+            "run_id=$GITHUB_RUN_ID" "run_attempt=$GITHUB_RUN_ATTEMPT" "job=$GITHUB_JOB" "started=$(date +%s)" declared_empty=1 exit=0 \
+            > "$RUNNER_TEMP/receipts/e2e--declared-empty--primary.receipt"
+          : > "$RUNNER_TEMP/receipts/e2e--declared-empty--primary.files"
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-e2e-${{ matrix.shard }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
       - name: Upload E2E timing log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -222,8 +273,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      # Transaction-mode pooler for the backend-matrix step (same settings as
-      # docker-compose.ci.yml and persistence-validation.yml).
       pgbouncer:
         image: edoburu/pgbouncer:latest
         env:
@@ -282,20 +331,166 @@ jobs:
         # (test/e2e/helpers.ts) as the other DB-backed files on this line.
         # Also added to the E2E_EXCLUSIONS in scripts/e2e-matrix.ts so a PR
         # touching sync.ts doesn't run it a second time there.
-        run: bun test --timeout=60000 test/e2e/mechanical.test.ts test/e2e/job-isolation.test.ts test/e2e/sync-reconcile-postgres.test.ts
+        run: bash scripts/run-with-receipt.sh tier1 mechanical -- bun test --timeout=60000 test/e2e/mechanical.test.ts test/e2e/job-isolation.test.ts test/e2e/sync-reconcile-postgres.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           # #3485 preload guard: this job intentionally tests against a DB.
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
       - name: Run engine parity suite
         # The behavioral parity pin for the two engines (containment-sprint
         # engine peels lean on it). Own invocation line: this suite has only
         # ever run one-process-per-file via run-e2e.sh — do not fold it into
         # the shared-process tier1 line above.
-        run: bun test --timeout=60000 test/e2e/engine-parity.test.ts
+        run: bash scripts/run-with-receipt.sh tier1 engine-parity -- bun test --timeout=60000 test/e2e/engine-parity.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Run engine graduation suites (direct Postgres and PgBouncer)
+        # PGLite -> Postgres graduation (docs/guides/move-to-postgres.md): the
+        # agent flow, stale clients and respawned serves, SIGKILL at every
+        # custody boundary, faults, and the legacy copier. Every PR, with the
+        # transaction-mode pooler as a second target route (pooledUrl).
+        # Excluded from the selected matrix (scripts/e2e-matrix.ts) so they
+        # run once. Named files only, no glob.
+        shell: bash
+        run: bash scripts/run-e2e.sh test/e2e/graduation-cli.test.ts test/e2e/graduation-clients.test.ts test/e2e/graduation-crash.test.ts test/e2e/graduation-faults.test.ts test/e2e/graduation-legacy-copy.test.ts
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_PGBOUNCER_URL: postgresql://postgres:postgres@localhost:55433/gbrain_test?prepare=false
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_DB: '1'
+          E2E_FILE_TIMEOUT_SECS: '900'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_TEST_RECEIPT_LANE: tier1
+      - name: Run multi-agent serve suite
+        # cathedral-6 (T7): multi-agent continuity + isolation over a real
+        # `gbrain serve --http`. Own invocation line (engine-parity
+        # precedent): the file spawns two serves on fixed ports
+        # (19133/19134) and SIGKILLs one mid-hammer — never fold it into the
+        # shared-process tier1 line above. Named files only, no glob.
+        run: bash scripts/run-with-receipt.sh tier1 serve-http-multi-agent -- bun test --timeout=60000 test/e2e/serve-http-multi-agent.test.ts
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Create isolated database for the bootstrap suite
+        # The bootstrap suite rewinds the schema ledger and replays every
+        # migration; replayed constraint-adds (e.g. facts_source_id_fkey)
+        # break on rows earlier tier1 suites legitimately leave in
+        # gbrain_test (the suite's own TRUNCATE list predates facts). The
+        # nightly lane masks this via preceding files' TRUNCATE CASCADE —
+        # here it gets a database of its own instead.
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -d gbrain_test -c 'CREATE DATABASE gbrain_bootstrap_test'
+      - name: Run Postgres bootstrap suite
+        # Forward-reference bootstrap on REAL Postgres (#366/#375/#378, the
+        # v121/#2626 wedge class, v0.46.26 private-queue lifecycle incl. the
+        # token-only probe). Previously reachable only via the nightly
+        # coverage-full-e2e glob, so a broken PostgresEngine bootstrap block
+        # could reach master with every PR lane green. Own invocation line
+        # and its OWN database (see the step above). Named files only, no glob.
+        run: bash scripts/run-with-receipt.sh tier1 postgres-bootstrap -- bun test --timeout=60000 test/e2e/postgres-bootstrap.test.ts
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_bootstrap_test
+          # #3485 preload guard: this job intentionally tests against a DB.
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Run serve-delegated sync suite
+        # Serve-delegated sync (PGLite): a real `gbrain serve` owns the
+        # single-writer lock while real `gbrain sync` subprocesses delegate
+        # through its IPC socket, get SIGKILLed mid-run, and resume. Own
+        # invocation line, and deliberately NO DATABASE_URL — the suite is
+        # PGLite-only (env DATABASE_URL is a live gbrain config source and
+        # would flip the sandboxed brain to Postgres; the file also
+        # self-strips). Named files only, no glob.
+        run: bash scripts/run-with-receipt.sh tier1 sync-delegation -- bun test --timeout=240000 test/e2e/sync-delegation-under-serve.serial.test.ts
+        env:
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Run PGLite inline subagent drain suite
+        # dream-synthesize-pglite pins the inline drain's per-child lease
+        # keepalive (v0.46.26 private-queue lifecycle) — previously nightly-
+        # glob-only, where the keepalive pin broke silently. Deliberately NO
+        # DATABASE_URL: the suite is PGLite-only. Named files only, no glob.
+        run: bash scripts/run-with-receipt.sh tier1 dream-synthesize -- bun test --timeout=120000 test/e2e/dream-synthesize-pglite.test.ts
+        env:
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-tier1
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+
+  # The backend matrix (scripts/e2e-backend-matrix.txt) runs each file on
+  # direct Postgres and again through transaction-mode PgBouncer, one file at
+  # a time, so it needs no more than 4 vCPUs (C5). Split from Tier 1, which
+  # keeps 16 vCPUs for its CLI-spawn timing. It is the PR owner of every
+  # listed test/e2e/ file: scripts/e2e-matrix.ts excludes them from Selected
+  # E2E (C3).
+  tier1-backend-matrix:
+    name: Tier 1 backend matrix (direct + PgBouncer) ${{ matrix.shard }}/2
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    # Two weighted shards: the whole matrix took 715s on one 4-vCPU runner
+    # (the PR critical path); files run sequentially, so a split halves it.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gbrain_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      # Transaction-mode pooler (same settings as docker-compose.ci.yml and
+      # persistence-validation.yml).
+      pgbouncer:
+        image: edoburu/pgbouncer:latest
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          POOL_MODE: transaction
+          AUTH_TYPE: plain
+          MAX_CLIENT_CONN: '200'
+          DEFAULT_POOL_SIZE: '10'
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
+        ports:
+          - 55433:5432
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      # PGLite snapshot (restore-only; test.yml's serial-tests job saves).
+      # run-e2e.sh builds it when absent/stale — this just avoids paying the
+      # build once per job. KEY: byte-identical with the homes in test.yml.
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts') }}
+      - run: bun install --frozen-lockfile
       - name: Run backend matrix (direct Postgres, then PgBouncer)
         # scripts/e2e-backend-matrix.txt: the E5 executor binding matrix and the
         # engine parity files, each run on direct Postgres and again through the
@@ -314,66 +509,18 @@ jobs:
           GBRAIN_CI_REQUIRE_PGBOUNCER: '1'
           GBRAIN_TEST_DB: '1'
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
-      - name: Run engine graduation suites (direct Postgres and PgBouncer)
-        # PGLite -> Postgres graduation (docs/guides/move-to-postgres.md): the
-        # agent flow, stale clients and respawned serves, SIGKILL at every
-        # custody boundary, faults, and the legacy copier. Every PR, with the
-        # transaction-mode pooler as a second target route (pooledUrl).
-        # Excluded from the selected matrix (scripts/e2e-matrix.ts) so they
-        # run once. Named files only, no glob.
-        shell: bash
-        run: bash scripts/run-e2e.sh test/e2e/graduation-cli.test.ts test/e2e/graduation-clients.test.ts test/e2e/graduation-crash.test.ts test/e2e/graduation-faults.test.ts test/e2e/graduation-legacy-copy.test.ts
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
-          GBRAIN_PGBOUNCER_URL: postgresql://postgres:postgres@localhost:55433/gbrain_test?prepare=false
-          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
-          GBRAIN_TEST_DB: '1'
-          E2E_FILE_TIMEOUT_SECS: '900'
-      - name: Run multi-agent serve suite
-        # cathedral-6 (T7): multi-agent continuity + isolation over a real
-        # `gbrain serve --http`. Own invocation line (engine-parity
-        # precedent): the file spawns two serves on fixed ports
-        # (19133/19134) and SIGKILLs one mid-hammer — never fold it into the
-        # shared-process tier1 line above. Named files only, no glob.
-        run: bun test --timeout=60000 test/e2e/serve-http-multi-agent.test.ts
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
-          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
-      - name: Create isolated database for the bootstrap suite
-        # The bootstrap suite rewinds the schema ledger and replays every
-        # migration; replayed constraint-adds (e.g. facts_source_id_fkey)
-        # break on rows earlier tier1 suites legitimately leave in
-        # gbrain_test (the suite's own TRUNCATE list predates facts). The
-        # nightly lane masks this via preceding files' TRUNCATE CASCADE —
-        # here it gets a database of its own instead.
-        run: PGPASSWORD=postgres psql -h localhost -U postgres -d gbrain_test -c 'CREATE DATABASE gbrain_bootstrap_test'
-      - name: Run Postgres bootstrap suite
-        # Forward-reference bootstrap on REAL Postgres (#366/#375/#378, the
-        # v121/#2626 wedge class, v0.46.26 private-queue lifecycle incl. the
-        # token-only probe). Previously reachable only via the nightly
-        # coverage-full-e2e glob, so a broken PostgresEngine bootstrap block
-        # could reach master with every PR lane green. Own invocation line
-        # and its OWN database (see the step above). Named files only, no glob.
-        run: bun test --timeout=60000 test/e2e/postgres-bootstrap.test.ts
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_bootstrap_test
-          # #3485 preload guard: this job intentionally tests against a DB.
-          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
-      - name: Run serve-delegated sync suite
-        # Serve-delegated sync (PGLite): a real `gbrain serve` owns the
-        # single-writer lock while real `gbrain sync` subprocesses delegate
-        # through its IPC socket, get SIGKILLed mid-run, and resume. Own
-        # invocation line, and deliberately NO DATABASE_URL — the suite is
-        # PGLite-only (env DATABASE_URL is a live gbrain config source and
-        # would flip the sandboxed brain to Postgres; the file also
-        # self-strips). Named files only, no glob.
-        run: bun test --timeout=240000 test/e2e/sync-delegation-under-serve.serial.test.ts
-      - name: Run PGLite inline subagent drain suite
-        # dream-synthesize-pglite pins the inline drain's per-child lease
-        # keepalive (v0.46.26 private-queue lifecycle) — previously nightly-
-        # glob-only, where the keepalive pin broke silently. Deliberately NO
-        # DATABASE_URL: the suite is PGLite-only. Named files only, no glob.
-        run: bun test --timeout=120000 test/e2e/dream-synthesize-pglite.test.ts
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_TEST_RECEIPT_LANE: backend-matrix
+          SHARD: ${{ matrix.shard }}/2
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-tier1-backend-matrix-${{ matrix.shard }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
   tier2:
     name: Tier 2 (LLM Skills)
@@ -467,13 +614,29 @@ jobs:
           }
           EOF
       - name: Run Tier 2 skill tests
-        run: bun test --timeout=60000 test/e2e/skills.test.ts
+        run: bash scripts/run-with-receipt.sh tier2 skills -- bun test --timeout=60000 test/e2e/skills.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           # #3485 preload guard: this job intentionally tests against a DB.
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-tier2
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Provider-key coverage notice
+        if: ${{ !cancelled() }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: bash scripts/e2e-provider-key-notice.sh
 
   # ──────────────────────────────────────────────────────────────────────
   # Full coverage pipeline (scheduled or explicitly dispatched). The honest
@@ -502,6 +665,17 @@ jobs:
         run: scripts/test-shard.sh ${{ matrix.shard }} 10
         env:
           COVERAGE_DIR: ${{ runner.temp }}/coverage
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_TEST_RECEIPT_LANE: full-unit
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-full-unit-${{ matrix.shard }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -525,6 +699,17 @@ jobs:
       - run: bun run test:serial
         env:
           COVERAGE_DIR: ${{ runner.temp }}/coverage
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_TEST_RECEIPT_LANE: full-serial
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-full-serial
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -546,7 +731,6 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       # Separate coverage dirs per bun process (a reused dir is overwritten).
-      - run: bun test test/eval-longmemeval-e2e.slow.test.ts --timeout=60000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/slow-a
       - run: bun test test/entity-resolve-perf.slow.test.ts --timeout=300000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/slow-b
       - run: bun test test/entity-card-perf.slow.test.ts --timeout=300000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/slow-c
       - run: bun test test/eval-brainbench-e2e.slow.test.ts --timeout=300000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/slow-d
@@ -635,6 +819,23 @@ jobs:
           E2E_FILE_TIMEOUT_SECS: '300'
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_TEST_RECEIPT_LANE: full-e2e
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-full-e2e-${{ matrix.shard }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Provider-key coverage notice
+        if: ${{ !cancelled() }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: bash scripts/e2e-provider-key-notice.sh
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -706,10 +907,53 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
 
+  # Report-only executed-test ledger (X2) plus the A9 missing-key line: every
+  # lane's receipts in one identity table (step summary + JSON artifact). Not
+  # in e2e-status; baseline comparisons run locally with
+  #   bun scripts/ci-executed-counts.ts --base-run <id> --head-run <id>
+  executed-receipts:
+    needs: [jsonb-parity, tier1, tier1-backend-matrix, tier2, selected-e2e, coverage-full-unit, coverage-full-serial, coverage-full-e2e]
+    if: always()
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.2
+      - name: Download receipts
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: receipts-*
+          path: ${{ runner.temp }}/receipts
+      - name: Executed-test identities and missing-key skips → step summary (report-only)
+        # Selected E2E never receives provider keys; Tier 2 and the nightly
+        # full E2E receive the repo secrets, which may be unset (A9).
+        env:
+          OPENAI_SET: ${{ secrets.OPENAI_API_KEY != '' }}
+          ANTHROPIC_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/receipts"
+          state() { [ "$1" = true ] && echo set || echo unset; }
+          echo "Provider secrets: OPENAI_API_KEY $(state "$OPENAI_SET"), ANTHROPIC_API_KEY $(state "$ANTHROPIC_SET"). Selected E2E runs without provider keys by design." >> "$GITHUB_STEP_SUMMARY"
+          bun scripts/ci-executed-counts.ts --head-dir "$RUNNER_TEMP/receipts" --report-only \
+            --expect-attempt "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" --missing-keys OPENAI_API_KEY,ANTHROPIC_API_KEY \
+            --summary "$GITHUB_STEP_SUMMARY" --json "$RUNNER_TEMP/executed-identities.json" > /dev/null
+      - name: Upload identity ledger
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: executed-identities
+          path: ${{ runner.temp }}/executed-identities.json
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+
   # The stable aggregate includes full-profile execution lanes when requested.
   # Coverage reporting itself remains advisory; failed tests never do.
   e2e-status:
-    needs: [jsonb-parity, tier1, tier2, prepare-e2e, selected-e2e, coverage-full-unit, coverage-full-serial, coverage-full-slow, coverage-full-e2e]
+    needs: [jsonb-parity, tier1, tier1-backend-matrix, tier2, prepare-e2e, selected-e2e, coverage-full-unit, coverage-full-serial, coverage-full-slow, coverage-full-e2e]
     if: always()
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
@@ -720,13 +964,14 @@ jobs:
         run: |
           JSONB="${{ needs.jsonb-parity.result }}"
           TIER1="${{ needs.tier1.result }}"
+          BACKEND_MATRIX="${{ needs.tier1-backend-matrix.result }}"
           TIER2="${{ needs.tier2.result }}"
           PREPARE="${{ needs.prepare-e2e.result }}"
           SELECTED="${{ needs.selected-e2e.result }}"
           EVENT="${{ github.event_name }}"
           echo "event=$EVENT"
-          echo "jsonb-parity=$JSONB  tier1=$TIER1  tier2=$TIER2  prepare-e2e=$PREPARE  selected-e2e=$SELECTED"
-          for r in "$JSONB" "$TIER1" "$TIER2" "$PREPARE" "$SELECTED"; do
+          echo "jsonb-parity=$JSONB  tier1=$TIER1  tier1-backend-matrix=$BACKEND_MATRIX  tier2=$TIER2  prepare-e2e=$PREPARE  selected-e2e=$SELECTED"
+          for r in "$JSONB" "$TIER1" "$BACKEND_MATRIX" "$TIER2" "$PREPARE" "$SELECTED"; do
             if [ "$r" != "success" ]; then
               echo "✗ gated e2e job did not succeed (got $r) — E2E fail"
               exit 1

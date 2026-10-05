@@ -4,7 +4,7 @@
  * Ubicloud VMs.
  *
  *   bun run ci:ubicloud                 # gitleaks + verify + serial + slow + unit + ALL E2E
- *   bun run ci:ubicloud:diff            # same, E2E narrowed by select-e2e (doc-only: gitleaks only)
+ *   bun run ci:ubicloud:diff            # doc-only diff: doc checks + gitleaks; any other diff: the full gate
  *
  * Options:
  *   --vms N            VMs to provision in parallel (default 4: 64 vCPUs of the
@@ -13,7 +13,7 @@
  *   --slots N          concurrent work slots per VM (default: half of --size's vCPUs)
  *   --location LOC     Ubicloud location (default eu-central-h1)
  *   --lanes a,b        subset of gitleaks,verify,serial,slow,unit,e2e (default all)
- *   --diff             select E2E files from the branch diff (ci:local --diff)
+ *   --diff             doc-only diffs run only the doc checks and gitleaks (ci:local --diff)
  *   --record-weights   write measured durations to scripts/ubicloud/weights.json
  *   --keep             leave the VMs running (destroy with ubi-runner.sh down NAME)
  *
@@ -186,16 +186,16 @@ async function main() {
   mkdirSync(join(runDir, "failures"), { recursive: true });
 
   // ── Inventory: the same discovery the ci:local wrappers use ───────────────
-  let e2eFiles = lines(sh("bash", ["scripts/run-e2e.sh", "--dry-run-list"]));
+  const e2eFiles = lines(sh("bash", ["scripts/run-e2e.sh", "--dry-run-list"]));
   if (opts.diff) {
     const classification = spawnSync("bun", ["run", "scripts/select-e2e.ts", "--classify-only"], { cwd: ROOT, encoding: "utf8" }).stdout?.trim();
     if (classification === "DOC_ONLY") {
-      log("--diff: doc-only diff — running gitleaks only (ci:local Tier 2 fast-path)");
+      log("--diff: doc-only diff — running the doc checks locally, then gitleaks (ci:local doc-only fast-path)");
+      if (spawnSync("bash", ["scripts/ci-doc-checks.sh"], { cwd: ROOT, stdio: "inherit" }).status !== 0) process.exit(1);
       opts.lanes = new Set(["gitleaks"]);
       opts.vms = 1;
     } else {
-      log(`--diff: classification ${classification || "unknown"} — full unit lanes + selected E2E`);
-      e2eFiles = lines(sh("bun", ["run", "scripts/select-e2e.ts"]));
+      log(`--diff: E2E narrowing is retired; running the full E2E corpus (see docs/TESTING.md#e2e-selection). Classification: ${classification || "unknown"}`);
     }
   }
   const exclusive = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list-exclusive"]));

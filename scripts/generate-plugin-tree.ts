@@ -20,8 +20,9 @@
  * _brain-filing-rules.json) always ship, mirroring the openclaw bundler.
  *
  * Starter-surface gap snapshot: each bundled skill's frontmatter `tools:`
- * list is compared against STARTER_OPS (the plugin lanes serve
- * `--surface starter`). Harness tools (shell/exec/read/write/edit/
+ * list is compared against the REGISTRATION_SURFACE op set (the plugin lanes
+ * serve `--surface starter`, the surface every stdio registration gbrain
+ * writes pins; the root plugin manifests must pin the same value). Harness tools (shell/exec/read/write/edit/
  * web_search/web_fetch), literal `gbrain` (CLI usage marker), and unknown
  * non-op names are not MCP ops; `mcp:`-prefixed names count with the prefix
  * stripped. The computed per-skill gap set must equal the `starter_gaps`
@@ -38,7 +39,8 @@
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
-import { STARTER_OPS } from '../src/mcp/surface.ts';
+import { allowedOpNames } from '../src/mcp/surface.ts';
+import { REGISTRATION_SURFACE } from '../src/core/mcp-registration.ts';
 import { operations } from '../src/core/operations.ts';
 import { cliEquivalent } from '../src/core/ops/cli-equivalent.ts';
 import { parseSkillFrontmatter } from '../src/core/skill-frontmatter.ts';
@@ -130,6 +132,7 @@ try {
 }
 
 // ── Starter-gap snapshot ────────────────────────────────────────────────────
+const SURFACE_OPS = allowedOpNames(operations, REGISTRATION_SURFACE);
 // Harness-native tool names a skill may declare that are not gbrain MCP ops.
 const HARNESS_TOOLS = new Set(['shell', 'exec', 'read', 'write', 'edit', 'web_search', 'web_fetch', 'gbrain']);
 
@@ -150,7 +153,7 @@ function starterGaps(slug: string): string[] {
     // Multi-word entries ("gbrain schema add-type …") are CLI command
     // strings, not MCP op names — same class as the bare `gbrain` marker.
     .filter(t => !HARNESS_TOOLS.has(t) && !t.startsWith('gbrain '));
-  return [...new Set(mcpOps.filter(t => !STARTER_OPS.has(t)))].sort();
+  return [...new Set(mcpOps.filter(t => !SURFACE_OPS.has(t)))].sort();
 }
 
 const computedGaps: Record<string, string[]> = {};
@@ -172,10 +175,10 @@ function surfaceNote(gaps: readonly string[]): string {
   });
   return [
     '', '## Tools outside your MCP surface', '',
-    'This plugin serves the starter tool surface. When a step above names one of these tools and your tool list',
-    'does not have it, run its gbrain CLI equivalent instead:', '',
+    `This plugin serves the ${REGISTRATION_SURFACE} tool surface. When a step above names one of these tools and your tool list`,
+    'does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:', '',
     ...rows, '',
-    "Or widen this machine's plugin surface with GBRAIN_SURFACE=full (new sessions pick it up).", '',
+    "To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.", '',
   ].join('\n');
 }
 
@@ -204,6 +207,19 @@ if (writeGaps) {
         '`bun run scripts/generate-plugin-tree.ts --out plugin --write-gaps`.',
     );
   }
+}
+
+// The root plugin manifests (copied into every variant) must pin the registration surface.
+function pinnedSurface(args: unknown): string | undefined {
+  if (!Array.isArray(args)) return undefined;
+  const i = args.indexOf('--surface');
+  return i >= 0 ? String(args[i + 1]) : undefined;
+}
+for (const file of ['.codex-plugin/mcp.json', '.claude-plugin/plugin.json']) {
+  if (!existsSync(join(ROOT, file))) continue;
+  const servers = (JSON.parse(readFileSync(join(ROOT, file), 'utf8')) as { mcpServers?: Record<string, { args?: unknown }> }).mcpServers;
+  const pinned = pinnedSurface(servers?.gbrain?.args);
+  if (pinned !== REGISTRATION_SURFACE) fail(`${file} pins --surface ${pinned ?? '(none)'}; plugin lanes serve the registration surface '${REGISTRATION_SURFACE}' (src/core/mcp-registration.ts)`);
 }
 
 if (failed) process.exit(1);
@@ -253,15 +269,16 @@ addition/exclusion).
 
 ## MCP surface note (read once)
 
-The plugin's MCP server runs \`gbrain serve --surface starter\` — the
-${STARTER_OPS.size}-op daily-driver surface (the seven memory verbs + daily
-brain ops + capture). ${gapSkills}
+The plugin's MCP server runs \`gbrain serve --surface ${REGISTRATION_SURFACE}\` — the
+${SURFACE_OPS.size}-op daily-driver surface (the seven memory verbs + daily
+brain ops + capture), the same surface every stdio registration gbrain writes
+pins. ${gapSkills}
 bundled skills reference gbrain operations beyond that surface; every one of
 them has a first-class \`gbrain\` CLI path, which is the primary way skills
 drive gbrain. When a skill step names an operation your MCP tool list doesn't
-carry, run the equivalent \`gbrain\` CLI command, or widen this machine's
-plugin surface with \`GBRAIN_SURFACE=full\` (the launcher honors it; new
-sessions pick it up).
+carry, call \`request_tools {"surface":"full"}\` to add it to this session, run
+the equivalent \`gbrain\` CLI command, or widen this machine's plugin surface
+with \`GBRAIN_SURFACE=full\` (the server honors it; new sessions pick it up).
 
 ## Requirements
 

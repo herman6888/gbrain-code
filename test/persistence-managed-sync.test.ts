@@ -25,6 +25,8 @@ import { withEnv } from './helpers/with-env.ts';
 import { prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { loadSyncFailures, syncFailuresPath } from '../src/core/sync-failure-ledger.ts';
+import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-sync-'));
 const engines: BrainEngine[] = [];
@@ -730,3 +732,35 @@ test('the waiver lookup for unfinished page requests is served by the request in
     expect(text).not.toContain('Seq Scan');
   }
 }, 60_000);
+
+test('a fact withdrawn between sync preparation and canonical file writeback conflicts without publishing', async () => withEnv({GBRAIN_HOME:home},async()=>{
+  for(const engine of engines){
+    const f=await fixture(engine,{'a.md':'An original observation before the withdrawal race.\n'});
+    await performManagedSync(engine,{sourceId:f.id,noPull:true,noEmbed:true,noExtract:true});
+    await disposePersistenceConsumer(engine);
+    await engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],()=>tx.addTag('a','database-only-tag',{sourceId:f.id}),TEST_WRITE_ATTRIBUTION));
+    const base=(await engine.readPageSnapshot('a',{sourceId:f.id}))!;
+    const claim='withdrawn between managed sync preparation and publication';
+    const content=`Facts: ${renderFactsTable([{rowNum:1,claim,kind:'fact',confidence:1,visibility:'world',notability:'medium',active:true,context:'test evidence'}])}\n`;
+    writeFileSync(join(f.root,'a.md'),content); const target=commit(f.root);
+    const binding=(await getWorktreeBinding(engine,f.id))!;
+    const authority=await managedSyncAuthority(engine,f.id,binding.source_incarnation,f.root);
+    const intent:SyncIntent={kind:'managed_sync_import',processingOptions:{noEmbed:true,noExtract:true,noSchemaPack:false},expected_revision:base.revision,sourcePath:'a.md',path:'a.md',rawHash:sha256(content),content,
+      ownerEpoch:String(binding.owner_epoch),syncAuthority:authority,cursorKey:'test-cursor',runId:randomUUID(),index:0,total:1,from:f.head,target,slugMode:'git-root'};
+    await admitWrite(engine,{requestId:randomUUID(),operation:'submit_job',sourceId:f.id,sourceIncarnation:binding.source_incarnation,slug:'a',pageId:base.page.id,
+      worktreeId:binding.worktree_id,topologyGeneration:binding.topology_generation,principal:authority.writer.principal,authority:authority.writer,callerIntent:intent,intent});
+    const claimed=(await claimNextWrite(engine,localHostId()))!;
+    const prepared=await prepareManagedSyncMutation(engine,claimed,{engine:engine.kind});
+    expect(prepared.file?.content).toContain(claim);
+    const fact=await engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],()=>
+      tx.insertFact({fact:claim,source:'remember',visibility:'world'},{source_id:f.id}),TEST_WRITE_ATTRIBUTION));
+    await engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],()=>recordFactWithdrawal(tx,fact.id,f.id,true),TEST_WRITE_ATTRIBUTION));
+    const boundaries:string[]=[];
+    const outcome=await publishMutation(engine,claimed,prepared,localHostId(),{boundary:async name=>{boundaries.push(name);},fileBoundary:name=>{boundaries.push(name);}});
+    expect(outcome).toMatchObject({state:'conflict',error_code:'revision_conflict'});
+    expect(boundaries).not.toContain('before_publication');
+    expect(boundaries).not.toContain('before_file');
+    expect(readFileSync(join(f.root,'a.md'),'utf8')).toBe(content);
+    expect((await engine.readPageSnapshot('a',{sourceId:f.id}))?.revision).toBe(base.revision);
+  }
+}),120_000);

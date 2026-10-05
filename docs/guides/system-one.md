@@ -693,5 +693,12 @@ gbrain decide judge-agreement --suite <longmemeval|grounding> --input <file> [--
   output, or grounding labels) and reports Cohen's kappa. It needs no brain,
   and nothing is substituted at runtime.
 
+Know-to-ask (`recall_needed`) turn latency: `bun scripts/bench-s6-turn-context.ts
+[--rounds 3] [--delays-ms 120,160,300] [--json]` replays every BrainBench
+know-to-ask turn through the hook's turn-context path in an in-memory brain,
+with S6 off and then on against a fixture transport drawing delays from a
+measured latency sample, and reports p50/p95/p99, the added latency per turn,
+the outcome mix and the deadline miss rate. It calls no provider.
+
 Row and summary fields: [`docs/eval-bench.md`](../eval-bench.md#system-one-arms---decide).
 Protocols and verdicts: [`docs/eval/system-one/`](../eval/system-one/).

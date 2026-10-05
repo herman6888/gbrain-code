@@ -13,7 +13,7 @@
  * `--if-version` compare-and-set (8); `--migrate-legacy` previews without
  * writing and never changes an effective grant (10). Doctor counts both.
  * The CLI aliases, client path and rotation live in
- * test/auth-rescope-unified.serial.test.ts.
+ * test/auth-rescope-unified.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';

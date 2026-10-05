@@ -228,6 +228,13 @@ export async function scanFeatures(engine: BrainEngine): Promise<FeatureScanResu
   };
 }
 
+/** The recommendations `gbrain features` would pitch to this user now; reads the offer state, never writes it. */
+export async function pitchableFeatures(engine: BrainEngine): Promise<FeatureRecommendation[]> {
+  const scan = await scanFeatures(engine);
+  const offers = loadOffers();
+  return scan.recommendations.filter(r => shouldPitch(r, offers, scan.version));
+}
+
 // --- Auto-fix ---
 
 async function executeAutoFix(rec: FeatureRecommendation, engine: BrainEngine): Promise<{ success: boolean; output: string }> {
@@ -362,8 +369,8 @@ export async function runFeatures(engine: BrainEngine, args: string[]) {
 /** Auto-fixes that embed (paid): they need the user's approval (--yes, --max-usd, --max-cost, tokenmax or a preapproval). */
 const PAID_AUTO_FIX_IDS: ReadonlySet<string> = new Set(['missing-embeddings', 'low-coverage']);
 
-/** F7: the `features_auto_fix` coaching notice; null when nothing is auto-fixable. */
-function featuresAutoFixNotice(pitchable: readonly FeatureRecommendation[]): Notice | null {
+/** F7: the `features_auto_fix` coaching notice; null when nothing is auto-fixable. Pure: the CLI and the stdio onboarding cache share it. */
+export function featuresAutoFixNotice(pitchable: readonly FeatureRecommendation[]): Notice | null {
   const fixable = pitchable.filter(r => r.auto_fixable);
   if (fixable.length === 0) return null;
   const paid = fixable.some(r => PAID_AUTO_FIX_IDS.has(r.id));

@@ -532,6 +532,10 @@ CREATE TABLE IF NOT EXISTS links (
   -- extraction time. NULL for legacy/manual/frontmatter edges.
   resolution_type TEXT   CHECK (resolution_type IS NULL OR resolution_type IN ('qualified', 'unqualified')),
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Temporal typed edges: tense of the assertion on its origin page ('past' for
+  -- "previously at", "former CTO of"); NULL = present. Temporal state lives in
+  -- link_transitions / link_relationships (src/core/link-temporal-schema.ts).
+  assertion_tense TEXT   CONSTRAINT links_assertion_tense_check CHECK (assertion_tense IS NULL OR assertion_tense IN ('present', 'past')),
   -- NULLS NOT DISTINCT (PG15+) so two rows with link_source IS NULL or
   -- origin_page_id IS NULL collide as expected. Without this, every row with
   -- NULL origin_page_id (markdown/manual edges) would be treated as unique.
@@ -1646,6 +1650,9 @@ BEGIN
     IF NEW.submission_authority IS NULL OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation + 1 THEN
       RAISE EXCEPTION 'Minion queue protocol 1 required: old workers cannot claim upgraded queue jobs';
     END IF;
+    IF NEW.spend_authorization IS NOT NULL AND NEW.spend_claim_token IS DISTINCT FROM NEW.claim_generation THEN
+      RAISE EXCEPTION 'Minion spend protocol 1 required: only upgraded workers can claim spend-authorized jobs; restart workers on the upgraded binary';
+    END IF;
   ELSIF NEW.claim_generation IS DISTINCT FROM OLD.claim_generation THEN
     RAISE EXCEPTION 'Minion queue claim generation may advance only with a claim';
   END IF;
@@ -2577,6 +2584,89 @@ DO $rls$ BEGIN
   END IF;
 END $rls$;
 -- END GENERATED from src/core/facts/relink-schema.ts (FACT_RELINK_SCHEMA_SQL)
+
+-- Temporal typed edges: dated evidence, derived relationship state, proposals.
+-- BEGIN GENERATED from src/core/link-temporal-schema.ts (LINK_TEMPORAL_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS link_transitions (
+  id              BIGSERIAL PRIMARY KEY,
+  source_id       TEXT NOT NULL,
+  from_page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  to_page_id      INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type       TEXT NOT NULL,
+  kind            TEXT NOT NULL CHECK (kind IN ('start','end')),
+  occurred_on     DATE NOT NULL,
+  date_precision  TEXT NOT NULL DEFAULT 'day' CHECK (date_precision IN ('day','month','year')),
+  producer        TEXT NOT NULL CHECK (producer IN ('timeline','explicit','frontmatter','manual','inline','dream')),
+  origin_page_id  INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+  line_hash       TEXT NOT NULL DEFAULT '',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS link_transitions_identity_idx
+  ON link_transitions (origin_page_id, from_page_id, to_page_id, link_type, kind, occurred_on, producer) NULLS NOT DISTINCT;
+CREATE INDEX IF NOT EXISTS link_transitions_relationship_idx ON link_transitions (from_page_id, to_page_id, link_type);
+CREATE INDEX IF NOT EXISTS link_transitions_origin_idx ON link_transitions (origin_page_id);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE link_transitions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS link_relationships (
+  from_page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  to_page_id      INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type       TEXT NOT NULL,
+  scope           TEXT NOT NULL CHECK (scope IN ('all','world')),
+  source_id       TEXT NOT NULL,
+  semantics       TEXT NOT NULL CHECK (semantics IN ('state','event')),
+  valid_ranges    DATEMULTIRANGE NOT NULL,
+  status_now      TEXT NOT NULL CHECK (status_now IN ('live','ended','ended_unknown_date','not_started','disputed','event')),
+  first_start     DATE,
+  last_start      DATE,
+  last_end        DATE,
+  undated_present INTEGER NOT NULL DEFAULT 0,
+  undated_past    INTEGER NOT NULL DEFAULT 0,
+  disputed        BOOLEAN NOT NULL DEFAULT false,
+  recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retired_at      TIMESTAMPTZ,
+  evidence_hash   TEXT NOT NULL,
+  refreshed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (from_page_id, to_page_id, link_type, scope)
+);
+CREATE INDEX IF NOT EXISTS link_relationships_to_idx ON link_relationships (to_page_id, link_type, scope);
+CREATE INDEX IF NOT EXISTS link_relationships_source_idx ON link_relationships (source_id, status_now);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE link_relationships ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS link_edge_proposals (
+  id                 BIGSERIAL PRIMARY KEY,
+  source_id          TEXT NOT NULL,
+  from_page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  a_to_page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  b_to_page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type          TEXT NOT NULL,
+  evidence_hash      TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN ('proposed','applied','rejected','undone','stale','reverted_by_user','undated_unresolved','ambiguous_same_date','compatible','error')),
+  ending_to_page_id  INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+  close_date         DATE,
+  born_closed        BOOLEAN NOT NULL DEFAULT false,
+  model              TEXT,
+  confidence         REAL,
+  cost_usd           REAL,
+  generated_line     TEXT,
+  detail             TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (from_page_id, a_to_page_id, b_to_page_id, link_type, evidence_hash)
+);
+CREATE INDEX IF NOT EXISTS link_edge_proposals_status_idx ON link_edge_proposals (source_id, status, created_at);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE link_edge_proposals ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE SEQUENCE IF NOT EXISTS graph_generation_seq;
+-- END GENERATED from src/core/link-temporal-schema.ts (LINK_TEMPORAL_SCHEMA_SQL)
 
 -- #5255/#5176 (O-DX-8): last upstream observation per source, recorded by sync
 -- from the checkout's Git state (upstream ref, its last fetch/push time, commits

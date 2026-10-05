@@ -13,7 +13,7 @@
  * flag stops being validated, or a valid / string-typed value is refused
  * (onboard's `--max-usd off`).
  * Why new: D3/D4 add the specs and the validator; the subprocess journey is
- * test/cli-help-curated.serial.test.ts. Seam: none (pure functions + lazy modules).
+ * test/cli-help-curated-cli.test.ts. Seam: none (pure functions + lazy modules).
  */
 import { describe, expect, test } from 'bun:test';
 import { CLI_COMMANDS } from '../src/cli/command-table.ts';

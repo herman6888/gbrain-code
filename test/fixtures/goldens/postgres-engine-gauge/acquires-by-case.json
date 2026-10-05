@@ -282,7 +282,7 @@
       "tx": 1
     },
     "replaceDerivedLinks#default": {
-      "raw": 8,
+      "raw": 12,
       "tx": 1
     },
     "resolveSlugWithAlias#default": {},

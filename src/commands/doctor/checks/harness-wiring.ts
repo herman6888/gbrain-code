@@ -9,14 +9,19 @@
  * otherwise spawn the registered argv (15 s bound) and run initialize +
  * tools/list + `recall {query:"gbrain install check", limit:1}` (an empty
  * result passes). A `gbrain_status` reply (status-only serve) is reported with
- * its reason and fix. Doctor writes nothing and seeds nothing.
+ * its reason and fix. A live status-only `serve --http` (its marker under
+ * GBRAIN_HOME, answering `/health` 503 as that instance within 500 ms) is
+ * reported first as `serve_status_only` (transport http) with the status
+ * reason's fix. Doctor seeds nothing; the only file it removes is a status
+ * marker whose process is gone.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { gbrainPath, loadConfig } from '../../../core/config.ts';
 import { peekLock } from '../../../core/pglite-lock.ts';
-import { harnessWiringEntry, type ReadinessHarness } from '../../../core/readiness.ts';
+import { harnessWiringEntry, httpStatusServerEntry, type ReadinessHarness } from '../../../core/readiness.ts';
+import { verifiedStatusMarkers } from '../../../core/serve-http-status-marker.ts';
 import { agentProcessMarker } from '../../../core/interaction.ts';
 import { resolveGbrainBin } from '../../../core/gbrain-bin.ts';
 import type { Action } from '../../../core/agent-output.ts';
@@ -231,6 +236,13 @@ async function smoke(r: HarnessRegistration): Promise<Check> {
 
 /** Registration read (full run) or registration read + smoke (`--only harness_wiring`). */
 export async function harnessWiringCheck(opts: { smoke: boolean }): Promise<Check> {
+  // A shared HTTP server that answers in status-only mode outranks every registration verdict.
+  const statusServer = (await verifiedStatusMarkers())[0];
+  if (statusServer) {
+    const entry = httpStatusServerEntry(statusServer);
+    return { name: NAME, status: 'warn', message: entry.why, ...(entry.fix ? { fix: entry.fix } : { fix_unavailable_reason: 'no_safe_automatic_fix' as const }),
+      details: { reason: entry.reason, transport: 'http', port: statusServer.port, pid: statusServer.pid, status_reason: statusServer.reason } };
+  }
   const regs = readHarnessRegistrations();
   if (regs.length === 0) {
     const harnesses = detectedHarnesses();

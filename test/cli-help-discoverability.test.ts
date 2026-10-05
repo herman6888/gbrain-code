@@ -25,7 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCli, runCliMemo } from './helpers/cli-spawn.ts';
 
-// Hermetic no-brain environment, matching cli-help-without-brain.serial.test.ts:
+// Hermetic no-brain environment, matching cli-help-without-brain.test.ts:
 // GBRAIN_HOME alone is not enough — loadConfig also honours GBRAIN_DATABASE_URL
 // and DATABASE_URL, so a developer or CI runner exporting either would let the
 // CLI connect anyway and these assertions would go inert. cli-spawn strips both

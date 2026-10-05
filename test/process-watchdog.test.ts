@@ -1,7 +1,7 @@
 /**
  * Pure-function coverage for the watchdog state machine (#1633). No threads, no
  * real timers — the spawn-based integration lives in
- * test/process-watchdog.serial.test.ts (Bun-pinned, real processes).
+ * test/process-watchdog-harness.test.ts (Bun-pinned, real processes).
  */
 import { describe, test, expect } from 'bun:test';
 import {

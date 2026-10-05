@@ -13,7 +13,8 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { clearHealthMemo } from '../core/health-memo.ts';
-import { OperationError } from '../core/ops/contract.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
 import { REPAIR_KINDS, resolveRepairScope, type RepairKind, type RepairResult } from '../core/repair/core.ts';
 import { consentGate, engineConsentEnv } from '../core/consent-cli.ts';
 import { AUTO_REPAIR_REGISTRY, EXPLICIT_REPAIR_REGISTRY, REPAIR_REGISTRY, explicitRepairNotices, repairMaySpend, repairPreviewCommand, repairRunner, repairSpec } from '../core/repair/registry.ts';
@@ -71,6 +72,10 @@ const BOOLEAN_FLAGS = new Set(['--apply', '--all', '--json', '--no-embed', '--in
 const VALUE_FLAGS = new Set(['--source', '--limit', '--expect', '--only', '--skip']);
 /** Flags only `gbrain repair frontmatter` accepts. */
 const FRONTMATTER_FLAGS = ['--only', '--skip', '--diff', '--yes'] as const;
+const VALUE_EXAMPLES: Record<string, string> = { '--source': 'default', '--limit': '50', '--expect': 'PLAN_HASH', '--only': 'notes/a.md', '--skip': 'notes/a.md' };
+/** A usage refusal whose fix is the read-only preview (gbrain repair without --apply writes nothing). */
+const invalid = (message: string, suggestion: string, preview: string[] = ['gbrain', 'repair', '--json']) => opError('invalid_params', message, suggestion,
+  { fix: readFix('Previews the repair; without --apply it writes nothing.', { argv: preview }) });
 
 interface RepairArgs { kind?: string; apply: boolean; all: boolean; json: boolean; noEmbed: boolean; includeAmbiguous: boolean; diff: boolean; yes: boolean;
   source?: string; limit?: string; expect?: string; only: string[]; skip: string[] }
@@ -92,7 +97,7 @@ export function parseRepairArgs(args: string[]): RepairArgs {
         `To cap paid repair work, preview gbrain doctor --remediation-plan --json, then after the user agrees run: gbrain doctor --remediate --yes --include-repairs --max-usd ${cap && !cap.startsWith('-') ? cap : '<n>'} --expect <plan_hash> (plan_hash from the preview)`);
     }
     if (BOOLEAN_FLAGS.has(flag)) {
-      if (equal >= 0) throw new OperationError('invalid_params', `${flag} does not accept a value.`);
+      if (equal >= 0) throw invalid(`${flag} does not accept a value.`, `Write ${flag} on its own, without =value; leave it out to keep it off.`);
       if (flag === '--apply') parsed.apply = true;
       else if (flag === '--all') parsed.all = true;
       else if (flag === '--json') parsed.json = true;
@@ -102,9 +107,9 @@ export function parseRepairArgs(args: string[]): RepairArgs {
       else parsed.noEmbed = true;
       continue;
     }
-    if (!VALUE_FLAGS.has(flag)) throw new OperationError('invalid_params', `Unknown option ${flag} for gbrain repair.`, 'Run gbrain repair --help for the accepted options.');
+    if (!VALUE_FLAGS.has(flag)) throw invalid(`Unknown option ${flag} for gbrain repair.`, `Remove ${flag}; gbrain repair accepts ${[...BOOLEAN_FLAGS, ...VALUE_FLAGS].join(', ')}.`);
     const value = equal >= 0 ? token.slice(equal + 1) : args[++i];
-    if (!value || value.startsWith('--')) throw new OperationError('invalid_params', `${flag} requires a value.`);
+    if (!value || value.startsWith('--')) throw invalid(`${flag} requires a value.`, `Give ${flag} its value right after it, e.g. ${flag} ${VALUE_EXAMPLES[flag]}${flag === '--expect' ? ' (the plan_hash the preview printed)' : ''}.`);
     if (flag === '--source') parsed.source = value;
     else if (flag === '--expect') parsed.expect = value;
     else if (flag === '--only') parsed.only.push(value);
@@ -114,7 +119,9 @@ export function parseRepairArgs(args: string[]): RepairArgs {
   if (positional.length > 1) throw new OperationError('invalid_params', `Unexpected argument '${positional[1]}'; gbrain repair takes at most one kind.`,
     `Kinds: ${REPAIR_KINDS.join(', ')}.`);
   parsed.kind = positional[0];
-  if (used.has('--yes') && parsed.kind !== 'frontmatter') throw new OperationError('invalid_params', '`--yes` is not accepted by gbrain repair; pass --apply to write.');
+  if (used.has('--yes') && parsed.kind !== 'frontmatter') throw invalid('`--yes` is not accepted by gbrain repair; pass --apply to write.',
+    `Preview first with gbrain repair${parsed.kind ? ` ${parsed.kind}` : ''}, then run the same command with --apply instead of --yes.`,
+    ['gbrain', 'repair', ...(parsed.kind ? [parsed.kind] : []), ...(parsed.source ? ['--source', parsed.source] : []), '--json']);
   const frontmatterOnly = [...used].find(flag => flag !== '--yes');
   if (frontmatterOnly && parsed.kind !== 'frontmatter') throw new OperationError('invalid_params', `${frontmatterOnly} applies only to gbrain repair frontmatter.`,
     `Preview it by name: gbrain repair frontmatter${parsed.source ? ` --source ${parsed.source}` : ''}`);
@@ -155,12 +162,15 @@ export async function runRepairCommand(engine: BrainEngine, args: string[]): Pro
   if (args.includes('--help') || args.includes('-h')) { console.log(REPAIR_HELP); return; }
   const { kind, apply, all, json, noEmbed, includeAmbiguous, source, expect, only, skip, diff, limit: limitText } = parseRepairArgs(args);
   const limit = limitText === undefined ? undefined : Number(limitText);
-  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new OperationError('invalid_params', '--limit must be a positive integer.');
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw invalid('--limit must be a positive integer.', 'Pass --limit as a positive whole number, e.g. --limit 50, or omit it to repair every item.');
   if (kind && !REPAIR_KINDS.includes(kind as RepairKind)) {
     throw new OperationError('invalid_params', `Unknown repair kind '${kind}'.`, `Kinds: ${REPAIR_KINDS.join(', ')}.`);
   }
-  if (kind && all) throw new OperationError('invalid_params', 'Pass either a kind or --all, not both.');
-  if (!kind && apply && !all) throw new OperationError('invalid_params', 'Name a kind or pass --all with --apply.');
+  if (kind && all) throw invalid('Pass either a kind or --all, not both.', `Drop --all to repair only ${kind}, or drop ${kind} to run every automatic kind.`,
+    ['gbrain', 'repair', kind, ...(source ? ['--source', source] : []), '--json']);
+  if (!kind && apply && !all) throw invalid('Name a kind or pass --all with --apply.',
+    'Review the preview of every automatic kind, then apply one by name (gbrain repair KIND --apply) or all of them with --all --apply.',
+    ['gbrain', 'repair', ...(source ? ['--source', source] : []), '--json']);
   const kinds: RepairKind[] = kind ? [kind as RepairKind] : AUTO_REPAIR_REGISTRY.map(spec => spec.kind);
   const explicitKindsNotRun = kind ? [] : explicitRepairNotices({ source });
   const scope = await resolveRepairScope(engine, source);

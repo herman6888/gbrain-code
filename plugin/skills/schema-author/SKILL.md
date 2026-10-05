@@ -315,7 +315,7 @@ On failure, the error envelope follows the standard `StructuredAgentError` shape
 ## Tools outside your MCP surface
 
 This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, run its gbrain CLI equivalent instead:
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
 
 - `get_active_schema_pack` → `gbrain schema active`
 - `list_schema_packs` → `gbrain schema list`
@@ -327,4 +327,4 @@ does not have it, run its gbrain CLI equivalent instead:
 - `schema_review_orphans` → `gbrain schema review-orphans`
 - `schema_stats` → `gbrain schema stats`
 
-Or widen this machine's plugin surface with GBRAIN_SURFACE=full (new sessions pick it up).
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

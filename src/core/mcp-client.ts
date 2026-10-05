@@ -306,7 +306,8 @@ async function getAccessToken(config: GBrainConfig, force = false, signal?: Abor
     throw new RemoteMcpError(
       disco.reason === 'http' || disco.reason === 'parse' ? 'discovery' : 'network',
       `OAuth discovery failed: ${disco.message}`,
-      { ...(disco.status ? { status: disco.status } : {}), ...(disco.kind ? { kind: disco.kind } : {}), mcp_url: remote.mcp_url },
+      { ...(disco.status ? { status: disco.status } : {}), ...(disco.kind ? { kind: disco.kind } : {}), mcp_url: remote.mcp_url,
+        ...(disco.status_only ? { ...extractToolErrorDetail(JSON.stringify(disco.status_only)), retry_after_s: disco.retry_after_s } : {}) },
     );
   }
 
@@ -321,6 +322,7 @@ async function getAccessToken(config: GBrainConfig, force = false, signal?: Abor
         ...(tokenRes.status ? { status: tokenRes.status } : {}), ...(tokenRes.kind ? { kind: tokenRes.kind } : {}),
         ...(tokenRes.retry_after_s !== undefined ? { retry_after_s: tokenRes.retry_after_s } : {}), mcp_url: remote.mcp_url,
         ...(tokenRes.reason === 'rate_limited' ? rateLimitedMintDetail(tokenRes.retry_after_s) : {}),
+        ...(tokenRes.status_only ? extractToolErrorDetail(JSON.stringify(tokenRes.status_only)) : {}),
       },
     );
   }

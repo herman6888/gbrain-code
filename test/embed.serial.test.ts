@@ -107,6 +107,30 @@ describe('runEmbed --all (parallel)', () => {
     expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(10);
   });
 
+  test('#5183: on Postgres neither embed loop runs more workers than the client pool', async () => {
+    const pages = Array.from({ length: 20 }, (_, i) => ({ slug: `pool-${i}`, source_id: 'default' }));
+    const chunks = (slug: string) => [{ chunk_index: 0, chunk_text: `text for ${slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }];
+    const stale = pages.map((p, i) => ({ slug: p.slug, chunk_index: 0, chunk_text: `text for ${p.slug}`, chunk_source: 'compiled_truth' as const,
+      model: null, token_count: null, source_id: 'default', page_id: i + 1 }));
+    const previousPool = process.env.GBRAIN_POOL_SIZE;
+    process.env.GBRAIN_EMBED_CONCURRENCY = '10';
+    process.env.GBRAIN_POOL_SIZE = '3';
+    try {
+      await runEmbed(mockEngine({ kind: 'postgres', listPages: async () => pages, getChunks: async (slug: string) => chunks(slug), upsertChunks: async () => {} }), ['--all']);
+      expect(totalEmbedCalls).toBe(20);
+      expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
+      expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(3);
+      totalEmbedCalls = 0; maxConcurrentEmbedCalls = 0;
+      await runEmbedCore(mockEngine({ kind: 'postgres', countStaleChunks: async () => stale.length, listStaleChunks: async () => stale,
+        getChunks: async (slug: string) => chunks(slug) }), { stale: true });
+      expect(totalEmbedCalls).toBe(20);
+      expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
+      expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(3);
+    } finally {
+      if (previousPool === undefined) delete process.env.GBRAIN_POOL_SIZE; else process.env.GBRAIN_POOL_SIZE = previousPool;
+    }
+  });
+
   test('v0.41.31: stamps embedding_signature after embedding each page (--all)', async () => {
     const pages = [{ slug: 'a', source_id: 'default' }, { slug: 'b', source_id: 'default' }];
     const chunksBySlug = new Map(

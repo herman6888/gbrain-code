@@ -29,13 +29,21 @@ import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { rawProvenanceCheck } from '../src/commands/doctor/checks/core-health.ts';
 import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
+import { testWaitMs } from './helpers/wait-for.ts';
 
 const backends = testBackends();
 const engines: BrainEngine[] = [];
 const dataDir = mkdtempSync(join(tmpdir(), 'gbrain-maintenance-db-'));
 let closePostgres: (() => Promise<void>) | undefined;
+let restoreWriteWait: () => void = () => {};
+// Cases that drive a publication into write_pending on purpose wait a short
+// budget; every case that must commit keeps the production 5s.
+async function pendingWait<T>(run: () => Promise<T>): Promise<T> {
+  const restore = __setMaintenanceWriteWaitForTests(testWaitMs(500));
+  try { return await run(); } finally { restore(); }
+}
 beforeAll(async () => {
-  __setMaintenanceWriteWaitForTests(5_000);
+  restoreWriteWait = __setMaintenanceWriteWaitForTests(5_000);
   configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: {} });
   if (backends.includes('pglite')) {
     const engine = new PGLiteEngine();
@@ -47,7 +55,7 @@ beforeAll(async () => {
   }
 }, 120_000);
 afterAll(async () => {
-  __setMaintenanceWriteWaitForTests(null);
+  restoreWriteWait();
   for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
   await closePostgres?.(); resetGateway(); rmSync(dataDir, { recursive: true, force: true });
 });
@@ -262,7 +270,7 @@ for (const change of ['derived', 'semantic'] as const) {
       const lock = (await acquireWorktree((await getWorktreeBinding(engine, sourceId))!, 5000))!;
       expect(lock).not.toBeNull();
       try {
-        await expect(runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 })).rejects.toMatchObject({ code: 'write_pending' });
+        await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 }))).rejects.toMatchObject({ code: 'write_pending' });
         await disposePersistenceConsumer(engine);
       } finally { await lock.release(); }
       const row = (await claimNextWrite(engine, localHostId()))!;
@@ -320,7 +328,7 @@ test('paused owner retains an admitted consolidation and a fresh process publish
     const lock = (await acquireWorktree(binding, 5000))!;
     expect(lock).not.toBeNull();
     try {
-      await expect(runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 })).rejects.toMatchObject({ code: 'write_pending' });
+      await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 }))).rejects.toMatchObject({ code: 'write_pending' });
       await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding.worktree_id]);
       await disposePersistenceConsumer(engine);
       expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND consolidated_at IS NOT NULL', [sourceId])).toHaveLength(0);
@@ -401,7 +409,7 @@ for (const failure of ['commit', 'withdrawal'] as const) {
       const lock = (await acquireWorktree(binding, 5000))!;
       expect(lock).not.toBeNull();
       try {
-        await expect(runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 })).rejects.toMatchObject({ code: 'write_pending' });
+        await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 }))).rejects.toMatchObject({ code: 'write_pending' });
         await disposePersistenceConsumer(engine);
       } finally { await lock.release(); }
       const row = (await claimNextWrite(engine, localHostId()))!;
@@ -456,10 +464,10 @@ test('managed synthesis drives real children and publishes repaired provenance p
         const opts = { brainDir: root, sourceId, dryRun: false, inputFile: transcript, date: '2026-09-20' };
         const binding = (await getWorktreeBinding(engine, sourceId))!;
         const completion = await engine.getConfig('dream.synthesize.last_completion_ts');
-        const pending = await runPhaseSynthesize(engine, { ...opts, yieldDuringPhase: async () => {
+        const pending = await pendingWait(() => runPhaseSynthesize(engine, { ...opts, yieldDuringPhase: async () => {
           const rows = await engine.executeRaw("SELECT id FROM minion_jobs WHERE status='completed' AND data->>'source_id'=$1 LIMIT 1", [sourceId]);
           if (rows.length) await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding.worktree_id]);
-        } });
+        } }));
         expect(pending.status).toBe('warn');
         expect(pending.details.publish_pending).toBe(1);
         expect(await engine.getConfig('dream.synthesize.last_completion_ts')).toBe(completion);

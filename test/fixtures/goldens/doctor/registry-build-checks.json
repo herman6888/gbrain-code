@@ -619,6 +619,10 @@
       },
       {
         "category": "brain",
+        "name": "edge_validity"
+      },
+      {
+        "category": "brain",
         "name": "auto_chronicle"
       },
       {

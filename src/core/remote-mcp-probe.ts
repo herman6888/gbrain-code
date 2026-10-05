@@ -24,8 +24,28 @@ type ProbeFailure<Reason extends string> = {
   kind?: 'timeout' | 'aborted';
   /** Seconds the server asked the caller to wait (Retry-After), when it said. */
   retry_after_s?: number;
+  /** A status-only `gbrain serve --http` answered 503: its `serve_status_only` envelope. */
+  status_only?: Record<string, unknown>;
   message: string;
 };
+
+/**
+ * A 503 from a status-only `gbrain serve --http` carries a `serve_status_only`
+ * envelope (why, fix, user_message); any other body is not one. Consumes the
+ * body only for a 503.
+ */
+async function statusOnlyFailure(res: Response, label: string): Promise<ProbeFailure<'http'> | null> {
+  if (res.status !== 503) return null;
+  let body: unknown;
+  try { body = await res.json(); } catch { return null; }
+  if (!body || typeof body !== 'object' || (body as { code?: unknown }).code !== 'serve_status_only') return null;
+  const env = body as Record<string, unknown>;
+  const retryAfter = parseRetryAfterSeconds(res.headers.get('retry-after'));
+  return {
+    ok: false, reason: 'http', status: 503, status_only: env, ...(retryAfter !== undefined ? { retry_after_s: retryAfter } : {}),
+    message: `${label} answered 503: the gbrain server is in status-only mode. ${typeof env.why === 'string' ? env.why : ''}`.trim(),
+  };
+}
 
 /** Longest Retry-After honoured; a larger value is clamped to it. */
 const MAX_RETRY_AFTER_S = 24 * 60 * 60;
@@ -85,6 +105,8 @@ export async function discoverOAuth(
   try {
     const res = await fetch(url, { signal });
     if (!res.ok) {
+      const statusOnly = await statusOnlyFailure(res, 'OAuth discovery');
+      if (statusOnly) return statusOnly;
       await res.body?.cancel().catch(() => {});
       return { ok: false, reason: 'http', status: res.status, message: `OAuth discovery returned ${res.status} for ${url}` };
     }
@@ -160,6 +182,8 @@ export async function mintClientCredentialsToken(
       };
     }
     if (!res.ok) {
+      const statusOnly = await statusOnlyFailure(res, 'OAuth /token');
+      if (statusOnly) return statusOnly;
       await res.body?.cancel().catch(() => {});
       return { ok: false, reason: 'http', status: res.status, message: `OAuth /token returned ${res.status}` };
     }

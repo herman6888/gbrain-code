@@ -36,15 +36,14 @@ describe('CI runner routing', () => {
 
   test('single-process lanes and soaks use 4 vCPUs, pooled lanes 8, and the label-gated heavy suite keeps 30', () => {
     // Measured: a unit shard is one bun process (1.1-1.5 busy cores on average)
-    // and took the same time on 4, 8 and 16 vCPUs; the serial pool and verify
-    // match 16 vCPUs at 8.
-    for (const name of ['test', 'slow-eval-longmemeval', 'slow-brainbench-e2e', 'brainbench', 'slow-entity-resolve-perf', 'admin-browser', 'shared-skills-compatibility']) {
+    // and took the same time on 4, 8 and 16 vCPUs; verify matches 16 vCPUs at 8.
+    for (const name of ['slow-brainbench-e2e', 'brainbench', 'slow-entity-resolve-perf', 'admin-browser', 'shared-skills-compatibility']) {
       expect(load('test.yml').jobs[name]['runs-on'], name).toBe(single);
     }
-    for (const name of ['verify', 'serial-tests']) expect(load('test.yml').jobs[name]['runs-on'], name).toBe(pooled);
+    expect(load('test.yml').jobs.verify['runs-on']).toBe(pooled);
     // E2E files run one bun process at a time against the job's Postgres:
     // full-corpus shard 1 took 668s on 4 vCPUs, 704s on 8 and 741s on 16.
-    for (const name of ['jsonb-parity', 'selected-e2e', 'tier2', 'coverage-full-unit', 'coverage-full-slow', 'coverage-full-e2e']) {
+    for (const name of ['jsonb-parity', 'tier2', 'tier1-backend-matrix', 'coverage-full-unit', 'coverage-full-slow', 'coverage-full-e2e']) {
       expect(load('e2e.yml').jobs[name]['runs-on'], name).toBe(single);
     }
     expect(load('e2e.yml').jobs.tier1['runs-on']).toBe(normal);
@@ -54,6 +53,16 @@ describe('CI runner routing', () => {
     expect(load('persistence-validation.yml').jobs.reconciliation['runs-on']).toBe(single);
     expect(load('persistence-validation.yml').jobs['deployment-matrix']['runs-on']).toBe(pooled);
     expect(load('heavy-tests.yml').jobs.heavy['runs-on']).toBe(heavy);
+  });
+
+  test('Selected E2E shards run on 2 vCPUs; unit shards and the serial pool on 4 (C1, C8; C4 reverted)', () => {
+    // A 25-file E2E sample took 442s on 2 cores vs 455s on 4. Unit shards stay on
+    // 4: on PR #6013 the 2-vCPU cell raised the unit shard mean from 542s to 608s
+    // and made Test the critical path (V-2 revert). The serial shards finish far
+    // off the critical path on 4.
+    expect(load('test.yml').jobs.test['runs-on']).toBe(single);
+    expect(load('e2e.yml').jobs['selected-e2e']['runs-on']).toBe(small);
+    expect(load('test.yml').jobs['serial-tests']['runs-on']).toBe(single);
   });
 
   test('security matrix labels and native platform coverage retain their identities', () => {

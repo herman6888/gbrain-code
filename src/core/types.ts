@@ -919,6 +919,14 @@ export interface SearchResult {
   /** Shortest connecting slug path seed→…→result (for "how I know this"). */
   relational_path?: string[];
   /**
+   * Multi-hop chain evidence: why a chain put this page here. `role` is the
+   * page's place on the chain (a candidate answer, an intermediate page, or the
+   * page an edge was written on), not a correctness claim; `path_count` counts
+   * retained paths and is not corroboration. `edges` is the best path's
+   * evidence, at most three edges.
+   */
+  relational?: RelationalEvidence;
+  /**
    * Ranker wave — set when `pinRelationalRows` (relational-rerank-pin.ts)
    * re-pinned this relational-arm row above the reranked text rows. Autocut
    * preserves stamped rows and excludes them from its cliff computation (they
@@ -1399,6 +1407,12 @@ export interface SearchOpts extends PageReadPolicy {
    * Eval A/B gates drive it here.
    */
   relationalRerankPin?: number;
+  /** Per-call override for `search.relational_planner` (multi-hop chains; eval A/B). */
+  relationalPlanner?: boolean;
+  /** Per-call override for `search.relational_orient_onehop` (typed one-hop orientation; eval A/B). */
+  relationalOrientOneHop?: boolean;
+  /** Per-call override for `search.relational_chain_slots` (0..10; eval A/B). */
+  relationalChainSlots?: number;
 }
 
 /**
@@ -1518,6 +1532,7 @@ export interface RelationalFanoutRow {
 
 /** Options for BrainEngine.relationalFanout. */
 export interface RelationalFanoutOpts extends PageReadPolicy {
+  temporal?: import('./link-validity.ts').EdgeTemporalOpts; // per-hop temporal edge policy; absent = every edge
   /** Resolved seed identities; separate from the read grant for edge origins. */
   seedRefs?: Array<{ source_id: string; slug: string }>;
   /** Edge types to traverse; null/empty = type-agnostic. */
@@ -1534,6 +1549,67 @@ export interface RelationalFanoutOpts extends PageReadPolicy {
   sourceIds?: string[];
   /** Hard cap on returned candidate nodes. Default 50. */
   limit?: number;
+}
+
+/** Chain evidence carried on a search row (SearchResult.relational). */
+export interface RelationalEvidence {
+  role: 'answer' | 'support' | 'origin';
+  seed: string;
+  hop: number;
+  path_count: number;
+  edges: Array<{
+    link_type: string;
+    stored_from: string;
+    stored_to: string;
+    orientation: 'canonical' | 'stored' | 'flipped' | 'uncertain';
+    context: string | null;
+    origin: string | null;
+  }>;
+}
+
+/**
+ * Options for BrainEngine.relationalChainHop: one bounded, oriented expansion
+ * step of a multi-hop relational chain. `subjectTypes`/`objectTypes` are the
+ * hop relation's page-type signature; `degreeLinkTypes` names the typed edges
+ * counted for a frontier node's degree (hub weighting).
+ */
+export interface ChainHopOpts extends PageReadPolicy {
+  linkTypes: string[];
+  toward: 'object' | 'subject';
+  subjectTypes: string[];
+  objectTypes: string[];
+  degreeLinkTypes: string[];
+  /** Max logical edges returned per frontier node (deterministic: lowest link id first). */
+  neighborCap: number;
+  temporal?: import('./link-validity.ts').EdgeTemporalOpts; // relationship-validity policy per link row; absent = every edge
+}
+
+/**
+ * One LOGICAL edge from a frontier node, oriented by the relation's type
+ * signature and already authorized (both endpoints and any origin page pass
+ * the read policy). Stored rows between the same pair that resolve to the same
+ * subject/object collapse into one edge (`link_ids`).
+ */
+export interface ChainHopEdge {
+  from_page_id: number;
+  to_page_id: number;
+  to_slug: string;
+  to_type: string;
+  source_id: string;
+  link_type: string;
+  orientation: 'canonical' | 'stored' | 'flipped' | 'uncertain';
+  link_ids: number[];
+  stored_from_slug: string;
+  stored_to_slug: string;
+  /** Edge context from the evidence row; null when the caller may not read the evidence page's text. */
+  context: string | null;
+  origin_page_id: number | null;
+  origin_slug: string | null;
+  canonical_chunk_id: number | null;
+  /** Distinct typed neighbors of the frontier node the caller may read; saturates at 300 readable link rows. */
+  from_degree: number;
+  /** True when the frontier node had more logical edges than `neighborCap`. */
+  neighbor_cap_hit: boolean;
 }
 
 // Timeline
@@ -2007,6 +2083,8 @@ export interface HybridSearchMeta {
    * and every reranker fail-open path. Surfaced for `gbrain search --explain`.
    */
   relational_rerank_pin?: import('./search/relational-rerank-pin.ts').RelationalRerankPinDecision;
+  /** Multi-hop planner outcome for a 2-3 relation question (status, anchor, per-hop counts, cap). */
+  relational_plan?: import('./search/relational-recall.ts').RelationalPlanMeta;
   /**
    * Ranker wave (Phase E2, Cat 13) — keyword-arm confidence decision:
    * `margin_ratio` (scale-free `top / (top + second)` over the keyword arm's

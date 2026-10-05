@@ -282,6 +282,16 @@
         "                         source. An unknown source is a hard error. Local",
         "                         installs only: a thin client rejects it (the server",
         "                         scopes the walk to your grant).",
+        "  --hop <type>:<toward>  One hop of a typed chain; repeat for 2-3 hops. <toward>",
+        "                         is 'object' (subject -> object, e.g. investor -> company)",
+        "                         or 'subject' (object -> subject, e.g. company -> founder).",
+        "                         Follows the relation's meaning, whichever page the edge",
+        "                         was written on. Prints answers with the edges that prove",
+        "                         each one. Cannot be combined with --type, --depth or",
+        "                         --direction. MCP: traverse_graph {\"hops\":[{\"link_type\":",
+        "                         \"invested_in\",\"toward\":\"object\"}, ...]}. Chain link",
+        "                         types: founded, invested_in, led_round, advises, works_at, attended, yc_partner.",
+        "                         Guide: docs/guides/multi-hop.md",
         "  --include-foreign      Include edges to pages in other sources (v0.37.7.0).",
         "                         Off by default; the walk stays inside the resolved",
         "                         source, and a footer reports the count of",
@@ -298,6 +308,8 @@
         "    -> Bob's direct connections",
         "  gbrain graph-query people/bob --include-foreign",
         "    -> include edges to pages in other sources",
+        "  gbrain graph-query people/alice --hop invested_in:object --hop founded:subject",
+        "    -> founders of the companies Alice invested in, with evidence",
         ""
       ]
     },
@@ -652,6 +664,16 @@
       "stderr": [
         "Error [requires_local_engine]: `gbrain loops` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
         "Fix: gbrain loops",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "edge-proposals",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain edge-proposals` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain edge-proposals",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
       ],
       "stdout": []

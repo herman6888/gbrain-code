@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 197023,
-    "stdoutSha256": "20847890a8675cef50b3fc32b88c43beae726ee1a0b84a78e7de69d2ce63fa9c",
+    "stdoutBytes": 198603,
+    "stdoutSha256": "7b5e35aa62ab4e12fbfa100da46f8e032101875370cb5a59a2348649c234689f",
     "toolNames": [
       "remember",
       "entity",
@@ -1484,7 +1484,9 @@
           "from": "string",
           "link_source": "string?",
           "link_type": "string?",
-          "to": "string"
+          "to": "string",
+          "valid_from": "string?",
+          "valid_until": "string?"
         },
         "required_scopes": [],
         "schema": {
@@ -1507,6 +1509,14 @@
             },
             "to": {
               "description": "Slug of the page the link points to, e.g. 'companies/acme-example'.",
+              "type": "string"
+            },
+            "valid_from": {
+              "description": "When the relationship started (YYYY-MM-DD), for dated relations such as works_at or invested_in.",
+              "type": "string"
+            },
+            "valid_until": {
+              "description": "When it ended (YYYY-MM-DD, exclusive). Re-run add_link with valid_until to record that a relationship ended.",
               "type": "string"
             }
           },
@@ -1559,15 +1569,19 @@
         "scope": "write"
       },
       {
-        "description": "List a page's outgoing links (typed edges to other pages). Use when exploring what a page points at; pass source_id or all_sources to widen. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
+        "description": "List a page's outgoing links (typed edges to other pages). Use when exploring what a page points at; rows carry status and dates, live relationships by default (status: \"all\" for history, during: \"2022\" for a period). Pass source_id or all_sources to widen. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "get_links",
         "parameters": {
           "all_sources": "boolean?",
+          "as_of": "string?",
+          "during": "string?",
+          "link_type": "string?",
           "slug": "string",
-          "source_id": "string?"
+          "source_id": "string?",
+          "status": "string?"
         },
         "required_scopes": [],
         "schema": {
@@ -1576,12 +1590,33 @@
               "description": "Same as source_id __all__.",
               "type": "boolean"
             },
+            "as_of": {
+              "description": "YYYY-MM-DD.",
+              "type": "string"
+            },
+            "during": {
+              "description": "Period: 2022, 2022-03 or 2021..2023.",
+              "type": "string"
+            },
+            "link_type": {
+              "description": "Only this type.",
+              "type": "string"
+            },
             "slug": {
               "description": "Slug of the page whose outgoing links to list.",
               "type": "string"
             },
             "source_id": {
               "description": "One source, or '__all__'.",
+              "type": "string"
+            },
+            "status": {
+              "description": "Default live (true now).",
+              "enum": [
+                "live",
+                "ended",
+                "all"
+              ],
               "type": "string"
             }
           },
@@ -1600,8 +1635,10 @@
         "name": "get_backlinks",
         "parameters": {
           "all_sources": "boolean?",
+          "as_of": "string?",
           "slug": "string",
-          "source_id": "string?"
+          "source_id": "string?",
+          "status": "string?"
         },
         "required_scopes": [],
         "schema": {
@@ -1610,12 +1647,24 @@
               "description": "Same as source_id __all__.",
               "type": "boolean"
             },
+            "as_of": {
+              "description": "YYYY-MM-DD",
+              "type": "string"
+            },
             "slug": {
               "description": "Page slug.",
               "type": "string"
             },
             "source_id": {
               "description": "One source, or '__all__'.",
+              "type": "string"
+            },
+            "status": {
+              "description": "Default live.",
+              "enum": [
+                "live",
+                "all"
+              ],
               "type": "string"
             }
           },
@@ -1651,6 +1700,7 @@
           "all_sources": "boolean?",
           "depth": "number?",
           "direction": "string?",
+          "hops": "array?",
           "link_type": "string?",
           "slug": "string",
           "source_id": "string?"
@@ -1674,6 +1724,23 @@
                 "both"
               ],
               "type": "string"
+            },
+            "hops": {
+              "description": "≤3 typed hops, e.g. [{\"link_type\":\"founded\",\"toward\":\"subject\"}]; toward: object|subject.",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "link_type": {
+                    "type": "string"
+                  },
+                  "toward": {
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              },
+              "type": "array"
             },
             "link_type": {
               "description": "Follow only this link type.",
@@ -4198,7 +4265,7 @@
         "scope": "read"
       },
       {
-        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} persists a wider surface for your OAuth client.",
+        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client; stdio: this session).",
         "idempotent": false,
         "local_only": false,
         "mutating": true,
@@ -4211,7 +4278,7 @@
         "schema": {
           "properties": {
             "surface": {
-              "description": "Surface to persist for your client.",
+              "description": "Surface to widen to (stdio: this session only).",
               "enum": [
                 "verbs",
                 "starter",
@@ -6254,7 +6321,7 @@
         "scope": "write"
       },
       {
-        "description": "Stop a coaching or info notice from appearing for this client (or unmute it with muted: false). Safety, degraded and ask notices cannot be muted.",
+        "description": "Stop a coaching or info notice (or first_run_decisions) from appearing for this client; muted: false unmutes.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -6268,21 +6335,6 @@
           "properties": {
             "code": {
               "description": "Notice code, the word after `[gbrain notice` in the block.",
-              "enum": [
-                "backup_coverage",
-                "degraded_dedup",
-                "empty_retrieval",
-                "facts_drain_first_run",
-                "features_auto_fix",
-                "listing_truncated",
-                "local_transcripts",
-                "onboard_opportunities",
-                "recovered_frontmatter",
-                "source_binding_narrowed",
-                "synthesis_keyless",
-                "think_not_saved",
-                "unknown_param"
-              ],
               "type": "string"
             },
             "muted": {

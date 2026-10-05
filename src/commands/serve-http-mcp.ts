@@ -23,6 +23,7 @@ import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
+import { STATUS_TOOL_NAME, statusModeOf, statusToolResult } from '../mcp/status-mode.ts';
 import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import { scopeDeniedError } from '../core/ops/op-fix.ts';
 import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
@@ -284,6 +285,9 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   const { engine, broadcastEvent, logFullParams } = ctx;
   const { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows } = state;
   const { name, arguments: params } = request.params;
+  // A server that recovered from status-only mode answers clients still holding the status tool list (never listed).
+  const statusMode = name === STATUS_TOOL_NAME ? statusModeOf(engine) : null;
+  if (statusMode && hasScope(authInfo.scopes, 'read')) return statusToolResult(statusMode, 'http');
   const op = mcpOperations.find(o => o.name === name);
   if (!op) {
     return rejectUnknownMcpOperation(ctx, state, name);

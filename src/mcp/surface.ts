@@ -17,9 +17,10 @@
  * op stays uncallable even if a client guesses its name (tool-list filtering
  * alone leaves dispatch resolving the global catalog — codex c2).
  *
- * Resolution: --surface flag > config `mcp_surface` > 'full'. Why default
- * full: verbs/starter are for agents and quickstarts; full preserves existing
- * advanced tooling.
+ * Resolution: stdio GBRAIN_SURFACE > --surface flag > config `mcp_surface` >
+ * 'full' (resolveStdioSurface); `serve --http` ignores GBRAIN_SURFACE. Why
+ * default full: a bare `serve` keeps existing advanced tooling; the
+ * registrations gbrain writes pin `starter` (src/core/mcp-registration.ts).
  *
  * WP4 (D2 CEILING): on the OAuth HTTP transport the server-resolved surface is
  * a CEILING, not the final answer — each request resolves
@@ -31,6 +32,7 @@
  */
 
 import type { Operation } from '../core/operations.ts';
+import type { Notice } from '../core/agent-output.ts';
 import type { GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
@@ -103,6 +105,8 @@ export const STARTER_OPS: ReadonlySet<string> = new Set([
   'get_write_request', 'list_write_requests', 'cancel_write_request',
   'list_skills', 'get_skill', 'list_brain_skillpack', 'get_skill_asset',
   'join_brain', 'sync_brain_skills', 'leave_brain', 'put_skill', 'delete_skill',
+  // The dismissal for the coaching notices starter sessions receive (onboarding, features).
+  'mute_notice',
 ]);
 
 /**
@@ -169,14 +173,45 @@ export function isReadOnlyOperation(op: Pick<Operation, 'scope' | 'mutating' | '
   return op.scope === 'read' && op.mutating !== true && !op.requiredScopes?.length;
 }
 
-/** Flag > config `mcp_surface` > 'full'. */
+export type SurfaceSource = 'env' | 'flag' | 'config' | 'default';
+
+/** How `serve` prints and `whoami` reports a surface source. */
+export const SURFACE_SOURCE_LABEL: Record<SurfaceSource, string> = {
+  env: 'env GBRAIN_SURFACE', flag: '--surface', config: 'config', default: 'default',
+};
+
+/** --surface flag > config `mcp_surface` > 'full', with where the answer came from. */
+export function resolveSurfaceWithSource(
+  flag: McpSurface | null,
+  config: Pick<GBrainConfig, 'mcp_surface'> | null | undefined,
+): { surface: McpSurface; source: SurfaceSource; invalidEnv?: string } {
+  if (flag) return { surface: flag, source: 'flag' };
+  if (config && isMcpSurface(config.mcp_surface)) return { surface: config.mcp_surface, source: 'config' };
+  return { surface: 'full', source: 'default' };
+}
+
+/** Flag > config `mcp_surface` > 'full' (`serve --http`; stdio adds GBRAIN_SURFACE via resolveStdioSurface). */
 export function resolveSurface(
   flag: McpSurface | null,
   config: Pick<GBrainConfig, 'mcp_surface'> | null | undefined,
 ): McpSurface {
-  if (flag) return flag;
-  if (config && isMcpSurface(config.mcp_surface)) return config.mcp_surface;
-  return 'full';
+  return resolveSurfaceWithSource(flag, config).surface;
+}
+
+/**
+ * Stdio `serve`: GBRAIN_SURFACE > --surface > config `mcp_surface` > 'full',
+ * the plugin launcher's substitute-or-append semantics. An invalid env value
+ * never stops the server (that would end it before the handshake, where no
+ * agent sees it): it is ignored and returned as `invalidEnv`.
+ */
+export function resolveStdioSurface(
+  flag: McpSurface | null,
+  config: Pick<GBrainConfig, 'mcp_surface'> | null | undefined,
+  env: string | undefined = process.env.GBRAIN_SURFACE,
+): { surface: McpSurface; source: SurfaceSource; invalidEnv?: string } {
+  if (env === undefined || env === '') return resolveSurfaceWithSource(flag, config);
+  if (isMcpSurface(env)) return { surface: env, source: 'env' };
+  return { ...resolveSurfaceWithSource(flag, config), invalidEnv: env };
 }
 
 export function filterOpsForSurface(ops: Operation[], surface: McpSurface): Operation[] {
@@ -184,7 +219,13 @@ export function filterOpsForSurface(ops: Operation[], surface: McpSurface): Oper
   // FROZEN: 'verbs' is EXACTLY `op.verb === true` (MEMORY_VERBS v1) — starter
   // extends the ladder above it and must never alter these semantics.
   if (surface === 'verbs') return ops.filter(op => op.verb === true);
-  return ops.filter(op => STARTER_OPS.has(op.name));
+  return ops.filter(op => STARTER_OPS.has(op.name)).map(starterParams);
+}
+
+/** Starter ops advertise every param except the full-surface-only ones. */
+function starterParams(op: Operation): Operation {
+  if (!Object.values(op.params).some(p => p.fullSurfaceOnly)) return op;
+  return { ...op, params: Object.fromEntries(Object.entries(op.params).filter(([, p]) => !p.fullSurfaceOnly)) };
 }
 
 /** The fail-closed allow-set handed to dispatchToolCall. */
@@ -307,4 +348,70 @@ export function effectiveSurfaceForClient(opts: {
 }): McpSurface {
   const requested = opts.clientSurface ?? opts.defaultSurface ?? opts.ceiling;
   return clampSurface(minSurface(opts.ceiling, requested), opts.warn);
+}
+
+// ---------------------------------------------------------------------------
+// Stdio session surface — one mutable allow-set per stdio server process
+// ---------------------------------------------------------------------------
+
+/**
+ * The stdio session's surface: tools/list, dispatch, the capabilities
+ * resource and `whoami` read the same object, so a `request_tools` widen is
+ * visible to all of them at once. Widening is session-scoped (nothing is
+ * written) and never passes `--access read-only`.
+ */
+export interface StdioSurfaceState {
+  surface: McpSurface;
+  readonly source: SurfaceSource;
+  readonly readOnly: boolean;
+  /** `mcp.allow_session_widen` as last resolved (boot, then each request_tools call). */
+  widenAllowed: boolean;
+  surfacedOps: Operation[];
+  allowedOps: ReadonlySet<string> | undefined;
+  widen(to: McpSurface): { from: McpSurface; to: McpSurface; added: string[] };
+}
+
+export function createStdioSurfaceState(
+  ops: Operation[],
+  init: { surface: McpSurface; source: SurfaceSource; readOnly: boolean; onWiden?: (change: { from: McpSurface; to: McpSurface; added: string[] }) => void },
+): StdioSurfaceState {
+  const compute = (surface: McpSurface) => {
+    const surfacedOps = filterOpsForSurface(ops, surface).filter(op => !init.readOnly || isReadOnlyOperation(op));
+    const allowedOps = init.readOnly ? new Set(surfacedOps.map(op => op.name)) : surface === 'full' ? undefined : allowedOpNames(ops, surface);
+    return { surface, surfacedOps, allowedOps };
+  };
+  const state: StdioSurfaceState = {
+    source: init.source,
+    readOnly: init.readOnly,
+    widenAllowed: true,
+    ...compute(init.surface),
+    widen(to) {
+      const from = state.surface;
+      const before = new Set(state.surfacedOps.map(op => op.name));
+      Object.assign(state, compute(to));
+      const change = { from, to, added: state.surfacedOps.filter(op => !before.has(op.name)).map(op => op.name) };
+      init.onWiden?.(change);
+      return change;
+    },
+  };
+  return state;
+}
+
+/** `mcp.allow_session_widen` (default true): DB plane, then the file plane (file only when `engine` is null). */
+export async function sessionWidenAllowed(engine: BrainEngine | null, config: GBrainConfig | null | undefined): Promise<boolean> {
+  const off = (v: unknown) => v === false || (typeof v === 'string' && /^(false|0|off|no)$/i.test(v.trim()));
+  try {
+    const dbVal = engine ? await engine.getConfig('mcp.allow_session_widen') : null;
+    if (dbVal != null) return !off(dbVal);
+  } catch { /* the file plane decides */ }
+  return !off(config?.mcp?.allow_session_widen);
+}
+
+/** The once-per-process `surface_env_invalid` info notice for an ignored GBRAIN_SURFACE value. */
+export function surfaceEnvInvalidNotice(raw: string, served: McpSurface, source: SurfaceSource): Notice {
+  return {
+    code: 'surface_env_invalid', kind: 'info',
+    why: `GBRAIN_SURFACE="${raw}" is not a tool surface (use verbs, starter or full), so this server ignored it and serves '${served}' (source: ${SURFACE_SOURCE_LABEL[source]}).`,
+    user_message: `The gbrain MCP server's GBRAIN_SURFACE setting ("${raw}") is not valid; it takes verbs, starter or full. Can you fix it in the env of your agent app's MCP server entry for gbrain?`,
+  };
 }

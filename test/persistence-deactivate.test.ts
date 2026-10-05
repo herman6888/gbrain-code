@@ -66,8 +66,9 @@ for (const databaseUrl of process.env.DATABASE_URL ? [undefined, process.env.DAT
       suggestion: expect.stringContaining(`gbrain cancel-write-request ${request.request_id}`) });
     await protocol(engine, "UPDATE persistence_requests SET state='committed' WHERE id=$1::uuid", [request.id]);
 
+    const current = await writerAdminState(engine);
     await expect(admin(engine, 'writer_deactivate', { admin_intent: 'writer_deactivate', expected_state: 'f'.repeat(64) }))
-      .rejects.toMatchObject({ code: 'writer_admin_state_changed', suggestion: expect.stringContaining(`The current admin_state is ${await writerAdminState(engine)}`) });
+      .rejects.toMatchObject({ code: 'writer_admin_state_changed', suggestion: expect.stringContaining(`The current admin_state is ${current}`) });
     await expect(admin(engine, 'writer_deactivate', { source_id: 'default', dry_run: true })).rejects.toMatchObject({ code: 'invalid_params',
       message: expect.stringContaining('brain-wide') });
     const stdio = await registerLocalWriter(engine, 'stdio');

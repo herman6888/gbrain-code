@@ -4,7 +4,7 @@
  * intact, the `permissions` mirror stays a JSONB object (double-encode class),
  * `--migrate-legacy` preserves every effective grant, and an older binary's
  * JSONB edit fails closed on the OAuth-provider path. PGLite coverage:
- * test/access-token-grants.test.ts and test/auth-rescope-unified.serial.test.ts.
+ * test/access-token-grants.test.ts and test/auth-rescope-unified.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';

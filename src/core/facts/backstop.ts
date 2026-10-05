@@ -302,8 +302,9 @@ export async function runFactsBackstop(
   const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
   if (await managedPersistenceEnabled(ctx.engine)) {
     if (mode !== 'inline') {
-      const { OperationError } = await import('../ops/contract.ts');
-      throw new OperationError('writer_coordinator_required', 'Managed page backstops must use the durable publication outbox.');
+      const { opError } = await import('../ops/contract.ts');
+      throw opError('writer_coordinator_required', 'Managed page backstops must use the durable publication outbox.',
+        `On a managed brain the publication outbox queues facts for ${parsedPage.slug ?? 'a page'}; a direct ${mode} backstop is a gbrain bug in its caller. The page write is unaffected. Report it with gbrain --version.`);
     }
     return { mode: 'inline', ...await runPipeline(parsedPage, ctx, ctx.abortSignal) };
   }

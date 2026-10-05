@@ -27,7 +27,6 @@
 # Markdown it does not own), but pinning this repo's own .md checkout to LF
 # removes the whole class for anyone working here.
 *.md text eol=lf
-/.gbrain-evals/eval-results.jsonl merge=union
 
 # Native source hashes and prebuilds must survive Windows checkout unchanged.
 native/locks/** text eol=lf

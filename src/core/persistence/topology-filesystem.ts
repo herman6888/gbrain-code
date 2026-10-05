@@ -18,7 +18,11 @@ export function topologyDirectoryIdentity(path:string):{device:string;inode:stri
     {fix:recoveryFix('Shows pending lifecycle requests and their recovery records, read-only.')});
   return {device:info.dev.toString(),inode:info.ino.toString(),birthNs:info.birthtimeNs.toString()};
 }
-/** Complete tree accounting includes .git, sparse files, and metadata headroom. */
+/**
+ * Complete tree accounting includes .git, sparse files, and metadata headroom. A path below the
+ * root that vanishes or stops being a directory mid-walk (git's auto-gc pruning .git/objects) is
+ * counted as already seen; errors on the root and every other error still throw.
+ */
 export async function topologyDirectoryBytes(root:string,limit=Number.MAX_SAFE_INTEGER):Promise<number>{
   let bytes=0;
   const pending=[root];
@@ -30,7 +34,14 @@ export async function topologyDirectoryBytes(root:string,limit=Number.MAX_SAFE_I
     if(!Number.isSafeInteger(bytes)||bytes>limit)throw opError('request_too_large','The staged checkout exceeds its reserved recovery capacity.',
       `The checkout staged at ${root} is larger than the ${limit} bytes reserved for its recovery. Inspect the pending lifecycle request in writer status; it needs a smaller repository or a larger recovery budget, which is the user's call.`,
       {fix:recoveryFix('Shows the pending lifecycle request and the recovery capacity it holds, read-only.')});
-    if(info.isDirectory())for(const entry of await readdir(path))pending.push(join(path,entry));
+    if(!info.isDirectory())continue;
+    let entries:string[];
+    try{entries=await readdir(path);}catch(error){
+      const code=(error as NodeJS.ErrnoException).code;
+      if(path!==root&&(code==='ENOENT'||code==='ENOTDIR'))continue;
+      throw error;
+    }
+    for(const entry of entries)pending.push(join(path,entry));
   }
   return bytes;
 }

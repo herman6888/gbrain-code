@@ -270,6 +270,7 @@ This section is the single home for the merge rules (other docs link here).
 `borrow_from` targets) into the `resolved.manifest` every consumer reads.
 The rules:
 
+- **`link_types[].temporal`** (`state` | `event`, optional) declares whether a relation can end or happened on a date; graph reads then treat it as a temporal typed edge ([temporal edges](../guides/temporal-edges.md)).
 - **Six fields inherit, child-wins:** `page_types`, `link_types`,
   `frontmatter_links`, `enrichable_types`, `filing_rules`, and `takes_kinds`.
   A child value with the same key (type name, link name, etc.) overrides the

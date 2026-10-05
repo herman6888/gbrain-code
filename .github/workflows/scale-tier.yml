@@ -5,9 +5,9 @@ name: Scale tier
 #
 # When it runs (one rule):
 # - pull requests that touch the paths below, or carry the `scale-tier` label: 10k;
-# - nightly: 10k + 20k until the import-rate gate has passed at 20k on five
-#   consecutive nights, then 50k (scripts/scale/trend.ts decides from the last
-#   five nightly reports);
+# - nightly: 10k + 20k until the import-rate gate has passed at 20k on both
+#   engines on five consecutive nights, then 50k (scripts/scale/trend.ts
+#   decides from the last five nightly reports);
 # - workflow_dispatch: the size you pass.
 #
 # Enforced: import rate, known answers, no-op re-import, no duplicates across
@@ -127,9 +127,10 @@ jobs:
         engine: [pglite, postgres]
         pages: ${{ fromJSON(needs.plan.outputs.pages) }}
     runs-on: ubicloud-standard-8-ubuntu-2404
-    # Backstop only: the harness phase timers fail first, naming the phase
-    # (10k <= 20 min, 50k <= 100 min per engine).
-    timeout-minutes: ${{ matrix.pages > 20000 && 130 || 50 }}
+    # Backstop only: the harness's out-of-process phase watchdog
+    # (scripts/scale/watchdog.ts, 1.5x the phase ceilings: 10k ~30 min,
+    # 20k ~60 min) kills a stalled phase first and names it.
+    timeout-minutes: ${{ matrix.pages >= 20000 && 130 || 50 }}
     services:
       postgres:
         # An empty image skips the service on the PGLite cell.
@@ -142,7 +143,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -180,7 +181,14 @@ jobs:
           REPORT: .context/scale/report-${{ matrix.engine }}-${{ matrix.pages }}-seed1.json
         run: |
           if [ ! -f "$REPORT" ]; then
-            echo "No report: the harness crashed before writing one; see the step log." >> "$GITHUB_STEP_SUMMARY"
+            WATCHDOG="${REPORT%.json}.watchdog.txt"
+            if [ -f "$WATCHDOG" ]; then
+              # The annotation is the signature nightly-watch matches against .github/nightly-known-red.tsv.
+              echo "::error title=Scale phase watchdog::$(head -1 "$WATCHDOG")"
+              { echo "### Phase watchdog killed the harness"; echo '```'; cat "$WATCHDOG"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "No report: the harness crashed before writing one; see the step log." >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 0
           fi
           jq -r '"### " + .headline.metric + ": " + (.headline.p50_ms|tostring) + " ms (" + .engine + ")",

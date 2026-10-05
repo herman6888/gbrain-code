@@ -43,6 +43,13 @@ const LinkTypeSchema = z.object({
   name: z.string().min(1),
   inverse: z.string().optional(),
   inference: LinkInferenceSchema.optional(),
+  /**
+   * Temporal typed edges: `state` relations can end (works_at, reports_to) and
+   * graph reads return the ones true today; `event` relations happened on a
+   * date and stay true. Omitted: the built-in table decides, else a plain
+   * reference. See docs/guides/temporal-edges.md.
+   */
+  temporal: z.enum(['state', 'event']).optional(),
 }).strict();
 
 /**

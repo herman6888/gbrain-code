@@ -1,3 +1,5 @@
+import { parseRelationalPlan } from '../search/relational-plan.ts';
+import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
 import { randomUUID } from 'node:crypto';
@@ -442,12 +444,7 @@ const recall: Operation = {
       const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
       const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
       if (!isAvailable('embedding')) {
-        const raw = await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope });
-        searchResults = dedupResults(raw);
-        // #3783 — direct FTS path: every row is a keyword hit by construction.
-        markKeywordHits(searchResults);
-        stampEvidenceSafe(searchResults);
-        await stampContentFlags(ctx.engine, searchResults, { ...searchScope, excludePrivate });
+        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope);
         searchDegraded = 'keyword_only_no_embedding_provider';
       } else {
         searchResults = await hybridSearchCached(ctx.engine, queryText, {
@@ -561,6 +558,7 @@ const recall: Operation = {
               create_safety: r.create_safety,
               provenance: r.slug,
               ...(r.delivered ? { delivered: r.delivered } : {}),
+              ...(r.relational ? { relational: r.relational } : {}),
             })),
             ...(searchDegraded ? { search_degraded: searchDegraded } : {}),
           }
@@ -703,6 +701,7 @@ const context_pack: Operation = {
         open_threads: c.open_threads,
         edges: c.edges,
         backlink_count: c.backlink_count,
+        ...(c.relationship_note ? { relationship_note: c.relationship_note } : {}),
       })),
       open_threads,
       facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
@@ -1061,3 +1060,33 @@ export function parseTtlParam(raw: unknown): Date | null {
 export const factsOperations: Operation[] = [
   extract_facts, recall, context_pack, delta, forget_fact,
 ];
+
+/**
+ * Keyless recall's page arm: direct keyword FTS, except that a planned
+ * multi-relation question (planner on) goes through hybridSearch's keyless
+ * path, which runs keyword + title + the relational chain (zero LLM).
+ */
+async function keylessRecallRows(
+  ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
+  searchScope: { sourceId?: string; sourceIds?: string[] },
+): Promise<SearchResult[]> {
+  if (await keylessChainQuestion(ctx, queryText)) {
+    return hybridSearchCached(ctx.engine, queryText, {
+      limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
+      takesHoldersAllowList: readHolders(ctx), ...searchScope,
+    });
+  }
+  const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope }));
+  // #3783 — direct FTS path: every row is a keyword hit by construction.
+  markKeywordHits(rows);
+  stampEvidenceSafe(rows);
+  await stampContentFlags(ctx.engine, rows, { ...searchScope, excludePrivate });
+  return rows;
+}
+
+/** Keyless recall routes a planned multi-relation question through the relational chain when the planner is on. */
+async function keylessChainQuestion(ctx: OperationContext, queryText: string): Promise<boolean> {
+  if (parseRelationalPlan(queryText).kind !== 'plan') return false;
+  const modeInput = await loadSearchModeConfig(ctx.engine);
+  return resolveSearchMode({ mode: modeInput.mode, overrides: modeInput.overrides }).relational_planner;
+}

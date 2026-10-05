@@ -6,6 +6,7 @@ import { clampLockDurationMs } from '../../core/minions/handler-timeouts.ts';
 import { MinionWorker } from '../../core/minions/worker.ts';
 import { reportInlineWorkerConfiguration } from '../jobs-readiness.ts';
 import { intFlagValue, numberFlagValue } from '../../cli/flag-values.ts';
+import { spendSubmitSummary, type SpendAuthorization } from '../../core/minions/spend-authorization.ts';
 
 export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext): Promise<void> {
   // Lazy: jobs.ts imports this module statically, so a static import back would be a cycle.
@@ -111,6 +112,14 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
     }
   }
 
+  // A4 + T8: queued paid enrich/subagent work needs the user's authorization; it is stored on the row and the worker enforces its cap.
+  let spendAuthorization: SpendAuthorization | undefined;
+  if (PAID_SUBMIT_NAMES.has(name)) {
+    const authorized = await authorizePaidSubmit(engine, name, data, args);
+    if (!authorized) return;
+    spendAuthorization = authorized;
+  }
+
   try { await queue.ensureSchema(); }
   catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
@@ -148,7 +157,10 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
     lock_duration_ms: lockDurationMs,
     idempotency_key: idempotencyKey,
     queue: queueName,
-  }, trusted);
+  }, { ...trusted, ...(spendAuthorization ? { spendAuthorization } : {}) });
+  if (spendAuthorization) {
+    for (const line of spendSubmitSummary(spendAuthorization, [job], spendAuthorization.argv ?? []).lines) process.stderr.write(`${line}\n`);
+  }
 
   // Submission audit log (operational trace, not forensic insurance).
   try {
@@ -237,6 +249,44 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
   } else {
     console.log(JSON.stringify(job, null, 2));
   }
+}
+
+/** Paid job names a CLI submit must authorize (the consent-gated producers' job types). */
+const PAID_SUBMIT_NAMES = new Set(['enrich', 'subagent']);
+
+/**
+ * The same consent gate the producing commands run: `--yes` (derived or
+ * default cap), `--max-usd <usd>`, a preapproval or tokenmax authorize it,
+ * `--max-usd off` is the explicit uncapped choice; otherwise exit 3 with the
+ * consent payload and nothing queued. Returns the record to store, or null.
+ */
+async function authorizePaidSubmit(engine: JobsCommandContext['engine'], name: string, data: Record<string, unknown>, args: string[]): Promise<SpendAuthorization | null> {
+  const { consentGate, engineConsentEnv } = await import('../../core/consent-cli.ts');
+  const { jobSpendAuthorization } = await import('../../core/minions/spend-authorization.ts');
+  const argv = ['gbrain', 'jobs', ...args.filter(a => a !== '--yes')];
+  const maxUsd = parseFlag(args, '--max-usd');
+  if (maxUsd !== undefined && ['off', 'unlimited', 'none'].includes(maxUsd.trim().toLowerCase())) {
+    return jobSpendAuthorization({ uncapped: true, via: 'max_usd' }, { command: `jobs submit ${name}`, of: 1, argv });
+  }
+  const { DEFAULT_LIMIT } = await import('../enrich.ts');
+  const estUsd = name === 'enrich'
+    ? Math.ceil((typeof data.limit === 'number' && data.limit > 0 ? data.limit : DEFAULT_LIMIT) * 0.01 * 100) / 100
+    : null;
+  const auth = await consentGate({
+    command: `jobs submit ${name}`, effects: ['paid'], actor: 'agent',
+    what: `Queue a paid ${name} job`,
+    why: name === 'enrich'
+      ? 'An enrich job writes model-generated summaries into thin pages and pays the chat model provider per page.'
+      : 'A subagent job runs a model tool loop and pays the model provider for every turn.',
+    risk: estUsd !== null
+      ? `Spends about $${estUsd.toFixed(2)} with the chat model provider once a worker runs it. Without --max-usd, a model with no known price runs unmetered under the derived or default cap.`
+      : 'Spends with the model provider once a worker runs it; with no estimate the default $5 cap applies unless --max-usd sets one. Without --max-usd, a model with no known price runs unmetered under the derived or default cap.',
+    user_message: estUsd !== null
+      ? `Queue an enrich job that spends about $${estUsd.toFixed(2)}?`
+      : `Queue a subagent job that spends up to $5 unless you set another cap?`,
+    argv, preview_argv: [...argv, '--dry-run'], est_usd: estUsd, args,
+  }, { json: hasFlag(args, '--json'), env: engineConsentEnv(engine) });
+  return auth ? jobSpendAuthorization(auth, { command: `jobs submit ${name}`, of: 1, argv, ...(estUsd !== null ? { est_usd: estUsd } : {}) }) : null;
 }
 
 /**

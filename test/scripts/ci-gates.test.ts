@@ -52,7 +52,7 @@ describe('CI execution evidence', () => {
   test('unit aggregate rejects failed, cancelled or skipped required jobs', () => {
     expect(unit.jobs['test-status'].if).toBe("${{ always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}");
     expect(unit.jobs['test-status'].needs).toEqual([
-      'gitleaks', 'security-regressions', 'dependency-audit', 'verify', 'serial-tests', 'slow-eval-longmemeval',
+      'gitleaks', 'security-regressions', 'dependency-audit', 'verify', 'serial-tests',
       'slow-entity-resolve-perf', 'slow-brainbench-e2e', 'brainbench', 'test', 'native-locks', 'persistence-validation',
       'admin-browser', 'shared-skills-compatibility',
     ]);
@@ -68,7 +68,7 @@ describe('CI execution evidence', () => {
     expect(e2e.jobs['e2e-status'].if).toBe('always()');
     const needs = e2e.jobs['e2e-status'].needs as string[];
     const nightly = ['coverage-full-unit', 'coverage-full-serial', 'coverage-full-slow', 'coverage-full-e2e'];
-    expect(needs).toEqual(['jsonb-parity', 'tier1', 'tier2', 'prepare-e2e', 'selected-e2e', ...nightly]);
+    expect(needs).toEqual(['jsonb-parity', 'tier1', 'tier1-backend-matrix', 'tier2', 'prepare-e2e', 'selected-e2e', ...nightly]);
     for (const event of ['pull_request', 'push', 'workflow_dispatch']) {
       expect(aggregate(e2e, 'e2e-status', event, Object.fromEntries(nightly.map(job => [job, 'skipped'])))).toBe(0);
     }

@@ -26,6 +26,11 @@
  *                                   an op's `cliOnly.argv` template is exempt: cliOnlyRefusal declares its inputs)
  *   retry-on-mutating               "retry" advice in an error raised by a mutating, non-idempotent op handler
  *                                   (say "inspect state before resubmitting"; retry only with the same request identity)
+ *   defaulted-suggestion            a function that builds an error (opError, new OperationError, usageError, invalidParam,
+ *                                   hostOnlyError) from a suggestion/hint parameter that has a default, is optional or is
+ *                                   `??`-defaulted: each call site names its own next step (never baselined)
+ *   generic-suggestion              a suggestion whose whole text is boilerplate ("see --help", "try again", "check your
+ *                                   input"), at an error constructor or a funnel call site; name the exact usage (never baselined)
  *   unregistered-code               a literal error code thrown in src/ missing from src/core/error-registry.ts (never baselined)
  *   code-naming                     a registry code that is not snake_case or carries a transport prefix (never baselined)
  *
@@ -44,7 +49,7 @@ export type Rule =
   | 'suggestionless-operation-error' | 'throw-new-error-in-ops' | 'hand-built-command' | 'legacy-advice-key'
   | 'interactive-io' | 'yes-rerun-string' | 'stdio-inherit' | 'marker-literal' | 'verify-not-read-only'
   | 'flag-in-mcp-text' | 'in-scope-placeholder' | 'retry-on-mutating'
-  | 'unregistered-code' | 'code-naming';
+  | 'defaulted-suggestion' | 'generic-suggestion' | 'unregistered-code' | 'code-naming';
 
 export const BASELINED_RULES: readonly Rule[] = [
   'suggestionless-operation-error', 'throw-new-error-in-ops', 'hand-built-command', 'legacy-advice-key',
@@ -84,6 +89,151 @@ const FLAG_RE = /(?:^|[\s(`'"])--[a-z][a-z0-9-]*/;
 const PLACEHOLDER_RE = /<(?:source|source[-_]id|slug|id|request[-_]id|client[-_]id|page|uuid|brain|name)>/;
 const RETRY_RE = /\bretry\b/i;
 const SAFE_RETRY_RE = /(?:do not|don't|never) retry|same request_id|same request identity/i;
+
+const SUGGESTION_PARAM = /(?:suggestion|hint)$/i;
+const SUGGESTION_SINK = /^(opError|OperationError|usageError|invalidParam|hostOnlyError)$/;
+const SUGGESTION_ARG: Readonly<Record<string, number>> = { opError: 2, OperationError: 2, verbError: 2, usageError: 1 };
+const GENERIC_SUGGESTION: readonly RegExp[] = [
+  /^(?:please )?(?:see|check|read|consult|run|use)(?: with)?(?: the)? (?:gbrain(?: [a-z][a-z0-9-]*)* )?--help(?: (?:output|for usage|for details|for options))?$/,
+  /^(?:please )?(?:check|verify|fix|correct|review) (?:your|the) (?:input|arguments|parameters|params|request|options)$/,
+  /^(?:please )?(?:try again|retry)(?: later)?$/,
+  /^(?:please )?(?:see|check|read) (?:the )?(?:docs|documentation)$/,
+];
+
+/** True when a suggestion names no next step: empty, or only a generic denylist phrase. */
+export function isGenericSuggestion(text: string): boolean {
+  const t = text.replace(/[`'"]/g, '').replace(/\s+/g, ' ').trim().toLowerCase().replace(/[.!]+$/, '');
+  return t === '' || GENERIC_SUGGESTION.some(re => re.test(t));
+}
+
+type FnLike = ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction;
+const isFnLike = (n: ts.Node): n is FnLike => ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n);
+
+function fnName(fn: FnLike): string | undefined {
+  if (ts.isFunctionDeclaration(fn)) return fn.name?.text;
+  return ts.isVariableDeclaration(fn.parent) && ts.isIdentifier(fn.parent.name) ? fn.parent.name.text : undefined;
+}
+
+/** Error-constructor calls in a function body (the `defaulted-suggestion` sinks). */
+function sinkCalls(fn: FnLike, sf: ts.SourceFile): Array<ts.CallExpression | ts.NewExpression> {
+  const out: Array<ts.CallExpression | ts.NewExpression> = [];
+  const visit = (n: ts.Node) => {
+    if ((ts.isCallExpression(n) || ts.isNewExpression(n)) && SUGGESTION_SINK.test(n.expression.getText(sf))) out.push(n);
+    ts.forEachChild(n, visit);
+  };
+  if (fn.body) visit(fn.body);
+  return out;
+}
+
+function nullishDefaulted(fn: FnLike, name: string): boolean {
+  let found = false;
+  const visit = (n: ts.Node) => {
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+      && ts.isIdentifier(n.left) && n.left.text === name) found = true;
+    if (!found) ts.forEachChild(n, visit);
+  };
+  if (fn.body) visit(fn.body);
+  return found;
+}
+
+/** A file-local function that forwards one of its parameters as an error's suggestion. */
+interface Funnel { name: string; index: number }
+export interface FunnelSite { file: string; line: number; funnel: string; texts: string[] | undefined; expr: string }
+
+/** File-level `const NAME = <string literal>` bindings, so a shared suggestion constant counts as literal text. */
+function literalConsts(sf: ts.SourceFile): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const statement of sf.statements) {
+    if (!ts.isVariableStatement(statement) || !(statement.declarationList.flags & ts.NodeFlags.Const)) continue;
+    for (const d of statement.declarationList.declarations) {
+      const t = ts.isIdentifier(d.name) && d.initializer ? flatText(d.initializer, sf) : undefined;
+      if (t !== undefined) out.set((d.name as ts.Identifier).text, t);
+    }
+  }
+  return out;
+}
+
+/** Literal texts of a suggestion expression (each branch of a conditional); undefined when any branch is not literal. */
+function suggestionTexts(n: ts.Expression, sf: ts.SourceFile, consts: Map<string, string>): string[] | undefined {
+  if (ts.isParenthesizedExpression(n)) return suggestionTexts(n.expression, sf, consts);
+  if (ts.isConditionalExpression(n)) {
+    const a = suggestionTexts(n.whenTrue, sf, consts); const b = suggestionTexts(n.whenFalse, sf, consts);
+    return a && b ? [...a, ...b] : undefined;
+  }
+  const t = ts.isIdentifier(n) ? consts.get(n.text) : flatText(n, sf);
+  return t === undefined ? undefined : [t];
+}
+
+function fileFunnels(sf: ts.SourceFile): Funnel[] {
+  const fns: FnLike[] = [];
+  const collect = (n: ts.Node) => { if (isFnLike(n)) fns.push(n); ts.forEachChild(n, collect); };
+  collect(sf);
+  const out: Funnel[] = [];
+  const forwards = (fn: FnLike, param: string): boolean => {
+    let found = false;
+    const visit = (n: ts.Node) => {
+      if (found) return;
+      if (ts.isCallExpression(n) || ts.isNewExpression(n)) {
+        const callee = n.expression.getText(sf);
+        const args = n.arguments ?? [];
+        if (SUGGESTION_SINK.test(callee) && args.some(a => ts.isIdentifier(a) && a.text === param)) found = true;
+        for (const f of out) if (f.name === callee && ts.isIdentifier(args[f.index] ?? n) && (args[f.index] as ts.Identifier).text === param) found = true;
+      }
+      ts.forEachChild(n, visit);
+    };
+    if (fn.body) visit(fn.body);
+    return found;
+  };
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const fn of fns) {
+      const name = fnName(fn);
+      if (!name) continue;
+      fn.parameters.forEach((p, index) => {
+        if (!ts.isIdentifier(p.name) || !SUGGESTION_PARAM.test(p.name.text) || out.some(f => f.name === name && f.index === index)) return;
+        if (forwards(fn, p.name.text)) { out.push({ name, index }); grew = true; }
+      });
+    }
+  }
+  return out;
+}
+
+/** The suggestion parameter names of the function enclosing `n` (a forwarding call is not a call site). */
+function enclosingSuggestionParams(n: ts.Node): Set<string> {
+  for (let p = n.parent; p; p = p.parent) {
+    if (isFnLike(p)) return new Set(p.parameters.flatMap(q => ts.isIdentifier(q.name) && SUGGESTION_PARAM.test(q.name.text) ? [q.name.text] : []));
+  }
+  return new Set();
+}
+
+function funnelCallSites(sf: ts.SourceFile, path: string): FunnelSite[] {
+  const funnels = fileFunnels(sf);
+  if (!funnels.length) return [];
+  const out: FunnelSite[] = [];
+  const consts = literalConsts(sf);
+  const visit = (n: ts.Node) => {
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
+      for (const f of funnels) {
+        if (f.name !== n.expression.text) continue;
+        const arg = n.arguments[f.index];
+        if (arg && ts.isIdentifier(arg) && enclosingSuggestionParams(n).has(arg.text)) continue;
+        out.push({
+          file: path, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1, funnel: f.name,
+          texts: arg ? suggestionTexts(arg, sf, consts) : undefined, expr: arg ? arg.getText(sf) : '',
+        });
+      }
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+/** Every call site of a suggestion-forwarding funnel (`invalid`, `fail`, `usage`, …) under src/, or in the named files. */
+export function funnelSites(files?: readonly string[], root: string = ROOT): FunnelSite[] {
+  const paths = files ? files.map(f => join(root, f)) : tsFiles(join(root, 'src'));
+  return paths.flatMap(file => funnelCallSites(ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true), rel(file)));
+}
 
 /** Text args of an error constructor call: message (1) and suggestion (2); hostOnlyError's message is arg 2. */
 function errorTextArgs(n: ts.CallExpression | ts.NewExpression, sf: ts.SourceFile): ts.Expression[] {
@@ -221,6 +371,17 @@ export function scan(root: string = ROOT): Hit[] {
         const args = n.arguments ?? [];
         if (args.length < 3 || args[2]!.getText(sf) === 'undefined') add('suggestionless-operation-error', n);
       }
+      if (isFnLike(n) && sinkCalls(n, sf).length) {
+        for (const p of n.parameters) {
+          if (!ts.isIdentifier(p.name) || !SUGGESTION_PARAM.test(p.name.text)) continue;
+          if (p.initializer || p.questionToken || nullishDefaulted(n, p.name.text)) add('defaulted-suggestion', p);
+        }
+      }
+      if ((ts.isCallExpression(n) || ts.isNewExpression(n)) && SUGGESTION_ARG[n.expression.getText(sf)] !== undefined) {
+        const arg = (n.arguments ?? [])[SUGGESTION_ARG[n.expression.getText(sf)]!];
+        const t = arg ? flatText(arg, sf) : undefined;
+        if (t !== undefined && isGenericSuggestion(t)) add('generic-suggestion', arg!);
+      }
       if ((ts.isCallExpression(n) || ts.isNewExpression(n)) && ERROR_CALLEE.test(n.expression.getText(sf))) {
         const texts = errorTextArgs(n, sf);
         for (const arg of texts) {
@@ -278,6 +439,11 @@ export function scan(root: string = ROOT): Hit[] {
       ts.forEachChild(n, visit);
     };
     visit(sf);
+    for (const site of funnelCallSites(sf, path)) {
+      if (site.texts?.some(isGenericSuggestion)) {
+        hits.push({ rule: 'generic-suggestion', file: path, line: site.line, text: `${site.funnel}(…, ${site.expr.slice(0, 100)})` });
+      }
+    }
     if (registry) {
       for (const { code, line } of collectThrownCodes(sf)) {
         if (!registry.has(code)) hits.push({ rule: 'unregistered-code', file: path, line, text: code });
@@ -326,6 +492,8 @@ function main(): number {
   const failures: string[] = [];
   for (const h of hits) {
     if (h.rule === 'unregistered-code') failures.push(`${h.file}:${h.line} [unregistered-code] '${h.text}' is thrown but not registered — add a row to src/core/error-registry.ts, then bun run build:error-codes`);
+    if (h.rule === 'defaulted-suggestion') failures.push(`${h.file}:${h.line} [defaulted-suggestion] ${h.text}: a default suggestion lets call sites skip their next step — make it required and pass one at every call site`);
+    if (h.rule === 'generic-suggestion') failures.push(`${h.file}:${h.line} [generic-suggestion] ${h.text}: name the exact next step (the flag usage, the command, the value to pass), not a generic phrase`);
     if (h.rule === 'code-naming') failures.push(`[code-naming] registry code '${h.text}' must be snake_case with no transport prefix`);
   }
   for (const rule of BASELINED_RULES) {

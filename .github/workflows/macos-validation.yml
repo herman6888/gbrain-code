@@ -89,7 +89,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           GBRAIN_BASH32: /bin/bash
-          GBRAIN_BASH32_REQUIRE: '1'
+          GBRAIN_TEST_BASH32_REQUIRE: '1'
           # tsc peaks near 3 GB of heap on this repo; Node's default limit on
           # the 7 GB runner is lower, so typecheck aborted on heap exhaustion.
           NODE_OPTIONS: --max-old-space-size=4096

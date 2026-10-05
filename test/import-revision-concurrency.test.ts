@@ -72,7 +72,8 @@ test('absence guards reject create races and physical recreation of the same slu
     const original = (await engine.getPage(slug, { sourceId }))!;
     await engine.deletePage(slug, { sourceId });
     await importFromContent(engine, slug, content('recreated'), { sourceId, noEmbed: true });
-    await expect(engine.transaction(tx => assertImportBase(tx, slug, sourceId, original))).rejects.toMatchObject({ code: 'page_identity_changed' });
+    await expect(engine.transaction(tx => assertImportBase(tx, slug, sourceId, original))).rejects.toMatchObject({ code: 'page_identity_changed',
+      fix: { argv: ['gbrain', 'get', '--source', sourceId, '--', slug], mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId } } } });
     expect((await engine.getPage(slug, { sourceId }))!.frontmatter.captured_at).toBe('recreated');
   }
 });

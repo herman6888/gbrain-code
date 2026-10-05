@@ -29,7 +29,8 @@ import { getWriteRequest } from '../core/persistence/journal.ts';
 import { isTerminal, type WriteRequest } from '../core/persistence/model.ts';
 import { digest } from '../core/persistence/digest.ts';
 import type { PreparedMutation } from '../core/persistence/coordinator.ts';
-import { OperationError } from '../core/ops/contract.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
 import { createProgress } from '../core/progress.ts';
 import { importAnalyzeEveryPages, maybeRefreshPlannerStats } from '../core/planner-stats.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -265,16 +266,22 @@ async function publishPageTimeline(engine: BrainEngine, authority: MaintenanceAu
 }
 
 /** Preparer for `managed_maintenance_timeline_extract`: a database-only publication on the page key. */
+function timelinePageChanged(row: WriteRequest, message: string): OperationError {
+  return opError('page_identity_changed', message,
+    `Page ${row.slug} in source ${row.source_id} changed before its queued timeline extraction ran, so this page was skipped. Read the page that holds the slug now; gbrain extract timeline --source db --source-id ${row.source_id} extracts it again under a new request.`,
+    { fix: readFix(`Shows which page holds ${row.slug} now and its revision.`, { argv: ['gbrain', 'get', '--source', row.source_id, '--', row.slug], mcp: { tool: 'get_page', arguments: { slug: row.slug, source_id: row.source_id } } }) });
+}
+
 export async function prepareTimelineExtract(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
-  if (!snapshot || snapshot.page.id !== Number(row.page_id)) throw new OperationError('page_identity_changed', 'The page was deleted or replaced before its timeline was extracted.');
+  if (!snapshot || snapshot.page.id !== Number(row.page_id)) throw timelinePageChanged(row, 'The page was deleted or replaced before its timeline was extracted.');
   await authorizeWrite(engine, row.authority, 'submit_job', row.slug);
   const inferDates = (row.intent as { infer_dates?: unknown } | null)?.infer_dates === true;
   return { observedRevision: snapshot.revision, noop: true,
     validate: async tx => { await authorizeWrite(tx, row.authority, 'submit_job', row.slug); },
     apply: async tx => {
       const current = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id });
-      if (!current) throw new OperationError('page_identity_changed', 'The page disappeared before its timeline was extracted.');
+      if (!current) throw timelinePageChanged(row, 'The page disappeared before its timeline was extracted.');
       return { status: 'completed', added: await writePageTimeline(tx, current.page, row.slug, row.source_id, inferDates) };
     } };
 }

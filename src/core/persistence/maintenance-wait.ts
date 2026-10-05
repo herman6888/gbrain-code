@@ -10,10 +10,26 @@
 import { isTerminal, type WriteRequest } from './model.ts';
 
 export const MAINTENANCE_WRITE_WAIT_MS = 30_000;
+/**
+ * Maintenance publishes that run outside a MaintenanceWriteWait job budget
+ * (managed facts, connector checkpoints, grandfathering, projection reindex)
+ * wait this long for their accepted write before reporting `write_pending`.
+ */
+export const MAINTENANCE_PUBLISH_WAIT_MS = 5_000;
 
 let testWaitMs: number | null = null;
-/** Test seam: replace the 30 s base wait (null restores it). */
-export function __setMaintenanceWriteWaitForTests(ms: number | null): void { testWaitMs = ms; }
+/**
+ * Test seam: replace both maintenance waits (null restores the defaults).
+ * Returns a function that restores the previous value; call it in afterAll/afterEach.
+ */
+export function __setMaintenanceWriteWaitForTests(ms: number | null): () => void {
+  const previous = testWaitMs;
+  testWaitMs = ms;
+  return () => { testWaitMs = previous; };
+}
+
+/** The wait for a maintenance publish outside a job budget. */
+export function maintenancePublishWaitMs(): number { return testWaitMs ?? MAINTENANCE_PUBLISH_WAIT_MS; }
 
 export class MaintenanceWriteWait {
   private pending = false;

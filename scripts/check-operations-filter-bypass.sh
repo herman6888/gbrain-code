@@ -62,6 +62,8 @@ ALLOWED=(
   "src/commands/enrich.ts"                       # local CLI tool; calls put_page handler with remote=false, not network-exposed
   "src/core/extract-takes-from-pages.ts"          # local CLI extraction calls put_page with remote=false; it does not expose operations to a transport
   "src/commands/book-mirror.ts"                 # local CLI tool; not network-exposed
+  "src/commands/edge-proposals.ts"              # local CLI review of edge proposals; calls trusted handlers with remote=false, not network-exposed
+  "src/core/cycle/edge-contradictions.ts"       # dream phase appends closure lines via add_timeline_entry with remote=false; never exposes operations
   "src/commands/tools-json.ts"                  # gbrain --tools-json introspection; full op list IS the purpose
   "src/mcp/publish-gates.ts"                    # reads op.publishGateKey/name only to compute gate-DISABLED sets; never lists/exposes ops
   "src/mcp/tool-catalog.ts"                     # docs/TOOL_CATALOG.md renderer; filters !op.localOnly at the boundary; never a transport surface

@@ -10,6 +10,7 @@ import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { isPhysicalRootMetadata } from '../../src/core/persistence/physical-root.ts';
 import { __setMaintenanceWriteWaitForTests } from '../../src/core/persistence/maintenance-wait.ts';
+import { testWaitMs } from './wait-for.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration, type LocalGrant } from '../../src/core/persistence/identity.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
@@ -31,8 +32,8 @@ type Case = typeof atomContractCases[number];
 export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-atoms-'));
   const sourceId = `atoms-${scenario.replaceAll('_', '-')}`;
-  // The deferred case only needs a pending publish; keep its wait at the pre-#5854 5 s.
-  if (scenario === 'deferred') __setMaintenanceWriteWaitForTests(5_000);
+  // The deferred case only needs a pending publish; a short wait proves the same deferral.
+  const restoreWait = scenario === 'deferred' ? __setMaintenanceWriteWaitForTests(testWaitMs(250)) : () => {};
   try {
     await withEnv({ GBRAIN_HOME: home }, async () => {
       await disposePersistenceConsumer(engine);
@@ -268,7 +269,7 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         expect(state).toEqual([{ content_hash: page.content_hash!, fail_count: scenario === 'malformed' ? 1 : 0, tombstoned: scenario === 'zero_yield' }]);
       }
     });
-  } finally { __setMaintenanceWriteWaitForTests(null); await disposePersistenceConsumer(engine); await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); __setChatTransportForTests(null); rmSync(home, { recursive: true, force: true }); }
+  } finally { restoreWait(); await disposePersistenceConsumer(engine); await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); __setChatTransportForTests(null); rmSync(home, { recursive: true, force: true }); }
 }
 
 export async function exerciseManagedAtomReconciliation(engine: BrainEngine): Promise<void> {

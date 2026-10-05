@@ -4,13 +4,15 @@
  * for coaching/info notices. Engine-free.
  */
 import { writeStdoutFinal, setCliExitVerdict } from '../../core/cli-force-exit.ts';
-import { mutedNoticeCodes, setNoticeMuted } from '../../core/notice-ledger.ts';
+import { mutedNoticeCodes, setNoticeMuted, unmuteNoticeForOwner } from '../../core/notice-ledger.ts';
 import { MUTEABLE_NOTICE_CODES } from '../../core/ops/notices.ts';
 
 const HELP = `Usage: gbrain notices <mute|unmute> <code> | gbrain notices list [--json]
 
-Mute a coaching or info notice for every agent connected to this brain.
-Safety, degraded and ask notices always show.
+Mute a coaching or info notice (or the first_run_decisions ask) for every
+agent connected to this brain. Unmute clears the owner's mute and the one set
+through mute_notice on the stdio MCP pipe. Other safety, degraded and ask
+notices always show.
 Muteable codes: ${MUTEABLE_NOTICE_CODES.join(', ')}
 `;
 
@@ -23,7 +25,7 @@ export async function run(args: string[]): Promise<void> {
     return;
   }
   if (sub === 'list') {
-    const muted = [...mutedNoticeCodes()].sort();
+    const muted = [...mutedNoticeCodes('stdio')].sort();
     await writeStdoutFinal(json ? `${JSON.stringify({ muted, muteable: MUTEABLE_NOTICE_CODES }, null, 2)}\n` : `${muted.length ? muted.join('\n') : '(no muted notices)'}\n`);
     return;
   }
@@ -32,6 +34,6 @@ export async function run(args: string[]): Promise<void> {
     setCliExitVerdict(2);
     return;
   }
-  const muted = setNoticeMuted(code, sub === 'mute');
+  const muted = sub === 'mute' ? setNoticeMuted(code, true) : unmuteNoticeForOwner(code);
   await writeStdoutFinal(json ? `${JSON.stringify({ code, muted: sub === 'mute', muted_codes: muted }, null, 2)}\n` : `${sub === 'mute' ? 'Muted' : 'Unmuted'} ${code}.\n`);
 }

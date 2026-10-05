@@ -22,6 +22,7 @@ import { writeCliNotices } from '../core/interop-notices.ts';
 import { exitCodeForCode } from '../core/error-catalogue.ts';
 import { promptLineStderr } from '../core/interaction.ts';
 import type { SearchMode as SearchModeName } from '../core/search/mode.ts';
+import type { McpSurface } from '../mcp/surface.ts';
 
 /** D2: `--json` writes exactly one document, after whichever branch ran (see init-json.ts). */
 export async function runInit(args: string[]) {
@@ -45,6 +46,7 @@ async function runInitBranches(args: string[]) {
   }
 
   validateInitFlags(args);
+  registrationSurface = (await import('../mcp/surface.ts')).parseSurfaceFlag(args) ?? undefined;
 
   const isSupabase = args.includes('--supabase');
   const isPGLite = args.includes('--pglite');
@@ -257,6 +259,7 @@ const INIT_VALUE_FLAGS = new Set([
   '--issuer-url',
   '--oauth-client-id',
   '--oauth-client-secret',
+  '--surface',
 ]);
 
 function validateInitFlags(args: string[]) {
@@ -1268,7 +1271,7 @@ export async function initPGLite(opts: {
     const stats = await engine.getStats();
 
     if (opts.jsonOutput) {
-      setInitJsonResult({ status: 'success', engine: 'pglite', path: dbPath, pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode)) });
+      setInitJsonResult({ status: 'success', engine: 'pglite', path: dbPath, pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode, registrationSurface)) });
     } else if (process.env.GBRAIN_IN_AGENT_SETUP === '1') {
       printInAgentReady(dbPath);
     } else {
@@ -1293,7 +1296,7 @@ export async function initPGLite(opts: {
 
       // G5: the ONE first-run decision bundle (search mode, writeback,
       // harness wiring, skills scaffold); never blocks init.
-      writeCliNotices(await firstRunBundle(engine, searchMode));
+      writeCliNotices(await firstRunBundle(engine, searchMode, registrationSurface));
 
       // The single primary action, last-on-screen.
       printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0, onPglite: true });
@@ -1309,13 +1312,14 @@ const INIT_EMBEDDING_HINT = 'Pick an embedding model whose dimensions match (`gb
  * MEMORY_VERBS v1 quickstart funnel (E3 + D4B + T1 consent). Printed LAST in
  * both init epilogues as the ONE primary action. The copy-next block is
  * three commands (codex DX 9): wire the harness (the readiness
- * `harness_wiring` fix: absolute binary, `--surface verbs`), save an
+ * `harness_wiring` fix: absolute binary, `--surface starter` or init's `--surface`), save an
  * install-check marker (never a made-up fact about the user), and recall it.
  * The demo uses the facts arm only, so it works with NO embedding key [F-B]. Secondary paths (import, migrate) ride a single terse
  * "More:" footer so they never compete with the primary action.
  */
+let registrationSurface: McpSurface | undefined;
 function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boolean } = {}): void {
-  const register = harnessRegistrationCommand();
+  const register = harnessRegistrationCommand(registrationSurface);
   console.log('');
   console.log(`→ Do this next — give your agent memory (copy these ${register ? 'three' : 'two'} commands):`);
   if (register) console.log(`  ${register}`);
@@ -1598,7 +1602,7 @@ export async function initPostgresCore(opts: {
     const stats = await engine.getStats();
 
     if (opts.jsonOutput) {
-      setInitJsonResult({ status: 'success', engine: 'postgres', pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode)) });
+      setInitJsonResult({ status: 'success', engine: 'postgres', pages: stats.page_count, embedding_check: embedCheck, content: contentReceipt, ...firstRunJson(await firstRunBundle(engine, searchMode, registrationSurface)) });
     } else {
       console.log(`\nBrain ready. ${stats.page_count} pages. Engine: Postgres (Supabase).`);
       if (stats.page_count > 0) {
@@ -1616,7 +1620,7 @@ export async function initPostgresCore(opts: {
       await runInitNudge(engine);
 
       // G5: the first-run decision bundle — same contract as the PGLite arm.
-      writeCliNotices(await firstRunBundle(engine, searchMode));
+      writeCliNotices(await firstRunBundle(engine, searchMode, registrationSurface));
 
       // The single primary action, last-on-screen.
       printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0 });
@@ -1847,6 +1851,7 @@ OPTIONS
   --chat-model <PROVIDER:MODEL>
                         Default subagent driver (v0.27+)
   --no-embedding        Defer embedding setup (skips the embedding-key check)
+  --surface <verbs|starter|full>  Tool surface the printed harness registration pins (default starter)
   --skip-embed-check    Skip the init-time embedding-key validation (config +
                         live test-embed). Also via GBRAIN_INIT_SKIP_EMBED_CHECK=1
 

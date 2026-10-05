@@ -273,6 +273,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | Reserved by MEMORY_VERBS v1; never returned. | A capability this request needs is not configured or not reachable on this brain. | A required capability is not available on this brain. Run `gbrain doctor --json` to see what is missing. | agent | `gbrain doctor --json` | 1 | no |
 
+### cache_quota_exceeded
+
+<a id="cache_quota_exceeded"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Retained shared-skill revisions reached this installation's local cache quota. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
+
 ### cancelled
 
 <a id="cancelled"></a>
@@ -280,6 +290,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The write was cancelled before it committed. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### catalog_capacity_exceeded
+
+<a id="catalog_capacity_exceeded"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The shared-skills catalog visible to this connection exceeds the delivery limits. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
 
 ### catalog_unavailable
 
@@ -695,6 +715,14 @@ More: [docs/guides/write-refusals.md#embedding_auth_failed](../../docs/guides/wr
 
 More: [docs/guides/move-to-postgres.md#graduated-datastore](../../docs/guides/move-to-postgres.md#graduated-datastore)
 
+### eval_suite_unwired
+
+<a id="eval_suite_unwired"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `gbrain eval run-all` was asked for a suite it does not run in-process (longmemeval or replay); nothing ran. | run-all runs only wired suites (brainbench). Recording a skipped run and exiting 0 would read as a completed sweep with no numbers behind it. | Run each requested suite with its own command (`gbrain eval longmemeval <dataset.jsonl> --mode <mode> --record`, `gbrain eval replay --mode <mode>`), once per mode, or drop it from --suites. | agent | `repeat the read that failed` | 1 | no |
+
 ### export_limit
 
 <a id="export_limit"></a>
@@ -792,6 +820,16 @@ More: [docs/guides/write-refusals.md#fetch_failed](../../docs/guides/write-refus
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The file is over the import size limit (5 MB for Markdown and code, 10 MiB for any sync read), so it was not imported. | Size limits bound parsing, chunking and embedding cost. The same bytes refuse on every retry. | Split the file into smaller files, or leave it out of the source (sync.exclude), then sync or import again. | agent | `repeat the read that failed` | 1 | no |
+
+### follow_approval_required
+
+<a id="follow_approval_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Following a brain's shared skills needs the user's explicit follow approval. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#approve-publication-following-and-editing-separately](../../docs/guides/shared-brain-skills.md#approve-publication-following-and-editing-separately)
 
 ### frontmatter_slug_conflict
 
@@ -1089,6 +1127,16 @@ More: [docs/guides/move-to-postgres.md#verify](../../docs/guides/move-to-postgre
 |---|---|---|---|---|---|---|
 | The operation was interrupted by a signal before it finished. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 130 | no |
 
+### invalid_acknowledgment
+
+<a id="invalid_acknowledgment"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The shared-skills delivery acknowledgment does not match a batch issued to this enrollment. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
+
 ### invalid_client
 
 <a id="invalid_client"></a>
@@ -1154,6 +1202,26 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | A parameter is missing, has the wrong type, or has an invalid value. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 2 | no |
+
+### invalid_receipt
+
+<a id="invalid_receipt"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A company-source ingestion receipt input failed validation inside gbrain; nothing was written. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/company-brain-ingestion.md#resume-and-verify](../../docs/guides/company-brain-ingestion.md#resume-and-verify)
+
+### invalid_receipt_transition
+
+<a id="invalid_receipt_transition"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| An ingestion receipt cannot skip a phase or complete while files failed, writes are pending or verification failed. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/company-brain-ingestion.md#resume-and-verify](../../docs/guides/company-brain-ingestion.md#resume-and-verify)
 
 ### invalid_request
 
@@ -1248,6 +1316,26 @@ More: [docs/guides/repair.md#legacy-jobs-active](../../docs/guides/repair.md#leg
 | The managed pull was skipped. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/guides/write-refusals.md#managed_pull_skipped](../../docs/guides/write-refusals.md#managed_pull_skipped)
+
+### membership_inactive
+
+<a id="membership_inactive"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The shared-skills enrollment epoch was left or superseded. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#membership-inactive-after-a-re-enrollment](../../docs/guides/shared-brain-skills.md#membership-inactive-after-a-re-enrollment)
+
+### membership_not_found
+
+<a id="membership_not_found"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| This principal has no shared-skills membership with that installation id. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
 
 ### method_not_allowed
 
@@ -1579,6 +1667,46 @@ More: [docs/guides/repair.md#projection-owner-resident](../../docs/guides/repair
 |---|---|---|---|---|---|---|
 | The request was rate-limited; retry after the stated delay. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
 
+### receipt_conflict
+
+<a id="receipt_conflict"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The ingestion receipt changed since it was read. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/company-brain-ingestion.md#resume-and-verify](../../docs/guides/company-brain-ingestion.md#resume-and-verify)
+
+### receipt_fence_changed
+
+<a id="receipt_fence_changed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The managed owner, topology or source binding changed while the ingestion ran. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/company-brain-ingestion.md#resume-and-verify](../../docs/guides/company-brain-ingestion.md#resume-and-verify)
+
+### receipt_fence_required
+
+<a id="receipt_fence_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Ingestion into a managed or bound source needs the worktree owner's fence. | Only the operator of the brain host can change what blocks this. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/company-brain-ingestion.md#resume-and-verify](../../docs/guides/company-brain-ingestion.md#resume-and-verify)
+
+### receipt_identity_mismatch
+
+<a id="receipt_identity_mismatch"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The receipt ID is already bound to different approved ingestion metadata. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/company-brain-ingestion.md#agent-and-ci-use](../../docs/guides/company-brain-ingestion.md#agent-and-ci-use)
+
 ### recovery_required
 
 <a id="recovery_required"></a>
@@ -1813,7 +1941,7 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | gbrain serve is in status-only mode: its brain is locked by another server, missing, damaged, or its config is unreadable. | A capability this request needs is not configured or not reachable on this brain. | Call gbrain_status for the cause, the fix and what to tell the user. | agent | `gbrain doctor --json` | 1 | no |
 
-Reasons: `lock_held`, `no_brain`, `config_unreadable`, `missing_brain`, `brain_unopenable`, `repair_failed`.
+Reasons: `lock_held`, `no_brain`, `config_unreadable`, `missing_brain`, `brain_unopenable`, `repair_failed`, `unavailable`.
 
 ### shared_skills_unavailable
 
@@ -1870,6 +1998,16 @@ Reasons: `lock_held`, `no_brain`, `config_unreadable`, `missing_brain`, `brain_u
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Retained skill revisions exceed this source storage budget. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### skill_unavailable
+
+<a id="skill_unavailable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The qualified shared skill is not in this installation's current authorized view. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
 
 ### source_binding_required
 
@@ -1950,6 +2088,16 @@ Reasons: `lock_held`, `no_brain`, `config_unreadable`, `missing_brain`, `brain_u
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Split unparseable. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### stale_unavailable
+
+<a id="stale_unavailable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| No complete, current authorized shared-skills view is available; cached shared skills stay unused. | A capability this request needs is not configured or not reachable on this brain. | A required capability is not available on this brain. Run `gbrain doctor --json` to see what is missing. | agent | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
 
 ### state_mismatch
 

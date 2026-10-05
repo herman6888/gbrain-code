@@ -167,6 +167,58 @@ export function startLockSampler(adminUrl: string, db: string, everyMs = 100): {
   return { async stop() { running = false; await loop; await sql.end(); return samples; } };
 }
 
+/**
+ * Effect kinds whose execution takes the native worktree lock (`acquireWorktree`
+ * in src/core/persistence/effects.ts): git (also record-only, briefly, and its
+ * group commit and push) and withdrawal-mirror, when the effect has a worktree.
+ * embedding and facts-backstop never take it.
+ */
+export const WORKTREE_LOCK_KINDS = new Set(['git', 'withdrawal-mirror']);
+
+/** Samples the queued + running effects backlog every `everyMs` (direct connection to the row's database, BENCH_SQL-tagged). */
+export function startEffectsSampler(url: string, everyMs = 2000): { stop: () => Promise<number[]> } {
+  const sql = postgres(url, { max: 1, onnotice: () => {} });
+  const samples: number[] = [];
+  let running = true;
+  const loop = (async () => {
+    while (running) {
+      try { samples.push(Number((await sql.unsafe(`${BENCH_SQL} SELECT count(*) FILTER (WHERE state IN ('queued','running'))::int AS n FROM persistence_effects`))[0]!.n)); }
+      catch { /* sampling is best effort */ }
+      await Bun.sleep(everyMs);
+    }
+  })();
+  return { async stop() { running = false; await loop; await sql.end(); return samples; } };
+}
+
+/**
+ * Effects of the managed-sync page requests admitted since `since` (all publish
+ * database-only here) per group (`intent->>'group'`, else the request alone),
+ * and every effect of the window's requests by kind (`sync_effects` = the
+ * managed-sync share) with whether the kind needs the worktree lock.
+ */
+export async function readEffects(sql: Sql, since: Date): Promise<Record<string, unknown>> {
+  const sync = "r.intent->>'kind' IN ('managed_sync_import','managed_sync_delete')";
+  const groups = await sql.unsafe(`${BENCH_SQL} SELECT COALESCE(r.intent->>'group', r.id::text) AS grp, count(DISTINCT r.id)::int AS requests, count(e.id)::int AS effects
+    FROM persistence_requests r LEFT JOIN persistence_effects e ON e.request_id=r.id WHERE r.created_at >= $1 AND ${sync} GROUP BY 1`, [since]) as unknown as Array<{ requests: number; effects: number }>;
+  const kinds = await sql.unsafe(`${BENCH_SQL} SELECT e.kind, e.state, (e.worktree_id IS NOT NULL) AS worktree, (${sync}) AS sync, count(*)::int AS n
+    FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id WHERE r.created_at >= $1 GROUP BY 1,2,3,4`, [since]) as unknown as Array<{ kind: string; state: string; worktree: boolean; sync: boolean; n: number }>;
+  const compacted = Number((await sql.unsafe(`${BENCH_SQL} SELECT count(*)::int AS n FROM persistence_requests WHERE created_at >= $1 AND compacted`, [since]))[0]!.n);
+  const byKind: Record<string, { effects: number; sync_effects: number; with_worktree: number; needs_worktree_lock: boolean; by_state: Record<string, number> }> = {};
+  for (const k of kinds) {
+    const entry = byKind[k.kind] ??= { effects: 0, sync_effects: 0, with_worktree: 0, needs_worktree_lock: false, by_state: {} };
+    entry.effects += k.n;
+    if (k.sync) entry.sync_effects += k.n;
+    if (k.worktree) entry.with_worktree += k.n;
+    entry.needs_worktree_lock ||= WORKTREE_LOCK_KINDS.has(k.kind) && k.worktree;
+    entry.by_state[k.state] = (entry.by_state[k.state] ?? 0) + k.n;
+  }
+  const perGroup = groups.map(g => g.effects);
+  return { groups: groups.length, requests: sum(groups.map(g => g.requests)), effects: sum(perGroup), compacted_requests: compacted,
+    effects_per_group: { mean: groups.length ? round1(sum(perGroup) / groups.length) : null, p50: pct(perGroup, 50), max: pct(perGroup, 100) },
+    effects_per_request: groups.length ? round1(sum(perGroup) / Math.max(1, sum(groups.map(g => g.requests)))) : null,
+    by_kind: byKind };
+}
+
 export interface TraceRecord { t: number; ms: number; pid: number; label: string; pool: string; conn: number; backend: number; kind: string; sql: string; err?: string }
 
 /** Reads a trace, interning statement text so a multi-million-record trace keeps one copy of each statement. */

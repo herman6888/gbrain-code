@@ -382,7 +382,7 @@ describe('#4587: full-sync reconcile + unsyncable lane are SOFT, purge window is
     expect(result.status).not.toBe('blocked_by_failures');
 
     // The pin: swept via softDeletePages — EXISTS + tombstone, not absent.
-    // (test/sync-malformed-path.serial.test.ts only asserts not-live, which a
+    // (test/sync-malformed-path.test.ts only asserts not-live, which a
     // hard delete would also satisfy.)
     const swept = await rowState(JUNK_SLUG);
     expect(swept.exists).toBe(true);

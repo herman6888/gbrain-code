@@ -54,9 +54,11 @@ import {
 } from '../core/op-checkpoint.ts';
 import { createProgress } from '../core/progress.ts';
 import { consentGateOrExit, engineConsentEnv, tokenmaxUncappedEnv } from '../core/consent-cli.ts';
+import { derivedCapUsd } from '../core/consent.ts';
+import { jobSpendAuthorization, spendSubmitSummary, type SpendAuthorization } from '../core/minions/spend-authorization.ts';
 import { getCliOptions, cliOptsToProgressOptions, maybeBackground } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
-import { runSlidingPool } from '../core/worker-pool.ts';
+import { isMustAbortError, runSlidingPool } from '../core/worker-pool.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import {
@@ -602,7 +604,7 @@ export async function runEnrichCore(
       // pages completed since the last 25-item flush BEFORE it bubbles to
       // runEnrichCore's catch, else resume re-charges them (and SKIP pages stay
       // thin). `done` is in scope here; it isn't in the outer catch.
-      if (err instanceof BudgetExhausted && !dryRun) {
+      if ((err instanceof BudgetExhausted || isMustAbortError(err)) && !dryRun) {
         await recordCompleted(engine, cpKey, [...done]);
       }
       throw err;
@@ -948,40 +950,8 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
 
   // --background: fan out one Minion job per source (D4). With --source, one job.
   // PGLite has no worker daemon → fall through to inline (note emitted below).
-  if (args.includes('--background') && engine.kind !== 'pglite') {
-    const parsed = parseArgs(args);
-    if (parsed.error) { console.error(parsed.error); process.exit(1); }
-    const sourceIds = parsed.sourceId
-      ? [parsed.sourceId]
-      : (await listSources(engine)).map((s) => s.id);
-    if (sourceIds.length <= 1) {
-      // Single source (or only one source exists) → one job via maybeBackground.
-      const backgrounded = await maybeBackground({
-        engine,
-        args: parsed.sourceId ? args : [...args, '--source', sourceIds[0] ?? 'default'],
-        jobName: 'enrich',
-        paramBuilder: buildJobParams,
-      });
-      if (backgrounded) return;
-    } else {
-      // Multi-source fan-out: one job per source.
-      const { MinionQueue } = await import('../core/minions/queue.ts');
-      const queue = new MinionQueue(engine);
-      const ids: number[] = [];
-      for (const sid of sourceIds) {
-        const job = await queue.add(
-          'enrich',
-          { ...buildJobParams(args), sourceId: sid },
-          { idempotency_key: backgroundIdempotencyKey(sid, args) },
-        );
-        ids.push(job.id);
-      }
-      console.log(`Submitted ${ids.length} enrich job(s) (one per source): ${ids.map((i) => `job_id=${i}`).join(' ')}`);
-      console.log('Follow with: gbrain jobs follow <id>');
-      return;
-    }
-  } else if (args.includes('--background')) {
-    // PGLite + --background: no worker daemon; degrade to inline.
+  const background = args.includes('--background') && engine.kind !== 'pglite';
+  if (args.includes('--background') && !background) {
     process.stderr.write('[--background] PGLite has no worker daemon; running enrich inline.\n');
   }
 
@@ -992,10 +962,11 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
     process.exit(1);
   }
 
-  // Chat gateway is required for non-dry-run. Recover a cold singleton before
-  // reporting an availability error (#2590).
-  if (!parsed.dryRun && !isAvailable('chat')) configureGatewayIfUninitialized();
-  if (!parsed.dryRun && !isAvailable('chat')) {
+  // Chat gateway is required for non-dry-run inline work (the worker needs it
+  // for background jobs). Recover a cold singleton before reporting an
+  // availability error (#2590).
+  if (!background && !parsed.dryRun && !isAvailable('chat')) configureGatewayIfUninitialized();
+  if (!background && !parsed.dryRun && !isAvailable('chat')) {
     console.error(
       'Chat gateway unavailable. Set a provider key (OPENAI_API_KEY or ANTHROPIC_API_KEY — ' +
       'chat routes to whichever is present), or configure a model explicitly ' +
@@ -1004,34 +975,71 @@ export async function runEnrich(engine: BrainEngine, args: string[]): Promise<vo
     process.exit(1);
   }
 
-  const sourceIds: string[] = parsed.sourceId
+  const listed: string[] = parsed.sourceId
     ? [parsed.sourceId]
     : (await listSources(engine)).map((s) => s.id);
+  const sourceIds = background && listed.length === 0 ? ['default'] : listed;
 
-  // A4 consent before spending. `--max-usd <usd>`, `--yes` (derived cap: the
-  // estimate x1.5), a per-run preapproval or spend.posture=tokenmax authorize
-  // it; `--max-usd off` is the explicit uncapped choice. tokenmax keeps its
-  // documented meaning here (D15A: the ceiling is removed, spend is still
-  // ledgered), so unattended tokenmax runs do not flip to a derived-cap stop.
-  // Without authorization: a TTY prompt, else exit 3 with the consent payload.
+  // A4 consent before spending, and before queueing paid jobs. `--max-usd
+  // <usd>`, `--yes` (derived cap: the estimate x1.5), a per-run preapproval or
+  // spend.posture=tokenmax authorize it; `--max-usd off` is the explicit
+  // uncapped choice. tokenmax keeps its documented meaning here (D15A: the
+  // ceiling is removed, spend is still ledgered), so unattended tokenmax runs
+  // do not flip to a derived-cap stop. Without authorization: a TTY prompt,
+  // else exit 3 with the consent payload and nothing queued.
   const explicitOff = parsed.maxCostUsd === Infinity;
   let maxCostUsd = parsed.maxCostUsd;
+  const base = args.filter(a => a !== '--yes');
+  let spend: SpendAuthorization | undefined;
+  if (background && !parsed.dryRun && explicitOff) {
+    spend = jobSpendAuthorization({ uncapped: true, via: 'max_usd' }, { command: 'enrich', of: sourceIds.length, argv: ['gbrain', 'enrich', ...base] });
+  }
   if (!parsed.dryRun && !explicitOff) {
     const limit = parsed.limit ?? DEFAULT_LIMIT;
     const estUsd = Math.ceil(limit * sourceIds.length * COST_ESTIMATE_PER_PAGE_USD * 100) / 100;
     const auth = await consentGateOrExit({
       command: 'enrich', effects: ['paid'], actor: 'agent',
-      what: `Enrich up to ${limit} page(s) per source across ${sourceIds.length} source(s)`,
+      what: `Enrich up to ${limit} page(s) per source across ${sourceIds.length} source(s)${background ? ' as background jobs' : ''}`,
       why: 'Fills thin person and company pages with model-written summaries from the brain\'s own evidence.',
-      risk: `Spends about $${estUsd.toFixed(2)} with the chat model provider; pages gain model-written text (each write is attributed and can be reviewed).`,
+      risk: `Spends about $${estUsd.toFixed(2)} with the chat model provider; pages gain model-written text (each write is attributed and can be reviewed).${background ? ' Without --max-usd, a model with no known price runs unmetered under the derived or default cap.' : ''}`,
       user_message: `Enrich up to ${limit} thin page(s) per source across ${sourceIds.length} source(s) for about $${estUsd.toFixed(2)}?`,
-      argv: ['gbrain', 'enrich', ...args.filter(a => a !== '--yes')],
-      preview_argv: ['gbrain', 'enrich', ...args.filter(a => a !== '--yes' && a !== '--json'), '--dry-run'],
+      argv: ['gbrain', 'enrich', ...base, ...(background && parsed.maxCostUsd === undefined ? ['--max-usd', derivedCapUsd(estUsd).toFixed(2)] : [])],
+      preview_argv: ['gbrain', 'enrich', ...base.filter(a => a !== '--json' && a !== '--background' && a !== '--follow'), '--dry-run'],
       est_usd: estUsd,
       args,
     }, { json: parsed.json === true, env: engineConsentEnv(engine, await tokenmaxUncappedEnv(engine, parsed.maxCostUsd !== undefined)) });
     if (maxCostUsd === undefined && auth.cap_usd !== null) maxCostUsd = auth.cap_usd;
+    if (background) spend = jobSpendAuthorization(auth, { command: 'enrich', est_usd: estUsd, of: sourceIds.length, argv: ['gbrain', 'enrich', ...base] });
   }
+
+  if (background) {
+    if (sourceIds.length === 1) {
+      await maybeBackground({
+        engine,
+        args: parsed.sourceId ? args : [...args, '--source', sourceIds[0]],
+        jobName: 'enrich',
+        paramBuilder: buildJobParams,
+        spendAuthorization: spend,
+      });
+      return;
+    }
+    const { MinionQueue } = await import('../core/minions/queue.ts');
+    const queue = new MinionQueue(engine);
+    const jobs = [];
+    for (const sid of sourceIds) {
+      jobs.push(await queue.add(
+        'enrich',
+        { ...buildJobParams(args), sourceId: sid },
+        { idempotency_key: backgroundIdempotencyKey(sid, args) },
+        spend ? { spendAuthorization: spend } : undefined,
+      ));
+    }
+    console.log(`Submitted ${jobs.length} enrich job(s) (one per source): ${jobs.map((j) => `job_id=${j.id}`).join(' ')}`);
+    console.log('Follow with: gbrain jobs follow <id>');
+    if (spend) for (const line of spendSubmitSummary(spend, jobs, spend.argv!).lines) console.error(line);
+    return;
+  }
+
   const uncapped = !parsed.dryRun && maxCostUsd === Infinity;
   if (uncapped) {
     console.error(`${explicitOff ? '--max-usd off' : 'spend.posture=tokenmax'}: running uncapped, spend ledgered. docs: docs/operations/spend-controls.md`);

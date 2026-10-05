@@ -9,7 +9,7 @@
  * Regression: the `ai` default logger's `console.info` banner on stdout,
  * which broke `--json` output, or clobbering a user's `false`.
  * Existing coverage: none at this boundary; the CLI-level check lives in
- * test/json-stdout-ai-warnings.serial.test.ts.
+ * test/json-stdout-ai-warnings.test.ts.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';

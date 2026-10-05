@@ -114,6 +114,17 @@ async function materializeAndAdvance(engine: BrainEngine, effect: PersistenceEff
 
 /** At most this many skipped scan targets are recorded on one effect. */
 const SKIPPED_TARGET_LIMIT = 100;
+/** An embedding claim renews this often while the provider works; the claim lease is 2 minutes. */
+export const EFFECT_RENEWAL_INTERVAL_MS = 10_000;
+let effectRenewalIntervalMs = EFFECT_RENEWAL_INTERVAL_MS;
+/** Test seam: replace the embedding-claim renewal interval (null restores it); returns the restore function. */
+export function __setEffectRenewalIntervalForTests(ms: number | null): () => void {
+  const previous = effectRenewalIntervalMs;
+  effectRenewalIntervalMs = ms ?? EFFECT_RENEWAL_INTERVAL_MS;
+  return () => { effectRenewalIntervalMs = previous; };
+}
+/** The renewal interval in effect (production: EFFECT_RENEWAL_INTERVAL_MS). */
+export function effectRenewalInterval(): number { return effectRenewalIntervalMs; }
 
 async function recordSkippedTarget(engine: BrainEngine, effect: PersistenceEffect, target: SkippedTarget): Promise<void> {
   await engine.executeRaw(`UPDATE persistence_effects SET data=jsonb_set(data,'{skipped}',COALESCE(data->'skipped','[]'::jsonb)||$3::text::jsonb)
@@ -290,7 +301,7 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
     }).catch(error => { lease.abort(embeddingStorageFailure(error)); });
     const interval = setInterval(() => {
       if (!renewing && !signal.aborted) renewing = renew().finally(() => { renewing = undefined; });
-    }, 10_000);
+    }, effectRenewalIntervalMs);
     interval.unref?.();
     let vectors: (Float32Array | null)[];
     // #4616: a degenerate vector refuses only its own chunk; the usable vectors still install.

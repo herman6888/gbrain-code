@@ -144,8 +144,8 @@ describe('pglite-snapshot CI cache keys (DX O7)', () => {
 
   test('discovers every key: 13 across e2e.yml and test.yml, two profiles', () => {
     expect(keys.length).toBe(13);
-    expect(keys.filter((k) => k.file.endsWith('e2e.yml')).length).toBe(5);
-    expect(keys.filter((k) => k.file.endsWith('test.yml')).length).toBe(8);
+    expect(keys.filter((k) => k.file.endsWith('e2e.yml')).length).toBe(6);
+    expect(keys.filter((k) => k.file.endsWith('test.yml')).length).toBe(7);
     expect([...new Set(keys.map((k) => k.namespace))].sort()).toEqual(['pglite-snapshot', 'pglite-snapshot-default']);
   });
 

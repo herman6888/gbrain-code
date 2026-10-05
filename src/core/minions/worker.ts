@@ -50,6 +50,7 @@ import {
   type PoolDiagnostics,
 } from './db-probe.ts';
 import { buildJobContext } from './job-context.ts';
+import { runWithJobSpend } from './spend-authorization.ts';
 import {
   runJobInChild,
   ChildSpawnInfraError,
@@ -1515,7 +1516,7 @@ export class MinionWorker extends EventEmitter {
       }
       const result = isolated
         ? await runJobInChild({
-            jobId: job.id,
+            jobId: job.id, spendAuthorized: job.spend_authorization != null,
             jobName: job.name,
             lockToken,
             abortSignal: abort.signal,
@@ -1533,7 +1534,7 @@ export class MinionWorker extends EventEmitter {
           })
         // #4218: attribute every gateway.chat() the handler makes to this
         // job so chat_usage_log rows carry `phase = 'job:<name>'`.
-        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => handler(context as MinionJobContext)), abort.signal);
+        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => runWithJobSpend(this.engine, job, context as MinionJobContext, handler)), abort.signal);
 
       // The child spawned and ran — the spawn path is healthy again.
       this._consecutiveChildSpawnFailures = 0;

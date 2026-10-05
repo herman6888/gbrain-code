@@ -9,13 +9,15 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import postgres from '#postgres';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { GraduationDeps } from '../../src/core/persistence/engine-graduation.ts';
 import type { InventoryEntry, TableReceipt, VerifyResult } from '../../src/core/persistence/engine-graduation.types.ts';
 import { withGraduationRun } from '../../src/core/persistence/graduation-schema.ts';
 import { withEnv } from './with-env.ts';
+import { assertSafeE2eDatabaseUrl } from './db-guard.ts';
 
 export const PROBE: InventoryEntry = {
   relation: 'grad_probe', kind: 'table', class: 'carry', engines: { pglite: true, postgres: true },
@@ -91,18 +93,34 @@ export interface Harness {
 
 export interface HarnessOptions { postgresUrl?: string }
 
-async function freshTarget(opts: HarnessOptions): Promise<BrainEngine> {
+/**
+ * An empty target brain. On Postgres it is a database of its own, dropped on
+ * close: a graduation leaves its target fenced (rollback abandons it that way
+ * on purpose), and the shared test database must stay writable for every
+ * later file in the same lane.
+ */
+async function freshTarget(opts: HarnessOptions): Promise<{ engine: BrainEngine; drop: () => Promise<void> }> {
   if (!opts.postgresUrl) {
     const engine = new PGLiteEngine();
     await engine.connect({ engine: 'pglite' });
-    return engine;
+    return { engine, drop: async () => {} };
   }
+  assertSafeE2eDatabaseUrl(opts.postgresUrl);
   const { PostgresEngine } = await import('../../src/core/postgres-engine.ts');
+  const database = `gbrain_test_graduation_${randomUUID().replace(/-/g, '')}`;
+  const admin = postgres(opts.postgresUrl, { max: 1, prepare: false, onnotice: () => {} });
+  await admin.unsafe(`CREATE DATABASE ${database}`);
+  const url = new URL(opts.postgresUrl);
+  url.pathname = `/${database}`;
   const engine = new PostgresEngine();
-  await engine.connect({ engine: 'postgres', database_url: opts.postgresUrl });
-  await engine.executeRaw('DROP SCHEMA IF EXISTS public CASCADE');
-  await engine.executeRaw('CREATE SCHEMA public');
-  return engine;
+  const drop = async () => { await admin.unsafe(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`); await admin.end(); };
+  try {
+    await engine.connect({ engine: 'postgres', database_url: url.toString() });
+  } catch (error) {
+    await drop();
+    throw error;
+  }
+  return { engine, drop };
 }
 
 /** A source brain with history-shaped rows: three probe rows and one access token. */
@@ -124,7 +142,7 @@ export async function makeHarness(opts: HarnessOptions = {}): Promise<Harness> {
       await source.executeRaw(`INSERT INTO access_tokens (id, name, token_hash) VALUES ($1::uuid, 'agent-example', 'hash-a1')`, [SOURCE_TOKEN_ID]);
     } finally { await source.disconnect(); }
   });
-  const target = await freshTarget(opts);
+  const { engine: target, drop: dropTarget } = await freshTarget(opts);
   const calls: Record<string, number> = {};
   const count = (name: string) => { calls[name] = (calls[name] ?? 0) + 1; };
   const deps: Partial<GraduationDeps> = {
@@ -186,7 +204,7 @@ export async function makeHarness(opts: HarnessOptions = {}): Promise<Harness> {
   return {
     root, home, gbrainDir, dataDir, mountsPath, target, deps, calls,
     inHome: fn => withEnv({ GBRAIN_HOME: home }, fn),
-    close: async () => { await target.disconnect(); },
+    close: async () => { await target.disconnect(); await dropTarget(); },
   };
 }
 

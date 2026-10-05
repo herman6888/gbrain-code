@@ -873,6 +873,17 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // columns from the migration chain.
   'takes.embedding_model',
   'takes.embedded_text_hash',
+  // Spend meter budget owner (v205): mcp_spend_reservations and mcp_spend_log
+  // are migration-only tables (no CREATE TABLE in the schema blob), so there is
+  // no blob forward reference; the migration chain adds the column and index.
+  'mcp_spend_reservations.budget_key',
+  'mcp_spend_log.budget_key',
+  // Spend fence columns (v205): migration-only, appended after every earlier
+  // migration-added column so fresh and upgraded catalogs agree. No blob index
+  // references them; the blob's queue-protocol trigger reads them only on a
+  // claim, after the migration chain has run.
+  'minion_jobs.spend_authorization',
+  'minion_jobs.spend_claim_token',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so

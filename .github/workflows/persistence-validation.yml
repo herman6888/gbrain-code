@@ -19,7 +19,7 @@ jobs:
         bun: ['1.4.0', '1.4.2']
         # Pull requests run the primary Bun version; pushes, schedules and
         # manual runs keep every supported version.
-        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"bun":"1.4.0"}]' || '[]') }}
+        exclude: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"bun":"1.4.0"}]' || '[]') }}
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -60,7 +60,7 @@ jobs:
         bun: ['1.4.0', '1.4.2']
         # Pull requests run the primary Bun version; pushes, schedules and
         # manual runs keep every supported version.
-        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"bun":"1.4.0"}]' || '[]') }}
+        exclude: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"bun":"1.4.0"}]' || '[]') }}
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -136,7 +136,7 @@ jobs:
         run: |
           : "${DATABASE_URL:?Data-safety tests require the explicit test database}"
           bun --no-env-file test --timeout=180000 test/persistence-publication-native.serial.test.ts
-          bun --no-env-file test --timeout=180000 test/persistence-sync-origin-native.serial.test.ts
+          bun --no-env-file test --timeout=180000 test/persistence-sync-origin-native.test.ts
           bun --no-env-file test --timeout=180000 test/persistence-sync-options.serial.test.ts
           bun --no-env-file test --timeout=180000 test/persistence-sync-company.serial.test.ts
       - name: Require canonical reconciliation through direct and pooled PostgreSQL
@@ -160,6 +160,139 @@ jobs:
           path: .context/persistence-runtime-matrix.json
           if-no-files-found: error
 
+  # Unit-lane suites whose PostgreSQL arm is gated on DATABASE_URL: the unit,
+  # serial and slow lanes unset it, so these arms run only here (both arms per
+  # file; the PGLite arm also runs in the unit lane). scripts/check-postgres-lane-coverage.ts
+  # fails a new DATABASE_URL-gated arm until it is listed here or wrapped in a
+  # test/e2e registerPostgresTests file. The two shards are balanced by measured runtime.
+  unit-postgres-arms:
+    name: Unit-lane PostgreSQL arms ${{ matrix.shard }}/2 / Bun ${{ matrix.bun }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+        bun: ['1.4.0', '1.4.2']
+        # Pull requests run the primary Bun version; pushes, schedules and
+        # manual runs keep every supported version.
+        exclude: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"bun":"1.4.0"}]' || '[]') }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Require PostgreSQL arms of unit-lane suites
+        timeout-minutes: 20
+        shell: bash
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          SHARD: ${{ matrix.shard }}
+        run: |
+          : "${DATABASE_URL:?unit-lane PostgreSQL arms require the explicit test database}"
+          case "$SHARD" in
+            1) files=(
+                test/attribution-backfill-history.test.ts
+                test/colon-slug-windows-5032.test.ts
+                test/decide/conflict-proposals-managed.test.ts
+                test/declared-lineage-visibility.test.ts
+                test/extract-endpoint-revision.serial.test.ts
+                test/graduation-digest.test.ts
+                test/graduation-drain.test.ts
+                test/graduation-inventory.test.ts
+                test/graduation-state.test.ts
+                test/grandfather-managed.test.ts
+                test/harness-skills-epoch.test.ts
+                test/links-attendance-blocked.test.ts
+                test/managed-cycle-pull-upstream.test.ts
+                test/managed-lint.test.ts
+                test/managed-maintenance-links.test.ts
+                test/managed-sync-drain.test.ts
+                test/pack-relation-direction-engine.test.ts
+                test/page-state-engine.test.ts
+                test/persistence-commit-durability.test.ts
+                test/persistence-deactivate.test.ts
+                test/persistence-file-import.test.ts
+                test/persistence-graph-publication.test.ts
+                test/persistence-managed-lifecycle.test.ts
+                test/persistence-managed-sync.test.ts
+                test/persistence-memory-mutations.test.ts
+                test/persistence-page-authority.test.ts
+                test/persistence-skill-bundles.serial.test.ts
+                test/shared-content-freshness.test.ts
+                test/shared-skills-writer-boundary.test.ts
+                test/source-retire-missing-checkout.test.ts
+                test/sync-legacy-holds.test.ts
+                test/takes-vector-lifecycle-5885.serial.test.ts
+                test/withdrawal-overlay-concurrency.test.ts
+              ) ;;
+            2) files=(
+                test/alias-source-cascade-5094.test.ts
+                test/company-brain-policy.test.ts
+                test/company-brain-runtime.test.ts
+                test/derived-link-reconciliation.test.ts
+                test/doctor-frontmatter-holds.test.ts
+                test/embedding-completion-atomic.serial.test.ts
+                test/graduation-copy.test.ts
+                test/graduation-rollback.test.ts
+                test/graduation-target.test.ts
+                test/graduation-verify.test.ts
+                test/held-read-signals.test.ts
+                test/import-frontmatter-key-order-5158.test.ts
+                test/import-revision-concurrency.test.ts
+                test/managed-sweep-corpus-windows.test.ts
+                test/managed-sync-bulk.test.ts
+                test/managed-sync-chunker-version.test.ts
+                test/managed-sync-group-completion.test.ts
+                test/persistence-diagnostics.test.ts
+                test/persistence-git-subdir-origin.test.ts
+                test/persistence-history-fixture.test.ts
+                test/persistence-image-import.serial.test.ts
+                test/persistence-physical-root-device.test.ts
+                test/persistence-skill-crash.slow.test.ts
+                test/persistence-sync-cursor-options.test.ts
+                test/persistence-sync-holds.test.ts
+                test/persistence-writer-fences.test.ts
+                test/repair-embedding-effects.test.ts
+                test/repair-frontmatter.test.ts
+                test/shared-skills-catalog.test.ts
+                test/shared-skills-retention-capacity.test.ts
+                test/stats-health-source-scope.test.ts
+                test/sync-frontmatter-recovery.test.ts
+                test/sync-frontmatter-slug-conflict.test.ts
+                test/withdrawal-publication-file.test.ts
+              ) ;;
+            *) echo "::error::unknown shard $SHARD" >&2; exit 1 ;;
+          esac
+          # One bun process per file: *.serial.test.ts files require their own
+          # process, and a test that fails while its body keeps running would
+          # otherwise leak process.env into every later file (one such leak
+          # deleted DATABASE_URL for the rest of a shard and silently dropped
+          # those files' PostgreSQL arms).
+          failed=()
+          for file in "${files[@]}"; do
+            echo "::group::$file"
+            bun --no-env-file test --timeout=120000 "$file" || failed+=("$file")
+            echo "::endgroup::"
+          done
+          for file in ${failed[@]+"${failed[@]}"}; do
+            echo "::error file=$file::PostgreSQL arm failed. Reproduce: DATABASE_URL=<pgvector test database> GBRAIN_TEST_ALLOW_DATABASE_URL=1 bun test --timeout=120000 $file"
+          done
+          [ "${#failed[@]}" -eq 0 ]
+
   invariants:
     name: ${{ matrix.engine }} / Bun ${{ matrix.bun }}
     # The soak uses 1.3-1.8 busy cores: the 2,500-write PGLite soak took 523s on
@@ -173,7 +306,7 @@ jobs:
         bun: ['1.4.0', '1.4.2']
         # Pull requests run the primary Bun version; pushes, schedules and
         # manual runs keep every supported version.
-        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"bun":"1.4.0"}]' || '[]') }}
+        exclude: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"bun":"1.4.0"}]' || '[]') }}
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -196,7 +329,7 @@ jobs:
       - name: Execute 1000 schedules, eight SIGKILL boundaries and the process-separated write soak
         env:
           DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
-          SOAK_OPERATIONS: ${{ github.event_name == 'pull_request' && '2500' || '10000' }}
+          SOAK_OPERATIONS: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '2500' || '10000' }}
         run: >-
           bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
           --operations="$SOAK_OPERATIONS" --robot-seconds=0
@@ -226,7 +359,7 @@ jobs:
         bun: ['1.4.0', '1.4.2']
         # Pull requests run the primary Bun version; pushes, schedules and
         # manual runs keep every supported version.
-        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"bun":"1.4.0"}]' || '[]') }}
+        exclude: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"bun":"1.4.0"}]' || '[]') }}
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -263,7 +396,7 @@ jobs:
           PGPASSWORD: gbrain_test
           DATABASE_URL: postgres://gbrain_test@127.0.0.1:5432/gbrain_test
           GBRAIN_PGBOUNCER_URL: postgres://gbrain_test@127.0.0.1:55433/gbrain_test
-          ROBOT_SECONDS: ${{ github.event_name == 'pull_request' && '150' || '600' }}
+          ROBOT_SECONDS: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '150' || '600' }}
         run: >-
           bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
           --schedules=0 --operations=0 --no-crashes --robot-seconds="$ROBOT_SECONDS"
@@ -301,7 +434,7 @@ jobs:
         bun: ['1.4.0', '1.4.2']
         # Pull requests run the primary Bun version; pushes, schedules and
         # manual runs keep every supported version.
-        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"bun":"1.4.0"}]' || '[]') }}
+        exclude: ${{ fromJSON((github.event_name == 'pull_request' || github.event_name == 'merge_group') && '[{"bun":"1.4.0"}]' || '[]') }}
     services:
       postgres:
         image: pgvector/pgvector:pg16

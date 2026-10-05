@@ -624,6 +624,44 @@ allowlist-validated (alphanumeric + hyphens; no control chars, RTL overrides,
 or backslashes). Local CLI callers (`gbrain files upload ...`) keep
 unrestricted filesystem access since the user owns the machine.
 
+## Status-only mode
+
+A `gbrain serve --http` that cannot open its brain (another serve holds the
+PGLite lock, no brain is configured yet, the brain is missing or damaged, or
+the config is unreadable) keeps its port and answers in status-only mode
+instead of exiting, so a supervisor does not crash-loop it and every client
+sees the cause:
+
+```text
+$ curl -i localhost:3131/health
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Retry-After: 5
+
+{"status":"unavailable","reason":"unavailable","why":"This gbrain server cannot open its brain; its host operator can see why with `gbrain doctor`.","fix":{"argv":["gbrain","doctor","--json"],"command":"gbrain doctor --json","consent":[],"actor":"host_admin","next":"tell_user_to_run",...},"user_message":"The gbrain memory server is running but cannot open its brain, so memory is offline. ...","retry_after_s":5,"contract_version":1,"instance":"<nonce>"}
+```
+
+- `/mcp` offers only `gbrain_status`; OAuth and admin routes answer `503` with
+  the `serve_status_only` envelope. Responses never name the reason, a path or
+  a PID: Tailscale Funnel delivers public requests from a loopback address, so
+  every request is treated as remote.
+- On the host, stderr prints the reason and its fix ("Re-checking every 5 s;
+  Ctrl-C to stop; `--fail-fast` to exit instead"), the marker
+  `GBRAIN_HOME/serve-http-status-<port>.json` records it, and
+  `gbrain doctor --only harness_wiring` reports `serve_status_only` with the
+  fix. `gbrain mcp expose` reports `verify.local` as status-only with the
+  reason.
+- The server re-checks every 5 s and, once the brain opens, serves the full app
+  on the same port. Clients reconnect: a client that connected during status
+  mode receives `401` with `WWW-Authenticate` resource metadata and completes
+  OAuth again.
+- Container health checks that probe `/health` treat the `503` as unhealthy and
+  restart the container. Pass `--fail-fast` (or set `GBRAIN_SERVE_FAIL_FAST=1`)
+  there so the process exits non-zero with the classified envelope on stderr.
+- A second `gbrain serve --http` on a port another server already holds exits
+  with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
+  path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).
+
 ## Deployment Options
 
 Tailscale via `gbrain mcp expose` is the recommended shape for a brain on your

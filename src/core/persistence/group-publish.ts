@@ -25,7 +25,7 @@ import { OperationError } from '../ops/contract.ts';
 import { authorizeStoredRequest } from './authority.ts';
 import { localHostId } from './identity.ts';
 import { acquireWorktree, getWorktreeBinding, guardOwnership } from './ownership.ts';
-import { completeWrite, getWriteRequestById, lockCounters, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
+import { completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
 import { principalKey, requestPrincipal, type WriteRequest } from './model.ts';
 import { setMemberAttribution, withCoordinatedWrite } from './context.ts';
 import { requestAttribution } from './attribution.ts';
@@ -34,7 +34,10 @@ import { queuePublicationEffects } from './effect-journal.ts';
 import { assertUnboundPublication, classifyUnboundPage } from './unbound-source.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
 import { classifyMirrorPage } from './mirror-read-only.ts';
-import { decoratePublicationOutcome, finishUnpublishedFailure, publishMutation, type PreparedMutation } from './coordinator.ts';
+import { decoratePublicationOutcome, finishUnpublishedFailure, publicationPostimage, publishMutation, type PreparedMutation } from './coordinator.ts';
+import { pipelined } from '../page-state/transactions.ts';
+import { jsonBytes } from './digest.ts';
+import { writerStamp } from './writer-versions.ts';
 
 /** Whether a prepared member can share a group transaction. */
 export function groupable(row: WriteRequest, prepared: PreparedMutation): boolean {
@@ -75,25 +78,17 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
           if ((snapshot?.revision ?? null) !== member.observedRevision) throw new OperationError('revision_conflict', 'The page changed during preparation.', 'Read its current revision and submit the updated intent with a new request_id.');
           await member.validate?.(tx);
           await setMemberAttribution(tx, requestAttribution(row));
-          const outcome = await member.apply(tx);
+          member.postimage = undefined;
+          const outcome = await member.apply(tx, snapshot);
           await classifyUnboundPage(tx, row);
           if (member.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
-          const final = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+          const final = await publicationPostimage(tx, row, member);
           decoratePublicationOutcome(row, member, outcome, final, 0, false);
           await queuePublicationEffects(tx, row, final, outcome, member);
           outcomes.push(outcome);
         }
       }, requestAttribution(head));
-      await lockCounters(tx, ['brain', ...new Set(rows.map(row => principalKey(requestPrincipal(row)))), `worktree:${head.worktree_id}`]);
-      const current = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY sequence FOR UPDATE', [rows.map(row => row.id)]);
-      const byId = new Map(current.map(row => [row.id, row]));
-      const done: WriteRequest[] = [];
-      for (let i = 0; i < rows.length; i++) {
-        const locked = byId.get(rows[i]!.id);
-        if (!locked || locked.execution_token !== rows[i]!.execution_token || locked.state !== 'running') throw new OperationError('write_claim_lost', 'Execution claim changed before publication.', 'Another worker holds the request; inspect it rather than resubmitting.');
-        done.push(await completeWrite(tx, locked, 'committed', outcomes[i]!, undefined, locked));
-      }
-      return done;
+      return completeGroup(tx, rows, outcomes);
     });
   } catch {
     return null;
@@ -101,6 +96,52 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
     releaseCapacity?.();
     await lock.release();
   }
+}
+
+/**
+ * #5984: completes every member's request row in one statement. Each member's
+ * queued effect bytes are read (and missing counter rows created) before the
+ * counters are locked; then the counter lock (`brain`, each principal,
+ * `worktree:<id>`, the order every completion uses) and one UPDATE that checks
+ * each member's claim (`execution_token`, `state='running'`) and terminal
+ * reservation, completes the rows and decrements the counters, are pipelined.
+ * If the UPDATE returns fewer rows than the group, this throws so the
+ * transaction rolls back; the group then takes the single path, where
+ * completeWrite reports each member's exact error code. JSON binds as text.
+ */
+export async function completeGroup(tx: BrainEngine, rows: WriteRequest[], outcomes: Record<string, unknown>[]): Promise<WriteRequest[]> {
+  const ids = rows.map(row => row.id);
+  const keys = [...new Set(['brain', ...rows.map(row => principalKey(requestPrincipal(row))), `worktree:${rows[0]!.worktree_id}`])].sort();
+  const [effects] = await pipelined(tx, [
+    () => tx.executeRaw<{ request_id: string; bytes: string }>(`SELECT request_id::text AS request_id,SUM(octet_length(data::text)+octet_length(kind)+1024)::text AS bytes
+      FROM persistence_effects WHERE request_id=ANY($1::uuid[]) GROUP BY request_id`, [ids]),
+    () => tx.executeRaw(ENSURE_COUNTERS_SQL, [keys]),
+  ]) as [Array<{ request_id: string; bytes: string }>];
+  const effectBytes = new Map(effects.map(e => [e.request_id, Number(e.bytes)]));
+  const stamp = writerStamp();
+  const [, completed] = await pipelined(tx, [
+    () => tx.executeRaw(LOCK_COUNTERS_SQL, [keys]),
+    () => tx.executeRaw<WriteRequest & { principal_key: string }>(`WITH m AS (
+        SELECT * FROM unnest($1::uuid[],$2::uuid[],$3::text[],$4::bigint[],$5::text[]) AS m(id,token,outcome,need,principal_key)
+      ), done AS (
+        UPDATE persistence_requests r SET state='committed',outcome=m.outcome::jsonb,error_code=NULL,error_message=NULL,
+          completed_at=now(),updated_at=now(),claim_expires_at=NULL,blocked_reason=NULL,
+          consumer_version=$6,consumer_host_id=$7::uuid,published_at=now()
+        FROM m WHERE r.id=m.id AND r.execution_token=m.token AND r.state='running' AND m.need<=r.terminal_reservation
+        RETURNING r.*,m.principal_key
+      ), released AS (
+        UPDATE persistence_counters c SET outstanding_count=c.outstanding_count-d.n,intent_bytes=c.intent_bytes-d.bytes
+        FROM (SELECT k.key,count(*) AS n,SUM(done.intent_bytes) AS bytes FROM done CROSS JOIN LATERAL (VALUES ('brain'),(done.principal_key)) AS k(key) GROUP BY k.key) d
+        WHERE c.key=d.key
+      )
+      SELECT * FROM done`, [ids, rows.map(row => row.execution_token), outcomes.map(outcome => JSON.stringify(outcome)),
+      rows.map((row, i) => jsonBytes(outcomes[i]) + jsonBytes(row.authority) + 1024 + (effectBytes.get(row.id) ?? 0)),
+      rows.map(row => principalKey(requestPrincipal(row))), stamp.version, stamp.hostId]),
+  ]) as [unknown, Array<WriteRequest & { principal_key: string }>];
+  if (completed.length !== rows.length) throw new OperationError('write_claim_lost', 'A group member failed its claim or terminal-reservation check before publication.',
+    'The group rolls back and its members publish one at a time, where each member reports its own outcome; inspect the requests rather than resubmitting.');
+  const byId = new Map(completed.map(({ principal_key: _key, ...row }) => [row.id, row as WriteRequest]));
+  return rows.map(row => byId.get(row.id)!);
 }
 
 export interface GroupExecution {

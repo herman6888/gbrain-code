@@ -629,7 +629,7 @@ export function renderPagesBlock(
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
     const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
-    const flag = p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '';
+    const flag = (p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '') + graphEvidenceLine(p);
     // Evidence delivery: the block was already budgeted and cut around its
     // hits; render it whole (capped only by excerptLen).
     if (typeof opts.verbatim === 'function' ? opts.verbatim(p) : opts.verbatim) {
@@ -647,6 +647,14 @@ export function renderPagesBlock(
       (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
     return `<page slug="${slug}" rank="${idx + 1}">\n${flag}${body}\n</page>`;
   }).join('\n\n');
+}
+
+/** One line naming the typed links that put a chain row in the context (slugs and link types only). */
+function graphEvidenceLine(p: SearchResult): string {
+  const edges = p.relational?.edges ?? [];
+  if (edges.length === 0) return '';
+  const clean = (v: string) => v.replace(/[\r\n<>]/g, ' ');
+  return `Graph evidence (${p.relational!.role}): ${edges.map(e => `${clean(e.stored_from)} -${clean(e.link_type)}-> ${clean(e.stored_to)}`).join('; ')}\n`;
 }
 
 export function takesHitToTakeForPrompt(h: TakeHit | Take): {

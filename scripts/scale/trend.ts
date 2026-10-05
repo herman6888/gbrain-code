@@ -16,7 +16,8 @@
  *    per metric. Enforcement then flips with the repo variable
  *    GBRAIN_SCALE_ENFORCE_CEILINGS=1, a reviewed human step.
  * 2. Which sizes run tonight (the one cadence rule)? 10k + 20k nightly until
- *    the import-rate gate has passed at 20k on five consecutive nights, then
+ *    the import-rate gate has passed at 20k on both engines on five
+ *    consecutive nights (a missing 20k report counts as not passed), then
  *    50k nightly (sticky: once the latest night ran 50k it stays there).
  *
  * Exit 0 whatever the verdict (it is advice; the workflow reads --json);
@@ -31,6 +32,8 @@ export const STABLE_RUNS = 5;
 export const CV_MAX = 0.15;
 export const DEFAULT_TIERS = [10_000, 20_000];
 export const PROMOTED_TIERS = [50_000];
+/** Promotion needs a 20k report from every engine: a cell that never wrote one (killed, cancelled) blocks it. */
+export const ENGINES = ['pglite', 'postgres'];
 
 export interface TrendReport {
   engine: string;
@@ -88,7 +91,8 @@ export function nightlyTiers(runs: TrendRun[]): { tiers: number[]; reason: strin
   const window = runs.slice(0, STABLE_RUNS);
   const ratePassedAt20k = (run: TrendRun) => {
     const at20k = run.reports.filter(r => r.pages === 20_000);
-    return at20k.length > 0 && at20k.every(r => r.gates?.find(g => g.gate === 'import_rate')?.status === 'pass');
+    return ENGINES.every(engine => at20k.some(r => r.engine === engine))
+      && at20k.every(r => r.gates?.find(g => g.gate === 'import_rate')?.status === 'pass');
   };
   if (window.length === STABLE_RUNS && window.every(ratePassedAt20k)) {
     return { tiers: PROMOTED_TIERS, reason: `the import-rate gate passed at 20k on the last ${STABLE_RUNS} nights` };
