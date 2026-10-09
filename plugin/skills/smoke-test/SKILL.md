@@ -17,6 +17,7 @@ tools:
   - exec
   - read
 mutating: true
+when_to_use: "Use when the user asks: \"smoke test\", \"run smoke tests\", \"container restart check\", \"health check\", \"did the restart break anything\"."
 ---
 
 # Smoke Test Skillpack
@@ -155,7 +156,7 @@ not the OpenAI Codex CLI.)
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Exit code = number of unfixed failures: report each by name and the attempted fix; never report all-green when a test was skipped.
 - The database test fails with a `GBRAIN_DB_ACCESS` marker: run `gbrain db-repair` and re-test; the rewrite tier needs the user's agreement.

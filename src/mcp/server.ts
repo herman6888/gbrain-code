@@ -7,9 +7,9 @@ import { operations, opError, OperationError } from '../core/operations.ts';
 import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { dispatchToolCall, buildOperationContext, dispatchRenderContext, type ToolResult } from './dispatch.ts';
+import { dispatchToolCall, buildOperationContext, dispatchRenderContext, requestMetaSessionId, type ToolResult } from './dispatch.ts';
 import { findInvalidParam, schemaInvalidParams, parseStrictParamsMode } from './validate-params.ts';
-import { clampSurface, createStdioSurfaceState, sessionWidenAllowed, surfaceEnvInvalidNotice, type McpAccess, type McpSurface, type SurfaceSource } from './surface.ts';
+import { clampSurface, createStdioSurfaceState, resolveAdvertisedSurface, stdioToolListing, sessionWidenAllowed, surfaceEnvInvalidNotice, type McpAccess, type McpSurface, type SurfaceSource } from './surface.ts';
 import { startOnboardingRefresher } from '../core/onboard/mcp-onboarding.ts';
 import { noticeBlock, renderNotice, type Notice } from '../core/agent-output.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
@@ -295,16 +295,16 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts }),
     },
   );
-  // F1: the contract for the effective callable set + readiness tail (or the
-  // status-only line), resolved when the client initializes.
+  const listing = stdioToolListing(() => resolveAdvertisedSurface(isEngineDegraded(engine) ? null : engine, config), session, server);
+  // F1: callable-set contract + readiness tail (or status-only line), resolved at client initialize.
   installInstructionsResolver(server, async () => {
     if (statusMode && isEngineDegraded(engine)) {
       return resolveMcpInstructions(config, process.env, { tools: { callable: n => n === STATUS_TOOL_NAME, statusLine: statusInstructionLine(statusMode) } });
     }
-    const visible = new Set((await stdioVisibleTools(engine, session.surfacedOps)).map(op => op.name));
+    const visibleOps = await stdioVisibleTools(engine, session.surfacedOps), visible = new Set(visibleOps.map(op => op.name));
     return resolveMcpInstructions(config, process.env, {
       writeback: writebackOpts,
-      tools: { callable: n => visible.has(n), readiness: await instructionReadiness(engine, config, 'stdio') },
+      tools: { callable: n => visible.has(n), readiness: await instructionReadiness(engine, config, 'stdio'), hiddenCallable: visibleOps.length - (await listing.listed(visibleOps)).length },
     });
   });
 
@@ -352,7 +352,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   server.setRequestHandler(ListToolsRequestSchema, async () => trackStdioRpc(async () => ({
     tools: statusMode && isEngineDegraded(engine)
       ? [STATUS_TOOL_DEF]
-      : buildToolDefs(await stdioVisibleTools(engine, session.surfacedOps), { strictParams }),
+      : buildToolDefs(await listing.listed(await stdioVisibleTools(engine, session.surfacedOps)), { strictParams }),
   })));
 
   // #4583 (fixes #4564's misrouted-write symptom): once-per-process advisory
@@ -389,10 +389,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // request.params. Thread it (clamped in dispatch) into the typed
     // OperationContext.sessionId so the hot-memory metaHook's cache keys per
     // session instead of collapsing every caller onto the null-session key.
-    const rawMetaSession = (request.params as { _meta?: { session_id?: unknown } })?._meta?.session_id;
-    const sessionId = typeof rawMetaSession === 'string' && rawMetaSession.length > 0
-      ? rawMetaSession
-      : undefined;
+    const sessionId = requestMetaSessionId(request.params);
     // #4583 rework: warn (once per process) when a MUTATING call's RESOLVED
     // source scope actually lands in 'default' (tier seed_default) on a
     // bulk-non-default brain. Keyed on the already-computed resolution tier —
@@ -431,7 +428,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       surface: session.surface,
       // WP4 (D2): stdio has no per-client rows; its surface is the ceiling
       // request_tools bounds its catalog by; its {surface} call widens the session.
-      surfaceCeiling: session.surface, stdioSurface: session,
+      surfaceCeiling: session.surface, stdioSurface: session, revealTools: listing.reveal,
       resultRows,
     }));
   }));
@@ -457,7 +454,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     bootPhase('persistence_consumer');
     const persistence = await createPersistenceIpcProvider(engine, residentPersistenceConfig(config) ?? { engine: engine.kind });
     bootPhase('resolve_ipc_bind');
-    ipcBinding = await bindResolveIpcForServe(engine, ipcSourceId, persistence);
+    ipcBinding = await bindResolveIpcForServe(engine, ipcSourceId, persistence, { rememberCallable: () => !session.allowedOps || session.allowedOps.has('remember') });
 
     // v0.45.7 ambient recall: age out stale session cursors once per serve boot
     // (7-day TTL, indexed DELETE). Best-effort — GC failure never blocks serve.

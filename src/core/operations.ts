@@ -119,6 +119,8 @@ import { entityIdentityOperations } from './ops/entity-identity.ts';
 import { requestToolsOperations } from './ops/request-tools.ts';
 import { noticesOperations } from './ops/notices.ts';
 import { pageEditOperations } from './ops/page-edit.ts';
+import { pageBatchOperations } from './ops/page-batch.ts';
+import { feedbackOperations } from './ops/feedback.ts';
 
 // parseTtlParam moved to ops/facts.ts with the facts cluster; the `remember`
 // verb (verbs.ts) loads it from THIS module at runtime — re-exported so every
@@ -136,10 +138,11 @@ export const operations: Operation[] = [
   ...verbOperations,
   // Page CRUD (get_page, put_page, delete_page, list_pages + the v0.26.5
   // destructive-guard ops restore_page, purge_deleted_pages) — ops/pages.ts
-  ...pagesOperations, ...pageEditOperations,
+  ...pagesOperations, ...pageEditOperations, ...pageBatchOperations,
   ...persistenceOperations,
   // Search (search, query) — ops/search.ts
   ...searchOperations,
+  ...feedbackOperations,
   // v0.36 Phase 2: image-as-query (search_by_image) — ops/image.ts
   ...imageOperations,
   // Tags (add_tag, remove_tag, get_tags) — ops/tags.ts
@@ -256,6 +259,7 @@ const OP_AREAS: Record<string, string> = {
   add_link: 'links', remove_link: 'links', get_links: 'links',
   get_backlinks: 'links', list_link_sources: 'links', traverse_graph: 'links',
   find_orphans: 'links',
+  wanted_pages: 'links',
   // timeline
   add_timeline_entry: 'timeline', get_timeline: 'timeline',
   // life chronicle

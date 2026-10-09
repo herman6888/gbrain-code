@@ -1,6 +1,7 @@
+import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
+import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { postprocessManagedSynthesis, withPublishPending } from './synthesize-postprocess.ts';
-import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
+import { deferPublishOrThrow, postprocessManagedSynthesis, withPublishPending } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -76,6 +77,7 @@ import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { stampDreamProvenance } from './dream-provenance.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { findLegacyCompletion, findSynthV2Completion, partitionCompletedSynthesis } from './synthesize-completion.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
 // allow-list loader to filing-rules.ts (#2397); patterns.ts and the
@@ -94,6 +96,8 @@ import { withChatPhase, estimateChatCostUsd } from '../ai/chat-usage.ts';
 import { verifyAndRepairDreamPages, normForGrounding, readVerifyEpoch, loadChildWriteEpochs, isDreamOwnedPage, type QuoteVerifyStats, type TranscriptForVerify } from './synthesize-verify.ts';
 import { dreamBreakerRefusal, loadDreamBreaker } from './dream-breaker.ts';
 import { resolveTriageDecide, type TriageDecide, type TriageDecideStats } from './triage-decide.ts';
+import { OperationError } from '../ops/contract.ts';
+import { backoffUntil, recordUnreliableTriage, responseDiagnostic, triageBackoffDetails, TRIAGE_UNRELIABLE_BACKOFF, type TriageDiagnostic } from './triage-backoff.ts';
 import { resolveGroundingDecide } from './grounding-decide.ts';
 import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_MIN_SEGMENTS, DEFAULT_RESCUE_CONTENT_TYPES, DEFAULT_RESCUE_CONFIG, type RescueConfig, type RescueVerdictLike } from './triage-rescue.ts';
 
@@ -527,11 +531,9 @@ async function runPhaseSynthesizeInner(
       process.stderr.write(`[dream] warning: verdict cache sweep failed: ${e instanceof Error ? e.message : String(e)}\n`);
     }
 
-    const synthesisIdentity = maintenance ? `${opts.sourceId ?? 'default'}/${maintenance.writer.sourceIncarnation}` : opts.sourceId ?? 'default';
-    const retainedKeys = maintenance ? await loadSuccessfulSynthesisKeys(engine, opts.sourceId ?? 'default', 'dream:synth-v2:') : [];
-    const retained = new Set(transcripts.filter(t => maintenance && findSynthV2Completion(retainedKeys, t.filePath,
-      t.contentHash.slice(0, 16), synthesisIdentity)).map(t => t.filePath));
-    const pass = await runTriagePass(engine, transcripts.filter(t => !retained.has(t.filePath)), {
+    const { completed, successfulLegacyKeys, successfulV2Keys, synthesisIdentity } = await partitionCompletedSynthesis(engine, transcripts, opts.sourceId ?? 'default', maintenance, opts.dryRun);
+    const synthesisState = { candidates: transcripts.length - completed.size, already_synthesized: completed.size };
+    const pass = await runTriagePass(engine, transcripts.filter(t => !completed.has(t.filePath)), {
       model: config.triage.model,
       maxChars: config.triage.maxChars,
       maxTokens: config.triage.maxTokens,
@@ -541,9 +543,8 @@ async function runPhaseSynthesizeInner(
       signal: opts.signal,
       rescue: rescueConfigOf(config.triage), decide: await resolveTriageDecide(engine),
     }, opts.yieldDuringPhase);
-    pass.reports.push(...transcripts.filter(t => retained.has(t.filePath)).map(t => ({ filePath: t.filePath,
+    pass.reports.push(...transcripts.filter(t => completed.has(t.filePath)).map(t => ({ filePath: t.filePath,
       worth: true, score: null, content_type: null, cached: true, reasons: ['retained_completed_output'] })));
-    pass.cacheHits += retained.size;
     const verdicts = pass.reports;
 
     // Read-time gate: retuning dream.triage.threshold (or the rescue knobs)
@@ -566,7 +567,7 @@ async function runPhaseSynthesizeInner(
       judged: pass.judged,
       cache_hits: pass.cacheHits,
       unreliable: pass.unreliable,
-      deferred: pass.deferred,
+      deferred: pass.deferred, ...triageBackoffDetails(pass.backoff),
       degraded: degradedCount,
       below_threshold: pass.reports.filter(r => r.score !== null && !r.worth).length,
       // F6 spend visibility: judge-call tokens for this pass's cache MISSES
@@ -584,20 +585,21 @@ async function runPhaseSynthesizeInner(
       rescue_fired: pass.reports.filter(r => r.rescued === true).length, ...(pass.decide ? { decide: pass.decide } : {}),
     };
     // 3A: a time-boxed cold pass must never read as mass rejection.
-    const deferralSuffix = pass.deferred > 0
+    const deferralSuffix = (pass.deferred > 0
       ? ` (${pass.deferred} not yet triaged — time budget; re-run or use dream retriage)`
-      : '';
+      : '') + (pass.backoff > 0 ? ` (${pass.backoff} in unreliable-verdict backoff — dream retriage --force re-judges)` : '');
 
     // Dry-run stops here: the triage pass ran (scores cached), but no
     // synthesis. Codex finding #8: --dry-run does NOT mean "zero LLM calls";
     // it means "skip the synthesis model."
     if (opts.dryRun) {
-      return ok(`dry-run: ${worthProcessing.length} of ${transcripts.length} transcripts would synthesize${deferralSuffix}`, {
+      return ok(`dry-run: ${worthProcessing.length - completed.size} of ${synthesisState.candidates} transcripts would synthesize${completed.size ? `; ${completed.size} already synthesized` : ''}${deferralSuffix}`, {
         transcripts_discovered: transcripts.length,
         transcripts_processed: 0,
         pages_written: 0,
         verdicts,
         triage: triageDetails,
+        synthesis_state: synthesisState,
         dryRun: true,
       });
     }
@@ -619,6 +621,7 @@ async function runPhaseSynthesizeInner(
         pages_written: 0,
         verdicts,
         triage: triageDetails,
+        synthesis_state: synthesisState,
       });
     }
 
@@ -679,8 +682,6 @@ async function runPhaseSynthesizeInner(
     const skipReports: Array<{ filePath: string; reason: string }> = [];
 
     const maxCharsPerChunk = computeChunkCharBudget(config.model, config.maxPromptTokens);
-    const successfulLegacyKeys = maintenance ? [] : await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth:');
-    const successfulV2Keys = maintenance ? retainedKeys : await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth-v2:');
 
     // Per-source daily submission cap (D2D: default 0 = disabled; opt-in
     // backstop via dream.synthesize.max_submissions_per_source_per_day).
@@ -882,7 +883,7 @@ async function runPhaseSynthesizeInner(
         config.originalsPrefix,
         config.mode,
         summaryDate,
-        config.attributionRules,
+        config.attributionRules, config.dateGrounding,
       ));
       // One check for the whole chunk set: a transcript never half-submits.
       const callsPerChild = config.mode === 'agentic' ? config.maxTurns : 1;
@@ -910,6 +911,7 @@ async function runPhaseSynthesizeInner(
           oneshot_slug_suffix: chunks.length > 1
             ? `${t.contentHash.slice(0, 6)}-c${i}`
             : t.contentHash.slice(0, 6),
+          oneshot_task_prefixes: [config.reflectionsPrefix, config.originalsPrefix], // #6160: oneshot task shapes
           require_writes: true,
           // #1586: scope every child tool call to the cycle's resolved source
           // so put_page writes land there instead of the hardcoded 'default'.
@@ -1032,6 +1034,7 @@ async function runPhaseSynthesizeInner(
         skips: skipReports,
         verdicts,
         triage: triageDetails,
+        synthesis_state: synthesisState,
       });
     }
 
@@ -1177,7 +1180,7 @@ async function runPhaseSynthesizeInner(
     if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
       const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
       if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance)
-        .catch((e: unknown) => { if (!acceptedPendingReceipt(e)) throw e; publishPending++; });
+        .catch((e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
@@ -1312,6 +1315,7 @@ async function runPhaseSynthesizeInner(
           skips: skipReports,
           verdicts,
           triage: triageDetails,
+          synthesis_state: synthesisState,
           synthesis: {
             jobs: childIds.length,
             max_turns_config: config.maxTurns,
@@ -1370,6 +1374,7 @@ async function runPhaseSynthesizeInner(
       summary_slug: summarySlug,
       verdicts,
       triage: triageDetails,
+      synthesis_state: synthesisState,
       synthesis: {
         jobs: childIds.length,
         max_turns_config: config.maxTurns,
@@ -1416,8 +1421,8 @@ async function runPhaseSynthesizeInner(
       },
     }));
   } catch (e) {
-    return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
-      e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
+    return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL', e instanceof Error ? (e.message || 'synthesize phase threw') : String(e),
+      e instanceof OperationError ? e.suggestion : undefined), e instanceof OperationError ? { error_code: e.code } : {});
   } finally {
     if (ownedPrivateQueue) {
       try {
@@ -1483,6 +1488,8 @@ export interface SynthConfig {
   allowUnpriced: boolean;
   /** dream.synthesize.attribution_rules: add SYNTH_ATTRIBUTION_RULE to the prompt (#5425, opt-in). */
   attributionRules: boolean;
+  /** extraction.date_grounding: label the transcript date as the observation date and resolve relative dates against it. */
+  dateGrounding: boolean;
   cooldownHours: number;
   /**
    * D1: Override the per-chunk token budget (model_context × HEADROOM_RATIO
@@ -1749,6 +1756,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     budgetUsd: parseBudgetUsd(await engine.getConfig('dream.synthesize.budget_usd'), DEFAULT_SYNTH_BUDGET_USD),
     allowUnpriced: await loadAllowUnpriced(engine),
     attributionRules: (await engine.getConfig('dream.synthesize.attribution_rules'))?.trim() === 'true',
+    dateGrounding: await isConsumerDateGroundingOn(engine, 'synthesis'),
     cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
@@ -1902,15 +1910,10 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
         maxTokens: params.max_tokens,
         // DeepSeek v4 thinks by default and bills reasoning as OUTPUT tokens
         // against max_tokens (recipe thinking_by_default, #4172) — same for
-        // OpenRouter's DeepSeek hosts (#4758). The judge wants only the small
-        // JSON verdict, so pin thinking off per-call — the openai-compatible
-        // adapter spreads providerOptions[recipe.id] into the wire body,
-        // where `thinking` is DeepSeek's documented knob.
-        ...(v.parsed.providerId === 'deepseek'
-          || (v.parsed.providerId === 'openrouter'
-            && v.parsed.modelId.trim().toLowerCase().startsWith('deepseek/'))
-          ? { providerOptions: { [v.parsed.providerId]: { thinking: { type: 'disabled' } } } }
-          : {}),
+        // OpenRouter's DeepSeek hosts (#4758) and a configured Anthropic
+        // thinking mode. The judge wants only the small JSON verdict, so it
+        // turns thinking off per call (#5331; per-route mapping in thinking-off.ts).
+        thinking: 'off',
         // #4077: a cancelled cycle tears down the in-flight judge call too.
         abortSignal: options?.signal,
       });
@@ -1985,10 +1988,12 @@ export interface TriageResult {
    *                   could be parsed out of the response. Out-of-range scores
    *                   land here deliberately — clamping would cache a
    *                   fabricated verdict.
-   * runTriagePass skips putDreamVerdict for these so the next cycle re-judges
-   * the transcript instead of permanently trusting a degenerate rejection.
+   * runTriagePass never caches these as a verdict: it writes a backoff marker
+   * (triage-backoff.ts) so the same input is not re-paid every cycle.
    */
   unreliable?: 'truncated' | 'refusal' | 'unparseable';
+  /** Set with `unreliable`: stop reason, length and digest of the response, never its text. */
+  diagnostic?: TriageDiagnostic;
   /**
    * F6: judge-call token usage when the client surfaced it (gateway clients
    * do; legacy SDK-shape mocks may not). Present on degenerate results too —
@@ -2126,8 +2131,10 @@ Quote verbatim; never paraphrase inside "quote".`;
     ? { in: rawUsage.input_tokens, out: rawUsage.output_tokens }
     : undefined;
   const answeredBy = (msg as { answered_by?: string }).answered_by;
-  const withTokens = (r: TriageResult): TriageResult =>
-    ({ ...r, ...(callTokens ? { tokens: callTokens } : {}), ...(answeredBy ? { answeredBy } : {}) });
+  const withTokens = (r: TriageResult): TriageResult => ({
+    ...r, ...(callTokens ? { tokens: callTokens } : {}), ...(answeredBy ? { answeredBy } : {}),
+    ...(r.unreliable ? { diagnostic: responseDiagnostic(stopReasonRaw, text) } : {}),
+  });
   const refused = stopReasonRaw === 'refusal';
   const abnormalStop: TriageResult['unreliable'] | undefined =
     truncated ? 'truncated' : refused ? 'refusal' : undefined;
@@ -2348,8 +2355,10 @@ export interface TriageFileReport {
   reasons: string[];
   cached: boolean;
   unreliable?: string;
-  /** True when the maxMs budget (or shouldStop) expired before this file could be judged. */
+  /** True when the maxMs budget (or shouldStop) expired, or an unreliable-verdict backoff holds, before this file could be judged. */
   deferred?: boolean;
+  /** `triage_unreliable_backoff` when a backoff marker deferred the file (counted in the pass's `backoff`, not `deferred`). */
+  code?: string;
 }
 
 export interface TriagePassResult {
@@ -2361,6 +2370,8 @@ export interface TriagePassResult {
   cacheHits: number;
   unreliable: number;
   deferred: number;
+  /** Files skipped by an unreliable-verdict backoff marker: free, and not a budget deferral. */
+  backoff: number;
   /** F6: summed judge-call usage across cache MISSES this pass (hits are free). */
   tokens: { in: number; out: number };
   /** S7 decide stats, present only when the slot is not off. */
@@ -2411,6 +2422,7 @@ export async function runTriagePass(
   let cacheHits = 0;
   let unreliableCount = 0;
   let deferredCount = 0;
+  let backoffCount = 0;
   let tokensIn = 0;
   let tokensOut = 0;
 
@@ -2460,7 +2472,8 @@ export async function runTriagePass(
   const processLlm = async (idx: number): Promise<void> => {
     const t = transcripts[idx];
     // Cache lookup is always free — never deferred by the time budget.
-    const cached = cfg.force ? null : await engine.getDreamVerdict(t.filePath, t.contentHash);
+    const existing = await engine.getDreamVerdict(t.filePath, t.contentHash);
+    const cached = cfg.force ? null : existing;
     const cacheValid = cached !== null && isTriageCacheValid(cached, cfg.model, cfg.staleBefore);
     if (cached && cacheValid) {
       cacheHits++;
@@ -2474,6 +2487,15 @@ export async function runTriagePass(
         content_type: cached.content_type,
         reasons: cached.reasons,
         cached: true,
+      };
+      return;
+    }
+    const backedOffUntil = cfg.force ? null : backoffUntil(existing, cfg.model, TRIAGE_VERSION);
+    if (backedOffUntil) {
+      backoffCount++;
+      reports[idx] = {
+        filePath: t.filePath, worth: false, score: null, content_type: null, cached: false, deferred: true, code: TRIAGE_UNRELIABLE_BACKOFF,
+        reasons: [`${TRIAGE_UNRELIABLE_BACKOFF}: the last judge verdict was unreliable; not re-judged before ${backedOffUntil}`],
       };
       return;
     }
@@ -2527,16 +2549,14 @@ export async function runTriagePass(
         tokensOut += triage.tokens.out;
       }
       if (triage.unreliable) {
-        // Degenerate judgement — do NOT write it to dream_verdicts: a cached
-        // rejection is permanent for this content hash, and a triage model
-        // that reliably truncates would silently reject every transcript
-        // forever. Log + skip so the next cycle re-judges.
+        // Degenerate judgement — never cached as a verdict (a cached rejection
+        // is permanent for this content hash). A backoff marker instead keeps
+        // the next cycles from paying to re-judge the same input (#6069).
         unreliableCount++;
-        process.stderr.write(
-          `[dream] triage for ${t.basename} was ${triage.unreliable} ` +
-          `(${triage.reasons.join('; ')}); not caching in dream_verdicts — ` +
-          `next cycle will re-judge ${t.filePath}\n`,
-        );
+        await recordUnreliableTriage(engine, t, triage.unreliable, triage.diagnostic, {
+          existing, keepExisting: existing !== null && isTriageCacheValid(existing, cfg.model),
+          model: cfg.model, triageVersion: TRIAGE_VERSION, aborted: cfg.signal?.aborted === true,
+        });
         reports[idx] = {
           filePath: t.filePath,
           worth: false,
@@ -2648,7 +2668,7 @@ export async function runTriagePass(
     }
   }
 
-  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, tokens: { in: tokensIn, out: tokensOut }, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
+  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, backoff: backoffCount, tokens: { in: tokensIn, out: tokensOut }, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
 }
 
 // ── Subagent prompt ──────────────────────────────────────────────────
@@ -2782,8 +2802,16 @@ function buildSynthesisPrompt(
   cycleDate: string = utcDate(),
   // #5425: opt-in speaker/withdrawal rule (dream.synthesize.attribution_rules).
   attributionRules = false,
+  // extraction.date_grounding: the transcript's own date is the observation date;
+  // the cycle date is never used to resolve relative references.
+  dateGrounding = false,
 ): string {
   const dateHint = t.inferredDate ?? cycleDate;
+  const dateContextLine = !dateGrounding
+    ? `- Today's date: ${dateHint}`
+    : t.inferredDate
+      ? `- ${observationDateLine({ date: t.inferredDate, source: 'caller' })}\n- ${observationDateRule().split('\n').join('\n  ')}`
+      : `- Observation date: unknown (today is ${cycleDate}; never resolve relative dates against it — keep them as written)`;
   const baseSlugSegment = sanitizeForSlug(t.basename) || `session-${dateHint}`;
   const isChunked = chunkTotal > 1;
   const hashSuffix = isChunked
@@ -2816,7 +2844,7 @@ function buildSynthesisPrompt(
   return `You are synthesizing a conversation transcript into the user's personal knowledge brain.
 
 CONTEXT
-- Today's date: ${dateHint}
+${dateContextLine}
 - Transcript hash suffix (USE THIS in slugs): ${hashSuffix}
 - Source file basename: ${baseSlugSegment}${chunkBanner}${priorContradictionsBlock}${triageMapBlock}${linkManifestBlock}${allowedPathsBlock}
 
@@ -2933,119 +2961,6 @@ async function collectChildPutPageSlugs(
     const first_write_at = firstWriteAt.get(slug);
     return { slug, source_id: sourceId, ...(raw_source ? { raw_source } : {}), ...(first_write_at ? { first_write_at } : {}) };
   });
-}
-
-/**
- * Load every `completed` subagent job key in one synthesis key family for
- * one source. Called once per phase per family so the submit loop can skip
- * transcripts already synthesized BEFORE building their link manifest:
- *  - D8 legacy `dream:synth:<filePath>:<hash16>[:c<i>of<n>]` (pre-v2 shape;
- *    must not be re-submitted under v2 keys);
- *  - current `dream:synth-v2:<source>:filename:<basename>:<hash16>[:c<i>of<n>]`
- *    (the queue's idempotency dedupe would coalesce these too, but only after
- *    the manifest build, and the coalesced children would re-enter writtenRefs).
- * `dream:synth:%` does not match `dream:synth-v2:` keys.
- *
- * Plain `status = 'completed'` deliberately mirrors the queue-level
- * idempotency semantics the legacy keys relied on: a completed job blocks
- * re-submission regardless of `result.stop_reason` (pinned in
- * test/minions.test.ts). Filtering on stop_reason here would re-pay for
- * transcripts the old code path never re-ran, and reading `result` at all
- * would need the `(result #>> '{}')` double-encoded-jsonb defense.
- *
- * Completed rows that `jobs prune` removed live on in
- * `dream_synthesis_completions` (the prune archives them), so pruning never
- * makes a synthesized transcript eligible again. Loads source-scoped
- * completions once per phase; no repeated history scan per transcript.
- */
-async function loadSuccessfulSynthesisKeys(
-  engine: BrainEngine,
-  sourceId: string,
-  keyPrefix: 'dream:synth:' | 'dream:synth-v2:',
-): Promise<string[]> {
-  const rows = await engine.executeRaw<{ idempotency_key: string }>(
-    `SELECT idempotency_key
-       FROM minion_jobs
-      WHERE name = 'subagent'
-        AND status = 'completed'
-        AND COALESCE(NULLIF(data->>'source_id', ''), 'default') = $1
-        AND idempotency_key LIKE $2
-     UNION
-     SELECT idempotency_key FROM dream_synthesis_completions
-      WHERE source_id = $1 AND idempotency_key LIKE $2`,
-    [sourceId, `${keyPrefix}%`],
-  );
-  return rows.map(row => row.idempotency_key);
-}
-
-/**
- * Mirror of findLegacyCompletion for the synth-v2 key family (grammar as
- * produced by the submit loop / parsed by `parseSynthV2Key`): `'single'` when
- * the unchunked key completed, `'chunked'` when a FULL `:c0of<n>`..`:c<n-1>of<n>`
- * set completed, null otherwise (a cancelled row never counts).
- */
-function findSynthV2Completion(
-  successfulKeys: string[],
-  filePath: string,
-  hash16: string,
-  sourceId: string,
-): 'single' | 'chunked' | null {
-  const prefix =
-    `dream:synth-v2:${encodeURIComponent(sourceId)}` +
-    `:filename:${encodeURIComponent(basename(filePath))}:${hash16}`;
-  const chunkSets = new Map<number, Set<number>>();
-  for (const key of successfulKeys) {
-    if (key === prefix) return 'single';
-    if (!key.startsWith(prefix + ':c')) continue;
-    const chunk = /:c(\d+)of(\d+)$/.exec(key);
-    if (!chunk) continue;
-    const i = Number(chunk[1]);
-    const n = Number(chunk[2]);
-    if (n < 1 || i < 0 || i >= n) continue;
-    let seen = chunkSets.get(n);
-    if (!seen) chunkSets.set(n, seen = new Set());
-    seen.add(i);
-  }
-  for (const [n, seen] of chunkSets) {
-    if (seen.size === n) return 'chunked';
-  }
-  return null;
-}
-
-/**
- * Match a transcript (by filename + content hash) against completed legacy
- * keys. `'single'` when a `dream:synth:<path>:<hash16>` completion exists;
- * `'chunked'` when a FULL chunk set `:c0of<n>`..`:c<n-1>of<n>` completed
- * (chunk indices are 0-based). Partial chunk sets return null so the
- * transcript gets a fresh v2 synthesis instead of shipping with holes.
- */
-function findLegacyCompletion(
-  successfulKeys: string[],
-  filePath: string,
-  hash16: string,
-): 'single' | 'chunked' | null {
-  const filename = basename(filePath);
-  const hashSuffix = `:${hash16}`;
-  /** total chunk count n → completed 0-based chunk indices */
-  const chunkSets = new Map<number, Set<number>>();
-  for (const key of successfulKeys) {
-    const chunk = /:c(\d+)of(\d+)$/.exec(key);
-    const base = chunk ? key.slice(0, -chunk[0].length) : key;
-    if (!base.endsWith(hashSuffix)) continue;
-    const historicalPath = base.slice('dream:synth:'.length, -hashSuffix.length);
-    if (basename(historicalPath) !== filename) continue;
-    if (!chunk) return 'single';
-    const i = Number(chunk[1]);
-    const n = Number(chunk[2]);
-    if (n < 1 || i < 0 || i >= n) continue;
-    let seen = chunkSets.get(n);
-    if (!seen) chunkSets.set(n, seen = new Set());
-    seen.add(i);
-  }
-  for (const [n, seen] of chunkSets) {
-    if (seen.size === n) return 'chunked';
-  }
-  return null;
 }
 
 // ── Reverse-write DB rows → markdown files ───────────────────────────

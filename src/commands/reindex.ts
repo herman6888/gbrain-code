@@ -34,6 +34,10 @@ import { resolve } from 'path';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
+import { loadConfig } from '../core/config.ts';
+import { BudgetExhausted, BudgetTracker } from '../core/budget/budget-tracker.ts';
+import { withBudgetTracker } from '../core/ai/gateway.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -81,7 +85,7 @@ export interface ReindexResult {
 const REINDEX_HELP = `gbrain reindex — re-chunk / re-embed existing pages after a pipeline upgrade
 
 USAGE
-  gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--workers N] [--dry-run] [--no-embed] [--json] [--repo PATH]
+  gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--workers N] [--dry-run] [--no-embed] [--yes] [--max-usd USD] [--json] [--repo PATH]
   gbrain reindex --multimodal [--limit N] [--workers N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]
   gbrain reindex --aliases    [--limit N] [--dry-run] [--json] [--source <id>]
   gbrain reindex --vectors    [--dry-run] [--json]
@@ -89,7 +93,10 @@ USAGE
 TARGETS (exactly one required)
   --markdown        Re-chunk markdown pages whose chunker_version lags the
                     current chunker (or whose contextual-retrieval state is
-                    unset when embedding is on).
+                    unset when embedding is on). On a managed brain it
+                    runs gbrain repair safe-chunks (and contextual-mode
+                    unless --no-embed) instead: no page writes; --type is
+                    refused there.
   --multimodal      Re-embed image/PDF chunks through the multimodal
                     embedding pipeline (Voyage batches).
   --aliases         Backfill the free-text alias layer (page_aliases) for
@@ -107,7 +114,11 @@ OPTIONS
   --dry-run         Report what would change; write nothing
   --cost-estimate   --multimodal only: print the embed cost estimate and stop
   --no-embed        Skip re-embedding (chunk-only reindex)
-  --yes             --multimodal only: skip the cost confirm
+  --yes             Approve the paid run: --markdown re-embeds pages and asks
+                    first (exit 3 without approval when not interactive;
+                    --dry-run, --no-embed and a keyless brain never ask);
+                    --multimodal skips its cost confirm
+  --max-usd USD     --markdown: approve the paid run with this cost cap
   --source <id>     --aliases only: restrict to one source
   --repo PATH       --markdown only: brain repo override
   --json            Machine-readable output
@@ -121,7 +132,7 @@ export function printReindexHelp(): void {
   console.log(REINDEX_HELP);
 }
 
-const REINDEX_VALUE_FLAGS = new Set(['--type', '--limit', '--repo', '--workers', '--concurrency']);
+const REINDEX_VALUE_FLAGS = new Set(['--type', '--limit', '--repo', '--workers', '--concurrency', '--max-usd']);
 
 export function normalizeReindexArgs(args: string[]): string[] {
   return args.flatMap((arg) => {
@@ -218,7 +229,7 @@ function parseArgs(args: string[]): ReindexOpts {
  * hook for post-v81 brains. The simple `chunker_version OR mode IS NULL`
  * predicate covers the headline upgrade case the wave is shipping.
  */
-async function countPending(engine: BrainEngine, type: string | null = null, noEmbed = false): Promise<number> {
+export async function countPending(engine: BrainEngine, type: string | null = null, noEmbed = false): Promise<number> {
   const driftPredicate = pendingDriftPredicate(noEmbed);
   if (type) {
     const rows = await engine.executeRaw<{ count: string | number }>(
@@ -285,7 +296,15 @@ async function readBatch(
   );
 }
 
-export async function runReindex(engine: BrainEngine, args: string[]): Promise<ReindexResult> {
+/** How a caller already authorized the paid run (W4.5): the job handler's stored spend record, or the upgrade prompt's TTY yes. */
+export interface ReindexRunOpts {
+  /** The paid run is already authorized; skip the consent gate. */
+  authorized?: boolean;
+  /** False for unattended callers (the job handler): the gate never prompts. */
+  interactive?: boolean;
+}
+
+export async function runReindex(engine: BrainEngine, args: string[], runOpts: ReindexRunOpts = {}): Promise<ReindexResult> {
   args = normalizeReindexArgs(args);
   const invalidType = args.some((arg, index) =>
     arg === '--type' && !parsePageType(args[index + 1]));
@@ -365,6 +384,30 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     return { pending, pendingAfter: pending, reindexed: 0, skipped: 0, failed: 0, dryRun: true, chunkerVersion: MARKDOWN_CHUNKER_VERSION, type };
   }
 
+  // W4.5: re-embedding is paid work; ask before it starts (throws the exit-3 consent refusal or cost_cap_exceeded).
+  // W12 P1: the approved cap is enforced while the run spends (embedding and synopsis calls), not only checked up front.
+  let cap: BudgetTracker | null = null;
+  let capHit: BudgetExhausted | null = null;
+  if (!opts.noEmbed && !runOpts.authorized) {
+    const { requireReindexConsent } = await import('../core/reindex-consent.ts');
+    const gate = await requireReindexConsent(engine, { args, type, target, ...(runOpts.interactive === false ? { interactive: false } : {}) });
+    const capUsd = gate?.auth.cap_usd;
+    if (typeof capUsd === 'number' && Number.isFinite(capUsd) && capUsd > 0) {
+      cap = new BudgetTracker({ maxCostUsd: capUsd, label: 'reindex', capSource: gate!.auth.cap_source ?? undefined });
+      // An import swallows a refused embedding (its chunks wait for `embed --stale`), so the run stops at the next page.
+      const tracker = cap;
+      tracker.onExhausted(() => { capHit = new BudgetExhausted(`reindex reached its $${capUsd.toFixed(2)} cost cap`, { reason: 'cost', spent: tracker.totalSpent, cap: capUsd }); });
+    }
+  }
+  const metered = <T>(fn: () => Promise<T>): Promise<T> => (cap ? withBudgetTracker(cap, fn) : fn());
+
+  if (await managedPersistenceEnabled(engine)) {
+    try { return await metered(() => reindexManaged(engine, opts, type, pending)); } catch (e) {
+      if (!(e instanceof BudgetExhausted)) throw e;
+      return reportBudgetStop(engine, e, { pending, type, json: !!opts.json, reindexed: 0, skipped: 0, failed: 0 });
+    }
+  }
+
   const reporter = createProgress(cliOptsToProgressOptions(getCliOptions()));
   reporter.start('reindex.markdown', target);
 
@@ -378,7 +421,8 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   // exactly the auto threshold (100), so batch length never enabled it.
   const { workers } = resolveWorkersWithClamp(engine, opts.workers, 'reindex', target);
 
-  while (reindexed + skipped + failed < target) {
+  let stopped: BudgetExhausted | null = null;
+  try { await metered(async () => { while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
     const batchSize = Math.min(BATCH, remaining);
     const batch = await readBatch(engine, batchSize, type, !!opts.noEmbed, afterId);
@@ -395,6 +439,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
       workers,
       failureLabel: (row) => row.slug,
       onItem: async (row) => {
+        if (capHit) throw capHit;
         reporter.tick();
         try {
           if (row.source_path && repoPath) {
@@ -438,7 +483,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
             { type: page.type, title: page.title, tags },
           );
           const imported = await importFromContent(engine, row.slug, fullMarkdown, {
-            sourceId: row.source_id,
+            sourceId: row.source_id, preserveGateMarkers: true,
             noEmbed: !!opts.noEmbed,
             forceRechunk: true,
           });
@@ -454,15 +499,20 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
             skipped++;
           }
         } catch (err) {
+          if (err instanceof BudgetExhausted) throw err;
           const msg = err instanceof Error ? err.message : String(err);
           process.stderr.write(`[reindex] ${row.slug}: ${msg}\n`);
           failed++;
         }
       },
     });
+  } }); } catch (e) {
+    if (!(e instanceof BudgetExhausted)) throw e;
+    stopped = e;
   }
 
   reporter.finish();
+  if (stopped) return reportBudgetStop(engine, stopped, { pending, type, json: !!opts.json, reindexed, skipped, failed, workers });
 
   if (reindexed > 0) await refreshProjectionStatistics(engine);
   const pendingAfter = await countPending(engine, type, !!opts.noEmbed);
@@ -493,4 +543,72 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   }
 
   return result;
+}
+
+/**
+ * W12 P1: the run stopped at its approved cost cap. Pages re-chunked so far are
+ * kept (a rerun continues with the rest); exit 1 with the spend and the rerun.
+ */
+async function reportBudgetStop(engine: BrainEngine, e: BudgetExhausted, r: { pending: number; type: string | null; json: boolean; reindexed: number; skipped: number; failed: number; workers?: number }): Promise<ReindexResult> {
+  if (r.reindexed > 0) await refreshProjectionStatistics(engine);
+  const pendingAfter = await countPending(engine, r.type, false);
+  setCliExitVerdict(1);
+  const message = `stopped at the $${e.cap.toFixed(2)} cost cap after spending $${e.spent.toFixed(4)} (${e.message}). ${pendingAfter} page(s) still pending, and pages re-chunked after the cap wait for gbrain embed --stale; ask the user before running again with a higher --max-usd.`;
+  if (r.json) {
+    process.stdout.write(JSON.stringify({ pending: r.pending, pending_after: pendingAfter, reindexed: r.reindexed, skipped: r.skipped, failed: r.failed,
+      chunker_version: MARKDOWN_CHUNKER_VERSION, type: r.type, budget_exhausted: { cap_usd: e.cap, spent_usd: e.spent, reason: e.reason } }) + '\n');
+  } else {
+    process.stderr.write(`[reindex] ${message}\n`);
+  }
+  return { pending: r.pending, pendingAfter, reindexed: r.reindexed, skipped: r.skipped, failed: r.failed, dryRun: false, chunkerVersion: MARKDOWN_CHUNKER_VERSION, type: r.type,
+    ...(r.workers !== undefined ? { workers: r.workers } : {}) };
+}
+
+/**
+ * #5377: a managed brain cannot re-import through the legacy writer, so the
+ * sweep delegates to the projection repairs: `safe-chunks` re-seals every page
+ * chunked before the current chunker and `contextual-mode` stamps pages imported
+ * without a contextual mode (skipped under --no-embed, which does not count
+ * them as pending). Neither writes a page revision, journal request or
+ * canonical file. `--type` cannot narrow those repairs, so it is refused with
+ * the repair commands instead.
+ */
+async function reindexManaged(engine: BrainEngine, opts: ReindexOpts, type: string | null, pending: number): Promise<ReindexResult> {
+  const base = { pending, dryRun: false, chunkerVersion: MARKDOWN_CHUNKER_VERSION, type };
+  const repairs = opts.noEmbed ? ['safe-chunks'] : ['safe-chunks', 'contextual-mode'];
+  const redirect = repairs.map(kind => `gbrain repair ${kind} --apply${opts.noEmbed ? ' --no-embed' : ''}`).join(' && ');
+  if (type) {
+    const error = `--type cannot narrow a managed reindex; re-chunk every drifted page with: ${redirect}`;
+    if (opts.json) process.stdout.write(JSON.stringify({ error, delegated_to: repairs }) + '\n');
+    else process.stderr.write(`[reindex] ${error}\n`);
+    setCliExitVerdict(2);
+    return { ...base, pendingAfter: pending, reindexed: 0, skipped: 0, failed: 0 };
+  }
+  const { contextualModeRepair } = await import('../core/repair/contextual-mode.ts');
+  const { safeChunksRepair } = await import('../core/repair/safe-chunks.ts');
+  const { resolveRepairScope, runRepair } = await import('../core/repair/core.ts');
+  const ctx = { engine, config: loadConfig() ?? { engine: engine.kind }, remote: false, dryRun: false, sourceId: 'default',
+    logger: { info: (msg: string) => process.stderr.write(`${msg}\n`), warn: (msg: string) => process.stderr.write(`${msg}\n`), error: (msg: string) => process.stderr.write(`${msg}\n`) } };
+  const scope = await resolveRepairScope(engine);
+  const stopped: string[] = [];
+  let unsupported = 0;
+  for (const handler of opts.noEmbed ? [safeChunksRepair] : [safeChunksRepair, contextualModeRepair]) {
+    const run = await runRepair(ctx as Parameters<typeof runRepair>[0], handler, scope, { apply: true, limit: opts.limit, embed: !opts.noEmbed });
+    if (run.stopped) stopped.push(run.stopped.message);
+    unsupported += Object.values(run.residuals).reduce((sum, count) => sum + count, 0);
+  }
+  if (pending > 0) await refreshProjectionStatistics(engine);
+  const pendingAfter = await countPending(engine, type, !!opts.noEmbed);
+  const reindexed = Math.max(0, pending - pendingAfter);
+  if (stopped.length) setCliExitVerdict(1);
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ pending, pending_after: pendingAfter, reindexed, skipped: 0, failed: 0, chunker_version: MARKDOWN_CHUNKER_VERSION, type,
+      delegated_to: repairs, ...(unsupported ? { unsupported_pages: unsupported } : {}), ...(stopped.length ? { stopped } : {}) }) + '\n');
+  } else {
+    process.stderr.write(`[reindex] Managed brain: re-chunked through ${repairs.map(kind => `gbrain repair ${kind}`).join(' and ')} (no page writes). `
+      + `reindexed=${reindexed} pending_before=${pending} pending_after=${pendingAfter}\n`);
+    if (unsupported) process.stderr.write(`[reindex] ${unsupported} page(s) the projection repairs cannot rebuild (code without a source path, or another page kind) are left for their importer.\n`);
+    for (const message of stopped) process.stderr.write(`[reindex] ${message}\n`);
+  }
+  return { ...base, pendingAfter, reindexed, skipped: 0, failed: 0 };
 }

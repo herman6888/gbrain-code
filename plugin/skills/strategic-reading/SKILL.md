@@ -19,6 +19,7 @@ writes_to:
 # uploaded source text + writes brain pages; it doesn't call external
 # APIs. Declarative opt-out.
 brain_first: exempt
+when_to_use: "Use when the user asks: \"strategic reading\", \"read this through the lens of\", \"apply this to my problem\", \"what can I learn from this about\", \"extract a playbook from\"."
 ---
 
 # strategic-reading — Applied Analysis from Source Texts
@@ -185,7 +186,7 @@ The skill's output shape is documented inline in the body sections above (see "O
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - The source text is unavailable or truncated: say which parts were read; do not extend the playbook beyond what was read.
 - Saving the playbook returns `revision_conflict` or `write_pending` (exit 10): re-read and merge, or poll `gbrain write-request <request_id>`.

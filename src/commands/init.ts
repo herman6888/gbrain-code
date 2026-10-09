@@ -1228,6 +1228,7 @@ export async function initPGLite(opts: {
     // disables embedding at runtime.
     if (!opts.aiOpts?.noEmbedding && resolvedModel && resolvedDim) {
       delete config.embedding_disabled;
+      await engine.unsetConfig('embedding_disabled');
     }
     // PR1: new installs publish their skill catalog over MCP by default
     // (existing config wins on re-init, so a prior opt-out is preserved).
@@ -1242,6 +1243,7 @@ export async function initPGLite(opts: {
     preserveConversionConfig(false);
     saveConfig(config);
     if (freshContentDatabase) (await import('./migrations/fresh-install.ts')).recordFreshInstallMigrations();
+    if (freshContentDatabase) { const n = await import('../core/behavior-change-notice.ts'); n.stampFreshBrainBaseline(n.behaviorBrainKey(config)); }
     const contentReceipt = await setupSharedBrainContent({ engine, config, sourceId: await resolveSourceId(engine, undefined), remote: false, dryRun: false, logger: { info: console.error, warn: console.error, error: console.error } }, {
       ...opts.content, fresh: freshContentDatabase,
       ...(process.env.GBRAIN_IN_AGENT_SETUP === '1' && !opts.content?.root ? { root: join(dirname(configPath()), '..', 'memory') } : {}),
@@ -1312,7 +1314,7 @@ const INIT_EMBEDDING_HINT = 'Pick an embedding model whose dimensions match (`gb
  * MEMORY_VERBS v1 quickstart funnel (E3 + D4B + T1 consent). Printed LAST in
  * both init epilogues as the ONE primary action. The copy-next block is
  * three commands (codex DX 9): wire the harness (the readiness
- * `harness_wiring` fix: absolute binary, `--surface starter` or init's `--surface`), save an
+ * `harness_wiring` fix: absolute binary, `--surface full` or init's `--surface`), save an
  * install-check marker (never a made-up fact about the user), and recall it.
  * The demo uses the facts arm only, so it works with NO embedding key [F-B]. Secondary paths (import, migrate) ride a single terse
  * "More:" footer so they never compete with the primary action.
@@ -1565,6 +1567,7 @@ export async function initPostgresCore(opts: {
     // disables embedding at runtime.
     if (!opts.aiOpts?.noEmbedding && resolvedModel && resolvedDim) {
       delete config.embedding_disabled;
+      await engine.unsetConfig('embedding_disabled');
     }
     // PR1: new installs publish their skill catalog over MCP by default
     // (existing config wins on re-init, so a prior opt-out is preserved).
@@ -1578,6 +1581,7 @@ export async function initPostgresCore(opts: {
     preserveConversionConfig(false);
     saveConfig(config);
     if (freshContentDatabase) (await import('./migrations/fresh-install.ts')).recordFreshInstallMigrations();
+    if (freshContentDatabase) { const n = await import('../core/behavior-change-notice.ts'); n.stampFreshBrainBaseline(n.behaviorBrainKey(config)); }
     const contentReceipt = await setupSharedBrainContent({ engine, config, sourceId: await resolveSourceId(engine, undefined), remote: false, dryRun: false, logger: { info: console.error, warn: console.error, error: console.error } }, { ...opts.content, fresh: freshContentDatabase });
     if (!opts.jsonOutput) console.error(`[init] Content: ${contentReceipt.root ?? contentReceipt.repository_kind} (${contentReceipt.repository_kind}; ${contentReceipt.status}). ${contentReceipt.pending_actions.join(' ')}`);
     console.log('Config saved to ~/.gbrain/config.json');
@@ -1851,7 +1855,7 @@ OPTIONS
   --chat-model <PROVIDER:MODEL>
                         Default subagent driver (v0.27+)
   --no-embedding        Defer embedding setup (skips the embedding-key check)
-  --surface <verbs|starter|full>  Tool surface the printed harness registration pins (default starter)
+  --surface <verbs|starter|full>  Tool surface the printed harness registration pins (default full)
   --skip-embed-check    Skip the init-time embedding-key validation (config +
                         live test-embed). Also via GBRAIN_INIT_SKIP_EMBED_CHECK=1
 

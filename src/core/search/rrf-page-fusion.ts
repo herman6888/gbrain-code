@@ -37,7 +37,24 @@ function rrfPageKey(r: SearchResult): string {
   return `${r.source_id ?? 'default'}:${r.slug}`;
 }
 
-export type RrfEntry = { result: SearchResult; score: number; own: number; keywordHit: boolean };
+/**
+ * One fusion vote, for explain attribution: which arm instance voted, at
+ * which 0-based list rank, with what k / weight and contribution
+ * (`weight / (k + rank)`). `vote: 'page'` = the page-level vote the lead chunk
+ * carries (the page's best-ranked chunk in that list, `chunk_id` names it);
+ * `vote: 'chunk'` = this chunk's own vote.
+ */
+export interface RrfArmVote {
+  arm: string;
+  rank: number;
+  k: number;
+  weight: number;
+  contribution: number;
+  vote: 'page' | 'chunk';
+  chunk_id?: number;
+}
+
+export type RrfEntry = { result: SearchResult; score: number; own: number; keywordHit: boolean; arms: RrfArmVote[] };
 
 /**
  * Shared accumulation for both RRF fusers: chunk entries (identity and
@@ -45,23 +62,30 @@ export type RrfEntry = { result: SearchResult; score: number; own: number; keywo
  * first-seen order; each page's lead scores the page total, the rest their
  * own vote.
  */
-export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: number; weight?: number }>): RrfEntry[] {
+export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: number; weight?: number; arm?: string }>): RrfEntry[] {
   const chunks = new Map<string, RrfEntry>();
   const pages = new Map<string, number>();
   // Graph evidence is page-level: the relational arm may surface a page's
   // canonical chunk while keyword/vector pick another chunk of the same page,
   // so the evidence rides on whichever of the page's rows survives.
   const graphEvidence = new Map<string, Partial<SearchResult>>();
-  for (const { list, k, weight } of lists) {
+  const pageVotes = new Map<string, RrfArmVote[]>();
+  for (let li = 0; li < lists.length; li++) {
+    const { list, k, weight } = lists[li];
+    const arm = lists[li].arm ?? `list#${li + 1}`;
     const w = weight ?? 1;
     const votedPages = new Set<string>();
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank];
       const rrfScore = w / (k + rank);
       const page = rrfPageKey(r);
+      const vote: RrfArmVote = { arm, rank, k, weight: w, contribution: rrfScore, vote: 'chunk' };
       if (!votedPages.has(page)) {
         votedPages.add(page);
         pages.set(page, (pages.get(page) ?? 0) + rrfScore);
+        const pv = pageVotes.get(page) ?? [];
+        pv.push({ ...vote, vote: 'page', ...(typeof r.chunk_id === 'number' ? { chunk_id: r.chunk_id } : {}) });
+        pageVotes.set(page, pv);
       }
       if (!graphEvidence.has(page) && (r.relational !== undefined || r.relational_seed !== undefined)) {
         graphEvidence.set(page, pickGraphEvidence(r));
@@ -70,6 +94,7 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
       const existing = chunks.get(key);
       if (existing) {
         existing.own += rrfScore;
+        existing.arms.push(vote);
         // #3783 — OR-propagate lexical-arm membership: a row that fusion
         // first saw via a vector list must still read keyword_hit when the
         // keyword arm ALSO surfaced it.
@@ -81,7 +106,7 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
           existing.result = strict;
         }
       } else {
-        chunks.set(key, { result: r, score: 0, own: rrfScore, keywordHit: r.keyword_hit === true });
+        chunks.set(key, { result: r, score: 0, own: rrfScore, keywordHit: r.keyword_hit === true, arms: [vote] });
       }
     }
   }
@@ -99,7 +124,10 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
     const lead = leads.get(page);
     if (!lead || e.own > lead.own) leads.set(page, e);
   }
-  for (const [page, lead] of leads) lead.score = pages.get(page) ?? lead.own;
+  for (const [page, lead] of leads) {
+    lead.score = pages.get(page) ?? lead.own;
+    lead.arms = pageVotes.get(page) ?? lead.arms;
+  }
   return entries;
 }
 

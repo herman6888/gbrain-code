@@ -17,6 +17,7 @@
 
 import { homedir } from 'node:os';
 import type { BrainEngine } from '../core/engine.ts';
+import type { CliDispatchContext } from '../cli/command-table.ts';
 import type { RecentTranscript } from '../core/transcripts.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import type { TranscriptFormat } from '../core/transcripts/types.ts';
@@ -193,6 +194,8 @@ const HELP = `Usage:
   gbrain transcripts ingest              # discovery: show found session logs
   gbrain transcripts ingest --all        # import everything discovered
   gbrain transcripts status              # found vs imported gap table
+  gbrain transcripts recover codex       # restore user turns lost to #5163 (preview; --apply)
+  gbrain transcripts audit-secrets       # list imported pages that still carry a credential (read-only)
   gbrain transcripts recent [options]
 
 ingest — import dead session logs and chat exports as conversation pages
@@ -332,8 +335,14 @@ export function fmtSummary(r: TranscriptsIngestResult): string {
   if (r.redactions > 0) lines.push(`redactions: ${r.redactions} secrets/patterns redacted before write`);
   if (r.imperatives > 0) lines.push(`flagged: ${r.imperatives} agent-directed imperative(s) noted in frontmatter`);
   if (r.driftFiles > 0) {
+    const userless = r.files.filter((f) => f.userTurnsMissing).length;
+    const zero = r.driftFiles - userless;
+    const shapes = [
+      zero > 0 ? `${zero} parsed to zero sessions` : '',
+      userless > 0 ? `${userless} parsed to assistant turns with no user turns` : '',
+    ].filter(Boolean).join(', ');
     lines.push(
-      `DRIFT WARNING: ${r.driftFiles} file(s) parsed to zero sessions — the host ` +
+      `DRIFT WARNING: ${r.driftFiles} file(s) drifted (${shapes}) — the host ` +
         `format may have changed; see the adapter SPEC_TARGET runbook`,
     );
   }
@@ -352,7 +361,7 @@ export function fmtSummary(r: TranscriptsIngestResult): string {
   return lines.join('\n');
 }
 
-async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
+async function runIngest(engine: BrainEngine, args: string[], dispatch: Pick<CliDispatchContext, 'makeContext'>): Promise<void> {
   const parsed = parseIngestArgs(args);
   if ('help' in parsed) {
     console.log(HELP);
@@ -484,6 +493,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
   reporter.start('transcripts.ingest', paths.length);
 
   let result: TranscriptsIngestResult;
+  const context = await dispatch.makeContext?.(engine, { source: sourceId, dry_run: parsed.dryRun === true });
   try {
     result = await runTranscriptsIngest(engine, {
       paths,
@@ -495,6 +505,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
       maxBytes: parsed.maxBytes,
       embed: parsed.embed,
       activePack,
+      context,
       onFileDone: () => reporter.tick(),
       // Multi-session stores (one hermes state.db = thousands of sessions)
       // need liveness BETWEEN file ticks.
@@ -522,7 +533,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
 
   // --facts: ONE extractor invocation over every touched slug (including
   // hash-skipped pages — the extractor's version-token gate dedupes work).
-  let factsSummary: { pages: number; spentUsd?: number } | undefined;
+  let factsSummary: { pages: number; pagesFailed: number; spentUsd?: number } | undefined;
   if (parsed.facts && !parsed.dryRun && result.slugsTouched.length > 0) {
     const { runIngestFacts } = await import('../core/transcripts/ingest-facts.ts');
     factsSummary = await runIngestFacts(engine, {
@@ -539,8 +550,9 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
     console.log(fmtSummary(result));
     if (factsSummary) {
       console.log(
-        `facts: extracted over ${factsSummary.pages} page(s)` +
-          (factsSummary.spentUsd !== undefined ? `, ~$${factsSummary.spentUsd.toFixed(2)} spent` : ''),
+        `facts: attempted ${factsSummary.pages} page(s), ${factsSummary.pagesFailed} failed` +
+          (factsSummary.spentUsd !== undefined ? `, ~$${factsSummary.spentUsd.toFixed(2)} spent` : '') +
+          (factsSummary.pagesFailed > 0 ? ' (failed pages stay unfinished; stderr names each retry command)' : ''),
       );
     }
     const firstImported = result.files.flatMap((f) => f.sessions).find((s) => !s.error && s.baseSlug);
@@ -552,7 +564,7 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
   const allFailed =
     result.files.length > 0 &&
     result.files.every((f) => f.error !== undefined || (f.drift && f.sessions.length === 0));
-  if (allFailed) setCliExitVerdict(1);
+  if (allFailed || (factsSummary?.pagesFailed ?? 0) > 0) setCliExitVerdict(1);
 }
 
 async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
@@ -586,20 +598,30 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   }
 }
 
-export async function runTranscripts(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runTranscripts(engine: BrainEngine, args: string[], dispatch: Pick<CliDispatchContext, 'makeContext'> = {}): Promise<void> {
   const sub = args[0];
   if (sub === 'ingest') {
-    await runIngest(engine, args.slice(1));
+    await runIngest(engine, args.slice(1), dispatch);
     return;
   }
   if (sub === 'status') {
     await runStatus(engine, args.slice(1));
     return;
   }
+  if (sub === 'audit-secrets') {
+    const { runTranscriptsAuditSecrets } = await import('./transcripts-audit.ts');
+    await runTranscriptsAuditSecrets(engine, args.slice(1));
+    return;
+  }
+  if (sub === 'recover') {
+    const { runTranscriptsRecover } = await import('./transcripts-recover.ts');
+    await runTranscriptsRecover(engine, args.slice(1), dispatch);
+    return;
+  }
   if (sub !== 'recent') {
     if (sub !== '--help' && sub !== '-h' && args.includes('--json')) {
       const { exitCliError, usageError } = await import('../cli/cli-error.ts');
-      exitCliError(usageError(sub && !sub.startsWith('-') ? `Unknown transcripts subcommand: ${sub}` : 'gbrain transcripts needs a subcommand: ingest, status or recent.',
+      exitCliError(usageError(sub && !sub.startsWith('-') ? `Unknown transcripts subcommand: ${sub}` : 'gbrain transcripts needs a subcommand: ingest, status, recover, audit-secrets or recent.',
         'Run `gbrain transcripts recent --json` to list recent transcripts, or `gbrain transcripts --help`.'), 'transcripts', { json: true });
     }
     console.log(HELP);

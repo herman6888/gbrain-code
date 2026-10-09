@@ -91,7 +91,15 @@ written up in [`RETRIEVAL_MAXPOOL_INCIDENT.md`](../incidents/RETRIEVAL_MAXPOOL_I
   chunks fill the inner candidate pool, the engines escalate the pool in a
   bounded loop (×4 per step, at most 3 escalations). SQL candidate limits and
   offsets are independent of `ef_search`; supported pgvector versions use
-  strict iterative scans with bounded visits. A filtered short pool is not
+  `relaxed_order` iterative scans with bounded visits (`ef_search` is still
+  sized to the candidate pool). Relaxed order keeps a closer candidate the
+  scan finds after farther ones, which strict order drops, so a selective
+  source or visibility filter fills more of its true neighbours; output order
+  never reaches callers because the inner `ORDER BY distance` and the pooled
+  outer sort re-sort it. `search.hnsw_iterative_scan` (`relaxed_order` |
+  `strict_order` | `off`; env `GBRAIN_HNSW_ITERATIVE_SCAN` wins) restores the
+  older mode without a release; it is latched once per process, so restart
+  serve and autopilot after changing it. A filtered short pool is not
   proof that the corpus is exhausted. Postgres may make one exact fallback
   inside the remaining eight-second arm budget; PGLite does not pretend that
   a JavaScript timeout can cancel its WASM work. Unresolved shortfalls appear
@@ -215,6 +223,10 @@ deduplication (4-layer: per-page cap, same-page Jaccard, type diversity)
 reranker (cross-encoder — balanced/tokenmax; fail-open)
        │
        ▼
+feedback (use-attributed page weights × the ordering score, bounded ±λ;
+   no-op when no page was rated — src/core/search/feedback-boost.ts)
+       │
+       ▼
 relational re-pin (relational-arm rows back above the reranked text rows, in
    fused order, ≤ search.relational_rerank_pin; only when the reranker actually
    reordered — src/core/search/relational-rerank-pin.ts)
@@ -284,6 +296,21 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
   `crag.ts`), so default-shape callers never pay a second expansion call for
   a near-identical candidate set. `search.crag_think=true` (local callers)
   escalates a still-weak result to `think`.
+
+### Use-attributed feedback
+
+Answers from `query`, `search`, `think`, `synthesize` and `recall` record the
+pages they used (with the revision read) and the typed edges on their
+relational paths. A rating (`rate_answer`, or a `think` citation for the brain
+owner) moves each element's weight `w` by `w + α·(r − w)`; the feedback stage
+then multiplies the ordering score by `1 + λ·2·(w − 0.5)`. It runs after the
+reranker, on the reranker's score when it reordered the list, because a boost
+applied before the cross-encoder would be erased; raw scores stay untouched,
+so autocut and evidence grading are unchanged. No retrieval path runs a
+query-language string: the relational arm
+and `traverse_graph` take only typed parameters into fixed SQL, and
+`test/raw-query-routing-guard.test.ts` pins that no op accepts query text as
+SQL or graph syntax. Guide: [retrieval feedback](../guides/retrieval-feedback.md).
 
 ### Relational re-pin: edge answers bypass reranker demotion
 
@@ -498,11 +525,17 @@ built from (`content_chunks.embedding_input_hash`: column, model, dimensions,
 wrapping tier and wrapped text), and a rebuild keeps it only when the current
 page would produce the same input, so an unchanged contextual page keeps its
 vectors and a synopsis-mode body edit nulls every synopsis-tier chunk. Vectors
-written before that record existed are kept on non-contextual pages and nulled
-once on contextual ones. Remaining NULL vectors still need an explicitly
-authorized `gbrain embed --stale` run. A text-ready index is not a promise that
-every page has a vector. Diagnostics do not disclose private or foreign-source
-pending pages and never start repair themselves.
+written before that record existed are grandfathered on pages whose mode
+is still NULL; contextual-mode repair and reindex stamp compatible raw inputs
+when moving those pages to explicit `none`. An explicit `none` page may have
+inherited a title-wrapped vector, so a rebuild clears unstamped vectors there,
+and switching from title or synopsis to `none` clears active text vectors
+immediately. Genuine old raw vectors on explicit `none` pages may need a
+one-time re-embed; it never starts automatically. Remaining NULL vectors
+still need an explicitly authorized `gbrain embed --stale` run. A text-ready
+index is not a promise that every page has a vector. Diagnostics do not
+disclose private or foreign-source pending pages and never start repair
+themselves.
 
 Markdown chunk creation applies the strict protected-body sanitizer before
 splitting text. For remote reads, all existing chunks of every page kind are

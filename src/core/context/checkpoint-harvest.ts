@@ -40,11 +40,20 @@ import { corpusFileSessionId, corpusTextForExtraction, readSegmentLedger, selfCa
 import { corpusFileStat, readCorpusProgress, runCorpusWindows } from './corpus-windows.ts';
 import { isClaudeCliSelfSessionId } from '../ai/providers/claude-cli-scratch.ts';
 import { writeHeartbeat } from './hook-heartbeat.ts';
+import { OperationError } from '../ops/contract.ts';
 
 /** Bounded queue — overflow is a typed skip; the sweep backstop extracts later. */
 export const HARVEST_QUEUE_CAP = 8;
 /** Per-file abort so a hung provider can't wedge the FIFO. */
 export const HARVEST_JOB_TIMEOUT_MS = 60_000;
+/**
+ * #5557: a writeback turn whose facts preflight still finds the canonical
+ * writer busy after its own wait (`writer_lock_unavailable`, thrown before any
+ * model call) is re-queued after each of these delays in turn; past the last
+ * one it ends as an error. A Git effect holds that lock through its commit and
+ * its push.
+ */
+export const HARVEST_WRITER_BUSY_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
 /** Receipt sidecar suffix — canonical home is corpus-segments (engine-free,
  * so the hook's GC can reap orphaned receipts); re-exported for callers. */
 export { HARVEST_RECEIPT_SUFFIX };
@@ -71,6 +80,8 @@ export interface HarvestJob {
   capabilities?: CapabilityReport;
   /** TEST SEAM: per-job abort budget override (default HARVEST_JOB_TIMEOUT_MS). */
   timeoutMs?: number;
+  /** Busy-writer re-queues already spent on this job; set by the pump only (#5557). */
+  writerBusyRetries?: number;
 }
 
 interface HarvestReceipt {
@@ -86,6 +97,11 @@ let shuttingDown = false;
 let currentAbort: AbortController | null = null;
 /** Resolves when the pump goes idle — the shutdown join point. */
 let idleResolve: (() => void) | null = null;
+/** Busy-writer retries waiting on their delay (#5557); shutdown clears them. */
+const pendingRetries = new Map<ReturnType<typeof setTimeout>, HarvestJob>();
+let writerBusyRetryDelays: readonly number[] = HARVEST_WRITER_BUSY_RETRY_DELAYS_MS;
+/** Error reasons already written to stderr by this serve run (#5557). */
+const loggedErrorReasons = new Set<string>();
 
 export type HarvestAck = { status: 'scheduled' } | { status: 'skipped'; reason: string };
 
@@ -95,7 +111,7 @@ export type HarvestAck = { status: 'scheduled' } | { status: 'skipped'; reason: 
  */
 export function scheduleCheckpointHarvest(job: HarvestJob): HarvestAck {
   if (shuttingDown) return { status: 'skipped', reason: 'shutting_down' };
-  if (queue.some((q) => q.file === job.file && q.corpusDir === job.corpusDir)) {
+  if ([...queue, ...pendingRetries.values()].some((q) => q.file === job.file && q.corpusDir === job.corpusDir)) {
     return { status: 'skipped', reason: 'already_queued' };
   }
   // F9/OV2-4 cost posture: per-session prompt-harvest cap for the writeback
@@ -153,6 +169,7 @@ export const HARVEST_SHUTDOWN_GRACE_MS = 5000;
 export async function shutdownCheckpointHarvest(): Promise<void> {
   shuttingDown = true;
   queue.length = 0;
+  clearPendingRetries();
   try {
     currentAbort?.abort();
   } catch {
@@ -177,11 +194,19 @@ export function __resetCheckpointHarvestForTests(): void {
   currentAbort = null;
   idleResolve = null;
   wbSessionCounts.clear();
+  clearPendingRetries();
+  writerBusyRetryDelays = HARVEST_WRITER_BUSY_RETRY_DELAYS_MS;
+  loggedErrorReasons.clear();
 }
 
-/** TEST SEAM: resolves once the queue is fully drained. */
+/** TEST SEAM: busy-writer retry delays (null restores the defaults). */
+export function __setWriterBusyRetryDelaysForTests(delays: readonly number[] | null): void {
+  writerBusyRetryDelays = delays ?? HARVEST_WRITER_BUSY_RETRY_DELAYS_MS;
+}
+
+/** TEST SEAM: resolves once the queue is fully drained, pending retries included. */
 export async function __drainCheckpointHarvestForTests(): Promise<void> {
-  while (inFlight || queue.length > 0) {
+  while (inFlight || queue.length > 0 || pendingRetries.size > 0) {
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -211,8 +236,7 @@ async function pump(): Promise<void> {
     superseded = r.superseded;
     links = r.links;
   } catch (e) {
-    outcome = 'error';
-    reason = e instanceof Error ? (e.name || 'Error').toLowerCase() : 'error';
+    ({ outcome, reason } = classifyHarvestFailure(job, e));
   } finally {
     inFlight = false;
     await writeHeartbeat({
@@ -236,6 +260,81 @@ async function pump(): Promise<void> {
       idleResolve = null;
     }
   }
+}
+
+function clearPendingRetries(): void {
+  for (const timer of pendingRetries.keys()) clearTimeout(timer);
+  pendingRetries.clear();
+}
+
+/**
+ * A writeback turn refused because the canonical writer stayed busy is
+ * re-queued; any other failure is an error that keeps its code. A compact
+ * segment is never re-queued: its first window already wrote `.progress`, which
+ * a retry reads as window 1 done, so the error stands and the sweep resumes it.
+ */
+function classifyHarvestFailure(job: HarvestJob, e: unknown): { outcome: 'degraded' | 'error'; reason: string } {
+  if (job.lane === 'writeback' && isWriterBusy(e) && requeueWhileWriterBusy(job)) {
+    return { outcome: 'degraded', reason: 'writer_busy_requeued' };
+  }
+  // #6091: writeback turned off while the provider call was in flight; admission
+  // refused the facts and the next pass retires the file.
+  if (e instanceof OperationError && e.code === 'ambient_capture_off') return { outcome: 'degraded', reason: 'writeback_off_inflight' };
+  const reason = harvestErrorReason(e);
+  logFirstHarvestError(job, reason, e);
+  return { outcome: 'error', reason };
+}
+
+/** The facts preflight refused because the canonical writer stayed busy; nothing was extracted. */
+function isWriterBusy(e: unknown): boolean {
+  return e instanceof OperationError && e.code === 'writer_lock_unavailable';
+}
+
+/**
+ * Schedules the job's next attempt after its busy-writer delay; false once the
+ * delays are spent or serve is stopping. The retry skips the admission checks:
+ * the job was admitted (and counted against its session cap) once already.
+ */
+function requeueWhileWriterBusy(job: HarvestJob): boolean {
+  const spent = job.writerBusyRetries ?? 0;
+  const delay = writerBusyRetryDelays[spent];
+  if (delay === undefined || shuttingDown) return false;
+  const timer = setTimeout(() => {
+    pendingRetries.delete(timer);
+    if (shuttingDown) return;
+    queue.push({ ...job, writerBusyRetries: spent + 1 });
+    void pump();
+  }, delay);
+  (timer as { unref?: () => void }).unref?.();
+  pendingRetries.set(timer, job);
+  return true;
+}
+
+/** A heartbeat reason is a short machine code, the shape hook.ts's reasonCode() enforces. */
+const HEARTBEAT_REASON_CODE = /^[A-Za-z0-9_.:-]{1,48}$/;
+
+/**
+ * The error name plus its `code`, or else its `reason` (FactsExtractionError):
+ * `operationerror:writer_lock_unavailable`, `factsextractionerror:provider_error`.
+ * A composite past the reason-code shape falls back to the bare name.
+ */
+function harvestErrorReason(e: unknown): string {
+  if (!(e instanceof Error)) return 'error';
+  const name = (e.name || 'Error').toLowerCase();
+  const { code, reason } = e as { code?: unknown; reason?: unknown };
+  const detail = typeof code === 'string' ? code : typeof reason === 'string' ? reason : null;
+  const composite = detail === null ? name : `${name}:${detail.toLowerCase()}`;
+  if (HEARTBEAT_REASON_CODE.test(composite)) return composite;
+  return HEARTBEAT_REASON_CODE.test(name) ? name : 'error';
+}
+
+/** The heartbeat keeps counts and codes only; the first failure of each reason also reaches serve's stderr. */
+function logFirstHarvestError(job: HarvestJob, reason: string, e: unknown): void {
+  if (loggedErrorReasons.has(reason)) return;
+  loggedErrorReasons.add(reason);
+  const message = e instanceof Error ? e.message : String(e);
+  console.error(`[checkpoint-harvest] ${job.lane ?? 'compact'} harvest failed (${reason}): ${message.slice(0, 300)} `
+    + '(logged once per serve run; later failures with this reason are counted in the hooks heartbeat only)');
 }
 
 /** `<sessionId>.seg-<hash12>.txt` → hash12 ('' when the name has no hash part). */
@@ -267,6 +366,16 @@ async function runOne(job: HarvestJob): Promise<{
     }
 
     if (job.lane === 'writeback') return await runWritebackTurn(job, full, ingestedPath);
+
+    // #6091: the capture gate runs under the claim before any provider call or
+    // receipt republication (serve compact lane and OpenClaw rung 2).
+    const { applyCaptureGate, resolveCaptureGate } = await import('./capture-consent.ts');
+    const gate = await applyCaptureGate(full, (await resolveCaptureGate(job.engine)).compact);
+    if (gate.action === 'hold') return { outcome: 'degraded', reason: gate.reason };
+    if (gate.action === 'retire') {
+      await rm(receiptPath, { force: true }).catch(() => {});
+      return { outcome: 'ok', reason: gate.reason };
+    }
 
     // Receipt retry path (codex round 2): extraction already happened; the
     // manifest publish failed transiently. Re-publish WITHOUT re-extracting.
@@ -437,29 +546,21 @@ async function runWritebackTurn(job: HarvestJob, full: string, ingestedPath: str
     await writeFile(ingestedPath, selfCaptureSidecarJson());
     return { outcome: 'ok', reason: 'self_capture' };
   }
-  const { resolveWritebackConfig } = await import('../facts/writeback-config.ts');
-  const { loadConfig } = await import('../config.ts');
-  // Gate semantics ({gate:true}): a config READ FAILURE is OFF but NOT
-  // terminal — skip with no sidecar (claim releases, sweep retries when the
-  // DB returns). Same for PLANE DRIFT (DB row absent while the file mirror
-  // says enabled — a failed dual-write is not operator intent) and for an
-  // UNRECOGNIZED mode value (a typo is not a decision). Only a
-  // genuinely-resolved OFF writes the terminal sidecar: that one is intent.
-  // The gate resolves BEFORE the capability/kill-switch checks: an
-  // operator's OFF must retire the banked turn even on a keyless or
-  // extraction-disabled brain — otherwise the file lingers eligible and a
-  // later re-enable would extract turns the operator already revoked
-  // (codex re-review, this wave).
-  const wb = await resolveWritebackConfig(job.engine, loadConfig(), { gate: true });
-  if (wb.read_error) return { outcome: 'degraded', reason: 'gate_unreadable' };
-  if (!wb.enabled && (wb.plane_drift || !wb.mode_valid)) {
-    return { outcome: 'degraded', reason: wb.plane_drift ? 'writeback_plane_drift' : 'writeback_mode_invalid' };
-  }
-  if (!wb.enabled) {
-    const { writebackOffSidecarJson } = await import('./corpus-segments.ts');
-    await writeFile(ingestedPath, writebackOffSidecarJson());
-    return { outcome: 'ok', reason: 'writeback_off' };
-  }
+  // Gate semantics (captureGateDecision, resolved {gate:true}): a config READ
+  // FAILURE, PLANE DRIFT (DB row absent while the file mirror says enabled — a
+  // failed dual-write is not operator intent) and an UNRECOGNIZED mode value
+  // hold: no sidecar, the claim releases and the sweep retries once the config
+  // is coherent. Only a genuinely-resolved OFF (or unset: this lane is opt-in)
+  // writes the terminal sidecar. The gate resolves BEFORE the
+  // capability/kill-switch checks: an operator's OFF must retire the banked
+  // turn even on a keyless or extraction-disabled brain — otherwise the file
+  // lingers eligible and a later re-enable would extract turns the operator
+  // already revoked (codex re-review, this wave).
+  const { applyCaptureGate, resolveCaptureGate } = await import('./capture-consent.ts');
+  const gate = await resolveCaptureGate(job.engine);
+  const applied = await applyCaptureGate(full, gate.writeback);
+  if (applied.action === 'hold') return { outcome: 'degraded', reason: applied.reason };
+  if (applied.action === 'retire') return { outcome: 'ok', reason: applied.reason };
   const { extractionAvailableForEngine } = await import('../facts/extraction-availability.ts');
   if (!(await extractionAvailableForEngine(job.engine, job.capabilities))) {
     return { outcome: 'degraded', reason: 'keyless' };
@@ -484,7 +585,7 @@ async function runWritebackTurn(job: HarvestJob, full: string, ingestedPath: str
       mode: 'inline',
       remote: false,
       abortSignal: abort.signal,
-      notabilityFilter: wb.mode === 'salient' ? 'medium-and-up' : 'all',
+      notabilityFilter: gate.mode === 'salient' ? 'medium-and-up' : 'all',
       // visibility deliberately unset → resolveDefaultVisibility [ENG-8] —
       // the backstop inherits extract_facts' contract, never widened (req 6).
     });

@@ -380,6 +380,42 @@ brain data. To end one client's access, follow the distinct preview/revision
 flows for token invalidation, revocation, or deletion in
 [MCP administration](../mcp/ADMIN.md#invalidate-tokens-revoke-or-delete).
 
+## Writing many pages
+
+Say to your agent: *"When you save more than three pages to gbrain, use
+put_pages with one request_id per batch and wait_ms 25000."*
+
+- **`put_pages`** writes 1-50 complete pages (8 MB of content at most) in one
+  call. Every page is an ordinary `put_page` write with the same fences,
+  revision checks and receipts; the pages are admitted together, so the
+  writer queue has room for the whole batch or the call refuses with
+  `queue_capacity` and admits none of them. Keep 5-8 large pages per call:
+  the model has to write every page into the tool arguments.
+- **One receipt per batch.** The reply lists each page's state, revision or
+  error (with its own `fix`), counts, and `next`: `done`, `poll` or
+  `fix_pages`. A page refused for its own reason (an invalid slug, a slug
+  outside the grant, a revision conflict) does not stop the others.
+- **Replays and progress.** Replaying the identical call with the same
+  `request_id` never writes twice. Calling `put_pages` with only the
+  `request_id` reads the batch's progress without resending the pages. A
+  replay with different pages refuses with `idempotency_conflict` and names
+  the pages that changed.
+- **`wait_ms`** (put_page and put_pages, 0-30000 ms) holds the reply until
+  the commit. It is not part of the write, so changing it on a replay is
+  safe. When a reply is still pending, follow `next` no sooner than
+  `retry_after_ms`.
+- **Links.** For remote writes, `[[wikilinks]]` in a page body that point at
+  pages already in the same source become plain `mentions` links after the
+  commit, and a batch links pages to each other once its last page commits.
+  The batch receipt's `links` field shows when they have landed; agents do
+  not add them by hand. Typed links still need `add_link`. Turn this off with
+  `gbrain config set mcp.remote_auto_links false`.
+- **Embedding** runs after the commit. New text is searchable by keyword
+  immediately and by meaning once its embedding effect finishes.
+- **Request size.** `gbrain serve --http` reads the whole request; the
+  simpler HTTP transport caps a request at `GBRAIN_HTTP_MAX_BODY_BYTES`
+  (1 MiB by default) and its 413 reply tells the agent to split the batch.
+
 ## PGLite brains
 
 PGLite is single-writer. While the service runs, host-side commands that open

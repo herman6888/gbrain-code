@@ -12,14 +12,17 @@
  * for every held file; the next sync adds those paths to its manifest even if
  * Git did not touch them, imports each one that now passes and keeps the rest
  * held. Most holds re-screen by themselves (changed or deleted file, newer
- * gbrain); the request covers causes outside the file.
+ * gbrain); the request covers causes outside the file (#6188: a prepare-time
+ * fence hold whose stored-row conflict was fixed in the database).
  */
 import type { BrainEngine } from '../core/engine.ts';
 import type { Action } from '../core/agent-output.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { managedBrain, readAllSourceHolds, readHoldRetryKeys, requestHoldRetry, writeHeldRetryPointer } from '../core/connectors/item-holds-store.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
-import { readGitHoldRetryPaths, readGitSourceHolds, requestGitHoldRetry } from '../core/persistence/sync-holds.ts';
+import { fenceAutoRepairFor, holdRepairSteps, readGitHoldRetryPaths, readGitSourceHolds, requestGitHoldRetry, type GitHoldRecord } from '../core/persistence/sync-holds.ts';
+import { readManagedSyncBacklog } from '../core/persistence/sync-drain.ts';
+import type { FenceAutoRepair } from '../core/fence-repair/hold-fix.ts';
 
 export interface RetryHeldReceipt {
   source_id: string;
@@ -33,7 +36,7 @@ export interface RetryHeldReceipt {
   fix?: Action;
 }
 
-interface Scheduled { items: Array<{ key: string; code: string; reason?: string; already: boolean }>; sync: string[] }
+interface Scheduled { items: Array<{ key: string; code: string; reason?: string; already: boolean }>; sync: string[]; fenceAuto?: FenceAutoRepair }
 
 async function scheduleConnectorItems(engine: BrainEngine, sourceId: string, incarnation: string, dryRun: boolean): Promise<Scheduled> {
   const held = (await readAllSourceHolds(engine, { sourceIds: [sourceId] }))[0]?.held ?? [];
@@ -48,15 +51,30 @@ async function scheduleConnectorItems(engine: BrainEngine, sourceId: string, inc
   return { items: held.map(record => ({ key: record.key, code: record.code, already: already.has(record.key) })), sync };
 }
 
+/**
+ * #6278: the follow-up sync keeps the run's processing options (`--no-embed`
+ * and friends) instead of starting a second cursor: the unfinished managed
+ * cursor's options when one exists, else the arguments a `preparation_stalled`
+ * hold recorded, else the plain command.
+ */
+async function gitFollowUpSync(engine: BrainEngine, sourceId: string, held: ReadonlyArray<Pick<GitHoldRecord, 'code' | 'meta'>>): Promise<string[]> {
+  if (!await managedBrain(engine)) return ['gbrain', 'sync', '--source', sourceId];
+  const [backlog] = await readManagedSyncBacklog(engine, [sourceId]).catch(() => []);
+  if (backlog) return ['gbrain', 'sync', ...backlog.resume_args];
+  const stalled = held.find(record => record.code === 'preparation_stalled' && record.meta.stall?.sync_argv?.length);
+  return ['gbrain', 'sync', ...(stalled?.meta.stall?.sync_argv ?? ['--source', sourceId, '--no-pull'])];
+}
+
 async function scheduleGitFiles(engine: BrainEngine, sourceId: string, incarnation: string, dryRun: boolean): Promise<Scheduled> {
   const held = (await readGitSourceHolds(engine, { sourceIds: [sourceId] }))[0]?.holds ?? [];
   // Managed sync refuses to pull; the plain command is the classic one.
-  const sync = ['gbrain', 'sync', '--source', sourceId, ...(await managedBrain(engine) ? ['--no-pull'] : [])];
+  const sync = await gitFollowUpSync(engine, sourceId, held);
   if (!held.length) return { items: [], sync };
   if (!dryRun) await requestGitHoldRetry(engine, sourceId, incarnation, held.map(record => record.path));
   const already = new Set(dryRun ? await readGitHoldRetryPaths(engine, sourceId, incarnation) : []);
+  const fenceAuto = await fenceAutoRepairFor(engine, held);
   return { items: held.map(record => ({ key: record.path, code: record.code, ...(record.meta.reason ? { reason: record.meta.reason } : {}),
-    already: already.has(record.path) })), sync };
+    already: already.has(record.path) })), sync, ...(fenceAuto ? { fenceAuto } : {}) };
 }
 
 function gitNextStep(sourceId: string, dryRun: boolean, scheduled: Scheduled): { text: string; fix: Action } {
@@ -68,8 +86,12 @@ function gitNextStep(sourceId: string, dryRun: boolean, scheduled: Scheduled): {
   if (dryRun) return { text: `${count} held file(s) would be scheduled for a re-screen; run: gbrain sources retry-held ${sourceId}. ${automatic}`,
     fix: { argv: ['gbrain', 'sources', 'retry-held', sourceId], consent: [], actor: 'agent', requires_exclusive: false, verify,
       why: `Schedules a re-screen of ${count} held file(s) on the next sync of ${sourceId}; nothing runs now.` } };
+  const fences = scheduled.items.filter(item => item.code === 'invalid_fence').length;
+  const concurrent = scheduled.items.filter(item => item.code === 'concurrent_write').length;
+  const stalled = scheduled.items.filter(item => item.code === 'preparation_stalled').length;
+  const dirty = scheduled.items.filter(item => item.code === 'worktree_dirty').length;
   return { text: `${count} held file(s) scheduled for a re-screen; none has run yet. ${automatic} Run it now with: ${sync}, then verify with: gbrain sources status ${sourceId}. `
-      + `A file that still refuses stays held; preview its fix with: gbrain repair frontmatter --source ${sourceId}`,
+      + `A file that still refuses stays held; ${holdRepairSteps(sourceId, { fences, others: count - fences - concurrent - stalled - dirty, concurrent, stalled, dirty }, scheduled.fenceAuto).text}.`,
     fix: { argv: scheduled.sync, consent: [], actor: 'agent', requires_exclusive: false, verify,
       why: `The sync re-screens the ${count} scheduled file(s): each one that now passes imports and its hold clears; the rest stay held without blocking the sync.` } };
 }
@@ -99,7 +121,9 @@ export async function runRetryHeld(engine: BrainEngine, args: string[]): Promise
     console.log('Usage: gbrain sources retry-held <id> [--dry-run] [--json]\n\n'
       + 'Re-attempt every held connector item of a Google or GitHub source on its next sync, or re-screen every\n'
       + 'held file of a Git source on its next sync (most held files re-screen by themselves when they change).\n'
-      + 'Nothing runs now.\n'
+      + 'Nothing runs now. A file that still refuses stays held: preview frontmatter holds with\n'
+      + "'gbrain repair frontmatter --source <id>' and fence holds (invalid_fence) with 'gbrain repair fences --source <id>';\n"
+      + "a preparation_stalled hold needs no file repair: inspect 'gbrain sources writer status --source <id> --json', then rerun the sync it prints.\n"
       + '  --dry-run   show what would be scheduled; change nothing\n  --json      print the receipt as JSON');
     return;
   }

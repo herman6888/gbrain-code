@@ -26,6 +26,7 @@ tools:
   - context_pack
 mutating: true
 writes_pages: false
+when_to_use: "Use when the user asks: \"connect gmail\", \"connect google\", \"connect calendar\", \"connect contacts\", \"who is waiting on me\"."
 ---
 
 # Google Loops — Setup and Daily Operation
@@ -152,7 +153,7 @@ unanswered-thread detector is free and unaffected.
 
 ## Output Format
 
-When relaying `gbrain waiting`, present per counterparty, most urgent first:
+When relaying `gbrain waiting`, present per counterparty, most urgent first, then the `## No counterparty` section (loops that name no person) last:
 
 ```
 ## <Counterparty> (<N> open)
@@ -168,7 +169,7 @@ failures; never dump raw JSON envelopes at the user.
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Setup prints `[SHOW USER]` blocks: relay them verbatim, one message per block. `gbrain mcp expose` and `gbrain google` still exit 2 when they need the user's confirmation (documented legacy), so read the block, not just the exit code.
 - A Google credential error (`invalid_grant_revoked`, `consent_timeout`, `wrong_account_consented`, …) carries `{ code, problem, cause, fix }`: show the user the problem and fix; most fixes are "run it again" by the user.
@@ -193,14 +194,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
 - **Marking loops done for the user.** Close (`gbrain loops done <id>`) only
   after the user says it's handled; thread loops self-close on the next sync
   when the reply is visible in Gmail.
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `loops_close` → `gbrain loops done`
-- `loops_mute` → `gbrain loops mute`
-- `open_loops` → `gbrain loops list`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

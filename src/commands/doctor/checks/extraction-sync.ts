@@ -13,7 +13,8 @@ import { probeSourceGitState } from '../../../core/git-head.ts';
 import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
 import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
-import { LINK_EXTRACTOR_VERSION_TS } from '../../../core/link-extraction.ts';
+import { effectiveLinkExtractorWatermark, smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
+import { previewMentionPass } from '../../../core/mentions/stale.ts';
 import { isUndefinedColumnError } from '../../../core/utils.ts';
 import {
   loadStorageConfig,
@@ -22,9 +23,10 @@ import {
   findDbOnlyCollisions,
 } from '../../../core/storage-config.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from '../../../core/sync.ts';
-import { resolveSourceLocalFilePath } from '../../../core/markdown.ts';
+import { resolveSourceLocalFilePath, sourceGitScope } from '../../../core/markdown.ts';
 import { scannerSlugRootMode } from '../../../core/write-through.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
+import { quarantineFilterFragment } from '../../../core/quarantine.ts';
 import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
 import { upstreamFreshness } from '../../../core/sync-upstream.ts';
 import type { Check } from '../../doctor.ts';
@@ -108,8 +110,8 @@ export async function checkLinksExtractionLag(
   try {
     const totalRows = await engine.executeRaw<{ count: number }>(
       sourceId
-        ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND source_id = $1`
-        : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL`,
+        ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND ${quarantineFilterFragment('pages')} AND source_id = $1`
+        : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND ${quarantineFilterFragment('pages')}`,
       sourceId ? [sourceId] : [],
     );
     const total = Number(totalRows[0]?.count ?? 0);
@@ -119,13 +121,13 @@ export async function checkLinksExtractionLag(
     // Vacuous-skip tiny brains unless explicitly source-scoped. Shared floor
     // const so the sync nudge (D6/C4) skips on the exact same predicate.
     if (total < EXTRACTION_LAG_MIN_PAGES && !sourceId) {
-      return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)` };
+      return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)${await smallBrainBacklogNote(engine)}` };
     }
 
     // #5761: a page left stale only by an unresolved attendee, and not edited
     // since, is attendance-blocked: `extract --stale` cannot clear it, so it
     // is reported apart from lag. Pre-v180 brains have no marker column.
-    const versionTs = LINK_EXTRACTOR_VERSION_TS;
+    const versionTs = await effectiveLinkExtractorWatermark(engine);
     let stale: number;
     let attendanceBlocked = 0;
     try {
@@ -159,14 +161,18 @@ export async function checkLinksExtractionLag(
       }
     }
 
-    const details = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: warnPct, fail_pct: failPct ?? null, source_id: sourceId ?? null };
+    // Entity mention index: pages the mention pass has not scanned at their current content.
+    const mention = await previewMentionPass(engine, sourceId).catch(() => null);
+    const mentionNote = mention?.due ? `; ${mention.due} page(s) await the mention pass (last pass: ${mention.last_pass_at ?? 'never'})` : '';
+    const details = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: warnPct, fail_pct: failPct ?? null, source_id: sourceId ?? null,
+      mention_due: mention?.due ?? null, mention_last_pass_at: mention?.last_pass_at ?? null };
     if (failPct !== undefined && pct > failPct) {
-      return { name, status: 'fail', message: `${stale}/${total} pages (${pctStr}%)${scope} need link/timeline extraction (> ${failPct}% fail threshold). ${fix}${blockedNote}`, details };
+      return { name, status: 'fail', message: `${stale}/${total} pages (${pctStr}%)${scope} need link/timeline extraction (> ${failPct}% fail threshold)${mentionNote}. ${fix}${blockedNote}`, details };
     }
     if (pct > warnPct) {
-      return { name, status: 'warn', message: `${stale}/${total} pages (${pctStr}%)${scope} have un-extracted edges. ${fix}${blockedNote}`, details };
+      return { name, status: 'warn', message: `${stale}/${total} pages (${pctStr}%)${scope} have un-extracted edges${mentionNote}. ${fix}${blockedNote}`, details };
     }
-    return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${blockedNote}`, details };
+    return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${mentionNote}${blockedNote}`, details };
   } catch (e) {
     // Pre-v112 brain: links_extracted_at column doesn't exist yet. Graceful OK
     // (migration/bootstrap adds it; nothing to assess until then).
@@ -235,7 +241,6 @@ export async function checkUnverifiedExtractions(
  */
 export async function checkContentHashDuplicates(engine: BrainEngine): Promise<Check> {
   const name = 'content_hash_duplicates';
-  const fix = 'Fix: gbrain pages delete <bare-slug> for each pair, then gbrain pages purge-deleted --older-than 0';
   try {
     // #3946: no shape predicates — EVERY same-source duplicate-content group
     // surfaces (HAVING count(*) > 1 alone). Classification happens at render:
@@ -257,6 +262,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
       return { name, status: 'ok', message: 'No same-source content-hash duplicate groups' };
     }
     let pairCount = 0;
+    const pairSources = new Set<string>();
     const samples: string[] = [];
     let otherGroupCount = 0;
     const otherSamples: string[] = [];
@@ -268,6 +274,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
         for (const b of bare) {
           const twin = prefixed.find(p => p.endsWith('/' + b)) ?? prefixed[0];
           pairCount++;
+          pairSources.add(r.source_id);
           if (samples.length < 5) samples.push(`${b} <-> ${twin}`);
         }
       } else {
@@ -277,6 +284,12 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     }
     const parts: string[] = [];
     if (pairCount > 0) {
+      // `gbrain delete` soft-deletes in the active source, so the command pins
+      // the pairs' source; --force because page writes are revisioned and a
+      // delete naming neither --force nor --expected-revision is refused.
+      const source = pairSources.size === 1 ? [...pairSources][0] : '<source-id>';
+      const sourceNote = pairSources.size === 1 ? '' : ` (pairs span sources ${[...pairSources].sort().join(', ')}; run it once per pair with that pair's source)`;
+      const fix = `Fix: GBRAIN_SOURCE=${source} gbrain delete <bare-slug> --force for each pair${sourceNote}.`;
       parts.push(
         `${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — ` +
         `usually an import run from the wrong root, which drops the path prefix). ` +
@@ -435,10 +448,11 @@ export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<C
       if (rows.length === 0) continue;
       let backedWithoutSourcePath: Set<string> | null = null;
       const mode = await scannerSlugRootMode(engine, src.id, src.local_path!);
+      const gitScope = sourceGitScope(src.local_path!);
       for (const { slug, source_path: sourcePath } of rows) {
         if (dbOnlyDirs.some(dir => slug.startsWith(dir))) continue;
         if (sourcePath) {
-          const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath, slug, mode);
+          const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath, slug, mode, gitScope);
           if (filePath && existsSync(filePath)) continue;
         } else {
           backedWithoutSourcePath ??= collectMarkdownSlugs(src.local_path!);
@@ -697,6 +711,7 @@ export async function computeExtractAtomsBacklogCheck(
     }
 
     const { packDeclaresPhase } = await import('../../../core/cycle.ts');
+    const { extractAtomsPhaseStaleWarning } = await import('../../../core/cycle/extract-atoms-stamp.ts');
     let declared = false;
     try { declared = await packDeclaresPhase(engine, 'extract_atoms'); } catch { declared = false; }
 
@@ -763,7 +778,13 @@ export async function computeExtractAtomsBacklogCheck(
           },
         };
       }
-      // Pack runs it AND a cycle completed recently (or the backlog is small,
+      // #5028: a recent cycle does not prove THIS phase ran; check each backlog source's own stamp.
+      if (evidence && evidence.state === 'fresh') {
+        const bySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
+        const phaseWarn = bySource ? await extractAtomsPhaseStaleWarning(engine, backlog, bySource, buildExtractAtomsDrainCommand, approx) : null;
+        if (phaseWarn) return { name, status: 'warn', ...phaseWarn };
+      }
+      // Pack runs it AND the phase ran recently (or the backlog is small,
       // or evidence is unreadable — fail-open). Informational.
       return {
         name, status: 'ok',
@@ -998,6 +1019,7 @@ export async function computeExtractHealthCheck(
       expected_limit_count: number;
       rollup_write_failures: number;
       last_updated_at: Date | string | null;
+      last_halt_age_days: number | string | null;
     };
 
     // #4482: expected_limit_count (migration v141) counts runs that stopped
@@ -1014,7 +1036,8 @@ export async function computeExtractHealthCheck(
          SUM(round_completed_count) AS round_completed_count,
          ${withExpected ? 'SUM(expected_limit_count)' : '0'} AS expected_limit_count,
          SUM(rollup_write_failures) AS rollup_write_failures,
-         MAX(updated_at) AS last_updated_at
+         MAX(updated_at) AS last_updated_at,
+         CURRENT_DATE - MAX(day) FILTER (WHERE halt_count > 0) AS last_halt_age_days
        FROM extract_rollup_7d
        WHERE day >= CURRENT_DATE - 7
        GROUP BY kind
@@ -1050,6 +1073,7 @@ export async function computeExtractHealthCheck(
       expected_limit_count: number;
       halt_rate: number;
       last_updated_at: string | null;
+      last_halt_age_days: number | null;
     };
 
     const kinds: KindAggregate[] = rows.map(r => {
@@ -1073,6 +1097,7 @@ export async function computeExtractHealthCheck(
         last_updated_at: r.last_updated_at
           ? new Date(r.last_updated_at).toISOString()
           : null,
+        last_halt_age_days: r.last_halt_age_days == null ? null : Number(r.last_halt_age_days),
       };
     });
 
@@ -1092,16 +1117,15 @@ export async function computeExtractHealthCheck(
       // high halt rate from entirely historical failures with nothing
       // currently wrong — the operator has no way to tell "actively
       // failing" from "hasn't run since a bug that's already fixed" without
-      // this. last_updated_at is already computed (MAX(updated_at) above)
-      // but wasn't surfaced in the message text, only in `details`.
+      // this. The age is the most recent day with a halt, not the last
+      // rollup write: a kind that halted 4 days ago and ran cleanly today
+      // reads "last halt 4d ago".
       const top3 = [...highHaltKinds]
         .sort((a, b) => b.halt_rate - a.halt_rate)
         .slice(0, 3)
         .map(k => {
-          const ageDays = k.last_updated_at
-            ? Math.floor((Date.now() - new Date(k.last_updated_at).getTime()) / 86_400_000)
-            : null;
-          const ageSuffix = ageDays === null ? '' : ageDays <= 0 ? ', today' : `, ${ageDays}d ago`;
+          const ageDays = k.last_halt_age_days;
+          const ageSuffix = ageDays === null ? '' : ageDays <= 0 ? ', last halt today' : `, last halt ${ageDays}d ago`;
           return `${k.kind}=${(k.halt_rate * 100).toFixed(1)}%${ageSuffix}`;
         })
         .join(', ');
@@ -1440,7 +1464,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'fail',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` for each stale source${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` for each stale source${inProgressNote}`,
         details,
       };
     }
@@ -1448,7 +1472,7 @@ export async function checkSyncFreshness(
       return {
         name: 'sync_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>\` to refresh${inProgressNote}`,
+        message: `${issues.join('; ')}. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` to refresh${inProgressNote}`,
         details,
       };
     }

@@ -2,6 +2,14 @@ import type { BrainEngine } from '../engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import type { ImportResult, ParsedPage } from '../import-file.ts';
 
+/**
+ * #6007: what an apply reports to its caller. `pageId` is the page it
+ * wrote, when the write left it live; `sealed` means sealing its text
+ * projection was its last step that can change the page's revision, title or
+ * timeline.
+ */
+export interface PreparedImportApplied { pageId?: number; sealed: boolean }
+
 /** Parsing/provider work is complete. apply must run under the coordinator's transaction. */
 export interface PreparedContentImport {
   slug: string;
@@ -13,5 +21,5 @@ export interface PreparedContentImport {
   result: ImportResult;
   validate(tx: BrainEngine): Promise<void>;
   /** `preimage` (#5984): the publisher's guarded read of this page at the observed revision (see PreparedMutation.apply). */
-  apply(tx: BrainEngine, preimage?: PageSnapshot | null): Promise<void>;
+  apply(tx: BrainEngine, preimage?: PageSnapshot | null): Promise<PreparedImportApplied | void>;
 }

@@ -18,6 +18,8 @@ export interface WriteAuthority {
   slugPrefixes: string[] | null;
   delegatedPrefixes?: string[] | null;
   delegated?: boolean;
+  /** Minions job that accepted an OAuth-delegated write; a live `job` grant re-derives only that job's namespace from it. */
+  delegatedJobId?: number;
   takesHolders?: string[] | null;
   /** Actual holders touched by a published take mutation; retained after intent compaction. */
   takeHoldersUsed?: string[];
@@ -87,6 +89,12 @@ export interface WriteRequest {
   blocked_reason: string | null;
   compacted: boolean;
   publication_started: boolean;
+  /** #6278 (v220): preparations cut off by a deadline or an expired `preparing` claim; reset by a commit. Absent on rows read before the migration. */
+  /** #6176 (v217): the owner's claim-phase stamp (claim-phase.ts), read back by `claimStateOf`; absent on rows read before the migration. */
+  claim_phase?: unknown;
+  preparation_attempts?: number;
+  /** #6278: on a row the claim statements return: the stamp the previous claim left (its last recorded step). Never stored. */
+  previous_claim_phase?: unknown;
   created_at: Date | string;
   updated_at: Date | string;
   completed_at: Date | string | null;

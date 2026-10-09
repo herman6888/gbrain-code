@@ -27,7 +27,8 @@
 # wrong shard until next regen, never silently dropped.
 #
 # Stable partitioning: same `(files, weights, N)` always produces the
-# same assignment, so retries are reproducible.
+# same assignment, so retries are reproducible. Files also run in the
+# planned order (see the `./` prefix at the bun invocation below).
 
 set -euo pipefail
 unset SHARD # Routing belongs to this wrapper, never to nested test runners.
@@ -73,7 +74,7 @@ receipts_init unit
 # keep-in-matrix bar.
 # export-scale.slow.test.ts (571s at its 100,001-page master scale) rides the
 # slow-entity-resolve-perf job, which sets GBRAIN_TEST_EXPORT_SCALE_PAGES per
-# event. reconcile-crash.slow.test.ts (244s) is not duplicated here: the
+# event. reconcile-crash-*.slow.test.ts (244s) is not duplicated here: the
 # persistence-validation invariants job already runs it on PGLite for every
 # event, before and after activation.
 # evals/ is included: its *.test.ts files (eval-harness unit tests) were
@@ -88,7 +89,7 @@ ALL_FILES=$(find test evals -name '*.test.ts' \
   -not -name 'entity-card-perf.slow.test.ts' \
   -not -name 'eval-brainbench-e2e.slow.test.ts' \
   -not -name 'export-scale.slow.test.ts' \
-  -not -name 'reconcile-crash.slow.test.ts' \
+  -not -name 'reconcile-crash-*.slow.test.ts' \
   -not -path 'test/e2e/*' | sort)
 
 if [ -z "$ALL_FILES" ]; then
@@ -156,8 +157,14 @@ receipt_begin primary "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_
 # --max-concurrency mirrors the local runner: unbounded intra-process
 # concurrency under parallel PGLite boots produced real shard deaths (the
 # 22-minute matrix timeout in test.yml records 13 of them).
+#
+# The `./` prefix makes each argument a path, not a name filter: Bun runs
+# bare `test/x.test.ts` arguments in directory-scan order (filesystem
+# dependent, so CI on ext4 and a Mac disagree), and explicit paths in the
+# order given. Bun still reports them as `test/x.test.ts`, so the log and
+# JUnit parsers see the same names.
 rc=0
-printf '%s\n' "$SHARD_FILES" | xargs ${XARGS_FLAGS[@]+"${XARGS_FLAGS[@]}"} bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} || rc=$?
+printf '%s\n' "$SHARD_FILES" | sed 's#^#./#' | xargs ${XARGS_FLAGS[@]+"${XARGS_FLAGS[@]}"} bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} || rc=$?
 receipt_end "$rc"
 
 # Lane manifest: written ONLY on a fully green run (complete:true means the

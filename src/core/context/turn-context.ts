@@ -37,7 +37,9 @@ import {
 import { volunteerContext, type VolunteeredPage } from './volunteer.ts';
 import { getBrainHotMemoryMeta } from '../facts/meta-hook.ts';
 import { collapseHotFacts } from '../facts/capture-dedup.ts';
+import type { ArmStatus, RawFactRef } from './delta-cursor.ts';
 import { buildEntityCard, type EntityCard, type EntityOpenThread } from '../verbs/entity-card.ts';
+import { isNewerMentionsEnabled, readNewerMentions, renderNewerMentionRow, NEWER_MENTIONS_HEADER, NEWER_MENTIONS_PACK_CHARS, type NewerMentions } from '../mentions/newer-mentions.ts';
 import { estimateTokens } from '../search/token-budget.ts';
 import type { DecideSlotMeta } from '../search/decide-stage.ts';
 
@@ -83,6 +85,8 @@ export interface TurnContextFact {
   created_at?: string;
   /** #4206: provenance context (e.g. extract_facts' source_slug). */
   context?: string | null;
+  /** Who asserted the claim; rendered so an assistant suggestion never reads as the user's own claim. */
+  attributed_to?: 'user' | 'assistant' | 'other' | null;
   confidence: number;
 }
 
@@ -97,6 +101,13 @@ export interface DeltaPage {
 export interface TurnContextResult {
   /** Rendered block ('' when there is nothing to inject). */
   text: string;
+  /**
+   * Always-loaded core block (core-memory.ts) on session-start and coreOnly
+   * requests; absent from older serves and from every other trigger.
+   */
+  core?: { text: string; revision: string; chars_used: number; chars_limit: number; truncated: boolean };
+  /** Context-pressure gate (pressure.ts), serve-sourced; an older serve omits it and no notice fires. */
+  pressure?: import('./pressure.ts').PressureGate;
   /** Reflex pointers that survived suppression + budget. */
   pointers: ReflexPointer[];
   /**
@@ -124,6 +135,16 @@ export interface TurnContextResult {
   deltaOverflow?: boolean;
   /** pack/delta mode — the hot facts included (structured, for the verb JSON). */
   facts?: TurnContextFact[];
+  /**
+   * delta mode — per-arm completion captured in the SAME snapshot as the
+   * arrays: `ok` (read completed), `failed` (read threw), `unknown` (the
+   * deadline fired first). The verb advances only `ok` arms.
+   */
+  deltaArms?: { pages: ArmStatus; facts: ArmStatus; threads: ArmStatus };
+  /** delta mode — every raw fact row the facts arm read (oldest first) with its collapsed representative. */
+  deltaFactsRaw?: RawFactRef[];
+  /** delta mode — the facts arm's limit+1 probe row when more facts are waiting. */
+  deltaFactsOverflowRow?: { id: number; at: string } | null;
   /** The mode this result was assembled in. */
   mode?: ContextMode;
   /**
@@ -173,6 +194,12 @@ export interface AssembleTurnContextOpts {
    * timestamp pages deterministically. Facts/threads still use `since` (time).
    */
   sinceSlug?: string;
+  /**
+   * delta — the facts arm's own keyset (contributor audit wave P0): facts
+   * strictly after `(at, id)` (`id: null` = strictly after `at`). Defaults to
+   * `{ at: since, id: null }`, the legacy shared time cursor.
+   */
+  factsAfter?: { at: string; id: number | null };
   /**
    * Widen ALL arms to include private facts. Default false = world-only
    * (the safe injected-context posture). Fail-closed: only an explicit `true`
@@ -493,7 +520,7 @@ async function assemblePack(
     .filter((e) => typeof e === 'string' && e.trim())
     .slice(0, maxEntities);
 
-  const acc: { cards: EntityCard[]; facts: TurnContextFact[] } = { cards: [], facts: [] };
+  const acc: { cards: EntityCard[]; facts: TurnContextFact[]; mentions: Map<string, NewerMentions> } = { cards: [], facts: [], mentions: new Map() };
   // Cooperative deadline (perf review): raceDeadline abandons but cannot stop
   // the build, and on PGLite's single connection orphaned card queries would
   // queue AHEAD of the caller's next work. Check between iterations so no new
@@ -512,6 +539,19 @@ async function assemblePack(
     }
     if (deadlineAt !== null && Date.now() >= deadlineAt) return;
     acc.facts = await fetchHotFacts(engine, opts, remote);
+    // Newer mentions read last: a deadline drops them before a card or a fact.
+    if (!acc.cards.length || !(await isNewerMentionsEnabled(engine))) return;
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const excludePrivate = await resolveExcludePrivatePages(engine, remote ? undefined : false);
+    let left = NEWER_MENTIONS_PACK_CHARS;
+    for (const card of acc.cards) {
+      if (left <= 0 || (deadlineAt !== null && Date.now() >= deadlineAt)) return;
+      const m = await readNewerMentions(engine, opts.sourceId, card.entity.slug,
+        { excludePrivate, keepVisibility: remote ? ['world'] : ['private', 'world'], charBudget: left });
+      if (!m) continue;
+      acc.mentions.set(card.entity.slug, m);
+      left -= renderNewerMentionLines({ ...card, newer_mentions: m }).join('\n').length + 1;
+    }
   })();
 
   const degradedReason = await raceDeadline(build, opts.deadlineMs);
@@ -519,7 +559,8 @@ async function assemblePack(
   // still running and keeps MUTATING acc — a live array reference in the
   // response could diverge from the rendered text after the first await
   // downstream. Copies freeze the delivered view.
-  const cards = [...acc.cards];
+  const mentions = new Map(acc.mentions);
+  const cards = acc.cards.map((c) => (mentions.has(c.entity.slug) ? { ...c, newer_mentions: mentions.get(c.entity.slug) } : c));
   const facts = [...acc.facts];
   // `since` filter (adversarial review: was documented but dead) — open-thread
   // events are cut to those after the cursor, matching the verb contract.
@@ -547,6 +588,8 @@ async function assemblePack(
  */
 /** Max changed pages fetched per delta call (+1 probe row detects overflow). */
 export const DELTA_PAGE_FETCH_LIMIT = 50;
+/** Max facts fetched per delta call (+1 probe row detects overflow). */
+export const DELTA_FACT_FETCH_LIMIT = 50;
 
 async function assembleDelta(
   engine: BrainEngine,
@@ -554,15 +597,19 @@ async function assembleDelta(
 ): Promise<TurnContextResult> {
   const remote = opts.includePrivate !== true;
   const since = typeof opts.since === 'string' && opts.since.trim() ? opts.since : undefined;
+  // Each arm publishes its result in ONE assignment when it completes, so the
+  // snapshot taken after the deadline race sees an arm either whole or absent
+  // (`unknown`), never half-filled.
   const acc: {
-    pages: DeltaPage[];
-    overflow: boolean;
-    facts: TurnContextFact[];
-    threads: EntityOpenThread[];
-    failedArms: ('pages' | 'facts')[];
-  } = { pages: [], overflow: false, facts: [], threads: [], failedArms: [] };
+    pages?: { status: 'ok'; rows: DeltaPage[]; overflow: boolean } | { status: 'failed' };
+    facts?:
+      | { status: 'ok'; facts: TurnContextFact[]; raw: RawFactRef[]; overflowRow: { id: number; at: string } | null }
+      | { status: 'failed' };
+    threads?: { status: ArmStatus; items: EntityOpenThread[] };
+  } = {};
   const deadlineAt =
     typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0 ? Date.now() + opts.deadlineMs : null;
+  const pastDeadline = () => deadlineAt !== null && Date.now() >= deadlineAt;
 
   const build = (async () => {
     if (since) {
@@ -585,40 +632,49 @@ async function assembleDelta(
           limit: DELTA_PAGE_FETCH_LIMIT + 1,
           sort: 'updated_asc',
         });
-        acc.overflow = pages.length > DELTA_PAGE_FETCH_LIMIT;
-        acc.pages = pages.slice(0, DELTA_PAGE_FETCH_LIMIT).map((p) => ({
-          slug: p.slug,
-          source_id: opts.sourceId,
-          title: p.title,
-          // Column-precision cursor: `next_cursor.since` minted from a JS Date
-          // re-selects every same-millisecond row on the next wake.
-          updated_at:
-            p.updated_at_iso ?? (p.updated_at instanceof Date ? p.updated_at.toISOString() : String(p.updated_at)),
-        }));
+        acc.pages = {
+          status: 'ok',
+          overflow: pages.length > DELTA_PAGE_FETCH_LIMIT,
+          rows: pages.slice(0, DELTA_PAGE_FETCH_LIMIT).map((p) => ({
+            slug: p.slug,
+            source_id: opts.sourceId,
+            title: p.title,
+            // Column-precision cursor: `next_cursor.since` minted from a JS Date
+            // re-selects every same-millisecond row on the next wake.
+            updated_at:
+              p.updated_at_iso ?? (p.updated_at instanceof Date ? p.updated_at.toISOString() : String(p.updated_at)),
+          })),
+        };
       } catch {
-        acc.pages = [];
-        acc.failedArms.push('pages');
+        acc.pages = { status: 'failed' };
       }
     }
     // Facts arm: query the store DIRECTLY by recording time (pre-landing
     // review): the hot-memory meta hook's fallback window is 24h/topK-25, so a
     // cursor older than a day would silently miss facts recorded between the
-    // cursor and yesterday — the exact O(changes) contract violation delta
-    // exists to prevent. "New since" means created_at (recording time).
-    if (deadlineAt === null || Date.now() < deadlineAt) {
+    // cursor and yesterday. Contributor audit wave P0: OLDEST first after the
+    // arm's own (created_at, id) keyset with a limit+1 probe, so the facts
+    // dropped by the limit are the NEWEST ones, past the advanced keyset.
+    if (!pastDeadline()) {
       try {
-        const sinceDate = since ? new Date(since) : new Date(0);
+        const after = opts.factsAfter ?? (since ? { at: since, id: null } : null);
         const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
-        const rows = await engine.listFactsSince(opts.sourceId, sinceDate, {
-          activeOnly: true,
-          limit: 50,
-          visibility,
-          fingerprint: true,
-        });
+        const rows = await engine.listFactsKeyset(
+          opts.sourceId,
+          after ? { createdAt: after.at, id: after.id } : null,
+          { activeOnly: true, limit: DELTA_FACT_FETCH_LIMIT + 1, visibility, fingerprint: true },
+        );
+        const kept = rows.slice(0, DELTA_FACT_FETCH_LIMIT);
+        const probe = rows.length > DELTA_FACT_FETCH_LIMIT ? rows[DELTA_FACT_FETCH_LIMIT] : null;
+        const iso = (r: (typeof rows)[number]) => r.created_at_iso ?? r.created_at.toISOString();
+        const members = new Map<number, number>();
         // #5888: duplicates collapse to their newest representative, as in hot memory.
-        acc.facts = (await collapseHotFacts(engine, opts.sourceId, rows))
-          .filter((r) => !since || isAfter(r.created_at.toISOString(), since))
-          .map((r) => ({
+        const collapsed = await collapseHotFacts(engine, opts.sourceId, kept, members);
+        acc.facts = {
+          status: 'ok',
+          raw: kept.map((r) => ({ id: r.id, at: iso(r), repId: members.get(r.id) ?? r.id })),
+          overflowRow: probe ? { id: probe.id, at: iso(probe) } : null,
+          facts: collapsed.map((r) => ({
             id: r.id,
             fact: r.fact,
             kind: r.kind,
@@ -630,47 +686,68 @@ async function assembleDelta(
             // #4206: provenance context rides delta like the other projections.
             context: r.context ?? null,
             confidence: r.confidence,
-          }));
+            ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
+          })),
+        };
       } catch {
-        acc.facts = [];
-        acc.failedArms.push('facts');
+        acc.facts = { status: 'failed' };
       }
     }
 
+    // Threads are best-effort: buildEntityCard caps and swallows internally,
+    // and thread events key on event date, not a keyset. A throw still marks
+    // the arm `failed` (degraded_reason `threads`) and holds the time cursor
+    // the events follow.
     const entities = (opts.entities ?? [])
       .filter((e) => typeof e === 'string' && e.trim())
       .slice(0, clampPositive(opts.maxEntities, PACK_DEFAULT_MAX_ENTITIES));
+    const items: EntityOpenThread[] = [];
+    let failed = false;
     for (const name of entities) {
-      if (deadlineAt !== null && Date.now() >= deadlineAt) return;
+      if (pastDeadline()) return;
       try {
         const res = await buildEntityCard(engine, opts.sourceId, name, { remote });
         if (res.found && res.card) {
           for (const t of res.card.open_threads ?? []) {
-            if (!since || (t.date && isAfter(t.date, since))) acc.threads.push(t);
+            if (!since || (t.date && isAfter(t.date, since))) items.push(t);
           }
         }
       } catch {
-        /* fail-soft */
+        failed = true;
       }
     }
+    acc.threads = { status: failed ? 'failed' : 'ok', items };
   })();
 
   const deadlineReason = await raceDeadline(build, opts.deadlineMs);
-  const degradedReason = [deadlineReason, ...acc.failedArms].filter(Boolean).join(',') || undefined;
-  // Snapshot copies — same post-deadline mutation hazard as assemblePack.
-  const pages = [...acc.pages];
-  const facts = [...acc.facts];
-  const threads = [...acc.threads];
+  // ONE snapshot: arm flags and arrays come from the same read of `acc`.
+  const snap = { ...acc };
+  const pagesArm = snap.pages;
+  const factsArm = snap.facts;
+  const threadsArm = snap.threads;
+  const arms = {
+    pages: (since ? pagesArm?.status ?? 'unknown' : 'ok') as ArmStatus,
+    facts: (factsArm?.status ?? 'unknown') as ArmStatus,
+    threads: (threadsArm?.status ?? 'unknown') as ArmStatus,
+  };
+  const failedArms = (['pages', 'facts', 'threads'] as const).filter((a) => arms[a] === 'failed');
+  const degradedReason = [deadlineReason, ...failedArms].filter(Boolean).join(',') || undefined;
+  const pages = pagesArm?.status === 'ok' ? [...pagesArm.rows] : [];
+  const facts = factsArm?.status === 'ok' ? [...factsArm.facts] : [];
+  const threads = [...(threadsArm?.items ?? [])];
   const text = renderDelta(pages, facts, threads, since);
   return {
     text,
     pointers: [],
     factsCount: facts.length,
     deltaPages: pages,
-    deltaOverflow: acc.overflow,
+    deltaOverflow: pagesArm?.status === 'ok' && pagesArm.overflow,
     openThreads: threads,
     facts,
     mode: 'delta',
+    deltaArms: arms,
+    deltaFactsRaw: factsArm?.status === 'ok' ? factsArm.raw : [],
+    deltaFactsOverflowRow: factsArm?.status === 'ok' ? factsArm.overflowRow : null,
     ...(degradedReason ? { degradedReason } : {}),
   };
 }
@@ -704,8 +781,19 @@ export const renderCardLine = (c: EntityCard): string =>
 export const renderThreadLine = (t: EntityOpenThread): string =>
   `- [${t.kind}] ${t.text}${t.date ? ` (${t.date})` : ''}`;
 export const renderFactLine = (f: TurnContextFact): string =>
-  `- ${f.fact}${f.entity_slug ? ` [${f.entity_slug}]` : ''} (${f.confidence.toFixed(2)})`;
+  `- ${f.attributed_to === 'assistant' ? '(assistant said) ' : ''}${f.fact}${f.entity_slug ? ` [${f.entity_slug}]` : ''} (${f.confidence.toFixed(2)})`;
 export const renderPageLine = (p: DeltaPage): string => `- **${p.title}** → \`${p.slug}\` (${p.updated_at})`;
+
+/** One card's newer-mentions block: a line naming the entity and its page date, then one line per page. [] when there are none. */
+export const renderNewerMentionLines = (c: EntityCard): string[] => {
+  const m = c.newer_mentions;
+  if (!m?.rows.length) return [];
+  return [
+    `- **${c.entity.title}** (\`${c.entity.slug}\`, page dated ${m.since.slice(0, 10)}):`,
+    ...m.rows.map(renderNewerMentionRow),
+    ...(m.more ? [`  - more pages dated after ${m.since.slice(0, 10)} mention it: entity("${c.entity.slug}") lists them all`] : []),
+  ];
+};
 
 const PACK_HEADERS = ['## Standing entities', '## Open threads', '## Hot memory (recent facts)'] as const;
 const deltaHeaders = (since?: string): readonly [string, string, string] => {
@@ -743,6 +831,8 @@ export function renderPack(
   if (cards.length) lines.push('', PACK_HEADERS[0], ...cards.map(renderCardLine));
   if (openThreads.length) lines.push('', PACK_HEADERS[1], ...openThreads.map(renderThreadLine));
   if (facts.length) lines.push('', PACK_HEADERS[2], ...facts.map(renderFactLine));
+  const mentionLines = cards.flatMap(renderNewerMentionLines);
+  if (mentionLines.length) lines.push('', NEWER_MENTIONS_HEADER, ...mentionLines);
   return lines.join('\n');
 }
 

@@ -5,9 +5,12 @@
  * doctor.ts) and buildChecks / doctorReportRemote consume them.
  */
 import { loadConfigFileOnly } from '../../../core/config.ts';
+import { DEFAULT_MAX_COST_USD, findUnpricedBrainstormChatModel } from '../../../core/brainstorm/cost-gate.ts';
+import { pricingSetCommand } from '../../../core/budget/no-pricing.ts';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { checkError } from '../check-fix.ts';
+import { isConnectorSourceKind } from '../../../core/persistence/connector-identity.ts';
 
 /**
  * v0.40.4 graph_signals_coverage doctor check.
@@ -114,7 +117,7 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
 /**
  * v0.37.0 brainstorm_health doctor check.
  *
- * Surfaces three readiness signals for `gbrain brainstorm` / `gbrain lsd`:
+ * Surfaces four readiness signals for `gbrain brainstorm` / `gbrain lsd`:
  *
  *   1. Migration v79 applied — the `pages.last_retrieved_at` column exists.
  *      If missing, LSD's stale-page signal degrades silently (corpus-sampling
@@ -125,14 +128,22 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
  *      is fine; explicit-off is a warning so the user notices the setting.
  *      Fix: `gbrain config set search.track_retrieval true`.
  *
- *   3. Calibration cold-start — the latest calibration profile has empty
+ *   3. Chat model pricing (#5873): a cross or judge chat model nothing
+ *      prices runs under the default $5 cap with a warning (its calls go
+ *      unmetered), and a run with an explicit --max-usd refuses it. The
+ *      warning names the model, its role and the `gbrain pricing set`
+ *      command. Skipped when no gateway is configured: the chat model is
+ *      then unknown, not unpriced.
+ *
+ *   4. Calibration cold-start — the latest calibration profile has empty
  *      `active_bias_tags`. brainstorm + LSD judge fall back to no-anti-bias
  *      mode with a stderr warning at run time; this surfaces it earlier.
  *      Fix: `gbrain calibration --regenerate` once enough takes are resolved.
  *
  * Returns the FIRST non-ok signal as the status — column-missing dominates,
- * then disabled-tracking, then cold-start. All three are non-blocking warnings;
- * brainstorm + LSD still work, just with degraded signal.
+ * then disabled-tracking, then unpriced-chat-model, then cold-start. All four
+ * are non-blocking warnings; brainstorm + LSD still work, just with degraded
+ * signal.
  */
 export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check> {
   // (1) Column probe — fast, single-query.
@@ -177,7 +188,26 @@ export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check>
     // Config read miss is benign; default-on applies.
   }
 
-  // (3) Calibration cold-start — empty active_bias_tags.
+  // (3) Chat model pricing: the models runBrainstorm's cost gate checks.
+  try {
+    const unpriced = await findUnpricedBrainstormChatModel(engine);
+    if (unpriced) {
+      return {
+        name: 'brainstorm_health',
+        status: 'warn',
+        message: `brainstorm ${unpriced.role} model "${unpriced.model}" has no price: brainstorm/lsd run it under the default $${DEFAULT_MAX_COST_USD} cap with a warning (its calls go unmetered), and a run with an explicit --max-usd refuses it. Fix: look up its rate and register it: ${pricingSetCommand(unpriced.model, 'chat')}`,
+      };
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'brainstorm_health',
+      status: 'warn',
+      message: `Could not check brainstorm chat model pricing (${msg}); brainstorm/lsd may refuse to start under an explicit --max-usd.`,
+    };
+  }
+
+  // (4) Calibration cold-start — empty active_bias_tags.
   try {
     const calibRows = await engine.executeRaw<{ active_bias_tags: string[] | null }>(
       `SELECT active_bias_tags
@@ -430,6 +460,9 @@ export async function checkJunkEntityHubs(
       source_id: string | null;
       edges: number;
       chunks: number;
+      connector_page: boolean;
+      source_kind: string | null;
+      default_twin: boolean;
     }>(
       `WITH edge_counts AS (
          SELECT page_id, COUNT(*)::int AS edges FROM (
@@ -445,9 +478,14 @@ export async function checkJunkEntityHubs(
          FROM content_chunks
          GROUP BY page_id
        )
-       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks
+       SELECT p.slug, p.source_id, ec.edges, COALESCE(cc.chunks, 0)::int AS chunks,
+              (p.frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_page,
+              s.config ->> 'kind' AS source_kind,
+              EXISTS (SELECT 1 FROM pages t WHERE t.source_id = 'default' AND t.slug = p.slug
+                AND t.deleted_at IS NULL AND p.source_id <> 'default') AS default_twin
        FROM edge_counts ec
        JOIN pages p ON p.id = ec.page_id AND p.deleted_at IS NULL
+       LEFT JOIN sources s ON s.id = p.source_id
        LEFT JOIN chunk_counts cc ON cc.page_id = ec.page_id
        WHERE COALESCE(cc.chunks, 0) <= $2
          AND COALESCE(p.frontmatter ->> 'junk_hub_exempt', 'false') <> 'true'
@@ -464,25 +502,48 @@ export async function checkJunkEntityHubs(
       };
     }
 
-    const list = rows
-      .map(r => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`)
-      .join('\n');
-    return {
-      name: 'junk_entity_hubs',
-      status: 'warn',
-      message:
-        `${rows.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
-        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${list}\n` +
+    const line = (r: typeof rows[number]) => `  ${r.slug}${(r.source_id ?? 'default') !== 'default' ? ` [${r.source_id}]` : ''} — ${r.edges} edges, ${r.chunks} chunk(s)`;
+    // #6158: a connector's own contact page (re-rendered by the connector) collects its source's
+    // mention links by design (the own-source twin wins); it is not an extractor-minted entity.
+    const isConnector = (r: typeof rows[number]) => r.connector_page || isConnectorSourceKind(r.source_kind);
+    const hubs = rows.filter(r => !isConnector(r));
+    const twins = rows.filter(isConnector);
+    const parts: string[] = [];
+    if (hubs.length > 0) {
+      parts.push(
+        `${hubs.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
+        `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${hubs.map(line).join('\n')}\n` +
         `Review each page and merge/delete deliberately (nothing is auto-deleted). ` +
         `New accretion is already gated: enrichEntity refuses generic single-token mints and ` +
         `buildGazetteer drops single-generic-token person titles. If a page is an intentional thin ` +
-        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`,
+        `hub/index page, opt it out with junk_hub_exempt: true in frontmatter.`);
+    }
+    if (twins.length > 0) {
+      parts.push(
+        `${twins.length} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
+        `These are not junk: a connector renders each contact as its own page, and mentions in that source link to it ` +
+        `before the main-brain page of the same name (by design). Frontmatter edits do not stick (the connector re-renders ` +
+        `the page) and gbrain has no merge command. Whether a contact page should defer to its main-brain twin is an open ` +
+        `policy question (issue #6158); nothing needs doing now, so ask the user before changing anything.`);
+    }
+    return {
+      name: 'junk_entity_hubs',
+      status: 'warn',
+      message: parts.join('\n'),
+      ...(twins.length > 0 ? { fix_unavailable_reason: 'operator_judgement' as const } : {}),
       details: {
-        hubs: rows.map(r => ({
+        hubs: hubs.map(r => ({
           slug: r.slug,
           source_id: r.source_id ?? 'default',
           edges: r.edges,
           chunks: r.chunks,
+        })),
+        connector_twins: twins.map(r => ({
+          slug: r.slug,
+          source_id: r.source_id ?? 'default',
+          edges: r.edges,
+          chunks: r.chunks,
+          canonical_twin: r.default_twin ? r.slug : null,
         })),
       },
     };

@@ -99,7 +99,7 @@ function words(text: string): string[] {
   return text.normalize('NFKC').split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 }
 
-function contentTerms(text: string): Set<string> {
+export function contentTerms(text: string): Set<string> {
   const out = new Set<string>();
   for (const w of words(text)) {
     const lower = w.toLowerCase();

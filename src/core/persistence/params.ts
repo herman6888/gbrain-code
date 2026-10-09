@@ -19,6 +19,13 @@ export const WRITE_REQUEST_PARAM: ParamDef = {
   description: 'UUID; retry with it on timeout.',
 };
 
+/** #6007: transport-only long-poll; never stored with the write or compared on replay. */
+export const WIRE_WRITE_WAIT_MAX_MS = 30_000;
+export const WRITE_WAIT_PARAM: ParamDef = {
+  type: 'number',
+  description: `Commit wait ms (0-${WIRE_WRITE_WAIT_MAX_MS}, default 5000).`,
+};
+
 export const PAGE_MUTATION_PARAMS: Record<string, ParamDef> = {
   source_id: {
     type: 'string',

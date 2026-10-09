@@ -49,10 +49,10 @@ export const LIST_PAGES_DESCRIPTION =
   "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows (remote max 100); a full page may be truncated: continue with updated_after + updated_after_slug from the last row.";
 
 export const QUERY_DESCRIPTION =
-  "Ranked hybrid search with multi-query expansion, for concept / synonym / landscape questions: expansion recovers synonym-phrased matches. Still top-K; return_unit returns whole sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no expansion LLM call). Personal questions: get_recent_salience, find_anomalies; raw transcripts: `gbrain transcripts recent` on the brain host. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key, else keyword-only; expansion needs a chat-model key. fields: \"full\" adds diagnostics.";
+  "Hybrid search plus multi-query expansion for concept or landscape questions (expansion recovers synonym-phrased matches). Still top-K; return_unit returns whole sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no expansion LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent` on the host. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. fields: \"full\" adds diagnostics.";
 
 export const SEARCH_DESCRIPTION =
-  "Cheap hybrid search (vector + keyword), no LLM expansion, top 20: for exact tokens, names, field values. Results are NOT proof of coverage: concepts or landscape, use `query`; exhaustive lists, list_pages. return_unit returns whole sections or conversations. Personal questions: get_recent_salience; saved facts: recall. fields: \"full\" adds diagnostics.";
+  "Cheap hybrid search (vector + keyword), no LLM expansion, top 20: for exact tokens, names, field values. Results are NOT proof of coverage: concepts or landscape, use `query`; exhaustive lists, list_pages. return_unit returns whole sections or conversations. Personal: get_recent_salience; saved facts: recall. fields: \"full\" adds diagnostics.";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // v0.32.6 — contradiction probe MCP surface (M3)
@@ -167,7 +167,7 @@ export const SKILL_CATALOG_INSTRUCTIONS = {
       "are not callable by you on this server.",
     "For host-repository skills, declared `tools` narrow the usable tools. Valid " +
       "frontmatter without `tools` inherits your available brain tools; `tools: []` permits none. " +
-      "Canonical shared skills use their approved requirements instead.",
+      "Canonical shared skills follow the same rule; their other requirements gate `usable`.",
   ],
 } as const;
 
@@ -185,7 +185,7 @@ export const SKILL_CLIENT_GUIDANCE = {
     "Do not invent tools — only the tools in `usable_tools` are callable by you.",
     "For host-repository skills, declared `tools` narrow this list. Valid frontmatter " +
       "without `tools` inherits your available brain tools; `tools: []` permits none. " +
-      "Canonical shared skills use their approved requirements instead.",
+      "Canonical shared skills follow the same rule; their other requirements gate `usable`.",
     "If `mutating` is true, this skill writes to the brain; confirm before doing so " +
       "if the user hasn't clearly asked for a write.",
   ],

@@ -2,8 +2,10 @@
  * takes-quality-eval/runner — orchestrator for one `eval takes-quality run`.
  *
  * Three-model panel scored over a sample of takes. Each cycle dispatches
- * gateway.chat() to all 3 models in parallel via Promise.allSettled, parses
- * the JSON via the shared eval-shared/json-repair, drops models with
+ * gateway.chat() to all 3 models in parallel via Promise.allSettled (thinking
+ * off, #5331), parses the JSON via the shared eval-shared/json-repair, re-asks
+ * each malformed slot once with the same model and sample (#5325; a correction
+ * replaces the first attempt only when it validates), drops models with
  * incomplete dim scores (codex review #5), aggregates, and stops early on
  * PASS or INCONCLUSIVE.
  *
@@ -18,9 +20,9 @@
  * (the CLI wires receipt-write after the runner returns).
  */
 import type { BrainEngine } from '../engine.ts';
-import { chat } from '../ai/gateway.ts';
+import { chat, thinkingOffOutputCap } from '../ai/gateway.ts';
 import { parseModelJSON } from '../eval-shared/json-repair.ts';
-import { aggregate, type SlotResult, type AggregateResult } from './aggregate.ts';
+import { aggregate, slotFormatFailure, type SlotResult, type AggregateResult } from './aggregate.ts';
 import {
   RUBRIC_VERSION,
   rubricSha8,
@@ -30,8 +32,9 @@ import {
   corpusSha8,
   modelSetSha8,
 } from './receipt-name.ts';
-import type { TakesQualityReceipt } from './receipt.ts';
+import type { TakesQualityCorrection, TakesQualityReceipt } from './receipt.ts';
 import { estimateCost, getPricing, unpricedUnderCapError, unpricedWarning } from './pricing.ts';
+import type { PricingOverrides } from '../budget/reservation-cost.ts';
 import { loadPricingOverrides } from '../budget/budget-tracker.ts';
 import { DEFAULT_CYCLES_NONTTY } from '../eval/cycle-default.ts';
 
@@ -43,6 +46,25 @@ import { DEFAULT_CYCLES_NONTTY } from '../eval/cycle-default.ts';
  * the OpenAI recipe's chat list) sat here dead until #3510; gemini-2.0-flash
  * replaced the former and was itself retired before it was ever swept.
  */
+/** Receipt `protocol_version`: thinking-off judges plus one correction per malformed slot. */
+export const TAKES_QUALITY_PROTOCOL_VERSION = 2;
+
+function correctionPrompt(prompt: string, formatFailure: string): string {
+  return `${prompt}\n\nYour previous response failed validation: ${formatFailure}\n` +
+    'Return a complete replacement in the requested JSON shape, with a score for every dimension. ' +
+    'Do not invent scores when evidence is insufficient.';
+}
+
+/** Each judge call's requested output cap; `judgeCallCostUsd` prices the cap `chat()` actually sends. */
+export const JUDGE_MAX_TOKENS = 2000;
+/** Assumed judge prompt size for the pre-call projection (real usage is counted after each call). */
+const PROJECTED_INPUT_TOKENS = 5000;
+
+/** Worst-case price of one judge call (or correction) to `modelId`, or null when unpriced. */
+export function judgeCallCostUsd(modelId: string, overrides?: PricingOverrides): number | null {
+  return estimateCost(modelId, PROJECTED_INPUT_TOKENS, thinkingOffOutputCap(modelId, JUDGE_MAX_TOKENS), overrides);
+}
+
 export const DEFAULT_MODEL_PANEL = [
   'openai:gpt-5.2',
   'anthropic:claude-opus-4-7',
@@ -126,9 +148,10 @@ async function callOneModel(
       model: modelId,
       system: 'You are an evaluation judge. Return strict JSON in the requested shape. Do not include markdown fences in your final response.',
       messages: [{ role: 'user', content: systemPrompt }],
-      maxTokens: 2000,
+      maxTokens: JUDGE_MAX_TOKENS,
       abortSignal,
       allowFallback: false,
+      thinking: 'off',
     });
     try {
       const parsed = parseModelJSON(result.text);
@@ -176,6 +199,13 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
     if (budgetUsd !== null) throw unpricedUnderCapError(m, budgetUsd);
     process.stderr.write(`${unpricedWarning(m)}\n`);
   }
+  for (const m of models) {
+    const cap = thinkingOffOutputCap(m, JUDGE_MAX_TOKENS);
+    if (cap === JUDGE_MAX_TOKENS) continue;
+    process.stderr.write(
+      `[eval takes-quality] note: ${m} cannot turn thinking off; its calls send and are priced at a ${cap}-token output cap\n`,
+    );
+  }
 
   // Sample the corpus.
   const { takesText, nTakes } = await sampleTakesAsText(engine, { limit, slugPrefix: opts.slugPrefix ?? null });
@@ -193,6 +223,7 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
   let cumulativeCost = 0;
   let budgetAborted = false;
   let lastAggregate: AggregateResult | null = null;
+  const corrections: TakesQualityCorrection[] = [];
 
   for (let cycle = 0; cycle < cycles; cycle++) {
     if (opts.abortSignal?.aborted) {
@@ -200,14 +231,14 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
       break;
     }
 
-    // Project the worst-case spend for this cycle if budget is set. We
-    // assume the prompt is ~5k tokens input + ~2k output per model; the
-    // cap fires before the call if the projection would exceed remaining
-    // budget. (Real usage is captured post-call from result.usage.)
+    // Project the worst-case spend for this cycle if budget is set: ~5k
+    // input tokens plus the output cap each call sends. The cap fires before
+    // the call if the projection would exceed remaining budget. (Real usage
+    // is captured post-call from result.usage.)
     if (budgetUsd !== null) {
       let projected = 0;
       for (const m of models) {
-        projected += estimateCost(m, 5000, 2000, overrides) ?? 0;
+        projected += judgeCallCostUsd(m, overrides) ?? 0;
       }
       if (cumulativeCost + projected > budgetUsd) {
         process.stderr.write(
@@ -235,6 +266,29 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
       } else {
         slots.push({ ok: false, modelId: m, error: `allSettled_rejected: ${String(s.reason)}` });
       }
+    }
+    // #5325: one same-model correction per malformed slot, priced against the
+    // cap before it is sent. Provider errors and valid low scores never re-run.
+    for (let i = 0; i < slots.length; i++) {
+      const firstError = slotFormatFailure(slots[i]!);
+      if (!firstError) continue;
+      const m = models[i]!;
+      const skipped = opts.abortSignal?.aborted ? 'aborted'
+        : budgetUsd !== null && cumulativeCost + (judgeCallCostUsd(m, overrides) ?? 0) > budgetUsd ? 'budget'
+        : null;
+      if (skipped) {
+        corrections.push({ cycle, modelId: m, first_error: firstError, corrected: null, skipped_reason: skipped });
+        continue;
+      }
+      const retry = await callOneModel(m, correctionPrompt(prompt, firstError), opts.abortSignal);
+      if (retry._usage) cumulativeCost += estimateCost(m, retry._usage.input_tokens, retry._usage.output_tokens, overrides) ?? 0;
+      const retryError = retry.ok ? slotFormatFailure(retry) : retry.error;
+      corrections.push({
+        cycle, modelId: m, first_error: firstError,
+        corrected: retryError === null ? 'valid' : 'invalid',
+        ...(retryError !== null ? { corrected_error: retryError } : {}),
+      });
+      if (retryError === null) slots[i] = retry;
     }
     const agg = aggregate({ slots });
     lastAggregate = agg;
@@ -274,6 +328,9 @@ export async function runEval(engine: BrainEngine, opts: RunOpts = {}): Promise<
     improvements: lastAggregate.topImprovements,
     errors: lastAggregate.errors,
     verdictMessage: lastAggregate.verdictMessage,
+    protocol_version: TAKES_QUALITY_PROTOCOL_VERSION,
+    correction_selection_rule: 'corrected_if_valid',
+    ...(corrections.length > 0 ? { corrections } : {}),
   };
 
   return { receipt, budgetAborted };

@@ -21,12 +21,15 @@
  * different targets whose combined evidence hash has no proposal yet.
  * Bounded by max_subjects and the cycle budget meter (max_usd).
  */
+import { LINK_EXTRACTION_GENERATION_KEY } from '../line-grammar.ts';
+import { linkExtractorWatermarkFor } from '../link-extraction-watermark.ts';
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult } from '../cycle.ts';
 import { BudgetMeter, loadAllowUnpriced, loadPricingOverrides, parseBudgetUsd } from './budget-meter.ts';
 import { resolveModel } from '../model-config.ts';
 import { closeContradiction, parseMultirange, utcToday, dateKey, type Stint } from '../link-validity.ts';
+import { declaredSingleValueTypes, planSingleValueClosures } from '../link-single-value.ts';
 
 export interface EdgeContradictionsResult {
   name: 'edge_contradictions';
@@ -165,6 +168,7 @@ export async function defaultEdgeJudge(input: Parameters<EdgeJudgeFn>[0]): Promi
     messages: [{ role: 'user', content: buildEdgeJudgePrompt(input.subject, input.relationships) }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens: input.maxOutputTokens ?? JUDGE_MAX_OUTPUT_TOKENS,
+    allowFallback: false,
   });
   return parseEdgeJudgeOutput(result.text, input.relationships.length);
 }
@@ -179,6 +183,10 @@ interface SubjectGroup { sourceId: string; fromId: number; slug: string; title: 
 
 async function findCandidateGroups(engine: BrainEngine, maxSubjects: number): Promise<SubjectGroup[]> {
   const today = utcToday();
+  // After a line-grammar change, a subject whose links have not been re-derived yet is skipped: no closure is
+  // decided on a half-reconciled graph. Before any change (generation unset) every subject is eligible, as before.
+  const generation = await engine.getConfig(LINK_EXTRACTION_GENERATION_KEY);
+  const pendingCutoff = generation ? linkExtractorWatermarkFor(generation) : null;
   const rows = await engine.executeRaw<CandidateRow>(
     `WITH live AS (
        SELECT lr.* FROM link_relationships lr
@@ -193,9 +201,10 @@ async function findCandidateGroups(engine: BrainEngine, maxSubjects: number): Pr
             f.slug AS subject_slug, f.title AS subject_title, t.slug AS target_slug, t.title AS target_title
        FROM live l JOIN multi m USING (source_id, from_page_id, link_type)
        JOIN pages f ON f.id = l.from_page_id AND f.deleted_at IS NULL
+         AND ($3::timestamptz IS NULL OR f.links_extracted_at >= $3::timestamptz)
        JOIN pages t ON t.id = l.to_page_id AND t.deleted_at IS NULL
       ORDER BY l.from_page_id, l.link_type, l.last_start NULLS FIRST, t.slug`,
-    [today, maxSubjects]);
+    [today, maxSubjects, pendingCutoff]);
   const groups = new Map<string, SubjectGroup>();
   for (const r of rows) {
     const key = `${r.from_page_id}\0${r.link_type}`;
@@ -222,18 +231,28 @@ export async function runPhaseEdgeContradictions(engine: BrainEngine, opts: Edge
 
   const model = await resolveModel(engine, { configKey: 'models.dream.edge_contradictions', tier: 'utility', fallback: 'haiku' });
   const config = await loadEdgeContradictionsConfig(engine, model);
-  if (config.mode === 'off') return done('skipped', 'mode off (dream.edge_contradictions.mode)');
+  const declaredMode = await loadSingleValueMode(engine);
+  if (config.mode === 'off' && declaredMode === 'off') return done('skipped', 'mode off (dream.edge_contradictions.mode, dream.single_value.mode)');
+
+  const reverted = await markRevertedProposals(engine);
+  const allGroups = await findCandidateGroups(engine, config.maxSubjects);
+  if (allGroups.length === 0) return done('complete', `no subjects with competing live relationships${reverted ? `; ${reverted} reverted by user` : ''}`, { subjects: 0, reverted });
+  if (opts.dryRun) return done('skipped', `dry-run: ${allGroups.length} subject(s) would be judged`, { subjects: allGroups.length });
+
+  const declared = await runDeclaredSingleValue(engine, allGroups, declaredMode, opts);
+  const groups = allGroups.filter(g => !declared.handled.has(g));
+  const declaredDetail = declared.handled.size
+    ? `; declared single-value: ${declared.totals.proposed} closure(s), ${declared.totals.applied} applied, ${declared.totals.undated_unresolved} undated, ${declared.totals.ambiguous_same_date} same-date`
+    : '';
+  const withDeclared = (t: Record<string, number>) => ({ ...t, ...Object.fromEntries(Object.entries(declared.totals).map(([k, v]) => [`declared_${k}`, v])) });
+  if (groups.length === 0) return done('complete', `no subjects left for the judge${declaredDetail}`, withDeclared({ subjects: allGroups.length, reverted }));
+  if (config.mode === 'off') return done(declared.handled.size ? 'complete' : 'skipped', `mode off (dream.edge_contradictions.mode)${declaredDetail}`, withDeclared({ subjects: allGroups.length, reverted }));
   if (!opts.judge && !opts.assumeChatAvailable) {
     const { isAvailable } = await import('../ai/gateway.ts');
     if (!isAvailable('chat', model)) {
-      return done('skipped', `no chat model available (${model}); configure one (gbrain models) to have relationship contradictions proposed`);
+      return done(declared.handled.size ? 'complete' : 'skipped', `no chat model available (${model}); configure one (gbrain models) to have relationship contradictions proposed${declaredDetail}`, withDeclared({ subjects: allGroups.length, reverted }));
     }
   }
-
-  const reverted = await markRevertedProposals(engine);
-  const groups = await findCandidateGroups(engine, config.maxSubjects);
-  if (groups.length === 0) return done('complete', `no subjects with competing live relationships${reverted ? `; ${reverted} reverted by user` : ''}`, { subjects: 0, reverted });
-  if (opts.dryRun) return done('skipped', `dry-run: ${groups.length} subject(s) would be judged`, { subjects: groups.length });
 
   const meter = new BudgetMeter({
     budgetUsd: config.budgetUsd, allowUnpriced: config.allowUnpriced,
@@ -310,9 +329,67 @@ export async function runPhaseEdgeContradictions(engine: BrainEngine, opts: Edge
     (config.mode === 'apply' ? `, ${totals.applied} applied` : ' (mode propose: review with gbrain edge-proposals list)') +
     `, ${totals.compatible} compatible, ${totals.undated_unresolved} undated, ${totals.ambiguous_same_date} same-date` +
     (totals.errors ? `, ${totals.errors} judge error(s)` : '') + (budgetExhausted ? ' (budget exhausted)' : '') +
-    `. Cost: $${meter.totalSpent.toFixed(4)} / $${config.budgetUsd.toFixed(2)} with ${model}`;
+    `. Cost: $${meter.totalSpent.toFixed(4)} / $${config.budgetUsd.toFixed(2)} with ${model}${declaredDetail}`;
   const status = budgetExhausted || totals.errors ? (totals.judged ? 'partial' : 'failed') : 'complete';
-  return done(status, detail, totals);
+  return done(status, detail, withDeclared(totals));
+}
+
+export type SingleValueMode = 'apply' | 'propose' | 'off';
+export const SINGLE_VALUE_MODEL = 'schema-pack:cardinality';
+
+async function loadSingleValueMode(engine: BrainEngine): Promise<SingleValueMode> {
+  const raw = (await engine.getConfig('dream.single_value.mode'))?.trim().toLowerCase();
+  return raw === 'apply' || raw === 'off' ? raw : 'propose';
+}
+
+/**
+ * Groups whose relation the source's pack declares `cardinality: one_per_from`
+ * are closed by the chain rule (link-single-value.ts) without a model: each
+ * live relationship ends at the next one's dated start. Undated and same-date
+ * members are recorded as open conflicts. Handled groups never reach the judge.
+ */
+async function runDeclaredSingleValue(
+  engine: BrainEngine, groups: SubjectGroup[], mode: SingleValueMode, opts: EdgeContradictionsOpts,
+): Promise<{ handled: Set<SubjectGroup>; totals: Record<string, number> }> {
+  const totals = { groups: 0, proposed: 0, applied: 0, undated_unresolved: 0, ambiguous_same_date: 0 };
+  const handled = new Set<SubjectGroup>();
+  if (mode === 'off') return { handled, totals };
+  const declaredBySource = new Map<string, Set<string>>();
+  for (const g of groups) {
+    if (!declaredBySource.has(g.sourceId)) declaredBySource.set(g.sourceId, await declaredSingleValueTypes(engine, g.sourceId));
+    if (!declaredBySource.get(g.sourceId)!.has(g.linkType)) continue;
+    handled.add(g);
+    totals.groups++;
+    const byTo = new Map(g.rels.map(r => [Number(r.to_page_id), r]));
+    const plan = planSingleValueClosures(g.rels.map(r => ({
+      to_page_id: Number(r.to_page_id), lastStart: dateKey(r.last_start), stints: parseMultirange(r.valid_ranges) as Stint[],
+      recordedAt: r.recorded_at instanceof Date ? r.recorded_at : r.recorded_at == null ? null : String(r.recorded_at),
+    })));
+    const record = async (a: CandidateRow, b: CandidateRow, p: Parameters<typeof recordProposal>[5]) => {
+      const [x, y] = ordered(a, b);
+      return recordProposal(engine, g, x, y, pairHash(x, y), p);
+    };
+    for (const c of plan.closures) {
+      const ending = byTo.get(c.ending)!, successor = byTo.get(c.successor)!;
+      const id = await record(ending, successor, {
+        status: 'proposed', model: SINGLE_VALUE_MODEL, confidence: 1, endingTo: c.ending, closeDate: c.closeDate,
+        bornClosed: c.bornClosed, line: dreamClosureLine(g.linkType, ending.target_slug, successor.target_slug),
+      });
+      if (id === null) continue;
+      totals.proposed++;
+      if (mode === 'apply' && (await (opts.applier ?? applyEdgeProposal)(engine, id)).status === 'applied') totals.applied++;
+    }
+    const dated = g.rels.filter(r => dateKey(r.last_start));
+    for (const to of plan.undated) {
+      const a = byTo.get(to)!;
+      const b = dated[dated.length - 1] ?? g.rels.find(r => r !== a)!;
+      if (await record(a, b, { status: 'undated_unresolved', model: SINGLE_VALUE_MODEL, detail: 'declared single-value relation without a dated start' }) !== null) totals.undated_unresolved++;
+    }
+    for (const [x, y] of plan.sameDate) {
+      if (await record(byTo.get(x)!, byTo.get(y)!, { status: 'ambiguous_same_date', model: SINGLE_VALUE_MODEL, detail: 'declared single-value relation with two starts on the same date' }) !== null) totals.ambiguous_same_date++;
+    }
+  }
+  return { handled, totals };
 }
 
 async function recordProposal(

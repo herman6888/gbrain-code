@@ -11,6 +11,7 @@
       "chat_usage_log.chat_usage_log_pkey": "p PRIMARY KEY (id)",
       "chronicle_judge_reservations.chronicle_judge_reservations_pkey": "p PRIMARY KEY (id)",
       "chronicle_page_state.chronicle_page_state_attempts_check": "c CHECK ((attempts >= 0))",
+      "chronicle_page_state.chronicle_page_state_max_attempts_check": "c CHECK ((max_attempts > 0))",
       "chronicle_page_state.chronicle_page_state_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "chronicle_page_state.chronicle_page_state_pkey": "p PRIMARY KEY (source_id, page_id, content_hash, extractor_version)",
       "chronicle_page_state.chronicle_page_state_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
@@ -32,9 +33,13 @@
       "context_volunteer_events.context_volunteer_events_pkey": "p PRIMARY KEY (id)",
       "conversation_parser_llm_cache.conversation_parser_llm_cache_call_shape_check": "c CHECK ((call_shape = ANY (ARRAY['polish'::text, 'fallback'::text])))",
       "conversation_parser_llm_cache.conversation_parser_llm_cache_pkey": "p PRIMARY KEY (content_sha256, model_id, call_shape)",
+      "core_edit_notices.core_edit_notices_pkey": "p PRIMARY KEY (id)",
       "decide_calibrations.decide_calibrations_pkey": "p PRIMARY KEY (id)",
       "decide_proposals.decide_proposals_pkey": "p PRIMARY KEY (id)",
       "decide_proposals.decide_proposals_sweep_id_pair_index_key": "u UNIQUE (sweep_id, pair_index)",
+      "decide_review_proposals.decide_review_proposals_kind_source_id_a_ref_b_ref_subject_key": "u UNIQUE (kind, source_id, a_ref, b_ref, subject)",
+      "decide_review_proposals.decide_review_proposals_pkey": "p PRIMARY KEY (id)",
+      "decide_review_queue.decide_review_queue_pkey": "p PRIMARY KEY (kind, source_id, a_ref, b_ref)",
       "decide_spend.decide_spend_pkey": "p PRIMARY KEY (request_id)",
       "decide_state.decide_state_pkey": "p PRIMARY KEY (key)",
       "decide_sweep_deferred.decide_sweep_deferred_pkey": "p PRIMARY KEY (slot, source_id, fact_id)",
@@ -69,6 +74,7 @@
       "fact_withdrawals.fact_withdrawals_pkey": "p PRIMARY KEY (source_id, visibility, subject, fact_hash)",
       "fact_withdrawals.fact_withdrawals_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "fact_withdrawals.fact_withdrawals_visibility_check": "c CHECK ((visibility = ANY (ARRAY['private'::text, 'world'::text])))",
+      "facts.facts_attributed_to_check": "c CHECK ((attributed_to = ANY (ARRAY['user'::text, 'assistant'::text, 'other'::text])))",
       "facts.facts_confidence_check": "c CHECK (((confidence >= (0)::double precision) AND (confidence <= (1)::double precision)))",
       "facts.facts_kind_check": "c CHECK ((kind = ANY (ARRAY['event'::text, 'preference'::text, 'commitment'::text, 'belief'::text, 'fact'::text, 'idea'::text])))",
       "facts.facts_notability_check": "c CHECK ((notability = ANY (ARRAY['high'::text, 'medium'::text, 'low'::text])))",
@@ -122,6 +128,11 @@
       "mcp_spend_reservations.mcp_spend_reservations_one_budget_owner": "c CHECK (((client_id IS NULL) <> (budget_key IS NULL)))",
       "mcp_spend_reservations.mcp_spend_reservations_pkey": "p PRIMARY KEY (reservation_id)",
       "mcp_spend_reservations.mcp_spend_reservations_status_check": "c CHECK ((status = ANY (ARRAY['pending'::text, 'settled'::text, 'expired'::text])))",
+      "mention_gazetteer_entries.mention_gazetteer_entries_pkey": "p PRIMARY KEY (source_id, name_norm, target_slug, case_sensitive)",
+      "mention_gazetteer_entries.mention_gazetteer_entries_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
+      "mention_index_status.mention_index_status_pkey": "p PRIMARY KEY (source_id)",
+      "mention_index_status.mention_index_status_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
+      "mention_index_status.mention_index_status_state_check": "c CHECK ((state = ANY (ARRAY['complete'::text, 'pending'::text, 'disabled'::text, 'failed'::text])))",
       "migration_impact_log.migration_impact_log_job_id_fkey": "f FOREIGN KEY (job_id) REFERENCES minion_jobs(id) ON DELETE SET NULL",
       "migration_impact_log.migration_impact_log_pkey": "p PRIMARY KEY (id)",
       "minion_attachments.chk_attachment_size": "c CHECK ((size_bytes >= 0))",
@@ -171,13 +182,21 @@
       "open_loops.open_loops_pkey": "p PRIMARY KEY (id)",
       "open_loops.open_loops_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "open_loops.open_loops_status_check": "c CHECK ((status = ANY (ARRAY['open'::text, 'done'::text, 'dropped'::text, 'stale'::text])))",
+      "page_aliases.page_aliases_origin_check": "c CHECK ((origin = ANY (ARRAY['frontmatter'::text, 'declared'::text, 'subject'::text])))",
+      "page_aliases.page_aliases_origin_uniq": "u UNIQUE (source_id, alias_norm, slug, origin)",
       "page_aliases.page_aliases_pkey": "p PRIMARY KEY (id)",
       "page_aliases.page_aliases_source_fk": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
-      "page_aliases.page_aliases_uniq": "u UNIQUE (source_id, alias_norm, slug)",
+      "page_facts_reconcile.page_facts_reconcile_outcome_check": "c CHECK ((outcome = ANY (ARRAY['complete'::text, 'deferred'::text, 'invalid'::text, 'cancelled'::text])))",
+      "page_facts_reconcile.page_facts_reconcile_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "page_facts_reconcile.page_facts_reconcile_pkey": "p PRIMARY KEY (page_id)",
       "page_generation_clock.page_generation_clock_id_check": "c CHECK ((id = 1))",
       "page_generation_clock.page_generation_clock_pkey": "p PRIMARY KEY (id)",
+      "page_mention_state.page_mention_state_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "page_mention_state.page_mention_state_pkey": "p PRIMARY KEY (page_id)",
+      "page_mention_state.page_mention_state_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "page_projection_jobs.page_projection_jobs_pkey": "p PRIMARY KEY (source_incarnation, slug)",
       "page_projection_jobs.page_projection_jobs_source_incarnation_fkey": "f FOREIGN KEY (source_incarnation) REFERENCES sources(incarnation) ON DELETE CASCADE",
+      "page_retrievals.page_retrievals_pkey": "p PRIMARY KEY (page_id)",
       "page_versions.page_versions_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "page_versions.page_versions_pkey": "p PRIMARY KEY (id)",
       "page_write_guards.page_write_guards_pkey": "p PRIMARY KEY (source_incarnation, slug)",
@@ -189,6 +208,8 @@
       "persistence_brain.persistence_brain_pkey": "p PRIMARY KEY (singleton)",
       "persistence_brain.persistence_brain_singleton_check": "c CHECK ((singleton = 1))",
       "persistence_brain.persistence_brain_writer_protocol_floor_check": "c CHECK ((writer_protocol_floor = ANY (ARRAY[1, 2])))",
+      "persistence_consumers.persistence_consumers_mode_check": "c CHECK ((mode = ANY (ARRAY['probing'::text, 'full'::text, 'waiter_only'::text, 'promoted'::text])))",
+      "persistence_consumers.persistence_consumers_pkey": "p PRIMARY KEY (host_id, pid, nonce)",
       "persistence_counters.persistence_counters_intent_bytes_check": "c CHECK ((intent_bytes >= 0))",
       "persistence_counters.persistence_counters_lifetime_ids_check": "c CHECK ((lifetime_ids >= 0))",
       "persistence_counters.persistence_counters_outstanding_count_check": "c CHECK ((outstanding_count >= 0))",
@@ -212,6 +233,7 @@
       "persistence_local_writers.persistence_local_writers_lane_check": "c CHECK ((lane = ANY (ARRAY['cli'::text, 'stdio'::text])))",
       "persistence_local_writers.persistence_local_writers_pkey": "p PRIMARY KEY (id)",
       "persistence_requests.persistence_requests_pkey": "p PRIMARY KEY (id)",
+      "persistence_requests.persistence_requests_preparation_attempts_check": "c CHECK ((preparation_attempts >= 0))",
       "persistence_requests.persistence_requests_principal_kind_check": "c CHECK ((principal_kind = ANY (ARRAY['oauth_client'::text, 'legacy_token'::text, 'local_cli'::text, 'local_stdio'::text, 'application'::text])))",
       "persistence_requests.persistence_requests_principal_kind_principal_id_request_id_key": "u UNIQUE (principal_kind, principal_id, request_id)",
       "persistence_requests.persistence_requests_protocol_version_check": "c CHECK ((protocol_version = ANY (ARRAY[1, 2])))",
@@ -241,6 +263,21 @@
       "raw_data.raw_data_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "raw_data.raw_data_page_id_source_key": "u UNIQUE (page_id, source)",
       "raw_data.raw_data_pkey": "p PRIMARY KEY (id)",
+      "retrieval_event_links.retrieval_event_links_event_id_fkey": "f FOREIGN KEY (event_id) REFERENCES retrieval_events(id) ON DELETE CASCADE",
+      "retrieval_event_links.retrieval_event_links_pkey": "p PRIMARY KEY (event_id, source_id, edge_key, to_slug)",
+      "retrieval_event_pages.retrieval_event_pages_event_id_fkey": "f FOREIGN KEY (event_id) REFERENCES retrieval_events(id) ON DELETE CASCADE",
+      "retrieval_event_pages.retrieval_event_pages_pkey": "p PRIMARY KEY (event_id, source_id, slug)",
+      "retrieval_events.retrieval_events_op_check": "c CHECK ((op = ANY (ARRAY['query'::text, 'search'::text, 'think'::text, 'synthesize'::text, 'recall'::text])))",
+      "retrieval_events.retrieval_events_pkey": "p PRIMARY KEY (id)",
+      "retrieval_feedback.retrieval_feedback_element_kind_check": "c CHECK ((element_kind = ANY (ARRAY['page'::text, 'link'::text])))",
+      "retrieval_feedback.retrieval_feedback_event_id_fkey": "f FOREIGN KEY (event_id) REFERENCES retrieval_events(id) ON DELETE CASCADE",
+      "retrieval_feedback.retrieval_feedback_pkey": "p PRIMARY KEY (event_id, signal, element_kind, source_id, element_key)",
+      "retrieval_feedback.retrieval_feedback_rating_check": "c CHECK (((rating >= 1) AND (rating <= 5)))",
+      "retrieval_feedback.retrieval_feedback_signal_check": "c CHECK ((signal = ANY (ARRAY['explicit'::text, 'cited'::text])))",
+      "retrieval_weights.retrieval_weights_element_kind_check": "c CHECK ((element_kind = ANY (ARRAY['page'::text, 'link'::text])))",
+      "retrieval_weights.retrieval_weights_pkey": "p PRIMARY KEY (source_id, element_kind, element_key)",
+      "retrieval_weights.retrieval_weights_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
+      "retrieval_weights.retrieval_weights_weight_check": "c CHECK (((weight >= (0)::double precision) AND (weight <= (1)::double precision)))",
       "search_telemetry.search_telemetry_pkey": "p PRIMARY KEY (date, mode, intent)",
       "session_context_state.session_context_state_pkey": "p PRIMARY KEY (source_id, client_id, session_id)",
       "shared_skill_delivery_batches.shared_skill_delivery_batches_installation_id_epoch_sequenc_key": "u UNIQUE (installation_id, epoch, sequence)",
@@ -322,7 +359,13 @@
       "think_ab_results.think_ab_results_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "timeline_entries.timeline_entries_event_page_id_fkey": "f FOREIGN KEY (event_page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "timeline_entries.timeline_entries_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
-      "timeline_entries.timeline_entries_pkey": "p PRIMARY KEY (id)"
+      "timeline_entries.timeline_entries_pkey": "p PRIMARY KEY (id)",
+      "wanted_links.wanted_links_origin_page_id_fkey": "f FOREIGN KEY (origin_page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "wanted_links.wanted_links_pkey": "p PRIMARY KEY (id)",
+      "wanted_links.wanted_links_producer_check": "c CHECK ((producer = ANY (ARRAY['body'::text, 'frontmatter'::text])))",
+      "wanted_links.wanted_links_ref_kind_check": "c CHECK ((ref_kind = ANY (ARRAY['slug'::text, 'name'::text])))",
+      "wanted_links.wanted_links_reference_unique": "u UNIQUE (origin_page_id, producer, ref_kind, target_source_id, target_ref)",
+      "wanted_links.wanted_links_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE"
     },
     "extensions": [
       "pg_trgm",
@@ -333,26 +376,27 @@
       "bump_page_generation_clock_fn()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=c40a0a3b86e640b6c8979976173dd93ae92c8c1b9a9e3595cae2af1e265328fe",
       "bump_page_generation_fn()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=c4135ae3f74177aa71313a6c73f22bda7a298bbf12435a8def390212ae11466a",
       "enforce_minion_queue_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=be82640d1979fc81dc812efb78bb3596ef536f656d20750e5e4aa19016bf4784",
-      "gbrain_advance_page_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=ae793ff5263f7b76311e0c22593fb658db9f82e7b3781914421d9508b6da0e88",
-      "gbrain_advance_tag_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=7807b26b4933148aa63c67fca824a60d3492396728205d04e16c48c81174cbd5",
-      "gbrain_clear_atom_page_state()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=7db0ef05d1220a579e64428b2dd7cf5183191da186fbe64b6496433a7a713d11",
-      "gbrain_count_modifications()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=9518c925621def19cafb2918da4d41e602ce94619af872eafa3c11b46c66296f",
-      "gbrain_fact_fingerprint(claim text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[] body_sha256=666cc212d15431ede62a3d1e8932676a950705717852262f86df6d836d526ab4",
-      "gbrain_fact_fingerprint_v1(claim text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[] body_sha256=38f7cfc0016f2b34d6f54652f4910cf1dd5240fbec5fd636c782e46fb70a6c7d",
-      "gbrain_fact_normalize(claim text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[] body_sha256=5fff22c689f79bb28b4cc66254ca3a42c2fc809be193c6ceaf75c3200a353035",
-      "gbrain_graduation_fence()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=cd4642fe8deee2a3c14ef41f53862f0a449b2d8a10e47177bd4f5d2e05ce8803",
-      "gbrain_guard_effect_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=e8b5589dafd4a355106104daffdf57c7776d34fe18c5b5f5336a27de188688a1",
-      "gbrain_guard_protocol_activation()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=f27354966c25d961fcecbffebba0e45747ad3de23575351319f6aee4f9aefd47",
-      "gbrain_guard_request_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=12baf1d365a8aa3009ac0fe6605497e6433304e8d5915a3fc0b0b39ad748f6c2",
-      "gbrain_guard_skill_publication()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=e854c0d058e75a65c3a90127c5c417380975100e83fc34288f6085e786df10a9",
-      "gbrain_lease_shared_skill_delivery()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=5e493c1ac8dce8cb025a736629e563437c4b214744137c302c532c20bf7e7acf",
-      "gbrain_preserve_fact_withdrawal()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=9beb118551a08451a228146373f50f2aa2ce0cfe89937e937d361b33224aa0aa",
-      "gbrain_queue_page_projection()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=6c544b9c129b6a17dcabeb5ee8d44a2b0e0af9d02ca3fe47c7d7f22ec313042c",
-      "gbrain_require_managed_writer()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=9dc91548479da39c77e3015481b89901ef13fb02ce496597606fbac592c05201",
-      "gbrain_require_persistence_protocol(required integer)": "RETURNS void kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=af07b7fac60dec0a4fe568217931ac449d32f73b3a53a047b3b02a5f59cb5058",
-      "gbrain_stamp_revision_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=d446ed1145d8bb9c93cb0ca4aa076a5dc7a5fe07b3e79518adaf1b17b0a51216",
-      "gbrain_stamp_version_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=1b28a0e5769198d86490dc20b2aee80b7e6595670428a63ac9c6825cd2a35b10",
-      "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[] body_sha256=022ddf5754968b6a6647f32a0c42db94b7aa4e680e739b79c1ec8931d06cfb92",
+      "gbrain_advance_page_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=ae793ff5263f7b76311e0c22593fb658db9f82e7b3781914421d9508b6da0e88",
+      "gbrain_advance_tag_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=7807b26b4933148aa63c67fca824a60d3492396728205d04e16c48c81174cbd5",
+      "gbrain_clear_atom_page_state()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=7db0ef05d1220a579e64428b2dd7cf5183191da186fbe64b6496433a7a713d11",
+      "gbrain_count_modifications()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=9518c925621def19cafb2918da4d41e602ce94619af872eafa3c11b46c66296f",
+      "gbrain_fact_fingerprint(claim text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[] body_sha256=ff99709590deb4c83f0e16d30b3988ca2598018f5fd6f30d132acf31b1010174",
+      "gbrain_fact_fingerprint_v1(claim text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[] body_sha256=aa955a02d3c695f237e1771f0ffded2fa8e5c7b795c42b87f7fd239ae35e213c",
+      "gbrain_fact_normalize(claim text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[] body_sha256=595b1e012edeb66edbec72a2a8b1d046a8360a386bfce2fd903e50e3f78af37b",
+      "gbrain_forget_page_retrievals()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=0f053c08f9d5a4512d10406f7b20b9c60ec43d9bbea48b28b7e4cf7187ee191b",
+      "gbrain_graduation_fence()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=cd4642fe8deee2a3c14ef41f53862f0a449b2d8a10e47177bd4f5d2e05ce8803",
+      "gbrain_guard_effect_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e8b5589dafd4a355106104daffdf57c7776d34fe18c5b5f5336a27de188688a1",
+      "gbrain_guard_protocol_activation()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=f27354966c25d961fcecbffebba0e45747ad3de23575351319f6aee4f9aefd47",
+      "gbrain_guard_request_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=12baf1d365a8aa3009ac0fe6605497e6433304e8d5915a3fc0b0b39ad748f6c2",
+      "gbrain_guard_skill_publication()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e854c0d058e75a65c3a90127c5c417380975100e83fc34288f6085e786df10a9",
+      "gbrain_lease_shared_skill_delivery()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=5e493c1ac8dce8cb025a736629e563437c4b214744137c302c532c20bf7e7acf",
+      "gbrain_preserve_fact_withdrawal()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=9beb118551a08451a228146373f50f2aa2ce0cfe89937e937d361b33224aa0aa",
+      "gbrain_queue_page_projection()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=6c544b9c129b6a17dcabeb5ee8d44a2b0e0af9d02ca3fe47c7d7f22ec313042c",
+      "gbrain_require_managed_writer()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=9dc91548479da39c77e3015481b89901ef13fb02ce496597606fbac592c05201",
+      "gbrain_require_persistence_protocol(required integer)": "RETURNS void kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=af07b7fac60dec0a4fe568217931ac449d32f73b3a53a047b3b02a5f59cb5058",
+      "gbrain_stamp_revision_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=d446ed1145d8bb9c93cb0ca4aa076a5dc7a5fe07b3e79518adaf1b17b0a51216",
+      "gbrain_stamp_version_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=1b28a0e5769198d86490dc20b2aee80b7e6595670428a63ac9c6825cd2a35b10",
+      "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=50e9b0e5bf37eeae6555dd16c8104cb0807be6c05a79e0c82237d45162c21dc2",
       "update_chunk_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e12c37d5489202aaf708560db42e6c0c7c8886d198d412e1c5d915c3ae782559",
       "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=8e2e253471f22c3e70b2fa2e67ba9162ee3d2c764d175cb5b674db2b907d1e9d"
     },
@@ -399,10 +443,19 @@
       "conversation_parser_llm_cache": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "core_edit_notices": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "decide_calibrations": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "decide_proposals": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "decide_review_proposals": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "decide_review_queue": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "decide_spend": [
@@ -495,6 +548,12 @@
       "mcp_spend_reservations": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "mention_gazetteer_entries": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "mention_index_status": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "migration_impact_log": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -540,13 +599,22 @@
       "page_aliases": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "page_facts_reconcile": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "page_generation_clock": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "page_links": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "page_mention_state": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "page_projection_jobs": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "page_retrievals": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "page_versions": [
@@ -559,6 +627,9 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "persistence_brain": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "persistence_consumers": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "persistence_counters": [
@@ -604,6 +675,21 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "raw_data": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "retrieval_event_links": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "retrieval_event_pages": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "retrieval_events": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "retrieval_feedback": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "retrieval_weights": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "search_telemetry": [
@@ -683,6 +769,9 @@
       ],
       "timeline_entries": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "wanted_links": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ]
     },
     "indexes": {
@@ -714,11 +803,17 @@
       "context_volunteer_events_src_slug_idx": "CREATE INDEX context_volunteer_events_src_slug_idx ON public.context_volunteer_events USING btree (source_id, slug)",
       "context_volunteer_events_src_time_idx": "CREATE INDEX context_volunteer_events_src_time_idx ON public.context_volunteer_events USING btree (source_id, volunteered_at DESC)",
       "conversation_parser_llm_cache_pkey": "CREATE UNIQUE INDEX conversation_parser_llm_cache_pkey ON public.conversation_parser_llm_cache USING btree (content_sha256, model_id, call_shape)",
+      "core_edit_notices_pending_idx": "CREATE INDEX core_edit_notices_pending_idx ON public.core_edit_notices USING btree (source_id, slug, id) WHERE (acked_at IS NULL)",
+      "core_edit_notices_pkey": "CREATE UNIQUE INDEX core_edit_notices_pkey ON public.core_edit_notices USING btree (id)",
       "decide_calibrations_lookup_idx": "CREATE INDEX decide_calibrations_lookup_idx ON public.decide_calibrations USING btree (slot, provider, model_resolved, created_at DESC)",
       "decide_calibrations_pkey": "CREATE UNIQUE INDEX decide_calibrations_pkey ON public.decide_calibrations USING btree (id)",
       "decide_proposals_pkey": "CREATE UNIQUE INDEX decide_proposals_pkey ON public.decide_proposals USING btree (id)",
       "decide_proposals_status_created_idx": "CREATE INDEX decide_proposals_status_created_idx ON public.decide_proposals USING btree (status, created_at)",
       "decide_proposals_sweep_id_pair_index_key": "CREATE UNIQUE INDEX decide_proposals_sweep_id_pair_index_key ON public.decide_proposals USING btree (sweep_id, pair_index)",
+      "decide_review_proposals_kind_source_id_a_ref_b_ref_subject_key": "CREATE UNIQUE INDEX decide_review_proposals_kind_source_id_a_ref_b_ref_subject_key ON public.decide_review_proposals USING btree (kind, source_id, a_ref, b_ref, subject)",
+      "decide_review_proposals_pkey": "CREATE UNIQUE INDEX decide_review_proposals_pkey ON public.decide_review_proposals USING btree (id)",
+      "decide_review_proposals_status_idx": "CREATE INDEX decide_review_proposals_status_idx ON public.decide_review_proposals USING btree (status, created_at)",
+      "decide_review_queue_pkey": "CREATE UNIQUE INDEX decide_review_queue_pkey ON public.decide_review_queue USING btree (kind, source_id, a_ref, b_ref)",
       "decide_spend_created_idx": "CREATE INDEX decide_spend_created_idx ON public.decide_spend USING btree (created_at)",
       "decide_spend_pkey": "CREATE UNIQUE INDEX decide_spend_pkey ON public.decide_spend USING btree (request_id)",
       "decide_state_pkey": "CREATE UNIQUE INDEX decide_state_pkey ON public.decide_state USING btree (key)",
@@ -841,6 +936,7 @@
       "idx_pages_frontmatter": "CREATE INDEX idx_pages_frontmatter ON public.pages USING gin (frontmatter)",
       "idx_pages_projection_pending": "CREATE INDEX idx_pages_projection_pending ON public.pages USING btree (source_id, page_kind, slug) WHERE ((deleted_at IS NULL) AND (text_projection_revision IS DISTINCT FROM knowledge_revision))",
       "idx_pages_search": "CREATE INDEX idx_pages_search ON public.pages USING gin (search_vector)",
+      "idx_pages_slug_basename": "CREATE INDEX idx_pages_slug_basename ON public.pages USING btree (source_id, regexp_replace(slug, '^.*/'::text, ''::text))",
       "idx_pages_source_id": "CREATE INDEX idx_pages_source_id ON public.pages USING btree (source_id)",
       "idx_pages_trgm": "CREATE INDEX idx_pages_trgm ON public.pages USING gin (title gin_trgm_ops)",
       "idx_pages_type": "CREATE INDEX idx_pages_type ON public.pages USING btree (type)",
@@ -889,6 +985,8 @@
       "mcp_request_log_pkey": "CREATE UNIQUE INDEX mcp_request_log_pkey ON public.mcp_request_log USING btree (id)",
       "mcp_spend_log_pkey": "CREATE UNIQUE INDEX mcp_spend_log_pkey ON public.mcp_spend_log USING btree (id)",
       "mcp_spend_reservations_pkey": "CREATE UNIQUE INDEX mcp_spend_reservations_pkey ON public.mcp_spend_reservations USING btree (reservation_id)",
+      "mention_gazetteer_entries_pkey": "CREATE UNIQUE INDEX mention_gazetteer_entries_pkey ON public.mention_gazetteer_entries USING btree (source_id, name_norm, target_slug, case_sensitive)",
+      "mention_index_status_pkey": "CREATE UNIQUE INDEX mention_index_status_pkey ON public.mention_index_status USING btree (source_id)",
       "migration_impact_log_attribution_idx": "CREATE INDEX migration_impact_log_attribution_idx ON public.migration_impact_log USING btree (job_id, source_id) WHERE (job_id IS NOT NULL)",
       "migration_impact_log_pkey": "CREATE UNIQUE INDEX migration_impact_log_pkey ON public.migration_impact_log USING btree (id)",
       "migration_impact_log_remediation_idx": "CREATE INDEX migration_impact_log_remediation_idx ON public.migration_impact_log USING btree (remediation_id, applied_at DESC)",
@@ -920,11 +1018,15 @@
       "open_loops_status_idx": "CREATE INDEX open_loops_status_idx ON public.open_loops USING btree (source_id, status, last_activity_at DESC)",
       "open_loops_thread_idx": "CREATE INDEX open_loops_thread_idx ON public.open_loops USING btree (source_id, thread_id) WHERE (status = 'open'::text)",
       "page_aliases_lookup_idx": "CREATE INDEX page_aliases_lookup_idx ON public.page_aliases USING btree (source_id, alias_norm)",
+      "page_aliases_origin_uniq": "CREATE UNIQUE INDEX page_aliases_origin_uniq ON public.page_aliases USING btree (source_id, alias_norm, slug, origin)",
       "page_aliases_pkey": "CREATE UNIQUE INDEX page_aliases_pkey ON public.page_aliases USING btree (id)",
       "page_aliases_slug_idx": "CREATE INDEX page_aliases_slug_idx ON public.page_aliases USING btree (source_id, slug)",
-      "page_aliases_uniq": "CREATE UNIQUE INDEX page_aliases_uniq ON public.page_aliases USING btree (source_id, alias_norm, slug)",
+      "page_facts_reconcile_pkey": "CREATE UNIQUE INDEX page_facts_reconcile_pkey ON public.page_facts_reconcile USING btree (page_id)",
       "page_generation_clock_pkey": "CREATE UNIQUE INDEX page_generation_clock_pkey ON public.page_generation_clock USING btree (id)",
+      "page_mention_state_pkey": "CREATE UNIQUE INDEX page_mention_state_pkey ON public.page_mention_state USING btree (page_id)",
+      "page_mention_state_source_idx": "CREATE INDEX page_mention_state_source_idx ON public.page_mention_state USING btree (source_id, mention_version)",
       "page_projection_jobs_pkey": "CREATE UNIQUE INDEX page_projection_jobs_pkey ON public.page_projection_jobs USING btree (source_incarnation, slug)",
+      "page_retrievals_pkey": "CREATE UNIQUE INDEX page_retrievals_pkey ON public.page_retrievals USING btree (page_id)",
       "page_versions_pkey": "CREATE UNIQUE INDEX page_versions_pkey ON public.page_versions USING btree (id)",
       "page_write_guards_pkey": "CREATE UNIQUE INDEX page_write_guards_pkey ON public.page_write_guards USING btree (source_incarnation, slug)",
       "pages_atom_source_hash_idx": "CREATE INDEX pages_atom_source_hash_idx ON public.pages USING btree (((frontmatter ->> 'source_hash'::text))) WHERE ((type = 'atom'::text) AND (deleted_at IS NULL))",
@@ -932,14 +1034,16 @@
       "pages_coalesce_date_idx": "CREATE INDEX pages_coalesce_date_idx ON public.pages USING btree (COALESCE(effective_date, updated_at))",
       "pages_dedup_idx": "CREATE INDEX pages_dedup_idx ON public.pages USING btree (source_id, content_hash) WHERE (deleted_at IS NULL)",
       "pages_deleted_at_purge_idx": "CREATE INDEX pages_deleted_at_purge_idx ON public.pages USING btree (deleted_at) WHERE (deleted_at IS NOT NULL)",
+      "pages_file_uri_name_idx": "CREATE INDEX pages_file_uri_name_idx ON public.pages USING btree (source_id, regexp_replace(source_uri, '^.*/'::text, ''::text)) WHERE (source_uri ~~ 'file:%'::text)",
       "pages_generation_idx": "CREATE INDEX pages_generation_idx ON public.pages USING btree (generation)",
-      "pages_last_retrieved_at_idx": "CREATE INDEX pages_last_retrieved_at_idx ON public.pages USING btree (last_retrieved_at)",
       "pages_links_extracted_at_idx": "CREATE INDEX pages_links_extracted_at_idx ON public.pages USING btree (source_id, links_extracted_at)",
       "pages_pkey": "CREATE UNIQUE INDEX pages_pkey ON public.pages USING btree (id)",
       "pages_safe_chunk_pending_idx": "CREATE INDEX pages_safe_chunk_pending_idx ON public.pages USING btree (source_id) WHERE (chunker_version < 4)",
       "pages_source_path_idx": "CREATE INDEX pages_source_path_idx ON public.pages USING btree (source_path) WHERE (source_path IS NOT NULL)",
+      "pages_source_path_name_idx": "CREATE INDEX pages_source_path_name_idx ON public.pages USING btree (source_id, regexp_replace(replace(btrim(source_path), chr(92), '/'::text), '^.*/'::text, ''::text)) WHERE (source_path IS NOT NULL)",
       "pages_source_slug_key": "CREATE UNIQUE INDEX pages_source_slug_key ON public.pages USING btree (source_id, slug)",
       "persistence_brain_pkey": "CREATE UNIQUE INDEX persistence_brain_pkey ON public.persistence_brain USING btree (singleton)",
+      "persistence_consumers_pkey": "CREATE UNIQUE INDEX persistence_consumers_pkey ON public.persistence_consumers USING btree (host_id, pid, nonce)",
       "persistence_counters_pkey": "CREATE UNIQUE INDEX persistence_counters_pkey ON public.persistence_counters USING btree (key)",
       "persistence_effects_parked": "CREATE INDEX persistence_effects_parked ON public.persistence_effects USING btree (id) WHERE (data ? 'parked'::text)",
       "persistence_effects_pending": "CREATE INDEX persistence_effects_pending ON public.persistence_effects USING btree (next_attempt_at, id) WHERE (state = ANY (ARRAY['queued'::text, 'running'::text]))",
@@ -950,6 +1054,7 @@
       "persistence_host_bindings_pkey": "CREATE UNIQUE INDEX persistence_host_bindings_pkey ON public.persistence_host_bindings USING btree (worktree_id, host_id)",
       "persistence_local_writers_credential_hash_key": "CREATE UNIQUE INDEX persistence_local_writers_credential_hash_key ON public.persistence_local_writers USING btree (credential_hash)",
       "persistence_local_writers_pkey": "CREATE UNIQUE INDEX persistence_local_writers_pkey ON public.persistence_local_writers USING btree (id)",
+      "persistence_requests_compactable": "CREATE INDEX persistence_requests_compactable ON public.persistence_requests USING btree (completed_at) WHERE ((recovery IS NULL) AND (NOT compacted) AND (state = ANY (ARRAY['committed'::text, 'conflict'::text, 'failed'::text, 'cancelled'::text])))",
       "persistence_requests_database_pending": "CREATE INDEX persistence_requests_database_pending ON public.persistence_requests USING btree (source_incarnation, sequence) WHERE ((worktree_id IS NULL) AND (state = ANY (ARRAY['queued'::text, 'running'::text, 'recovering'::text])))",
       "persistence_requests_pending": "CREATE INDEX persistence_requests_pending ON public.persistence_requests USING btree (worktree_id, sequence) WHERE (state = ANY (ARRAY['queued'::text, 'running'::text, 'recovering'::text]))",
       "persistence_requests_pkey": "CREATE UNIQUE INDEX persistence_requests_pkey ON public.persistence_requests USING btree (id)",
@@ -959,6 +1064,7 @@
       "persistence_requests_sequence_key": "CREATE UNIQUE INDEX persistence_requests_sequence_key ON public.persistence_requests USING btree (sequence)",
       "persistence_requests_sync_run_committed": "CREATE INDEX persistence_requests_sync_run_committed ON public.persistence_requests USING btree (source_id, ((intent ->> 'runId'::text)), ((intent ->> 'index'::text))) WHERE ((state = 'committed'::text) AND (intent ? 'runId'::text))",
       "persistence_requests_sync_run_open": "CREATE INDEX persistence_requests_sync_run_open ON public.persistence_requests USING btree (worktree_id, ((intent ->> 'runId'::text))) WHERE ((state <> 'committed'::text) AND ((intent ->> 'kind'::text) = ANY (ARRAY['managed_sync_import'::text, 'managed_sync_delete'::text])))",
+      "persistence_requests_sync_watermark": "CREATE INDEX persistence_requests_sync_watermark ON public.persistence_requests USING btree (worktree_id, source_incarnation, completed_at DESC) WHERE ((state = 'committed'::text) AND (COALESCE((intent ->> 'kind'::text), ''::text) ~~ 'managed_sync_%'::text))",
       "persistence_source_bindings_pkey": "CREATE UNIQUE INDEX persistence_source_bindings_pkey ON public.persistence_source_bindings USING btree (source_id)",
       "persistence_topology_changes_pkey": "CREATE UNIQUE INDEX persistence_topology_changes_pkey ON public.persistence_topology_changes USING btree (id)",
       "persistence_topology_changes_principal_id_request_id_key": "CREATE UNIQUE INDEX persistence_topology_changes_principal_id_request_id_key ON public.persistence_topology_changes USING btree (principal_id, request_id)",
@@ -972,6 +1078,13 @@
       "query_cache_pkey": "CREATE UNIQUE INDEX query_cache_pkey ON public.query_cache USING btree (id)",
       "raw_data_page_id_source_key": "CREATE UNIQUE INDEX raw_data_page_id_source_key ON public.raw_data USING btree (page_id, source)",
       "raw_data_pkey": "CREATE UNIQUE INDEX raw_data_pkey ON public.raw_data USING btree (id)",
+      "retrieval_event_links_pkey": "CREATE UNIQUE INDEX retrieval_event_links_pkey ON public.retrieval_event_links USING btree (event_id, source_id, edge_key, to_slug)",
+      "retrieval_event_pages_pkey": "CREATE UNIQUE INDEX retrieval_event_pages_pkey ON public.retrieval_event_pages USING btree (event_id, source_id, slug)",
+      "retrieval_events_pkey": "CREATE UNIQUE INDEX retrieval_events_pkey ON public.retrieval_events USING btree (id)",
+      "retrieval_events_time_idx": "CREATE INDEX retrieval_events_time_idx ON public.retrieval_events USING btree (created_at)",
+      "retrieval_feedback_client_time_idx": "CREATE INDEX retrieval_feedback_client_time_idx ON public.retrieval_feedback USING btree (client_id, applied_at DESC)",
+      "retrieval_feedback_pkey": "CREATE UNIQUE INDEX retrieval_feedback_pkey ON public.retrieval_feedback USING btree (event_id, signal, element_kind, source_id, element_key)",
+      "retrieval_weights_pkey": "CREATE UNIQUE INDEX retrieval_weights_pkey ON public.retrieval_weights USING btree (source_id, element_kind, element_key)",
       "search_telemetry_pkey": "CREATE UNIQUE INDEX search_telemetry_pkey ON public.search_telemetry USING btree (date, mode, intent)",
       "session_context_state_pkey": "CREATE UNIQUE INDEX session_context_state_pkey ON public.session_context_state USING btree (source_id, client_id, session_id)",
       "session_context_state_updated_idx": "CREATE INDEX session_context_state_updated_idx ON public.session_context_state USING btree (updated_at)",
@@ -1033,7 +1146,11 @@
       "timeline_entries_pkey": "CREATE UNIQUE INDEX timeline_entries_pkey ON public.timeline_entries USING btree (id)",
       "uniq_minion_attachments_job_filename": "CREATE UNIQUE INDEX uniq_minion_attachments_job_filename ON public.minion_attachments USING btree (job_id, filename)",
       "uniq_minion_jobs_idempotency": "CREATE UNIQUE INDEX uniq_minion_jobs_idempotency ON public.minion_jobs USING btree (idempotency_key) WHERE (idempotency_key IS NOT NULL)",
-      "uniq_subagent_messages_idx": "CREATE UNIQUE INDEX uniq_subagent_messages_idx ON public.subagent_messages USING btree (job_id, message_idx)"
+      "uniq_subagent_messages_idx": "CREATE UNIQUE INDEX uniq_subagent_messages_idx ON public.subagent_messages USING btree (job_id, message_idx)",
+      "wanted_links_pkey": "CREATE UNIQUE INDEX wanted_links_pkey ON public.wanted_links USING btree (id)",
+      "wanted_links_reference_unique": "CREATE UNIQUE INDEX wanted_links_reference_unique ON public.wanted_links USING btree (origin_page_id, producer, ref_kind, target_source_id, target_ref)",
+      "wanted_links_source_idx": "CREATE INDEX wanted_links_source_idx ON public.wanted_links USING btree (source_id)",
+      "wanted_links_target_idx": "CREATE INDEX wanted_links_target_idx ON public.wanted_links USING btree (target_source_id, target_ref)"
     },
     "policies": {},
     "sequences": {
@@ -1045,8 +1162,10 @@
       "code_traversal_cache_id_seq": "integer start=1 min=1 max=2147483647 increment=1 cycle=false cache=1 owned_by=code_traversal_cache.id",
       "content_chunks_id_seq": "integer start=1 min=1 max=2147483647 increment=1 cycle=false cache=1 owned_by=content_chunks.id",
       "context_volunteer_events_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=context_volunteer_events.id",
+      "core_edit_notices_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=core_edit_notices.id",
       "decide_calibrations_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=decide_calibrations.id",
       "decide_proposals_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=decide_proposals.id",
+      "decide_review_proposals_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=decide_review_proposals.id",
       "decision_receipts_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=decision_receipts.id",
       "drift_decisions_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=drift_decisions.id",
       "entity_identities_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=entity_identities.id",
@@ -1089,7 +1208,8 @@
       "take_proposals_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=take_proposals.id",
       "takes_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=takes.id",
       "think_ab_results_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=think_ab_results.id",
-      "timeline_entries_id_seq": "integer start=1 min=1 max=2147483647 increment=1 cycle=false cache=1 owned_by=timeline_entries.id"
+      "timeline_entries_id_seq": "integer start=1 min=1 max=2147483647 increment=1 cycle=false cache=1 owned_by=timeline_entries.id",
+      "wanted_links_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=wanted_links.id"
     },
     "tables": {
       "access_tokens": {
@@ -1207,7 +1327,13 @@
           "17 event_slugs ARRAY/_text NOT NULL DEFAULT '{}'::text[]",
           "18 event_hashes ARRAY/_text NOT NULL DEFAULT '{}'::text[]",
           "19 decided_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
-          "20 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "20 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "21 campaign_id text/text NULL",
+          "22 attempt_cap_usd numeric/numeric NULL",
+          "23 max_attempts integer/int4 NULL",
+          "24 pricing_policy text/text NULL",
+          "25 campaign_max_usd numeric/numeric NULL",
+          "26 cost_attempts ARRAY/_int4 NOT NULL DEFAULT '{}'::integer[]"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -1285,7 +1411,8 @@
           "22 doc_comment text/text NULL",
           "23 symbol_name_qualified text/text NULL",
           "24 search_vector tsvector/tsvector NULL",
-          "25 edges_backfilled_at timestamp with time zone/timestamptz NULL"
+          "25 edges_backfilled_at timestamp with time zone/timestamptz NULL",
+          "26 embedding_pending_since timestamp with time zone/timestamptz NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -1313,6 +1440,21 @@
           "5 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=false force_rls=false"
+      },
+      "core_edit_notices": {
+        "columns": [
+          "1 id bigint/int8 NOT NULL DEFAULT nextval('core_edit_notices_id_seq'::regclass)",
+          "2 source_id text/text NOT NULL",
+          "3 slug text/text NOT NULL",
+          "4 page_id bigint/int8 NULL",
+          "5 revision text/text NULL",
+          "6 base_revision text/text NULL",
+          "7 base_text text/text NULL",
+          "8 actor text/text NOT NULL",
+          "9 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "10 acked_at timestamp with time zone/timestamptz NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "decide_calibrations": {
         "columns": [
@@ -1362,6 +1504,41 @@
           "14 decided_at timestamp with time zone/timestamptz NULL",
           "15 before_state text/text NULL",
           "16 after_state text/text NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "decide_review_proposals": {
+        "columns": [
+          "1 id bigint/int8 NOT NULL DEFAULT nextval('decide_review_proposals_id_seq'::regclass)",
+          "2 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "3 kind text/text NOT NULL",
+          "4 source_id text/text NOT NULL",
+          "5 sweep_id text/text NOT NULL",
+          "6 a_ref text/text NOT NULL",
+          "7 b_ref text/text NOT NULL",
+          "8 subject text/text NOT NULL DEFAULT '*'::text",
+          "9 visibility text/text NULL",
+          "10 p_action real/float4 NOT NULL",
+          "11 threshold real/float4 NULL",
+          "12 model_resolved text/text NULL",
+          "13 question_version text/text NULL",
+          "14 status text/text NOT NULL DEFAULT 'pending'::text",
+          "15 decided_at timestamp with time zone/timestamptz NULL",
+          "16 receipt text/text NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "decide_review_queue": {
+        "columns": [
+          "1 kind text/text NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 a_ref text/text NOT NULL",
+          "4 b_ref text/text NOT NULL DEFAULT '*'::text",
+          "5 evidence text/text NULL",
+          "6 reason text/text NOT NULL DEFAULT 'queued'::text",
+          "7 attempts integer/int4 NOT NULL DEFAULT 0",
+          "8 next_attempt_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "9 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -1681,7 +1858,8 @@
           "37 last_write_request_id uuid/uuid NULL",
           "38 last_write_principal_kind text/text NULL",
           "39 last_write_principal_id text/text NULL",
-          "40 last_written_at timestamp with time zone/timestamptz NULL"
+          "40 last_written_at timestamp with time zone/timestamptz NULL",
+          "41 attributed_to text/text NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -1861,6 +2039,29 @@
           "14 budget_key text/text NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
+      },
+      "mention_gazetteer_entries": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 name_norm text/text NOT NULL",
+          "3 target_slug text/text NOT NULL",
+          "4 case_sensitive boolean/bool NOT NULL DEFAULT false"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "mention_index_status": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 generation bigint/int8 NOT NULL DEFAULT 0",
+          "3 state text/text NOT NULL DEFAULT 'pending'::text",
+          "4 pending integer/int4 NOT NULL DEFAULT 0",
+          "5 counted_at timestamp with time zone/timestamptz NULL",
+          "6 last_pass_at timestamp with time zone/timestamptz NULL",
+          "7 policy_fingerprint text/text NULL",
+          "8 error text/text NULL",
+          "9 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "migration_impact_log": {
         "columns": [
@@ -2127,9 +2328,23 @@
           "2 source_id text/text NOT NULL",
           "3 alias_norm text/text NOT NULL",
           "4 slug text/text NOT NULL",
-          "5 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "5 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "6 origin text/text NOT NULL DEFAULT 'frontmatter'::text",
+          "7 case_sensitive boolean/bool NOT NULL DEFAULT false",
+          "8 alias_text text/text NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
+      },
+      "page_facts_reconcile": {
+        "columns": [
+          "1 page_id integer/int4 NOT NULL",
+          "2 reconciled_revision uuid/uuid NULL",
+          "3 reconciled_at timestamp with time zone/timestamptz NULL",
+          "4 outcome text/text NOT NULL",
+          "5 attempted_revision uuid/uuid NULL",
+          "6 attempted_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "page_generation_clock": {
         "columns": [
@@ -2138,6 +2353,20 @@
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
+      "page_mention_state": {
+        "columns": [
+          "1 page_id integer/int4 NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 mention_revision uuid/uuid NULL",
+          "4 mention_version integer/int4 NULL",
+          "5 mention_generation bigint/int8 NULL",
+          "6 mentions_scanned_at timestamp with time zone/timestamptz NULL",
+          "7 alias_revision uuid/uuid NULL",
+          "8 alias_version integer/int4 NULL",
+          "9 aliases_refreshed_at timestamp with time zone/timestamptz NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
       "page_projection_jobs": {
         "columns": [
           "1 source_incarnation uuid/uuid NOT NULL",
@@ -2145,6 +2374,13 @@
           "3 revision uuid/uuid NOT NULL",
           "4 reason text/text NOT NULL",
           "5 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "page_retrievals": {
+        "columns": [
+          "1 page_id integer/int4 NOT NULL",
+          "2 last_retrieved_at timestamp with time zone/timestamptz NOT NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -2233,6 +2469,26 @@
           "6 skill_bundles_enabled boolean/bool NOT NULL DEFAULT false",
           "7 writer_version_cutoff timestamp with time zone/timestamptz NULL",
           "8 mode_epoch bigint/int8 NOT NULL DEFAULT 1"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "persistence_consumers": {
+        "columns": [
+          "1 host_id uuid/uuid NOT NULL",
+          "2 pid integer/int4 NOT NULL",
+          "3 nonce text/text NOT NULL",
+          "4 pid_ns text/text NULL",
+          "5 kind text/text NOT NULL",
+          "6 mode text/text NOT NULL",
+          "7 started_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "8 renewed_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "9 restart_required boolean/bool NOT NULL DEFAULT false",
+          "10 root_barrier_age_ms integer/int4 NULL",
+          "11 pool jsonb/jsonb NULL",
+          "12 host_json_path text/text NOT NULL",
+          "13 persistence_home text/text NOT NULL",
+          "14 minted_under jsonb/jsonb NULL",
+          "15 version text/text NOT NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -2351,7 +2607,9 @@
           "36 consumer_version text/text NULL",
           "37 consumer_host_id uuid/uuid NULL",
           "38 published_at timestamp with time zone/timestamptz NULL",
-          "39 error_detail jsonb/jsonb NULL"
+          "39 error_detail jsonb/jsonb NULL",
+          "40 claim_phase jsonb/jsonb NULL",
+          "41 preparation_attempts integer/int4 NOT NULL DEFAULT 0"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -2474,6 +2732,62 @@
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
+      "retrieval_event_links": {
+        "columns": [
+          "1 event_id text/text NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 edge_key text/text NOT NULL",
+          "4 to_slug text/text NOT NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "retrieval_event_pages": {
+        "columns": [
+          "1 event_id text/text NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 slug text/text NOT NULL",
+          "4 content_hash text/text NULL",
+          "5 rank integer/int4 NOT NULL",
+          "6 cited boolean/bool NOT NULL DEFAULT false"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "retrieval_events": {
+        "columns": [
+          "1 id text/text NOT NULL",
+          "2 client_id text/text NOT NULL DEFAULT 'local'::text",
+          "3 op text/text NOT NULL",
+          "4 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "retrieval_feedback": {
+        "columns": [
+          "1 event_id text/text NOT NULL",
+          "2 signal text/text NOT NULL",
+          "3 element_kind text/text NOT NULL",
+          "4 source_id text/text NOT NULL",
+          "5 element_key text/text NOT NULL",
+          "6 client_id text/text NOT NULL DEFAULT 'local'::text",
+          "7 rating smallint/int2 NOT NULL",
+          "8 weight_before real/float4 NOT NULL",
+          "9 weight_after real/float4 NOT NULL",
+          "10 applied_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "retrieval_weights": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 element_kind text/text NOT NULL",
+          "3 element_key text/text NOT NULL",
+          "4 weight real/float4 NOT NULL DEFAULT 0.5",
+          "5 content_hash text/text NULL",
+          "6 updates integer/int4 NOT NULL DEFAULT 0",
+          "7 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
       "search_telemetry": {
         "columns": [
           "1 date text/text NOT NULL",
@@ -2504,7 +2818,10 @@
           "5 surfaced_slugs jsonb/jsonb NOT NULL DEFAULT '[]'::jsonb",
           "6 checkpoint_manifest jsonb/jsonb NOT NULL DEFAULT '[]'::jsonb",
           "7 last_wake_at timestamp with time zone/timestamptz NULL",
-          "8 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "8 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "9 facts_cursor_at timestamp with time zone/timestamptz NULL",
+          "10 facts_cursor_id bigint/int8 NULL",
+          "11 degraded_wakes integer/int4 NOT NULL DEFAULT 0"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -2894,6 +3211,22 @@
           "15 last_written_at timestamp with time zone/timestamptz NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
+      },
+      "wanted_links": {
+        "columns": [
+          "1 id bigint/int8 NOT NULL DEFAULT nextval('wanted_links_id_seq'::regclass)",
+          "2 origin_page_id integer/int4 NOT NULL",
+          "3 source_id text/text NOT NULL",
+          "4 producer text/text NOT NULL",
+          "5 ref_kind text/text NOT NULL",
+          "6 target_source_id text/text NOT NULL",
+          "7 target_ref text/text NOT NULL",
+          "8 link_type text/text NOT NULL DEFAULT ''::text",
+          "9 context text/text NOT NULL DEFAULT ''::text",
+          "10 checked_at timestamp with time zone/timestamptz NOT NULL",
+          "11 first_seen_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       }
     },
     "triggers": {
@@ -2917,6 +3250,7 @@
       "pages.bump_page_generation_trg": "CREATE TRIGGER bump_page_generation_trg BEFORE INSERT OR UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION bump_page_generation_fn()",
       "pages.managed_writer_guard": "CREATE TRIGGER managed_writer_guard BEFORE INSERT OR DELETE OR UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()",
       "pages.pages_clear_atom_scan_state": "CREATE TRIGGER pages_clear_atom_scan_state AFTER UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION gbrain_clear_atom_page_state()",
+      "pages.pages_forget_retrievals": "CREATE TRIGGER pages_forget_retrievals AFTER DELETE ON public.pages REFERENCING OLD TABLE AS gbrain_deleted_pages FOR EACH STATEMENT EXECUTE FUNCTION gbrain_forget_page_retrievals()",
       "pages.pages_knowledge_revision": "CREATE TRIGGER pages_knowledge_revision BEFORE UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION gbrain_advance_page_revision()",
       "pages.pages_projection_queue": "CREATE TRIGGER pages_projection_queue AFTER INSERT OR DELETE OR UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION gbrain_queue_page_projection()",
       "pages.pages_revision_attribution": "CREATE TRIGGER pages_revision_attribution BEFORE INSERT OR UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION gbrain_stamp_revision_attribution()",

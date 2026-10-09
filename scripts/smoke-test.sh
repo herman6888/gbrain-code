@@ -22,6 +22,40 @@ FIXES=0
 TOTAL=0
 SKIPPED=0
 
+# with_deadline SECONDS CMD [ARG...]: run CMD, stopping it once SECONDS pass.
+# Linux has coreutils `timeout` and Homebrew installs it as `gtimeout`, but
+# stock macOS ships neither (#5248). Without either, CMD runs as a background
+# child that this shell polls; at the deadline it gets TERM and, if still
+# alive a second later, KILL. Only that child pid is ever signalled, and CMD
+# is run from "$@" as given, never re-parsed. The return value is CMD's own
+# status, or 124 when the deadline stopped it, as `timeout` reports.
+with_deadline() {
+  local limit="$1" tool
+  shift
+  for tool in timeout gtimeout; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      "$tool" "$limit" "$@"
+      return
+    fi
+  done
+  "$@" &
+  local child=$! give_up=$((SECONDS + limit + 1)) expired=0 status
+  while kill -0 "$child" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$give_up" ]; then
+      expired=1
+      kill -TERM "$child" 2>/dev/null
+      sleep 1
+      kill -0 "$child" 2>/dev/null && kill -KILL "$child" 2>/dev/null
+      break
+    fi
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+  wait "$child"
+  status=$?
+  if [ "$expired" = 1 ]; then return 124; fi
+  return "$status"
+}
+
 timestamp() { date -u '+%Y-%m-%d %H:%M:%S'; }
 pass()    { TOTAL=$((TOTAL + 1)); echo "✅ $1"; echo "$(timestamp) PASS: $1" >> "$LOG"; }
 fail()    { TOTAL=$((TOTAL + 1)); FAILURES=$((FAILURES + 1)); echo "❌ $1"; echo "$(timestamp) FAIL: $1" >> "$LOG"; }
@@ -75,12 +109,12 @@ fi
 
 # ── 2. GBrain CLI loads ────────────────────────────────────
 if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
-  if timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+  if with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
     pass "GBrain CLI ($GBRAIN_DIR)"
   else
     # Auto-fix: reinstall deps
     cd "$GBRAIN_DIR" && "$BUN_PATH" install --frozen-lockfile 2>/dev/null
-    if timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+    if with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
       fixed "GBrain deps reinstalled"
       pass "GBrain CLI (after dep fix)"
     else
@@ -99,15 +133,16 @@ fi
 # works with the DB down), then branch on doctor --json's connection check,
 # with `gbrain db-repair --yes` as the auto-fix arm.
 if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
-  ENGINE_JSON=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" engine status --json 2>/dev/null)
+  ENGINE_JSON=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" engine status --json 2>/dev/null)
   # #4182: BSD grep (macOS) has no -P; keep this shipped smoke test POSIX-portable.
   ENGINE_KIND=$(printf '%s\n' "$ENGINE_JSON" | sed -n 's/.*"effective_engine": *"\([a-z]*\)".*/\1/p' | head -1)
   ENGINE_SRC=$(printf '%s\n' "$ENGINE_JSON" | sed -n 's/.*"db_url_source": *"\([^"]*\)".*/\1/p' | head -1)
   [ -n "$ENGINE_KIND" ] && echo "  engine: $ENGINE_KIND (${ENGINE_SRC:-no url})"
-  if [ -z "$DB_URL" ] && [ "$ENGINE_KIND" != "pglite" ]; then
-    fail "GBrain database — no DATABASE_URL or GBRAIN_DATABASE_URL (and the engine is not pglite)"
+  # #5063: a URL from the config file (engine status db_url_source) is as valid as one from the environment.
+  if [ -z "$DB_URL" ] && [ "$ENGINE_KIND" != "pglite" ] && [ -z "$ENGINE_SRC" ]; then
+    fail "GBrain database — no DATABASE_URL, GBRAIN_DATABASE_URL or configured database URL (and the engine is not pglite)"
   else
-    run_doctor_json() { DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 30 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor --json 2>/dev/null; }
+    run_doctor_json() { DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" with_deadline 30 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor --json 2>/dev/null; }
     DOCTOR_JSON=$(run_doctor_json)
     CONN_STATUS=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"name": *"connection", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
     if [ "$CONN_STATUS" = "ok" ]; then
@@ -119,7 +154,7 @@ if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
       # 240s: the docker conn_refused arm's readiness poll alone can run
       # ~165s worst-case; a 60s cap would SIGTERM the repair mid-poll and
       # report failure while the container it just started is still warming.
-      DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 240 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" db-repair --yes >> "$LOG" 2>&1
+      DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" with_deadline 240 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" db-repair --yes >> "$LOG" 2>&1
       DOCTOR_JSON=$(run_doctor_json)
       CONN_STATUS=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"name": *"connection", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
       if [ "$CONN_STATUS" = "ok" ]; then
@@ -139,7 +174,7 @@ if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ] && [ -n "$DB_URL" ]; then
   SUPERVISOR_RUNNING=0
   LEGACY_WORKER_RUNNING=0
   if DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" \
-      timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json >/dev/null 2>&1; then
+      with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json >/dev/null 2>&1; then
     SUPERVISOR_RUNNING=1
   fi
   if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
@@ -187,12 +222,20 @@ else
   skip "OpenClaw gateway — not responding (may not be running yet)"
 fi
 
-# ── 7. Embedding API key ─────────────────────────────────
+# ── 7. Embedding provider ────────────────────────────────
+# #5063: the configured provider decides (ollama and other keyless providers
+# need no OPENAI/VOYAGE key), so trust doctor's embedding_provider verdict when
+# section 3 read it; fall back to the raw keys only without a doctor report.
+EMBED_STATUS=$(printf '%s\n' "${DOCTOR_JSON:-}" | sed -n 's/.*"name": *"embedding_provider", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
 EMBED_KEY="${OPENAI_API_KEY:-${VOYAGE_API_KEY:-}}"
-if [ -n "$EMBED_KEY" ]; then
+if [ "$EMBED_STATUS" = "fail" ]; then
+  fail "Embedding provider — doctor embedding_provider failed (run: gbrain doctor --only embedding_provider)"
+elif [ -n "$EMBED_STATUS" ]; then
+  pass "Embedding provider (doctor embedding_provider: $EMBED_STATUS)"
+elif [ -n "$EMBED_KEY" ]; then
   pass "Embedding API key set"
 else
-  fail "Embedding API key — neither OPENAI_API_KEY nor VOYAGE_API_KEY is set"
+  fail "Embedding provider — no doctor report and neither OPENAI_API_KEY nor VOYAGE_API_KEY is set"
 fi
 
 # ── 8. Brain repo (if configured) ────────────────────────

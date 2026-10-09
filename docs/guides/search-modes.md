@@ -10,6 +10,9 @@ Two decisions shape every gbrain lookup, and this guide covers both:
    `gbrain query` (hybrid), or `gbrain get` (direct). This is the
    per-lookup decision an agent makes on every question.
 
+To see how a specific result was ranked, or why an expected page is missing,
+see [Explaining search results](search-explain.md).
+
 ## The three mode bundles
 
 A search mode is a named preset for retrieval knobs. Operation-level options
@@ -140,6 +143,21 @@ Seven of the knobs deserve a sentence:
   to OR when strict AND matching finds nothing, so a multi-word query still
   gets keyword recall instead of leaning on vectors alone. Set the config
   key to `false` to keep strict AND matching.
+- **`cjk_keyword_deadline_ms`** (config key `search.cjk_keyword_deadline_ms`,
+  integer milliseconds, default 3000, range 500 to 30000; for example
+  `gbrain config set search.cjk_keyword_deadline_ms 5000`) is the total time
+  budget of hybrid search's CJK keyword arm, split between full scoring and
+  one capped retry (see [multi-language FTS](multi-language-fts.md)). A cut
+  arm reports `keyword_candidates_incomplete`; another value is refused
+  with exit 2.
+- **`hnsw_iterative_scan`** (Postgres with pgvector 0.8+; config key
+  `search.hnsw_iterative_scan`, string, default `relaxed_order`, one of
+  `relaxed_order | strict_order | off`; env `GBRAIN_HNSW_ITERATIVE_SCAN`
+  wins) is the iterative HNSW scan mode for filtered vector search. Relaxed
+  order keeps closer in-filter candidates that strict order drops; results
+  are re-sorted either way. `gbrain config set search.hnsw_iterative_scan
+  strict_order` restores the older mode (restart serve and autopilot: it is
+  read once per process); another value is refused with exit 2.
 
 ### Setting and resolving the mode
 

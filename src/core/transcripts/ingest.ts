@@ -29,8 +29,11 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { importFromContent } from '../import-file.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { canonicalJson } from '../remediation-step.ts';
-import type { TranscriptAdapter, TranscriptFormat } from './types.ts';
+import type { FileDiagnostics, TranscriptAdapter, TranscriptFormat } from './types.ts';
 import { detectAdapter } from './detect.ts';
 import {
   loadImportRedactionPatterns,
@@ -70,6 +73,12 @@ export interface TranscriptsIngestOpts {
    */
   maxBytes?: number;
   activePack?: IngestActivePack;
+  /**
+   * The CLI's trusted-local operation context. On a writer-claimed brain each
+   * rendered part is submitted as a `put_page` write request through it; the
+   * direct importer is refused there. Without it the direct importer runs.
+   */
+  context?: OperationContext;
   /** Test seam for the redaction user-pattern file. */
   userPatternsPath?: string;
   /** Adapter registry override (tests). */
@@ -103,6 +112,8 @@ export interface IngestFileOutcome {
   sessions: IngestSessionOutcome[];
   skippedLines: number;
   drift: boolean;
+  /** E-N4: assistant turns parsed with zero user turns (counted in driftFiles). */
+  userTurnsMissing?: boolean;
   /** Adapter degraded to a bounded read (e.g. codex head+tail) — part of the file was never scanned. */
   truncated: boolean;
   error?: string;
@@ -188,6 +199,7 @@ export async function runTranscriptsIngest(
   // recompiles the pattern file on every call, which a bulk import would
   // otherwise repeat thousands of times.
   const redactionPatterns = loadImportRedactionPatterns(opts.userPatternsPath);
+  const coordinator = !opts.dryRun && opts.context && await managedPersistenceEnabled(engine) ? opts.context : null;
 
   const total = opts.paths.length;
   let done = 0;
@@ -309,14 +321,15 @@ export async function runTranscriptsIngest(
             for (const part of rendered.parts) {
               try {
                 await preserveForeignFrontmatter(engine, opts.sourceId ?? 'default', part);
-                const r = await importFromContent(engine, part.slug, part.content, {
-                  noEmbed: !opts.embed,
-                  sourceId: opts.sourceId,
-                  activePack: opts.activePack,
-                  source_kind: `transcript:${session.meta.harness}`,
-                  source_uri: path,
-                  ingested_via: 'cli:transcripts-ingest',
-                });
+                const provenance = { source_kind: `transcript:${session.meta.harness}`, source_uri: path, ingested_via: 'cli:transcripts-ingest' };
+                const r = coordinator
+                  ? await submitTranscriptPart(coordinator, engine, opts.sourceId, part, provenance)
+                  : await importFromContent(engine, part.slug, part.content, {
+                    noEmbed: !opts.embed,
+                    sourceId: opts.sourceId,
+                    activePack: opts.activePack,
+                    ...provenance,
+                  });
                 outcome.statuses.push(r.status);
                 if (r.status === 'imported') result.pages.imported++;
                 else if (r.status === 'skipped') result.pages.skipped++;
@@ -435,34 +448,7 @@ export async function runTranscriptsIngest(
 
         step = await gen.next();
       }
-      if (step.done && step.value) {
-        const diag = step.value;
-        fileOutcome.skippedLines = diag.skippedLines;
-        if (diag.bytesRead > 0 && diag.sessions === 0 && !diag.expectedEmpty) {
-          fileOutcome.drift = true;
-          result.driftFiles++;
-          // A drifting file may hold sessions a fixed parser will surface
-          // later (torn hermes copy, transient format break) — the shared
-          // watermark must not advance past it. expectedEmpty (a grok
-          // tool/reasoning-only session) is understood, not drifted.
-          result.cleanScan = false;
-        }
-        if (diag.skippedLines > 0) {
-          // Malformed lines can be DROPPED RECORDS (an actively-appended
-          // file read mid-write, corruption) — freeze the watermark so a
-          // later repair with an older timestamp is still picked up.
-          // Re-scans stay cheap via content-hash skip.
-          result.cleanScan = false;
-        }
-        if (diag.truncated) {
-          // A bounded read (codex head+tail over an over-budget rollout)
-          // skipped a window of the file — advancing the since-watermark
-          // over that unscanned window would drop its sessions permanently.
-          fileOutcome.truncated = true;
-          result.truncatedFiles++;
-          result.cleanScan = false;
-        }
-      }
+      if (step.done && step.value) applyFileDiagnostics(step.value, fileOutcome, result);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith(RUN_ABORT_MARKER)) throw err;
       fileOutcome.error = err instanceof Error ? err.message : String(err);
@@ -476,6 +462,31 @@ export async function runTranscriptsIngest(
 
   if (opts.dryRun) result.cleanScan = false; // dry-runs never advance watermarks
   return result;
+}
+
+/**
+ * A writer-claimed brain refuses the direct importer, so a rendered part is
+ * submitted as a `put_page` write request: the same importer runs behind the
+ * coordinator, naming the current revision so a replacement is never a blind
+ * overwrite (no revision means create-only). Embedding is deferred there, as
+ * for every coordinated page write.
+ */
+async function submitTranscriptPart(
+  ctx: OperationContext,
+  engine: BrainEngine,
+  sourceId: string,
+  part: RenderedPart,
+  provenance: { source_kind: string; source_uri: string; ingested_via: string },
+): Promise<{ slug: string; status: 'imported' | 'skipped' | 'error' }> {
+  const snapshot = await engine.readPageSnapshot(part.slug, { sourceId, includeDeleted: true });
+  const receipt = await submitPageMutation(ctx, {
+    operation: 'put_page',
+    params: { slug: part.slug, content: part.content, source_id: sourceId, ...provenance,
+      ...(snapshot?.revision ? { expected_revision: snapshot.revision } : {}) },
+  });
+  const slug = typeof receipt.slug === 'string' && receipt.slug ? receipt.slug : part.slug;
+  if (receipt.state !== 'committed') return { slug, status: 'error' };
+  return { slug, status: receipt.noop === true || receipt.status === 'skipped' ? 'skipped' : 'imported' };
 }
 
 /**
@@ -509,4 +520,43 @@ async function adoptExistingBaseSlug(engine: BrainEngine, sourceId: string, rend
   if (!existing || existing.slug === rendered.baseSlug) return;
   rendered.baseSlug = existing.slug;
   for (const part of rendered.parts) part.slug = part.part === 1 ? existing.slug : `${existing.slug}-p${part.part}`;
+}
+
+/** Fold one file's adapter diagnostics into its outcome and the run result (drift, skipped lines, truncation). */
+function applyFileDiagnostics(diag: FileDiagnostics, fileOutcome: IngestFileOutcome, result: TranscriptsIngestResult): void {
+  fileOutcome.skippedLines = diag.skippedLines;
+  if (diag.bytesRead > 0 && diag.sessions === 0 && !diag.expectedEmpty) {
+    fileOutcome.drift = true;
+    result.driftFiles++;
+    // A drifting file may hold sessions a fixed parser will surface
+    // later (torn hermes copy, transient format break) — the shared
+    // watermark must not advance past it. expectedEmpty (a grok
+    // tool/reasoning-only session) is understood, not drifted.
+    result.cleanScan = false;
+  }
+  if (diag.userTurnsMissing && !fileOutcome.drift) {
+    // E-N4: assistant turns parsed but not one user turn — the shape
+    // #5163 hid behind (a host renamed its user-turn record). The
+    // session still imports, but the file is drift: the watermark holds
+    // so a fixed parser re-reads it.
+    fileOutcome.drift = true;
+    fileOutcome.userTurnsMissing = true;
+    result.driftFiles++;
+    result.cleanScan = false;
+  }
+  if (diag.skippedLines > 0) {
+    // Malformed lines can be DROPPED RECORDS (an actively-appended
+    // file read mid-write, corruption) — freeze the watermark so a
+    // later repair with an older timestamp is still picked up.
+    // Re-scans stay cheap via content-hash skip.
+    result.cleanScan = false;
+  }
+  if (diag.truncated) {
+    // A bounded read (codex head+tail over an over-budget rollout)
+    // skipped a window of the file — advancing the since-watermark
+    // over that unscanned window would drop its sessions permanently.
+    fileOutcome.truncated = true;
+    result.truncatedFiles++;
+    result.cleanScan = false;
+  }
 }

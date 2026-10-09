@@ -27,6 +27,7 @@ writes_to:
   - people/
   - concepts/
   - sources/
+when_to_use: "Use when the user asks: \"shares a link or URL\", \"read this\", \"save this\", \"think about this\", \"put this in brain\"."
 ---
 
 # Idea Ingest Skill
@@ -122,7 +123,7 @@ Format: `- **YYYY-MM-DD** | Referenced in [page title](path) — brief context`
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - The fetch fails (paywall, 404, timeout): save a stub with URL, metadata and the failure reason (`status: fetch_failed`) and ask the user to paste the content.
 - `gbrain files upload-raw` / `file_upload` is refused (path outside the allowed root, payload too large): tell the user the limit and offer a link or an excerpt instead.
@@ -140,13 +141,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
 - Hallucinating connections to brain knowledge — only cite connections you verified via search/query
 - Creating generic slugs like `concepts/strategy` — be specific: `concepts/flywheel-effects`
 - Assuming the fetch succeeded without verifying content was actually retrieved
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-- `file_upload` → `gbrain call file_upload <params_json>`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

@@ -91,7 +91,9 @@ describe('test-shard.sh — exclusion contract', () => {
   it('runs export-scale and reconcile-crash exactly once per event outside the unit matrix', () => {
     const allFiles = [1, 2, 3, 4].flatMap(s => dryRunList(s, 4));
     expect(allFiles).not.toContain('test/export-scale.slow.test.ts');
-    expect(allFiles).not.toContain('test/reconcile-crash.slow.test.ts');
+    const reconcileCrash = require('fs').readdirSync(resolve(REPO_ROOT, 'test')).filter((f: string) => /^reconcile-crash-.*\.slow\.test\.ts$/.test(f));
+    expect(reconcileCrash.length).toBe(4);
+    for (const file of reconcileCrash) expect(allFiles).not.toContain(`test/${file}`);
     const fs = require('fs');
     const yaml = require('js-yaml');
     const workflow = yaml.load(fs.readFileSync(resolve(REPO_ROOT, '.github/workflows/test.yml'), 'utf8'));
@@ -101,7 +103,7 @@ describe('test-shard.sh — exclusion contract', () => {
     const persistence = yaml.load(fs.readFileSync(resolve(REPO_ROOT, '.github/workflows/persistence-validation.yml'), 'utf8'));
     expect(persistence.jobs.reconciliation.strategy.matrix.engine).toContain('pglite');
     expect(persistence.jobs.reconciliation.steps.some((step: { run?: string }) =>
-      step.run?.includes('test/reconcile-crash.slow.test.ts'))).toBe(true);
+      step.run?.includes('test/reconcile-crash-*.slow.test.ts'))).toBe(true);
   });
 
   it('INCLUDES *.slow.test.ts files (CI matrix is where slow files run)', () => {
@@ -228,4 +230,72 @@ describe('test-shard.sh — LPT balance contract', () => {
     const fresh = dryRunList(1, 6);
     expect(fresh).toEqual(cached);
   });
+});
+
+describe('test-shard.sh — execution order contract', () => {
+  // Bun treats a bare `test/x.test.ts` argument as a name filter and runs
+  // the matches in directory-scan order, so the planned LPT order never
+  // reached the shard process and cross-file pollution depended on the
+  // runner's filesystem. Drive the real script with a fake partitioner
+  // that reverses the sorted list, and the real Bun on tiny fixture files.
+  it('runs the shard files in the planned order', () => {
+    const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs');
+    const { tmpdir } = require('os');
+    const { join } = require('path');
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-test-shard-order-'));
+    try {
+      for (const dir of ['scripts/lib', 'test', 'evals', 'bin']) mkdirSync(join(root, dir), { recursive: true });
+      copyFileSync(SHARD_SH, join(root, 'scripts/test-shard.sh'));
+      copyFileSync(resolve(REPO_ROOT, 'scripts/lib/test-env.sh'), join(root, 'scripts/lib/test-env.sh'));
+      const names = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'];
+      for (const name of names) {
+        writeFileSync(join(root, `test/${name}.test.ts`),
+          `import { test } from 'bun:test';\nimport { appendFileSync } from 'fs';\n` +
+          `test('${name}', () => { appendFileSync(process.env.ORDER_LOG!, '${name}\\n'); });\n`);
+      }
+      writeFileSync(join(root, 'bin/bun'), `#!/usr/bin/env bash
+set -eu
+if [ "$1" = run ] && [ "$2" = scripts/sharding.ts ]; then
+  awk '{ lines[NR] = $0 } END { for (i = NR; i > 0; i--) print lines[i] }'
+  exit 0
+fi
+[ "$1" = test ] || exit 1
+printf '%s\\n' "$@" > "$ARGV_LOG"
+exec "$REAL_BUN" "$@"
+`);
+      chmodSync(join(root, 'bin/bun'), 0o755);
+      const env = {
+        ...process.env,
+        PATH: `${join(root, 'bin')}:${process.env.PATH}`,
+        REAL_BUN: process.execPath,
+        ORDER_LOG: join(root, 'order.log'),
+        ARGV_LOG: join(root, 'argv.log'),
+        GBRAIN_NO_SNAPSHOT: '1',
+        GBRAIN_TEST_RECEIPT_DIR: join(root, 'receipts'),
+        COVERAGE_DIR: '',
+      };
+      const planned = execFileSync('bash', [join(root, 'scripts/test-shard.sh'), '--dry-run-list', '1', '1'], { cwd: root, encoding: 'utf-8', env })
+        .split('\n').filter(Boolean);
+      expect(planned).toEqual([...names].reverse().map(n => `test/${n}.test.ts`));
+      execFileSync('bash', [join(root, 'scripts/test-shard.sh'), '1', '1'], { cwd: root, encoding: 'utf-8', env, stdio: 'pipe' });
+      const argv = readFileSync(join(root, 'argv.log'), 'utf-8').split('\n').filter((a: string) => a.endsWith('.test.ts'));
+      expect(argv).toEqual(planned.map(f => `./${f}`));
+      expect(readFileSync(join(root, 'order.log'), 'utf-8').split('\n').filter(Boolean)).toEqual([...names].reverse());
+      // Receipt mode forces the single-invocation xargs tripwire, and the
+      // receipt `.files` plus Bun's JUnit report keep the canonical bare
+      // names in planned order, so the ledger matches assigned to executed.
+      const rawArgv = readFileSync(join(root, 'argv.log'), 'utf-8').split('\n');
+      expect(rawArgv.some((a: string) => a.startsWith('--reporter-outfile='))).toBe(true);
+      const receiptDir = join(root, 'receipts');
+      const id = 'unit--s1of1--primary';
+      expect(readFileSync(join(receiptDir, `${id}.files`), 'utf-8').split('\n').filter(Boolean)).toEqual(planned);
+      expect(readFileSync(join(receiptDir, `${id}.receipt`), 'utf-8')).toContain('exit=0');
+      const junit = readFileSync(join(receiptDir, `${id}.junit.xml`), 'utf-8');
+      const suites = [...junit.matchAll(/<testsuite name="([^"]+)"[^>]*file="([^"]+)"/g)].map(m => m[2]);
+      expect(suites).toEqual(planned);
+      expect([...junit.matchAll(/<testcase /g)]).toHaveLength(names.length);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

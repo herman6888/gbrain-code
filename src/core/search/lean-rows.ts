@@ -28,6 +28,8 @@ const KEPT_FIELDS: ReadonlySet<string> = new Set([
   'evidence', 'create_safety',
   'injection_suspected', 'injection_p', 'unverified', 'content_flag', 'status', 'superseded', 'superseded_by',
   'message_id', 'thread_id', 'source_subject', 'relational',
+  // Present only when the caller asked for `explain: true`.
+  'score_details',
 ]);
 
 /** Explicit `fields` wins; then trusted local callers get full rows; then the transport's choice (default lean). */

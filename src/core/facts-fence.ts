@@ -47,6 +47,7 @@ import {
   parseStringCell,
   escapeFenceCell,
 } from './fence-shared.ts';
+import { findLineOutsideFencedCode, locateOutsideCode, protectedRegions, unclosedCodeFenceStart } from './fence-scan.ts';
 
 // HTML-comment fence markers — verbatim per spec. Same shape as the takes
 // fence markers so anyone who's seen one immediately recognizes the other.
@@ -58,6 +59,8 @@ export const FACTS_FENCE_END   = '<!--- gbrain:facts:end -->';
 // markdown contexts (the chunker strip, the CI invariant check) where
 // importing engine.ts pulls a large DB-shaped transitive graph.
 export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact' | 'idea';
+export type FactAttribution = 'user' | 'assistant' | 'other';
+const ATTRIBUTION_VALUES: ReadonlySet<string> = new Set(['user', 'assistant', 'other']);
 
 // Mirror src/core/engine.ts FactVisibility ('private' | 'world'). Binary
 // gate per the existing takes D21 contract — drives the chunker strip
@@ -118,6 +121,14 @@ export interface ParsedFact {
   claimValue?: number;
   claimUnit?: string;
   claimPeriod?: string;
+  /**
+   * Speaker attribution (15th column): who asserted the claim. A row carrying
+   * it is written 15 cells wide with the typed-claim cells padded empty;
+   * every other row keeps its width. Parsers that predate the column read
+   * the first 14 cells and ignore the 15th; writers that predate it drop
+   * the cell on rewrite.
+   */
+  attributedTo?: FactAttribution;
 }
 
 export interface FactsFenceParseResult {
@@ -178,8 +189,7 @@ function parseForgottenFromContext(context: string | undefined): boolean {
  * `FACTS_TABLE_MALFORMED` sync-failures entries.
  */
 export function parseFactsFence(body: string): FactsFenceParseResult {
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+  const { beginIdx, endIdx } = locateOutsideCode(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
   const warnings: string[] = [];
 
   if (beginIdx === -1 && endIdx === -1) return { facts: [], warnings };
@@ -239,6 +249,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       claimValueRaw = '',
       claimUnitRaw = '',
       claimPeriodRaw = '',
+      attributedToRaw = '',
     ] = cells;
 
     const rowNum = parseInt(rowNumStr, 10);
@@ -286,6 +297,12 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       continue;
     }
 
+    const attributedTo = attributedToRaw.trim().toLowerCase();
+    if (attributedTo && !ATTRIBUTION_VALUES.has(attributedTo)) {
+      warnings.push(`FACTS_TABLE_MALFORMED: unknown attributed_to "${attributedToRaw.trim()}" in row ${rowNumStr} (expected user|assistant|other)`);
+      continue;
+    }
+
     const { text: claimText, struck } = stripStrikethrough(claimRaw);
     const context = parseStringCell(contextRaw);
     const supersededBy = parseSupersededByFromContext(context);
@@ -310,6 +327,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       claimValue,
       claimUnit:   parseStringCell(claimUnitRaw),
       claimPeriod: parseStringCell(claimPeriodRaw),
+      ...(attributedTo ? { attributedTo: attributedTo as FactAttribution } : {}),
     });
   }
 
@@ -318,6 +336,17 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
   }
 
   return { facts, warnings };
+}
+
+/**
+ * The whitespace the codec changes about a claim, and nothing else: cells are
+ * trimmed (JavaScript `trim`, Unicode whitespace including NBSP) and CRLF/CR
+ * come back as LF. Two claims equal under this normalization render and parse
+ * to the same fence row text; the fact adoption (#6278) accepts exactly this
+ * difference between a stored legacy claim and its parsed fence cell.
+ */
+export function normalizeClaimWhitespace(text: string): string {
+  return text.replace(/\r\n?/g, '\n').trim();
 }
 
 /**
@@ -361,18 +390,23 @@ export function renderFactsTable(facts: ParsedFact[]): string {
     f.claimUnit   !== undefined ||
     f.claimPeriod !== undefined,
   );
-  const header = anyTyped
-    ? `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |`
+  // Speaker attribution widens the header to 15; only rows that carry it
+  // are written 15 cells wide (typed cells padded), others keep their width.
+  const anyAttributed = facts.some(f => f.attributedTo !== undefined);
+  const wide = anyTyped || anyAttributed;
+  const header = wide
+    ? `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |${anyAttributed ? ' attributed_to |' : ''}`
     : `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |`;
-  const separator = anyTyped
-    ? `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|`
+  const separator = wide
+    ? `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|${anyAttributed ? '---------------|' : ''}`
     : `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|`;
   const rows = facts.map(f => {
     const claimCell = f.active ? f.claim : `~~${f.claim}~~`;
     const base = `| ${f.rowNum} | ${escapeFenceCell(claimCell)} | ${f.kind} | ${formatConfidence(f.confidence)} | ${f.visibility} | ${f.notability} | ${escapeFenceCell(f.validFrom ?? '')} | ${escapeFenceCell(f.validUntil ?? '')} | ${escapeFenceCell(f.source ?? '')} | ${escapeFenceCell(f.context ?? '')} |`;
-    if (!anyTyped) return base;
+    if (!wide) return base;
     const valueCell = f.claimValue === undefined ? '' : String(f.claimValue);
-    return `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
+    const typed = `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
+    return f.attributedTo ? `${typed} ${f.attributedTo} |` : typed;
   });
   // #4615: the leading double-'' emits a BLANK LINE between the begin marker
   // and the header. The marker is an HTML block; with only one newline after
@@ -536,6 +570,7 @@ export function upsertFactRow(
       claimValue:  newRow.claimValue,
       claimUnit:   newRow.claimUnit,
       claimPeriod: newRow.claimPeriod,
+      ...(newRow.attributedTo ? { attributedTo: newRow.attributedTo } : {}),
     },
   ];
 
@@ -553,19 +588,22 @@ export function upsertFactRow(
  * page.timeline, where extract_facts refuses to reconcile it
  * (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF append on any page that already
  * had a timeline froze the fence permanently. No sentinel → EOF append.
+ * An unclosed code block before that point would swallow the fence (it would
+ * render as code), so the fence goes above the block's opener instead.
  */
 export function replaceOrInsertFactsFence(body: string, fenceBlock: string): string {
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+  const { beginIdx, endIdx } = locateOutsideCode(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
   if (beginIdx !== -1 && endIdx !== -1) {
     return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + FACTS_FENCE_END.length);
   }
   const section = `## Facts\n\n${fenceBlock}\n`;
   const sentinelAt = timelineSentinelOffset(body);
-  if (sentinelAt !== -1) {
-    const head = body.slice(0, sentinelAt);
+  const codeAt = unclosedCodeFenceStart(sentinelAt === -1 ? body : body.slice(0, sentinelAt));
+  const insertAt = codeAt !== -1 ? codeAt : sentinelAt;
+  if (insertAt !== -1) {
+    const head = body.slice(0, insertAt);
     const sep = head === '' ? '' : head.endsWith('\n\n') ? '' : head.endsWith('\n') ? '\n' : '\n\n';
-    return `${head}${sep}${section}\n${body.slice(sentinelAt)}`;
+    return `${head}${sep}${section}\n${body.slice(insertAt)}`;
   }
   const sep = body.endsWith('\n') ? '\n' : '\n\n';
   return `${body}${sep}${section}`;
@@ -593,28 +631,31 @@ function timelineSentinelOffset(body: string): number {
       if (lines[i].trim() === '---') { start = i + 1; break; }
     }
   }
-  let offset = 0;
-  for (let i = 0; i < start; i++) offset += lines[i].length + 1;
-  for (let i = start; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
+  const bodyLines = lines.slice(start);
+  // Same code rule as findTimelineSplitIndex: a sentinel quoted inside a
+  // closed fenced code block is not the page's sentinel.
+  const at = findLineOutsideFencedCode(bodyLines, (i) => {
+    const trimmed = bodyLines[i].trim();
     if (
       trimmed === '<!-- timeline -->' ||
       trimmed === '<!--timeline-->' ||
       /^---\s+timeline\s+---$/i.test(trimmed)
     ) {
-      return offset;
+      return true;
     }
-    if (trimmed === '---' && lines.slice(start, i).join('\n').trim().length > 0) {
-      for (let j = i + 1; j < lines.length; j++) {
-        const next = lines[j].trim();
+    if (trimmed === '---' && bodyLines.slice(0, i).join('\n').trim().length > 0) {
+      for (let j = i + 1; j < bodyLines.length; j++) {
+        const next = bodyLines[j].trim();
         if (next.length === 0) continue;
-        if (/^##\s+(timeline|history)\s*$/i.test(next)) return offset;
-        break;
+        return /^##\s+(timeline|history)\s*$/i.test(next);
       }
     }
-    offset += lines[i].length + 1;
-  }
-  return -1;
+    return false;
+  });
+  if (at === -1) return -1;
+  let offset = 0;
+  for (let i = 0; i < start + at; i++) offset += lines[i].length + 1;
+  return offset;
 }
 
 export interface StripFactsFenceOpts {
@@ -662,23 +703,27 @@ export function stripFactsFence(body: string, opts: StripFactsFenceOpts = {}): s
   // Pages without a compiled body have nothing to strip. Guard so the privacy
   // strip is a safe no-op rather than crashing on `undefined.indexOf`.
   if (typeof body !== 'string') return body;
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  if (beginIdx === -1) return body;
-  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  if (endIdx === -1) return body;
-
-  // Whole-fence strip mode (chunker case).
-  if (!opts.keepVisibility || opts.keepVisibility.length === 0) {
-    return body.slice(0, beginIdx) + body.slice(endIdx + FACTS_FENCE_END.length);
+  // Privacy boundary: the same regions sanitizeRemoteBody hides, including a
+  // fence quoted in a code block and an ambiguous tail (see protectedRegions).
+  const { regions, truncatedAt } = protectedRegions(body, FACTS_PAIR);
+  if (regions.length === 0 && truncatedAt === -1) return body;
+  const keep = opts.keepVisibility && opts.keepVisibility.length > 0 ? new Set(opts.keepVisibility) : null;
+  let out = '';
+  let cursor = 0;
+  for (const region of regions) {
+    out += body.slice(cursor, region.start);
+    cursor = region.end;
+    // Whole-fence strip mode (chunker case) drops the block. Selective
+    // row-level mode (get_page case) parses, filters and renders it; the
+    // parser's lenient posture means malformed rows are silently dropped,
+    // which is the safe direction at a privacy boundary — when in doubt,
+    // strip rather than leak.
+    if (keep) {
+      const { facts } = parseFactsFence(body.slice(region.start, region.end));
+      out += renderFactsTable(facts.filter(f => keep.has(f.visibility)));
+    }
   }
-
-  // Selective row-level strip mode (get_page case). Parse, filter, render.
-  // The parser's lenient posture means malformed rows are silently dropped,
-  // which is the safe direction at a privacy boundary — when in doubt,
-  // strip rather than leak.
-  const { facts } = parseFactsFence(body);
-  const keep = new Set(opts.keepVisibility);
-  const kept = facts.filter(f => keep.has(f.visibility));
-  const replacement = renderFactsTable(kept);
-  return body.slice(0, beginIdx) + replacement + body.slice(endIdx + FACTS_FENCE_END.length);
+  return out + (truncatedAt === -1 ? body.slice(cursor) : body.slice(cursor, truncatedAt));
 }
+
+const FACTS_PAIR = [{ begin: FACTS_FENCE_BEGIN, end: FACTS_FENCE_END }];

@@ -18,6 +18,7 @@
  *
  * Best-effort by contract: failure to bind never blocks the serve.
  */
+import { readPressureGate } from '../core/context/pressure.ts';
 import type { Server } from 'node:net';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig } from '../core/config.ts';
@@ -87,6 +88,7 @@ export async function bindResolveIpcForServe(
   engine: BrainEngine,
   defaultSource: string,
   persistenceProvider?: PersistenceIpcProvider,
+  opts: { rememberCallable?: boolean | (() => boolean) } = {},
 ): Promise<ResolveIpcBinding> {
   let persistence: PersistenceIpcBinding | null = null;
   try {
@@ -132,8 +134,10 @@ export async function bindResolveIpcForServe(
           sync_start: (req) =>
             runner.startDelegatedSync(engine, req.options, req.clientToken, {
               boundSourceId: defaultSource,
+              // #6317: the CLI's writer registration for a managed drain (verified by the runner, never here).
+              registration: req.registration,
             }),
-          sync_status: (req) => runner.getDelegatedSyncStatus(req.jobId),
+          sync_status: (req) => runner.getDelegatedSyncStatus(req.jobId, typeof req.afterLine === 'number' ? req.afterLine : 0),
           sync_abort: (req) => runner.abortDelegatedSync(req.jobId),
         };
       } catch (e) {
@@ -193,8 +197,8 @@ export async function bindResolveIpcForServe(
       // [CX2-10] Always assembles against the server's OWN registered
       // source — cross-source requests are rejected in the IPC layer via
       // boundSourceId below, and the handler never honors a caller source.
-      turn_context: (req) =>
-        assembleTurnContext(engine, {
+      turn_context: async (req) => ({
+        ...await assembleTurnContext(engine, {
           sourceId: defaultSource,
           window: req.window ?? [],
           priorContextText: req.priorContextText,
@@ -204,6 +208,9 @@ export async function bindResolveIpcForServe(
           // the resolve handler above (adversarial F3).
           lexicalArms: lexicalArmsEnabled(loadConfig()),
         }),
+        // Context-pressure gate for the harness hook (pressure.ts); a surface without remember never warns.
+        pressure: await readPressureGate(engine, typeof opts.rememberCallable === 'function' ? opts.rememberCallable() : opts.rememberCallable ?? true),
+      }),
       // v0.45.7 ambient recall: boundary context pack. Extracted to
       // context-pack-handler.ts (directly testable against a real engine);
       // the runtime owns entity merge, banking, the since-cursor, and the

@@ -32,6 +32,7 @@ writes_to:
   - companies/
   - sources/
 upstream: media-ingest@fc834ee
+when_to_use: "Use when the user asks: \"watch this video\", \"process this YouTube link\", \"ingest this PDF\", \"save this podcast\", \"process this book\"."
 ---
 
 # Media Ingest Skill
@@ -139,7 +140,7 @@ Brain page created with summary, highlights, and entity cross-links. Report to u
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Transcription fails: write `[transcript unavailable]` and continue with metadata; never fabricate content.
 - A transient API failure (network, `timeout`, `rate_limited`): retry once. On an auth failure, abort and tell the user which provider key is missing.
@@ -152,13 +153,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
 - Filing **raw ingest** by format (all videos in `media/videos/`) instead of by subject. Note: format-prefixed paths under `media/<format>/<slug>` ARE sanctioned for **synthesized one-of-one output** like book-mirror's `media/books/<slug>-personalized.md`. The anti-pattern is for raw ingest, not for sui generis synthesis. See `skills/_brain-filing-rules.md` "Sanctioned exception: synthesis output is sui generis."
 - Not preserving raw source files
 - Creating stub pages without meaningful content
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-- `file_upload` → `gbrain call file_upload <params_json>`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

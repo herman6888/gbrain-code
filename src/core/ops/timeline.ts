@@ -22,7 +22,7 @@ const add_timeline_entry: Operation = {
   name: 'add_timeline_entry',
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'Append a dated entry to a page timeline. Replaying the same entry changes nothing.',
+  description: 'Append a dated entry to a page timeline. Replaying the same entry changes nothing. A page\'s Timeline section needs no call.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
     slug: { type: 'string', description: 'Page slug.', required: true },

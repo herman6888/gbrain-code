@@ -13,28 +13,36 @@ import { sha256 } from './digest.ts';
 import { authorizeStoredRequest } from './authority.ts';
 import { localHostId } from './identity.ts';
 import { acquireWorktree, getWorktreeBinding, guardOwnership, type WorktreeBinding } from './ownership.ts';
-import { clearResolvedRecovery, completeWrite, getWriteRequestById, lockCounters, markRecovering, prepareRecovery, releaseUnpublishedClaim } from './journal.ts';
-import { isTerminal, principalKey, requestPrincipal, recoveryFiles, type RecoveryRecord, type WriteRequest } from './model.ts';
+import { chargePreparationAttempt, clearResolvedRecovery, completeWrite, getWriteRequestById, lockCounters, markRecovering, prepareRecovery, releaseUnpublishedClaim } from './journal.ts';
+import type { WaitingOn } from './claim-phase.ts';
+import { preparationKind } from './preparation-budget.ts';
+import { isTerminal, principalKey, requestPrincipal, recoveryFiles, type FileRecoveryRecord, type RecoveryRecord, type WriteRequest } from './model.ts';
 import type { NativeLockHandle } from './native-lock.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { lockCoreSources } from './core-guard.ts';
 import { requestAttribution } from './attribution.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
 import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, upgradeRecoveryStaging } from './staging.ts';
-import { assertMutationProtocol, assertSharedSkillPersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { databaseRefusal, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { fenceFailureDetail } from '../fence-repair/refusal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
+import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
+  /** Always-loaded core writes: source rows locked FOR UPDATE in id order (core-guard.ts lockCoreSources). */
+  exclusiveSources?: readonly string[];
   observedRevision: string | null;
   additionalPageKeys?: readonly {sourceId:string;slug:string}[];
   noop?: boolean;
@@ -57,8 +65,11 @@ interface PreparedMutationBase {
   postimage?: PageSnapshot | null;
   validate?(tx: BrainEngine): Promise<void>;
 }
-/** A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700. */
-export type PageMutationFile = MutationFile & { publishMode?: number };
+/**
+ * A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700.
+ * `commit` (trusted local preparers only) rides the Git effect into the commit message.
+ */
+export type PageMutationFile = MutationFile & { publishMode?: number; commit?: GitCommitNote };
 export type PreparedMutation = PreparedMutationBase & (
   | { target?: 'page'; file?: PageMutationFile; files?: never }
   | { target: 'skill_bundle'; file?: never; files: MutationFile[]; validate(tx: BrainEngine): Promise<void> }
@@ -109,7 +120,11 @@ function publishFile(file: PageMutationFile, stagingPath?: string, afterStagingF
 // its own recovery record and native root capability.
 export { fileHash as persistenceFileHash, publishFile as publishPersistenceFile };
 function requestError(error: unknown): PublicationFailure {
-  if (error instanceof OperationError) return { code: error.code, message: error.message };
+  if (error instanceof OperationError) {
+    // #6188: a typed fence refusal keeps its location in the bounded detail, which outlives receipt compaction.
+    const fence = fenceFailureDetail(error);
+    return { code: error.code, message: error.message, ...(fence ? { detail: fence } : {}) };
+  }
   const refusal = databaseRefusal(error);
   if (refusal) return refusal;
   const code = (error as { code?: string })?.code;
@@ -118,13 +133,62 @@ function requestError(error: unknown): PublicationFailure {
   }
   // #5216: the row still awaits its revision backfill; the error names the resume command.
   if (code === 'revision_backfill_pending' && error instanceof Error) return { code, message: error.message };
-  return { code: 'storage_error', message: `Publication failed${code ? ` (${code})` : ''}. Inspect owner diagnostics.` };
+  return ownerExceptionFailure(error);
 }
 function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed'].includes(code); }
 export function transientDatabaseFailure(error: unknown): boolean {
   return ['40001','40P01','55P03','57014','53300','57P01','57P02','57P03','08000','08003','08006','08001','08004',
     'ECONNRESET','ECONNREFUSED','ETIMEDOUT','CONNECTION_CLOSED','CONNECTION_ENDED'].includes(String((error as {code?:string})?.code));
 }
+/**
+ * #6278: the reasons a consumer aborts a preparation with. An error that is
+ * that abort (the reason itself, an AbortError, or the Postgres cancel the
+ * signal sent, 57014) is a release under that reason, never a terminal
+ * `storage_error` or an uncounted `database_contention`; classify it before
+ * `finishUnpublishedFailure`. Null when the error is the preparer's own.
+ */
+export type PreparationAbortReason = 'preparation_deadline' | 'consumer_stopping' | 'claim_lost' | 'group_member_waiting';
+const ABORT_REASONS: ReadonlySet<string> = new Set<PreparationAbortReason>(['preparation_deadline', 'consumer_stopping', 'claim_lost', 'group_member_waiting']);
+export function preparationAbortReason(error: unknown, signal?: AbortSignal): PreparationAbortReason | null {
+  const reason = signal?.aborted ? (signal.reason as { code?: unknown } | null)?.code : undefined;
+  const own = typeof reason === 'string' && ABORT_REASONS.has(reason) ? reason as PreparationAbortReason : null;
+  const e = error as { name?: unknown; code?: unknown; message?: unknown } | null;
+  if (e && typeof e === 'object' && typeof e.code === 'string' && ABORT_REASONS.has(e.code)) return e.code as PreparationAbortReason;
+  if (!own) return null;
+  if (error === signal!.reason || e?.name === 'AbortError') return own;
+  if (e?.code === '57014' && typeof e.message === 'string' && /canceling statement due to user request/.test(e.message)) return own;
+  // #6278: the engine discards a reserved connection whose cancel a pooler never completed; after our abort that end is ours.
+  if (e?.code === 'CONNECTION_DESTROYED' || e?.code === 'CONNECTION_CLOSED') return own;
+  return null;
+}
+
+/** #6278: the owner-only detail of a `preparation_stalled` receipt: the last recorded step and the count that reached the limit. */
+export interface PreparationStallDetail extends Pick<PublicationFailureDetail, 'stage' | 'attempt'> {
+  origin: 'preparation_stall'; step: string | null; waiting_on: WaitingOn; attempts: number; limit: number;
+}
+export interface PreparationStallInfo { step: string | null; waiting_on: WaitingOn; attempts: number; limit: number }
+export function preparationStalledFailure(row: WriteRequest, info: PreparationStallInfo): PublicationFailure {
+  const kind = preparationKind(row);
+  const where = info.step ? `, last at step ${info.step} (waiting on ${info.waiting_on})` : '';
+  const fix = kind === 'sync'
+    ? `Run gbrain sources writer status --source ${row.source_id} --json, then gbrain sources retry-held ${row.source_id}, then the same gbrain sync with the same options.`
+    : `Run gbrain sources writer status --source ${row.source_id} --json, fix or report what the step was waiting on, then submit the write again with a new request_id.`;
+  return { code: 'preparation_stalled',
+    message: `Preparation of this write was cut off ${info.attempts} time(s) at its deadline${where}, the limit of persistence.max_preparation_attempts (${info.limit}); it is not claimed again. ${fix}`,
+    detail: { origin: 'preparation_stall', step: info.step, waiting_on: info.waiting_on, attempts: info.attempts, limit: info.limit } as unknown as PublicationFailureDetail };
+}
+/**
+ * #6278: finishes a claimed request `failed`/`preparation_stalled`: at claim
+ * when its counter is already at the limit, or at the release that would
+ * bring it there (`charge`, which counts that attempt first). Token-fenced
+ * like every completion.
+ */
+export async function finishPreparationStalled(engine: BrainEngine, row: WriteRequest, info: Omit<PreparationStallInfo, 'attempts'>, charge: boolean): Promise<WriteRequest> {
+  const attempts = charge ? await chargePreparationAttempt(engine, row) : row.preparation_attempts ?? info.limit;
+  const failure = withAttempt(preparationStalledFailure(row, { ...info, attempts }), 'preparation');
+  return engine.transaction(tx => completeWrite(tx, row, 'failed', {}, failure));
+}
+
 export async function finishUnpublishedFailure(engine: BrainEngine, row: WriteRequest, error: unknown,
   stage: PublicationStage = 'publication'): Promise<WriteRequest> {
   const failure = withAttempt(requestError(error), stage);
@@ -163,6 +227,29 @@ export function decoratePublicationOutcome(row: WriteRequest, prepared: Prepared
  * The root lock spans all file effects; the DB guards span authorization and
  * publication. A rejected/ambiguous commit is recovered before releasing FIFO.
  */
+/**
+ * The recovery record of one page file publication (its before bytes, hashes,
+ * mode and reserved staging names) and the recovery bytes it reserves. Read
+ * while holding the worktree's native lock, before any file is touched.
+ */
+export function pageRecoveryRecord(row: WriteRequest, file: PageMutationFile, binding: WorktreeBinding): { record: FileRecoveryRecord; bytes: number } {
+  const before = existsSync(file.path) ? readFileSync(file.path) : null;
+  const record: FileRecoveryRecord = {
+    version: 1, path: file.path, root: file.root,
+    before: before?.toString('base64') ?? null, beforeHash: before ? sha256(before) : null,
+    afterHash: file.content === null ? null : sha256(file.content),
+    mode: before ? statSync(file.path).mode & 0o7777 : null,
+    ownerEpoch: String(binding.owner_epoch), attempt: row.execution_token!,
+    staging: {
+      ...(file.content === null ? {} : { publication: recoveryStagingFile(file.path, file.content) }),
+      ...(before === null ? {} : { restoration: recoveryStagingFile(file.path, before) }),
+    },
+  };
+  const nextBytes = file.content === null ? 0 : typeof file.content === 'string' ? Buffer.byteLength(file.content) : file.content.byteLength;
+  const beforeBytes = before?.byteLength ?? 0;
+  return { record, bytes: Math.max(beforeBytes * 3 + nextBytes * 2, Buffer.byteLength(JSON.stringify(record)) + beforeBytes + nextBytes) + 4096 };
+}
+
 export async function publishMutation(engine: BrainEngine, row: WriteRequest, prepared: PreparedMutation,
   hostId = localHostId(), callerHooks: PublicationHooks = {}): Promise<WriteRequest> {
   const hooks = withFaultPoints(callerHooks);
@@ -188,7 +275,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         await releaseUnpublishedClaim(engine, row, 'owner_unavailable');
         return (await getWriteRequestById(engine, row.id))!;
       }
-      lock = await acquireWorktree(binding, 0, undefined, engine);
+      lock = await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
       if (!lock) {
         await releaseUnpublishedClaim(engine, row, 'writer_busy');
         return (await getWriteRequestById(engine, row.id))!;
@@ -231,18 +318,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       if (!binding || !lock || !isWriteTargetContained(prepared.file.path, prepared.file.root)) throw opError('storage_error', 'Filesystem publication requires a confined canonical owner.',
         `This host does not hold source ${row.source_id}'s canonical worktree, or the file of ${row.slug} resolves outside it, so request ${row.request_id} wrote no file. Inspect the owner; the write publishes only on the host that owns the source.`,
         { fix: ownerStatusFix(row.source_id) });
-      const before = existsSync(prepared.file.path) ? readFileSync(prepared.file.path) : null;
-      const record: RecoveryRecord = {
-        version: 1, path: prepared.file.path, root: prepared.file.root,
-        before: before?.toString('base64') ?? null, beforeHash: before ? sha256(before) : null,
-        afterHash: prepared.file.content === null ? null : sha256(prepared.file.content),
-        mode: before ? statSync(prepared.file.path).mode & 0o7777 : null,
-        ownerEpoch: String(binding.owner_epoch), attempt: row.execution_token!,
-        staging: {
-          ...(prepared.file.content === null ? {} : { publication: recoveryStagingFile(prepared.file.path, prepared.file.content) }),
-          ...(before === null ? {} : { restoration: recoveryStagingFile(prepared.file.path, before) }),
-        },
-      };
+      const { record, bytes } = pageRecoveryRecord(row, prepared.file, binding);
       if (prepared.file.expectedBeforeHash !== undefined && record.beforeHash !== prepared.file.expectedBeforeHash) {
         // A coordinated writer (a withdrawal mirror) also advanced the page:
         // reprepare against it. Bytes changed at an unchanged revision are an
@@ -253,23 +329,20 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         }
         throw localEditRefusal('The canonical file changed after preparation.', row, skill, 'after the write was prepared, at an unchanged page revision');
       }
-      const nextBytes = prepared.file.content === null ? 0 : typeof prepared.file.content === 'string'
-        ? Buffer.byteLength(prepared.file.content) : prepared.file.content.byteLength;
-      const beforeBytes = before?.byteLength ?? 0;
-      await prepareRecovery(engine, row, record, Math.max(beforeBytes * 3 + nextBytes * 2,
-        Buffer.byteLength(JSON.stringify(record)) + beforeBytes + nextBytes) + 4096);
+      await prepareRecovery(engine, row, record, bytes);
       recovery = record;
       await hooks.boundary?.('prepared', row);
     }
     const done = await engine.transaction(async tx => {
-      await declarePersistenceProtocol(tx);
-      await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)");
+      await declareDurablePersistence(tx);
       const liveBinding = await guardOwnership(tx, row, hostId);
-      if (prepared.sourceExclusive) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
+      if (prepared.sourceExclusive && !prepared.exclusiveSources?.length) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
+      if (prepared.exclusiveSources?.length) await lockCoreSources(tx, prepared.sourceExclusive ? [row.source_id, ...prepared.exclusiveSources] : prepared.exclusiveSources);
       if (binding && String(liveBinding?.owner_epoch) !== String(binding.owner_epoch)) throw opError('owner_unavailable', 'Owner epoch changed before publication.',
         `Source ${row.source_id}'s canonical owner changed (a transfer or re-claim) after request ${row.request_id} was prepared, so this host published nothing for it. Inspect the owner and the request before resubmitting; do not claim or transfer the source to push this write through.`,
         { fix: ownerStatusFix(row.source_id) });
-      await authorizeStoredRequest(tx, row, true);
+      // A page target's visibility is checked below, once its page is locked.
+      await authorizeStoredRequest(tx, row, true, { pageVisibility: skill });
       await lockCounters(tx, ['brain', principalKey(requestPrincipal(row)), ...(row.worktree_id ? [`worktree:${row.worktree_id}`] : [])]);
       const [current] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [row.id]);
       if (!current || current.execution_token !== row.execution_token || current.state !== 'running') throw opError('write_claim_lost', 'Execution claim changed before publication.',
@@ -322,6 +395,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
+      await recordPublicationFenceTrend(tx, row, outcome);
       await queuePublicationEffects(tx, row, final, outcome, prepared);
       await hooks.boundary?.('before_commit', row);
       const committed = await completeWrite(tx, current, 'committed', outcome, undefined, current);
@@ -329,7 +403,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       return committed;
     });
     await hooks.boundary?.('after_commit', done);
-    if (recovery) await clearResolvedRecovery(engine, row.id);
+    if (recovery) await clearResolvedRecovery(engine, row.id, done);
     return done;
   } catch (error) {
     if (recovery) {
@@ -367,7 +441,7 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
   if (!binding || binding.owner_host_id !== hostId) throw opError('owner_unavailable', 'Recovery requires the canonical owner.',
     `Request ${row.request_id} in source ${row.source_id} holds a publication recovery record that only the host owning the source's canonical worktree can finish, and this host does not own it. Inspect the owner; its resident writer finishes the recovery.`,
     { fix: ownerStatusFix(row.source_id) });
-  const lock = alreadyLocked ? null : await acquireWorktree(binding, 0, undefined, engine);
+  const lock = alreadyLocked ? null : await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
   if (!alreadyLocked && !lock) return row;
   const releaseCapacity = capacityAlreadyHeld ? null : tryAcquirePublicationCapacity(engine);
   try {
@@ -376,10 +450,9 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
         WHERE id=$1::uuid AND recovery IS NOT NULL AND state IN ('running','recovering') AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING *`, [id]);
       return blocked ?? row;
     }
-    if (row.recovery.version === 1 && !row.recovery.staging && !isTerminal(row)) await upgradeRecoveryStaging(engine, 'persistence_requests', id, row.worktree_id!, 'restore');
+    if (!isTerminal(row)) await upgradeRecoveryStaging(engine, 'persistence_requests', id, row.worktree_id!, 'restore');
     row = await engine.transaction(async tx => {
-      await declarePersistenceProtocol(tx);
-      await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)");
+      await declareDurablePersistence(tx);
       await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [row!.worktree_id]);
       await lockCounters(tx, ['brain', principalKey(requestPrincipal(row!)), `worktree:${row!.worktree_id}`]);
       const [current] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [id]);

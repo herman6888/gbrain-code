@@ -447,7 +447,7 @@ export type GraduationErrorCode = typeof GRADUATION_ERROR_CODES[number];
 /**
  * Custody boundaries, in run order, that the orchestrator announces with
  * `graduationBoundary(name)` right after the step's durable write commits.
- * The crash suite (test/e2e/graduation-crash.test.ts) SIGKILLs the real CLI
+ * The crash suite (test/e2e/graduation-crash-*.test.ts) SIGKILLs the real CLI
  * at each one, and the zero-mutation suite pauses there to poll --status.
  * `table_copied` fires after each table's copy transaction commits and
  * `batch_copied` after each committed batch inside a table, both with

@@ -73,9 +73,10 @@ distinct_from:
   - name: skillify
     reason: "skillify is the meta-skill for turning a feature into a tested skill. EIIRP calls skillify when Phase 5 identifies a reusable pattern."
   - name: signal-detector
-    reason: "signal-detector ambiently captures the USER's ideas + entity mentions on every inbound message. EIIRP's auto-fire gate files the AGENT's own deliverable analysis at reply time. Both are always-on; they watch opposite directions of the conversation."
+    reason: "signal-detector (after explicit automatic-capture opt-in) ambiently captures the USER's ideas + entity mentions on every inbound message. EIIRP's auto-fire gate files the AGENT's own deliverable analysis at reply time. signal-detector runs only after the user's explicit automatic-capture opt-in; EIIRP's gate is always-on. They watch opposite directions of the conversation."
   - name: meeting-ingestion
     reason: "meeting-ingestion (like idea-ingest, media-ingest, voice-note-ingest, book-mirror) is a dedicated pipeline with its own brain-write logic. The auto-fire gate EXEMPTS dedicated-pipeline content — it never double-files."
+when_to_use: "Use when the user asks: \"everything in its right place\", \"eiirp\", \"store this research\", \"put this in the brain\", \"file this properly\"."
 ---
 
 # EIIRP — Everything In Its Right Place
@@ -458,7 +459,7 @@ reads it; doctor cross-references the pack version).
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - A schema change (`gbrain schema add-type`, `gbrain schema use`) needs the user's confirmation; present it and stop if they decline.
 - `gbrain schema suggest` runs heuristic-only without an API key: say the suggestions are heuristic, not LLM-refined.
@@ -538,12 +539,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
   plus undeclared types, the same classification as `schema lint
   --with-db`); over MCP, `run_doctor`'s schema_pack_consistency check
   carries the same verdict.
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

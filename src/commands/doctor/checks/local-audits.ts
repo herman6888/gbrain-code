@@ -8,6 +8,8 @@
  */
 
 import { applyExtractAtomsNoPricing, readExtractAtomsNoPricing } from '../../../core/cycle/extract-atoms-cost-gate.ts';
+import { applyFactsReconcileBacklog, readFactsReconcileBacklog } from '../../../core/facts/reconcile-watermark.ts';
+import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
 import { join } from 'path';
 import { gbrainPath } from '../../../core/config.ts';
 import { multiSourceDriftCheck, multiSourceDriftNotVerified } from '../schema-pack-checks.ts';
@@ -200,6 +202,12 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
       // expected limit in the rollup, not a halt; the overlay names the fix.
       const check = await computeExtractHealthCheck(engine);
       applyExtractAtomsNoPricing(check, await readExtractAtomsNoPricing(engine).catch(() => []));
+      // #5151: unmanaged brains reconcile fences in the cycle, so fence pages
+      // behind their facts watermark are facts not indexed yet.
+      if (!await managedPersistenceEnabled(engine).catch(() => true)) {
+        const backlog = await readFactsReconcileBacklog(engine).catch(() => null);
+        if (backlog) applyFactsReconcileBacklog(check, backlog);
+      }
       checks.push(check);
     } catch {
       // Best-effort; rollup-table missing on pre-v106 brains is normal
@@ -453,7 +461,7 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
           fix: {
             argv: ['rm', '-rf', copy.path], consent: ['destructive'], actor: 'agent', requires_exclusive: false,
             verify: { argv: ['gbrain', 'doctor', '--only', 'pglite_leftovers', '--json'] }, docs: 'docs/guides/move-to-postgres.md#after-the-move',
-            why: `${copy.path} is the PGLite brain engine graduation moved to Postgres; it still holds private memory and token hashes. Deleting it frees the disk and ends the option to roll back.`,
+            why: `${copy.path} is the PGLite brain engine graduation moved to Postgres; it still holds private memory and token hashes. Deleting it frees the disk and ends the option to roll back: afterwards a rollback to PGLite refuses with not_found and the brain stays on Postgres.`,
             user_message: `After moving your brain to Postgres, gbrain kept the old local copy at ${copy.path}. It still contains your private memory and access-token hashes. Should I delete it? You could then no longer roll back to it.`,
           },
         } : {}),
@@ -528,7 +536,7 @@ async function runDefaultSourcePath(ctx: DoctorContext): Promise<Check[]> {
         engine!,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
       );
-      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'local'));
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'local', await managedPersistenceEnabled(engine!).catch(() => false)));
     }
   } catch (e) {
     // A broken sources table must not stop doctor, but the check still

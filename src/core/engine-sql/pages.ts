@@ -14,13 +14,15 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import type { DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow } from '../types.ts';
-import type { Page, PageInput, PageFilters, PageVersion, StalePageRow } from '../types.ts';
+import type { Page, PageInput, PageFilters, StalePageRow } from '../types.ts';
+import type { GetVersionsOpts, PageVersionRows } from '../page-state/version-types.ts';
 import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
+import { quarantineFilterFragment } from '../quarantine.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
@@ -28,6 +30,7 @@ import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
 import type { ScopedReadRunner } from './cjk-search.ts';
 import { compileRowNormalizer } from './normalize.ts';
 import { renderFragment, sqlFragment, trustedSql } from './fragment.ts';
+import { quoteIdentifier, resolveWriteColumnFromConfigRows } from '../search/embedding-column.ts';
 
 /**
  * PGLite can return zero rows from `INSERT ... ON CONFLICT DO UPDATE ...
@@ -116,10 +119,17 @@ export async function putPage(
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
+    // #5984: the contextual retrieval stamp, when the caller passes it, rides in this statement.
+    const cr = opts?.contextualRetrieval && opts.contextualRetrieval.mode !== 'none' ? opts.contextualRetrieval : null;
+    const crColumns = cr ? sqlFragment`, contextual_retrieval_mode, corpus_generation` : sqlFragment``;
+    const crValues = cr ? sqlFragment`, ${cr.mode}, ${cr.corpusGeneration}` : sqlFragment``;
+    const crSet = cr ? sqlFragment`
+        contextual_retrieval_mode = EXCLUDED.contextual_retrieval_mode,
+        corpus_generation     = EXCLUDED.corpus_generation,` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${jsonbParam(frontmatter)}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, ${chunkerVersion}::smallint, ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
-      ON CONFLICT (source_id, slug) DO UPDATE SET
+      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at${crColumns})
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${jsonbParam(frontmatter)}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, ${chunkerVersion}::smallint, ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt}${crValues})
+      ON CONFLICT (source_id, slug) DO UPDATE SET${crSet}
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
         title = EXCLUDED.title,
@@ -240,7 +250,7 @@ export async function restorePage(exec: SqlExecutor, slug: string, opts?: { sour
     const sourceId = opts?.sourceId;
     const sourceCondition = sourceId ? sqlFragment`AND source_id = ${sourceId}` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      UPDATE pages SET deleted_at = NULL
+      UPDATE pages SET deleted_at = NULL, updated_at = now()
       WHERE slug = ${slug} AND deleted_at IS NOT NULL ${sourceCondition}
       RETURNING slug
     `);
@@ -314,6 +324,35 @@ export async function updatePageContextualRetrievalState(
   mode: string,
   corpusGeneration: string | null,
 ): Promise<void> {
+    if (mode === 'none') {
+      const { rows: config } = await exec.run<{ key: string; value: string }>(sqlFragment`
+        SELECT key,value FROM config WHERE key IN ('search_embedding_column','embedding_columns')`);
+      const column = resolveWriteColumnFromConfigRows({
+        searchEmbeddingColumn: config.find(row => row.key === 'search_embedding_column')?.value ?? null,
+        embeddingColumnsJson: config.find(row => row.key === 'embedding_columns')?.value ?? null,
+      });
+      const vector = trustedSql(quoteIdentifier(column.name));
+      await exec.run(sqlFragment`
+        WITH previous AS MATERIALIZED (
+          SELECT id, contextual_retrieval_mode AS old_mode,
+            COALESCE(frontmatter, '{}'::jsonb) ? 'embed_skip' AS skipped
+          FROM pages WHERE source_id=${sourceId} AND slug=${slug} AND deleted_at IS NULL
+          FOR UPDATE
+        ), changed AS (
+          UPDATE pages p SET contextual_retrieval_mode=${mode}, corpus_generation=${corpusGeneration},
+            updated_at=now(), embedding_signature=CASE
+              WHEN previous.old_mode IN ('title','per_chunk_synopsis') AND NOT previous.skipped
+              THEN NULL ELSE p.embedding_signature END
+          FROM previous WHERE p.id=previous.id
+          RETURNING p.id, previous.old_mode, previous.skipped
+        )
+        UPDATE content_chunks cc SET ${vector}=NULL, embedded_at=NULL,
+          embedded_text_hash=NULL, embedding_input_hash=NULL, embedding_pending_since=now()
+        FROM changed WHERE cc.page_id=changed.id
+          AND changed.old_mode IN ('title','per_chunk_synopsis') AND NOT changed.skipped
+          AND cc.${vector} IS NOT NULL`);
+      return;
+    }
     // Narrow UPDATE — bumps updated_at as a side effect so the autopilot
     // sweep doesn't think the page hasn't changed since last touch. Skips
     // soft-deleted rows. corpus_generation nullable (caller passes NULL
@@ -343,9 +382,13 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       // Exact only when the cursor carries the column's microseconds: callers
       // resume from `Page.updated_at_iso` (projected below), never from a JS
       // Date, which would re-select every row in the last row's millisecond.
-      ? sqlFragment`AND (p.updated_at > ${keyset.updatedAt}::timestamptz OR (p.updated_at = ${keyset.updatedAt}::timestamptz AND p.slug > ${keyset.slug}))`
+      // `::text::timestamptz`: a bare `::timestamptz` param is typed by the
+      // postgres.js driver, which serializes strings through a JS Date and
+      // truncates the cursor to milliseconds (re-selecting the whole
+      // millisecond; a >limit cluster inside one millisecond never drains).
+      ? sqlFragment`AND (p.updated_at > ${keyset.updatedAt}::text::timestamptz OR (p.updated_at = ${keyset.updatedAt}::text::timestamptz AND p.slug > ${keyset.slug}))`
       : updatedAfter
-        ? sqlFragment`AND p.updated_at > ${updatedAfter}::timestamptz`
+        ? sqlFragment`AND p.updated_at > ${updatedAfter}::text::timestamptz`
         : sqlFragment``;
     // slugPrefix uses the (source_id, slug) UNIQUE btree index for range scans.
     // Escape LIKE metacharacters so the user prefix is treated as a literal.
@@ -465,10 +508,11 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
           p.source_id,
           p.title,
           p.compiled_truth,
-          p.last_retrieved_at,
+          GREATEST(p.last_retrieved_at, r.last_retrieved_at) AS last_retrieved_at,
           substring(p.slug from '^[^/]+/[^/]+') AS prefix,
           COUNT(pl.id) AS connection_count
         FROM pages p
+        LEFT JOIN page_retrievals r ON r.page_id = p.id
         LEFT JOIN page_links pl ON pl.to_page_id = p.id
         WHERE p.deleted_at IS NULL
           AND substring(p.slug from '^[^/]+/[^/]+') = ANY(${opts.prefixes}::text[])
@@ -478,7 +522,7 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
             OR (${sourceIds}::text[] IS NULL AND ${sourceId}::text IS NOT NULL AND p.source_id = ${sourceId})
             OR (${sourceIds}::text[] IS NULL AND ${sourceId}::text IS NULL)
           )
-        GROUP BY p.id, p.slug, p.source_id, p.title, p.compiled_truth, p.last_retrieved_at
+        GROUP BY p.id, p.slug, p.source_id, p.title, p.compiled_truth, p.last_retrieved_at, r.last_retrieved_at
       ),
       ranked AS (
         SELECT
@@ -551,10 +595,11 @@ export async function listCorpusSample(scoped: ScopedReadRunner, opts: CorpusSam
           p.source_id,
           p.title,
           p.compiled_truth,
-          p.last_retrieved_at,
+          GREATEST(p.last_retrieved_at, r.last_retrieved_at) AS last_retrieved_at,
           substring(p.slug from '^[^/]+/[^/]+') AS prefix,
           (SELECT COUNT(*) FROM page_links pl WHERE pl.to_page_id = p.id) AS connection_count
         FROM pages p
+        LEFT JOIN page_retrievals r ON r.page_id = p.id
         WHERE p.deleted_at IS NULL
           AND (cardinality(${exclude}::text[]) = 0 OR NOT (p.slug = ANY(${exclude}::text[])))
           AND (
@@ -616,6 +661,19 @@ export async function resolveSlugs(
 // ── v0.42.7 (#1696): link/timeline extraction freshness watermark ──
 
 /**
+ * Origins of wanted links whose target now exists: a live page with the wanted
+ * slug (or, for a bare-name reference, the wanted basename) updated after the
+ * origin last resolved it. Their next extraction creates the edge
+ * (src/core/wanted-links.ts).
+ */
+const WANTED_ORIGIN_IS_STALE = sqlFragment`id IN (SELECT w.origin_page_id FROM wanted_links w
+      JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL
+      WHERE t.updated_at > w.checked_at
+    UNION SELECT w.origin_page_id FROM wanted_links w
+      JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL
+      WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)`;
+
+/**
  * Shared stale-for-extraction predicate. `attendance` narrows it by the #5761
  * marker: a page is attendance-blocked while its marker equals its current
  * knowledge revision. Extraction itself never passes it, so it keeps
@@ -623,13 +681,14 @@ export async function resolveSlugs(
  */
 function stalePagesWhere(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }) {
   const version = opts?.versionTs
-    ? sqlFragment`(links_extracted_at IS NULL OR links_extracted_at < ${opts.versionTs}::timestamptz OR updated_at > links_extracted_at)`
-    : sqlFragment`(links_extracted_at IS NULL OR updated_at > links_extracted_at)`;
+    ? sqlFragment`(links_extracted_at IS NULL OR links_extracted_at < ${opts.versionTs}::timestamptz OR updated_at > links_extracted_at OR ${WANTED_ORIGIN_IS_STALE})`
+    : sqlFragment`(links_extracted_at IS NULL OR updated_at > links_extracted_at OR ${WANTED_ORIGIN_IS_STALE})`;
   const source = opts?.sourceId ? sqlFragment` AND source_id = ${opts.sourceId}` : sqlFragment``;
   const attendance = opts?.attendance === 'exclude'
     ? sqlFragment` AND links_attendance_blocked_revision IS DISTINCT FROM knowledge_revision`
     : opts?.attendance === 'blocked' ? sqlFragment` AND links_attendance_blocked_revision = knowledge_revision` : sqlFragment``;
-  return sqlFragment`deleted_at IS NULL AND ${version}${source}${attendance}`;
+  // A quarantined page is hidden from search; it is neither re-extracted nor counted as stale.
+  return sqlFragment`deleted_at IS NULL AND ${trustedSql(quarantineFilterFragment('pages'))} AND ${version}${source}${attendance}`;
 }
 
 export async function countStalePagesForExtraction(exec: ScopedRead, opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }): Promise<number> {
@@ -768,42 +827,35 @@ export async function getPageTimestamps(exec: LegacyUnscopedRead, slugs: string[
  */
 const PAGE_VERSION_COLUMNS = trustedSql('pv.id, pv.page_id, pv.compiled_truth, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
   + 'pv.timeline, pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
+const PAGE_VERSION_METADATA_COLUMNS = trustedSql('pv.id, pv.page_id, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
+  + 'pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
 
-export async function getVersions(
+/**
+ * Newest first (`pv.id` breaks snapshot_at ties). Scope and privacy
+ * predicates sit in WHERE, so `limit` bounds only rows the caller may read;
+ * `includeBody: false` never selects the body columns.
+ */
+export async function getVersions<B extends boolean = true>(
   exec: LegacyUnscopedRead,
   slug: string,
-  opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean },
-): Promise<PageVersion[]> {
+  opts?: GetVersionsOpts<B>,
+): Promise<PageVersionRows<B>> {
     const privacy = opts?.excludePrivate
       ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}`) : sqlFragment``;
-    if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
-        JOIN pages p ON p.id = pv.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
-          ${privacy}
-        ORDER BY pv.snapshot_at DESC
-      `);
-      return rows;
-    }
-    if (opts?.sourceId) {
-      const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
-        JOIN pages p ON p.id = pv.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ${opts.sourceId}
-          ${privacy}
-        ORDER BY pv.snapshot_at DESC
-      `);
-      return rows;
-    }
-    const { rows } = await exec.run<PageVersion>(sqlFragment`
-      SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
+    const scope = opts?.sourceIds && opts.sourceIds.length > 0
+      ? sqlFragment`AND p.source_id = ANY(${opts.sourceIds}::text[])`
+      : opts?.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
+    const columns = opts?.includeBody === false ? PAGE_VERSION_METADATA_COLUMNS : PAGE_VERSION_COLUMNS;
+    const limit = opts?.limit !== undefined ? sqlFragment`LIMIT ${opts.limit}` : sqlFragment``;
+    const { rows } = await exec.run(sqlFragment`
+      SELECT ${columns} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
-      WHERE p.slug = ${slug}
+      WHERE p.slug = ${slug} ${scope}
         ${privacy}
-      ORDER BY pv.snapshot_at DESC
+      ORDER BY pv.snapshot_at DESC, pv.id DESC
+      ${limit}
     `);
-    return rows;
+    return rows as PageVersionRows<B>;
   }
 
 export async function revertToVersion(
@@ -859,7 +911,11 @@ export async function updateSlug(exec: SqlExecutor, tx: BrainEngine, oldSlug: st
       return moved.length;
   }
 
-/** Replace a page's alias set under its page-key lock, inside the engine's transaction. */
+/**
+ * Replace a page's frontmatter alias set under its page-key lock, inside the
+ * engine's transaction. Derived rows (`origin` declared/subject, written by
+ * the mention pass) are left alone.
+ */
 export async function setPageAliases(
   exec: SqlExecutor,
   tx: Pick<BrainEngine, 'lockPageKeys'>,
@@ -869,7 +925,7 @@ export async function setPageAliases(
 ): Promise<void> {
     const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
       await tx.lockPageKeys([{ sourceId, slug }]);
-      await exec.executeRaw('DELETE FROM page_aliases WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
+      await exec.executeRaw("DELETE FROM page_aliases WHERE source_id=$1 AND slug=$2 AND origin='frontmatter'", [sourceId, slug]);
       if (!uniq.length) return;
       await exec.executeRaw(`INSERT INTO page_aliases (source_id,alias_norm,slug)
         SELECT $1,a,$2 FROM unnest($3::text[]) AS a ON CONFLICT DO NOTHING`, [sourceId, slug, uniq]);

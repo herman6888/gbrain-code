@@ -4,8 +4,8 @@
  *
  * Protects: who wrote each page_versions row, live page revision, fact, take
  * and timeline row (created_by and last_mutated_by), on a managed brain, for
- * journaled requests (OAuth client, legacy token, local CLI) and for
- * coordinated maintenance with no request. Fails if the coordinator stops
+ * journaled requests (OAuth client, legacy token, local CLI), for receipted
+ * maintenance requests and for coordinated maintenance with no request. Fails if the coordinator stops
  * passing its request to withCoordinatedWrite, if a trigger is missing or
  * misclassifies a column, or if the managed guard refuses an attribution-only
  * update. Runs on PGLite, and on Postgres (direct and transaction-mode
@@ -26,11 +26,13 @@ import { localHostId, registerLocalWriter, readLocalWriter } from '../src/core/p
 import { getWriteRequest } from '../src/core/persistence/journal.ts';
 import { submitRememberMutation, submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { replaceDerivedFactsForPage } from '../src/core/persistence/derived-facts.ts';
+import { maintenancePreflight } from '../src/core/persistence/prepared-maintenance.ts';
+import { buildConversationPage, conversationGeneration, submitConversationPages } from '../src/core/facts/conversation-publication.ts';
+import { currentConversationVersionToken } from '../src/commands/extract-conversation-facts.ts';
 import type { Principal } from '../src/core/persistence/model.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { renderTakesFence } from '../src/core/takes-fence.ts';
-import { configureGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
@@ -60,6 +62,7 @@ beforeAll(async () => {
   }
 }, 120_000);
 afterAll(async () => {
+  resetGateway(); // R5: restore the preload baseline for later files in this shard
   for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
   await closePostgres?.();
   rmSync(home, { recursive: true, force: true });
@@ -71,8 +74,11 @@ interface Brain {
   principals: { oauth: Principal; token: Principal; local: Principal };
 }
 /** A managed brain with a database-only source and three principals that can write it. */
-async function managedBrain(engine: BrainEngine): Promise<Brain> {
+/** `embedding`: the supersession case needs fact vectors, so its brain must not opt out of embedding (no embedder call otherwise). */
+async function managedBrain(engine: BrainEngine, opts: { embedding?: boolean } = {}): Promise<Brain> {
   const sourceId = `attr-${randomUUID().slice(0, 8)}`;
+  // Each brain's consumer starts under this brain's config, not an earlier test's (the consumer keeps its first config).
+  await disposePersistenceConsumer(engine);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
   await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
   await registerLocalWriter(engine, 'cli'); await registerLocalWriter(engine, 'stdio');
@@ -86,7 +92,7 @@ async function managedBrain(engine: BrainEngine): Promise<Brain> {
     token: { kind: 'legacy_token', id: minted.id } as Principal,
     local: { kind: 'local_cli', id: (await readLocalWriter(engine, 'cli')).id } as Principal,
   };
-  const base = { engine, config: { engine: engine.kind, embedding_disabled: true }, sourceId, dryRun: false, logger: quiet };
+  const base = { engine, config: { engine: engine.kind, embedding_disabled: !opts.embedding }, sourceId, dryRun: false, logger: quiet };
   const [{ now }] = await engine.executeRaw<{ now: string }>('SELECT now()::text AS now');
   return {
     engine, sourceId, startedAt: now, principals,
@@ -191,7 +197,7 @@ describe('write attribution on a managed brain', () => {
   test('remember from two principals, duplicate remember and supersession keep created_by and move last_mutated_by', async () => {
     await withFixedEmbeddings(async () => {
       for (const engine of engines) {
-        const brain = await managedBrain(engine);
+        const brain = await managedBrain(engine, { embedding: true });
         await run(brain.local, 'put_page', { slug: 'people/alice-example', content: page('Alice', 'Profile') });
         await run(brain.local, 'put_page', { slug: 'people/charlie-example', content: page('Charlie', 'Profile') });
         const byOauth = await submitRememberMutation(brain.oauth, { fact: 'Prefers written updates', provenance: 'test', entity: 'people/alice-example', request_id: randomUUID() }, 30_000);
@@ -274,17 +280,22 @@ describe('write attribution on a managed brain', () => {
     }
   }, 120_000);
 
-  test('coordinated derived fact maintenance has no request and names the local writer', async () => {
+  test('conversation fact maintenance publishes under its own request and names the local writer', async () => {
     for (const engine of engines) {
       const brain = await managedBrain(engine);
       const slug = 'notes/derived-example';
       await run(brain.local, 'put_page', { slug, content: page('Derived', 'Conversation notes') });
-      await replaceDerivedFactsForPage(engine, brain.sourceId, slug, { sourcePrefix: 'cli:extract-conversation-facts', isCurrent: async () => true,
-        build: async () => [{ fact: 'Derived example claim', kind: 'fact', visibility: 'world', notability: 'medium',
-          source: 'cli:extract-conversation-facts:test', entity_slug: slug, row_num: 1, source_markdown_slug: slug }] as never });
+      const authority = (await maintenancePreflight(engine, brain.sourceId))!;
+      const current = (await engine.getPage(slug, { sourceId: brain.sourceId }))!;
+      const versionToken = await currentConversationVersionToken(engine, current);
+      const generation = await conversationGeneration(engine, authority, { slug, page: current, versionToken, since: null, segmentLimit: 0 });
+      const entry = await buildConversationPage(engine, brain.local.config, { slug, generation, attempt: 0, versionToken, since: null, segmentLimit: 0 },
+        [{ fact: 'Derived example claim', kind: 'fact', notability: 'medium', source: 'cli:extract-conversation-facts', entity_slug: slug, row_num: 0, source_markdown_slug: slug }],
+        { newestEnd: null, visibility: 'world' });
+      const receipt = await submitConversationPages(engine, authority, [entry]);
       const rows = await engine.executeRaw<RowActors>(`SELECT ${ROW_COLUMNS} FROM facts WHERE source_id=$1 AND fact='Derived example claim'`, [brain.sourceId]);
       expect(rows).toHaveLength(1);
-      expect(created(rows[0])).toEqual(actor(null, brain.principals.local));
+      expect(created(rows[0])).toEqual(actor(await requestRow(brain, brain.local, receipt), brain.principals.local));
     }
   }, 120_000);
 
@@ -352,10 +363,15 @@ describe('write attribution on a managed brain', () => {
         expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1', [sourceId])).toHaveLength(1);
         expect(await engine.executeRaw('SELECT id FROM takes WHERE page_id=$1', [alice.id])).toHaveLength(1);
         expect(await engine.executeRaw('SELECT id FROM timeline_entries WHERE page_id=$1', [alice.id])).toHaveLength(1);
+        // Facts and takes publish as receipted maintenance requests of the local writer (wave 9
+        // follow-ups, item 1); the timeline writer still runs as coordinated maintenance (TODO).
         const maintenance = actor(null, brain.principals.local);
-        for (const [table, where, key] of [['facts', 'source_id=$1', sourceId], ['takes', 'page_id=$1', alice.id], ['timeline_entries', 'page_id=$1', alice.id]] as const) {
+        const receipted = { request: true, kind: brain.principals.local.kind, id: brain.principals.local.id };
+        for (const [table, where, key, expected] of [['facts', 'source_id=$1', sourceId, receipted], ['takes', 'page_id=$1', alice.id, receipted],
+          ['timeline_entries', 'page_id=$1', alice.id, maintenance]] as const) {
           const rows = await engine.executeRaw<RowActors>(`SELECT ${ROW_COLUMNS} FROM ${table} WHERE ${where}`, [key]);
-          expect({ table, created: rows.map(created) }).toEqual({ table, created: [maintenance] });
+          const actors = rows.map(created).map(a => expected === receipted ? { ...a, request: a.request !== null } : a);
+          expect({ table, created: actors }).toEqual({ table, created: [expected] });
         }
 
         const remembered = await submitRememberMutation(ctx, { fact: 'Leads the design review', provenance: 'test', entity: 'people/charlie-example', request_id: randomUUID() }, 30_000);

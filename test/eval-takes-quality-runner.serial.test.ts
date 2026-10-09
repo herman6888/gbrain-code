@@ -211,6 +211,20 @@ describe('runner — budget cap (codex review #4)', () => {
     // the cycle ran, not the verdict.
     expect(r.receipt.cycles_run).toBe(1);
   });
+
+  test('a model that cannot turn thinking off is projected at the output cap its call sends (W9F item 5)', async () => {
+    // openai:gpt-5 ($5/$20) keeps a `minimal` reasoning floor under thinking
+    // off, so chat() sends the 32000-token headroom cap, not 2000. Projected:
+    // 2000-token pricing = $0.065 (fits $0.30), 32000-token = $0.665 (does not).
+    chatHandler = async (_opts) => {
+      throw new Error('chat should not be called when the projection exceeds the cap');
+    };
+
+    const r = await runEval(engine, { limit: 5, cycles: 1, models: ['openai:gpt-5'], budgetUsd: 0.30 });
+
+    expect(r.budgetAborted).toBe(true);
+    expect(r.receipt.cycles_run).toBe(0);
+  });
 });
 
 describe('runner — pricing gate (new models must run)', () => {
@@ -272,5 +286,99 @@ describe('runner — pricing gate (new models must run)', () => {
     } finally {
       await engine.setConfig('pricing.overrides', '');
     }
+  });
+});
+
+describe('runner — malformed-slot correction pass (#5325, protocol 2)', () => {
+  const PANEL = ['openai:gpt-5.2', 'anthropic:claude-opus-4-7'];
+  const reply = (text: string, outputTokens = 50) => ({
+    text, blocks: [], stopReason: 'end',
+    usage: { input_tokens: 100, output_tokens: outputTokens, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    model: 'stub', providerId: 'stub',
+  });
+  function missingAccuracy(): string {
+    const parsed = JSON.parse(fullScoreJson(8));
+    delete parsed.scores[RUBRIC_DIMENSIONS[0]];
+    return JSON.stringify(parsed);
+  }
+
+  test('a slot missing a dimension is re-asked once with the validator error and the run reaches a verdict', async () => {
+    const calls: Array<{ model: string; prompt: string; thinking?: string }> = [];
+    chatHandler = async (opts) => {
+      calls.push({ model: opts.model, prompt: opts.messages[0].content, thinking: opts.thinking });
+      const second = opts.model === PANEL[1];
+      const isCorrection = String(opts.messages[0].content).includes('failed validation');
+      return reply(second && !isCorrection ? missingAccuracy() : fullScoreJson(8));
+    };
+
+    const r = await runEval(engine, { limit: 5, cycles: 1, models: PANEL, budgetUsd: null });
+
+    expect(calls).toHaveLength(3);
+    expect(calls[2]!.model).toBe(PANEL[1]);
+    expect(calls[2]!.prompt).toContain(`incomplete_scores: missing dim(s) [${RUBRIC_DIMENSIONS[0]}]`);
+    expect(calls.every(c => c.thinking === 'off')).toBe(true);
+    expect(r.receipt.verdict).toBe('pass');
+    expect(r.receipt.successes_per_cycle).toEqual([2]);
+    expect(r.receipt.protocol_version).toBe(2);
+    expect(r.receipt.correction_selection_rule).toBe('corrected_if_valid');
+    expect(r.receipt.corrections).toEqual([{
+      cycle: 0, modelId: PANEL[1], first_error: `incomplete_scores: missing dim(s) [${RUBRIC_DIMENSIONS[0]}]`, corrected: 'valid',
+    }]);
+  });
+
+  test('an empty reply (the output cap spent on reasoning) is a format failure and gets the correction', async () => {
+    let n = 0;
+    chatHandler = async (opts) => {
+      n++;
+      if (opts.model === PANEL[0] && n === 1) return { ...reply('', 2000), stopReason: 'length' };
+      return reply(fullScoreJson(8));
+    };
+
+    const r = await runEval(engine, { limit: 5, cycles: 1, models: PANEL, budgetUsd: null });
+
+    expect(r.receipt.corrections?.[0]).toMatchObject({ modelId: PANEL[0], corrected: 'valid' });
+    expect(r.receipt.corrections?.[0]!.first_error).toStartWith('parse_failed:');
+    expect(r.receipt.verdict).toBe('pass');
+  });
+
+  test('a correction that is still malformed keeps the first failure and records both', async () => {
+    chatHandler = async (opts) => reply(opts.model === PANEL[1] ? 'no json here' : fullScoreJson(8));
+
+    const r = await runEval(engine, { limit: 5, cycles: 1, models: PANEL, budgetUsd: null });
+
+    expect(r.receipt.verdict).toBe('inconclusive');
+    expect(r.receipt.corrections).toHaveLength(1);
+    expect(r.receipt.corrections![0]).toMatchObject({ corrected: 'invalid' });
+    expect(r.receipt.corrections![0]!.corrected_error).toStartWith('parse_failed:');
+    expect(r.receipt.errors?.[0]?.error).toBe(r.receipt.corrections![0]!.first_error);
+  });
+
+  test('valid low scores and provider errors are never re-asked', async () => {
+    const calls: string[] = [];
+    chatHandler = async (opts) => {
+      calls.push(opts.model);
+      if (opts.model === PANEL[1]) throw new Error('synthetic provider error');
+      return reply(fullScoreJson(3));
+    };
+
+    const r = await runEval(engine, { limit: 5, cycles: 1, models: PANEL, budgetUsd: null });
+
+    expect(calls).toEqual(PANEL);
+    expect(r.receipt.corrections).toBeUndefined();
+  });
+
+  test('a correction the budget cap cannot cover is not sent and is recorded with corrected: null', async () => {
+    const calls: string[] = [];
+    chatHandler = async (opts) => {
+      calls.push(opts.model);
+      return reply(opts.model === PANEL[1] ? missingAccuracy() : fullScoreJson(8), 60_000);
+    };
+
+    const r = await runEval(engine, { limit: 5, cycles: 1, models: PANEL, budgetUsd: 0.5 });
+
+    expect(calls).toEqual(PANEL);
+    expect(r.receipt.corrections).toEqual([{
+      cycle: 0, modelId: PANEL[1], first_error: `incomplete_scores: missing dim(s) [${RUBRIC_DIMENSIONS[0]}]`, corrected: null, skipped_reason: 'budget',
+    }]);
   });
 });

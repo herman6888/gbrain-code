@@ -50,6 +50,7 @@ tools:
   - get_job_progress
 mutating: true
 upstream: long-ops@fc834ee, subagent-deadman@fc834ee, pipeline-stage-cache@fc834ee
+when_to_use: "Use when the user asks: \"gbrain jobs submit\", \"submit a gbrain job\", \"submit a shell job\", \"shell job\", \"run shell command in background\"."
 ---
 
 # Minion Orchestrator
@@ -314,6 +315,19 @@ rung of this ladder the deployment supports**. This is a harness-routing
 convention the agent follows, not a mechanical guarantee — nothing stops a
 bare background shell except this skill saying don't.
 
+**Paid work gets consent before it is submitted.** A job runs without a
+terminal, so a paid command (`embed --stale`, or anything else that calls a
+model provider) stops with exit 3 and a consent payload unless it already
+carries the user's approval. Get that approval first, in the conversation:
+run the command's preview (for example `gbrain embed --stale --dry-run`),
+relay the estimate, and only after the user agrees put the approval in the
+submitted command (`gbrain embed --stale --yes --max-usd <cap>` with the cap
+they approved), or rely on a standing approval the user set with
+`gbrain config set consent.preapprove.paid.max_usd_per_run <usd>`. Never add
+`--yes` without the user's answer. When a job ends with exit 3 or the
+`confirmation_required` code, relay its message to the
+user and stop; don't resubmit it with `--yes`.
+
 ### Rung 1 — Minion job + deadman (Postgres + worker)
 
 Requires: Postgres engine, a running `gbrain jobs work` worker, and — for
@@ -504,7 +518,7 @@ Total tokens so far: 4.3k
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - `gbrain jobs submit` over MCP for a protected job returns `permission_denied`: it must run from the trusted local CLI on the brain host; tell the user.
 - A shell job dead-letters immediately with the flag named in `error_text` (shell jobs disabled): tell the user which env flag the host operator must set; do not retry.
@@ -539,19 +553,3 @@ Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) f
 - Get structured progress — `get_job_progress` (MCP)
 - Queue stats — `get_job_stats` (MCP; admin scope over HTTP, same as the other
   jobs ops here — includes the wedged-queue silent-halt signal) or `gbrain jobs stats` (CLI)
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `get_job` → `gbrain jobs get`
-- `get_job_progress` → `gbrain call get_job_progress <params_json>`
-- `list_jobs` → `gbrain jobs list`
-- `pause_job` → `gbrain call pause_job <params_json>`
-- `replay_job` → `gbrain call replay_job <params_json>`
-- `resume_job` → `gbrain call resume_job <params_json>`
-- `send_job_message` → `gbrain call send_job_message <params_json>`
-- `submit_job` → `gbrain jobs submit`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

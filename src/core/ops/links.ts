@@ -1,4 +1,5 @@
 import { coordinatedManualLinkWrite } from '../persistence/manual-links.ts';
+import { filterBacklinkRows, readBacklinkPage, wantsPagedBacklinks } from './backlinks-paged.ts';
 /**
  * Links + graph operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). MANAGED_LINK_SOURCES stays exported (test suite + operations.ts
@@ -11,7 +12,7 @@ import { coordinatedManualLinkWrite } from '../persistence/manual-links.ts';
 import { opError, type Operation } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { presentEdgeContext, resolveChainAnchors, runRelationalChain, validateChainHops, type ChainEvidenceEdge, type ChainPlan } from '../search/relational-chain.ts';
-import { paramUse, readFix } from './op-fix.ts';
+import { invalidParam, paramUse, readFix } from './op-fix.ts';
 import {
   assertExplicitSourceLive,
   enforceClientSlugFence,
@@ -22,7 +23,10 @@ import {
   reclassifyMutationTimePageMiss,
   requireWritablePage,
   sourceScopeOpts,
+  assertSourceInCallerScope,
 } from './context.ts';
+import { listWantedPages } from '../wanted-links-store.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { OperationContext } from './contract.ts';
 import type { Link, PageReadPolicy } from '../types.ts';
 import { ALL_SOURCES } from '../source-id.ts';
@@ -55,7 +59,7 @@ import {
  * never cleans (see src/schema.sql). `manual` is intentionally absent — it IS
  * the user-facing provenance and the default for omitted link_source.
  */
-export const MANAGED_LINK_SOURCES = ['markdown', 'frontmatter', 'mentions', 'wikilink-resolved'];
+export const MANAGED_LINK_SOURCES = ['markdown', 'frontmatter', 'mentions', 'wikilink-resolved', 'mcp-remote-mention'];
 
 /** add_link valid_from / valid_until: calendar dates on a dated relation type. Null when neither is given. */
 function validateLinkDates(ctx: OperationContext, p: Record<string, unknown>, linkType: string): { validFrom?: string; validUntil?: string } | null {
@@ -84,7 +88,7 @@ const add_link: Operation = {
   name: 'add_link',
   idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'Create a typed link (edge) from one page to another in the same source. Use when recording a relationship (works_at, invested_in, mentions). Needs write scope; an explicit link_type must be declared by the active schema pack. On page_not_found: resolve both slugs with resolve_slugs.',
+  description: 'Create a typed link (edge) from one page to another in the same source. Use when recording a relationship (works_at, invested_in, mentions); remote page writes already link [[wikilinks]] to existing pages as mentions (receipt auto_links), so add only typed links or ones the text lacks. Needs write scope; an explicit link_type must be declared by the active schema pack. On page_not_found: resolve both slugs with resolve_slugs.',
   params: {
     from: { type: 'string', required: true, description: "Slug of the page the link originates from (the edge renders on this page), e.g. 'people/alice-example'. These are page slugs — there is no `source`/`target` pair." },
     to: { type: 'string', required: true, description: "Slug of the page the link points to, e.g. 'companies/acme-example'." },
@@ -393,15 +397,24 @@ const get_backlinks: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'List links pointing to a page. Use when finding what mentions an entity.',
+  description: 'Links to a page; group:"page" pages by referrer, newest first.',
   params: {
     slug: { type: 'string', description: 'Page slug.', required: true },
     status: STARTER_STATUS_PARAM,
     as_of: STARTER_AS_OF_PARAM,
     source_id: LINK_SOURCE_ID_PARAM,
     all_sources: LINK_ALL_SOURCES_PARAM,
+    type: { type: 'string', description: 'Referrer type.' },
+    group: { type: 'string', enum: ['page'], description: 'Per page.' },
+    limit: { type: 'number', description: 'Max 500.' },
+    cursor: { type: 'string', description: 'Paging.' },
   },
-  handler: async (ctx, p) => readLinkEdges(ctx, p, 'get_backlinks', 'in'),
+  handler: async (ctx, p) => {
+    if (!wantsPagedBacklinks(p)) return readLinkEdges(ctx, p, 'get_backlinks', 'in');
+    if (p.group !== undefined) return readBacklinkPage(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy);
+    const links = await readLinkEdges(ctx, p, 'get_backlinks', 'in');
+    return filterBacklinkRows(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy, links);
+  },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },
 };
@@ -579,8 +592,53 @@ const traverse_graph: Operation = {
   cliHints: { name: 'graph', positional: ['slug'] },
 };
 
+const WANTED_DEFAULT_LIMIT = 50;
+const WANTED_MAX_LIMIT = 100;
+
+const wanted_pages: Operation = {
+  name: 'wanted_pages',
+  mutating: false,
+  writeInference: 'none',
+  idempotent: true,
+  outputRedaction: 'retrieval',
+  description: 'Link targets that have no page yet, most-referenced first: each was written as a link but its page does not exist, so no edge exists. Use to find entities worth a page (enrichment) or typo links to fix. The edge appears on its own once the page is created.',
+  params: {
+    source_id: { type: 'string', description: 'Only targets referenced from this source (must be inside your source grant).' },
+    limit: { type: 'number', description: `Rows per page (default ${WANTED_DEFAULT_LIMIT}, max ${WANTED_MAX_LIMIT}).` },
+    offset: { type: 'number', description: 'Skip the first N targets.' },
+    count_only: { type: 'boolean', description: 'Return the total with no rows.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const named = p.source_id === undefined ? undefined : String(p.source_id);
+    if (named !== undefined) assertSourceInCallerScope(ctx, named);
+    const policy = named !== undefined ? await readPolicyOpts(ctx, { sourceId: named }) : await readPolicyOpts(ctx);
+    const limit = p.limit === undefined ? WANTED_DEFAULT_LIMIT : Number(p.limit);
+    const offset = p.offset === undefined ? 0 : Number(p.offset);
+    const limitOk = Number.isInteger(limit) && limit >= 1 && limit <= WANTED_MAX_LIMIT;
+    if (!limitOk || !Number.isInteger(offset) || offset < 0) {
+      throw invalidParam(ctx, 'wanted_pages', limitOk ? 'offset' : 'limit',
+        `wanted_pages: limit must be 1-${WANTED_MAX_LIMIT} and offset a non-negative integer`,
+        limitOk ? { def: wanted_pages.params.offset, example: 0 } : { def: wanted_pages.params.limit, example: WANTED_DEFAULT_LIMIT });
+    }
+    const { total, rows } = await listWantedPages(ctx.engine, { sourceId: policy.sourceId, sourceIds: policy.sourceIds,
+      excludePrivate: policy.excludePrivate, privateFilter: privatePagesFilterFragment,
+      limit: p.count_only === true ? 1 : limit, offset });
+    const next = offset + limit < total ? offset + limit : null;
+    return {
+      total, limit, offset, next_offset: p.count_only === true ? null : next,
+      targets: p.count_only === true ? [] : rows.map(row => ({ ...row,
+        next: row.existing_matches.length
+          ? `A page with this name exists (${row.existing_matches[0].slug}); link it by its full slug, e.g. [[${row.existing_matches[0].slug}]].`
+          : `Create ${row.target} if it is a real entity (the ${row.referenced_by} linking page(s) gain the edge on the next extraction), or fix the link if it is a typo.` })),
+      ...(total === 0 ? { note: 'Every authored link resolves to an existing page.' } : {}),
+    };
+  },
+  cliHints: { name: 'wanted' },
+};
+
 
 // Ops in EXACTLY the canonical `operations` array order.
 export const linksOperations: Operation[] = [
-  add_link, remove_link, get_links, get_backlinks, list_link_sources, traverse_graph,
+  add_link, remove_link, get_links, get_backlinks, list_link_sources, traverse_graph, wanted_pages,
 ];

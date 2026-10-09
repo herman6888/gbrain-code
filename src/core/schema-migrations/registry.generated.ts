@@ -206,7 +206,26 @@ import { v202 } from './v202-legacy-token-grant-conversion.ts';
 import { v203 } from './v203-oauth-client-grant-axes.ts';
 import { v204 } from './v204-links-temporal-state.ts';
 import { v205 } from './v205-minion-spend-authorization.ts';
-import { v206 } from './v206-cjk-bigram-fts.ts';
+import { v206 } from './v206-entity-mention-index.ts';
+import { v207 } from './v207-retrieval-feedback.ts';
+import { v208 } from './v208-delta-per-arm-cursor.ts';
+import { v209 } from './v209-page-facts-reconcile.ts';
+import { v210 } from './v210-clamp-oauth-token-ttl.ts';
+import { v211 } from './v211-function-search-path.ts';
+import { v212 } from './v212-decide-review-proposals.ts';
+import { v213 } from './v213-core-edit-notices.ts';
+import { v214 } from './v214-wanted-links.ts';
+import { v215 } from './v215-facts-attributed-to.ts';
+import { v216 } from './v216-chronicle-campaign-stamps.ts';
+import { v217 } from './v217-persistence-request-claim-phase.ts';
+import { v218 } from './v218-purge-legacy-worktree-manifest-files.ts';
+import { v219 } from './v219-pages-reconcile-name-indexes.ts';
+import { v220 } from './v220-persistence-request-preparation-attempts.ts';
+import { v221 } from './v221-chunk-embedding-pending-since.ts';
+import { v222 } from './v222-persistence-consumers.ts';
+import { v223 } from './v223-persistence-serve-loop-indexes.ts';
+import { v224 } from './v224-page-retrievals.ts';
+import { v225 } from './v225-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -412,4 +431,23 @@ export const MIGRATIONS: Migration[] = [
   v204,
   v205,
   v206,
+  v207,
+  v208,
+  v209,
+  v210,
+  v211,
+  v212,
+  v213,
+  v214,
+  v215,
+  v216,
+  v217,
+  v218,
+  v219,
+  v220,
+  v221,
+  v222,
+  v223,
+  v224,
+  v225,
 ];

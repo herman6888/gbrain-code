@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { viewedEngine } from '../persistence/switches.ts';
 import { fileURLToPath } from 'node:url';
 import { OperationError } from '../ops/contract.ts';
 import { isRelativeFileUri, resolveSourceLocalFilePath } from '../markdown.ts';
@@ -28,11 +29,22 @@ function reject(): never {
 }
 
 const packsInTransaction = new WeakMap<object, Promise<PackRoot[]>>();
+/** Engines (the connection owner, not a transaction view of it) whose schema has shared_skill_packs; migrations never drop it. */
+const packTablePresent = new WeakSet<object>();
+function connectionOwner(engine: object): object {
+  let owner = viewedEngine(engine);
+  while (Object.hasOwn(owner, '_pageTransaction') && (owner as { _pageTransaction?: boolean })._pageTransaction === true) owner = Object.getPrototypeOf(owner);
+  return owner;
+}
 /** The shared skillpack roots; #5984: read once per transaction engine. */
 function sharedPacks(engine: SqlEngine): Promise<PackRoot[]> {
   const read = async () => {
-    const [schema] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present");
-    if (!schema?.present) return [];
+    const owner = connectionOwner(engine);
+    if (!packTablePresent.has(owner)) {
+      const [schema] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present");
+      if (!schema?.present) return [];
+      packTablePresent.add(owner);
+    }
     return engine.executeRaw<PackRoot>(`SELECT p.source_id,p.source_incarnation,s.local_path AS source_root,
       h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p
       JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation

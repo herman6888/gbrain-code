@@ -1,3 +1,4 @@
+import { searchAnswerFeedback } from '../feedback/record.ts';
 import type { RelationalPlanMeta } from '../search/relational-recall.ts';
 import type { Notice } from '../agent-output.ts';
 import { readHolders } from './context.ts';
@@ -28,7 +29,9 @@ import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { redactRetrievalOutput } from '../search/output-redaction.ts';
 import { projectRows, resultRowsFor } from '../search/lean-rows.ts';
-import { assembleEvidenceForHits, capDeliveredSnippets, deliverEvidence, effectivePlan, resolveEvidencePlan, unsupportedDelivery, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
+import { buildScoreDetails } from '../search/explain-formatter.ts';
+import { TargetTrace, diagnoseProbe, diagnoseTrace, probeTarget, type ExplainTargetDiagnosis } from '../search/explain-target.ts';
+import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, effectivePlan, resolveEvidencePlan, unsupportedDelivery, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
@@ -37,6 +40,7 @@ import { probeProjectionReadiness } from '../search/projection-readiness.ts';
 import { resolveBoostMap, resolveHardExcludes } from '../search/source-boost.ts';
 import { pageReadFilter } from '../search/read-policy-sql.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
+import { declaredNames, titleName } from '../mentions/aliases.ts';
 import { heldFilesNotice, stampHeldHits } from '../persistence/held-reads.ts';
 import { opError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
@@ -81,6 +85,8 @@ type SourceScope = { sourceId?: string; sourceIds?: string[] };
 function searchOutput(ctx: OperationContext, p: Record<string, unknown>, results: SearchResult[], meta: Record<string, unknown>, snippetCap: number,
   evidence?: { delivery: DeliveryMeta; explicitSnippet: boolean }): SearchResult[] {
   const rows = resultRowsFor(ctx, p.fields);
+  // `explain: true` — every row carries its score breakdown (kept in lean rows).
+  if (p.explain === true) for (const r of results) r.score_details = buildScoreDetails(r);
   // The shape is reported where it can vary: remote callers, or an explicit `fields`.
   const shown = ctx.remote !== false || p.fields !== undefined ? { rows } : {};
   if (!evidence) {
@@ -92,7 +98,9 @@ function searchOutput(ctx: OperationContext, p: Record<string, unknown>, results
   // otherwise the blocks are returned whole (their budget already bounds
   // them). The cap runs before the meta is emitted so it can report itself.
   const output = redactRetrievalOutput(results, { ...meta, delivery: evidence.delivery, ...shown });
-  const capped = evidence.explicitSnippet ? capDeliveredSnippets(output.results, snippetCap, output.meta.delivery) : output.results;
+  // An explicit budget's cap holds at this final boundary too (snippet
+  // markers and redaction recounted); without one both are no-ops.
+  const capped = evidence.explicitSnippet ? capDeliveredSnippets(output.results, snippetCap, output.meta.delivery) : capEvidenceToBudget(output.results, output.meta.delivery);
   ctx.emitResponseMeta?.('retrieval', output.meta);
   return projectRows(capped, rows);
 }
@@ -108,7 +116,7 @@ const FIELDS_PARAM = {
 const RETURN_UNIT_PARAM = {
   type: 'string' as const,
   enum: ['chunk', 'window', 'section', 'page', 'auto'],
-  description: "chunk, window, section, page or auto (default; whole page for conversations).",
+  description: 'auto (default) returns whole conversations.',
 };
 const RETURN_WINDOW_PARAM = {
   type: 'number' as const,
@@ -249,10 +257,6 @@ function indexOfName(text: string, word: string, wholeWord: boolean): number {
   return -1;
 }
 
-const ALIAS_DECLARATION = /\b(?:account code|also known as|a\.k\.a\.|aka|short name|ticker|code name)\b\s*[:(]?\s*["\u201c']?([A-Z0-9][A-Za-z0-9&.-]{1,24})/gi;
-/** Every ALIAS_DECLARATION keyword, lowercased: a row containing none of them cannot match the regex. */
-const DECLARATION_KEYWORDS = ['account code', 'also known as', 'a.k.a', 'aka', 'short name', 'ticker', 'code name'];
-
 /**
  * Pages often declare another name for their subject ("Account code: MULI",
  * "also known as ..."), and documents elsewhere use only that name, so a
@@ -266,14 +270,9 @@ export function aliasDeclarations(rows: Array<{ slug: string; title?: string; ch
   const q = queryText.toLowerCase();
   const out = new Map<string, AliasDeclaration>();
   for (const row of rows.slice(0, 10)) {
-    const name = (row.title ?? '').split(':').pop()!.trim();
+    const name = titleName(row.title ?? '');
     if (!name) continue;
-    const text = row.chunk_text ?? '';
-    const lower = text.toLowerCase();
-    if (!DECLARATION_KEYWORDS.some(k => lower.includes(k))) continue;
-    for (const m of text.matchAll(ALIAS_DECLARATION)) {
-      const alias = m[1].replace(/[.,;]+$/, '');
-      if (!/[A-Z0-9]/.test(alias) || alias.toLowerCase() === name.toLowerCase()) continue;
+    for (const alias of declaredNames(row.chunk_text ?? '', name)) {
       const hasName = q.includes(name.toLowerCase());
       const hasAlias = indexOfName(q, alias, true) >= 0;
       if (hasName === hasAlias) continue;
@@ -409,7 +408,7 @@ async function buildRetrievalResponseMeta(
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
-  opts: { conceptHint?: boolean; types?: string[]; typeFilterNotice?: string; declarations?: DeclarationMemo } = {},
+  opts: { conceptHint?: boolean; types?: string[]; typeFilterNotice?: string; declarations?: DeclarationMemo; feedbackOp?: 'query' | 'search' } = {},
 ): Promise<Record<string, unknown>> {
   const m = meta as (HybridSearchMeta & { degraded?: unknown[]; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
@@ -459,6 +458,7 @@ async function buildRetrievalResponseMeta(
     ...(aliases.length ? { other_names: aliases } : {}),
     ...(heldFiles.length ? { held_files: heldFiles } : {}),
     ...(hint || readiness.hint ? { hint: [hint, readiness.hint].filter(Boolean).join(' ') } : {}),
+    ...(opts.feedbackOp ? await searchAnswerFeedback(ctx, opts.feedbackOp, results as SearchResult[]) : {}),
   };
 }
 
@@ -506,9 +506,93 @@ const TYPES_PARAM_DESCRIPTION = "Page types, e.g. ['person'].";
 
 const SOURCE_ID_PARAM_DESCRIPTION = "One source, or '__all__'.";
 const SALIENCE_PARAM = { type: 'string' as const, enum: ['off', 'on', 'strong'], description: 'Boost emotional pages (default: auto).' };
+
+/**
+ * Ranking explanation params, declared on `query` only and advertised on the
+ * full MCP surface only: every declared param is re-sent to the model on each
+ * turn, so the cheap `search` tool and the starter list stay lean (a starter
+ * session reaches them with `request_tools {surface: 'full'}`). The local CLI
+ * passes them to `search` too (`gbrain search --explain`).
+ */
+const EXPLAIN_PARAMS = {
+  explain: { type: 'boolean' as const, description: 'Per-row score_details.', fullSurfaceOnly: true },
+  explain_target: { type: 'string' as const, description: 'Expected page (slug or source:slug): why it is missing.', fullSurfaceOnly: true },
+};
+
+/** `explain_target` is `slug` or `source_id:slug` (slugs never contain ':'). */
+function parseExplainTarget(raw: string): { slug: string; sourceId?: string } {
+  const at = raw.indexOf(':');
+  return at > 0 ? { sourceId: raw.slice(0, at), slug: raw.slice(at + 1) } : { slug: raw };
+}
+
+/**
+ * explain_target, before the search: resolve the target among the pages this
+ * caller can read (one probe under the same scope and visibility the search
+ * uses). Returns the trace to thread into the search, or an early diagnosis
+ * (not visible / ambiguous) that needs no trace.
+ */
+async function prepareExplainTarget(
+  ctx: OperationContext, p: Record<string, unknown>, scope: SourceScope, excludePrivate: boolean, tool: 'search' | 'query',
+): Promise<{ trace?: TargetTrace; early?: ExplainTargetDiagnosis } | null> {
+  if (typeof p.explain_target !== 'string' || p.explain_target.trim() === '') return null;
+  const { slug, sourceId } = parseExplainTarget(p.explain_target.trim());
+  const retry = { tool, arguments: explainRetryArgs(p) };
+  let probe;
+  try {
+    probe = await probeTarget((sql, params) => ctx.engine.executeRaw(sql, params), slug,
+      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false });
+  } catch {
+    return { trace: new TargetTrace({ slug, sourceId }) };
+  }
+  const early = diagnoseProbe({ slug, sourceId }, probe, { requireSafeChunks: ctx.remote !== false, retry });
+  if (early && (early.code === 'target_not_found_or_not_visible' || early.code === 'target_ambiguous')) return { early };
+  const resolvedSource = sourceId ?? (probe.length === 1 ? probe[0].source_id : undefined);
+  return { trace: new TargetTrace({ slug, sourceId: resolvedSource }), ...(early ? { early } : {}) };
+}
+
+/** The caller's search arguments, minus explain params, so every fix is a complete retry call. */
+function explainRetryArgs(p: Record<string, unknown>): Record<string, unknown> {
+  const { explain: _e, explain_target: _t, ...rest } = p;
+  return rest;
+}
+
+/** Adds the explain_target diagnosis to the retrieval meta when one was requested. */
+function withExplainTarget(meta: Record<string, unknown>, diagnosis: ExplainTargetDiagnosis | undefined): Record<string, unknown> {
+  return diagnosis ? { ...meta, explain_target: diagnosis } : meta;
+}
+
+/** explain_target, after the search: diagnose, refine an unretrieved target with the probe, and emit the fix as a notice. */
+function finishExplainTarget(
+  ctx: OperationContext, p: Record<string, unknown>, prep: { trace?: TargetTrace; early?: ExplainTargetDiagnosis } | null,
+  results: SearchResult[], tool: 'search' | 'query',
+): ExplainTargetDiagnosis | undefined {
+  if (!prep) return undefined;
+  let diag = prep.early;
+  if (prep.trace) {
+    const traced = diagnoseTrace(prep.trace, results, { tool, arguments: explainRetryArgs(p) });
+    // A probe finding (no chunks / stale projection / unsealed) explains an unretrieved page better than "no arm found it".
+    diag = traced.state === 'not_retrieved' && prep.early ? { ...prep.early, stages: traced.stages } : traced;
+  }
+  if (diag?.fix) {
+    const notice: Notice = { code: diag.code, kind: 'info', why: diag.why, fix: diag.fix };
+    ctx.emitNotice?.(notice);
+  }
+  if (!diag) return undefined;
+  const { fix: _fix, ...wire } = diag;
+  return wire as ExplainTargetDiagnosis;
+}
 const RECENCY_PARAM = { type: 'string' as const, enum: ['off', 'on', 'strong'], description: "Boost recent pages (default: auto)." };
 
 const SNIPPET_CHARS_PARAM_DESCRIPTION = 'Max chars per chunk_text (0 = full).';
+
+/** The query op's image branch embed; a brain that opted out of embedding refuses before the image reaches a provider. */
+async function embedSearchImage(ctx: OperationContext, data: string, mime: string): Promise<Float32Array> {
+  const { assertBrainEmbeddingEnabled } = await import('../embedding-dim-check.ts');
+  await assertBrainEmbeddingEnabled(ctx.engine, ctx.config);
+  const { embedMultimodal } = await import('../ai/gateway.ts');
+  const [vec] = await embedMultimodal([{ kind: 'image_base64', data, mime }]);
+  return vec;
+}
 
 /**
  * #3800: resolve the effective snippet cap for one call. Explicit
@@ -551,7 +635,7 @@ const search: Operation = {
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
     return_unit: RETURN_UNIT_PARAM,
     return_window: RETURN_WINDOW_PARAM,
-    token_budget: { type: 'number', description: 'Evidence token budget (default 6000).' },
+    token_budget: { type: 'number', description: 'Evidence token cap (default 6000).' },
     // #4415: explicit ranking-axis overrides (the same knobs `query` has had
     // since v0.29.1). The auto-detect banks are English regex, so on a
     // non-English brain the recency/salience stages never fire — these flags
@@ -627,6 +711,7 @@ const search: Operation = {
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
     // expansion OFF (no per-call LLM cost). `query` op is the full-control variant.
     let capturedMeta: HybridSearchMeta | null = null;
+    const explainPrep = await prepareExplainTarget(ctx, p, scope, excludePrivate, 'search');
     const searchOpts = {
       limit,
       offset,
@@ -642,7 +727,9 @@ const search: Operation = {
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,
       decide: { remote: ctx.remote !== false },
     };
-    const primary = await hybridSearchCached(ctx.engine, queryText, { ...searchOpts, onMeta: (m) => { capturedMeta = m; } });
+    const primary = await hybridSearchCached(ctx.engine, queryText, {
+      ...searchOpts, onMeta: (m) => { capturedMeta = m; }, explain: p.explain === true, explainTarget: explainPrep?.trace,
+    });
     const declarations = new DeclarationMemo();
     const results = (await withDeclaredNameFanOut(primary, queryText, declarations,
       (alt, altLimit) => hybridSearchCached(ctx.engine, alt, { ...searchOpts, limit: altLimit, offset: 0 }))).map(r => ({ ...r }));
@@ -652,7 +739,7 @@ const search: Operation = {
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
     // #3800: cap AFTER capture/meta so eval + cache see the real payload.
     return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, capturedMeta, snippetCap,
-      rows => buildRetrievalResponseMeta(ctx, scope, queryText, rows, capturedMeta, { conceptHint: true, types, typeFilterNotice: typeFilter.notice, declarations }));
+      async rows => withExplainTarget(await buildRetrievalResponseMeta(ctx, scope, queryText, rows, capturedMeta, { conceptHint: true, types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'search' }), finishExplainTarget(ctx, p, explainPrep, results, 'search')));
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'search', positional: ['query'] },
@@ -673,7 +760,7 @@ const query: Operation = {
     /** v0.27.1: image-similarity search. Path resolved on the CLI side
      *  before the op fires (the op receives raw bytes neither side; the
      *  CLI loads the file, base64-encodes, and passes through `image`). */
-    image: { type: 'string', description: 'Base64 image for image search.' },
+    image: { type: 'string', description: 'Base64 image.' },
     image_mime: { type: 'string', description: 'MIME type of image.' },
     // #4356 — the text/hybrid path no longer hard-defaults this to 20; an
     // omitted OR falsy (0) `limit` resolves from the active search mode's
@@ -699,9 +786,9 @@ const query: Operation = {
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
     return_unit: RETURN_UNIT_PARAM,
     return_window: RETURN_WINDOW_PARAM,
-    token_budget: { type: 'number', description: 'Token cap on the returned evidence.' },
-    expand: { type: 'boolean', description: 'Default true; false skips the expansion LLM call.' },
-    detail: { type: 'string', description: 'low (compiled truth only), medium (default) or high (all chunks).' },
+    token_budget: { type: 'number', description: 'Evidence token cap.' },
+    expand: { type: 'boolean', description: 'Default true; false skips the LLM expansion.' },
+    detail: { type: 'string', description: 'low (compiled truth), medium (default) or high (all chunks).' },
     fields: FIELDS_PARAM,
     mode: { type: 'string', description: 'Local callers only.' },
     // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol-kind filters.
@@ -718,9 +805,10 @@ const query: Operation = {
     source_id: { type: 'string', description: SOURCE_ID_PARAM_DESCRIPTION },
     cross_modal: { type: 'string', enum: ['text', 'image', 'both', 'auto'], description: 'Default auto.' },
     embedding_column: { type: 'string', description: 'Registered embedding column.' },
-    adaptive_return: { type: 'boolean', description: 'true when one specific answer is wanted (fewer rows; never returns empty); omit for breadth.' },
-    autocut: { type: 'boolean', description: 'Default on (never returns empty); false gives full top-K for breadth. Cuts at the score cliff, unlike adaptive_return.' },
+    adaptive_return: { type: 'boolean', description: 'true when one answer is wanted (fewer rows; never returns empty); omit for breadth.' },
+    autocut: { type: 'boolean', description: 'Default on (never returns empty); false gives full top-K for breadth, unlike adaptive_return.' },
     relational: { type: 'boolean', description: 'Relationship-graph arm (default on).' },
+    ...EXPLAIN_PARAMS,
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -769,10 +857,7 @@ const query: Operation = {
       const imageMeta: HybridSearchMeta = {
         vector_enabled: true, expansion_applied: false, detail_resolved: null, degraded: [],
       };
-      const { embedMultimodal } = await import('../ai/gateway.ts');
-      const [vec] = await embedMultimodal([
-        { kind: 'image_base64', data: imageData, mime: imageMime },
-      ]);
+      const vec = await embedSearchImage(ctx, imageData, imageMime);
       // v0.34.1 (#861 F2 — 6th leak surface): the image path bypasses
       // hybridSearch and calls searchVector directly, so it needs its
       // own thread of the source scope. Pre-fix, this branch leaked
@@ -828,6 +913,7 @@ const query: Operation = {
     const typeFilter = await reconcileTypeFilter(ctx, querySourceScope, excludePrivate, types);
     types = typeFilter.types;
     let capturedMeta: HybridSearchMeta | null = null;
+    const explainPrep = await prepareExplainTarget(ctx, p, querySourceScope, excludePrivate, 'query');
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // token budget and intent weighting apply at the operation boundary.
     // Semantic cache reuse is suspended in the wrapper.
@@ -885,6 +971,7 @@ const query: Operation = {
       autocut: typeof p.autocut === 'boolean' ? (p.autocut as boolean) : undefined,
       // v0.43 — relational recall override. Omitted = smart default (mode bundle).
       relationalRetrieval: typeof p.relational === 'boolean' ? (p.relational as boolean) : undefined,
+      explain: p.explain === true, explainTarget: explainPrep?.trace,
     });
     const declarations = new DeclarationMemo();
     results = await withDeclaredNameFanOut(results, queryText, declarations, (alt, altLimit) => hybridSearchCached(ctx.engine, alt, {
@@ -1050,7 +1137,7 @@ const query: Operation = {
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded
     // and recorded the real payload; only the returned envelope is snipped.
     return evidenceOutput(ctx, p, results, plan, { ...querySourceScope, excludePrivate, detail }, capturedMeta, snippetCap,
-      async rows => ({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, typeFilterNotice: typeFilter.notice, declarations })), crag }));
+      async rows => withExplainTarget({ ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, rows, capturedMeta, { types, typeFilterNotice: typeFilter.notice, declarations, feedbackOp: 'query' })), crag }, finishExplainTarget(ctx, p, explainPrep, results, 'query')));
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'query', positional: ['query'] },

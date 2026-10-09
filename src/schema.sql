@@ -265,6 +265,7 @@ CREATE TRIGGER bump_page_generation_clock_trg
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_replace(slug, '^.*/', '')));
 -- v0.13.1 #170: avoids 14.6s seqscan on large brains when listing pages newest-first.
 CREATE INDEX IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC);
 -- v0.18.0: source-scoped scans (per /plan-eng-review Section 4).
@@ -276,13 +277,30 @@ CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 -- stays low. Don't add a regular `(deleted_at)` index without measuring.
 CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
   ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
--- v0.37.0: full B-tree index on last_retrieved_at supports LSD's stale-page
--- query `WHERE last_retrieved_at IS NULL OR last_retrieved_at < NOW() -
--- INTERVAL '90 days'`. Postgres handles NULL in B-tree indexes (sorted to
--- one end) so one index covers both branches. A partial WHERE NOT NULL
--- would miss the NULL branch that LSD prioritizes (codex round 2 #6).
-CREATE INDEX IF NOT EXISTS pages_last_retrieved_at_idx
-  ON pages (last_retrieved_at);
+-- Retrieval telemetry (src/core/last-retrieved.ts, migration v224): when a
+-- user-facing read last surfaced a page, written at most once per page per 5
+-- minutes. Kept off `pages` so the per-read upsert is a HOT update of a narrow
+-- row: an UPDATE of pages fires its triggers, rewrites a wide tuple with an
+-- entry in every pages index and advances page_generation_clock_seq, which
+-- expires the query-cache bookmark. Readers take GREATEST of this and the
+-- legacy pages.last_retrieved_at column (copied here by v224; v224 also drops
+-- its unused index). No foreign key: its KEY SHARE lock would dirty the pages
+-- row on every bump; the statement trigger below removes rows of hard-deleted
+-- pages instead.
+CREATE TABLE IF NOT EXISTS page_retrievals (
+  page_id           INTEGER PRIMARY KEY,
+  last_retrieved_at TIMESTAMPTZ NOT NULL
+);
+CREATE OR REPLACE FUNCTION gbrain_forget_page_retrievals() RETURNS trigger
+  LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+  DELETE FROM page_retrievals r USING gbrain_deleted_pages d WHERE r.page_id = d.id;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS pages_forget_retrievals ON pages;
+CREATE TRIGGER pages_forget_retrievals AFTER DELETE ON pages
+  REFERENCING OLD TABLE AS gbrain_deleted_pages
+  FOR EACH STATEMENT EXECUTE FUNCTION gbrain_forget_page_retrievals();
 -- v0.42.7 (migration v112): composite B-tree backing `extract --stale` and the
 -- `links_extraction_lag` doctor check. source_id leads so source-scoped staleness
 -- scans (`extract --stale --source X`, `gbrain doctor --source X`) are indexed;
@@ -312,6 +330,10 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   model                 TEXT    NOT NULL DEFAULT 'text-embedding-3-large',
   token_count           INTEGER,
   embedded_at           TIMESTAMPTZ,
+  -- v221: embedding_pending_since (when the stored vector last became missing;
+  -- doctor's embeddings check ages the backlog from it, never from created_at)
+  -- is added by migration v221 on every install, after the migration-added
+  -- content_chunks columns, so fresh and upgraded brains share their ordinals.
   -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
   -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
   embedded_text_hash    TEXT,
@@ -547,6 +569,27 @@ CREATE INDEX IF NOT EXISTS idx_links_from ON links(from_page_id);
 CREATE INDEX IF NOT EXISTS idx_links_to ON links(to_page_id);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(link_source);
 CREATE INDEX IF NOT EXISTS idx_links_origin ON links(origin_page_id);
+
+-- Wanted pages (migration wanted_links): authored links whose target page does
+-- not exist. A live target updated after checked_at makes the origin stale for
+-- link extraction (src/core/wanted-links.ts).
+CREATE TABLE IF NOT EXISTS wanted_links (
+  id               BIGSERIAL PRIMARY KEY,
+  origin_page_id   INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  source_id        TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  producer         TEXT NOT NULL CHECK (producer IN ('body','frontmatter')),
+  ref_kind         TEXT NOT NULL CHECK (ref_kind IN ('slug','name')),
+  target_source_id TEXT NOT NULL,
+  target_ref       TEXT NOT NULL,
+  link_type        TEXT NOT NULL DEFAULT '',
+  context          TEXT NOT NULL DEFAULT '',
+  checked_at       TIMESTAMPTZ NOT NULL,
+  first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT wanted_links_reference_unique
+    UNIQUE (origin_page_id, producer, ref_kind, target_source_id, target_ref)
+);
+CREATE INDEX IF NOT EXISTS wanted_links_target_idx ON wanted_links (target_source_id, target_ref);
+CREATE INDEX IF NOT EXISTS wanted_links_source_idx ON wanted_links (source_id);
 
 -- ============================================================
 -- tags
@@ -860,10 +903,65 @@ CREATE INDEX IF NOT EXISTS context_volunteer_events_src_time_idx
 CREATE INDEX IF NOT EXISTS context_volunteer_events_src_slug_idx
   ON context_volunteer_events (source_id, slug);
 
+-- Use-attributed retrieval feedback (src/core/feedback/): answers record the
+-- pages (with the retrieved revision's content_hash) and relational-path edges
+-- they used; ratings move per-element weights (neutral 0.5) that the search
+-- ranking stage reads. No query text is stored. Mirrors migration v207.
+CREATE TABLE IF NOT EXISTS retrieval_events (
+  id          TEXT PRIMARY KEY,
+  client_id   TEXT NOT NULL DEFAULT 'local',
+  op          TEXT NOT NULL CHECK (op IN ('query','search','think','synthesize','recall')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS retrieval_events_time_idx ON retrieval_events (created_at);
+CREATE TABLE IF NOT EXISTS retrieval_event_pages (
+  event_id      TEXT NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  source_id     TEXT NOT NULL,
+  slug          TEXT NOT NULL,
+  content_hash  TEXT,
+  rank          INTEGER NOT NULL,
+  cited         BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (event_id, source_id, slug)
+);
+CREATE TABLE IF NOT EXISTS retrieval_event_links (
+  event_id   TEXT NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  source_id  TEXT NOT NULL,
+  edge_key   TEXT NOT NULL,
+  to_slug    TEXT NOT NULL,
+  PRIMARY KEY (event_id, source_id, edge_key, to_slug)
+);
+CREATE TABLE IF NOT EXISTS retrieval_feedback (
+  event_id       TEXT NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  signal         TEXT NOT NULL CHECK (signal IN ('explicit','cited')),
+  element_kind   TEXT NOT NULL CHECK (element_kind IN ('page','link')),
+  source_id      TEXT NOT NULL,
+  element_key    TEXT NOT NULL,
+  client_id      TEXT NOT NULL DEFAULT 'local',
+  rating         SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  weight_before  REAL NOT NULL,
+  weight_after   REAL NOT NULL,
+  applied_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (event_id, signal, element_kind, source_id, element_key)
+);
+CREATE INDEX IF NOT EXISTS retrieval_feedback_client_time_idx
+  ON retrieval_feedback (client_id, applied_at DESC);
+CREATE TABLE IF NOT EXISTS retrieval_weights (
+  source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  element_kind  TEXT NOT NULL CHECK (element_kind IN ('page','link')),
+  element_key   TEXT NOT NULL,
+  weight        REAL NOT NULL DEFAULT 0.5 CHECK (weight >= 0 AND weight <= 1),
+  content_hash  TEXT,
+  updates       INTEGER NOT NULL DEFAULT 0,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, element_kind, element_key)
+);
+
 -- session_context_state (v0.45.7 / migration v126 — ambient recall issue #1):
 -- per-session cursor + boundary-tie dedup for the `delta` verb + heartbeat
 -- runtime. Key (source_id, client_id, session_id); client_id 'local' sentinel
 -- for CLI/hook, remote auth client id otherwise. jsonb DDL-literal defaults.
+-- facts_cursor_at/_id + degraded_wakes (migration v208): delta's per-arm facts
+-- keyset and its consecutive incomplete-wake counter.
 CREATE TABLE IF NOT EXISTS session_context_state (
   source_id           TEXT NOT NULL,
   client_id           TEXT NOT NULL DEFAULT 'local',
@@ -873,6 +971,9 @@ CREATE TABLE IF NOT EXISTS session_context_state (
   checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
   last_wake_at        TIMESTAMPTZ,
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  facts_cursor_at     TIMESTAMPTZ,
+  facts_cursor_id     BIGINT,
+  degraded_wakes      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (source_id, client_id, session_id)
 );
 CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
@@ -1696,6 +1797,7 @@ BEGIN
     ALTER TABLE pages ENABLE ROW LEVEL SECURITY;
     ALTER TABLE content_chunks ENABLE ROW LEVEL SECURITY;
     ALTER TABLE links ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE wanted_links ENABLE ROW LEVEL SECURITY;
     ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
     ALTER TABLE raw_data ENABLE ROW LEVEL SECURITY;
     ALTER TABLE timeline_entries ENABLE ROW LEVEL SECURITY;
@@ -1775,7 +1877,7 @@ CREATE TABLE IF NOT EXISTS page_write_guards (
     slug TEXT NOT NULL,
     PRIMARY KEY (source_incarnation, slug)
   );
-CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
     BEGIN
       IF OLD.knowledge_revision IS NULL THEN
         NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
@@ -1804,7 +1906,7 @@ CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUA
 DROP TRIGGER IF EXISTS pages_knowledge_revision ON pages;
 CREATE TRIGGER pages_knowledge_revision BEFORE UPDATE ON pages
     FOR EACH ROW EXECUTE FUNCTION gbrain_advance_page_revision();
-CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
     BEGIN
       IF TG_OP = 'UPDATE' AND (NEW.page_id, NEW.tag) IS NOT DISTINCT FROM (OLD.page_id, OLD.tag) THEN
         RETURN NULL;
@@ -1860,6 +1962,13 @@ CREATE TABLE IF NOT EXISTS chronicle_page_state (
   event_hashes TEXT[] NOT NULL DEFAULT '{}',
   decided_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #6199 (migration chronicle_campaign_stamps): the --max-usd campaign stamp.
+  campaign_id TEXT,
+  attempt_cap_usd NUMERIC,
+  max_attempts INTEGER CHECK (max_attempts > 0),
+  pricing_policy TEXT,
+  campaign_max_usd NUMERIC,
+  cost_attempts INTEGER[] NOT NULL DEFAULT '{}',
   PRIMARY KEY (source_id, page_id, content_hash, extractor_version)
 );
 CREATE INDEX IF NOT EXISTS chronicle_page_state_work_idx
@@ -1980,8 +2089,26 @@ CREATE TABLE IF NOT EXISTS persistence_effects (
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(request_id,kind)
   );
+CREATE TABLE IF NOT EXISTS persistence_consumers (
+    host_id uuid NOT NULL,
+    pid integer NOT NULL,
+    nonce text NOT NULL,
+    pid_ns text,
+    kind text NOT NULL,
+    mode text NOT NULL CHECK (mode IN ('probing','full','waiter_only','promoted')),
+    started_at timestamptz NOT NULL DEFAULT now(),
+    renewed_at timestamptz NOT NULL DEFAULT now(),
+    restart_required boolean NOT NULL DEFAULT false,
+    root_barrier_age_ms integer,
+    pool jsonb,
+    host_json_path text NOT NULL,
+    persistence_home text NOT NULL,
+    minted_under jsonb,
+    version text NOT NULL,
+    PRIMARY KEY(host_id,pid,nonce)
+  );
 
-CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
 DECLARE target_source text; old_source text; row_data jsonb; old_data jsonb; allowed jsonb;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM persistence_brain WHERE singleton=1 AND enabled) THEN
@@ -2065,7 +2192,7 @@ CREATE TABLE IF NOT EXISTS page_projection_jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY(source_incarnation,slug)
   );
-CREATE OR REPLACE FUNCTION gbrain_queue_page_projection() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE OR REPLACE FUNCTION gbrain_queue_page_projection() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
     DECLARE incarnation UUID;
     BEGIN
       IF TG_OP='DELETE' THEN
@@ -2272,13 +2399,13 @@ CREATE TABLE IF NOT EXISTS persistence_writer_protocols (
     registered_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY(worktree_id,host_id)
   );
-CREATE OR REPLACE FUNCTION gbrain_require_persistence_protocol(required integer) RETURNS void LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION gbrain_require_persistence_protocol(required integer) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
   BEGIN
     IF required >= 2 AND COALESCE(current_setting('gbrain.persistence_protocol',true),'') <> '2' THEN
       RAISE EXCEPTION 'writer_upgrade_required: this mutation requires persistence protocol 2' USING ERRCODE='42501';
     END IF;
   END $$;
-CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
   DECLARE target text; version integer; floor integer; active boolean; record jsonb;
   BEGIN
     IF TG_OP='DELETE' THEN target:=OLD.target_kind; version:=OLD.protocol_version;
@@ -2318,7 +2445,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGU
 DROP TRIGGER IF EXISTS gbrain_request_protocol ON persistence_requests;
 CREATE TRIGGER gbrain_request_protocol BEFORE INSERT OR UPDATE OR DELETE ON persistence_requests
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_request_protocol();
-CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
   DECLARE floor integer;
   BEGIN
     SELECT writer_protocol_floor INTO floor FROM persistence_brain WHERE singleton=1 FOR SHARE;
@@ -2329,7 +2456,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUA
 DROP TRIGGER IF EXISTS gbrain_effect_protocol ON persistence_effects;
 CREATE TRIGGER gbrain_effect_protocol BEFORE INSERT OR UPDATE OR DELETE ON persistence_effects
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_effect_protocol();
-CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
   BEGIN
     IF NEW.writer_protocol_floor<OLD.writer_protocol_floor THEN
       RAISE EXCEPTION 'writer_upgrade_required: the protocol floor cannot be lowered' USING ERRCODE='42501';
@@ -2352,7 +2479,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LA
 DROP TRIGGER IF EXISTS gbrain_protocol_activation ON persistence_brain;
 CREATE TRIGGER gbrain_protocol_activation BEFORE UPDATE ON persistence_brain
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_protocol_activation();
-CREATE OR REPLACE FUNCTION gbrain_guard_skill_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION gbrain_guard_skill_publication() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
   DECLARE permitted jsonb;
   BEGIN
     PERFORM gbrain_require_persistence_protocol(2);
@@ -2378,7 +2505,7 @@ CREATE TRIGGER gbrain_skill_publication BEFORE INSERT OR UPDATE OR DELETE ON sha
 DROP TRIGGER IF EXISTS gbrain_skill_publication ON shared_skill_revisions;
 CREATE TRIGGER gbrain_skill_publication BEFORE INSERT OR UPDATE OR DELETE ON shared_skill_revisions
       FOR EACH ROW EXECUTE FUNCTION gbrain_guard_skill_publication();
-CREATE OR REPLACE FUNCTION gbrain_lease_shared_skill_delivery() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION gbrain_lease_shared_skill_delivery() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
   DECLARE item text; found_revision shared_skill_revisions%ROWTYPE; brain text;
   BEGIN
     SELECT brain_id::text INTO brain FROM persistence_brain WHERE singleton=1;
@@ -2561,6 +2688,49 @@ DO $rls$ BEGIN
     ALTER TABLE decide_sweep_deferred ENABLE ROW LEVEL SECURITY;
   END IF;
 END $rls$;
+
+CREATE TABLE IF NOT EXISTS decide_review_queue (
+  kind            TEXT NOT NULL,
+  source_id       TEXT NOT NULL,
+  a_ref           TEXT NOT NULL,
+  b_ref           TEXT NOT NULL DEFAULT '*',
+  evidence        TEXT,
+  reason          TEXT NOT NULL DEFAULT 'queued',
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (kind, source_id, a_ref, b_ref)
+);
+CREATE TABLE IF NOT EXISTS decide_review_proposals (
+  id               BIGSERIAL PRIMARY KEY,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  kind             TEXT NOT NULL,
+  source_id        TEXT NOT NULL,
+  sweep_id         TEXT NOT NULL,
+  a_ref            TEXT NOT NULL,
+  b_ref            TEXT NOT NULL,
+  subject          TEXT NOT NULL DEFAULT '*',
+  visibility       TEXT,
+  p_action         REAL NOT NULL,
+  threshold        REAL,
+  model_resolved   TEXT,
+  question_version TEXT,
+  status           TEXT NOT NULL DEFAULT 'pending',
+  decided_at       TIMESTAMPTZ,
+  receipt          TEXT,
+  UNIQUE (kind, source_id, a_ref, b_ref, subject)
+);
+CREATE INDEX IF NOT EXISTS decide_review_proposals_status_idx ON decide_review_proposals (status, created_at);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE decide_review_queue ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE decide_review_proposals ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
 -- END GENERATED from src/core/ai/decide/schema.ts (DECIDE_SCHEMA_SQL)
 
 -- gbrain facts relink attempts and journal (#5836).
@@ -2667,6 +2837,28 @@ DO $rls$ BEGIN
 END $rls$;
 CREATE SEQUENCE IF NOT EXISTS graph_generation_seq;
 -- END GENERATED from src/core/link-temporal-schema.ts (LINK_TEMPORAL_SCHEMA_SQL)
+
+-- Always-loaded core memory: remote-edit notices.
+-- BEGIN GENERATED from src/core/core-memory-schema.ts (CORE_EDIT_NOTICES_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS core_edit_notices (
+  id              BIGSERIAL PRIMARY KEY,
+  source_id       TEXT NOT NULL,
+  slug            TEXT NOT NULL,
+  page_id         BIGINT,
+  revision        TEXT,
+  base_revision   TEXT,
+  base_text       TEXT,
+  actor           TEXT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  acked_at        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS core_edit_notices_pending_idx ON core_edit_notices (source_id, slug, id) WHERE acked_at IS NULL;
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE core_edit_notices ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/core-memory-schema.ts (CORE_EDIT_NOTICES_SCHEMA_SQL)
 
 -- #5255/#5176 (O-DX-8): last upstream observation per source, recorded by sync
 -- from the checkout's Git state (upstream ref, its last fetch/push time, commits

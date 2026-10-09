@@ -62,6 +62,18 @@ export async function routeThinClientCommand(
   const sub = args[0];
   const rest = args.slice(1);
 
+  if (command === 'sources' && sub === 'shared-skills') {
+    if (rest.includes('--help') || rest.includes('-h')) {
+      console.log((await import('./sources-shared-skills.ts')).SOURCES_SHARED_SKILLS_HELP);
+      return true;
+    }
+    const [id, action] = rest.filter(arg => !arg.startsWith('-'));
+    if (!id || !/^[a-z0-9-]{1,32}$/.test(id)) return false;
+    const { sharedSkillsRemoteRefusal } = await import('../core/shared-skills/source-opt-out.ts');
+    const { exitCliError } = await import('../cli/cli-error.ts');
+    exitCliError(sharedSkillsRemoteRefusal(id, action === 'on' || action === 'off' ? action : 'status'), 'sources');
+  }
+
   if (command === 'config') {
     const { tryRunConfigThinClient } = await import('./config.ts');
     return tryRunConfigThinClient(args);
@@ -108,7 +120,7 @@ export async function routeThinClientCommand(
   }
 
   if (command === 'search') {
-    if (sub === 'modes' && !rest.includes('--reset') && !rest.includes('--source')) {
+    if (sub === 'modes' && !rest.includes('--reset') && !rest.includes('--source') && !rest.includes('--mode')) {
       printJson(await call(cfg, 'search_modes', {}));
       return true;
     }
@@ -120,7 +132,7 @@ export async function routeThinClientCommand(
       printJson(await call(cfg, 'search_tune', {}));
       return true;
     }
-    return false; // modes --reset / modes --source (the reset dry-run) / tune --apply / diagnose — host-side config or live probe
+    return false; // modes --reset / modes --mode|--source (the reset dry-run) / tune --apply / diagnose — host-side config or live probe
   }
 
   if (command === 'jobs' && sub === 'stats') {

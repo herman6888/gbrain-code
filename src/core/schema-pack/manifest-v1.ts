@@ -50,6 +50,8 @@ const LinkTypeSchema = z.object({
    * reference. See docs/guides/temporal-edges.md.
    */
   temporal: z.enum(['state', 'event']).optional(),
+  /** `one_per_from`: a page holds at most one live relationship of this type; a newer dated start closes the older one (docs/guides/temporal-edges.md). */
+  cardinality: z.enum(['many', 'one_per_from']).optional(),
 }).strict();
 
 /**

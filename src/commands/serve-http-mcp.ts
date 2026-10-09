@@ -21,7 +21,7 @@ import { createSkillResources } from '../mcp/skill-resources.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
-import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, type ToolResult } from '../mcp/dispatch.ts';
+import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
 import { STATUS_TOOL_NAME, statusModeOf, statusToolResult } from '../mcp/status-mode.ts';
 import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
@@ -31,6 +31,8 @@ import { GBRAIN_CLIENT_HEADER, resolveResultRowsMode, resultRowsForRequest, type
 import { buildToolDefs } from '../mcp/tool-defs.ts';
 import {
   filterOpsForSurface,
+  advertisedOps,
+  resolveAdvertisedSurface,
   clampSurface,
   minSurface,
   resolveClientRowSurface,
@@ -230,9 +232,10 @@ async function listMcpTools(ctx: ServeHttpContext, state: McpRequestState) {
   // stays as the fail-closed backstop for all three layers.
   // Both per-request config reads are independent — issue them
   // concurrently (one RTT of latency on network Postgres, not two).
-  const [gateDisabled, strictParamsMode] = await Promise.all([
+  const [gateDisabled, strictParamsMode, advertised] = await Promise.all([
     disabledOpsForPublishGates(engine, config),
     resolveStrictParamsMode(engine, config),
+    resolveAdvertisedSurface(engine, config),
   ]);
   // FOV-4: `agent` deliberately implies only itself, which would strand
   // agent-only tokens with ZERO discovery — ops flagged `agentCallable`
@@ -252,7 +255,9 @@ async function listMcpTools(ctx: ServeHttpContext, state: McpRequestState) {
   // 'reject' closes each schema with additionalProperties:false and
   // declares the _meta/dry_run passthrough keys (D14.1).
   const strictParams = strictParamsMode === 'reject';
-  const tools = buildToolDefs(visibleOps, { strictParams });
+  // mcp.advertised_surface narrows the list only; dispatch below keeps the callable set (request_tools reaches the rest).
+  // A client that chose its own surface (request_tools {surface}, an operator rescope) gets that surface listed in full.
+  const tools = buildToolDefs(authInfo.surface ? visibleOps : advertisedOps(visibleOps, surface, advertised), { strictParams });
   // v0.28.10: log every JSON-RPC method, not just successful tools/call.
   // Pre-fix, /admin/api/requests showed nothing for clients that only
   // ever called tools/list, and the v0.26.3 persistence regression test
@@ -370,6 +375,11 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   let argsDigest = 'none';
   try { argsDigest = createHash('sha256').update(JSON.stringify(params ?? null)).digest('hex').slice(0, 16); } catch { /* unserializable */ }
   process.stderr.write(`[gbrain-serve] dispatch op=${name} args_sha256=${argsDigest}\n`);
+  // CX2-11 parity with stdio: the request-level `_meta.session_id` (a sibling
+  // of `arguments`) becomes OperationContext.sessionId, so the hot-memory
+  // metaHook and every other session consumer key per remote session. Identity
+  // only, never a trust surface.
+  const sessionId = requestMetaSessionId(request.params);
   let toolResult: Awaited<ReturnType<typeof dispatchToolCall>>;
   try {
     toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
@@ -377,6 +387,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
       // WP1/D7: network transport — the dispatch-layer localOnly
       // backstop keys off this marker.
       transport: 'http',
+      ...(sessionId ? { sessionId } : {}),
       takesHoldersAllowList: tokenAllowList,
       sourceId: tokenSourceId,
       ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),

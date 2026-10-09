@@ -8,7 +8,9 @@ import { loadConfig, type GBrainConfig } from '../config.ts';
 import { getCliOptions } from '../cli-options.ts';
 import { PENDING_WRITE_EXIT_CODE } from '../exit-codes.ts';
 import { OperationError } from '../ops/contract.ts';
+import { pinRouting, type FixRouting } from '../fix-routing.ts';
 import { admittedPendingReceipt, type WriteReceipt } from './types.ts';
+import { WIRE_WRITE_WAIT_MAX_MS } from './params.ts';
 
 /** Agent and server callers keep the historical bounded wait. */
 export const AGENT_WRITE_WAIT_MS = 5_000;
@@ -35,6 +37,22 @@ function parseMs(value: unknown, where: string): number | null {
   const n = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : NaN;
   if (!Number.isSafeInteger(n) || n < 0 || n > MAX_WRITE_WAIT_MS) throw invalidWriteWait(where, value);
   return n;
+}
+
+/**
+ * #6007: a caller's `wait_ms` on a write (total reply deadline from arrival).
+ * Absent → undefined (the context default applies). Outside 0-30000 → the
+ * same invalid_write_wait refusal the CLI uses, before anything is admitted.
+ */
+export function parseWireWriteWaitMs(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > WIRE_WRITE_WAIT_MAX_MS) {
+    throw new OperationError('invalid_write_wait',
+      `wait_ms must be a whole number of milliseconds from 0 to ${WIRE_WRITE_WAIT_MAX_MS} (got ${JSON.stringify(value)}); nothing was written.`,
+      `Resubmit the same write with the same request_id and wait_ms between 0 and ${WIRE_WRITE_WAIT_MAX_MS} (for example 25000), or omit wait_ms for the 5000 ms default.`,
+      'docs/guides/write-refusals.md#invalid_write_wait');
+  }
+  return value;
 }
 
 /** CLI write wait: `--wait <s>` > GBRAIN_WRITE_WAIT_MS > persistence.write_wait_ms (file plane) > 30 s. */
@@ -103,9 +121,16 @@ export function writeErrorExitCode(error: unknown, acceptPending: boolean): numb
   return acceptPending ? 0 : PENDING_WRITE_EXIT_CODE;
 }
 
-/** The copy-paste poll command for a pending receipt. */
-export function pollCommand(requestId: string): string {
-  return `gbrain call get_write_request '${JSON.stringify({ request_id: requestId })}'`;
+/**
+ * The copy-paste poll command for a pending receipt (#6255): the same
+ * `gbrain write-request [--brain <id>] -- <request_id>` argv the error
+ * envelope's `fix` carries. A `fix.argv` that reads this receipt wins, so the
+ * two never disagree; otherwise the receipt command is pinned to `routing`.
+ */
+export function pollCommand(requestId: string, fix?: { argv?: readonly string[] }, routing?: FixRouting): string {
+  const argv = fix?.argv?.[0] === 'gbrain' && fix.argv[1] === 'write-request' && fix.argv.includes(requestId)
+    ? fix.argv : pinRouting(['gbrain', 'write-request', '--', requestId], routing);
+  return argv.join(' ');
 }
 
 /**

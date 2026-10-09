@@ -55,7 +55,8 @@ import { isManagedBrain } from './cycle/phase-table.ts';
 import { managedPullWarning, type UpstreamRefresh } from './sync-upstream.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
-import { assertEmbedNotStalled } from './embed-stall.ts';
+import { acquireLeaseSet, maintenanceLockBusySkip, MAINTENANCE_LEASE_ID } from './cycle/lock-set.ts';
+import { assertEmbedNotStalled } from './embed-stall.ts'; import { embedBackfillFix } from './embed-consent.ts';
 import { anyAbortSignal } from './abort-signals.ts';
 import { maybeRefreshPlannerStats } from './planner-stats.ts';
 
@@ -66,6 +67,7 @@ export { anyAbortSignal } from './abort-signals.ts';
 
 export type CyclePhase =
   | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
+  | 'fence_repair' // #6188: repairs held and stored malformed facts/takes fences (global maintenance lane)
   | 'resolve_symbol_edges'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   // v0.36.1.0 Hindsight calibration wave:
@@ -121,6 +123,8 @@ export const ALL_PHASES: CyclePhase[] = [
   'lint',
   'backlinks',
   'sync',
+  // #6188: right after sync, so a fence the sync just held is repaired before extract and extract_facts read the page.
+  'fence_repair',
   'synthesize',
   'extract',
   // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
@@ -319,6 +323,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'lint',
   'backlinks',
   'sync',
+  'fence_repair', // #6188: writes repaired fences through coordinated writes
   'synthesize',
   'extract',
   // v0.32.2 — wipes + re-inserts facts per affected page.
@@ -617,7 +622,7 @@ export interface CycleOpts {
  */
 export const CYCLE_STALE_DRAIN_BUDGET_MS = 3 * 60 * 1000;
 
-const LEGACY_CYCLE_LOCK_ID = 'gbrain-cycle';
+const LEGACY_CYCLE_LOCK_ID = MAINTENANCE_LEASE_ID;
 // v0.41.19.0 (T2 of ops-fix-wave): dropped from 30 min to 5 min so a
 // crashed cycle releases the lock within 5 min instead of holding it for
 // the full 30-min TTL. Wired with active in-phase refresh via
@@ -710,14 +715,28 @@ function cycleLockIdLabelFor(sourceId?: string): string {
  *     boundaries; replacing it with a background timer drops the Minion
  *     side).
  */
-async function acquireDbCycleLock(engine: BrainEngine, sourceId?: string): Promise<LockHandle | null> {
-  const lockId = cycleLockIdFor(sourceId);
-  const handle: DbLockHandle | null = await tryAcquireDbLock(engine, lockId, LOCK_TTL_MINUTES);
-  if (handle === null) return null;
-  return {
-    refresh: handle.refresh,
-    release: handle.release,
+async function acquireDbCycleLock(engine: BrainEngine, sourceId: string | undefined, phases: CyclePhase[]): Promise<{ lock: LockHandle; maintenanceBusy: boolean } | { lock: null; busyId: string }> {
+  // #6242: a source-scoped cycle that selects brain-wide phases also tries the
+  // shared lease; when another cycle holds it, it runs its source phases only.
+  const shared = sourceId !== undefined && phases.some(needsMaintenanceLease) ? [LEGACY_CYCLE_LOCK_ID] : [];
+  const acquire = async (id: string): Promise<LockHandle | null> => {
+    const handle: DbLockHandle | null = await tryAcquireDbLock(engine, id, LOCK_TTL_MINUTES);
+    return handle && { refresh: handle.refresh, release: handle.release };
   };
+  const set = await acquireLeaseSet([cycleLockIdFor(sourceId)], acquire, shared);
+  return set.status === 'busy' ? { lock: null, busyId: set.busyId } : { lock: set.lease, maintenanceBusy: set.busyOptional !== null };
+}
+
+/** Brain-wide (mixed or global) phases that write: they run only under the shared `gbrain-cycle` lease. */
+function needsMaintenanceLease(phase: CyclePhase): boolean {
+  return NEEDS_LOCK_PHASES.has(phase) && PHASE_SCOPE[phase] !== 'source';
+}
+
+/** #6242: the shared lease is busy — report each brain-wide phase skipped and return the source phases to run. */
+async function skipBrainWidePhases(engine: BrainEngine, phases: CyclePhase[], results: PhaseResult[]): Promise<CyclePhase[]> {
+  const holder = await inspectLock(engine, LEGACY_CYCLE_LOCK_ID).catch(() => null);
+  results.push(...phases.filter(needsMaintenanceLease).map(p => maintenanceLockBusySkip(p, holder)));
+  return phases.filter(p => !needsMaintenanceLease(p));
 }
 
 /**
@@ -1023,30 +1042,30 @@ function checkAborted(signal?: AbortSignal): void {
 // going through runCycle's full setup cost.
 export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal, sourceId?: string): Promise<PhaseResult> {
   try {
-    const { runLintCore } = await import('../commands/lint.ts');
+    const [{ runLintCore }, { cycleLintFixEnabled, cycleLintExcludes }] = await Promise.all([import('../commands/lint.ts'), import('./cycle/lint-fix-setting.ts')]);
     // issue #1678: pass the cycle's live engine so lint's content-sanity
     // DB-plane lift REUSES it instead of creating + disconnecting a
     // competing module-style engine that nulls the shared db singleton
     // mid-cycle (which broke every phase after lint with a misleading
     // "connect() has not been called").
-    const result = await runLintCore({ target: brainDir, fix: true, dryRun, engine: engine ?? undefined, signal, sourceId }); // #5180: sourceId scopes the managed-brain coordinator write path
+    const [lintFix, exclude] = await Promise.all([cycleLintFixEnabled(engine), cycleLintExcludes(engine)]); // `cycle.lint_fix=false`: report-only; #6134 `cycle.lint_exclude`
+    const result = await runLintCore({ target: brainDir, fix: lintFix, dryRun, engine: engine ?? undefined, signal, sourceId, exclude }); // #5180: sourceId scopes the managed-brain coordinator write path
     const issues = result.total_issues ?? 0;
     const fixed = result.total_fixed ?? 0;
     const remaining = Math.max(0, issues - fixed);
     // 'ok' when nothing noteworthy remains:
     //   - no issues at all, or
     //   - non-dry-run and everything fixable was fixed.
-    // 'warn' when issues remain after the run.
-    const status: PhaseStatus =
-      issues === 0 || (!dryRun && remaining === 0) ? 'ok' : 'warn';
+    // 'warn' when issues remain after the run (a managed repair left pending, or a report-only run, counts as remaining).
+    const status: PhaseStatus = issues === 0 || (!dryRun && remaining === 0) ? 'ok' : 'warn';
     return {
       phase: 'lint',
       status,
       duration_ms: 0, // set by caller
       summary: dryRun
         ? `${issues} issue(s) found (dry-run, no writes)`
-        : `${fixed} fix(es) applied, ${remaining} remaining`,
-      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun, write_path: result.write_path, fix_pending: result.fix_pending },
+        : lintFix ? `${fixed} fix(es) applied, ${remaining} remaining` : `${issues} issue(s) found (report-only: cycle.lint_fix=false)`,
+      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun, lint_fix: lintFix, excluded: exclude, write_path: result.write_path, fix_pending: result.fix_pending, ...(result.pending_issues?.length ? { pending: result.pending_issues } : {}) },
     };
   } catch (e) {
     return {
@@ -1398,7 +1417,7 @@ async function runPhaseExtract(
         stale_pages_drained: drained.pagesProcessed,
         stale_links_created: drained.linksCreated,
         stale_timeline_created: drained.timelineCreated,
-        staleRemaining: drained.staleRemaining,
+        staleRemaining: drained.staleRemaining, ...(drained.mentions ? { mention_pages: drained.mentions.pages, mention_links_created: drained.mentions.created, mention_due: drained.mentions.remaining, mention_state: drained.mentions.state } : {}),
       };
     } catch (e) {
       staleDetails = { stale_drain_error: e instanceof Error ? e.message : String(e) };
@@ -1445,28 +1464,12 @@ async function runPhaseExtractFacts(
     const { runExtractFacts } = await import('./cycle/extract-facts.ts');
     const result = await runExtractFacts(engine, {
       slugs: changedSlugs,
+      drain: {},
       dryRun,
       sourceId,
       brainDir: brainDir ?? undefined,
       signal,
     });
-
-    // Empty-fence guard: unfenced rows the phase's own fence step could not
-    // fence this run. Surface as 'warn' so doctor + the cycle report can see
-    // it; the warnings name each page and why.
-    if (result.guardTriggered) {
-      return {
-        phase: 'extract_facts',
-        status: 'warn',
-        duration_ms: 0,
-        summary: `extract_facts skipped: ${result.legacyRowsPending} unfenced fact row(s) could not be fenced`,
-        details: {
-          legacyRowsPending: result.legacyRowsPending,
-          unfencedRowsFenced: result.unfencedRowsFenced,
-          warnings: result.warnings,
-        },
-      };
-    }
 
     // v0.35.5: phantom-redirect counters bubble up alongside the existing
     // fact-reconcile counts. We summarize the phantom counters in the
@@ -1492,12 +1495,20 @@ async function runPhaseExtractFacts(
         `destructive full walk may have wiped non-fence facts (#1928).`,
       );
     }
+    // Empty-fence guard (per page, #6278): unfenced rows the phase's own fence
+    // step could not fence this run keep their pages out of reconciliation
+    // while the other pages reconcile. The summary names those pages and keeps
+    // the reconcile counts; the warnings name each page and why.
+    const listed = result.legacyPages.slice(0, 3).join(', ') + (result.legacyPages.length > 3 ? `, +${result.legacyPages.length - 3} more` : '');
+    const guardSummary = result.guardTriggered
+      ? `; skipped ${result.legacyPages.length} page(s) holding ${result.legacyRowsPending} unfenced fact row(s) that could not be fenced: ${listed}`
+      : '';
     const decideConflict = dryRun ? undefined : await (await import('./ai/decide/sweep.ts')).conflictSweepTail(engine, sourceId, signal);
     return {
       phase: 'extract_facts',
       status: result.warnings.length > 0 ? 'warn' : 'ok',
       duration_ms: 0,
-      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)${phantomSummary}` +
+      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)${phantomSummary}` + guardSummary +
         (result.warnings.length > 0 ? ` (${result.warnings.length} warning(s))` : ''),
       details: {
         pagesScanned: result.pagesScanned,
@@ -1505,8 +1516,10 @@ async function runPhaseExtractFacts(
         factsInserted: result.factsInserted,
         factsDeleted: result.factsDeleted,
         unfencedRowsFenced: result.unfencedRowsFenced,
+        legacyRowsPending: result.legacyRowsPending,
+        legacyPages: result.legacyPages,
         pagesFailed: result.pagesFailed,
-        warnings: result.warnings.slice(0, 5),
+        warnings: result.guardTriggered ? result.warnings : result.warnings.slice(0, 5),
         // v0.35.5: phantom counters surfaced so extractTotals() can lift
         // them to CycleReport.totals and the daily report makes the
         // cleanup visible.
@@ -1613,13 +1626,11 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
     const result = await runEmbedCore(engine, { stale: true, dryRun, signal, quiet: true });
     assertEmbedNotStalled(result); // #4599: a watchdog-aborted drain is a failed phase, not 'ok'
     const embeddedCount = dryRun ? result.would_embed : result.embedded;
+    const failed = result.failures > 0 && !result.lock_skipped; // E-A: blocked pages are a warn; another backfill's lock is not
+    const counts = dryRun ? `${result.would_embed} chunk(s) would be embedded (dry-run)` : `${result.embedded} chunk(s) newly embedded (${result.skipped} already had embeddings)`;
     return {
-      phase: 'embed',
-      status: 'ok',
-      duration_ms: 0,
-      summary: dryRun
-        ? `${result.would_embed} chunk(s) would be embedded (dry-run)`
-        : `${result.embedded} chunk(s) newly embedded (${result.skipped} already had embeddings)`,
+      phase: 'embed', status: failed ? 'warn' : 'ok', duration_ms: 0,
+      summary: failed ? `${counts}; ${result.failures} chunk(s) could not be embedded this run` : counts,
       details: {
         embedded: result.embedded,
         skipped: result.skipped,
@@ -1631,6 +1642,8 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
         // In dry-run, this counts pages with stale chunks that would
         // have been processed (same semantic as a real run).
         pages_embedded_count: dryRun ? result.pages_processed : embeddedCount > 0 ? result.pages_processed : 0,
+        failures: result.failures,
+        ...(failed ? { failure_samples: result.failure_samples, fix: embedBackfillFix({ backlog: result.failures, verifyCheck: 'embeddings' }) } : {}),
       },
     };
   } catch (e) {
@@ -1755,6 +1768,8 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     // System One: decision receipts past decide.receipts.retention_days (reported only when rows were pruned).
     let purgedDecisionReceipts = 0;
     try { purgedDecisionReceipts = await (await import('./ai/decide/store.ts')).pruneReceiptsForCycle(engine); } catch { /* pre-v179 brain */ }
+    let purgedFeedback = { events: 0, weights: 0 };
+    try { purgedFeedback = await (await import('./feedback/store.ts')).pruneRetrievalFeedback(engine, (await (await import('./feedback/settings.ts')).loadFeedbackSettings(engine)).eventRetentionDays); } catch { /* pre-v207 brain */ }
     return {
       phase: 'purge',
       status: purgedPages.error ? 'fail' : 'ok', error: purgedPages.error,
@@ -1780,6 +1795,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_batch_retry_audit_files_count: purgedBatchRetryAuditFiles,
         purged_volunteer_events_count: purgedVolunteerEvents,
         ...(purgedDecisionReceipts > 0 ? { purged_decision_receipts_count: purgedDecisionReceipts } : {}),
+        ...(purgedFeedback.events + purgedFeedback.weights > 0 ? { purged_retrieval_feedback_events_count: purgedFeedback.events, purged_retrieval_weights_count: purgedFeedback.weights } : {}),
       },
     };
   } catch (e) {
@@ -1856,7 +1872,7 @@ export async function runCycle(
 ): Promise<CycleReport> {
   const start = performance.now();
   const requestedPhases = opts.phases ?? ALL_PHASES;
-  const phases = resolveCyclePhases(opts.phases, opts.sourceId, opts.fullImplicitSourceCycle);
+  let phases = resolveCyclePhases(opts.phases, opts.sourceId, opts.fullImplicitSourceCycle);
   const excludedPhases = requestedPhases.filter((phase) => !phases.includes(phase));
   const dryRun = !!opts.dryRun;
   const pull = !!opts.pull;
@@ -1944,12 +1960,12 @@ export async function runCycle(
         }
       }
 
-      let dbLock: LockHandle | null = null;
+      let dbLease: Awaited<ReturnType<typeof acquireDbCycleLock>>;
       try {
         // v0.38: per-source lock ID when opts.sourceId is set; legacy
         // `gbrain-cycle` otherwise (autopilot still passes nothing).
         // cycleLockIdFor validates the sourceId via assertValidSourceId.
-        dbLock = await acquireDbCycleLock(engine, opts.sourceId);
+        dbLease = await acquireDbCycleLock(engine, opts.sourceId, phases);
       } catch (e) {
         // Lock acquisition failed catastrophically (e.g., migration missing).
         // Release the PGLite file lock before returning so it doesn't strand
@@ -1978,13 +1994,13 @@ export async function runCycle(
         };
       }
 
-      if (dbLock === null) {
+      if (dbLease.lock === null) {
         // Busy DB lock (another cycle for the same source already running).
         // Release the file lock before returning skipped.
         if (pgliteFileLock) {
           try { await pgliteFileLock.release(); } catch { /* best effort */ }
         }
-        const holder = await inspectLock(engine, cycleLockIdFor(opts.sourceId)).catch(() => null);
+        const holder = await inspectLock(engine, dbLease.busyId).catch(() => null);
         return {
           schema_version: '1',
           timestamp,
@@ -1997,6 +2013,8 @@ export async function runCycle(
           totals: emptyTotals(),
         };
       }
+      const dbLock = dbLease.lock;
+      if (dbLease.maintenanceBusy) phases = await skipBrainWidePhases(engine, phases, phaseResults);
 
       // Compose the two handles into one so the existing release/refresh
       // sites at the cycle body's finally block don't need to know about
@@ -2221,6 +2239,12 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
+    if (phases.includes('fence_repair')) { // #6188: one bounded run of the `fences` repair kind (src/core/cycle/fence-repair.ts)
+      checkAborted(cycleSignal);
+      const { result, duration_ms } = await timePhase(async () => (await import('./cycle/fence-repair.ts')).runFenceRepairPhase(engine, { dryRun, signal: cycleSignal, deadlineAtMs: opts.deadlineAtMs ?? null }), 'fence_repair');
+      phaseResults.push({ ...result, duration_ms }); await safeYield(opts.yieldBetweenPhases);
+    }
+
     // ── Phase 4: synthesize (v0.23) ─────────────────────────────
     if (phases.includes('synthesize')) {
       if (!engine) {
@@ -2391,7 +2415,7 @@ export async function runCycle(
         });
       } else {
         progress.start('cycle.extract_atoms');
-        const { runPhaseExtractAtoms } = await import('./cycle/extract-atoms.ts');
+        const { runPhaseExtractAtomsStamped: runPhaseExtractAtoms } = await import('./cycle/extract-atoms-stamp.ts');
         const xaSourceId = cycleSourceId ?? 'default';
         // v0.41.2.1 (D9 #5): union sync + synthesize affected slugs so the
         // incremental discovery path doesn't miss pages just-written by the
@@ -3212,6 +3236,8 @@ export function deriveStatus(phases: PhaseResult[], totals: CycleReport['totals'
   );
   if (attempted.length > 0) phases = attempted;
   if (phases.length === 0) return 'failed';
+  // #6242: nothing ran because every selected phase needed the busy maintenance lease.
+  if (phases.every(p => p.details?.reason === 'maintenance_lock_busy')) return 'skipped';
   const anyFailed = phases.some(p => p.status === 'fail');
   const allFailed = phases.every(p => p.status === 'fail');
   const anyWarn = phases.some(p => p.status === 'warn');

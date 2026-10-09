@@ -134,6 +134,10 @@
         "name": "reranker_health"
       },
       {
+        "category": "ops",
+        "name": "chat_fallback_chain"
+      },
+      {
         "category": "brain",
         "name": "graph_signals_coverage"
       },
@@ -216,6 +220,10 @@
       {
         "category": "brain",
         "name": "connector_held_items"
+      },
+      {
+        "category": "brain",
+        "name": "fence_integrity"
       },
       {
         "category": "brain",

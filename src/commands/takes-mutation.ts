@@ -1,4 +1,4 @@
-/** One parser and one operation path for local, resident, and remote takes mutations. */
+/** One parser and one operation path for local, resident, and remote takes mutations (and `takes rebuild`). */
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
@@ -16,18 +16,19 @@ import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
 
-const names = ['add', 'update', 'supersede', 'resolve'] as const;
+const names = ['add', 'update', 'supersede', 'resolve', 'remove'] as const;
 export type TakesMutation = typeof names[number];
 export function isTakesMutation(value: string): value is TakesMutation { return (names as readonly string[]).includes(value); }
 const USAGE_FIX = readFix('Prints every gbrain takes form with its flags.', { argv: ['gbrain', 'takes', '--help'] });
 const invalid = (message: string, suggestion: string, fix: Action = USAGE_FIX) => opError('invalid_params', message, suggestion, { fix });
 const REQUIRED_USAGE: Record<TakesMutation, string> = {
   add: '--claim "..." --kind fact|take|bet|hunch --who HOLDER', update: '--row N', supersede: '--row N --claim "..."', resolve: '--row N --quality correct|incorrect|partial',
+  remove: '--row N',
 };
 
 export function parseTakesMutation(args: string[]): { operation: `takes_${TakesMutation}`; params: Record<string, unknown>; sourceId?: string; json: boolean } {
   const [sub, slug, ...rest] = args;
-  if (!isTakesMutation(sub) || !slug || slug.startsWith('-')) throw invalid('Usage: gbrain takes add|update|supersede|resolve <slug> [options].',
+  if (!isTakesMutation(sub) || !slug || slug.startsWith('-')) throw invalid('Usage: gbrain takes add|update|supersede|resolve|remove <slug> [options].',
     isTakesMutation(sub) ? `Name the page slug right after takes ${sub}: gbrain takes ${sub} people/alice-example ${REQUIRED_USAGE[sub]}.`
       : 'Start with the mutation and the page slug, e.g. gbrain takes add people/alice-example --claim "..." --kind take --who alice-example.');
   const params: Record<string, unknown> = { slug };
@@ -65,6 +66,7 @@ export function parseTakesMutation(args: string[]): { operation: `takes_${TakesM
   const allowed = sub === 'add' ? ['claim', 'kind', 'holder', 'weight', 'source', 'since']
     : sub === 'update' ? ['row_num', 'weight', 'source', 'since']
     : sub === 'supersede' ? ['row_num', 'claim', 'kind', 'holder', 'weight', 'source', 'since']
+    : sub === 'remove' ? ['row_num']
     : ['row_num', 'quality', 'outcome', 'evidence', 'source', 'value', 'unit', 'resolved_by'];
   const flagOf = (key: string) => Object.keys(fields).find(flag => fields[flag] === key) ?? `--${key}`;
   for (const key of Object.keys(params)) if (![...common, ...allowed].includes(key)) throw invalid(`${key} is not supported by takes ${sub}.`,
@@ -106,6 +108,8 @@ export async function runTakesMutation(engine: BrainEngine | (() => Promise<Brai
     const config = configOverride ?? loadConfig(), cli = getCliOptions();
     let result: Record<string, unknown>;
     if (isThinClient(config)) {
+      if (operation === 'takes_remove') throw invalid('takes remove runs only on the brain host.',
+        'Run gbrain takes remove on the brain host; a remote connection cannot remove takes.');
       if (args.some(arg => arg === '--outcome' || arg.startsWith('--outcome='))) console.error('[deprecated] --outcome is the v0.28 alias for --quality. Prefer --quality correct|incorrect|partial in new scripts.');
       if (cli.brain || parsed.sourceId || params.local_dir !== undefined) throw invalid('--brain, --source-id, and --dir require a local brain host; the remote credential selects its source.',
         'Drop --brain, --source-id and --dir on this thin client: the remote connection\'s credential selects the brain and source.',
@@ -139,6 +143,7 @@ export async function runTakesMutation(engine: BrainEngine | (() => Promise<Brai
       if (operation === 'takes_add') console.log(`Added take #${row} to ${params.slug}.`);
       else if (operation === 'takes_update') console.log(`Updated take #${row} on ${params.slug}.`);
       else if (operation === 'takes_supersede') console.log(`Superseded #${result.old_row} → new #${result.new_row} on ${params.slug}.`);
+      else if (operation === 'takes_remove') console.log(`Removed take #${row} from ${params.slug}.`);
       else console.log(`Resolved take #${row} on ${params.slug}: quality=${params.quality}.`);
     }
   } catch (error) {
@@ -146,5 +151,55 @@ export async function runTakesMutation(engine: BrainEngine | (() => Promise<Brai
       console.error(error instanceof Error ? error.message : String(error)); setCliExitVerdict(1);
     }
     if (requestId) console.error(`Retry the same takes ${args[0]} arguments with --request-id ${requestId}.`);
+  }
+}
+
+/**
+ * W9F item 8: `gbrain takes rebuild <slug> [--source-id <id>] [--json]`. A
+ * resident owner (`gbrain serve` holding PGLite) runs the `takes_rebuild`
+ * operation; otherwise it runs here on the local engine. Both render the same
+ * operation result, so JSON, warnings and exit codes match: exit 1 when the
+ * page is missing or the rebuild warned.
+ */
+export async function runTakesRebuild(engine: BrainEngine | (() => Promise<BrainEngine>), args: string[], configOverride?: GBrainConfig): Promise<void> {
+  const [slug, ...rest] = args;
+  const json = rest.includes('--json');
+  if (!slug || slug.startsWith('-')) {
+    console.error('Usage: gbrain takes rebuild <slug> [--source-id <id>] [--json]');
+    setCliExitVerdict(1);
+    return;
+  }
+  const sourceFlag = rest.indexOf('--source-id');
+  const sourceId = sourceFlag >= 0 ? rest[sourceFlag + 1] : undefined;
+  try {
+    const config = configOverride ?? loadConfig(), cli = getCliOptions();
+    if (isThinClient(config)) throw invalid('takes rebuild runs only on the brain host.',
+      'Run gbrain takes rebuild on the brain host; a remote connection cannot rebuild the takes index.');
+    const params: Record<string, unknown> = { slug, request_id: randomUUID() };
+    const delegated = await maybeDelegateLocalOperation('takes_rebuild', params, config, {
+      brain: cli.brain, source: sourceId ?? null, timeoutMs: cli.timeoutMs ?? undefined,
+    });
+    let result: { source_id: string; pagesScanned: number; takesUpserted: number; warnings: string[] };
+    if (delegated.handled) result = delegated.result as typeof result;
+    else {
+      const connected = typeof engine === 'function' ? await engine() : engine;
+      const { operations } = await import('../core/operations.ts');
+      const op = operations.find(candidate => candidate.name === 'takes_rebuild')!;
+      result = await op.handler({ engine: connected, config: config ?? { engine: 'pglite' }, remote: false,
+        sourceId: await resolveSourceId(connected, sourceId ?? null), dryRun: false,
+        logger: { info: message => console.error(message), warn: message => console.error(message), error: message => console.error(message) },
+      }, params) as typeof result;
+    }
+    if (json) await writeStdoutFinal(`${JSON.stringify(result, null, 2)}\n`);
+    else if (result.pagesScanned === 0) console.error(`No page ${slug} in source ${result.source_id}.`);
+    else {
+      for (const warning of result.warnings) console.error(`[takes rebuild] ${warning}`);
+      console.log(`Rebuilt ${result.takesUpserted} take row(s) on ${slug} from its takes fence.`);
+    }
+    if (result.pagesScanned === 0 || result.warnings.length) setCliExitVerdict(1);
+  } catch (error) {
+    if (!await reportPersistenceCliError(error, json)) {
+      console.error(error instanceof Error ? error.message : String(error)); setCliExitVerdict(1);
+    }
   }
 }

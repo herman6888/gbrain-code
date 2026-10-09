@@ -40,7 +40,7 @@ export const WRITE_ATTRIBUTION_CONTENT_COLUMNS: Record<AttributedTable, readonly
   facts: ['id', 'source_id', 'entity_slug', 'fact', 'kind', 'visibility', 'notability', 'context', 'valid_from',
     'valid_until', 'expired_at', 'superseded_by', 'consolidated_at', 'consolidated_into', 'source', 'source_session',
     'confidence', 'created_at', 'row_num', 'source_markdown_slug', 'claim_metric', 'claim_value', 'claim_unit',
-    'claim_period', 'event_type', 'dimension', 'value', 'value_hash', 'dim_status'],
+    'claim_period', 'event_type', 'dimension', 'value', 'value_hash', 'dim_status', 'attributed_to'],
   takes: ['id', 'page_id', 'row_num', 'claim', 'kind', 'holder', 'weight', 'since_date', 'until_date', 'source',
     'superseded_by', 'active', 'resolved_at', 'resolved_outcome', 'resolved_value', 'resolved_unit', 'resolved_source',
     'resolved_by', 'created_at', 'resolved_quality'],
@@ -74,7 +74,7 @@ const addColumns = (table: string, columns: readonly string[]) =>
  * changed (to NULL when no actor is set: an unattributed writer mutated it).
  * Either pair may be filled while it is still NULL (journal backfill).
  */
-const STAMP_ROW_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_write_attribution() RETURNS trigger LANGUAGE plpgsql AS $fn$
+const STAMP_ROW_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_write_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
 DECLARE req uuid; principal_kind text; principal_id text; changed boolean;
 BEGIN${SETTINGS}
   IF TG_OP = 'INSERT' THEN
@@ -109,7 +109,7 @@ END $fn$`;
  * writes bump the revision through an update of the page row, so they are
  * attributed too.
  */
-const STAMP_REVISION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_revision_attribution() RETURNS trigger LANGUAGE plpgsql AS $fn$
+const STAMP_REVISION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_revision_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
 DECLARE req uuid; principal_kind text; principal_id text;
 BEGIN${SETTINGS}
   IF TG_OP = 'INSERT' THEN
@@ -130,7 +130,7 @@ END $fn$`;
  * the same transaction, so the page row still carries the snapshotted
  * revision and its writer. The archiving actor comes from the settings.
  */
-const STAMP_VERSION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_version_attribution() RETURNS trigger LANGUAGE plpgsql AS $fn$
+const STAMP_VERSION_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_version_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
 DECLARE req uuid; principal_kind text; principal_id text;
 BEGIN${SETTINGS}
   IF (NEW.write_request_id, NEW.write_principal_kind, NEW.write_principal_id) IS NOT DISTINCT FROM (NULL::uuid, NULL::text, NULL::text) THEN

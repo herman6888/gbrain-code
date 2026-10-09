@@ -28,6 +28,7 @@ tools:
   - traverse_graph
   - get_timeline
 mutating: false
+when_to_use: "Use when the user asks: \"what do we know about\", \"tell me about\", \"who is\", \"what happened\", \"search for\"."
 ---
 
 # Query Skill
@@ -74,7 +75,7 @@ This skill guarantees:
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Check each retrieval result for notices before answering: on MCP, extra text blocks whose first line looks like [gbrain notice empty_retrieval kind=degraded], mirrored in `_meta.gbrain_notices`; on the CLI, the `[AGENT]` block, `search_degraded`, or a `note: search degraded` line.
 - `empty_retrieval` with `kind=degraded` (or `search_degraded: keyword_only_no_embedding_provider`): an empty result is NOT proof the user has no notes. Tell the user "your brain is searching keywords only right now, so I may be missing notes on X", try exact names and synonyms with `gbrain search`, and point to the notice's fix (usually enabling embeddings).
@@ -157,7 +158,7 @@ claiming activation; otherwise report adoption as unverified.
   page, budgeted by `token_budget`, default 6,000) or `"window"` (neighbor
   chunks). `return_unit: "chunk"` opts out.
   Each result then carries the evidence in `chunk_text` plus a `delivered`
-  block; see [evidence delivery](../../docs/evidence-delivery.md).
+  block; see [evidence delivery](https://github.com/garrytan/gbrain/blob/master/docs/evidence-delivery.md).
   `gbrain query "when did the launch move?" --return-unit page --token-budget 6000`
 - Only use `gbrain get <slug>` to load the full page when a chunk confirms the
   page is relevant and you need more context (e.g., compiled truth, timeline).
@@ -224,12 +225,3 @@ If search results seem off (wrong results, missing known pages, irrelevant hits)
 - Check backlinks in gbrain (get_backlinks)
 - Traverse the link graph in gbrain (traverse_graph)
 - View timeline entries in gbrain (get_timeline)
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `get_timeline` → `gbrain timeline`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

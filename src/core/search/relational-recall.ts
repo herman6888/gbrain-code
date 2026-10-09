@@ -223,6 +223,7 @@ async function hydrate(
       relational_seed: seedSlug,
       relational_hop: r.hop,
       relational_path: r.path,
+      relational_path_edges: r.path_edges,
     });
   }
   return out;

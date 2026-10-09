@@ -73,7 +73,7 @@ distinct_from:
   - name: skillify
     reason: "skillify is the meta-skill for turning a feature into a tested skill. EIIRP calls skillify when Phase 5 identifies a reusable pattern."
   - name: signal-detector
-    reason: "signal-detector ambiently captures the USER's ideas + entity mentions on every inbound message. EIIRP's auto-fire gate files the AGENT's own deliverable analysis at reply time. Both are always-on; they watch opposite directions of the conversation."
+    reason: "signal-detector (after explicit automatic-capture opt-in) ambiently captures the USER's ideas + entity mentions on every inbound message. EIIRP's auto-fire gate files the AGENT's own deliverable analysis at reply time. signal-detector runs only after the user's explicit automatic-capture opt-in; EIIRP's gate is always-on. They watch opposite directions of the conversation."
   - name: meeting-ingestion
     reason: "meeting-ingestion (like idea-ingest, media-ingest, voice-note-ingest, book-mirror) is a dedicated pipeline with its own brain-write logic. The auto-fire gate EXEMPTS dedicated-pipeline content — it never double-files."
 ---
@@ -458,7 +458,7 @@ reads it; doctor cross-references the pack version).
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - A schema change (`gbrain schema add-type`, `gbrain schema use`) needs the user's confirmation; present it and stop if they decline.
 - `gbrain schema suggest` runs heuristic-only without an API key: say the suggestions are heuristic, not LLM-refined.

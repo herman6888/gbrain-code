@@ -4,23 +4,85 @@
 instead of one Docker host. It packs the working tree once (tracked files,
 untracked files that are not ignored, and `.git`) and streams it to every VM, so
 uncommitted edits are tested. `scripts/ubicloud/ubi-runner.sh` creates and
-destroys the VMs; every VM is destroyed on exit, including Ctrl-C, and any
-`ubirun-*` VM older than 12 hours is garbage-collected by the next run.
+destroys the VMs.
+
+## Ownership and teardown
+
+Every VM is named `ubirun-<owner>-<epoch>-<suffix>`. The owner is `UBI_OWNER`
+(lowercased, letters and digits only, at most 12 characters, starting with a
+letter) or a random per-machine id kept in the runner's state directory. Set
+`UBI_OWNER` to your thread code (`UBI_OWNER=gbra41 bun run ci:ubicloud`) so
+everyone can see whose VMs hold the quota. Ubicloud names allow 63 characters
+of `[a-z0-9-]`, so a full name stays under 40.
+
+Each name is recorded before its create request is sent: the runner writes
+the VM's state directory first, and `ci-ubicloud.ts` appends the name to
+`.context/ci-ubicloud/<run>/vms.txt`. On every exit, including Ctrl-C,
+SIGTERM, SIGQUIT and SIGHUP (a dropped terminal or a cancelled background
+operation), an `up` still talking to the API finishes the request and destroys
+its own VM; further signals are ignored until teardown ends. Then every recorded name gets `down`, which destroys the VM and polls
+until it is confirmed gone. A create whose answer never arrived is waited out
+for `UBI_CREATE_GRACE` seconds (default 180) before the VM counts as never
+created. `down` gives up after `UBI_DOWN_TIMEOUT` seconds (default 900) and
+prints the command to rerun.
+
+Nothing sweeps stale VMs unless you ask. With `UBI_GC_HOURS` set to a positive
+number, each `up` first destroys the caller's own VMs older than that many
+hours. An operator runs the same sweep with `ubi-runner.sh gc HOURS`. Neither
+ever destroys another owner's VM, an untagged legacy `ubirun-<epoch>-*` VM, or a
+VM the runner did not name. Use `down NAME` for those after checking who owns
+them.
+
+A machine that goes to sleep kills the run outright, with no signal, so
+teardown can't run: on Capy, run `ci:ubicloud` as a watched background
+operation so the machine stays awake. After any interrupted run, check
+`list --mine` and reap leftovers with `down NAME` (or `gc HOURS`, which only
+destroys your own VMs older than HOURS).
+
+`ubi-runner.sh list --mine` lists your VMs. `ubi-runner.sh usage` prints VMs
+and vCPUs per owner across the project, which shows who holds the shared quota.
 
 Each VM runs `scripts/ubicloud/setup-ci-vm.sh`: the pinned Bun from
-`docker-compose.ci.yml`, the runner container's test prerequisites plus Node,
-frozen dependencies, both PGLite snapshot fixtures, and one
+`docker-compose.ci.yml`, the runner container's test prerequisites plus Node
+and a C compiler, frozen dependencies, both PGLite snapshot fixtures, and one
 `pgvector/pgvector:pg16` server fronted by a transaction-mode PgBouncer per
 slot. Every slot's schema is bootstrapped with `setupLegacyEmbeddingDB()`, the
 same step nightly full-corpus E2E workers run, so no E2E file depends on which
-file reaches a database first. Setup takes 70-90 seconds, including VM boot.
+file reaches a database first.
+
+Setup takes 60-80 seconds, including VM boot (about 25 seconds). The
+orchestrator packs the checkout while the VMs boot, then streams the setup
+script over SSH as soon as a VM answers, so apt, the Bun and gitleaks
+downloads and the image pulls run while the checkout is still uploading; the
+script waits for a marker file before the steps that need the checkout. apt
+skips fsync, man-db, needrestart and the translation, AppStream and
+command-not-found indexes. Database containers start only after apt finishes,
+because a package's systemd reload during `docker run` fails the container.
+The tarball carries a slim `.git` holding only what `HEAD` and `origin/master`
+reach, plus the branch, index and config, so a checkout that fetched many
+branches uploads about 80 MB instead of 250 MB. The critical path is now apt's
+package installs (about 23 seconds of dpkg work); downloads take two seconds.
+
+`scripts/ubicloud/build-ci-image.sh` builds the `gbrain-ci` machine image
+(apt packages and both database images baked in), and `--image
+gbrain-ci@latest` or `UBI_CI_IMAGE` boots it, which cuts the setup script from
+about 40 seconds to 18. It is opt-in until image boots prove as reliable as
+stock ones: on its first full gate five of eight VMs sat in `waiting for
+capacity`. Stock VMs hit the same wait later (six of ten in one burst), so
+`eu-central-h1` capacity, not just the quota, can shrink a fleet; the run
+then continues on the VMs that did start, and it ends once every item has a
+result rather than waiting for a VM that never came up. Rebuild the image when the package
+list or images change; setup still pulls the floating image tags, so a stale
+image costs time, not correctness.
 
 Scheduling is dynamic. Every unit, serial, slow and E2E file is one item in a
 global queue ordered by weight, heaviest first. Each idle slot on any VM takes
 the next item, so a slow VM or a mis-weighted file delays only the slot holding
 it. Light items leave in same-lane batches to amortize SSH round trips, and the
 batch target shrinks as the queue drains. Items of 60 seconds or more are the
-run's long poles, so they spread one per VM before any VM takes a second one.
+run's long poles, so they spread one per VM before any VM takes a second one;
+the VM running the machine-level items below counts only once it joins the
+pool.
 The first VM to finish setup runs the
 machine-level work first: gitleaks, `verify`, then the serial lane's
 machine-exclusive files one at a time with nothing else on that VM. After that
@@ -41,20 +103,35 @@ when any item fails, an item never produces a result, or no VM becomes ready.
 An item whose SSH batch dies without a result is retried once on any slot, and a
 VM with three such infrastructure errors is retired.
 
-Defaults are four `standard-16` VMs (64 vCPUs) in `eu-central-h1` with 8 slots
-each, one per two vCPUs (`--vms`, `--size`, `--slots`, `--location`). The
-Ubicloud project's vCPU quota (256) is shared with pull-request CI, so the
-default leaves room for about two concurrent PR runs; the former default of
-ten VMs took 160 vCPUs and queued PR jobs for up to 28 minutes. A VM that the
-quota refuses fails to provision and the run continues on the VMs that did
-start, so a busy project shrinks the fleet instead of failing. Pass `--vms 10`
-only when the quota is idle. Slow-lane items run `test/export-scale.slow.test.ts`
+The fleet is sized from the quota. Without `--vms`, the run reads
+`ubi-runner.sh usage` and takes as many `standard-16` VMs as fit under 448 of
+the project's 512 vCPUs, between the default of four (64 vCPUs) and the burst
+maximum of ten (160 vCPUs), and never more than the work can use (each slot
+needs at least two minutes of weighted work, so `--lanes gitleaks` gets one
+VM). The decision is logged (`fleet: project VMs hold 192 vCPUs, ceiling 448:
+10 VM(s) × 16 vCPUs (burst maximum 10)`). The 64 vCPUs above the ceiling are
+headroom for the managed GitHub runners `usage` can't see. When usage can't
+be read, or the project is busy, the run takes the default. Slots default to
+one per two vCPUs (`--slots`); `--size` and `--location` pick the VM shape. In
+a multi-lane wave, each lane runs `ci:ubicloud:diff` or its targeted suites,
+and only the integrator runs the full gate. A VM that the quota refuses fails
+to provision and the run continues on the VMs that did start, so a busy
+project shrinks the fleet instead of failing. The runner prints the refusal
+(needed, used and maximum vCPUs) with the project's VMs and vCPUs per owner;
+used vCPUs beyond that table are other usage, such as managed GitHub runners. Slow-lane items run `test/export-scale.slow.test.ts`
 at the pull-request scale (`GBRAIN_TEST_EXPORT_SCALE_PAGES=10001`). `--lanes` runs a
 subset, `--keep` leaves the VMs up for debugging, and `--diff` follows
-`ci:local:diff` (a doc-only diff runs the doc checks and gitleaks alone). The corpus is roughly
-8,000 seconds of test compute at that density, so 80 slots finish everything
-but the longest files about two minutes after setup; more slots per VM add CPU
-contention that slows timing-sensitive files without shortening the run. Wall time is bounded
-by setup plus the longest single file,
-`test/reindex-markdown-persistence.slow.test.ts` (one test, about 230 seconds),
-so adding VMs past the default does not shorten a run.
+`ci:local:diff` (a doc-only diff runs the doc checks and gitleaks alone).
+
+A full gate is about 16,000 seconds of test compute at 8 slots per VM, and
+the heaviest-first queue keeps every slot busy almost to the end, so wall
+time is setup plus compute divided by slots. No single file runs much past
+three minutes: the former long poles are split into files of about two
+minutes (`graduation-cli*`, `graduation-crash-*`, `graduation-clients*`,
+`reconcile-crash-*.slow`, `write-attribution-timeline-10k-postgres`), and the
+longest single test left is the 1k-page graduation round trip (about 150
+seconds). More slots per VM do not help: on eight VMs, 12 slots raised
+compute 27% (unit 27%, E2E 25%, serial 31%) and finished in 353 seconds
+against 359 at 8 slots, and 16 slots raised it 52% and took 444 seconds.
+Neither produced a failure, but the extra contention buys no wall time, so 8
+slots (one per two vCPUs) stays the default and bursts add VMs instead.

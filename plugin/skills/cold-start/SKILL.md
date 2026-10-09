@@ -37,6 +37,7 @@ writes_to:
   - media/
   - conversations/
   - sources/
+when_to_use: "Use when the user asks: \"cold start\", \"fill my brain\", \"bootstrap brain\", \"bootstrap my data\", \"import my data\"."
 ---
 
 # Cold Start — Day-One Brain Bootstrapping
@@ -476,7 +477,12 @@ After completing available phases:
    - Calendar: daily cron
    - Email: periodic sweep (4-8 hours)
    - X: daily ingest
-   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes
+   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes. A managed brain
+     (`gbrain sources writer status --json` shows `"mode": "managed"`) refuses
+     that line: use the managed recipe in `skills/cron-scheduler/SKILL.md`
+     ("Managed brain") with `--source <id>`, e.g.
+     `gbrain sources refresh <id>; gbrain sync --source <id> --no-pull --hard-deadline 13m`
+     every 15 minutes on the owner host.
 
 4. **Track state:**
    ```json
@@ -502,7 +508,7 @@ After completing available phases:
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Every import phase is a user choice: when a command exits 3 (`confirmation_required`) or prints an `[AGENT]` ask, relay the `[SHOW USER]` block and wait; do not chain phases with `--yes`.
 - `gbrain google setup` prints `[SHOW USER]` steps: relay them verbatim and wait for the user to finish the consent click. Credential errors carry their own `fix`; follow it.
@@ -563,13 +569,3 @@ Next: Phase N+1 — [description]. Ready to proceed?
 - `add_link` — cross-reference entities
 - `add_timeline_entry` — record events on entity timelines
 - `sync_brain` — sync changes to the index after each phase
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-- `sync_brain` → `gbrain sync`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

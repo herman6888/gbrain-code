@@ -154,6 +154,8 @@
     "getTimelineForDate#week+sourceId": {},
     "getVersions#default": {},
     "getVersions#excludePrivate": {},
+    "getVersions#limit": {},
+    "getVersions#metadataOnly": {},
     "getVersions#sourceId": {},
     "getVersions#sourceIds": {},
     "insertFact#default": {},
@@ -194,6 +196,9 @@
     "listFactsByEntity#default": {},
     "listFactsBySession#allFilters": {},
     "listFactsBySession#default": {},
+    "listFactsKeyset#default": {},
+    "listFactsKeyset#keyset": {},
+    "listFactsKeyset#strictTime": {},
     "listFactsSince#allFilters": {},
     "listFactsSince#default": {},
     "listFilesForPage#default": {},
@@ -283,6 +288,10 @@
     },
     "replaceDerivedLinks#default": {
       "raw": 12,
+      "tx": 1
+    },
+    "replaceDerivedLinksBatch#default": {
+      "raw": 13,
       "tx": 1
     },
     "resolveSlugWithAlias#default": {},

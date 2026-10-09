@@ -69,6 +69,7 @@ import {
   bankWritebackTurn,
   decideCorpusMode,
   gcCorpusArtifacts,
+  gcCorpusTurnFiles,
   CORPUS_PROGRESS_SUFFIX,
   CORPUS_PROGRESS_LOCK_SUFFIX,
   HARVEST_RECEIPT_SUFFIX,
@@ -77,6 +78,7 @@ import {
 import { hookLaneLabel, resolveSeat, seatReasonHint, writeSeatSidecar } from '../core/context/seat.ts';
 import { gateWritebackTurn, WRITEBACK_SKIP_REASONS } from '../core/facts/writeback-gate.ts';
 import { resolveWritebackConfigFromFile } from '../core/facts/writeback-config.ts';
+import { recordCaptureIfOff } from '../core/context/capture-consent.ts';
 import { memorableGateAllowed, recordAndRelayReceipt, redactedToolCallsJson } from '../core/context/hook-heartbeat.ts';
 import { captureSpecFor } from '../core/transcripts/capture-spec.ts';
 import {
@@ -87,6 +89,8 @@ import {
   type HookHeartbeatEntry,
 } from '../core/context/hook-heartbeat.ts';
 import { CLAUDE_HOOK_OUTPUT_CAP_CHARS } from '../core/bootstrap/host-specs.ts';
+import { composeSessionStartOutput } from '../core/context/session-start-output.ts';
+import { claudeCodePressure } from '../core/context/pressure.ts';
 import { readManifest, readReceipt, type InstallReceipt } from '../core/bootstrap/format.ts';
 import { githubOwnerRepoString } from '../core/repo-visibility.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
@@ -108,6 +112,9 @@ import {
 } from '../core/backup/status-file.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
 import { isClaudeCliSelfTranscriptPath } from '../core/ai/providers/claude-cli-scratch.ts';
+import { withoutPhysicalRootMetadata } from '../core/persistence/root-metadata.ts';
+import { HOOK_SUBCOMMANDS as HOOK_EVENTS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+import { isManagedFilesystemPath } from '../core/persistence/filesystem-guard.ts';
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
@@ -228,7 +235,8 @@ export interface HookIo {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
-export const HOOK_EVENTS = ['session-start', 'user-prompt', 'stop', 'session-end', 'compact'] as const;
+export { HOOK_EVENTS, HOOK_EVENTS as SUBCOMMANDS };
+export const printUsage = (): void => { process.stdout.write(`${USAGE}\n`); };
 
 const USAGE = `Usage: gbrain hook <event>
 
@@ -253,7 +261,7 @@ All events fail open: errors exit 0 with empty stdout and a heartbeat entry at
 /** Dispatch a hook event. Returns the process exit code (0 for every runtime path). */
 export async function runHook(args: string[], io: HookIo = {}): Promise<number> {
   const event = args[0];
-  if (event === '--help' || event === '-h' || event === 'help') {
+  if (subcommandHelpRequested(args, ROUTERS.hook)) {
     write(io, USAGE + '\n');
     return 0;
   }
@@ -478,6 +486,7 @@ async function hookSessionStart(io: HookIo): Promise<number> {
   let outcome: HookHeartbeatEntry['outcome'] = 'ok';
   let reason: string | undefined;
   const out: string[] = [];
+  const coreBox: { core: { text: string; revision: string; chars_used: number } | null; reason?: string } = { core: null };
   // Deferred nag records: fire ONLY after the digest actually reached stdout
   // (record-after-write — a deadline-suppressed note must re-fire next time).
   const deferredRecords: Array<() => void> = [];
@@ -556,6 +565,8 @@ async function hookSessionStart(io: HookIo): Promise<number> {
               if (res !== IPC_UNAVAILABLE && !('degraded' in res)) {
                 const pack = res as ContextPackResponse;
                 if (pack.ok && pack.block?.text) out.push(pack.block.text);
+                if (pack.ok && pack.block?.core && process.env.GBRAIN_CORE !== '0') coreBox.core = pack.block.core;
+                else if (pack.ok && !pack.block?.core) coreBox.reason = 'stale_serve_no_core';
               }
             }
           }
@@ -570,7 +581,8 @@ async function hookSessionStart(io: HookIo): Promise<number> {
     }
     // Print whatever accumulated before the deadline — a partial digest
     // beats an empty one (the deadline bounds latency, not usefulness).
-    const text = out.filter(Boolean).join('\n\n');
+    // Always-loaded core first; digest/pack trimmed to the cap (session-start-output.ts).
+    const text = composeSessionStartOutput(coreBox.core?.text ?? '', out.filter(Boolean));
     if (text) {
       write(io, text + '\n');
       for (const record of deferredRecords) {
@@ -589,8 +601,9 @@ async function hookSessionStart(io: HookIo): Promise<number> {
     ts: new Date().toISOString(),
     event: 'session-start',
     outcome,
-    ...(reason ? { reason } : {}),
+    ...(reason ? { reason } : coreBox.reason ? { reason: coreBox.reason } : {}),
     duration_ms: Date.now() - t0,
+    ...(coreBox.core ? { core_chars: coreBox.core.chars_used, core_revision: coreBox.core.revision } : {}),
   });
   return 0;
 }
@@ -808,6 +821,7 @@ async function dirtyTreePush(
     const root = await resolveBootstrapWorkspaceRoot(ws);
     if (!root) return null;
     if (!(await treeNeedsPush(root))) return null; // clean + up to date → nothing to recover
+    if (isManagedFilesystemPath(root)) return { reason: 'push_managed_coordinator' };
     // There IS unpushed work. Defer until the repo phase verified privacy +
     // recorded repo_url — never recover-push to an unverified origin
     // (create-repo-first race). Only fires when work actually exists (P2-1).
@@ -847,7 +861,7 @@ async function treeNeedsPush(root: string): Promise<boolean> {
   // doesn't resolve yet (never pushed), any commit past the empty tree counts
   // as needs-push.
   const status = await tryExecAsync('git', ['-C', root, 'status', '--porcelain']);
-  if ((status ?? '') !== '') return true;
+  if (withoutPhysicalRootMetadata(status ?? '') !== '') return true;
   const branch = await tryExecAsync('git', ['-C', root, 'branch', '--show-current']);
   const b = (branch ?? '').trim();
   if (b) {
@@ -934,6 +948,7 @@ async function stopPushIfDue(ws: string, io: HookIo): Promise<string> {
   // verified the origin and recorded repo_url (create-repo-first race).
   if (!(await repoPhaseComplete(root))) return 'push_deferred_repo_pending';
   if (!(await treeNeedsPush(root))) return 'push_clean';
+  if (isManagedFilesystemPath(root)) return 'push_managed_coordinator';
   try {
     // Written BEFORE the spawn so repeated fail-fast children stay debounced
     // on the healthy path; the [D20] failing-status bypass handles retries.
@@ -1075,6 +1090,7 @@ interface UserPromptOutcome {
   outcome: HookHeartbeatEntry['outcome'];
   reason?: string;
   turns?: number;
+  pressure_pct?: number;
 }
 
 async function hookUserPrompt(io: HookIo): Promise<number> {
@@ -1106,6 +1122,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     // path aborts the event (heartbeat + empty stdout), never "best effort".
     let turns: WindowTurn[] = [];
     let priorContextText: string | undefined;
+    let transcriptPath: string | undefined;
     if (j.transcript_path !== undefined && j.transcript_path !== null) {
       const conf = confineTranscriptPath(j.transcript_path, {
         ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
@@ -1115,6 +1132,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
         allowOversize: true,
       });
       if (!conf.ok) return { outcome: 'degraded', reason: `transcript_${conf.reason}` };
+      transcriptPath = conf.path;
       try {
         const parsed = parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES });
         turns = parsed.turns.slice(-USER_PROMPT_WINDOW_TURNS);
@@ -1191,7 +1209,9 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     if (!resp.ok) {
       return { outcome: 'degraded', reason: reasonCode(resp.error ?? 'server_error'), turns: turns.length };
     }
-    const text = resp.block?.text ?? '';
+    // Context-pressure notice (pressure.ts) leads the block so the cap loop never trims it.
+    const pressure = transcriptPath ? claudeCodePressure(resp.block?.pressure, transcriptPath, sessionId) : null;
+    const text = [pressure?.notice, resp.block?.text].filter(Boolean).join('\n\n');
     if (!text) return { outcome: 'ok', reason: 'empty_block', turns: turns.length };
 
     // [ENG-1] The 10000-char harness cap applies to the WHOLE stdout payload;
@@ -1222,10 +1242,9 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     // were never injected. Record it so the doctor's heartbeat reconciliation
     // (and a future reconciler) can see the divergence — outcome stays ok
     // (context WAS injected), the reason carries the signal.
-    if (blockText.length < text.length) {
-      return { outcome: 'ok', reason: 'trimmed', turns: turns.length };
-    }
-    return { outcome: 'ok', turns: turns.length };
+    const pct = pressure?.notice ? { pressure_pct: pressure.percent } : {};
+    if (blockText.length < text.length) return { outcome: 'ok', reason: 'trimmed', turns: turns.length, ...pct };
+    return { outcome: 'ok', turns: turns.length, ...pct };
   })();
 
   let result: UserPromptOutcome;
@@ -1263,6 +1282,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     ...(result.reason ? { reason: result.reason } : {}),
     duration_ms: Date.now() - t0,
     ...(result.turns !== undefined ? { turns: result.turns } : {}),
+    ...(result.pressure_pct !== undefined ? { pressure_pct: result.pressure_pct } : {}),
   });
   return 0;
 }
@@ -1357,6 +1377,7 @@ async function hookCompact(io: HookIo): Promise<number> {
       remainingMs: remaining,
       minScanMs: SEGMENT_MIN_BUDGET_MS,
       minWriteMs: SEGMENT_WRITE_MIN_BUDGET_MS,
+      beforeWrite: (file, text) => { recordCaptureIfOff(cfg, file, text, process.env.GBRAIN_SOURCE); },
     });
     segment = banked.segment;
     const flushCorpusFile = banked.flushCorpusFile;
@@ -1720,6 +1741,12 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           /* status telemetry best-effort */
         }
       } else if (turnsN > 0) {
+        // E-N4: assistant turns with not one user turn is how #5163 (a host
+        // renamed its user-turn record) banked half-sessions silently. The
+        // corpus is still written; the heartbeat says the human side is gone.
+        // Whole-file reads only: a bounded tail of a long agentic run can
+        // legitimately hold assistant turns alone.
+        if (parsed.genuineUserTurnIndexes.length === 0 && bytesN >= conf.size) degrade('no_user_turns');
         const dir = await corpusDir(cfg);
         // #4618: the seat is recorded BEFORE any corpus file of this session
         // is renamed into place, so a sweep never sees one without its seat.
@@ -1766,6 +1793,7 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           // completion sidecar survived the overwrite).
           const corpusFile = join(dir, `${sessionId}.txt`);
           const tmpCorpus = `${corpusFile}.tmp-${process.pid}`;
+          recordCaptureIfOff(cfg, corpusFile, text, process.env.GBRAIN_SOURCE); // #6091, before the rename
           writeFileSync(tmpCorpus, text, { mode: 0o600 });
           renameSync(tmpCorpus, corpusFile);
           // Additive signal for a local third-party consumer (never gbrain
@@ -1811,7 +1839,7 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           }
         }
         const retentionMs = corpusRetentionDays(cfg) * 24 * 60 * 60 * 1000;
-        gcOldFiles(dir, retentionMs); // [G15]
+        gcCorpusTurnFiles(dir, retentionMs); // [G15]; un-ingested turns kept longer (E-N1)
         gcCorpusArtifacts(dir, retentionMs, [
           CORPUS_INGESTED_SUFFIX,
           CORPUS_CLAIM_SUFFIX,
@@ -1835,7 +1863,9 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
   try {
     if (ws) {
       const root = await resolveBootstrapWorkspaceRoot(ws);
-      if (root && (await repoPhaseComplete(root))) {
+      if (root && isManagedFilesystemPath(root)) {
+        if (outcome === 'ok' && !reason) reason = 'push_managed_coordinator';
+      } else if (root && (await repoPhaseComplete(root))) {
         try {
           (io.spawnPush ?? spawnDetachedPush)(root);
           if (outcome === 'ok' && !reason) reason = 'push_spawned';

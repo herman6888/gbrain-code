@@ -43,7 +43,7 @@ import { VERSION } from '../version.ts';
 import { dispatchToolCall, requestLogStatusForResult, errorResult } from './dispatch.ts';
 import { GBRAIN_CLIENT_HEADER, resolveResultRowsMode, resultRowsForRequest } from './result-rows.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
-import { filterOpsForSurface, clampSurface, type McpSurface } from './surface.ts';
+import { filterOpsForSurface, clampSurface, advertisedOps, resolveAdvertisedSurface, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
@@ -53,10 +53,15 @@ import { classifyPgAccessError } from '../core/pg-access-classify.ts';
 import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
 import { redactUrlsInText } from '../core/url-redact.ts';
 import { authSourcesFromGrant } from '../core/grants/model.ts';
-import { resolveTokenGrant } from '../core/grants/legacy-token.ts';
+import { resolveTokenGrant, touchTokenLastUsed } from '../core/grants/legacy-token.ts';
 export { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
+
+/** #6007: what an agent does after a 413: nothing was processed, so split the request. */
+function oversizeSuggestion(bodyCap: number): string {
+  return `Nothing was processed. Send smaller requests: split put_pages into calls under ${bodyCap} bytes each (a new request_id per call). The host operator sets this limit with GBRAIN_HTTP_MAX_BODY_BYTES.`;
+}
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -212,10 +217,10 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // config plane — this transport builds its tool list once, so a
   // `mcp.strict_params` flip needs a restart here (deliberate; the OAuth
   // serve-http path re-reads dual-plane per request). Dispatch-side
-  // enforcement still resolves per call.
+  // enforcement still resolves per call. mcp.advertised_surface (file plane) narrows the tool list only.
   const fileConfig = loadConfig();
   const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
-  const tools = buildToolDefs(surfacedOps, { strictParams });
+  const tools = buildToolDefs(advertisedOps(surfacedOps, surface, await resolveAdvertisedSurface(null, fileConfig)), { strictParams });
 
   /**
    * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
@@ -265,13 +270,8 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (!row) return { ok: false };
       const rowId = row.id as string;
       const rowName = row.name as string;
-      // Debounced last_used_at update — only writes once per token per 60s.
-      // SQL-level WHERE clause keeps this race-tolerant even under concurrent requests;
-      // SKIP LOCKED keeps a row lock held elsewhere from parking a pool slot (#5730).
-      sql`UPDATE access_tokens SET last_used_at = now()
-          WHERE id IN (SELECT id FROM access_tokens WHERE id = ${rowId}
-            AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds') FOR UPDATE SKIP LOCKED)`
-        .catch(() => { /* fire-and-forget */ });
+      // Debounced fire-and-forget last_used_at update, shared with the OAuth provider.
+      void touchTokenLastUsed(sql, row);
       // One grant shape (grants/model.ts) shared with the OAuth provider
       // behind `serve --http`, so the two transports cannot drift; a row still
       // on the legacy shape is converted on this read. Takes holders fail safe
@@ -382,7 +382,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (bodyText === null) {
         logRequest(null, 'unknown', 'body_too_large', Date.now() - startedMs);
         return Response.json(
-          { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes` },
+          { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes`, suggestion: oversizeSuggestion(bodyCap) },
           { status: 413, headers: corsHeaders(origin) },
         );
       }

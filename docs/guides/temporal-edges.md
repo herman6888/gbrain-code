@@ -82,6 +82,83 @@ the page states:
 Dated evidence beats undated evidence from any page: a closure on a person's timeline
 ends the relationship even if the company page still lists them under `key_people`.
 
+## Relationship phrasings: what each wording means
+
+Link typing reads what the sentence entails, nothing more. Each policy below is one
+rule family with a stable rule id; `explainLinkType` (`src/core/link-extraction.ts`)
+returns, for any page and target, the stated type, the pack rule, the deciding rule,
+how its verb attached to this link, the alternatives it suppressed, the role prior,
+and the cue behind every dated transition.
+
+Rows marked **U1**, **U3** and **U4** are typing units that ship on: the preregistered held-out decision
+`q2-parser-gaps-2026-10` confirmed U1 and the joint unit U34 (U3 with U4, measured together because U4 alone loses
+as-of accuracy wherever board wording still types `works_at`). `ENABLED_TYPING_UNITS` in
+`src/core/link-typing-units.ts` lists them. The unmarked rows are the core rules. Three more units were tested and not
+shipped (see "Tested and not shipped" below); their code is removed, so those phrasings stay as the core rules read them.
+
+| Policy | Supported examples | Type | Temporal evidence | Unsupported (stays as written) |
+|---|---|---|---|---|
+| Employment verbs (`verb.works_at`) | "works at [X]", "VP engineering at [X]", "joined as CTO", "head of sales" | `works_at` | "Joined/Left/Moved from [X]" date it (`cue.employment.*`) | a job title alone after the link ("Joined [X] as designer"), "<role> for [X]", "[X] (<role>)"; leave idioms ("parted company with", "handed in her notice at") and start framings ("first day at", "onboarding week at") date nothing |
+| Advisory verbs (`verb.advises`) | "advises [X]", "is an advisor to [X]", "joined the advisory board of [X]" | `advises` | "Became an advisor to", "Started advising", "stepped down as advisor to" (`cue.advisory.*`) | "advising [X]", the `adviser` spelling |
+| Investment verbs (`verb.invested_in`) | "invested in [X]", "led the seed", "wrote a check" | `invested_in` (event) | "Invested in", "led the … round" (`cue.event.invested_in`) | "as an angel investor" |
+| Board seat (`verb.invested_in.board_seat`) | "board seat at [X]" | `invested_in` | event start | — |
+| Role priors (`prior.investor` > `prior.advisor` > `prior.employee`) | a person page that says "partner at a venture fund", "is an advisor", "is a senior engineer at" | the prior's type, for person → company links no verb typed | none of its own | timeline and see-also links never get a prior |
+| **U1** adviser wording (`unit.u1.adviser`) | "is an adviser to [X]", "serves as an adviser to", "now advising [X]", "technical adviser at [X]" | `advises` | as advisory verbs | "financial adviser at [Bank]" (a job title); a third party's role ("her husband is an adviser to"); an adviser phrase in another sentence or timeline entry |
+| **U1** local negation (`unit.u1.negated`) | "not an advisor to [X]", "no longer advises [X]", "stopped advising [X]" | `mentions` for that occurrence | the dated "no longer advises" cue still ends an `advises` the page states elsewhere | negation more than a few words away |
+| **U3** board wording (`unit.u3.board_wording`) | "board director at [X]", "independent director of [X]", "joined as an observer at [X]", "is also a board director at [X]" | `mentions` (a role prior may still apply) | none | board membership is not a type of its own |
+| **U3** board seat without investment (`unit.u3.board_seat_without_investment`) | "holds a board seat at [X]" on a page with no investor prior | `mentions`; `invested_in` with an investor prior or "… as an investor" in the clause | event start when typed | — |
+| **U4** not-employment starts | "Became an advisor at [X]", "Took an advisory role with [X]", "Took a board role at [X]" | unchanged | no `works_at` start (`cue.employment.start` skips advisory, board, investor, angel, observer roles) | "Joined the advisory board at [X]" still reads as a join; "head of advisory services" reads as advisory |
+| Stays `mentions` | board membership with no investment or advisory statement; "started something new at [X]" with no role or employment verb; third-party subjects; negation; hypotheticals and plans | `mentions` | none | — |
+
+### Tested and not shipped
+
+| Unit | What it read | Why it does not ship |
+|---|---|---|
+| U2 ordinary roles | "<role> for [X]", "led design at [X]", "[X] (<role>)", "as <role>" after a join or sign-on, where every other rule gave `mentions` | measured jointly with U5 as U25 (U2 alone let the single-value pass close a former employer on the wrong date); on the confirmation set U25 added nothing over the package before it (difference 0.000 on all 200 pairs) |
+| U5 leave idioms and exchange moves | "parted company with", "handed in her notice at", "called it a day at", "swapped [A] for [B]" as dated ends | part of U25, above |
+| U6 start framings | "first day at", "onboarding week at", "began working at", "a new chapter at" as dated starts | failed the safety conditions at held-out selection (set I1 and W1), so it was never packaged: now-recall −0.012, as-of exact −0.011, and one new wrong transition by identity |
+
+Development evidence and the reworks each unit went through: `docs/eval/decisions/q2-parser-gaps/dev-units.md`.
+
+### Precedence
+
+For one link occurrence: a typed relation line (`core/line-grammar.ts`) wins, then the
+active pack's inference rules, then meeting attendance, then the verb rules in this
+order: `founded` > `invested_in` (with the board-seat rule) > `advises` (with U1) >
+`works_at`, then the Chinese rules. Among verb matches, only one that belongs to this
+link counts: a match with another link between it and this one, or written right
+before another link, belongs to that link. A unit veto (U1 negation, U3 board wording)
+drops one match and inference moves to the next. Then the role priors (investor >
+advisor > employee; person → company links only, never in timeline or see-also
+sections). A link may keep a `mentions` row beside a typed one.
+
+### Changing a spelling (contributor recipe)
+
+1. **Where.** A verb spelling is a regex in `src/core/link-extraction.ts`
+   (`WORKS_AT_RE`, `INVESTED_RE`, `ADVISES_RE`, …, listed in `CORE_VERB_RULES`). A cue
+   is in `src/core/link-temporal-evidence.ts` (`EMPLOYMENT`, `ADVISORY`, `EVENT_START`).
+   Unit rules, vetoes and cues live in `src/core/link-typing-units.ts`, each gated by
+   `typingUnitEnabled('U<N>')`.
+2. **Controls.** Add the spelling's look-alikes beside it as examples in
+   `test/helpers/typing-unit-examples.ts` (or `test/link-extraction.test.ts` for a
+   core rule): negation, a third party, a concurrent role, a rejoin, the same target
+   twice, a link at the edge of the 240-character window, and an event line that uses
+   the same words. Freeze the type, the tense, the transitions and the as-of result.
+3. **Smallest tests.** `bun test test/link-typing-units.test.ts
+   test/link-typing-explain.test.ts test/link-type-attachment.test.ts
+   test/link-temporal-evidence.test.ts`; for a unit,
+   `bun test test/link-typing-units-subsets.test.ts` (every unit subset, and world-v1
+   typed as master with no unit and as the confirmed package with the shipped units, when a gbrain-evals checkout is
+   beside this one). A typing change to shipped behavior needs `LINK_EXTRACTOR_VERSION_TS` bumped so existing pages
+   re-extract.
+4. **Precedence effects.** Run `explainLinkType` on the example: `rule` is what
+   decided, `attachment` says whether the verb belonged to this link, and `suppressed`
+   lists the rules it beat (`:outranked`), the matches that belonged to another link
+   (`:other-link`) and unit vetoes. A new spelling for a higher-precedence verb steals
+   every link whose window it reaches, including a verb on the neighboring timeline
+   entry. Measure type steals and transitions by identity on development text with
+   `bun scripts/q2-typing-dev.ts dump` and `compare` before you propose it.
+
 ## Reading
 
 | Parameter | Meaning |
@@ -169,11 +246,52 @@ An applied proposal is one timeline line on the subject page:
 Delete the line to reopen the relationship; the check records that and does not
 propose it again until the evidence changes.
 
+## Declared single-value relations
+
+A schema pack can declare that a state relation has one current value per page, for
+example a company brain where `works_at` means the one current employer:
+
+```yaml
+link_types:
+  - name: works_at
+    cardinality: one_per_from   # default: many
+```
+
+For a declared type the nightly check asks no model: the declaration already says two
+live relationships cannot both hold. The chain rule orders the page's live
+relationships by their latest dated start and ends each one on the date the next one
+started, so an out-of-order import (Acme from January, Widget from March, then Gadget
+from February) ends Acme in February and Gadget in March. Relationships without a dated
+start, and two that start on the same date, stay open and appear in
+`gbrain edge-proposals list`. Closures are recorded as proposals with model
+`schema-pack:cardinality`; `gbrain edge-proposals accept <id>` writes one as the same
+reversible timeline line.
+
+- Only state relations take `cardinality`: the built-in ones (`works_at`, `advises`, `yc_partner`) and any type the
+  pack declares `temporal: state`. `gbrain schema lint` rejects it elsewhere, because only state relations end.
+- The declaration comes from the source's resolved pack. A child pack that redeclares
+  the type replaces the whole entry, so it must restate `cardinality`.
+- `gbrain schema cardinality-preview [--source <id>] [--json]` lists every page with
+  more than one live relationship of a declared type and what the next dream cycle
+  closes or leaves open. It writes nothing; run it before activating a pack that adds a
+  declaration.
+- `dream.single_value.mode` is `propose` by default: closures wait for review in
+  `gbrain edge-proposals list`. `gbrain config set dream.single_value.mode apply` writes them
+  automatically; `off` hands declared types back to the model judge. Held-out testing found
+  wrong closures when an advisory timeline line ("Took an advisory role with X") counted as
+  the start of a new job at X, so review proposals before accepting them.
+- To stop further closures, remove the declaration. `gbrain edge-proposals undo <id>`
+  (or deleting the line) reopens a relationship it closed.
+
+Older gbrain releases reject a pack that uses `cardinality`, so set the pack's
+`gbrain_min_version` to the release that adds it.
+
 ## Turning it off
 
 - `gbrain config set graph.edge_validity off`: graph reads return every edge, as
   before. Dated evidence keeps being recorded, so turning it back on loses nothing.
-- `gbrain config set dream.edge_contradictions.mode off`: no relationship checks.
+- `gbrain config set dream.edge_contradictions.mode off`: no model-judged relationship checks
+  (declared single-value relations follow `dream.single_value.mode`).
   Lines it already wrote stay until `gbrain edge-proposals undo --all-applied`.
 
 ## Health

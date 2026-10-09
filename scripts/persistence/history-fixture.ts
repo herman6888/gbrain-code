@@ -27,14 +27,15 @@
  *   and `exchangeClientCredentials`;
  * - the access token with unified grant columns: `mintLegacyToken`;
  * - the delayed effect: a real Git effect that failed on a stale `index.lock`
- *   and was rescheduled with `next_attempt_at` in the future (the lock is then
- *   removed);
+ *   (dated past the 10-minute contention grace, `git_index_stale`) and was
+ *   rescheduled with `next_attempt_at` in the future, then held a day out so
+ *   it stays delayed for the fixture's lifetime (the lock is then removed);
  * - the queued request: `admitWrite`, the journal call every page mutation
  *   makes, with no owner running: the state a crash right after admission leaves.
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
@@ -45,6 +46,7 @@ import { admitWrite } from '../../src/core/persistence/journal.ts';
 import { submissionAuthority } from '../../src/core/persistence/authority.ts';
 import { requestPrincipalForContext } from '../../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { declarePersistenceProtocol } from '../../src/core/persistence/protocol.ts';
 import { GBrainOAuthProvider } from '../../src/core/oauth-provider.ts';
 import { sqlQueryForEngine } from '../../src/core/sql-query.ts';
 import { mintLegacyToken } from '../../src/core/token-mint.ts';
@@ -63,6 +65,8 @@ export interface HistoryFixtureOptions {
   worktrees: number;
   /** Scratch directory for the checkouts; a fresh temporary directory by default. */
   root?: string;
+  /** Write reply wait for every op (test seam; absent = the operation default, 5 s for agents). */
+  writeWaitMs?: number;
 }
 export interface HistoryFixtureSource { id: string; root: string; worktree: number }
 export interface HistoryFixture {
@@ -206,8 +210,27 @@ export async function prepareTopology(engine: BrainEngine, { sources, worktrees,
 }
 
 /** Build a brain with real persistence history. See the module comment for preconditions. */
+/**
+ * A write that outlives its reply wait answers `write_pending` with its
+ * receipt (a loaded CI host can take longer than put_page's 5 s default).
+ * The caller's documented recovery is replaying the same request_id, which
+ * reports the same write's state; settle each op that way before the next op
+ * in its lane reads `$current`. A write still pending at the deadline, or
+ * refused, is reported as it is, so the "every op commits" check stays exact.
+ */
+const HISTORY_COMMIT_DEADLINE_MS = 120_000;
+async function executeCommitted(world: Parameters<typeof executeOp>[0], d: OpDescriptor) {
+  const deadline = Date.now() + HISTORY_COMMIT_DEADLINE_MS;
+  let observation = await executeOp(world, d);
+  while (observation.status === 'pending' && Date.now() < deadline) {
+    await Bun.sleep(100);
+    observation = await executeOp(world, d);
+  }
+  return observation;
+}
+
 export async function buildHistoryFixture(engine: BrainEngine,
-  { pages, seed, sources, worktrees, root: requestedRoot }: HistoryFixtureOptions): Promise<HistoryFixture> {
+  { pages, seed, sources, worktrees, root: requestedRoot, writeWaitMs }: HistoryFixtureOptions): Promise<HistoryFixture> {
   assert(Number.isSafeInteger(pages) && pages >= 1 && pages <= 10_000, 'history fixture: pages must be 1..10000');
   assert(Number.isSafeInteger(seed) && seed >= 0 && seed <= 0xFFFFFFFF, 'history fixture: seed must be an unsigned 32-bit integer');
   assert(Number.isSafeInteger(worktrees) && worktrees >= 1, 'history fixture: worktrees must be >= 1');
@@ -217,35 +240,55 @@ export async function buildHistoryFixture(engine: BrainEngine,
   const topology = await prepareTopology(engine, { sources, worktrees, root });
   const { world, checkouts, sources: fixtureSources, accessTokenId, oauthClientId } = topology;
   const remotes = world.remotes;
+  if (writeWaitMs !== undefined) world.writeWaitMs = writeWaitMs;
 
   const plan = historyPlan({ pages, seed, sources, worktrees }, fixtureSources.map(s => s.id), remotes);
   // Sources publish independently; ops within one source run in plan order.
   const lanes = new Map<string, OpDescriptor[]>();
   for (const d of plan) lanes.set(d.source, [...(lanes.get(d.source) ?? []), d]);
-  await Promise.all([...lanes.values()].map(async lane => { for (const d of lane) await executeOp(world, d); }));
+  await Promise.all([...lanes.values()].map(async lane => { for (const d of lane) await executeCommitted(world, d); }));
   const observations = plan.map(d => world.observations.get(d.id)!);
   const failed = observations.filter(o => o.status !== 'committed');
   assert.deepEqual(failed.map(o => `${o.id} ${o.kind} ${o.code}`), [], 'every history op must commit');
 
-  // A Git effect that fails on a stale index.lock reschedules into the future.
+  // A Git effect that fails on a stale index.lock reschedules into the future. A lock younger than
+  // 10 minutes is contention (`git_index_locked`, retried after 250 ms), so the lock is dated
+  // 11 minutes back: the effect fails as `git_index_stale` and requeues 30 s out.
+  // A committed op's Git effect can still be queued or running (always so when replies outlive
+  // their wait); a lock planted under a running effect is renamed away by Git's own commit.
+  const drainDeadline = Date.now() + 60_000;
+  while ((await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM persistence_effects
+    WHERE kind='git' AND state IN ('queued','running')`))[0].n > 0) {
+    assert(Date.now() < drainDeadline, 'history fixture: Git effects were still in flight 60 s after every op committed');
+    await Bun.sleep(100);
+  }
   const delayedSource = fixtureSources[0];
   const lock = join(checkouts[delayedSource.worktree], '.git', 'index.lock');
   writeFileSync(lock, '');
+  const staleAt = new Date(Date.now() - 11 * 60_000);
+  utimesSync(lock, staleAt, staleAt);
   let delayedEffectId: string;
   try {
     const delayed = descriptor('delayed-effect', 'put_page', 'local', delayedSource.id,
       { slug: 'notes/delayed-effect', content: pageContent('note', 'Delayed effect', 'Its Git effect waits on a stale index.lock.') });
-    assert.equal((await executeOp(world, delayed)).status, 'committed');
+    assert.equal((await executeCommitted(world, delayed)).status, 'committed');
     observations.push(world.observations.get('delayed-effect')!);
     const deadline = Date.now() + 60_000;
     for (;;) {
       const [effect] = await engine.executeRaw<{ id: string }>(`SELECT e.id::text AS id FROM persistence_effects e
         JOIN persistence_requests r ON r.id=e.request_id WHERE r.request_id=$1::uuid AND e.kind='git'
-          AND e.state='queued' AND e.attempts>0 AND e.next_attempt_at>now()`, [delayed.requestId]);
+          AND e.state='queued' AND e.attempts>0 AND e.error_code='git_index_stale' AND e.next_attempt_at>now()`, [delayed.requestId]);
       if (effect) { delayedEffectId = effect.id; break; }
       assert(Date.now() < deadline, 'history fixture: the Git effect never rescheduled after the stale index.lock');
       await Bun.sleep(100);
     }
+    // The production requeue is a fixed 30 s with no setting to lengthen it, and callers keep the
+    // fixture longer than that (a graduation copies it), so the recorded failure is kept and only
+    // its retry moves a day out: the effect stays delayed for the fixture's lifetime.
+    await engine.transaction(async tx => {
+      await declarePersistenceProtocol(tx);
+      await tx.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 day' WHERE id=$1", [delayedEffectId]);
+    });
   } finally {
     await disposePersistenceConsumer(engine);
     if (existsSync(lock)) rmSync(lock);

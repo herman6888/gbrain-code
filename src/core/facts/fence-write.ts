@@ -38,7 +38,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative } from 'node:path';
 
-import type { BrainEngine, NewFact, FactVisibility, FactKind } from '../engine.ts';
+import type { BrainEngine, NewFact, FactVisibility, FactKind, FactAttribution } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
 import { inferTypeFromPack, parseMarkdown } from '../markdown.ts';
 import { yamlScalar } from '../frontmatter-inference.ts';
@@ -97,6 +97,8 @@ export interface FenceInputFact {
   validUntil?: Date | null;
   embedding: Float32Array | null;
   sessionId: string | null;
+  /** Speaker attribution; written to the fence's attributed_to cell. */
+  attributedTo?: FactAttribution;
 }
 
 export interface FenceWriteResult {
@@ -473,6 +475,7 @@ export async function writeFactsToFence(
           validUntil:  f.validUntil ? formatFenceDate(f.validUntil) : undefined,
           source:      f.source,
           context:     f.context ?? undefined,
+          ...(f.attributedTo ? { attributedTo: f.attributedTo } : {}),
         });
         body = updated;
         assignedRowNums.push(rowNum);

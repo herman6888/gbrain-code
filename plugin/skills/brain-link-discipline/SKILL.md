@@ -26,6 +26,7 @@ upstream: brain-link-on-commit@fc834ee + brain-link-report@fc834ee
 # existence check against the user's own hosted git remote (link
 # verification, not data retrieval). Declarative opt-out.
 brain_first: exempt
+when_to_use: "Use when the user asks: \"give me the link\", \"where is the page\", \"why does this link 404\", \"brain link discipline\", \"rewrite subagent paths\"."
 ---
 
 # brain-link-discipline — The Link Is Part of the Deliverable
@@ -219,7 +220,7 @@ No hosted remote (fallback steps 2–3):
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - A brain-page link would 404 because the page is uncommitted or unsynced: say the link is not live yet and give the repo-relative path; do not invent a hosted URL.
 - `get_page` / `gbrain get` returns `page_not_found` for the slug you meant to link: resolve the real slug (search by title) before linking; never ship a guessed slug.

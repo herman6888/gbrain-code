@@ -36,6 +36,12 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
     typeFilter = `AND l.link_type = ANY($${params.length}::text[])`;
   }
   const mentionsFilter = opts?.includeMentions ? '' : `AND l.link_source IS DISTINCT FROM 'mentions'`;
+  const edgeExpr = direction === 'out'
+    ? `w.slug || '|' || l.link_type || '|' || p2.slug`
+    : direction === 'in'
+      ? `p2.slug || '|' || l.link_type || '|' || w.slug`
+      : `CASE WHEN l.from_page_id = w.id THEN w.slug || '|' || l.link_type || '|' || p2.slug
+              ELSE p2.slug || '|' || l.link_type || '|' || w.slug END`;
   const temporalFilter = opts?.temporal ? `AND ${relationshipFilterSql('l', { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
   const recurStep = direction === 'out'
     ? 'JOIN links l ON l.from_page_id = w.id JOIN pages p2 ON p2.id = l.to_page_id'
@@ -47,11 +53,11 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
     WITH RECURSIVE walk AS (
       SELECT p.id, p.slug, p.source_id, 0::int AS depth,
         ARRAY[p.id] AS visited, ARRAY[p.slug] AS path,
-        p.source_id AS seed_source, NULL::text AS last_link_type
+        p.source_id AS seed_source, NULL::text AS last_link_type, ARRAY[]::text[] AS edges
       FROM pages p WHERE p.slug = ANY($1::text[]) AND p.deleted_at IS NULL AND ${seed} ${seedIdentities}
       UNION ALL
       SELECT p2.id, p2.slug, p2.source_id, w.depth + 1,
-        w.visited || p2.id, w.path || p2.slug, w.seed_source, l.link_type
+        w.visited || p2.id, w.path || p2.slug, w.seed_source, l.link_type, w.edges || (${edgeExpr})
       FROM walk w ${recurStep}
       WHERE w.depth < $2 AND NOT (p2.id = ANY(w.visited))
         AND p2.source_id = w.seed_source AND p2.deleted_at IS NULL
@@ -62,6 +68,8 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
       array_agg(DISTINCT n.last_link_type) FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
       (array_agg(array_to_string(n.path, chr(9)) ORDER BY n.depth ASC,
         array_length(n.path, 1) ASC, array_to_string(n.path, chr(9)) ASC))[1] AS path_str,
+      (array_agg(array_to_string(n.edges, chr(9)) ORDER BY n.depth ASC,
+        array_length(n.path, 1) ASC, array_to_string(n.path, chr(9)) ASC))[1] AS edges_str,
       (SELECT cc.id FROM content_chunks cc WHERE cc.page_id = n.id
         ${requiresSafeChunks(opts) ? `AND EXISTS (SELECT 1 FROM pages cp WHERE cp.id = n.id AND ${safeChunksFilter('cp')})` : ''}
         ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
@@ -72,6 +80,7 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
     hop: Number(row.hop), edge_count: Number(row.edge_count),
     via_link_types: Array.isArray(row.via_link_types) ? row.via_link_types as string[] : [],
     path: row.path_str ? String(row.path_str).split('\t') : [],
+    path_edges: row.edges_str ? String(row.edges_str).split('\t') : [],
     canonical_chunk_id: row.canonical_chunk_id == null ? null : Number(row.canonical_chunk_id),
   }));
 }
@@ -340,16 +349,30 @@ export async function readAliases(query: ReadQuery, aliases: string[], scope?: P
   // read filter out of that lookup): without planner statistics (PGLite has no
   // autovacuum) the page_aliases -> sources foreign key otherwise makes the planner
   // walk every readable page and probe aliases per page.
-  const rows = await query<PageRef & { alias_norm: string }>(`
+  // Precedence: within a source, only the claims at the best origin answer
+  // (frontmatter > declared > subject), and a derived (declared or subject)
+  // alias never answers for a name that is another live page's exact title,
+  // so "Acme Example" stays the company page beside "CRM record: Acme Example".
+  const rows = await query<PageRef & { alias_norm: string; rank: number }>(`
     WITH a AS MATERIALIZED (
-      SELECT m.alias_norm, m.slug, m.source_id FROM page_aliases m
+      SELECT m.alias_norm, m.slug, m.source_id,
+             CASE m.origin WHEN 'subject' THEN 2 WHEN 'declared' THEN 1 ELSE 0 END AS rank
+      FROM page_aliases m
       WHERE m.alias_norm = ANY($1::text[]) AND ${aliasScope}
     )
-    SELECT a.alias_norm, a.slug, a.source_id FROM a
+    SELECT a.alias_norm, a.slug, a.source_id, a.rank FROM a
     CROSS JOIN LATERAL (SELECT * FROM pages WHERE source_id = a.source_id AND slug = a.slug OFFSET 0) p
     WHERE ${filter}
-    ORDER BY a.alias_norm, a.source_id, a.slug`, params);
+      AND (a.rank = 0 OR NOT EXISTS (SELECT 1 FROM pages t WHERE t.source_id = a.source_id AND t.deleted_at IS NULL
+                                     AND lower(t.title) = a.alias_norm AND t.slug <> a.slug))
+    ORDER BY a.alias_norm, a.source_id, a.rank, a.slug`, params);
+  const best = new Map<string, number>();
   for (const row of rows) {
+    const k = `${row.alias_norm}\0${row.source_id}`;
+    best.set(k, Math.min(best.get(k) ?? Infinity, Number(row.rank)));
+  }
+  for (const row of rows) {
+    if (Number(row.rank) > best.get(`${row.alias_norm}\0${row.source_id}`)!) continue;
     const refs = out.get(row.alias_norm) ?? [];
     if (!refs.some(ref => ref.slug === row.slug && ref.source_id === row.source_id)) refs.push({ slug: row.slug, source_id: row.source_id });
     out.set(row.alias_norm, refs);

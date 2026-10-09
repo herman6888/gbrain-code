@@ -29,6 +29,7 @@ upstream: brain-ingest-gate@fc834ee
 # brain-first lookup performed at write time (entity card, alias-expanded
 # search, read the top hit) before anything external or new is written.
 brain_first: true
+when_to_use: "Use when the user asks: \"move this to brain\", \"migrate to brain\", \"copy these files into the brain\", \"is this already in the brain\", \"check for duplicates before writing\"."
 ---
 
 # Brain Ingest Gate — Resolve and Dedup Before Anything Enters the Brain
@@ -265,7 +266,7 @@ recoverable from the conversation.
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - The "is this already in the brain?" search is empty with a degraded notice: an empty keyword-only result is not proof the content is missing. Check by slug, URL or exact title before importing.
 - `gbrain capture` / `put` returns `write_pending` (exit 10): the content is accepted. Poll `gbrain write-request <request_id>`; do not capture it again.

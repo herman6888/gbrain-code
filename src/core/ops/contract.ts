@@ -6,6 +6,7 @@
  * this entire surface, so existing importers are unchanged.
  */
 
+import type { WriteInference } from './write-inference.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
@@ -16,6 +17,7 @@ import { publicWriteReceipt, type WriteErrorCode, type WriteReceipt } from '../p
 // renderer below when it loads.
 import type { Action, Notice } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
+import type { WriteAuthority } from '../persistence/model.ts';
 import type { StdioSurfaceState } from '../../mcp/surface.ts';
 
 /** Agent contract v1: the wire renderer for `fix`/`notices` in toJSON(), registered by agent-output.ts on load. */
@@ -79,8 +81,13 @@ export class OperationError extends Error {
   public why?: string;
   /** Agent contract v1: the one next step. Rendered (`next`, `command`) only at serialization. */
   public fix?: Action;
+  /** Site-level override of the code's class-derived `retryable` (#6278: `owner_unavailable` / `host_mismatch` is never worth a retry). */
+  public retryable?: boolean;
   /** Agent contract v1: advice that rides the error (rendered into the envelope's `notices`). */
   public notices?: Notice[];
+  /** #6188 (D16, D18): a fence refusal's location and its blocking issues; location and class only, never a cell value. */
+  public fence?: Record<string, unknown>;
+  public fenceIssues?: Array<Record<string, unknown>>;
   /** Set to 1 by opError(); toJSON() emits `contract_version` only when set. */
   public contractVersion?: 1;
   /**
@@ -141,6 +148,8 @@ export class OperationError extends Error {
       ...(this.why !== undefined ? { why: this.why } : {}),
       ...(this.fix ? { fix: wireRenderer ? wireRenderer.fix(this.fix) : this.fix } : {}),
       ...(this.notices?.length ? { notices: this.notices.map(n => wireRenderer ? wireRenderer.notice(n) : n) } : {}),
+      ...(this.fence ? { fence: this.fence } : {}),
+      ...(this.fenceIssues?.length ? { fence_issues: this.fenceIssues } : {}),
       ...(this.contractVersion !== undefined ? { contract_version: this.contractVersion } : {}),
     };
   }
@@ -152,6 +161,8 @@ export interface OpErrorOpts {
   fix?: Action;
   docs?: string;
   detail?: string;
+  /** Overrides the class-derived `retryable` on the envelope for this site. */
+  retryable?: boolean;
   /**
    * The frozen v1 `error` wire value when this site historically threw a
    * different code (A1 frozen pairs). `error` keeps this value; `code` is the
@@ -172,6 +183,7 @@ export function opError(code: RegistryCode, message: string, suggestion: string,
   if (opts.why !== undefined) e.why = opts.why;
   if (opts.fix !== undefined) e.fix = opts.fix;
   if (opts.detail !== undefined) e.detail = opts.detail;
+  if (opts.retryable !== undefined) e.retryable = opts.retryable;
   e.contractVersion = 1;
   return e;
 }
@@ -268,6 +280,8 @@ export interface AuthInfo {
   grantRevision?: number;
   grantProfile?: string | null;
   grantRepairReasons?: string[];
+  /** The client's stored access-token lifetime override (`oauth_clients.token_ttl`); null = server default. */
+  tokenTtlSeconds?: number | null;
   delegatedSlugPrefixes?: string[] | null;
   /** Missing grant projection on a profile client is fail-closed. */
   grantProjectionDegraded?: boolean;
@@ -450,6 +464,12 @@ export interface OperationContext {
   /** The stdio session's surface (stdio MCP only): `request_tools` widens it for this session, `whoami` reports it. */
   stdioSurface?: StdioSurfaceState;
   /**
+   * Set by transports that can widen a session's listed tools (stdio): when
+   * `request_tools` returns schemas, the named tools join this session's
+   * tools/list and the client is notified (tools/list_changed).
+   */
+  revealTools?: (names: string[]) => void;
+  /**
    * Subagent runtime context (v0.16+). Set by the subagent tool dispatcher when
    * dispatching an op as a tool call from an LLM loop. Used to enforce per-op
    * agent policy (e.g. put_page namespace rule).
@@ -478,6 +498,17 @@ export interface OperationContext {
    * v0.15 behavior; pure addition, no regression).
    */
   allowedSlugPrefixes?: string[];
+  /**
+   * #5994: the stored authority of a failed write that `gbrain repair
+   * failed-writes` replays. Set only by that trusted local repair lane; no
+   * transport, dispatcher or job hydrates it. Admission reuses it as the
+   * write's authority ceiling (principal, delegation, source incarnation,
+   * autoLinkTrusted), re-authorized against the live grant, instead of
+   * deriving local authority from the replay context. The subagent fence
+   * accepts a missing `subagentId` only with this marker and a non-empty
+   * allow-list equal to the stored delegated prefixes.
+   */
+  replayAuthority?: WriteAuthority;
   /**
    * #4216 — defer chunk embeddings on put_page writes: importFromContent runs
    * noEmbed and the standing embed machinery (embed phase / phase-end
@@ -658,6 +689,11 @@ export interface Operation {
   outputRedaction: OutputRedactionPolicy;
   mutating?: boolean;
   /**
+   * What model work this write may do and when (`src/core/ops/write-inference.ts`).
+   * Unset resolves through OP_WRITE_INFERENCE, then to `'none'`.
+   */
+  writeInference?: WriteInference;
+  /**
    * Agent contract v1 (A2): repeating the call with the same arguments (and,
    * for journaled writes, the same request identity) has the same effect as
    * calling it once. Drives `idempotentHint` and whether an unknown-outcome
@@ -745,4 +781,14 @@ export interface Operation {
     stdin?: string;
     hidden?: boolean;
   };
+}
+
+/**
+ * An op that declares its own `source` param (timeline-add, ontology-add,
+ * takes add/update/supersede, raw data) takes `--source` as that param, e.g.
+ * provenance. Every CLI route (direct, delegated to a resident serve, thin
+ * client) then leaves it out of source scoping and passes it to the handler.
+ */
+export function opOwnsSource(op: Pick<Operation, 'params'>): boolean {
+  return 'source' in op.params;
 }

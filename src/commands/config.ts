@@ -11,8 +11,10 @@ import {
 } from '../core/search/embedding-column.ts';
 
 import { redactPgUrl } from '../core/url-redact.ts';
+import { PUBLISH_GATE_KEYS } from '../mcp/publish-gates.ts';
 import { isConsentConfigKey, setConsentPreapproval, unsetConsentPreapproval } from '../core/consent-preapproval.ts';
 import { WRITER_ADMIN_LOCK_KEY } from '../core/persistence/admin-contract.ts';
+import { CONFIG_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
 import {
   SELF_UPGRADE_CONFIG_LEAVES,
   isSelfUpgradeConfigLeaf,
@@ -132,6 +134,86 @@ const MEMORY_DUAL_PLANE_KEYS: ReadonlySet<string> = new Set(
  * audience must be readable by the ENGINE-FREE bootstrap-harness lane so a
  * shared-declared brain never gets the enable-nudge advisory. */
 const BRAIN_AUDIENCE_KEY = 'brain.audience';
+
+
+/** `embedding_disabled` is dual-plane too: the DB row is authoritative (a
+ * mounted brain has no other plane) and the host's file mirror keeps the
+ * engine-free readers in step. Runtime gates treat `true` on EITHER plane as
+ * disabled, so set and unset always write both and `get` reports that
+ * effective value. */
+const EMBEDDING_DISABLED_KEY = 'embedding_disabled';
+
+async function setEmbeddingDisabled(engine: BrainEngine, value: string): Promise<void> {
+  const normalized = value.trim().toLowerCase();
+  if (normalized !== 'true' && normalized !== 'false') {
+    console.error(`[config] ${EMBEDDING_DISABLED_KEY} must be true or false (got '${value}'). Nothing was written.`);
+    process.exit(1);
+  }
+  const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
+  const hostPlane = await hostBrainSelected();
+  const cfg = loadConfigFileOnly();
+  if (hostPlane && cfg) {
+    if (normalized === 'true') cfg.embedding_disabled = true;
+    else delete cfg.embedding_disabled;
+    saveConfig(cfg);
+  }
+  try {
+    await engine.setConfig(EMBEDDING_DISABLED_KEY, normalized);
+  } catch (e) {
+    console.error(`[config] ERROR: ${hostPlane ? 'file plane written but ' : ''}the DB-plane write failed (${e instanceof Error ? e.message : String(e)}).`);
+    console.error(`[config] The planes now disagree and embedding stays off while either says true — re-run this command once the database is reachable.`);
+    process.exit(1);
+  }
+  console.log(`Set ${EMBEDDING_DISABLED_KEY} = ${normalized} (${hostPlane ? 'file + db planes' : 'db plane only — mounted brain'})`);
+  if (normalized === 'false' && cfg && !cfg.embedding_model?.trim()) {
+    const { embeddingEnablement } = await import('../core/readiness.ts');
+    const { shellQuote } = await import('../core/agent-output.ts');
+    const fix = embeddingEnablement({ ...cfg, embedding_disabled: false });
+    if (fix.argv) console.log(`No embedding model is configured yet. Turn on semantic search (pages and facts are kept): ${shellQuote(fix.argv)}`);
+  }
+}
+
+async function unsetEmbeddingDisabled(engine: BrainEngine): Promise<void> {
+  const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
+  const cfg = loadConfigFileOnly();
+  const fileHad = (await hostBrainSelected()) && cfg !== null && EMBEDDING_DISABLED_KEY in cfg;
+  if (fileHad) {
+    delete cfg!.embedding_disabled;
+    saveConfig(cfg!);
+  }
+  const dbDeleted = await engine.unsetConfig(EMBEDDING_DISABLED_KEY);
+  if (!fileHad && dbDeleted === 0) {
+    console.error(`Config key not found: ${EMBEDDING_DISABLED_KEY}`);
+    process.exit(1);
+  }
+  console.log(`Unset ${EMBEDDING_DISABLED_KEY} (${[fileHad ? 'file plane' : null, dbDeleted > 0 ? 'db plane' : null].filter(Boolean).join(' + ')})`);
+}
+
+/** The effective `embedding_disabled` and where it comes from; null when neither plane holds it. */
+async function effectiveEmbeddingDisabled(engine: BrainEngine): Promise<{ value: boolean; note: string } | null> {
+  const file = loadConfig()?.embedding_disabled;
+  const db = await engine.getConfig(EMBEDDING_DISABLED_KEY);
+  if (file === undefined && db === null) return null;
+  const value = file === true || db === 'true';
+  const planes = `file: ${file === undefined ? 'unset' : String(file)}, db: ${db ?? 'unset'}`;
+  const agree = db === null || file === undefined || String(file === true) === db;
+  return { value, note: agree
+    ? `effective value (${planes}); either plane's true turns embedding off`
+    : `planes disagree (${planes}); embedding stays off while either says true. Re-sync: gbrain config set ${EMBEDDING_DISABLED_KEY} <true|false>` };
+}
+
+const SCHEMA_PACK_SOURCE_LABEL: Record<string, string> = {
+  env: 'GBRAIN_SCHEMA_PACK env', 'db-config': 'db plane (gbrain config set schema_pack)', 'gbrain-yml': 'gbrain.yml',
+  'home-config': 'file plane (~/.gbrain/config.json)', default: 'built-in default',
+};
+
+/** The brain-wide schema pack the runtime resolves (the same tiers `gbrain schema active` uses). */
+async function effectiveSchemaPack(engine: BrainEngine): Promise<{ value: string; note: string }> {
+  const { readDbSchemaPack } = await import('../core/schema-pack/engine-resolution.ts');
+  const { resolveActivePackNameOnly } = await import('../core/schema-pack/load-active.ts');
+  const resolution = resolveActivePackNameOnly({ cfg: loadConfig(), remote: false, dbConfig: await readDbSchemaPack(engine) });
+  return { value: resolution.pack_name, note: `${SCHEMA_PACK_SOURCE_LABEL[resolution.source] ?? resolution.source}; the tier gbrain schema active resolves` };
+}
 
 /** Ambient-writeback posture re-stamp (red-team review, this wave): the
  * engine-free bootstrap-harness renderer reads `memory.visibility_posture`
@@ -292,18 +374,35 @@ export async function tryRunConfigEngineFree(args: string[]): Promise<boolean> {
  * extraction, so they validate here too, and an explicit auto_chronicle set
  * records the operator's answer to the default-on change.
  */
+const setLineGrammarConfig = async (engine: BrainEngine, key: string, value: string) => (await import('./config-line-grammar.ts')).setLineGrammarConfig(engine, key, value);
+
 async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value: string, force = false): Promise<void> {
+  if (await setLineGrammarConfig(engine, key, value)) return;
   if (key.startsWith('decide.')) {
     const { validateDecideConfigValue } = await import('../core/ai/decide/config.ts');
     const err = validateDecideConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  (await import('./config/enumerated-keys.ts')).refuseUnregisteredEnumeratedKey(key, force);
+  const searchRefusal = key.startsWith('search.') ? (await import('../core/search/config-values.ts')).searchConfigValueRefusal(key, value) : null;
+  if (searchRefusal) {
+    const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+    exitCliError(usageError(searchRefusal.message, `Re-run with a valid value, e.g. gbrain config set ${key} ${searchRefusal.example}.`,
+      { fix: { argv: ['gbrain', 'config', 'get', key], consent: [], actor: 'agent', why: 'Shows the value in effect; nothing was written.', requires_exclusive: false } }), 'config');
+  }
   if (key === 'auto_chronicle' || key.startsWith('chronicle.')) await refuseInvalidChronicleValue(key, value, force);
-  if (key.startsWith('facts.drain_')) {
-    const { validateFactsDrainConfigValue } = await import('../core/facts/drain-config.ts');
-    const err = validateFactsDrainConfigValue(key, value);
+  if (key.startsWith('fences.')) {
+    const { validateFenceConfigValue } = await import('../core/fence-repair/config.ts');
+    const err = validateFenceConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  if (key === 'persistence.max_claim_ms') {
+    const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
+    const err = validateMaxClaimConfigValue(key, value);
+    if (err) { console.error(`[config] ${err}`); process.exit(1); }
+  }
+  if (key.startsWith('persistence.')) await (await import('./config/preparation-keys.ts')).refuseInvalidPreparationValue(engine, key, value);
+  if (key.startsWith('facts.')) await (await import('./config/facts-values.ts')).refuseInvalidFactsConfigValue(key, value);
   await engine.setConfig(key, value);
   if (key === 'auto_chronicle') await acknowledgeAutoChronicle(engine, value);
   if (!key.startsWith('decide.slots.')) return;
@@ -536,8 +635,57 @@ export async function tryRunConfigThinClient(args: string[]): Promise<boolean> {
   return false;
 }
 
+/** `config show`: file/env values, with the effective DB-aware value for the dual-plane keys. */
+async function showConfig(engine: BrainEngine): Promise<void> {
+  const config = loadConfig();
+  if (!config) {
+    console.error('No config found. Run: gbrain init');
+    process.exit(1);
+  }
+  console.log('GBrain config:');
+  const effective: Record<string, { value: unknown; note: string }> = {};
+  try {
+    effective.schema_pack = await effectiveSchemaPack(engine);
+    const disabled = await effectiveEmbeddingDisabled(engine);
+    if (disabled) effective[EMBEDDING_DISABLED_KEY] = disabled;
+  } catch { /* DB plane unreadable: show the file/env values alone */ }
+  const shown = { ...config } as Record<string, unknown>;
+  for (const [k, e] of Object.entries(effective)) shown[k] = e.value;
+  for (const [k, v] of Object.entries(shown)) {
+    if (effective[k]) { console.log(`  ${k}: ${String(v)}    (${effective[k]!.note})`); continue; }
+    // #575: objects interpolated into the template literal printed
+    // `[object Object]` — render them as JSON instead. Sensitive keys
+    // stay redacted whether the value is a string or an object.
+    const display = typeof v === 'string'
+      ? redactConfigValue(k, v)
+      : v !== null && typeof v === 'object'
+        ? (isSensitiveConfigKey(k) ? '***' : JSON.stringify(v))
+        : v;
+    console.log(`  ${k}: ${display}`);
+  }
+}
+
+export { CONFIG_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
+
+const USAGE = `Usage: gbrain config [show|get|set|unset] <key> [value]
+       gbrain config unset --pattern <prefix>
+
+Subcommands:
+  show                         Print the effective configuration
+  get <key> [--raw]            Print one value (--raw: no secret redaction)
+  set <key> <value>            Write a value. --force accepts an unknown key;
+                               --coverage-override (or --yes) passes the embedding
+                               coverage gate; --yes accepts a disclosure prompt
+  unset <key>                  Remove one key
+  unset --pattern <prefix>     Remove every key under a prefix`;
+
+export function printUsage(): void {
+  console.log(USAGE);
+}
+
 export async function runConfig(engine: BrainEngine, args: string[]) {
-  const action = args[0];
+  if (subcommandHelpRequested(args, ROUTERS.config)) { printUsage(); return; }
+  const action = args[0] as (typeof CONFIG_SUBCOMMANDS)[number] | undefined;
 
   // The writer admin lock is reserved for `gbrain sources writer lock|unlock`; --force is no escape.
   if (action === 'set' || action === 'unset') {
@@ -551,23 +699,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
   }
 
   if (action === 'show') {
-    const config = loadConfig();
-    if (!config) {
-      console.error('No config found. Run: gbrain init');
-      process.exit(1);
-    }
-    console.log('GBrain config:');
-    for (const [k, v] of Object.entries(config)) {
-      // #575: objects interpolated into the template literal printed
-      // `[object Object]` — render them as JSON instead. Sensitive keys
-      // stay redacted whether the value is a string or an object.
-      const display = typeof v === 'string'
-        ? redactConfigValue(k, v)
-        : v !== null && typeof v === 'object'
-          ? (isSensitiveConfigKey(k) ? '***' : JSON.stringify(v))
-          : v;
-      console.log(`  ${k}: ${display}`);
-    }
+    await showConfig(engine);
     return;
   }
 
@@ -583,7 +715,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         console.error('Usage: gbrain config unset --pattern <prefix>');
         process.exit(1);
       }
-      const keys = await engine.listConfigKeys(prefix);
+      const keys = (await engine.listConfigKeys(prefix)).filter(k => !k.startsWith('_internal.'));
       // Dual-plane keys matching the prefix must ALSO leave the file mirror
       // (codex re-review, this wave): a DB-only pattern delete would report
       // success while the engine-free Stop hook keeps reading the mirror's
@@ -613,11 +745,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         console.log(`No keys match prefix "${prefix}".`);
         return;
       }
-      let deleted = 0;
-      for (const k of keys) {
-        const n = await engine.unsetConfig(k);
-        if (n > 0) deleted += n;
-      }
+      const deleted = await (await import('./config-line-grammar.ts')).unsetConfigKeys(engine, keys);
       console.log(`Unset ${deleted} key(s) matching "${prefix}":`);
       for (const k of keys) console.log(`  - ${k}`);
       for (const k of fileSwept) {
@@ -631,6 +759,10 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     if (!key) {
       console.error('Usage: gbrain config unset <key> | --pattern <prefix>');
       process.exit(1);
+    }
+    if (key === EMBEDDING_DISABLED_KEY) {
+      await unsetEmbeddingDisabled(engine);
+      return;
     }
     if (MEMORY_DUAL_PLANE_KEYS.has(key) || key === BRAIN_AUDIENCE_KEY) {
       // Dual-plane delete, mirroring the dual-plane set: file mirror AND the
@@ -672,7 +804,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       if (fileHad || dbDeleted > 0) {
         console.log(`Unset ${key} (${[fileHad ? 'file plane' : null, dbDeleted > 0 ? 'db plane' : null].filter(Boolean).join(' + ')})`);
         if (key === 'memory.auto_writeback') {
-          console.log('Ambient writeback resolves off while unset. If harness instruction blocks were installed, remove them: gbrain bootstrap harness --yes (converges on off).');
+          for (const line of (await import('../core/facts/writeback-config.ts')).writebackUnsetMessage()) console.log(line);
         }
       } else {
         console.error(`Config key not found: ${key}`);
@@ -729,7 +861,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       }
       return;
     }
-    const n = await engine.unsetConfig(key);
+    const n = await (await import('./config-line-grammar.ts')).unsetConfigKeys(engine, [key], { single: true });
     if (n > 0) {
       console.log(`Unset ${key}${key === 'auto_chronicle' ? AUTO_CHRONICLE_UNSET_NOTE : ''}`);
       if (key === 'facts.default_visibility') await restampVisibilityPosture(null);
@@ -747,6 +879,16 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
   const key = positionals[1];
   const value = positionals[2];
 
+  if (action === 'get' && (key === EMBEDDING_DISABLED_KEY || key === 'schema_pack')) {
+    const effective = key === 'schema_pack' ? await effectiveSchemaPack(engine) : await effectiveEmbeddingDisabled(engine);
+    if (!effective) {
+      console.error(`Config key not found: ${key}`);
+      process.exit(1);
+    }
+    console.log(String(effective.value));
+    console.error(`[config] source: ${effective.note}`);
+    return;
+  }
   if (action === 'get' && key) {
     // #2120: `get` used to read only the DB plane, so a runtime-effective key
     // in ~/.gbrain/config.json (or env) reported not-found. Resolve the way
@@ -769,7 +911,10 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // serves the previous DB value — exactly the lie the off switch's
     // non-zero exit exists to prevent. Everything else keeps the #2120
     // file/env-wins resolution.
-    const dbAuthoritative = MEMORY_DUAL_PLANE_KEYS.has(key) || key === BRAIN_AUDIENCE_KEY;
+    // Publish-gate keys (#5358) are DB-authoritative too: readPublishGate
+    // resolves DB > file, so a file-first answer would print a stale mirror
+    // while the gate already hides the tools.
+    const dbAuthoritative = MEMORY_DUAL_PLANE_KEYS.has(key) || key === BRAIN_AUDIENCE_KEY || (PUBLISH_GATE_KEYS as ReadonlySet<string>).has(key);
     // File-plane keys have no DB reader: a DB row is a stale pre-routing
     // write, never the answer (#5489).
     const fileOnly = isFilePlaneDottedKey(key);
@@ -785,7 +930,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       const out = typeof val === 'string' ? val : JSON.stringify(val);
       console.log(rawFlag ? out : redactConfigValue(key, out));
       if (dbAuthoritative) {
-        console.error(`[config] source: ${dbVal !== null && dbVal !== undefined ? 'db plane (authoritative for this key)' : 'file mirror (no DB row)'}`);
+        console.error(`[config] source: ${dbVal !== null && dbVal !== undefined ? 'db plane (authoritative for this key)' : 'file mirror (no DB row)'}${await writebackLanesNote(engine, key)}`);
         if (dbVal !== null && dbVal !== undefined && fileVal !== undefined && fileVal !== null && String(fileVal) !== String(dbVal)) {
           console.error(`[config] WARN: file mirror disagrees ('${String(fileVal)}') — planes diverged; re-run: gbrain config set ${key} ${String(dbVal)}`);
         }
@@ -843,6 +988,10 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // Ambient-writeback keys DUAL-WRITE (OV2-5): file mirror first (the
     // engine-free readers' plane), then the authoritative DB row. A DB
     // failure leaves the planes briefly diverged — reported, not hidden.
+    if (key === EMBEDDING_DISABLED_KEY) {
+      await setEmbeddingDisabled(engine, value);
+      return;
+    }
     if (key === BRAIN_AUDIENCE_KEY) {
       // Dual-plane like memory.* (WP8): the engine-free harness lane gates
       // its enable-nudge advisory on the file-plane declared audience.
@@ -959,7 +1108,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         // The off switch gates instructions + extraction immediately, but
         // previously-installed harness instruction blocks keep directing new
         // sessions until converged — say so (red-team review, this wave).
-        console.log('Ambient writeback off. If harness instruction blocks were installed, remove them: gbrain bootstrap harness --yes (converges on off).');
+        for (const line of (await import('../core/facts/writeback-config.ts')).writebackOffMessage()) console.log(line);
       }
       return;
     }
@@ -1060,6 +1209,28 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
     }
 
+    // Core memory and pressure keys are read on every session/turn; reject bad values here.
+    if (key.startsWith('memory.core.') || key.startsWith('memory.pressure.')) {
+      const { validateCoreConfigValue } = await import('../core/core-memory.ts');
+      const { validatePressureConfigValue } = await import('../core/context/pressure.ts');
+      const problem = validateCoreConfigValue(key, value) ?? validatePressureConfigValue(key, value);
+      if (problem) { console.error(`[config] ${problem} Nothing was written.`); process.exit(1); }
+    }
+
+    // The shared-skills migration reads these bounds on every run; refuse a malformed or over-ceiling value.
+    const { INVENTORY_LIMIT_KEYS, parseInventoryLimitValue } = await import('../core/shared-skills/inventory-limits.ts');
+    if (INVENTORY_LIMIT_KEYS.includes(key)) {
+      try { parseInventoryLimitValue(key, value); }
+      catch (error) { (await import('../cli/cli-error.ts')).exitCliError(error, 'config'); }
+    }
+
+    // #4907: a phase knob the phase would ignore is refused before the write.
+    const [{ PHASE_CONFIG_KEYS, parsePhaseConfigValue }, { CYCLE_GUARDED_KEYS, assertCycleConfigValue }] = await Promise.all([import('../core/cycle/phase-config-values.ts'), import('../core/cycle/config-guards.ts')]);
+    if (PHASE_CONFIG_KEYS.includes(key) || CYCLE_GUARDED_KEYS.includes(key)) { // #6134/#6177: lint_exclude paths, the last_run state key
+      try { if (PHASE_CONFIG_KEYS.includes(key)) parsePhaseConfigValue(key, value); else assertCycleConfigValue(key, value); }
+      catch (error) { (await import('../cli/cli-error.ts')).exitCliError(error, 'config'); }
+    }
+
     // #5254: an unknown value would silently keep refusing unbound writes.
     const { UNBOUND_WRITE_KEY, parseUnboundWriteValue } = await import('../core/persistence/unbound-source.ts');
     if (key === UNBOUND_WRITE_KEY) {
@@ -1079,6 +1250,14 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         );
         process.exit(1);
       }
+    }
+
+    // #5363: the consolidate phase falls back to 0.85 on a malformed value;
+    // refuse it here, where the operator can fix it.
+    if (key === 'cycle.consolidate.cluster_threshold') {
+      const { parseClusterThreshold } = await import('../core/cycle/phases/consolidate.ts');
+      try { parseClusterThreshold(value); }
+      catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
     }
 
     // Validate sources.default at set time. This key is read by
@@ -1271,8 +1450,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       }
     }
   } else {
-    console.error('Usage: gbrain config [show|get|set|unset] <key> [value]');
-    console.error('       gbrain config unset --pattern <prefix>');
+    console.error(USAGE);
     process.exit(1);
   }
 }
@@ -1308,4 +1486,11 @@ async function refuseSchemaSizingKey(key: 'embedding_model' | 'embedding_dimensi
   console.error(`[config]`);
   console.error(`[config] No --force escape: silently writing a no-op preserves the bug class this rejection closes.`);
   process.exit(1);
+}
+
+/** #6091: the per-lane effective state of `memory.auto_writeback`, appended to `config get`'s stderr source line. */
+async function writebackLanesNote(engine: BrainEngine, key: string): Promise<string> {
+  if (key !== 'memory.auto_writeback') return '';
+  const { captureLaneSummary, resolveWritebackConfig } = await import('../core/facts/writeback-config.ts');
+  return `; capture lanes: ${captureLaneSummary(await resolveWritebackConfig(engine, loadConfig(), { gate: true }))}`;
 }

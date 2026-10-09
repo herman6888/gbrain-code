@@ -21,17 +21,40 @@ instructions. Do not put secrets in memory pages. A durable decision about a
 setup can be recorded without copying its credentials or assuming that setup is
 active in another harness.
 
-Automatic capture is opt-in. Time-limited facts need an explicit TTL; ordinary
+Automatic capture is opt-in. Installing the harness hooks opts into the
+compaction and SessionEnd capture lanes; `gbrain config set
+memory.auto_writeback off` stops every capture lane, and `gbrain bootstrap
+harness --remove` stops the hooks from banking session text at all (see
+[ambient writeback](ambient-writeback.md#capture-lanes-and-the-off-switch)).
+Time-limited facts need an explicit TTL; ordinary
 saved facts do not expire just because they describe a temporary situation.
 `forget` withdraws a fact from active recall, not from all source material,
 history, or private backups. See [ambient writeback](ambient-writeback.md).
+
+## What a write costs
+
+Saving text or a fact never waits on a generative model: a write is
+acknowledged and keyword-queryable without one. Embeddings are the configured
+feature (`remember` embeds before saving to detect near-duplicates; pages embed
+just after the save). With default settings each saved page of an
+extraction-eligible type (note, meeting, email and similar) also gets one facts
+extraction call after it is saved; it runs as a queued job, is attributed to the
+write that caused it, and stops with `gbrain config set facts.extraction_enabled
+false`.
+`gbrain config set facts.page_write_notability_filter medium-and-up` keeps
+only high- and medium-notability facts from page writes (`high-only` keeps the
+high tier, as sync does; `all`, the default, keeps every tier). Image OCR, when turned on (`embedding_image_ocr`), runs before the save.
+Set `GBRAIN_AI_CALL_LOG=<path>` to record every model call a process makes (kind,
+model, tokens, duration, and the write request, job or cycle phase it served; no
+prompt or response text).
 
 ## Page writes and the graph are separate outcomes
 
 | Write path | Graph behavior |
 |---|---|
 | Trusted local `put_page` / capture | Extracts supported page references without an LLM when auto-linking is enabled. |
-| MCP `put_page` / capture, including stdio | Saves body references as text; no inline graph extraction. The receipt reports `auto_links.skipped: remote`. |
+| MCP `put_page` / capture / `edit_page`, including stdio | Saves body references as text; no inline graph extraction. The receipt reports `auto_links.skipped: remote`. |
+| Post-commit `links` effect of an MCP page write | Adds untyped `mentions` edges (`link_source: mcp-remote-mention`) for the body's markdown links, `[[wikilinks]]` and page-path mentions whose target already exists in the same source, is not deleted, is visible to the writer and is inside its slug grant. No typed, frontmatter, timeline or cross-source edges and no new pages. The receipt reports `auto_links.mention_links: queued`; `get_write_request` lists the effect with `added`/`removed` counts. `gbrain config set mcp.remote_auto_links off` (or `auto_link off`) disables it. |
 | Stdio `gbrain serve` | Has bounded, best-effort startup and idle maintenance sweeps, unless disabled. This is eventual maintenance, not a guarantee that a remote write immediately has edges. |
 | `gbrain serve --http` | Does not self-sweep. The host must run maintenance explicitly. |
 

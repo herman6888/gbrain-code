@@ -1,3 +1,4 @@
+import { withAIAttribution } from '../ai/invocation-guard.ts';
 import { randomUUID } from 'node:crypto';
 import { targetedWithdrawalEffect, upgradeWithdrawalEffect } from './effect-targets.ts';
 import { existsSync, statSync } from 'node:fs';
@@ -32,7 +33,8 @@ import { guardEffectSource, recoverEffectPublication, reserveEffectRecovery } fr
 import { commitGitTargets, publishGitEffect, pushGitRoot } from './effect-git.ts';
 import { isDurabilityHardenedAsync } from '../brain-repo-durability.ts';
 import { dispatchFactsBackstopEffect } from './effect-facts.ts';
-import { PARK_AFTER_FAILURES, type EffectRecovery, type PersistenceEffect, type SkippedTarget } from './effect-model.ts';
+import { runLinksEffect } from './effect-links.ts';
+import { PARK_AFTER_FAILURES, type EffectRecovery, type GitCommitNote, type PersistenceEffect, type SkippedTarget } from './effect-model.ts';
 import { SYNC_SKIP_FILES } from '../sync.ts';
 import { recoveryStagingFile } from './staging.ts';
 import { selectEffectRecoveries } from './effect-recovery-scan.ts';
@@ -206,6 +208,12 @@ async function singleFileGitTarget(engine: BrainEngine, effect: PersistenceEffec
   return relative(binding.local_path, path).split(sep).join('/');
 }
 
+/** The commit metadata a single-file Git effect's preparer recorded, if any. */
+function gitCommitNote(effect: PersistenceEffect): GitCommitNote | undefined {
+  const { commit_subject: subject, commit_line: line } = effect.data;
+  return typeof subject === 'string' && typeof line === 'string' ? { subject, line } : undefined;
+}
+
 async function gitPage(engine: BrainEngine, effect: PersistenceEffect, binding: WorktreeBinding | null, opts: EffectWorkerOptions,
   attempt: EffectAttempt, hardened: boolean | undefined): Promise<void> {
   if (!binding?.local_path) { await completeEffect(engine, effect, { git: 'skipped', reason: 'no_repo_configured' }); return; }
@@ -214,7 +222,7 @@ async function gitPage(engine: BrainEngine, effect: PersistenceEffect, binding: 
   const root = binding.local_path;
   if (!targetedWithdrawalEffect(effect) && !effect.data.source_scan) {
     const target = await singleFileGitTarget(engine, effect, { ...binding, local_path: root }, attempt);
-    if (target !== null) await completeEffect(engine, effect, await publishGitEffect(root, target, opts.signal, hardened));
+    if (target !== null) await completeEffect(engine, effect, await publishGitEffect(root, target, opts.signal, hardened, gitCommitNote(effect)));
     return;
   }
   // Only a page walk reads snapshots; a single-file effect completes by its recorded hash.
@@ -346,7 +354,7 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
         // A refused chunk keeps no vector from an earlier convention, and the page reads as not fully embedded.
         const ids = refused.failures.map(f => pending[f.index]?.id).filter((id): id is number => id !== undefined);
         await tx.executeRaw(`UPDATE content_chunks SET ${quoteIdentifier(prepared.embeddingColumn.name)}=NULL,embedded_at=NULL,
-          embedded_text_hash=NULL,embedding_input_hash=NULL WHERE page_id=$1 AND id=ANY($2::int[])`, [prepared.snapshot.page.id, ids]);
+          embedded_text_hash=NULL,embedding_input_hash=NULL,embedding_pending_since=COALESCE(embedding_pending_since,now()) WHERE page_id=$1 AND id=ANY($2::int[])`, [prepared.snapshot.page.id, ids]);
         await tx.executeRaw('UPDATE pages SET embedding_signature=NULL WHERE id=$1', [prepared.snapshot.page.id]);
       }
       if (installed && !refused) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, snapshot.page.slug, effect.source_id);
@@ -497,7 +505,7 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
     // still proves the owned root, but it is not held while recording.
     const recordOnly = effect.kind === 'git' && hardened === false && !targetedWithdrawalEffect(effect) && !effect.data.source_scan;
     try {
-      if (effect.worktree_id && !['embedding', 'facts-backstop'].includes(effect.kind)) {
+      if (effect.worktree_id && !['embedding', 'facts-backstop', 'links'].includes(effect.kind)) {
         if (!binding) throw opError('owner_unavailable', 'The canonical effect owner is unavailable.',
           `This host does not hold source ${effect.source_id}'s canonical worktree, so its ${effect.kind} effect waits for the owner. Check which host owns the source; the effect runs there.`,
           { fix: effectStatusFix(effect) });
@@ -515,8 +523,10 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
       effect = await upgradeWithdrawalEffect(engine, effect, opts.hostId);
       if (effect.kind === 'withdrawal-mirror') await mirrorPage(engine, effect, binding, opts, attempt);
       else if (effect.kind === 'git') await gitPage(engine, effect, binding, opts, attempt, hardened);
-      else if (effect.kind === 'facts-backstop') await dispatchFactsBackstopEffect(engine, effect, opts.hostId);
-      else await embedPage(engine, config, effect, opts);
+      else await withAIAttribution({ request_id: effect.request_id, effect: effect.kind }, () => effect.kind === 'facts-backstop'
+        ? dispatchFactsBackstopEffect(engine, effect, opts.hostId)
+        : effect.kind === 'links' ? runLinksEffect(engine, effect, opts.hostId)
+          : embedPage(engine, config, effect, opts));
     } catch (error) { await recordFailure(engine, effect, error, opts.signal, attempt.target); }
     finally { await lock?.release(); }
   };
@@ -532,8 +542,11 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
   // effect; a push failure leaves the whole group retryable (the next pass
   // finds nothing to commit and pushes once). Nothing holds a lock or a
   // database connection while waiting.
-  const probes = new Map<string, Promise<boolean>>();
-  const deferred: { effects: PersistenceEffect[]; binding: WorktreeBinding; hardened: Promise<boolean> }[] = [];
+  // #6210: each cached probe settles to a value, so a failed probe is never an
+  // unhandled rejection while it waits in the map; it fails every effect it covers.
+  type DurabilityProbe = { durable: boolean } | { error: unknown };
+  const probes = new Map<string, Promise<DurabilityProbe>>();
+  const deferred: { effects: PersistenceEffect[]; binding: WorktreeBinding; hardened: Promise<DurabilityProbe> }[] = [];
   const unpushed = new Map<string, { binding: WorktreeBinding; items: { effect: PersistenceEffect; git: string; target?: string }[] }>();
   const commitGroup = async (effects: PersistenceEffect[], binding: WorktreeBinding & { local_path: string }) => {
     // A short group yields to publications still queued for its worktree, so a
@@ -574,7 +587,8 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
           if (path !== null) targets.push({ effect, path, attempt });
         } catch (error) { await recordFailure(engine, effect, error, opts.signal, attempt.target); }
       }
-      const outcomes = targets.length ? await commitGitTargets(binding.local_path, targets.map(t => t.path), opts.signal) : new Map();
+      const notes = new Map(targets.flatMap(({ effect, path }) => { const note = gitCommitNote(effect); return note ? [[path, note] as const] : []; }));
+      const outcomes = targets.length ? await commitGitTargets(binding.local_path, targets.map(t => t.path), opts.signal, notes) : new Map();
       const pending = unpushed.get(binding.local_path) ?? { binding, items: [] };
       for (const { effect, path, attempt } of targets) {
         const outcome = outcomes.get(path)!;
@@ -596,11 +610,11 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
       attempted++;
       let binding: WorktreeBinding | null = null;
       try {
-        if (effect.worktree_id && !['embedding', 'facts-backstop'].includes(effect.kind)) binding = await getWorktreeBinding(engine, effect.source_id, opts.hostId);
+        if (effect.worktree_id && !['embedding', 'facts-backstop', 'links'].includes(effect.kind)) binding = await getWorktreeBinding(engine, effect.source_id, opts.hostId);
       } catch (error) { await recordFailure(engine, effect, error, opts.signal); continue; }
       if (effect.kind === 'git' && binding?.local_path) {
         const root = binding.local_path;
-        if (!probes.has(root)) probes.set(root, isDurabilityHardenedAsync(root));
+        if (!probes.has(root)) probes.set(root, isDurabilityHardenedAsync(root).then(durable => ({ durable }), error => ({ error })));
         const group = singleFileGitEffect(effect) && effect.worktree_id
           ? [effect, ...await claimCoalescedGitEffects(engine, opts.hostId, effect.worktree_id, GIT_GROUP_SIZE - 1)] : [effect];
         deferred.push({ effects: group, binding, hardened: probes.get(root)! });
@@ -608,7 +622,12 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
     }
     if (!deferred.length) break;
     for (const { effects, binding, hardened } of deferred.splice(0)) {
-      const durable = await hardened;
+      const probe = await hardened;
+      if ('error' in probe) {
+        for (const effect of effects) await recordFailure(engine, effect, probe.error, opts.signal);
+        continue;
+      }
+      const durable = probe.durable;
       if (durable && singleFileGitEffect(effects[0]!)) await commitGroup(effects, { ...binding, local_path: binding.local_path! });
       // Coalesced siblings run with their own source's binding (sources can share a worktree).
       else for (const effect of effects) {

@@ -278,7 +278,8 @@ function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; user
           if (p.type === 'text') return p.text;
           if (p.type === 'reasoning') return ''; // dropped on replay
           if (p.type === 'tool-call') {
-            return `[tool_use ${p.toolName}(${p.input})]`;
+            // #6236: the V2 prompt's input is an object; a template literal rendered it as [object Object].
+            return `[tool_use ${p.toolName}(${typeof p.input === 'string' ? p.input : JSON.stringify(p.input)})]`;
           }
           if (p.type === 'tool-result') {
             const out = typeof p.output === 'string' ? p.output : JSON.stringify(p.output);
@@ -622,6 +623,19 @@ function normalizeModel(model: string): string {
   return idx >= 0 ? model.slice(idx + 1) : model;
 }
 
+/**
+ * #6260: the CLI's own `stop_reason` decides the finish reason, so a response
+ * cut off at the output cap reads as `length` and a refusal as
+ * `content-filter`; callers that refuse to commit a clipped answer can only
+ * see it this way. Tool calls parsed from the text finish as `tool-calls`
+ * unless the answer was cut off. A missing or unknown reason stays `stop`.
+ */
+export function claudeCliFinishReason(stopReason: string | null | undefined, hasToolCalls: boolean): 'stop' | 'length' | 'content-filter' | 'tool-calls' {
+  if (stopReason === 'max_tokens') return 'length';
+  if (stopReason === 'refusal') return 'content-filter';
+  return hasToolCalls ? 'tool-calls' : 'stop';
+}
+
 export class ClaudeCliLanguageModel implements LanguageModelV2 {
   readonly specificationVersion = 'v2' as const;
   readonly provider = 'claude-cli';
@@ -666,18 +680,19 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
       content.push({ type: 'text', text: result.result ?? '' });
     }
 
-    const finishReason = toolCalls.length > 0 ? 'tool-calls' as const : 'stop' as const;
-    const inputTokens = result.usage?.input_tokens;
-    const outputTokens = result.usage?.output_tokens;
-    const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
-    // `cache_creation_input_tokens` is deliberately NOT surfaced here — the AI
-    // SDK's LanguageModelV2Usage has no corresponding field, and folding it in
-    // would need a claude-cli-specific branch in the gateway's usage assembly
-    // (src/core/ai/gateway.ts). Out of scope for this fix.
+    const finishReason = claudeCliFinishReason(result.stop_reason, toolCalls.length > 0);
+    // The CLI reports Anthropic's separate buckets; LanguageModelV2Usage wants
+    // the TOTAL input with the cache read as a subset (what every SDK provider
+    // reports), so the gateway prices cache tokens once. Cache creation has no
+    // V2 field: it stays inside the total at the input rate.
     const cachedInputTokens =
       result.usage?.cache_read_input_tokens !== undefined
         ? Number(result.usage.cache_read_input_tokens)
         : undefined;
+    const inputTokens = result.usage?.input_tokens === undefined ? undefined
+      : result.usage.input_tokens + (cachedInputTokens ?? 0) + Number(result.usage.cache_creation_input_tokens ?? 0);
+    const outputTokens = result.usage?.output_tokens;
+    const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
 
     return {
       content,

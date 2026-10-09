@@ -20,6 +20,7 @@ import { VERB_NAMES } from './verbs.ts';
 import { classifyPgAccessError, formatDbAccessMarker } from './pg-access-classify.ts';
 import { redactConnectionInfo } from './audit/redact-connection-info.ts';
 import { redactUrlsInText } from './url-redact.ts';
+import { parseRepoBase } from './repo-base.ts';
 import { recordAgentContractEvent } from './agent-contract-log.ts';
 import { cliRouting, pinRouting, type FixRouting } from './fix-routing.ts';
 
@@ -92,6 +93,8 @@ export interface AgentEnvelope {
   notices?: RenderedNotice[];
   contract_version: 1;
   detail?: string; protocol_version?: 1; write_request?: unknown; write_error?: string;
+  /** #6188: a fence refusal's location and blocking issues (location and class only). */
+  fence?: Record<string, unknown>; fence_issues?: Array<Record<string, unknown>>;
 }
 
 export interface RenderContext {
@@ -205,8 +208,17 @@ function docsRef(): string {
 export function docsUrl(anchor: string): string {
   if (/^https?:\/\//.test(anchor)) return anchor;
   const path = anchor.replace(/^\.?\//, '');
-  const forkBase = process.env.LLMS_REPO_BASE?.replace(/\/+$/, '');
-  return forkBase ? `${forkBase}/${path}` : `${REPO_BLOB}/${docsRef()}/${path}`;
+  const forkBase = parseRepoBase(process.env.LLMS_REPO_BASE);
+  if (forkBase !== null && typeof forkBase !== 'string') warnInvalidRepoBase(forkBase.invalid);
+  return typeof forkBase === 'string' ? `${forkBase}/${path}` : `${REPO_BLOB}/${docsRef()}/${path}`;
+}
+
+let warnedRepoBase: string | null = null;
+/** W4.12: an invalid `LLMS_REPO_BASE` is ignored (default links), with one stderr line per value. */
+function warnInvalidRepoBase(value: string): void {
+  if (warnedRepoBase === value) return;
+  warnedRepoBase = value;
+  process.stderr.write('[gbrain] LLMS_REPO_BASE is not a plain https URL, so documentation links use the default repository. Unset it or set an https base.\n');
 }
 
 // ── next + rendering ───────────────────────────────────────────────────────
@@ -351,6 +363,8 @@ export interface EnvelopeParts {
   write_request?: unknown;
   write_error?: string;
   retryable?: boolean;
+  fence?: Record<string, unknown>;
+  fence_issues?: Array<Record<string, unknown>>;
 }
 
 /** Replace each occurrence of `bare` that is a whole command (not followed by a word, path or more flags). */
@@ -397,6 +411,8 @@ export function buildEnvelope(p: EnvelopeParts, ctx: RenderContext): AgentEnvelo
     ...(p.protocol_version !== undefined ? { protocol_version: p.protocol_version } : {}),
     ...(p.write_request !== undefined ? { write_request: p.write_request } : {}),
     ...(p.write_error !== undefined ? { write_error: p.write_error } : {}),
+    ...(p.fence !== undefined ? { fence: p.fence } : {}),
+    ...(p.fence_issues?.length ? { fence_issues: p.fence_issues } : {}),
     ...(p.reason !== undefined ? { reason: p.reason } : {}),
     ...(p.why !== undefined ? { why: p.why } : {}),
     ...(fix ? { fix } : {}),
@@ -538,6 +554,8 @@ const ROWS: Row[] = [
         reason: e.reason, why: e.why, fix, docs: e.docs, notices: e.notices, detail: e.detail,
         protocol_version: e.protocolVersion === 1 ? 1 : undefined,
         write_request: j.write_request, write_error: e.writeError,
+        ...(e.fence ? { fence: e.fence } : {}), ...(e.fenceIssues?.length ? { fence_issues: e.fenceIssues } : {}),
+        ...(e.retryable !== undefined ? { retryable: e.retryable } : {}),
       };
     },
   },
@@ -604,6 +622,18 @@ const ROWS: Row[] = [
             why: 'Shows whether the brain\'s persistence owner is running and reachable before anything is repeated.' },
       };
     },
+  },
+  {
+    // Before any PageRevisionConflictError handling: same canonical revision, a newer projection installed by another worker.
+    match: named('PageProjectionConflictError'),
+    map: (e: Error & { changed: readonly string[]; slug: string; sourceId: string }, ctx) => ({
+      error: 'page_projection_conflict', code: 'page_projection_conflict', message: e.message,
+      detail: `changed: ${e.changed.join(', ')}`,
+      why: `Another worker (the persistence owner's projection rebuild, an embed or an import) installed a newer search projection of ${e.slug} while this command prepared its own; the guard keeps that newer installation instead of overwriting it.`,
+      suggestion: `Re-run ${ctx.command ? `gbrain ${ctx.command}` : 'the same command'}; it re-reads the current projection. If it conflicts again, another worker is still installing: wait for it to finish, then re-run.`,
+      fix: { argv: ['gbrain', 'get', '--source', e.sourceId, '--', e.slug], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Reads the page as stored now (read-only) before the command is re-run.' },
+    }),
   },
   {
     match: named('EmbeddingDisabledError'),
@@ -791,6 +821,13 @@ export function toAgentError(e: unknown, ctx: AgentErrorContext): AgentEnvelope 
     });
     return genericEnvelope(e, ctx);
   }
+}
+
+/** A batch command's one-line failure for a projection conflict that outlasted its retries: code, message and next step. */
+export function projectionConflictLine(e: unknown, command: string): string | null {
+  if (!named('PageProjectionConflictError')(e)) return null;
+  const env = toAgentError(e, { transport: 'cli', command, render: cliRenderContext() });
+  return `[${env.code}] ${env.message} ${env.suggestion}`;
 }
 
 /** Pure: callers write the strings. TTY order: `Error [code]: msg` / `Fix:` / `Why:` / `Docs:`. */

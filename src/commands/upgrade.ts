@@ -193,13 +193,13 @@ export async function runUpgrade(args: string[], opts: { targetVersion?: string 
   if (target && assessUpgradeOutcome(target, newVersion) === 'mismatch') {
     console.error(`Upgrade did not take effect: still running ${newVersion}, expected ${target}.`);
     console.error('Exact-tag Git installs stay pinned through `bun update`. Reinstall with:');
-    console.error(`  bun add -g github:garrytan/gbrain#v${target}`);
+    console.error(`  ${bunReinstallCommand(`#v${target}`)}`);
     recordUpgradeError({
       phase: 'verify-target',
       fromVersion: oldVersion,
       toVersion: target,
       error: `still running ${newVersion} after upgrade`,
-      hint: `bun add -g github:garrytan/gbrain#v${target}`,
+      hint: bunReinstallCommand(`#v${target}`),
     });
     setCliExitVerdict(1);
     return;
@@ -213,7 +213,7 @@ export async function runUpgrade(args: string[], opts: { targetVersion?: string 
     if (pin) {
       const { pendingUpgradeVersion } = await import('../core/self-upgrade.ts');
       const latest = pendingUpgradeVersion(oldVersion);
-      const reinstall = latest ? `bun add -g github:garrytan/gbrain#v${latest}` : 'bun add -g github:garrytan/gbrain';
+      const reinstall = bunReinstallCommand(latest ? `#v${latest}` : '');
       console.error(`Upgrade did not take effect: still running ${newVersion}, because the global install is pinned to ${pin} and \`bun update\` keeps a pinned tag.`);
       console.error('Reinstall to move off the pin:');
       console.error(`  ${reinstall}`);
@@ -290,6 +290,8 @@ export async function runUpgrade(args: string[], opts: { targetVersion?: string 
   }
   console.log(`Binary: installed ${newVersion || 'a new version (could not verify)'}`);
   console.log(migrationsLine);
+  // #6317 (I2): upgrade owns no relaunch, so the supervisor proves data movement after it restarts serve and the workers.
+  console.log(`Next: ${(await import('./sources-writer-movement.ts')).MOVEMENT_SUPERVISOR_STEP}`);
 }
 
 /**
@@ -340,7 +342,7 @@ function postSwapSmoke(newVersion: string, r: SmokeRecovery): boolean {
   const detail = (run.stderr ?? '').trim().split('\n')[0];
   const back = r.method === 'bun-link' && r.repoRoot && r.previousSha
     ? `git -C ${r.repoRoot} checkout ${r.previousSha} && bun install`
-    : r.method === 'bun' ? `bun install -g github:${GBRAIN_GITHUB_REPO}#v${r.oldVersion}` : null;
+    : r.method === 'bun' ? bunReinstallCommand(`#v${r.oldVersion}`) : null;
   console.error(`gbrain ${newVersion || '(new version)'} was installed but does not start: \`gbrain --help\` failed (${why}).${detail ? `\n  ${detail}` : ''}`);
   console.error('Recovery:');
   console.error('  If it names an old Bun: bun upgrade, then gbrain post-upgrade');
@@ -401,6 +403,17 @@ export function resolveBunGlobalRoot(): string {
 
   const installRoot = findBunInstallRootFromArgv();
   return installRoot ?? defaultRoot;
+}
+
+/**
+ * #5034 / B-NEW-5: reinstall the global Bun package at `ref` by removing it
+ * first. An in-place `bun add -g` / `bun install --global` tag swap over an
+ * existing global install fails with DependencyLoop on Bun 1.3 and, on Bun
+ * 1.4, exits 0 without swapping while it corrupts the global package.json
+ * and bun.lock.
+ */
+export function bunReinstallCommand(ref: string): string {
+  return `bun remove -g gbrain && bun add -g github:${GBRAIN_GITHUB_REPO}${ref}`;
 }
 
 /**
@@ -699,6 +712,9 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
 
         // #5876: auto_chronicle now defaults on; one-shot [AGENT] cost + opt-out notice, best-effort.
         await (await import('../core/chronicle/upgrade-notice.ts')).printAutoChronicleUpgradeNotice(engine);
+        await (await import('../core/feedback/upgrade-notice.ts')).printRetrievalFeedbackUpgradeNotice(engine);
+        // Entity mention index: [AGENT] catch-up line while pages are due (best-effort).
+        await (await import('../core/mentions/upgrade-notice.ts')).printMentionIndexUpgradeNotice(engine);
 
         // Temporal typed edges: one-shot [AGENT] notice (live-by-default graph reads + relationship check), best-effort.
         await (await import('../core/temporal-edges-upgrade-notice.ts')).printTemporalEdgesUpgradeNotice(engine);
@@ -804,7 +820,7 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             const promptResult = await runPostUpgradeReembedPrompt(engine, modelString);
             if (promptResult.proceeded) {
               const { runReindex } = await import('./reindex.ts');
-              await runReindex(engine, ['--markdown']);
+              await runReindex(engine, ['--markdown'], { authorized: true }); // the TTY yes above is the consent
             }
           }
         } catch (re) {
@@ -874,6 +890,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   } catch {
     // Fail-open per A18: never crash post-upgrade from the banner.
   }
+  // #6317 (I2): the supervisor's step; bare, so the check inherits its default window.
+  (json ? console.error : console.log)(`Next: ${(await import('./sources-writer-movement.ts')).MOVEMENT_SUPERVISOR_STEP}`);
   if (json) await writeJsonDocument(JSON.stringify(report));
 }
 

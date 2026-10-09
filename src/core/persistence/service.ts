@@ -1,36 +1,82 @@
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
-import { PersistenceConsumer, type PrepareMutation } from './consumer.ts';
+import { LANE_BUSY, PersistenceConsumer, type PersistenceConsumerLike, type PrepareMutation } from './consumer.ts';
+import { WaiterOnlyConsumer, type ElectedOwner } from './consumer-election.ts';
+import { RESIDENT_CONSUMER_KINDS, startConsumerHeartbeat, type ConsumerHeartbeat } from './consumer-heartbeat.ts';
+import { enginePoolStats } from '../postgres-engine/pool-stats.ts';
+import { claimOwnerKind } from './claim-phase.ts';
 import { preparePageMutation } from './page-prepare.ts';
 import { prepareSemanticPageMutation } from './semantic-pages.ts';
 import { getWriteRequestById, getWriteRequestProgress, receiptFor, type WriteRequestProgress } from './journal.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { isWriteErrorCode, type WriteReceipt } from './types.ts';
 import { registerPgliteReopen } from '../pglite-lifecycle.ts';
+import { localHostId } from './identity.ts';
 import { assertMutationProtocol } from './protocol.ts';
+import { writeSwitchOn } from './switches.ts';
 import { pendingWriteHint } from './health.ts';
+import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { receiptDeliveredHint } from './connector-errors.ts';
 import type { PgAccessReason } from '../pg-access-classify.ts';
 import { contentRefusalFromReceipt } from '../import-screen.ts';
+import { fenceIssuesFromDetail, fenceLocationFromDetail } from '../fence-repair/refusal.ts';
 import { heldFileDiagnostic } from './verb-errors.ts';
 import { isMissingPageMessage } from './page-identity.ts';
 
-interface Service { consumer: PersistenceConsumer; stopping: boolean; unregisterStop?: () => void; unregisterReopen?: () => void; }
+interface Service { consumer: PersistenceConsumerLike; heartbeat?: ConsumerHeartbeat; stopping: boolean; unregisterStop?: () => void; unregisterReopen?: () => void; }
 const services = new WeakMap<BrainEngine, Service>();
 type ProgressRead = { row: WriteRequestProgress | null } | { error: unknown } | { cancelled: true };
 const receiptReads = new WeakMap<BrainEngine, Map<string, { read: Promise<ProgressRead>; abort: AbortController }>>();
 const settledWaiters = new WeakMap<BrainEngine, Map<string, Set<(row: WriteRequest) => void>>>();
+/**
+ * Requests this process's consumer settled most recently. A waiter that registers after its write already
+ * settled (a caller that admits a window, then waits on each in turn) missed the handoff, so it reads at once
+ * instead of sleeping through the first poll.
+ */
+const recentlySettled = new WeakMap<BrainEngine, Set<string>>();
+const RECENTLY_SETTLED_IDS = 1024;
+/** #6007: when this process last settled requests, for pending retry_after_ms estimates. */
+const settlements = new WeakMap<BrainEngine, number[]>();
+const SETTLEMENT_SAMPLES = 21;
+function rememberSettled(engine: BrainEngine, id: string): void {
+  let ids = recentlySettled.get(engine);
+  if (!ids) { ids = new Set(); recentlySettled.set(engine, ids); }
+  ids.add(id);
+  if (ids.size > RECENTLY_SETTLED_IDS) ids.delete(ids.values().next().value!);
+}
+function recordSettlement(engine: BrainEngine): void {
+  let times = settlements.get(engine);
+  if (!times) { times = []; settlements.set(engine, times); }
+  times.push(performance.now());
+  if (times.length > SETTLEMENT_SAMPLES) times.shift();
+}
+/**
+ * #6007: a pending receipt's retry_after_ms from this process's recent pace:
+ * `remaining` requests at the median gap between settlements, clamped to
+ * 250 ms-30 s. Null until this process has settled at least two requests.
+ */
+export function estimatedRetryAfterMs(engine: BrainEngine, remaining: number): number | null {
+  const times = settlements.get(engine) ?? [];
+  if (times.length < 2 || remaining <= 0) return null;
+  const gaps = times.slice(1).map((at, i) => at - times[i]!).sort((a, b) => a - b);
+  return Math.round(Math.min(30_000, Math.max(250, gaps[Math.floor(gaps.length / 2)]! * remaining)));
+}
 const preparers = new Map<string, { prepare: PrepareMutation; target: 'page' | 'skill_bundle' }>();
 export function registerMutationPreparer(operation: string, prepare: PrepareMutation, target: 'page' | 'skill_bundle' = 'page'): void {
   preparers.set(operation, { prepare, target });
 }
-export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest, cfg: GBrainConfig, signal?: AbortSignal) {
+/**
+ * `signal` is the foreground (remember/put_page/edit_page) statement signal, as before; `clock` (#6278) is the claim's
+ * phase clock, which carries the preparation's cancellation to every preparer's `enterClaimStep` boundaries.
+ */
+export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest, cfg: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) {
   assertMutationProtocol(row);
+  enterClaimStep(clock, 'dispatch');
   const registered = preparers.get(row.operation);
   if (registered) {
     if (registered.target !== (row.target_kind ?? 'page')) throw new OperationError('unsupported_mutation_protocol', 'The registered preparer does not support this mutation target.', `Request ${row.request_id} (${row.operation}) was accepted by a gbrain version whose preparer this one lacks, so it has not run. Run gbrain upgrade on every host that serves this brain; the request stays journaled and resumes after the upgrade.`);
-    return registered.prepare(e, row, cfg, signal);
+    return registered.prepare(e, row, cfg, signal, clock);
   }
   if (row.target_kind === 'skill_bundle') {
     if (['put_skill', 'delete_skill'].includes(row.operation)) return (await import('../shared-skills/publication.ts')).prepareSharedSkillMutation(e, row, cfg);
@@ -43,20 +89,27 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (row.operation === 'put_page' && row.intent?.kind === 'canonical_reconcile') return (await import('./reconcile-prepare.ts')).prepareReconcileMutation(e, row, cfg);
   if (row.operation === 'put_page' && row.intent?.kind === 'managed_grandfather') return (await import('./grandfather.ts')).prepareGrandfatherMutation(e, row);
   if (row.operation === 'submit_job' && row.intent?.kind === 'code_projection_reindex') return (await import('./projection-reindex.ts')).prepareCodeReindex(e, row);
-  if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_sync_')) return (await import('./sync-prepare.ts')).prepareManagedSyncMutation(e, row, cfg);
-  if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_maintenance_')) return (await import('./prepared-maintenance.ts')).prepareMaintenanceMutation(e, row, cfg);
+  if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_sync_')) return (await import('./sync-prepare.ts')).prepareManagedSyncMutation(e, row, cfg, clock);
+  if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_maintenance_')) return (await import('./prepared-maintenance.ts')).prepareMaintenanceMutation(e, row, cfg, clock);
   if (row.operation === 'put_page' && row.intent?.kind === 'managed_file_import') return (await import('./import-prepare.ts')).prepareManagedImportMutation(e, row, cfg);
   if (row.operation === 'put_page' && row.intent?.kind === 'managed_file_repair') return (await import('./file-repair.ts')).prepareManagedFileRepairMutation(e, row, cfg);
   if (row.operation === 'remember') return (await import('./memory-mutations.ts')).prepareMemoryMutation(e, row, cfg, signal);
   if (row.operation === 'loops_close' && row.intent?.kind === 'retire_loop_fact') return (await import('./loop-fact-retirement.ts')).prepareLoopFactRetirement(e, row, cfg);
   if (row.operation === 'decide_proposal') return (await import('../facts/proposal-supersede.ts')).prepareProposalMutation(e, row, cfg);
   if (row.operation === 'relink_facts') return (await import('../facts/relink-publish.ts')).prepareRelinkMutation(e, row, cfg);
-  if (['takes_add','takes_update','takes_supersede','takes_resolve'].includes(row.operation)) return (await import('./takes-prepare.ts')).prepareTakesMutation(e,row,cfg);
+  if (['takes_add','takes_update','takes_supersede','takes_resolve','takes_remove'].includes(row.operation)) return (await import('./takes-prepare.ts')).prepareTakesMutation(e,row,cfg);
   if (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation)) return prepareSemanticPageMutation(e, row, cfg);
-  if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return preparePageMutation(e, row, cfg, undefined, signal);
+  if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return preparePageMutation(e, row, cfg, undefined, signal,
+    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock });
   throw new OperationError('unsupported_mutation_protocol', 'No compatible mutation preparer is registered for this operation.', `Request ${row.request_id} (${row.operation}) was accepted by a gbrain version whose preparer this one lacks, so it has not run. Run gbrain upgrade on every host that serves this brain; the request stays journaled and resumes after the upgrade.`);
 }
-export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConfig): PersistenceConsumer {
+/**
+ * #6317 (B1): starts this process's consumer, synchronously. A `serve` and every short-lived foreground command (`put`,
+ * `import`, `cli`, ...) get a full consumer at once, with its heartbeat row; the other resident kinds (`sync`, `jobs`,
+ * `autopilot`, `mcp`) get a `WaiterOnlyConsumer` that probes the host's consumer rows on its first tick and settles to
+ * full or waiter-only (consumer-election.ts). Either way the returned object has the consumer's whole surface.
+ */
+export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConfig): PersistenceConsumerLike {
   const prior = services.get(engine);
   if (prior) {
     if (prior.stopping) {
@@ -65,9 +118,15 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     }
     return prior.consumer;
   }
-  const consumer = new PersistenceConsumer(engine, config, preparePersistedMutation,
-    { onSettled: row => { for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
-  const service: Service = { consumer, stopping: false };
+  const full = () => new PersistenceConsumer(engine, config, preparePersistedMutation,
+    { onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
+  const kind = claimOwnerKind();
+  const service: Service = kind !== 'serve' && RESIDENT_CONSUMER_KINDS.includes(kind) && engine.kind === 'postgres'
+    ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId(), pool: () => enginePoolStats(engine) }), stopping: false }
+    : (() => { const consumer = full(); return { consumer, stopping: false, heartbeat: startConsumerHeartbeat(engine, consumer.hostId,
+        // #6317 (C1): the row's pool numbers come from the vendored driver's own queues (postgres-engine/pool-stats.ts).
+        { kind, mode: 'full', report: () => ({ restart_required: consumer.restartRequired(), root_barrier_age_ms: consumer.oldestRootBarrierAgeMs(), pool: enginePoolStats(engine) }) }) }; })();
+  const { consumer } = service;
   services.set(engine, service);
   const lifecycle = engine as BrainEngine & { registerBeforeDisconnect?: (run: () => Promise<void>) => unknown };
   const unregister = lifecycle.registerBeforeDisconnect?.(() => stopPersistenceConsumer(engine));
@@ -88,7 +147,13 @@ export async function stopPersistenceConsumer(engine: BrainEngine): Promise<void
   const pending = [...(receiptReads.get(engine)?.values() ?? [])];
   for (const entry of pending) entry.abort.abort();
   await service.consumer.stop();
+  await service.heartbeat?.stop();
   await Promise.all(pending.map(entry => entry.read));
+}
+/** #6317: the owner a waiter-only consumer in this process defers to, for the `writer_pending` envelope; null when this process consumes itself. */
+export function waiterOnlyOwner(engine: BrainEngine): ElectedOwner | null {
+  const consumer = services.get(engine)?.consumer;
+  return consumer instanceof WaiterOnlyConsumer && consumer.mode === 'waiter_only' ? consumer.electedOwner() : null;
 }
 /** Reset fixtures and drained lifecycle owners may discard a stopped service. */
 export async function disposePersistenceConsumer(engine: BrainEngine): Promise<void> {
@@ -99,8 +164,24 @@ export async function disposePersistenceConsumer(engine: BrainEngine): Promise<v
 function discardStoppedService(engine: BrainEngine, service: Service): void {
   service.unregisterStop?.(); service.unregisterReopen?.(); services.delete(engine);
 }
+/**
+ * Phase 4.4: runs `run` on this process's warm single-write lane (consumer.ts `onLane`) when its
+ * consumer is running and the lane is free; otherwise `fallback()`, on the pool.
+ */
+export async function onPersistenceLane<T>(engine: BrainEngine,
+  run: (transaction: <R>(fn: (tx: BrainEngine) => Promise<R>) => Promise<R>) => Promise<T>, fallback: () => Promise<T>): Promise<T> {
+  const service = services.get(engine);
+  if (!service || service.stopping) return fallback();
+  const done = await service.consumer.onLane(run);
+  return done === LANE_BUSY ? fallback() : done;
+}
 export function foregroundWriteCompletions(engine: BrainEngine, worktreeId: string): number {
   return services.get(engine)?.consumer.foregroundCompletions(worktreeId) ?? 0;
+}
+/** The config this process's consumer prepares writes with (its first caller's); undefined when none is running. */
+export function persistenceConsumerConfig(engine: BrainEngine): GBrainConfig | undefined {
+  const service = services.get(engine);
+  return service && !service.stopping ? service.consumer.config : undefined;
 }
 export function persistenceConsumerStatus(engine: BrainEngine) {
   const service = services.get(engine);
@@ -116,7 +197,7 @@ export function assertPersistenceAccepting(engine: BrainEngine): void {
 /** DX-A3: pending heads that need intervention, not more waiting. */
 export const BLOCKED_WRITE_REASONS = ['recovery_required', 'owner_unavailable', 'unexpected_file_bytes', 'unexpected_staging_bytes'] as const;
 const FATAL_READ_REASONS: readonly PgAccessReason[] = ['auth_failed', 'permission_denied', 'tenant_not_found', 'db_missing', 'schema_missing', 'storage_corrupt'];
-/** CEO-A7: the first poll waits this long (at most half the wait) for an in-process handoff; later polls back off from 50 to 250 ms. */
+/** CEO-A7: the first poll waits this long (at most half the wait) for an in-process handoff, or not at all when this process already settled the request; later polls back off from 50 to 250 ms. */
 export const WRITE_POLL_START_MS = 200;
 export type WriteWait =
   | { kind: 'terminal' | 'pending'; row: WriteRequest }
@@ -145,10 +226,10 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
   const listener = (settled: WriteRequest) => { handed = settled; wake?.(); };
   listeners.add(listener); waiters.set(id, listeners);
   // The admission transaction has committed: publish now, not after the idle backoff.
-  consumer.wake();
+  consumer.wake(true);
   const waitMs = opts.waitMs ?? 5000;
   const deadline = performance.now() + waitMs;
-  const firstPoll = Math.min(WRITE_POLL_START_MS, waitMs / 2);
+  const firstPoll = recentlySettled.get(engine)?.has(id) ? 0 : Math.min(WRITE_POLL_START_MS, waitMs / 2);
   let delay = firstPoll, failure: { error: unknown; attempts: number } | undefined;
   try {
     while (!service.stopping && !opts.signal?.aborted) {
@@ -217,6 +298,14 @@ async function readProgress(engine: BrainEngine, id: string, remaining: number):
 export async function waitForWrite(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, waitMs = 5000): Promise<WriteRequest> {
   return (await awaitWrite(engine, row, config, { waitMs })).row;
 }
+/**
+ * #6007: wait for several admitted writes against one deadline. Every row waits at once, so each one's consumer handoff is registered
+ * before a grouped publication settles them together; waiting one after
+ * another left all but the first to the progress polls.
+ */
+export async function waitForWrites(engine: BrainEngine, rows: readonly WriteRequest[], config: GBrainConfig, waitMs = 5000): Promise<WriteRequest[]> {
+  return Promise.all(rows.map(row => waitForWrite(engine, row, config, waitMs)));
+}
 /** B4: what a terminal receipt means for the caller, without guessing a mutation. */
 function terminalReceiptHint(row: WriteRequest, reason: string): string {
   const what = `The ${row.operation ? `${row.operation} ` : ''}write (request_id ${row.request_id}) ended ${row.state} with ${reason}; it will not publish.`;
@@ -224,8 +313,10 @@ function terminalReceiptHint(row: WriteRequest, reason: string): string {
     ? `${what} Submit again only if the change is still wanted, with a new request_id.`
     : `${what} Read the receipt and the current state before deciding to submit again; a new attempt needs a new request_id.`;
 }
-export function writeResponse(row: WriteRequest): Record<string, unknown> {
+export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number | null; waiterOnlyOwner?: ElectedOwner | null } = {}): Record<string, unknown> {
   const receipt = receiptFor(row);
+  // #6007: an in-process estimate beats the fixed fallback, never an owner-inspection hold.
+  if (!isTerminal(row) && hints.retryAfterMs != null && receipt.diagnostic?.next_action !== 'inspect_owner') receipt.retry_after_ms = hints.retryAfterMs;
   if (row.state === 'committed') return { ...receipt, write_request: receipt };
   const reason = !isTerminal(row) ? 'write_pending' : row.error_code ?? (row.state === 'cancelled' ? 'cancelled' : 'storage_error');
   const delivered = isTerminal(row) ? receiptDeliveredHint(row) : null;
@@ -235,12 +326,28 @@ export function writeResponse(row: WriteRequest): Record<string, unknown> {
   const held = isTerminal(row) && reason === 'source_changed' ? heldFileDiagnostic(row.error_message, row.source_id) : null;
   const error = new OperationError(reason, !isTerminal(row) ? 'The write is accepted and is still pending.'
     : row.error_message ?? 'The write did not commit.', !isTerminal(row)
-      ? pendingWriteHint(receipt)
+      ? pendingWriteHint(receipt, row.operation)
       : delivered?.suggestion ?? content?.suggestion ?? held?.suggestion ?? terminalReceiptHint(row, reason), delivered?.docs);
   if (delivered?.detail ?? held?.reason) error.detail = delivered?.detail ?? held?.reason;
+  // #6317 (B1b): a waiter-only process names the owner that publishes for it, so the caller is told who holds the write instead of polling blind.
+  if (!isTerminal(row) && hints.waiterOnlyOwner) {
+    const owner = hints.waiterOnlyOwner;
+    const claim = receipt.diagnostic as { claim?: { stall?: { step?: string | null } } } | undefined;
+    error.why = `${error.why} This process runs no consumer of its own: the ${owner.kind} process (pid ${owner.pid}) on this host owns publication${claim?.claim?.stall?.step ? `, and its claim is stalled on step ${claim.claim.stall.step}` : ''}.`;
+    error.fix = { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'Read-only: names the owner process, the running claim\'s step and every write waiting behind it.',
+      verify: { argv: ['gbrain', 'doctor', '--json'] } };
+  }
   if (content) {
     if (content.code !== reason) error.canonical = content.code;
     if (content.reason) error.reason = content.reason;
+    // #6188: the stored fence location and blocking issues (the caller's own rows; refused before any merge).
+    if (content.code === 'invalid_fence') {
+      const fence = fenceLocationFromDetail(row.error_detail) ?? content.fence;
+      if (fence) error.fence = { ...fence };
+      const issues = fenceIssuesFromDetail(row.error_detail);
+      if (issues.length) error.fenceIssues = issues;
+    }
     if (content.key || content.line !== undefined) error.detail = [content.key ? `key ${content.key}` : '', content.line !== undefined ? `line ${content.line}` : ''].filter(Boolean).join(', ');
   }
   if (reason === 'page_identity_changed' && isMissingPageMessage(row.error_message)) error.canonical = 'page_not_found';

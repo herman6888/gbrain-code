@@ -19,7 +19,7 @@ import { shellQuote, type Action } from './agent-output.ts';
 import { embeddingEnablement } from './readiness.ts';
 import { OperationError } from './ops/contract.ts';
 import { PGVECTOR_HNSW_VECTOR_MAX_DIMS, hnswMaxDimsForType } from './vector-index.ts';
-import { gbrainPath } from './config.ts';
+import { gbrainPath, loadConfig } from './config.ts';
 import { resolveRecipe } from './ai/model-resolver.ts';
 import type { Recipe } from './ai/types.ts';
 import { AIConfigError } from './ai/errors.ts';
@@ -77,6 +77,19 @@ export class EmbeddingDisabledError extends Error {
  * present, effects credentials + paid), never `gbrain config set
  * embedding_model`, which the config command refuses.
  */
+/**
+ * Refuse an explicit embedding action (semantic takes search, takes embed,
+ * image search, a vector eval) on a brain that opted out of embedding by any
+ * plane (factEmbeddingDisabled: caller config, running consumer, config file
+ * or the brain's own row), with the same enable-command error as
+ * assertEmbeddingEnabled. Nothing is sent to a provider.
+ */
+export async function assertBrainEmbeddingEnabled(engine: BrainEngine, cfg?: GBrainConfig | null): Promise<void> {
+  const { factEmbeddingDisabled } = await import('./embedding-disabled.ts');
+  if (!await factEmbeddingDisabled(engine, cfg)) return;
+  assertEmbeddingEnabled({ engine: engine.kind, ...(cfg ?? loadConfig() ?? {}), embedding_disabled: true });
+}
+
 export function assertEmbeddingEnabled(cfg: GBrainConfig | null): void {
   if (!cfg?.embedding_disabled) return;
   const fix = embeddingEnablement(cfg);
@@ -255,7 +268,7 @@ export function embeddingMismatchMessage(opts: EmbeddingMismatchOpts): string {
     `  DROP INDEX IF EXISTS idx_chunks_embedding;`,
     `  -- NULL embeddings BEFORE the alter: pgvector refuses to cast existing`,
     `  -- vectors across dimensions and aborts the transaction. NULLs cast fine.`,
-    `  UPDATE content_chunks SET embedding = NULL, embedded_at = NULL;`,
+    `  UPDATE content_chunks SET embedding = NULL, embedded_at = NULL, embedding_pending_since = now();`,
     `  ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(${requestedDims});`,
     `  ${reindexLine.split('\n').join('\n  ')}`,
     `  COMMIT;`,

@@ -107,10 +107,19 @@ database dropped every 400 ms, and the owner killed right after a
 `facts-absorb` job's extraction commits (deterministic chat and embedding
 stubs); the job then runs again and every absorbed fact must be active
 exactly once.
+The robot records each session-drop round it injects. Its own reads (oracle
+checks, drain polls, `$current` revision lookups, token re-verification)
+retry a closed connection only after a round that began before the error
+terminated a session; any other close fails the run with the next step,
+so a database, pooler or product-side close is never retried away.
 
 The reference model (`model.ts`) checks: a committed receipt is visible at
 once and later revisions move only through committed ops; a late receipt
-names a revision the page really had; a refused write never becomes visible;
+names a revision the page really had; after a concurrent group a page ends
+at a revision a committed member returned, or at the write of a committed sync
+or connector publish (which return no revision) whose marker it carries, and
+every receipted revision a later member replaced is in the page's history; a
+refused write never becomes visible;
 a withdrawn fact never returns through recall, `get_page` or the facts table;
 a write never lands in another source; another principal reusing a request
 id never receives the original receipt; takes and facts rows equal their
@@ -118,8 +127,11 @@ page fences; content rows carry write attribution; no orphan rows; every
 request and effect drains (within 20 s on PGLite, whose restarted owner
 releases a dead owner's claims, and within the 2-minute effect lease plus
 margin on Postgres); a fresh write still commits. `lock-order.ts` checks each
-transaction's row locks: worktrees before sources, sources in id order, and
-no exclusive brain-row lock inside a publication.
+transaction's row locks: worktrees before sources, sources in id order, no
+exclusive brain-row lock inside a publication, and the brain row before any
+worktree, source or counter row whenever one transaction locks both (a write
+to `persistence_requests` or `persistence_effects` counts as the brain-row
+FOR SHARE read its protocol trigger takes).
 
 Postgres runs connect through `GBRAIN_PGBOUNCER_URL` when it is set, with
 prepared statements off. A Postgres run with a budget under 300 s (the
@@ -303,7 +315,7 @@ backups, ordinary mutations after repair, and competing publications.
 HTTP and stdio PGLite owners before and after activation, restarts the owner, and
 independently reads the newly remembered private fact and provenance.
 
-`test/reconcile-crash.slow.test.ts` and `test/e2e/reconcile-crash*.test.ts` kill real
+`test/reconcile-crash-*.slow.test.ts` and `test/e2e/reconcile-crash*.test.ts` kill real
 processes at all eight publication boundaries with activation off/on. PostgreSQL
 uses one file per activation state to stay within the unchanged per-file cap. Optional
 `GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR` retains executed-case evidence.
@@ -539,17 +551,23 @@ seed and size (`GBRAIN_GRADUATION_FIXTURE_CACHE`, default
 `~/.cache/gbrain-graduation-fixtures`). A restore re-homes paths and owner
 stamps and marks sources synced, so the source doctor stays green.
 
-The E2E suites drive the real CLI in child processes:
-`graduation-crash` (SIGKILL at every run and rollback boundary),
-`graduation-faults` (ENOSPC on a tmpfs tablespace, which needs Docker;
-password rotation; DDL route mismatch), `graduation-clients` (older
-releases, respawned and resident serve, stale CLI and MCP configs) and
-`graduation-cli` (agent flow, zero-mutation `--plan`/`--status`, `--force`,
-PgBouncer through `GBRAIN_PGBOUNCER_URL`, a NOSUPERUSER role, the 1k round
-trip). Kill and pause points come from `graduationBoundary()` hooks that only
+The E2E suites drive the real CLI in child processes, each split into files
+of about two minutes or less so CI queues spread them:
+`graduation-crash-run-N` and `graduation-crash-rollback-N` (SIGKILL at every
+run and rollback boundary), `graduation-faults` (ENOSPC on a tmpfs
+tablespace, which needs Docker; password rotation; DDL route mismatch),
+`graduation-clients` (older releases) and `graduation-clients-serve`
+(respawned and resident serve, stale CLI and MCP configs), and
+`graduation-cli` (agent flow, `--force`), `graduation-cli-topologies`
+(PgBouncer through `GBRAIN_PGBOUNCER_URL`, a NOSUPERUSER role),
+`graduation-cli-history` (the 1k round trip) and
+`graduation-cli-zero-mutation-N` (zero-mutation `--plan`/`--status`, each
+file probing a share of the custody boundaries). Kill and pause points come
+from `graduationBoundary()` hooks that only
 `test/helpers/graduation-hooks-preload.ts` registers. Older release binaries
-are built once per tag under `GBRAIN_OLDER_RELEASE_DIR`. The crash suite takes
-about 40 seconds per case, so run it with `GBRAIN_E2E_FILE_TIMEOUT=3600`.
+are built once per tag under `GBRAIN_OLDER_RELEASE_DIR`. A crash case takes
+about 16 seconds; `scripts/run-e2e.sh` gives every graduation file four times
+its per-file cap.
 `scripts/persistence/graduation-ttv.ts` records the commands and wall time
 from the first plan to a green doctor, the run's phase timings and query
 p50/p95 on both engines. The 1k-page gate is five minutes;

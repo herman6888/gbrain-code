@@ -24,6 +24,7 @@ writes_to:
   - projects/
   - sources/
 upstream: bulk-skillify+manifest-driven-ingestion@fc834ee
+when_to_use: "Use when the user asks: \"bulk ingest\", \"bulk import\", \"ingest all\", \"ingestion pipeline\", \"mass ingestion\"."
 ---
 
 # bulk-ingestion — Trial → Improve → Bulk, on a Durable Manifest
@@ -382,7 +383,7 @@ Before declaring a pipeline "done":
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Paid batch work (`gbrain agent run`, LLM extraction) stops for confirmation (exit 3) or with `cost_cap_exceeded`: relay the estimate and get the user's agreement before raising a cap; never add `--yes` or a bigger `--max-usd` yourself.
 - A budget stop exits 11 (`derived_cap_exhausted`): run the printed `resume_command`; it is safe to re-run and skips finished items.

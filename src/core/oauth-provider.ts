@@ -37,11 +37,11 @@ import {
   dcrScopeViolation,
 } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
-import { authSourcesFromGrant, grantFromRow, normalizeGrantBrain, intersectGrantedScopes, type GrantPatch } from './grants/model.ts';
+import { TOKEN_TTL_MAX_SECONDS, authSourcesFromGrant, grantFromRow, normalizeGrantBrain, intersectGrantedScopes, type GrantPatch } from './grants/model.ts';
 import { assertValidSlugPrefixes, pgArray } from './grants/encoding.ts';
 import { rescopeOAuthClient, type RescopeClientOptions, type RescopeClientResult } from './grants/rescope.ts';
 import { grantValidationContext, validateClientGrant, insertClientGrant, assertGrantPatch } from './grants/service.ts';
-import { resolveTokenGrant } from './grants/legacy-token.ts';
+import { resolveTokenGrant, touchTokenLastUsed } from './grants/legacy-token.ts';
 import { NO_SOURCES } from './source-id.ts';
 
 /**
@@ -566,8 +566,8 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // token TTL — never a fixed permissive ceiling — so a self-registering
     // client cannot elect a longer-lived token than the server default
     // unless the admin explicitly configured a wider window.
-    const dcrTtlMin = options.dcrTtlMinSeconds ?? DEFAULT_DCR_TTL_MIN_SECONDS;
-    const dcrTtlMax = options.dcrTtlMaxSeconds ?? Math.max(this.tokenTtl, dcrTtlMin);
+    const dcrTtlMin = Math.min(options.dcrTtlMinSeconds ?? DEFAULT_DCR_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS);
+    const dcrTtlMax = Math.min(options.dcrTtlMaxSeconds ?? Math.max(this.tokenTtl, dcrTtlMin), TOKEN_TTL_MAX_SECONDS);
     this._clientsStore = new GBrainClientsStore(
       this.sql,
       options.allowClientCredentialsDcr === true,
@@ -869,6 +869,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         grantRevision: Number(row.grant_revision ?? 0),
         grantProfile: typeof row.grant_profile === 'string' ? row.grant_profile : null,
         grantRepairReasons: Array.isArray(row.grant_repair_reasons) ? row.grant_repair_reasons as string[] : [],
+        tokenTtlSeconds: currentGrant.token_ttl == null ? null : Number(currentGrant.token_ttl),
         boundTools: Array.isArray(row.bound_tools) ? row.bound_tools as string[] : null,
         boundSourceId: typeof row.bound_source_id === 'string' ? row.bound_source_id : null,
         boundBrainId: typeof row.bound_brain_id === 'string' ? row.bound_brain_id : null,
@@ -911,17 +912,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
     if (legacyRows.length > 0) {
       // For legacy tokens, name = clientId = clientName (single identifier).
-      // #2833: debounced fire-and-forget last_used_at update — only writes
-      // once per token per 60s, and NEVER blocks or fails verification (a
-      // slow/broken UPDATE used to hang or 401 every legacy-token request).
-      // Mirrors src/mcp/http-transport.ts validateToken; the SQL-level WHERE
-      // keeps the debounce race-tolerant under concurrent requests; SKIP LOCKED
-      // keeps a row lock held elsewhere from parking a pool slot (#5730).
-      this.sql`
-        UPDATE access_tokens SET last_used_at = now()
-        WHERE id IN (SELECT id FROM access_tokens WHERE token_hash = ${tokenHash}
-          AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds') FOR UPDATE SKIP LOCKED)
-      `.catch(() => { /* fire-and-forget */ });
+      // #2833: debounced fire-and-forget last_used_at update that never blocks
+      // or fails verification; shared with src/mcp/http-transport.ts.
+      void touchTokenLastUsed(this.sql, legacyRows[0]);
       const name = legacyRows[0].name as string;
       // One grant shape (grants/model.ts), shared with the legacy HTTP
       // transport so the two cannot drift. Unified rows read the columns,

@@ -96,6 +96,8 @@ export interface SyncResult {
   bankedFiles?: number;
   /** #5984: the managed drain's verdict and the next step for the agent (see sync-drain.ts). */
   drain?: import('../core/persistence/sync-drain.ts').DrainReport;
+  /** #6278: the run stopped because too many writes stalled while preparing (one systemic diagnostic instead of a pile of holds). */
+  breaker?: import('../core/persistence/sync-run.ts').ManagedSyncBreaker;
   /** #5984: managed cursor position (`index` of `total` manifest entries) and its active drain window. */
   managedCursor?: { index: number; total: number; progress?: import('../core/persistence/sync-run.ts').CursorProgress };
   /** Fix wave 4: connector items held after repeated item-scoped failures (not blocking freshness). */
@@ -116,10 +118,10 @@ export interface SyncResult {
   holds_fix?: import('../core/agent-output.ts').Action;
   /** Requests of a blocked cursor this run converted in place (held, or re-frozen after the file was fixed). */
   converted_from_failed?: string[];
-  /** Files imported by quoting unquoted frontmatter values, cumulative for the run. */
-  recovered_frontmatter?: import('../core/persistence/sync-holds.ts').RecoveredFrontmatter;
-  /** Dry run: files the run would hold, and entries the screen could not judge (never holds). */
-  dry_run?: true;
+  /** Files imported by quoting unquoted frontmatter values, and (#6188) files whose fences Tier 1 rewrote, cumulative for the run. */
+  recovered_frontmatter?: import('../core/persistence/sync-holds.ts').RecoveredFrontmatter; fences_normalized?: import('../core/fence-repair/report.ts').FencesNormalized; fence_issues?: ReturnType<ReturnType<typeof import('../core/fence-repair/report.ts').importFenceTally>['fields']>['fence_issues'];
+  /** Dry run: files the run would hold or (#6188) normalize, and entries the screen could not judge (never holds). */
+  dry_run?: true; would_normalize?: Array<{ path: string; classes: string[] }>; would_normalize_count?: number;
   would_hold?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
   would_hold_count?: number;
   screen_skipped?: Array<{ path: string; code: string }>;
@@ -328,7 +330,8 @@ export interface SyncOpts {
    * `sync_status` IPC polls read. Absent for direct CLI runs (stderr
    * breadcrumbs already cover that surface).
    */
-  onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number }) => void;
+  onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
+    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } }) => void;
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked
@@ -339,6 +342,7 @@ export interface SyncOpts {
   /** #5984: wall-clock ms the current drain started; managed cursors measure their rate from it. */
   drainStartedAt?: number;
   /** #5984: `--no-bulk`; and the drain's resolved bulk settings (internal; absent = one request per pass step). */ noBulk?: boolean; bulk?: import('../core/persistence/sync-group.ts').BulkSettings;
+  /** #5984 lanes: `--lanes N` (1..16) or `--no-lanes` (1). */ lanes?: number;
 }
 
 // The git-plumbing cluster (git(), discoverGitRoot, createSyncBaselineCommit,

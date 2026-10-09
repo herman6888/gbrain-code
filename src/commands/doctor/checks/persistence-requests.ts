@@ -2,6 +2,11 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { readRequestIndexStates, REQUEST_INDEXES_REPAIR_COMMAND } from '../../../core/persistence/checkpoint-validation.ts';
 import { oneYearCapacity, readJournalLimits, journalLimitKey } from '../../../core/persistence/limits.ts';
+import { claimStall, claimStateOf, MAX_CLAIM_CONFIG_KEY, readMaxClaimMs } from '../../../core/persistence/claim-phase.ts';
+import { preparationBudgetMs } from '../../../core/persistence/preparation-budget.ts';
+import { readPreparationPolicy } from '../../../core/persistence/switches.ts';
+import { resolvePrepare, resolveSessionTimeouts } from '../../../core/db.ts';
+import { agentFix, checkError } from '../check-fix.ts';
 
 const WINDOW_DAYS = 7;
 const SAMPLE = 10_000;
@@ -93,5 +98,98 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
     return { name: 'persistence_request_growth', status: 'warn',
       message: `Request-table growth could not be read: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
       details: { health: 'unknown', docs } };
+  }
+}
+
+/**
+ * #6176: a write request that has held its claim longer than
+ * `persistence.max_claim_ms` (default 10 minutes). The queue checks only see
+ * Minion jobs, so a persistence request whose preparation or publication hangs
+ * while its owner keeps renewing the claim was invisible: every later write on
+ * its root waits behind it. Names the stuck phase (claim-phase.ts), the root,
+ * the claim's age, how many writes wait behind it and whether the same request
+ * resumes on its own, with the read-only writer status as the next step.
+ * #6278: each stall also carries the claim's step, what it waits on, the owner
+ * process and, for a preparation past its budget, `claim.stall`
+ * (`preparation_overdue`); the budgets in effect are in the details.
+ */
+export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
+  const docs = 'docs/guides/troubleshooting.md#persistence-write-stall';
+  try {
+    const maxClaimMs = await readMaxClaimMs(engine);
+    const policy = await readPreparationPolicy(engine);
+    const rows = await engine.executeRaw<{ request_id: string; source_id: string; worktree_id: string | null; operation: string; intent_kind: string | null; state: string; claim_phase: unknown;
+      execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean; request_age_ms: string; waiting: number }>(
+      `SELECT r.request_id::text,r.source_id,r.worktree_id::text,r.operation,r.intent->>'kind' AS intent_kind,r.state,r.claim_phase,r.execution_token::text,r.claim_expires_at<now() AS claim_lapsed,
+        r.publication_started,(EXTRACT(EPOCH FROM (now()-r.created_at))*1000)::bigint::text AS request_age_ms,
+        (SELECT count(*)::int FROM persistence_requests q WHERE q.worktree_id=r.worktree_id AND q.state='queued' AND q.sequence>r.sequence) AS waiting
+      FROM persistence_requests r WHERE r.state='running' ORDER BY r.sequence LIMIT 100`);
+    const now = Date.now();
+    const stalls = rows.flatMap(row => {
+      const claim = claimStateOf(row, now);
+      if (!claim) return [];
+      // An owner that predates phase recording never stamps its claims; the request's own age bounds the claim's.
+      const held = claim.claim_age_ms ?? (row.claim_phase == null ? Math.max(0, Number(row.request_age_ms)) : null);
+      if (held === null || !(held >= maxClaimMs)) return [];
+      const budget = preparationBudgetMs({ operation: row.operation, intent: row.intent_kind ? { kind: row.intent_kind } : null }, policy, 30_000);
+      return [{ request_id: row.request_id, source_id: row.source_id, root: row.worktree_id, operation: row.operation, intent_kind: row.intent_kind, phase: claim.phase,
+        claim_age_ms: held, phase_age_ms: claim.phase_age_ms, step: claim.step, step_age_ms: claim.step_age_ms, waiting_on: claim.waiting_on, owner: claim.owner,
+        budget_ms: budget, stall: claimStall(claim, budget), waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own, why: claim.why }];
+    });
+    const details = { max_claim_ms: maxClaimMs, config_key: MAX_CLAIM_CONFIG_KEY, count: stalls.length, stalls, docs,
+      preparation_policy: { sync_preparation_ms: policy.syncMs, maintenance_preparation_ms: policy.maintenanceMs, preparation_ceiling_ms: policy.ceilingMs, max_preparation_attempts: policy.maxAttempts } };
+    if (!stalls.length) return { name: 'persistence_write_stall', status: 'ok', details,
+      message: `No write request has held its claim longer than ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms).` };
+    const first = stalls[0]!;
+    const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
+    return { name: 'persistence_write_stall', status: 'warn', details,
+      message: `${stalls.length} write request(s) have held their claim longer than ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms). `
+        + stalls.slice(0, 3).map(stall => `Request ${stall.request_id} (${stall.operation}) on source ${stall.source_id}, root ${stall.root ?? 'database-only'}, `
+          + `is stuck in phase ${stall.phase} after ${minutes(stall.claim_age_ms)}; ${stall.waiting_behind} queued write(s) wait behind it. ${stall.why}`).join(' ')
+        + ` Next: inspect it with gbrain sources writer status --source ${first.source_id} --json, then restart the gbrain serve that owns the root`
+        + `${first.resumes_on_its_own ? ' if it is still stuck after its transaction ends' : ''}. The root trigger of a hang is not known yet; attach that status output when reporting it.`,
+      fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', first.source_id, '--json'],
+        'Read-only: shows the owner, the stuck request\'s claim phase and every write waiting behind it on that root.', 'persistence_write_stall', { docs }) };
+  } catch (error) {
+    return checkError('persistence_write_stall', 'inspect running write requests', error, { details: { health: 'unknown', docs } });
+  }
+}
+
+/**
+ * #6278 (plan item 1.4): whether the session timeouts gbrain configures as
+ * connection startup parameters (`GBRAIN_STATEMENT_TIMEOUT`, default 5min)
+ * actually reach the server through the configured URL. A transaction-mode
+ * pooler (PgBouncer, Supavisor) drops or ignores startup parameters, so `SHOW
+ * statement_timeout` through the pool reads `0`: statements outside a
+ * transaction then have no server-side bound. Preparation reads carry their
+ * own transaction-local bound (bounded-reads.ts), so this is a warning about
+ * every other autocommit statement, not a stall by itself.
+ */
+export async function sessionTimeoutsCheck(engine: BrainEngine): Promise<Check> {
+  const docs = 'docs/guides/troubleshooting.md#session-timeouts-not-applied';
+  const configured = resolveSessionTimeouts().statement_timeout ?? null;
+  if (engine.kind !== 'postgres' || configured === null) {
+    return { name: 'persistence_session_timeouts', status: 'ok', details: { configured, applied: null, docs },
+      message: configured === null ? 'No session statement_timeout is configured (GBRAIN_STATEMENT_TIMEOUT=0).' : 'PGLite has no session to time out.' };
+  }
+  try {
+    const [row] = await engine.executeRaw<{ statement_timeout: string }>('SHOW statement_timeout');
+    const applied = row?.statement_timeout ?? null;
+    // #6278: the live stall ran through a transaction-mode pooler (Supavisor :6543), which can also leave a cancelled
+    // round-trip incomplete (backend in ClientRead). The engine settles those client-side; the pooler mode is still worth naming.
+    const url = process.env.GBRAIN_DATABASE_URL ?? process.env.DATABASE_URL ?? '';
+    const pooler = url !== '' && resolvePrepare(url) === false;
+    const poolerNote = pooler ? ' The configured URL is a transaction-mode pooler (prepared statements off): a cancel request may not reach the backend, so a cut-off statement is '
+      + 'discarded client-side after GBRAIN_CANCEL_SETTLE_MS (default 2000). The session-mode URL of the same pooler (Supabase: port 5432) avoids both limits for the persistence owner.' : '';
+    const details = { configured, applied, docs, ...(pooler ? { pooler: 'transaction_mode' } : {}) };
+    if (applied !== '0') return { name: 'persistence_session_timeouts', status: pooler ? 'warn' : 'ok', details: pooler ? { ...details, reason: 'transaction_mode_pooler' } : details,
+      message: `The session statement_timeout (${applied}) reaches the server.${poolerNote}` };
+    return { name: 'persistence_session_timeouts', status: 'warn', details: { ...details, reason: 'session_timeouts_not_applied' },
+      message: `session_timeouts_not_applied: gbrain configured statement_timeout=${configured} as a connection startup parameter, but SHOW statement_timeout through the configured URL `
+        + 'reads 0. A transaction-mode pooler (PgBouncer, Supavisor) drops startup parameters, so statements outside a transaction have no server-side bound; GBRAIN_STATEMENT_TIMEOUT is '
+        + 'ignored there. Preparation reads are bounded by their own transaction-local timeout (the preparation budget covers the gap); a long autocommit statement elsewhere still runs '
+        + `until it finishes. To restore the session default, set it on the role: ALTER ROLE <gbrain role> SET statement_timeout = '${configured}' (the pooler cannot be told to keep it).${poolerNote}` };
+  } catch (error) {
+    return checkError('persistence_session_timeouts', 'read the session statement_timeout', error, { details: { configured, health: 'unknown', docs } });
   }
 }

@@ -199,6 +199,21 @@ export const linkTypesTemporal: LintRule = (manifest) => {
   return issues;
 };
 
+export const linkTypesCardinality: LintRule = (manifest) => {
+  const issues: LintIssue[] = [];
+  for (const lt of manifest.link_types) {
+    if (lt.cardinality !== 'one_per_from' || (lt.temporal ?? RELATION_SEMANTICS[lt.name]) === 'state') continue;
+    issues.push({
+      rule: 'link_types_cardinality_not_state',
+      severity: 'error',
+      message: `link_type '${lt.name}' declares cardinality one_per_from, but only state relations have stints a newer start can close; declare temporal: state on '${lt.name}' or remove its cardinality`,
+      pack: manifest.name,
+      link: lt.name,
+    });
+  }
+  return issues;
+};
+
 export const frontmatterLinksUndeclared: LintRule = (manifest) => {
   const issues: LintIssue[] = [];
   const typeNames = new Set(manifest.page_types.map((t) => t.name));
@@ -458,6 +473,7 @@ export const ALL_LINT_RULES: ReadonlyArray<{ name: string; rule: LintRule; plane
   { name: 'enrichable_types_undeclared', rule: enrichableTypesUndeclared, planeAware: false },
   { name: 'link_types_undeclared', rule: linkTypesUndeclared, planeAware: false },
   { name: 'link_types_temporal', rule: linkTypesTemporal, planeAware: false },
+  { name: 'link_types_cardinality', rule: linkTypesCardinality, planeAware: false },
   { name: 'frontmatter_links_undeclared', rule: frontmatterLinksUndeclared, planeAware: false },
   { name: 'expert_routing_without_prefix', rule: expertRoutingWithoutPrefix, planeAware: false },
   { name: 'prefix_collision', rule: prefixCollision, planeAware: false },

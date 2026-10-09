@@ -1,3 +1,4 @@
+import { expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,8 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { GBrainConfig } from '../../src/core/config.ts';
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
-import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { disposePersistenceConsumer, waitForWrites } from '../../src/core/persistence/service.ts';
+import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { isolatedPersistencePostgres } from './persistence-postgres.ts';
 import { syncLockId } from '../../src/core/db-lock.ts';
 import { testBackends } from './test-backends.ts';
@@ -133,6 +135,29 @@ export function withGoogleAccount(fetcher: ((url: string, init?: RequestInit) =>
     if (!fetcher) throw new Error('Unexpected external fixture route');
     return fetcher(url, init);
   };
+}
+
+/**
+ * A managed sweep returns with an accepted write still pending once its wait
+ * budget runs out; the cursor stays put and the write publishes later. A seed
+ * that reads its imported pages, or stops the consumer and hands the database
+ * to a child, first waits for every write the source admitted to commit.
+ */
+export async function settleConnectorWrites(engine: BrainEngine, sourceId: string) {
+  const rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY created_at', [sourceId]);
+  const settled = await waitForWrites(engine, rows, { engine: engine.kind }, testWaitMs(30_000));
+  expect(settled.map(row => [row.slug, row.state])).toEqual(rows.map(row => [row.slug, 'committed']));
+}
+
+/**
+ * The fixture's 1.5 s wait budget is for runs against a paused owner. A run whose assertions need every write
+ * published (a healthy owner) runs on the production budget, so a slow host waits for the owner instead of
+ * stopping the sweep `writer_pending`. A committed write returns at once, so this costs nothing on a fast host.
+ */
+export async function withHealthyOwnerBudget<T>(run: () => Promise<T>): Promise<T> {
+  const budget = connectorWaitBudget.ms;
+  connectorWaitBudget.ms = CONNECTOR_WAIT_BUDGET_MS;
+  try { return await run(); } finally { connectorWaitBudget.ms = budget; }
 }
 
 /** #5600: the pending set a managed connector run ended with (connector state row). */

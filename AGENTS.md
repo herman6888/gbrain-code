@@ -23,8 +23,10 @@ start here.
    ```
    If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`,
    the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218).
-   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services, or fall back to the
-   deterministic install: `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
+   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services. It exits 0
+   only when the schema is at head; exit 1 with `migrations_pending` means the schema is still behind, and another
+   `--yes` repeats the failure, so run `gbrain doctor --json` and fall back to the deterministic install:
+   `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
 2. Init keyless memory: `gbrain init --pglite --no-embedding` (zero-config). For 1000+ files or
    multi-machine sync, init suggests Postgres + pgvector via Supabase.
 3. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
@@ -45,8 +47,10 @@ Recall relevant saved context before answering. Save explicit requests to rememb
 Durable preferences and facts belong in shared memory when the user wants them
 recalled later. Transient task state, credentials, local configuration, and harness
 activation state do not. Remote `put_page` saves references as text without inline
-graph extraction; stdio has best-effort startup/idle sweeps, while HTTP requires
-explicit host maintenance or authorized `add_link` calls. Configured model
+graph extraction; a post-commit `links` effect then adds plain mention edges to
+existing pages the writer can see (`mcp.remote_auto_links`, on by default). Typed
+edges rely on stdio's best-effort startup/idle sweeps, explicit host maintenance
+or authorized `add_link` calls. Configured model
 providers can receive text; Markdown export is not a full database backup.
 Read [memory boundaries](docs/guides/memory-boundaries.md) before promising
 portability, graph freshness, privacy, or recovery.
@@ -125,7 +129,34 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   next sync (`gbrain sync --source <id> --no-pull` does it now). Write brain
   files through `put_page`/`capture` or a YAML serializer and check generated
   content with `gbrain frontmatter validate --stdin --path <p>`. Walkthrough:
-  [held files](docs/guides/repair.md#held-files).
+  [held files](docs/guides/repair.md#held-files). A hold with code
+  `invalid_fence` is a facts or takes table, not frontmatter, and clears
+  automatically on the next maintenance run. `gbrain repair fences --source <id>`
+  previews the repair and its printed apply command runs it now, with no
+  extra consent; a `manual` reason needs the edit the hold names (read the
+  page with `gbrain get --source <id> -- <slug>`, edit only that fence,
+  commit, `gbrain sync --source <id> --no-pull`). Raising spend
+  (`fences.repair.max_usd_per_day`, `fences.repair.llm true`) is the user's
+  call ([fence holds](docs/guides/write-refusals.md#invalid_fence)). A hold
+  with code `preparation_stalled` (or a managed catch-up that stops
+  `preparation_abandoned` / `preparation_systemic`, or a write receipt with that
+  code) means the write owner stalled, not the file: no repair applies. Run
+  `gbrain sources writer status --source <id> --json` (read-only: the step, what
+  it waited on, the owner and its version), fix that or upgrade the owner, then
+  `gbrain sources retry-held <id>` and the sync it prints with the same options
+  (`--no-embed` stays). Runbook:
+  [catch-up stuck](docs/guides/troubleshooting.md#catch-up-stuck).
+- **Keep a managed catch-up moving without a human** (a live checkout where
+  other agents commit while `gbrain sync` drains thousands of pages): a page
+  that moves under the run is held (`concurrent_write`, `worktree_dirty`), a
+  dropped connection is retried, and a relaunch resumes the frozen manifest.
+  The operator loop is `gbrain sync status --source <id> --json` (cursor,
+  `committed_last_10m`, each hold and the last error with `class` /
+  `safe_actions` / `needs_human`), then, when nothing moved and
+  `needs_human` is false, `gbrain sync unblock --source <id> --apply` and
+  the sync it prints; when `needs_human` is true, relay `next.user_message`
+  with the slug. Decision table:
+  [`docs/guides/sync-unblock-runbook.md`](./docs/guides/sync-unblock-runbook.md).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes --no-autopilot-install` (manual migration orchestration without service installation).
@@ -208,10 +239,12 @@ seconds (gitleaks plus the doc checks) and runs the full gate otherwise. Require
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
 
 Fastest path, with a Ubicloud token (`UBICLOUD_API_KEY` or
-`UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across ten
+`UBICLOUD_API_TOKEN`): `bun run ci:ubicloud` runs the same gate across four
 ephemeral VMs in about five minutes, uncommitted edits included
 (`ci:ubicloud:diff` for the doc-only fast path). See "Ubicloud fan-out" in
-[`docs/TESTING.md`](./docs/TESTING.md).
+[`docs/TESTING.md`](./docs/TESTING.md). Set `UBI_OWNER` to your thread code. In a
+multi-lane wave, lanes run `ci:ubicloud:diff` or targeted suites; only the
+integrator runs the full gate.
 
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
 up the test Postgres container, run `bun run test:e2e`, tear it down).

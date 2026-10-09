@@ -106,6 +106,10 @@ export const HANDLER_DEFAULT_LOCK_DURATION_MS: Readonly<Record<string, number>> 
   'connector-sync': FIVE_MIN_MS,
   'autopilot-cycle': FIVE_MIN_MS,
   'autopilot-global-maintenance': FIVE_MIN_MS,
+  // A sync job's synchronous git helpers (sync-git.ts, 30s timeout each) can
+  // hold the event loop for a full 30s worker lease on their own, so a
+  // healthy sync would lose its lock without a longer default.
+  sync: FIVE_MIN_MS,
   contextual_reindex_per_chunk: FIVE_MIN_MS,
   chronicle_extract: TWO_MIN_MS,
   'facts-absorb': TWO_MIN_MS,
@@ -126,4 +130,20 @@ export const LOCK_DURATION_MS_MAX = 3_600_000;
 
 export function clampLockDurationMs(raw: number): number {
   return Math.max(LOCK_DURATION_MS_MIN, Math.min(LOCK_DURATION_MS_MAX, Math.floor(raw)));
+}
+
+/**
+ * Per-turn chat timeout for subagent jobs (#4921), `ai.chat.per_turn_timeout_ms`.
+ * The gateway's default chat backstop (300 s) killed long thinking-model
+ * turns inside a 30-min job, and the replay retried into the same wall.
+ * A subagent turn instead gets this cap (default: the 30-min subagent
+ * budget); the job's own signal still aborts at its deadline, so a turn ends
+ * at whichever comes first. Calls outside a job keep the 300 s backstop.
+ */
+export const DEFAULT_CHAT_PER_TURN_TIMEOUT_MS = THIRTY_MIN_MS;
+
+/** The configured per-turn cap, or the default when unset or not a positive integer. */
+export function resolveChatPerTurnTimeoutMs(raw: string | null | undefined): number {
+  const n = raw == null || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : DEFAULT_CHAT_PER_TURN_TIMEOUT_MS;
 }

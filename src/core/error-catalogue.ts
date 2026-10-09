@@ -37,6 +37,9 @@ export const ERROR_CATALOGUE = {
   legacy_job_authority: { code: 'permission_denied', docs: 'docs/guides/repair.md#legacy-job-authority' },
   preview_changed: { code: 'preview_changed', docs: 'docs/guides/repair.md#preview-changed' },
   projection_owner_resident: { code: 'projection_owner_resident', docs: 'docs/guides/repair.md#projection-owner-resident' },
+  file_removed_during_scan: { code: 'file_removed_during_scan', docs: 'docs/guides/repair.md#file-removed-during-scan' },
+  fix_not_writable: { code: 'fix_not_writable', docs: 'docs/guides/repair.md#fix-not-writable' },
+  page_projection_conflict: { code: 'page_projection_conflict', docs: 'docs/guides/repair.md#page-projection-conflict' },
   explicit_kind_required: { code: 'explicit_kind_required', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
   repair_kind_unavailable: { code: 'unavailable', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
   colon_slug_windows_write_through: { code: 'colon_slug_windows_write_through', docs: 'docs/guides/write-refusals.md#colon_slug_windows_write_through' },
@@ -46,6 +49,10 @@ export const ERROR_CATALOGUE = {
   source_checkout_missing: { code: 'recovery_required', docs: 'docs/guides/write-refusals.md#source_checkout_missing' },
   managed_pull_skipped: { code: 'managed_pull_skipped', docs: 'docs/guides/write-refusals.md#managed_pull_skipped' },
   no_pricing: { code: 'no_pricing', docs: 'docs/guides/write-refusals.md#no_pricing' },
+  timeline_comment_markup: { code: 'timeline_comment_markup', docs: 'docs/guides/repair.md#timeline-comments' },
+  timeline_rows_would_be_removed: { code: 'timeline_rows_would_be_removed', docs: 'docs/guides/write-refusals.md#timeline_rows_would_be_removed' },
+  reconcile_private_facts: { code: 'permission_denied', docs: 'docs/guides/write-refusals.md#reconcile-private-facts' },
+  maintenance_backpressure: { code: 'maintenance_backpressure', docs: 'docs/guides/write-refusals.md#maintenance_backpressure' },
   // F0 `gbrain sources refresh` (worktree-wide coordinated ff-only refresh).
   refresh_not_managed: { code: 'refresh_not_managed', docs: 'docs/guides/write-refusals.md#refresh_not_managed' },
   refresh_not_owner: { code: 'refresh_not_owner', docs: 'docs/guides/write-refusals.md#refresh_not_owner' },
@@ -65,6 +72,10 @@ export const ERROR_CATALOGUE = {
   sync_drain_database_contention: { code: 'database_contention', docs: 'docs/guides/write-refusals.md#drain-database-contention' },
   sync_drain_writer_blocked: { code: 'recovery_required', docs: 'docs/guides/write-refusals.md#drain-writer-blocked' },
   sync_drain_blocked_by_failures: { code: 'blocked_by_failures', docs: 'docs/guides/write-refusals.md#drain-blocked-by-a-failed-page' },
+  sync_drain_preparation_abandoned: { code: 'preparation_abandoned', docs: 'docs/guides/write-refusals.md#drain-preparation-abandoned' },
+  sync_drain_preparation_systemic: { code: 'preparation_systemic', docs: 'docs/guides/write-refusals.md#preparation_systemic' },
+  sync_drain_write_capacity: { code: 'queue_capacity', docs: 'docs/guides/write-refusals.md#drain-write-capacity' },
+  sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
 } as const satisfies Record<string, CatalogueEntry>;
 
 export type CatalogueName = keyof typeof ERROR_CATALOGUE;

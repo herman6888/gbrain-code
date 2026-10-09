@@ -49,6 +49,18 @@ export function privatePagesFilterFragment(pageAlias: string): string {
 }
 
 /**
+ * `privatePagesFilterFragment` with a cheap first test: a page with no
+ * `visibility` or `derived_from` key whose type is not atom, concept or event
+ * is visible by every rule above, so only the remaining pages run the full
+ * check. For scans over thousands of candidate pages (an entity's referrers).
+ */
+export function privatePagesFilterFragmentFast(pageAlias: string): string {
+  return `((${pageAlias}.frontmatter->'visibility' IS NULL AND ${pageAlias}.frontmatter->'derived_from' IS NULL
+      AND ${pageAlias}.type NOT IN ('atom', 'concept', 'event'))
+    OR ${privatePagesFilterFragment(pageAlias)})`;
+}
+
+/**
  * Declared lineage: a page whose frontmatter `derived_from` names a page (one
  * slug or a list, `.md` optional) that is explicitly `visibility: private` in
  * the same source is private too, whatever its own field says. Summaries,
@@ -57,14 +69,14 @@ export function privatePagesFilterFragment(pageAlias: string): string {
  * private input propagates; a missing input does not hide the page.
  */
 function declaredLineagePrivateSql(p: string): string {
-  return `(jsonb_typeof(${p}.frontmatter->'derived_from') IN ('array', 'string') AND EXISTS (
+  return `(CASE WHEN jsonb_typeof(${p}.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS (
     SELECT 1 FROM pages declared_origin
     WHERE declared_origin.source_id = ${p}.source_id
       AND declared_origin.frontmatter->>'visibility' = 'private'
-      AND declared_origin.slug IN (
+      AND declared_origin.slug = ANY(ARRAY(
         SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text(
           CASE WHEN jsonb_typeof(${p}.frontmatter->'derived_from') = 'array' THEN ${p}.frontmatter->'derived_from'
-            ELSE jsonb_build_array(${p}.frontmatter->'derived_from') END) AS declared(slug))))`;
+            ELSE jsonb_build_array(${p}.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)`;
 }
 
 /**

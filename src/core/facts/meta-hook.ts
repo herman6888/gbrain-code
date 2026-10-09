@@ -201,6 +201,7 @@ export async function getBrainHotMemoryMeta(
         // in) rides the pack/delta projections instead of being recall-only.
         context: r.context ?? null,
         confidence: Number(effectiveConfidence(r, now).toFixed(3)),
+        ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
       })),
     },
   };

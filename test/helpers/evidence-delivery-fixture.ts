@@ -71,7 +71,7 @@ export async function captureOffPath(engine: BrainEngine): Promise<Record<string
   });
   const prompts: string[] = [];
   await runThink(engine, {
-    question: 'ocelot pricing', remote: false,
+    question: 'ocelot pricing', remote: false, referenceDate: '2026-01-15',
     client: { create: async (params: { messages: unknown[] }) => {
       prompts.push(JSON.stringify(params.messages));
       return { content: [{ type: 'text', text: '{"answer":"ok","citations":[],"gaps":[]}' }], usage: { input_tokens: 1, output_tokens: 1 } };
@@ -114,4 +114,6 @@ export async function seedOffPath(engine: BrainEngine, pages = OFF_PATH_PAGES): 
     await installFixtureChunks(engine, p.slug, await prepareMarkdownChunks({ compiled_truth: p.body, timeline: p.timeline ?? '' }));
   }
   await engine.setConfig('search.mcp_keyword_only', 'true');
+  // Answer ids are minted per call, so the frozen off-path output is captured with retrieval feedback off.
+  await engine.setConfig('feedback.enabled', 'false');
 }

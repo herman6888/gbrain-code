@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../engine.ts';
 import { renderFactsTable, type ParsedFact } from '../facts-fence.ts';
 import { OperationError } from '../ops/contract.ts';
+import { fenceOperationError } from '../fence-repair/refusal.ts';
 import { withdrawnFact, withdrawalFenceBlocks } from './withdrawal-overlay.ts';
 import { ambiguousFenceClaims, discoverWithdrawalTargets, withdrawalDiscoveryFailure } from './withdrawal-discovery.ts';
 
@@ -10,9 +11,33 @@ export interface WithdrawalCommit {
 }
 
 /** DB-first: no filesystem ownership, provider work or root lock is required. */
+/**
+ * Called inside the withdrawal transaction after the ledger row commits with
+ * it: projections derived from the withdrawn claim (beyond pages and chunks,
+ * which this module invalidates) register here to invalidate in the same unit.
+ */
+export type WithdrawalInvalidation = (tx: BrainEngine, w: { sourceId: string; factId: number; subject: string; pages: WithdrawalCommit['pages'] }) => Promise<void>;
+const withdrawalInvalidations: WithdrawalInvalidation[] = [];
+export function registerWithdrawalInvalidation(fn: WithdrawalInvalidation): void {
+  if (!withdrawalInvalidations.includes(fn)) withdrawalInvalidations.push(fn);
+}
+
+/** The DB-plane switch for overnight semantic withdrawal review (decide review lane). */
+export const REVIEW_WITHDRAW_KEY = 'decide.slots.conflict.review_withdraw';
+
+/**
+ * `decide.slots.conflict.review_withdraw`: on unless explicitly turned off. The
+ * held-out qualification passed (docs/eval/decisions/p8/SEALED_VERDICTS.md); the
+ * lane still proposes only where the conflict slot is on with a decision provider.
+ */
+export function reviewWithdrawOn(raw: string | null | undefined): boolean {
+  const v = (raw ?? '').trim().toLowerCase();
+  return v === '' || ['true', 'on', '1', 'yes'].includes(v);
+}
+
 export async function recordFactWithdrawal(
   engine: BrainEngine, id: number, sourceId: string, worldOnly = false,
-  opts: { requestId?: string } = {},
+  opts: { requestId?: string; semanticReview?: boolean } = {},
 ): Promise<WithdrawalCommit> {
   return engine.transaction(async tx => {
     // A managed caller takes this EXCLUSIVE source lock before authority,
@@ -45,6 +70,11 @@ export async function recordFactWithdrawal(
       WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($3)
         AND ($4='*' OR entity_slug=$4) AND expired_at IS NULL`, [sourceId,row.visibility,row.fact,row.subject]);
     if (!inserted.length) return { withdrawn: false, pages: [] };
+    // Overnight semantic review (decide review lane): queued with the ledger row so a late commit is never skipped.
+    // Not queued when the caller opted out (`semantic_review: false`, also used by review-accepted withdrawals).
+    if (opts.semanticReview !== false && reviewWithdrawOn(await tx.getConfig(REVIEW_WITHDRAW_KEY))) {
+      await tx.executeRaw(`INSERT INTO decide_review_queue(kind,source_id,a_ref) VALUES ('withdraw',$1,$2) ON CONFLICT DO NOTHING`, [sourceId, String(id)]);
+    }
     // Logical revision and projection invalidation commit with the withdrawal.
     // The revision trigger queues durable rebuild work even for unmanaged calls.
     const pages = affected.length ? await tx.executeRaw<{ id: number; slug: string; knowledge_revision: string }>(
@@ -58,7 +88,9 @@ export async function recordFactWithdrawal(
         CROSS JOIN (VALUES ('withdrawal-mirror'),('git'),('embedding')) AS k(kind)
         WHERE s.id=$2 ON CONFLICT(request_id,kind) DO NOTHING`, [opts.requestId, sourceId, JSON.stringify({ version: 2, targets: pages.map(page => ({ slug: page.slug, page_id: page.id, revision: page.knowledge_revision })).sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0) })]);
     }
-    return { withdrawn: true, pages: pages.map(page => ({ sourceId, slug: page.slug, revision: page.knowledge_revision })) };
+    const committed = pages.map(page => ({ sourceId, slug: page.slug, revision: page.knowledge_revision }));
+    for (const invalidate of withdrawalInvalidations) await invalidate(tx, { sourceId, factId: id, subject: row.subject, pages: committed });
+    return { withdrawn: true, pages: committed };
   });
 }
 
@@ -131,8 +163,9 @@ export async function assertPreparedFactWithdrawals(engine: BrainEngine, sourceI
       'Read the current page revision, then submit the updated import with a new request_id.');
   }
   if (blocked) {
-    throw new OperationError('invalid_params', 'A malformed fact fence contains a withdrawn claim.',
-      'Repair the matching fence row, then retry the import.');
+    // Typed invalid_fence, wire invalid_params (E6): a managed sync holds this file instead of blocking.
+    const section = await ambiguousFenceMatchesWithdrawal(engine, sourceId, [body], subject ?? null) ? 'body' : 'timeline';
+    throw fenceOperationError({ reason: 'withdrawn_claim_in_malformed_fence', fence: 'facts', section, rows: [], columns: [], line: null }, subject, sourceId);
   }
 }
 

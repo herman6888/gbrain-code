@@ -37,6 +37,8 @@
  * commit 13 wires it.
  */
 
+import { observationDateFrom, resolveObservationDate, type ObservationDate } from '../ai/date-grounding.ts';
+import { factEventTime } from './event-time.ts';
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
 import { isFactsBackstopEligible } from './eligibility.ts';
@@ -48,22 +50,14 @@ import { isAvailable } from '../ai/gateway.ts';
 import { withAIInvocationPreflight } from '../ai/invocation-guard.ts';
 import { decideSingleFact } from './single-prepare.ts';
 import { cosineVerdict, dedupCapturedFacts, withCaptureDrops } from './capture-dedup.ts';
+import { assertAmbientCaptureAdmissible, type FactsBackstopSource } from './capture-sources.ts';
 import { appendContextNote, type InferredVia } from './subject-infer.ts';
 import { inferenceNote, inferMissingSubjects } from './subject-infer-write.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import type { FactNotabilityFilter } from './notability-filter.ts';
 
-/**
- * Notability-filter vocabulary shared by the durable facts-absorb payload
- * writer (queue mode below) and its only reader, the minion handler in
- * commands/jobs.ts. #4870: the reader must accept every value the writer can
- * send; `coerceNotabilityFilter` is the validated pass-through (unknown or
- * absent → 'all', the documented default).
- */
-export const NOTABILITY_FILTERS = ['all', 'high-only', 'medium-and-up'] as const;
-export type FactNotabilityFilter = typeof NOTABILITY_FILTERS[number];
-export function coerceNotabilityFilter(v: unknown): FactNotabilityFilter {
-  return (NOTABILITY_FILTERS as readonly unknown[]).includes(v) ? (v as FactNotabilityFilter) : 'all';
-}
+// The notability-filter vocabulary lives in notability-filter.ts; re-exported for existing importers.
+export { NOTABILITY_FILTERS, coerceNotabilityFilter, type FactNotabilityFilter } from './notability-filter.ts';
 
 /**
  * Context cell for a fact whose entity came from the bare-name
@@ -104,13 +98,15 @@ export interface FactsBackstopCtx {
    *   - 'hook:compact'       — compaction-boundary checkpoint harvest (cathedral 5)
    *   - 'hook:writeback'     — ambient-writeback Stop-hook backstop (WP4)
    *   - 'sweep:corpus'       — the sweep's session-corpus pass
-   * The last three are capture lanes (capture-dedup.ts, #5888).
+   * The last three are capture lanes (capture-dedup.ts, #5888); the list is
+   * FACTS_BACKSTOP_SOURCES (capture-sources.ts).
    */
-  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact' | 'hook:writeback' | 'sweep:corpus';
+  source: FactsBackstopSource;
   /** Execution mode — D8. Default 'queue' (fire-and-forget). */
   mode?: 'queue' | 'inline';
   /** Notability filter — D4. Default 'all'; sync uses 'high-only'; the
-   * ambient-writeback lane uses 'medium-and-up' in salient mode. */
+   * ambient-writeback lane uses 'medium-and-up' in salient mode; page-write
+   * jobs carry `facts.page_write_notability_filter` (notability-filter.ts). */
   notabilityFilter?: FactNotabilityFilter;
   /** Abort signal for shutdown propagation. */
   abortSignal?: AbortSignal;
@@ -134,8 +130,18 @@ export interface FactsBackstopCtx {
    * context_pack / delta projections surface the provenance.
    */
   sourceSlug?: string;
-  /** #5888: when the source turn happened, for the capture-lane dedup window (default: now). */
+  /**
+   * #5888: when the source turn happened, for the capture-lane dedup window
+   * (default: now). #6159: also the facts' event time after validFrom (see
+   * factEventTime); unlike validFrom it is not part of the managed batch key.
+   */
   turnAt?: Date;
+  /**
+   * #6048: with no request id (the batch is keyed by its input), re-admit the
+   * retained facts of entity requests the canonical file check refused once
+   * their pages pass it again (persistence/facts-maintenance.ts).
+   */
+  reAdmitFileRefusals?: boolean;
 }
 
 /** Discriminated return shape based on FactsBackstopCtx.mode. */
@@ -157,6 +163,16 @@ export type FactsBackstopResult =
       /** Set when the LLM extraction step failed non-transport-fatally (see runPipelineWithBody). */
       skipped_reason?: import('./extract.ts').ExtractFailureReason;
     };
+
+/** One pipeline run's input: the turn text plus its page provenance and observation date. */
+interface PipelineInput {
+  turnText: string;
+  isDreamGenerated: boolean;
+  ref?: string;
+  pageSlug?: string;
+  /** When the text was written or said; null/undefined = unknown. */
+  observationDate?: ObservationDate | null;
+}
 
 interface ParsedPageInput {
   slug: string;
@@ -518,6 +534,7 @@ async function runPipeline(
       // #4819: page provenance for DB-only rows. The turn-path entry
       // (runFactsPipeline) has no page, so it leaves this unset.
       pageSlug: parsedPage.slug,
+      observationDate: resolveObservationDate({ slug: parsedPage.slug, frontmatter: parsedPage.frontmatter }),
     },
     ctx,
     abortSignal,
@@ -552,7 +569,7 @@ async function runPipeline(
  * fallback regardless of local_path.
  */
 async function runPipelineWithBody(
-  input: { turnText: string; isDreamGenerated: boolean; ref?: string; pageSlug?: string },
+  input: PipelineInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
@@ -564,6 +581,10 @@ async function runPipelineWithBody(
   // never throw BudgetExhausted (cost/runtime gates need a cap); the
   // pipeline's failure surface is unchanged. An ambient tracker (cycle
   // phases, transcripts ingest) wins — no double scope, labels preserved.
+  // Observation time (date-grounding.ts): a dated page's facts default to the
+  // page's own date, never the sync/run time. Precedence stays extractor-stated
+  // event date > caller validFrom > observation date > now (resolveValidFrom).
+  if (!ctx.validFrom && input.observationDate) ctx = { ...ctx, validFrom: new Date(`${input.observationDate.date}T00:00:00.000Z`) };
   const { getCurrentBudgetTracker, withBudgetTracker } = await import('../ai/gateway.ts');
   if (!getCurrentBudgetTracker()) {
     const { BudgetTracker } = await import('../budget/budget-tracker.ts');
@@ -575,7 +596,7 @@ async function runPipelineWithBody(
 
 /** The actual pipeline body — always runs inside a BudgetTracker scope (#4210). */
 async function runPipelineBodyInner(
-  input: { turnText: string; isDreamGenerated: boolean; ref?: string; pageSlug?: string },
+  input: PipelineInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
@@ -620,7 +641,7 @@ async function runPipelineBodyInner(
     engine: ctx.engine,
     abortSignal,
     model: ctx.model,
-    notabilityAdmission,
+    notabilityAdmission, observationDate: input.observationDate ?? observationDateFrom(ctx.validFrom ?? ctx.turnAt ?? null),
     ...(managed ? { embedding: managed.embedding ?? null } : {}),
   });
   const outcome = managed ? await withAIInvocationPreflight(async call => {
@@ -658,6 +679,7 @@ async function runPipelineBodyInner(
   const visibility = ctx.visibility ?? (await resolveDefaultVisibility(ctx.engine));
   // #5888: one exact-duplicate check for the capture lanes, before either writer.
   const { facts, dropped } = await dedupCapturedFacts(ctx, await inferMissingSubjects(ctx, outcome.facts, visibility, input.pageSlug, managed), visibility, resolveEntitySlugWithSource);
+  if (!managed) await assertAmbientCaptureAdmissible(ctx.engine, ctx.source);
   if (managed) return withCaptureDrops(dropped, facts.length || !dropped.length ? await publishManagedFacts(ctx.engine, managed, ctx, facts, visibility, input.pageSlug) : null);
 
   let inserted = 0;
@@ -696,14 +718,14 @@ async function runPipelineBodyInner(
     // Dedup against DB candidates (correct per Codex Q7: fence rows
     // have no embeddings; FS lock + sync invariant means DB == fence
     // at write time). cosineVerdict: 0.95 for explicit lanes; capture lanes never drop by cosine (#5888).
-    const exact = resolvedSlug ? await decideSingleFact(ctx.engine, ctx.sourceId, { entity_slug: resolvedSlug, fact: f.fact, kind: f.kind ?? 'fact', visibility }, null) : null;
+    const exact = resolvedSlug ? await decideSingleFact(ctx.engine, ctx.sourceId, { entity_slug: resolvedSlug, fact: f.fact, kind: f.kind ?? 'fact', visibility, attributed_to: f.attributed_to ?? null }, null) : null;
     let matchedExistingId: number | null = exact?.candidate?.id ?? null;
     if (matchedExistingId === null && resolvedSlug && f.embedding && !f.entity_inferred) {
       const candidates = await ctx.engine.findCandidateDuplicates(
         ctx.sourceId,
         resolvedSlug,
         f.fact,
-        { embedding: f.embedding, embeddingModel: f.embedding_model, k: DEDUP_CANDIDATE_LIMIT },
+        { embedding: f.embedding, embeddingModel: f.embedding_model, k: DEDUP_CANDIDATE_LIMIT, attributedTo: f.attributed_to ?? null },
       );
       let top: { id: number; score: number; fact: string } | null = null;
       for (const c of candidates) {
@@ -788,11 +810,11 @@ async function runPipelineBodyInner(
       source_session: f.source_session ?? null,
       confidence: f.confidence,
       embedding: f.embedding ?? null,
-      embedding_model: f.embedding_model ?? null,
+      embedding_model: f.embedding_model ?? null, attributed_to: f.attributed_to ?? null,
       // #4206: caller event-time fallback + provenance context. #4819: a
       // DB-only row has no fence to name the page it came from, so the page
       // path's slug fills context when the caller passed no sourceSlug.
-      valid_from: f.valid_from ?? ctx.validFrom,
+      valid_from: factEventTime(f, ctx),
       context: annotateUnverifiedResolution(ctx.sourceSlug ?? input.pageSlug ?? null, resolutionSource, f.entity_inferred),
     };
     const result = await maintenanceTransaction(ctx.engine, tx => tx.insertFact(newFact, { source_id: ctx.sourceId })); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
@@ -826,9 +848,9 @@ async function runPipelineBodyInner(
       confidence: f.confidence,
       // #4206: extractor-derived date wins; then the caller's event time
       // (historical imports); then import time.
-      validFrom: f.valid_from ?? ctx.validFrom ?? new Date(),
+      validFrom: factEventTime(f, ctx) ?? new Date(),
       embedding: f.embedding ?? null,
-      embedding_model: f.embedding_model ?? null,
+      embedding_model: f.embedding_model ?? null, attributedTo: f.attributed_to ?? undefined,
       sessionId: f.source_session ?? null,
     }));
 
@@ -877,9 +899,9 @@ async function runPipelineBodyInner(
           source_session: f.source_session ?? null,
           confidence: f.confidence,
           embedding: f.embedding ?? null,
-          embedding_model: f.embedding_model ?? null,
+          embedding_model: f.embedding_model ?? null, attributed_to: f.attributed_to ?? null,
           // #4206: caller event-time fallback + provenance context.
-          valid_from: f.valid_from ?? ctx.validFrom,
+          valid_from: factEventTime(f, ctx),
           context: ctx.sourceSlug ?? input.pageSlug ?? null,
         };
         const legacyResult = await maintenanceTransaction(ctx.engine, tx => tx.insertFact(newFact, { source_id: ctx.sourceId })); // gbrain-allow-direct-insert: stub-guard / unresolvable-target fallback for unprefixed or fallback-resolved entity slugs (no fenceable page or usable tree)
@@ -910,9 +932,9 @@ async function runPipelineBodyInner(
           source_session: f.source_session ?? null,
           confidence: f.confidence,
           embedding: f.embedding ?? null,
-          embedding_model: f.embedding_model ?? null,
+          embedding_model: f.embedding_model ?? null, attributed_to: f.attributed_to ?? null,
           // #4206: caller event-time fallback + provenance context.
-          valid_from: f.valid_from ?? ctx.validFrom,
+          valid_from: factEventTime(f, ctx),
           context: ctx.sourceSlug ?? input.pageSlug ?? null,
         };
         const legacyResult = await maintenanceTransaction(ctx.engine, tx => tx.insertFact(newFact, { source_id: ctx.sourceId })); // gbrain-allow-direct-insert: DB-only fallback when the fence lane declined the write (write_through opt-out race / localPath echo)

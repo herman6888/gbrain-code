@@ -94,6 +94,10 @@ const SEAT_ORPHAN_GRACE_MS = 10 * 60 * 1000;
  * publish). Lives HERE so the engine-free hook lane can GC orphaned receipts
  * without importing the engine-typed harvest module. */
 export const HARVEST_RECEIPT_SUFFIX = '.receipt.json';
+/** #6091: capture-time consent record (capture-consent.ts); reaped with its corpus file after a grace period.
+ * `<file>.capture-off.json` is the pre-wave-12 single record; W4.2 records are `<file>.capture-off.<brain>.json`. */
+export const CAPTURE_OFF_SUFFIX = '.capture-off.json';
+export const CAPTURE_OFF_INFIX = '.capture-off.';
 /** #5887 window-progress sidecar (context/corpus-windows.ts) and its CAS
  * lock. Engine-free home so the hook's GC reaps both with the `.txt`; the
  * hook's resume rewrite never deletes them. */
@@ -428,7 +432,11 @@ export async function bankCompactSegment(
   sessionId: string,
   allTurns: WindowTurn[],
   boundaryTurnIndexes: number[],
-  opts: { remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number },
+  opts: {
+    remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number;
+    /** #6091: runs before the segment is renamed into place (capture-time consent record); a throw banks nothing. */
+    beforeWrite?: (file: string, text: string) => void;
+  },
 ): Promise<{ segment: string; flushCorpusFile?: string; hash?: string; ordinal?: number }> {
   try {
     const windowTurns = sliceBoundaryWindow(allTurns, boundaryTurnIndexes, {
@@ -440,6 +448,7 @@ export async function bankCompactSegment(
     if (!rendered) return { segment: 'scan_unavailable' };
     if (!rendered.text.trim()) return { segment: 'empty_window' };
     if (opts.remainingMs() < opts.minWriteMs) return { segment: 'deadline_write' };
+    opts.beforeWrite?.(join(dir, segmentFileName(sessionId, segmentHash(rendered.text))), rendered.text);
     const w = writeSegment(dir, sessionId, rendered.text);
     const ordinal = appendSegmentLedger(dir, sessionId, w.hash);
     return {
@@ -487,6 +496,75 @@ export async function decideCorpusMode(
 }
 
 /**
+ * E-N1: a corpus `.txt` with no `.ingested` sidecar holds turns nothing has
+ * extracted yet (an HTTP serve with no sweep, a refused harvest). Retention
+ * removes it only at this multiple of the configured retention, and doctor
+ * `memory_writeback` warns while it waits.
+ */
+export const CORPUS_UNINGESTED_RETENTION_FACTOR = 3;
+/** Completion sidecar suffix (sweep.ts CORPUS_INGESTED_SUFFIX; duplicated to stay engine-free). */
+const INGESTED_SUFFIX = '.ingested';
+
+export interface CorpusBacklog {
+  /** `.txt` files with no `.ingested` sidecar. */
+  pending: number;
+  /** mtime of the oldest pending file, or null with none pending. */
+  oldestPendingMtimeMs: number | null;
+  /** Pending files older than retention: kept only by the un-ingested rule, deleted at the ceiling. */
+  pastRetention: number;
+}
+
+/** Count corpus turn files still waiting for extraction. Missing dir = empty backlog; never throws. */
+export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()): CorpusBacklog {
+  const backlog: CorpusBacklog = { pending: 0, oldestPendingMtimeMs: null, pastRetention: 0 };
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return backlog;
+  }
+  const present = new Set(names);
+  for (const name of names) {
+    if (!name.endsWith('.txt') || present.has(name + INGESTED_SUFFIX)) continue;
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(join(dir, name)).mtimeMs;
+    } catch {
+      continue;
+    }
+    backlog.pending++;
+    if (backlog.oldestPendingMtimeMs === null || mtimeMs < backlog.oldestPendingMtimeMs) backlog.oldestPendingMtimeMs = mtimeMs;
+    if (mtimeMs < now - retentionMs) backlog.pastRetention++;
+  }
+  return backlog;
+}
+
+/**
+ * Retention GC for corpus turn files: an extracted file (`.ingested`
+ * sidecar present) goes at `retentionMs`; one nothing has extracted stays
+ * until `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1).
+ * Best-effort per file; never throws.
+ */
+export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.now()): void {
+  try {
+    const names = readdirSync(dir);
+    const present = new Set(names);
+    for (const name of names) {
+      if (!name.endsWith('.txt')) continue;
+      const ageLimit = present.has(name + INGESTED_SUFFIX) ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
+      const p = join(dir, name);
+      try {
+        if (statSync(p).mtimeMs < now - ageLimit) rmSync(p, { force: true });
+      } catch {
+        /* per-file best effort */
+      }
+    }
+  } catch {
+    /* GC never breaks the caller */
+  }
+}
+
+/**
  * GC companion for the corpus dir (extends the hook's `.txt`-only GC): remove
  * ledgers past the retention window, ORPHANED sidecars whose base `.txt` is
  * gone (previously they lived forever), and a session's seat sidecar once no
@@ -509,6 +587,12 @@ export function gcCorpusArtifacts(
           if (!liveSessions.has(name.slice(0, -SEAT_SIDECAR_SUFFIX.length)) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) {
             rmSync(p, { force: true });
           }
+          continue;
+        }
+        const offAt = name.endsWith('.json') ? name.lastIndexOf(CAPTURE_OFF_INFIX) : -1;
+        if (offAt > 0) {
+          // Written BEFORE its corpus file lands: only an orphan past the grace period is reaped (every brain's record alike).
+          if (!existsSync(join(dir, name.slice(0, offAt))) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) rmSync(p, { force: true });
           continue;
         }
         if (name.endsWith('.ledger.json')) {

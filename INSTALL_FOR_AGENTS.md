@@ -59,7 +59,9 @@ restart the shell or add the PATH export to the shell profile.
 > occasionally blocks the top-level postinstall hook on global installs, so schema
 > migrations don't run automatically), the CLI prints a recovery hint pointing at
 > [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain apply-migrations --yes --no-autopilot-install`
-> to recover. If that doesn't work, fall back to the deterministic install path:
+> to recover. It exits 0 only when the schema is at head. Exit 1 with `migrations_pending` means the schema
+> is still behind: another `--yes` repeats the failure, so run `gbrain doctor --json`, tell the user what it
+> reports, and fall back to the deterministic install path:
 >
 > ```bash
 > git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
@@ -177,9 +179,11 @@ lane; moving engines is `gbrain migrate`'s.
 `--json` emits `{status, engine, ladder_rung, url_source}` as the ONLY stdout
 content so a scripted install can `| jq` it. The access token is never
 persisted, logged, or echoed.
-Tradeoff to know before choosing: Postgres brains get MCP tools every session plus
-the pull protocol, but NOT the PGLite-only per-turn bootstrap hook lane (see
-`BOOTSTRAP_FOR_AGENTS.md` and the degradation matrix in `docs/guides/bootstrap.md`).
+Postgres brains get MCP tools every session plus the pull protocol, and keep the
+per-turn bootstrap hook lane: the IPC listener is engine-uniform (it keys its
+socket off the connection URL), so the hooks fire whenever a `gbrain serve` for
+the brain is running, same as PGLite (see the degradation matrix in
+`docs/guides/bootstrap.md`).
 
 **Runtime failure loop (how the harness self-heals).** When Postgres access
 breaks at runtime, gbrain emits a machine marker: `GBRAIN_DB_ACCESS <reason>`
@@ -307,8 +311,10 @@ gbrain stats                                             # verify links > 0
 
 For brand-new empty brains, skip this backfill: there is nothing to extract yet.
 Trusted local page writes auto-link when enabled. Remote `put_page` (both stdio
-and HTTP MCP) saves references as text without inline graph extraction. Stdio
-`gbrain serve` runs bounded startup/idle sweeps; `gbrain serve --http` does not
+and HTTP MCP) saves references as text without inline graph extraction; a
+post-commit `links` effect then adds plain mention edges to existing pages the
+writer can see (`gbrain config set mcp.remote_auto_links off` disables it). Stdio
+`gbrain serve` runs bounded startup/idle sweeps for typed edges; `gbrain serve --http` does not
 self-sweep. For HTTP, arrange explicit host-side `gbrain sweep --once` or
 extraction; use authorized `add_link` calls for edges needed immediately.
 
@@ -358,9 +364,9 @@ policy. Memory write access is not
 including the parent, needs its own principal and private handoff.
 
 Discover with `list_skills` using `schema_version: 2`, then fetch only relevant
-`get_skill` revisions and approved `get_skill_asset` dependencies. Starter
-supports these tools subject to grants; the `--surface verbs` examples below
-are deliberately memory-only. MCP resources at `gbrain://skills` offer the same
+`get_skill` revisions and approved `get_skill_asset` dependencies. The
+`--surface full` registrations below serve these tools subject to grants (the
+narrower `--surface verbs` is deliberately memory-only). MCP resources at `gbrain://skills` offer the same
 authorized catalog, not a promise that every client loads native skills.
 
 Managed Claude Code/Codex/opencode routers report `restart_required` and native
@@ -385,8 +391,15 @@ scaffold the bundled skills into it:
 
 ```bash
 cd /path/to/agent/workspace
-gbrain skillpack scaffold --all       # copy the 50+ bundled skills + RESOLVER.md
+gbrain skillpack scaffold --all       # copy the 50+ bundled skills and their shared files
 ```
+
+Scaffold copies each bundled skill plus the shared files the skills depend on
+(`skills/conventions/` and the `skills/_*` files `openclaw.plugin.json` lists
+under `shared_deps`). It does not copy `skills/RESOLVER.md` and leaves your
+workspace's own `RESOLVER.md` / `AGENTS.md` untouched: the skill dispatcher stays
+the bundled `skills/RESOLVER.md`, which a paragraph further down this step tells
+you to read.
 
 Scaffolded skills are first-class files in your repo. Edit freely; re-running scaffold
 refuses to overwrite anything that exists. Use `gbrain skillpack reference <name>` to
@@ -408,7 +421,7 @@ model gbrain removed in v0.33, needs `gbrain skillpack migrate-fence` once.)
 **If you are Hermes:** register gbrain as your MCP server:
 
 ```bash
-printf 'Y\n' | hermes mcp add gbrain --env GBRAIN_HOME=$HOME --connect-timeout 60 --command $(which gbrain) --args serve
+printf 'Y\n' | hermes mcp add gbrain --env GBRAIN_HOME=$HOME --connect-timeout 60 --command $(which gbrain) --args serve --surface full
 ```
 
 Keep `--args` last (everything after it becomes server argv) and verify with
@@ -418,12 +431,12 @@ Keep `--args` last (everything after it becomes server argv) and verify with
 **If you are Grok Build** (xAI's `grok` CLI): register gbrain as your MCP server:
 
 ```bash
-grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface verbs
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- "$(command -v gbrain)" serve --surface full
 ```
 
 The add is lazy (exit 0 without connecting) — verify with
-`grok mcp doctor gbrain`, which spawns the server and must report
-`7 tools discovered`. This is the brain-only install; the `gbrain bootstrap`
+`grok mcp doctor gbrain`, which spawns the server and must report the tools it
+discovered (the full surface). This is the brain-only install; the `gbrain bootstrap`
 personal-agent path does not support Grok yet (Claude Code, Codex, and opencode only).
 Verified against Grok Build v1.0.4. Full reference:
 [docs/mcp/GROK.md](docs/mcp/GROK.md).
@@ -434,7 +447,7 @@ install, follow `BOOTSTRAP_FOR_AGENTS.md` instead of this page. For the
 brain-only MCP registration:
 
 ```bash
-opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface verbs
+opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- "$(command -v gbrain)" serve --surface full
 ```
 
 The add is lazy (exit 0 without connecting) — verify with `opencode mcp list`,
@@ -443,8 +456,8 @@ even on failure; read the output). Restart opencode afterwards — it reads
 config at session start. Verified against opencode v1.18.18. Full reference:
 [docs/mcp/OPENCODE.md](docs/mcp/OPENCODE.md).
 
-Whether you scaffolded or not, read `skills/RESOLVER.md` (in your workspace, or
-[the published copy](https://github.com/garrytan/gbrain/blob/master/skills/RESOLVER.md)). It's
+Whether you scaffolded or not, read `skills/RESOLVER.md` (the bundled copy in your
+gbrain install, or [the published copy](https://github.com/garrytan/gbrain/blob/master/skills/RESOLVER.md)). It's
 the skill dispatcher — tells you which skill to read for any task. Save this to your
 memory permanently.
 
@@ -619,7 +632,7 @@ gbrain onboard --check --json
 The JSON envelope (`schema_version: 1`) carries `recommendations[]` with
 `apply_policy` per item: `auto_apply` (safe to run unattended),
 `prompt_required` (needs explicit user consent), or `manual_only`
-(LLM-bearing, user must run themselves).
+(pack upgrade, paid takes bootstrap: the user runs it).
 
 **After every `gbrain upgrade`:**
 ```bash
@@ -633,9 +646,10 @@ step regardless.
 ```bash
 gbrain onboard --auto --max-usd 5
 ```
-Refuses without `--max-usd N`. Runs auto-eligible items only. The
-autopilot daemon also consults onboard recommendations on its tick — no
-explicit agent action needed for the autonomous path.
+Refuses without `--max-usd N`. Never runs `manual_only` items; it
+lists them in `manual_only_skipped`. The autopilot daemon also consults
+onboard recommendations on its tick — no explicit agent action needed
+for the autonomous path.
 
 **Remote / federated brain installs (MCP):**
 The `run_onboard` MCP op (admin scope) lets thin-client agents probe

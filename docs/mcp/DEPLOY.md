@@ -59,17 +59,37 @@ the OAuth request when issuing my owner login link."*
 ### Local stdio (zero setup)
 
 ```bash
-gbrain serve                  # full operation catalog (default)
-gbrain serve --surface verbs  # just the 7 memory verbs (quickstart surface)
+gbrain serve --surface full   # full operation catalog (what registrations pin; also the bare-serve default)
 ```
 
 Works with Claude Code, Cursor, Windsurf, and any MCP client that supports stdio.
 No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
-`--surface verbs` exposes exactly the seven-verb memory protocol (`recall`,
-`remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
-[MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
-`--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
-omit the flag (default `full`) for every operation.
+`--surface full` serves every operation. For a client that cannot hold the full
+catalog, `--surface verbs` exposes exactly the seven-verb memory protocol
+(`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`,
+`delta` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) and `--surface
+starter` sits between (40 ops: the verbs plus the daily-driver set).
+
+`--surface` is the callable ceiling. To keep every operation callable while
+listing fewer tools to the agent, set `mcp.advertised_surface`:
+
+```bash
+gbrain config set mcp.advertised_surface verbs   # list the 7 verbs; everything else stays callable
+```
+
+Unset is the recommended default. In a held-out agent benchmark, listing only
+`starter` or `verbs` lowered task success by 8–10 points pooled across four
+frontier models, mostly on tasks that need an unlisted tool (agents rarely
+reached for `request_tools`), and saved no tokens. Narrow the list only for a
+client that cannot hold the full catalog.
+
+`tools/list` then shows the advertised surface, and the initialize
+instructions tell the agent how many more tools are callable. On stdio,
+`request_tools` with `tools: [names]` returns their schemas and adds them to
+that session's list (the server sends `tools/list_changed`). On the OAuth HTTP
+server, a client that set its own surface (`request_tools` with `surface`, or
+`gbrain auth rescope-client`) has that surface listed in full. Unset
+advertises the whole callable set.
 
 #### Stdio source binding
 
