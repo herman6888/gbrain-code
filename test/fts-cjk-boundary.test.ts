@@ -93,7 +93,19 @@ describe('one copy of the DDL', () => {
   test('src/schema.sql carries the helper and the runtime trigger bodies byte-for-byte', () => {
     expect(schema).toContain(FTS_INPUT_FUNCTION_SQL);
     expect(schema).toContain(pageSearchVectorTriggerFnSql('english'));
-    expect(schema).toContain(chunkSearchVectorTriggerFnSql('english'));
+    // Local fork patch (CJK bigram FTS): our chunk trigger carries the
+    // upstream body plus three 'simple'-config CJK setweight terms appended
+    // before the semicolon, so the byte-pin gets the fork variant.
+    const upstreamBody = chunkSearchVectorTriggerFnSql('english');
+    const forkBody = upstreamBody.replace(
+      `setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.chunk_text, ''))), 'B');`,
+      `setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.chunk_text, ''))), 'B') ||
+    setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.doc_comment, ''))), 'A') ||
+    setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.symbol_name_qualified, ''))), 'A') ||
+    setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.chunk_text, ''))), 'B');`,
+    );
+    expect(forkBody).not.toBe(upstreamBody);
+    expect(schema).toContain(forkBody);
   });
 
   test('every indexing to_tsvector in src/schema.sql reads through the helper', () => {
