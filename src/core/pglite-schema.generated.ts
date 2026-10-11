@@ -186,6 +186,24 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
 
+CREATE OR REPLACE FUNCTION gbrain_cjk_search_tokens(input_text TEXT) RETURNS TEXT
+LANGUAGE SQL IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS \$cjkfn\$
+  WITH chars AS (
+    SELECT ch, ord
+    FROM regexp_split_to_table(COALESCE(input_text, ''), '') WITH ORDINALITY AS t(ch, ord)
+    WHERE ch ~ '[一-鿿぀-ゟ゠-ヿ가-힯]'
+  )
+  SELECT COALESCE(string_agg(
+    CASE WHEN next_char.ch IS NOT NULL
+      THEN current_char.ch || ' ' || current_char.ch || next_char.ch
+      ELSE current_char.ch
+    END,
+    ' ' ORDER BY current_char.ord
+  ), '')
+  FROM chars current_char
+  LEFT JOIN chars next_char ON next_char.ord = current_char.ord + 1
+\$cjkfn\$;
+
 -- #6370: indexing and the title query read text through gbrain_fts_input(),
 -- which splits CJK/ASCII-alnum boundaries (a no-op on text without CJK).
 CREATE OR REPLACE FUNCTION gbrain_fts_input(t text) RETURNS text

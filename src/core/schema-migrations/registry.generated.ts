@@ -238,6 +238,7 @@ import { v234 } from './v234-persistence-git-durability.ts';
 import { v235 } from './v235-pinned-questions.ts';
 import { v236 } from './v236-open-loops-counterparty-source.ts';
 import { v237 } from './v237-facts-question-recall-indexes.ts';
+import { v238 } from './v238-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -474,4 +475,5 @@ export const MIGRATIONS: Migration[] = [
   v235,
   v236,
   v237,
+  v238,
 ];

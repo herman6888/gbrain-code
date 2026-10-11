@@ -421,7 +421,6 @@ AS $fn$
   SELECT regexp_replace(regexp_replace(t, '([一-鿿぀-ゟ゠-ヿ가-힯])([A-Za-z0-9])', '\1 \2', 'g'), '([A-Za-z0-9])([一-鿿぀-ゟ゠-ヿ가-힯])', '\1 \2', 'g')
 $fn$;
 -- END GENERATED from src/core/fts-language.ts (FTS_INPUT_FUNCTION_SQL)
->>>>>>> v0.60.172.0
 
 -- v0.20.0 Cathedral II: chunk-grain FTS trigger.
 -- Weight 'A' on doc_comment + symbol_name_qualified; weight 'B' on chunk_text.
