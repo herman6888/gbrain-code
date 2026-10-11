@@ -60,6 +60,8 @@ import {
 } from './graduation-target.ts';
 import { drainForGraduation, freezeSource, graduationBlockers, withSourceWritable } from './graduation-drain.ts';
 import { buildDeferredIndexes, copySequences, copyTable, deferIndexes, detectTriggerBypass, reenableTriggers } from './graduation-copy.ts';
+import { TRUST_BACKFILL_COMPLETED_KEY } from '../trust/schema.ts';
+import { WRITE_GATE_SCAN_BASELINE_KEY } from '../write-gate-schema.ts';
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
 const HANDOFF_TIMEOUT_MS = 30_000;
@@ -110,7 +112,7 @@ export interface GraduationDeps {
   initTargetSchema(target: BrainEngine, source: BrainEngine): Promise<void>;
   claimAutopilotPause(): Promise<(() => void) | null>;
   /** Failing check names of `gbrain doctor --no-migrate --json` against the fenced target. */
-  runTargetDoctor(runId: string, mainUrl: string): Promise<{ failing: readonly string[]; exempted: readonly string[] }>;
+  runTargetDoctor(runId: string, mainUrl: string, sourcePersistenceEnabled: boolean): Promise<{ failing: readonly string[]; exempted: readonly string[] }>;
   /** Failing source checks, measured with the source open under the run's lock. */
   runSourceDoctor(source: BrainEngine): Promise<readonly string[]>;
   hostId(): string;
@@ -152,7 +154,7 @@ export function defaultGraduationDeps(): GraduationDeps {
       await sized.initSchema(dimensions && model ? { embedding: { dimensions, model } } : {});
     },
     claimAutopilotPause: () => withStdoutOnStderr(() => quiesceAutopilot()),
-    async runTargetDoctor(runId, mainUrl) { return spawnTargetDoctor(runId, mainUrl); },
+    async runTargetDoctor(runId, mainUrl, sourcePersistenceEnabled) { return spawnTargetDoctor(runId, mainUrl, sourcePersistenceEnabled); },
     async runSourceDoctor(source) {
       // In process, on the engine this run (or plan) already opened; GBRAIN_GRADUATION_RUN keeps doctor read-only.
       const { buildChecks } = await import('../../commands/doctor.ts');
@@ -182,10 +184,11 @@ async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); } finally { console.log = log; }
 }
 
-function spawnTargetDoctor(runId: string, mainUrl: string): { failing: readonly string[]; exempted: readonly string[] } {
+function spawnTargetDoctor(runId: string, mainUrl: string, sourcePersistenceEnabled: boolean): { failing: readonly string[]; exempted: readonly string[] } {
   const script = process.argv[1] && /\.(ts|js|mjs)$/.test(process.argv[1]) ? [process.argv[1]] : [];
   const child = spawnSync(process.execPath, [...script, 'doctor', '--no-migrate', '--json', '--scope=brain'], {
-    env: { ...process.env, GBRAIN_DATABASE_URL: mainUrl, GBRAIN_GRADUATION_RUN: runId },
+    env: { ...process.env, GBRAIN_DATABASE_URL: mainUrl, GBRAIN_GRADUATION_RUN: runId,
+      GBRAIN_GRADUATION_SOURCE_PERSISTENCE: sourcePersistenceEnabled ? 'enabled' : 'disabled' },
     encoding: 'utf8', timeout: 600_000, maxBuffer: 64 * 1024 * 1024,
   });
   try {
@@ -421,7 +424,9 @@ function planHashOf(input: Record<string, unknown>): string {
 function probeTargetEmpty(probe: TargetProbe): boolean { return probe.empty; }
 
 /** initSchema writes these config keys (plus the copier's deferred-index marker); any other key is user data. */
-const SEED_CONFIG_KEYS = new Set(['chunk_strategy', 'embedding_dimensions', 'embedding_model', 'engine', 'version', 'graduation.deferred_indexes']);
+// The trust migrations seed two bookkeeping keys on an empty brain (v226 backfill completion, v227 scan baseline).
+const SEED_CONFIG_KEYS = new Set(['chunk_strategy', 'embedding_dimensions', 'embedding_model', 'engine', 'version', 'graduation.deferred_indexes',
+  TRUST_BACKFILL_COMPLETED_KEY, WRITE_GATE_SCAN_BASELINE_KEY]);
 async function userConfigKeys(main: BrainEngine): Promise<string[]> {
   const rows = await main.executeRaw<{ key: string }>('SELECT key FROM config ORDER BY key COLLATE "C"');
   return rows.map(r => r.key).filter(key => !SEED_CONFIG_KEYS.has(key));
@@ -877,7 +882,8 @@ async function stepVerify(run: Run): Promise<void> {
     runId: run.m.runId, expectFence: true,
     runDoctor: async () => {
       phase(run, 'doctor');
-      const doctor = await run.deps.runTargetDoctor(run.m.runId, run.m.targetUrls!.main);
+      const [brain] = await run.source!.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton = 1');
+      const doctor = await run.deps.runTargetDoctor(run.m.runId, run.m.targetUrls!.main, brain?.enabled === true);
       exempted = doctor.exempted;
       return doctor.failing;
     },

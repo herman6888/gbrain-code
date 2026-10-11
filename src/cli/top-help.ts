@@ -14,6 +14,7 @@ USAGE
 SETUP
   mcp grant <name> --help           Grant hosted access; private credential handoff
   mcp verify --help                 Verify connection, permissions, and memory
+  setup claude-code [--dry-run]      Give an agent memory: brain + MCP + hooks, verified (--remove undoes)
   init [--pglite|--supabase|--url]   Create brain (PGLite default, no server)
   init --prefer-postgres [--allow-docker]
                                      Postgres-first install ladder (env URL >
@@ -114,6 +115,7 @@ TOOLS
   facts relink [--dry-run]           Link facts saved without an entity to the entity they name
   check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)
   report --type <name> --content ... Save timestamped report to brain/reports/
+  questions pin|list|status|refresh|unpin  Pinned questions: cited answers kept current (owner-private)
 
 OPEN LOOPS (Gmail/Calendar/Contacts connector — v0.47)
   google setup [--account <email>]   One command: BYO OAuth → source → first sync → first digest

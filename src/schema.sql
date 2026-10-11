@@ -412,6 +412,17 @@ LANGUAGE SQL IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS $cj
   LEFT JOIN chars next_char ON next_char.ord = current_char.ord + 1
 $cjkfn$;
 
+-- #6370: indexing and the title query read text through gbrain_fts_input(),
+-- which splits CJK/ASCII-alnum boundaries (a no-op on text without CJK).
+-- BEGIN GENERATED from src/core/fts-language.ts (FTS_INPUT_FUNCTION_SQL). Edit that file, then run: bun run build:schema
+CREATE OR REPLACE FUNCTION gbrain_fts_input(t text) RETURNS text
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = pg_catalog
+AS $fn$
+  SELECT regexp_replace(regexp_replace(t, '([一-鿿぀-ゟ゠-ヿ가-힯])([A-Za-z0-9])', '\1 \2', 'g'), '([A-Za-z0-9])([一-鿿぀-ゟ゠-ヿ가-힯])', '\1 \2', 'g')
+$fn$;
+-- END GENERATED from src/core/fts-language.ts (FTS_INPUT_FUNCTION_SQL)
+>>>>>>> v0.60.172.0
+
 -- v0.20.0 Cathedral II: chunk-grain FTS trigger.
 -- Weight 'A' on doc_comment + symbol_name_qualified; weight 'B' on chunk_text.
 -- NL queries ("how do we handle errors") rank doc-comment hits above body text.
@@ -423,9 +434,9 @@ $cjkfn$;
 CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER SET search_path = pg_catalog, public AS $fn$
 BEGIN
   NEW.search_vector :=
-    setweight(to_tsvector('english', COALESCE(NEW.doc_comment, '')), 'A') ||
-    setweight(to_tsvector('english', COALESCE(NEW.symbol_name_qualified, '')), 'A') ||
-    setweight(to_tsvector('english', COALESCE(NEW.chunk_text, '')), 'B') ||
+    setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.doc_comment, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.symbol_name_qualified, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.chunk_text, ''))), 'B') ||
     setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.doc_comment, ''))), 'A') ||
     setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.symbol_name_qualified, ''))), 'A') ||
     setweight(to_tsvector('simple', gbrain_cjk_search_tokens(COALESCE(NEW.chunk_text, ''))), 'B');
@@ -1166,17 +1177,15 @@ CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET searc
 DECLARE
   timeline_text TEXT;
 BEGIN
-  -- Gather timeline_entries text for this page
   SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
   INTO timeline_text
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
-  -- Build weighted tsvector
   NEW.search_vector :=
-    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.timeline, ''))), 'C') ||
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(timeline_text, ''))), 'C');
 
   RETURN NEW;
 END;
@@ -1789,49 +1798,28 @@ CREATE TRIGGER minion_job_notify AFTER INSERT OR UPDATE OF status ON minion_jobs
 DO $$
 DECLARE
   has_bypass BOOLEAN;
+  target TEXT;
 BEGIN
   -- #1385: recognize superuser + inherited-role BYPASSRLS, not just the role's
   -- own rolbypassrls (alias `pr` avoids any plpgsql record-variable collision).
   SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
   IF has_bypass THEN
-    ALTER TABLE pages ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE content_chunks ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE links ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE wanted_links ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE raw_data ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE timeline_entries ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE page_versions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE ingest_log ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE config ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE files ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_jobs ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE sources ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE file_migration_ledger ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE access_tokens ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE mcp_request_log ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_inbox ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_attachments ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_messages ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_tool_executions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_rate_leases ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE gbrain_cycle_locks ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_candidates ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_capture_failures ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_takes_quality_runs ENABLE ROW LEVEL SECURITY;
-    -- v0.32.6 contradiction probe tables
-    ALTER TABLE eval_contradictions_cache ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_contradictions_runs ENABLE ROW LEVEL SECURITY;
-    -- v0.36.1.0 Hindsight calibration wave tables
-    ALTER TABLE calibration_profiles ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_proposals ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_grade_cache ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_nudge_log ENABLE ROW LEVEL SECURITY;
-    -- v0.26 OAuth 2.1 tables
-    ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
+    -- #5227 (W14 P1.6): conditional enables. ALTER TABLE ... ENABLE ROW LEVEL SECURITY takes an
+    -- ACCESS EXCLUSIVE lock even when RLS is already on, so re-running this block on a live brain
+    -- queued behind every open transaction; a table whose relrowsecurity is already set is skipped.
+    FOREACH target IN ARRAY ARRAY[
+      'pages','content_chunks','links','wanted_links','tags','raw_data','timeline_entries',
+      'page_versions','ingest_log','config','files','minion_jobs','sources','file_migration_ledger',
+      'access_tokens','mcp_request_log','minion_inbox','minion_attachments','subagent_messages',
+      'subagent_tool_executions','subagent_rate_leases','gbrain_cycle_locks','dream_verdicts',
+      'eval_candidates','eval_capture_failures','eval_takes_quality_runs','eval_contradictions_cache',
+      'eval_contradictions_runs','calibration_profiles','take_proposals','take_grade_cache',
+      'take_nudge_log','oauth_clients','oauth_tokens','oauth_codes'] LOOP
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = current_schema() AND c.relname = target AND c.relrowsecurity) THEN
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', target);
+      END IF;
+    END LOOP;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;
@@ -2021,6 +2009,7 @@ CREATE TABLE IF NOT EXISTS persistence_host_bindings (
     host_id uuid NOT NULL,
     local_path text NOT NULL,
     coordination_path text NOT NULL,
+    git_durability text CHECK (git_durability IN ('enabled','disabled')),
     PRIMARY KEY(worktree_id,host_id)
   );
 CREATE TABLE IF NOT EXISTS persistence_local_writers (
@@ -2119,7 +2108,9 @@ BEGIN
   IF TG_TABLE_NAME='pages' AND TG_OP='UPDATE' THEN
     IF (NEW.source_id,NEW.slug,NEW.type,NEW.page_kind,NEW.title,NEW.compiled_truth,NEW.timeline,NEW.frontmatter,NEW.deleted_at,NEW.knowledge_revision)
       IS NOT DISTINCT FROM
-       (OLD.source_id,OLD.slug,OLD.type,OLD.page_kind,OLD.title,OLD.compiled_truth,OLD.timeline,OLD.frontmatter,OLD.deleted_at,OLD.knowledge_revision) THEN RETURN NEW; END IF;
+       (OLD.source_id,OLD.slug,OLD.type,OLD.page_kind,OLD.title,OLD.compiled_truth,OLD.timeline,OLD.frontmatter,OLD.deleted_at,OLD.knowledge_revision)
+      -- The trust tier is guarded content (trust/schema.ts); read by key so brains before the column keep working.
+      AND row_data->'trust_tier' IS NOT DISTINCT FROM old_data->'trust_tier' THEN RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME='sources' THEN
     IF TG_OP='UPDATE' AND (NEW.id,NEW.incarnation,NEW.local_path,NEW.archived)
       IS NOT DISTINCT FROM (OLD.id,OLD.incarnation,OLD.local_path,OLD.archived) THEN
@@ -2140,10 +2131,11 @@ BEGIN
     END IF;
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
-    row_data := row_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
-    old_data := old_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
-    -- Embedding completion, retrieval telemetry and write attribution
-    -- (attribution-schema.ts; a journal backfill fills it) are physical projections.
+    row_data := row_data - ARRAY['embedding_model','embedded_text_hash','write_origin'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    old_data := old_data - ARRAY['embedding_model','embedded_text_hash','write_origin'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    -- Embedding completion, retrieval telemetry, write attribution
+    -- (attribution-schema.ts; a journal backfill fills it) and the write origin
+    -- record are physical projections. The trust tier is not: it stays guarded.
     IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
       = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
   END IF;
@@ -2860,6 +2852,137 @@ DO $rls$ BEGIN
 END $rls$;
 -- END GENERATED from src/core/core-memory-schema.ts (CORE_EDIT_NOTICES_SCHEMA_SQL)
 
+-- The purge guards (facts, takes, pages triggers) are installed by the memory_purge migration.
+-- BEGIN GENERATED from src/core/facts/purge-schema.ts (MEMORY_PURGE_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS fact_purges (
+  source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  visibility  TEXT NOT NULL CHECK (visibility IN ('private','world')),
+  subject     TEXT NOT NULL DEFAULT '*',
+  fact_hash   TEXT NOT NULL,
+  request_id  UUID,
+  actor       TEXT,
+  reason      TEXT,
+  purged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, visibility, subject, fact_hash)
+);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE fact_purges ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS take_purges (
+  source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  subject     TEXT NOT NULL DEFAULT '*',
+  claim_hash  TEXT NOT NULL,
+  request_id  UUID,
+  purged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, subject, claim_hash)
+);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE take_purges ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS page_purges (
+  source_id    TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  slug         TEXT NOT NULL,
+  request_id   UUID,
+  purged_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, content_hash)
+);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE page_purges ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS derivation_inputs (
+  derived_table TEXT NOT NULL,
+  derived_id    TEXT NOT NULL,
+  input_table   TEXT NOT NULL,
+  input_id      TEXT NOT NULL,
+  source_id     TEXT REFERENCES sources(id) ON DELETE CASCADE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (derived_table, derived_id, input_table, input_id)
+);
+CREATE INDEX IF NOT EXISTS idx_derivation_inputs_input ON derivation_inputs (input_table, input_id);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE derivation_inputs ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS needs_rederive (
+  derived_table TEXT NOT NULL,
+  derived_id    TEXT NOT NULL,
+  source_id     TEXT REFERENCES sources(id) ON DELETE CASCADE,
+  request_id    UUID,
+  reason        TEXT NOT NULL,
+  marked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (derived_table, derived_id)
+);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE needs_rederive ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/facts/purge-schema.ts (MEMORY_PURGE_SCHEMA_SQL)
+
+-- BEGIN GENERATED from src/core/facts/purge-schema.ts (FACT_PURGE_LOOKUP_INDEX_SQL). Edit that file, then run: bun run build:schema
+CREATE INDEX IF NOT EXISTS fact_purges_subject_idx ON fact_purges (source_id, subject, fact_hash) INCLUDE (visibility, purged_at);
+CREATE INDEX IF NOT EXISTS fact_purges_all_subjects_idx ON fact_purges (source_id, purged_at) WHERE subject = '*';
+-- END GENERATED from src/core/facts/purge-schema.ts (FACT_PURGE_LOOKUP_INDEX_SQL)
+
+-- #5575 blocking write gate: verdict receipts and held facts/takes.
+-- BEGIN GENERATED from src/core/write-gate-schema.ts (WRITE_GATE_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS write_gate_receipts (
+  id               BIGSERIAL PRIMARY KEY,
+  target_table     TEXT NOT NULL CHECK (target_table IN ('pages','facts','takes','timeline_entries','write_gate_holds')),
+  target_id        TEXT NOT NULL,
+  source_id        TEXT,
+  content_hash     TEXT NOT NULL,
+  tier             TEXT NOT NULL,
+  detector_version INTEGER NOT NULL,
+  verdict          TEXT NOT NULL CHECK (verdict IN ('flag','quarantine')),
+  reason_families  TEXT[] NOT NULL DEFAULT '{}',
+  reasons          TEXT[] NOT NULL DEFAULT '{}',
+  detector_error   BOOLEAN NOT NULL DEFAULT false,
+  request_id       TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS write_gate_receipts_target_idx ON write_gate_receipts (target_table, target_id, content_hash, detector_version);
+CREATE INDEX IF NOT EXISTS write_gate_receipts_seen_idx ON write_gate_receipts (last_seen_at);
+CREATE TABLE IF NOT EXISTS write_gate_holds (
+  id               BIGSERIAL PRIMARY KEY,
+  kind             TEXT NOT NULL CHECK (kind IN ('fact','take')),
+  source_id        TEXT NOT NULL,
+  slug             TEXT NOT NULL DEFAULT '',
+  fingerprint      TEXT NOT NULL,
+  detector_version INTEGER NOT NULL,
+  tier             TEXT NOT NULL,
+  reason_families  TEXT[] NOT NULL DEFAULT '{}',
+  reasons          TEXT[] NOT NULL DEFAULT '{}',
+  detector_error   BOOLEAN NOT NULL DEFAULT false,
+  payload          JSONB NOT NULL,
+  write_origin     JSONB,
+  request_id       TEXT,
+  status           TEXT NOT NULL DEFAULT 'held' CHECK (status IN ('held','released','dropped')),
+  seen_count       INTEGER NOT NULL DEFAULT 1,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  decided_at       TIMESTAMPTZ,
+  decided_by       TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS write_gate_holds_dedupe_idx ON write_gate_holds (source_id, slug, fingerprint, detector_version);
+CREATE INDEX IF NOT EXISTS write_gate_holds_status_idx ON write_gate_holds (status, source_id, id);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE write_gate_receipts ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE write_gate_holds ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/write-gate-schema.ts (WRITE_GATE_SCHEMA_SQL)
+
 -- #5255/#5176 (O-DX-8): last upstream observation per source, recorded by sync
 -- from the checkout's Git state (upstream ref, its last fetch/push time, commits
 -- the synced commit lacks); doctor sync_freshness reads it with no subprocess.
@@ -2868,3 +2991,67 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_checked_at TIMESTAMPTZ;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_commit TEXT;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_behind INTEGER;
 
+-- Pinned questions (C4): answers and their evidence pointers live outside pages.
+-- BEGIN GENERATED from src/core/questions/schema.ts (PINNED_QUESTIONS_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS pinned_questions (
+  id                        BIGSERIAL PRIMARY KEY,
+  source_id                 TEXT NOT NULL,
+  slug                      TEXT NOT NULL,
+  question                  TEXT NOT NULL,
+  scope_slug_prefix         TEXT,
+  scope_entity              TEXT,
+  state                     TEXT NOT NULL DEFAULT 'active',
+  inactive_reason           TEXT,
+  publish_mode              TEXT NOT NULL DEFAULT 'publish',
+  model                     TEXT,
+  cooldown_days             REAL,
+  origin                    TEXT NOT NULL DEFAULT 'pin',
+  created_by                TEXT NOT NULL,
+  revision                  BIGINT NOT NULL DEFAULT 1,
+  answer_revision           INTEGER NOT NULL DEFAULT 0,
+  answer                    TEXT,
+  answer_model              TEXT,
+  last_refresh_at           TIMESTAMPTZ,
+  last_attempt_at           TIMESTAMPTZ,
+  last_error                TEXT,
+  watermark_generation      BIGINT,
+  watermark_fact_id         BIGINT,
+  watermark_at              TIMESTAMPTZ,
+  lease_token               TEXT,
+  lease_owner               TEXT,
+  lease_expires_at          TIMESTAMPTZ,
+  refresh_attempts          INTEGER NOT NULL DEFAULT 0,
+  spend_usd                 DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  archived_at               TIMESTAMPTZ,
+  CONSTRAINT pinned_questions_source_slug_key UNIQUE (source_id, slug)
+);
+CREATE INDEX IF NOT EXISTS pinned_questions_state_idx ON pinned_questions (state, source_id);
+CREATE TABLE IF NOT EXISTS question_evidence (
+  id                        BIGSERIAL PRIMARY KEY,
+  question_id               BIGINT NOT NULL,
+  answer_revision           INTEGER NOT NULL,
+  sentence_id               TEXT NOT NULL,
+  kind                      TEXT NOT NULL,
+  source_id                 TEXT NOT NULL,
+  page_id                   INTEGER,
+  page_slug                 TEXT,
+  page_generation           BIGINT,
+  page_revision             TEXT,
+  item_id                   BIGINT,
+  content_hash              TEXT,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS question_evidence_question_idx ON question_evidence (question_id, answer_revision);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE pinned_questions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE question_evidence ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/questions/schema.ts (PINNED_QUESTIONS_SCHEMA_SQL)

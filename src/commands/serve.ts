@@ -1,11 +1,11 @@
 import { spawnSync } from 'node:child_process';
+import { PoolStallWatch } from '../core/postgres-engine/pool-stall-watch.ts';
 import type { BrainEngine } from '../core/engine.ts';
 // C10: `--fail-fast` / GBRAIN_SERVE_FAIL_FAST=1 — exit with the classified envelope instead of status-only/degraded mode (decided in src/cli.ts's connect path; F4's status mode consults it too).
 export { serveFailFastRequested, writeServeFailFastEnvelope } from '../core/serve-fail-fast.ts';
 import { isEngineDegraded as isEngineDegradedForServe } from '../core/degraded-marker.ts';
 import { startMcpServer, stdioRpcsInFlightCount, resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
-import { parseTokenTtl } from './auth.ts';
 import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
@@ -246,6 +246,8 @@ export async function runServe(
     console.error(`[gbrain serve] ignoring GBRAIN_SURFACE="${resolved.invalidEnv}" (use verbs | starter | full)`);
   }
   console.error(`[gbrain serve] surface=${surface} (source: ${SURFACE_SOURCE_LABEL[resolved.source]})`);
+  // #6383: the pool stall line (Postgres only; the watch reports nothing for an engine without pool numbers).
+  if (engine.kind === 'postgres') new PoolStallWatch(engine, (line) => console.error(line)).start();
   // #4768: stdio read-only access ceiling. HTTP refuses it: per-token grants
   // (auth rescope-token --operations / rescope-client) are its operation control.
   const access = parseAccessFlag(args);
@@ -276,6 +278,8 @@ export async function runServe(
     const port = portIdx >= 0 ? parseInt(args[portIdx + 1]) || 3131 : 3131;
 
     const ttlIdx = args.indexOf('--token-ttl');
+    // auth.ts reaches the whole operations graph; only --http needs it.
+    const { parseTokenTtl } = await import('./auth.ts');
     const tokenTtl = ttlIdx >= 0 ? parseTokenTtl(args[ttlIdx + 1] ?? '', 'Omit the flag for the 3600-second default.') : 3600;
 
     // #1353: --enable-dcr-insecure opts into the consent-bypassing

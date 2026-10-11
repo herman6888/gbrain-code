@@ -336,6 +336,11 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   // mutating ops (fresh-slug targets; envelope-echo checks only)
   remember: 'ok',
   forget: 'error',
+  purge_fact: 'error',
+  list_page_purges: 'error',
+  unpurge_page: 'error',
+  // Owner confirmation needs a memory_confirm grant; the sweep's connection has none (refused before any read).
+  confirm_memory: 'error',
   // rate_answer with no answer_id is a validation error; a real answer id only
   // ever names pages that answer returned to the same client.
   rate_answer: 'error',
@@ -378,6 +383,14 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   loops_unmute: 'error',
   // agent contract v1 A6: the generic invocation omits the required `code` → validation error.
   mute_notice: 'error',
+  // C4 pinned questions are owner-private: a sweep caller cannot read private
+  // pages, so every questions_* op refuses with question_owner_only (leakage
+  // matrix: test/helpers/pinned-questions-scenarios.ts).
+  questions_pin: 'error',
+  questions_list: 'error',
+  questions_status: 'error',
+  questions_refresh: 'error',
+  questions_unpin: 'error',
   sources_remove: 'error',
   submit_job: 'error',
   get_job: 'error',

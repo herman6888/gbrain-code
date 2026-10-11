@@ -115,7 +115,7 @@ have no per-client row: they serve the server-resolved surface directly.
 
 ## The verbs
 
-### recall(query?, entity?, budget_tokens?, budget_policy?, source_id?, since?, session_id?, limit?, …) — read
+### recall(query?, question?, entity?, budget_tokens?, budget_policy?, source_id?, since?, session_id?, limit?, …) — read
 
 Retrieve saved facts and (with `query`) budget-packed page snippets.
 
@@ -128,6 +128,21 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
   composes with `entity` and `session_id` in the same query, before the
   per-arm limit. An unparseable value is rejected with `invalid_params`.
 - `limit` is a PER-ARM cap (facts and search results each).
+- `question`: optional string (at most 2,000 characters). The FACTS arm then
+  returns active facts ranked by relevance to the question instead of newest
+  first: cosine to the question's embedding plus whole-word term share, plus
+  0.1 when the fact carries a writer-supplied date. Facts below the admission
+  rule are not returned, so an empty `facts[]` is a valid answer. `entity`,
+  `session_id`, `since` and `grep` filter before ranking. `question` does not
+  search pages; `query` does, and both may be passed. `supersessions: true` or
+  `include_expired: true` with `question` is `invalid_params` (ranking covers
+  active facts only); the error's `fix.mcp` is the call without them. One query
+  embedding per call, no model call. Without an embedding provider, with
+  embeddings turned off, or when the embed fails, facts rank by term share and
+  `facts_degraded.reason` says why. A server without question ranking ignores
+  the parameter (or rejects it under `mcp.strict_params=reject`); clients detect
+  support by `facts_order: "relevance"` in the response or `question` in the
+  live tool schema, not by `protocol_version`.
 - `budget_tokens`: SERVER-side packing — by default facts pack first and search
   results take the remainder. A positive finite numeric budget is floored;
   other values leave the arrays unbudgeted. Costs are `ceil(fact.length/4)` or
@@ -166,10 +181,18 @@ Response — an additive SUPERSET of the plain facts envelope on EVERY call
 | `protocol_version` | int | always present (every verb, every call) |
 | `facts[]` | array | the base fact fields, PLUS per fact: `fact_id` (opaque STRING — the value `forget` accepts; the numeric `id` remains alongside it for compatibility) and `provenance` (the stored source attribution) |
 | `total` | int | count of facts returned |
-| `results[]` | array | search arm only: `slug`, `title`, `chunk`, `evidence`, `create_safety`, `provenance` (origin page slug) |
+| `results[]` | array | search arm only: `slug`, `title`, `chunk`, `evidence`, `create_safety`, `provenance` (origin page slug), `source_id` (additive since #4830: the source the hit came from; on a federated read each hit names its own source, and a hit that carries none is labeled only when the read's scope is a single source, never a blind `default`) |
 | `search_degraded` | string? | present when keyword-only fallback fired |
+| `facts_order` | string | `relevance` (question passed) or `newest` |
+| `facts[].relevance` | number? | question calls only: the ranking score (about 0 to 2.1); not a probability and not comparable across calls |
+| `facts_degraded` | object? | question calls only: `reason` (`keyword_only_no_embedding_provider`, `keyword_only_embedding_disabled`, `embed_timeout`, `embed_unavailable`, `no_query_terms`, `facts_embedding_column_missing`) and `unembedded` (facts in scope without a comparable embedding; the `facts_unembedded` notice carries the `gbrain embed --stale --facts` preview) |
 | `budget_tokens` / `budget_used` / `dropped_count` | int? | present for a positive finite numeric budget, including when its floor is zero |
 | `budget_packing` | object? | present only when a valid `budget_policy` is supplied; effective policy and per-arm accounting |
+
+A call that passes `query` without `question` and without `entity`,
+`session_id`, `since` or `supersessions` returns its facts newest first, as v1
+always has, and carries a `recall_hint` notice (kind `info`) whose `fix.mcp` is
+the same call with `question` set to the query.
 
 `budget_packing` contains `policy` (effective `facts_first | query_first`),
 `applied` (whether the requested budget policy applied), `reason`, and `facts` /
@@ -236,7 +259,7 @@ matched. **create_safety** (enum): `exists` (a page for this already exists)
 signal). The derivation of both is implementation-defined and may improve;
 the values are frozen.
 
-### remember(fact, provenance, ttl?, entity?, kind?, visibility?, request_id?) — write
+### remember(fact, provenance, ttl?, entity?, kind?, visibility?, valid_from?, request_id?) — write
 
 Save ONE fact with mandatory attribution.
 
@@ -245,6 +268,7 @@ Save ONE fact with mandatory attribution.
   Empty ⇒ `provenance_required` error with a fix.
 - `entity`: set whenever the fact is about a specific person/company/project —
   entity-scoped recall will not find unattributed facts.
+- `valid_from` (ISO 8601): when the fact became true. Omitted ⇒ write time.
 - `infer_entity` (additive, boolean, default `true`): when `entity` is omitted,
   the server may link the fact to the one entity page its text names exactly
   (zero LLM; a second competing name, a bare first name or an ambiguous match
@@ -276,9 +300,8 @@ near-duplicates may insert; dedup and supersession ride embedding similarity).
 
 #### remember replaces (additive)
 
-`replaces` (string): the `fact_id` of the fact this new fact replaces. It is a
-caller-directed replacement: it says the old fact is no longer the current one,
-not that the two texts mean the same. Zero model calls; the cosine rule does
+`replaces` (string): the `fact_id` this fact replaces, caller-directed: the
+old fact is no longer current (the texts need not mean the same). Zero model calls; the cosine rule does
 not apply. The target must be an active fact in the same source, with the same
 visibility (world only for remote callers, else `not_found`) and the same
 entity, on the same entity page. Refusals come back as `invalid_params` with a
@@ -292,6 +315,18 @@ text equal to the target is `status: duplicate` and changes nothing. On success
 `replaced_by_caller` is `true`; the replaced fact is expired with
 `superseded_by` and its `## Facts` row is struck with `superseded by #N` in
 the same publication. Every `superseded` response carries `superseded_fact_id`.
+
+#### remember content_origin (additive)
+
+`content_origin` (string: `user_said`, `tool_output` or `inferred`): where the
+fact's text came from. `tool_output` (a web page, email, file or other tool's
+text) stores the fact as `external_untrusted`; `user_said` and `inferred` store
+it at the agent tier (`agent_written`), so `user_said` never confers owner
+authority. Any other value is `invalid_params` listing the accepted values.
+Optional, and safety never depends on it. Like `replaces`, it is advertised on
+the verbs and full surfaces but left out of the starter surface's schema (to
+keep that tool list inside its size budget); a starter client that passes it
+is still honored. `put_page` and `capture` take the same parameter.
 
 #### remember entity attribution fields (additive)
 
@@ -487,6 +522,14 @@ already-expired fact returns `expired: false` (success); unknown id ⇒
 
 Response: `{ id, expired, reason, protocol_version }`.
 
+#### forget and purge (additive note)
+
+`forget` keeps this contract: it expires, never deletes. Removing a claim's
+text from live stores is a separate owner-only operation, `purge_fact` (CLI:
+`gbrain forget <id> --purge` on the brain host), which is not a memory verb and
+is never callable over MCP; a remote call gets `trusted_local_only` with the
+command for the user. See [expire versus purge](../guides/memory-boundaries.md#purge).
+
 #### forget similar_active and semantic_review (additive)
 
 `semantic_review` (boolean, default `true`): `false` keeps this claim out of
@@ -527,7 +570,11 @@ A pending write is a protocol `unavailable` error with a populated suggestion,
 `protocol_version: 1`, and optional `write_request` and `write_error` fields.
 It never returns a success `status` or `expired` value. `write_error` carries
 the detailed concurrency reason without changing the frozen protocol error
-enum. A committed receipt retains the original memory-verb success fields.
+enum. Its values branch three ways on revisions: `revision_required` (the page
+exists and the write named no `expected_revision`: read it and resend),
+`revision_conflict` (the named revision is stale: re-read and merge) and
+`revision_backfill_pending` (resume the revision backfill). A committed receipt
+retains the original memory-verb success fields.
 Compaction may remove diagnostics, but must preserve those frozen result fields.
 
 The optional caller-generated UUID `request_id` identifies one write intent.
@@ -621,6 +668,7 @@ Refusals name the edit and never include protected text:
 | `edit_protected_span` | `edit_index=<i>` | The text touches a takes or facts section; use the scoped operations. |
 | `edit_invalid` | `edit_index=<i>` when one edit is malformed | Pass 1 to 50 `{old_text, new_text}` objects with non-empty `old_text`. |
 | `revision_conflict` | `current_revision=<uuid>` | Read the page again, rebuild the edits, resend. |
+| `revision_required` | — | The page exists and the call named no `expected_revision` (`put_page`; additive since #5385, formerly reported as `revision_conflict`). Read the page, then resend with its revision, or `force: true` for an intentional overwrite. |
 
 ```json
 → get_page {"slug": "projects/example", "include_content": true}
@@ -654,7 +702,7 @@ lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
-degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core? }`. `text` is the
+degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld? }`. `text` is the
 envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
 
 `entities` scopes cards and threads, not the hot facts (the session's recent
@@ -751,7 +799,7 @@ Published so harness authors place calls by cost, not by learning at timeout:
 | `entity` | zero-LLM, **p99 < 100ms** | CI-gated on a 20K-page corpus (below). Safe per entity-bearing message. |
 | `context_pack` | zero-LLM, sub-second | Fan-out capped at 8 entities. Session boundaries, not per-message. Push path passes a wall-clock deadline and returns a PARTIAL pack (`degraded_reason`) rather than overrun. |
 | `delta` | zero-LLM, sub-second | O(changes). Heartbeats — pull path only (there is no push heartbeat); session cursors expire after 7 idle days. |
-| `recall` | zero-LLM (keyword) to one embedding call (when `query` is passed) | Sub-second typical; the `query` arm adds one embedding round-trip. |
+| `recall` | zero-LLM (keyword) to one embedding call (when `query` or `question` is passed; a `query` and a `question` with the same text share one) | Sub-second typical; the `query` arm adds one embedding round-trip. |
 | `remember` / `forget` | write, sub-second | One durable write; `remember` adds one embedding call for dedup when a provider is configured. |
 | `synthesize` | **EXPENSIVE / SLOW** | LLM calls, seconds-to-minutes, costs money. Never place on a hot or ambient path. |
 

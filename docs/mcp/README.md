@@ -8,6 +8,7 @@ different credentials.
 | Run an HTTP MCP server | [Deployment](DEPLOY.md) | Access to the brain host and its service configuration |
 | Open the admin panel or manage clients | [MCP administration](ADMIN.md) | The running server's separate owner bootstrap credential |
 | Connect an existing agent | [Hosted harness setup](../guides/hosted-harness-access.md) | Native OAuth/PKCE, or a private machine-client handoff |
+| Wire Claude Code to a local brain in one command | [`gbrain setup claude-code`](../guides/setup.md) | A local GBrain installation; setup resolves the brain, writes MCP and read-context hooks, and verifies them |
 | Run a local MCP pipe | [Local stdio](DEPLOY.md#local-stdio-zero-setup) | A local GBrain installation; no HTTP admin panel is created |
 | Diagnose a failed connection | [Recovery table](ADMIN.md#recover-a-failed-step) | Start with the failed stage and the authority you actually hold |
 | A tool call returned an error | [A tool call returned an error](#a-tool-call-returned-an-error) | None: the error says who acts |
@@ -109,3 +110,20 @@ claim and never grants access.
 
 Say to your agent: *"Search my brain for the acme-example renewal terms and
 show me every ranking field for the top result."*
+
+### Fact rows in `query`
+
+`query` can return saved facts as rows of their own, after the page rows and
+only in slots and token budget the pages left free. A fact row is not a page.
+It has `result_type: "fact"` and `fact_id`, and no `slug`, `id`, `type` or
+`chunk_id`, so it can't be passed to `get_page`, `fetch` or
+`assemble_evidence`. `follow_up` names the call that returns the fact:
+`recall` with the fact's entity, or with a `grep` of its text when it has no
+entity. `page_slug` is present only when the caller can read the entity's page;
+pass it to `get_page`.
+
+```json
+{"result_type":"fact","fact_id":"412","page_slug":"companies/acme-example","follow_up":{"op":"recall","args":{"entity":"companies/acme-example"}},"title":"Saved fact about companies/acme-example","chunk_text":"Saved fact (fact; valid from 2026-09-01; provenance: user update): The billing contact for Acme Example is Bob.","score":0.42,"source_id":"default"}
+```
+
+`search.query_facts_arm=false` turns fact rows off.

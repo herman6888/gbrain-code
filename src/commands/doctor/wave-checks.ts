@@ -47,10 +47,11 @@ export interface WaveCheckSpec {
 
 /**
  * #6188 (D7): what clears malformed fences, from a check's `auto_repair` detail: the next maintenance run while
- * one is active and `fences.repair.enabled` is on, otherwise `gbrain repair fences` (whose preview prints the apply command).
+ * one is active and `fences.repair.enabled` is on, otherwise the preview `command`: the content lane for held files (#6377), `gbrain repair fences`
+ * for malformed fences stored pages carry (whose preview prints the apply command).
  */
-function fenceRepairHow(details: Record<string, any>, source?: string): string {
-  const preview = `preview with: gbrain repair fences${source ? ` --source ${source}` : ''}`;
+function fenceRepairHow(details: Record<string, any>, source: string | undefined, command: 'fences' | 'content'): string {
+  const preview = `preview with: gbrain repair ${command}${source ? ` --source ${source}` : ''}`;
   const auto = details.auto_repair as { active?: boolean; enabled?: boolean } | undefined;
   if (auto && auto.active === false) return `not repaired automatically (${auto.enabled === false ? 'fences.repair.enabled is false' : 'no maintenance run is active'}); ${preview}`;
   const manual = Array.isArray(details.sources) ? details.sources.reduce((sum: number, c: { by_tier?: { manual?: number } }) => sum + Number(c.by_tier?.manual ?? 0), 0) : 0;
@@ -119,6 +120,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/persistence-requests.ts')).writeStallCheck(engine),
   },
   {
+    id: 'lost_caller_writes', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Replaying refused caller writes is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some caller writes (remember, put_page, add_timeline_entry) were refused at publication and never landed; the caller saw an error and the fact or edit was dropped',
+    run: async (engine, scope) => (await import('./checks/persistence-requests.ts')).lostCallerWritesCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'persistence_session_timeouts', resolution: 'operator', registration: 'wave',
     count: d => d.reason === 'session_timeouts_not_applied' ? 1 : 0,
     hostOnly: 'The connection URL and its pooler are brain-host configuration outside any source scope.',
@@ -138,14 +146,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     hostOnly: 'Held file paths are host-local; remote callers see held counts on sync results, get_page and search.',
     count: d => Number(d.held ?? 0),
     impact: 'Some Git source files are held instead of imported, so their pages are missing or keep an older revision',
-    bannerHow: (d, how, source) => !d.fences ? how : d.fences >= Number(d.held ?? 0) ? `fence holds: ${fenceRepairHow(d, source)}` : `${how}; fence holds: ${fenceRepairHow(d, source)}`,
+    bannerHow: (d, how, source) => !d.fences ? how : d.fences >= Number(d.held ?? 0) ? `fence holds: ${fenceRepairHow(d, source, 'content')}` : `${how}; fence holds: ${fenceRepairHow(d, source, 'content')}`,
     run: async (engine, scope) => (await import('./checks/git-holds.ts')).gitHeldFilesCheck(engine, scope.sourceIds),
   },
   {
     id: 'fence_integrity', resolution: 'repair', registration: 'doctor.ts',
     count: d => Number(d.total ?? 0),
     impact: 'Some facts or takes fences are malformed and wait for repair; none of them blocks a sync',
-    bannerHow: (d, _how, source) => fenceRepairHow(d, source),
+    bannerHow: (d, _how, source) => fenceRepairHow(d, source, 'fences'),
     run: async (engine, scope) => (await import('./checks/fence-integrity.ts')).fenceIntegrityCheck(engine, scope.sourceIds),
   },
   {
@@ -169,6 +177,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.count ?? 0),
     impact: 'Some persistence source bindings belong to a removed source or an earlier source incarnation',
     run: async engine => (await import('./checks/orphan-bindings.ts')).checkOrphanBindings(engine),
+  },
+  {
+    id: 'foreign_ownership_marker', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Ownership markers are private files beside the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, so claiming that checkout refuses recovery_required',
+    instruction: 'Confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
+    run: async engine => (await import('./checks/orphan-bindings.ts')).checkForeignOwnershipMarkers(engine),
   },
   {
     id: 'unbound_source', resolution: 'operator', registration: 'wave',

@@ -9,7 +9,9 @@ import { isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { resolveSlugForPath, DEFAULT_SOURCE_ID } from './sync.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { invalidateGitListingCache, knownOutsideGitRepo, noteGitFailure } from './git-visible-files.ts';
 import { hasUnresolvedDbOnlyDeclaration, loadStorageConfig } from './storage-config.ts';
+import { gitChildEnv } from './git-env.ts';
 
 /**
  * v0.32.7 CJK wave (codex post-merge F4): resolve a slug by `pages.source_path`
@@ -281,6 +283,14 @@ export function resolveNoEmbed(
   return args.includes('--no-embed') || cfg?.embedding_disabled === true;
 }
 
+/** Subcommands that never change a repository; any other one drops the doctor-run git memo (git-visible-files.ts). */
+const READ_ONLY_GIT = new Set(['rev-parse', 'ls-files', 'ls-tree', 'cat-file', 'diff', 'log', 'show', 'status', 'rev-list', 'merge-base',
+  'for-each-ref', 'show-ref', 'describe', 'check-ignore', 'name-rev', 'blame', 'grep', 'check-attr', 'var', 'version']);
+
+function noteGitCommand(args: string[]): void {
+  if (!READ_ONLY_GIT.has(args[0] ?? '')) invalidateGitListingCache();
+}
+
 /**
  * Shell out to git with a generous maxBuffer.
  *
@@ -307,7 +317,9 @@ export function git(
   timeoutMs = 30000,
   { silenceStderr = false }: { silenceStderr?: boolean } = {},
 ): string {
+  noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(),
     encoding: 'utf-8',
     timeout: timeoutMs,
     maxBuffer: 100 * 1024 * 1024,
@@ -323,7 +335,9 @@ export function git(
  * live page was deleted on the corrupted evidence).
  */
 export function gitRawOutput(repoPath: string, args: string[]): string {
+  noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, []), {
+    env: gitChildEnv(),
     encoding: 'utf-8',
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
@@ -347,8 +361,10 @@ export function gitRawOutput(repoPath: string, args: string[]): string {
  */
 export function discoverGitRoot(inputPath: string): string {
   try {
+    if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
     return git(inputPath, ['rev-parse', '--show-toplevel'], [], 30000, { silenceStderr: true });
-  } catch {
+  } catch (error) {
+    noteGitFailure(inputPath, error);
     throw new Error(
       `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
     );
@@ -614,6 +630,7 @@ export function isPathSafe(filePath: string, gitRoot: string): boolean {
 export function hasOriginRemote(repoPath: string): boolean {
   try {
     execFileSync('git', buildGitInvocation(repoPath, ['remote', 'get-url', 'origin']), {
+      env: gitChildEnv(),
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['ignore', 'ignore', 'ignore'],

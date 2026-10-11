@@ -1406,6 +1406,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.return_budget_conversation',
   'search.return_budget_max_remote',
   'search.auto_packing',
+  'search.evidence_date_header', // C1: one-line date header per delivered block (default off; search/evidence-date.ts)
+  'search.entity_anchoring', // entity-anchored retrieval for entity-scoped current-state query/search (default off; search/entity-anchor.ts)
+  'search.query_facts_arm', // query adds matching active facts as rows in spare capacity (default on; search/facts-arm.ts)
+  'search.temporal_fact_reserve', // temporal-cue queries reserve up to 15% of the token budget for question-ranked dated facts (default off; search/facts-arm.ts)
   'think.return_unit',
   // Models tier system (v0.31.12)
   'models.default',
@@ -1434,6 +1438,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.dream.triage',
   'models.drift',
   'models.auto_think',
+  'models.standing_questions',
   'models.think', 'models.fence_repair', // models.fence_repair: #6188 Tier 3 fence repair model (fence-repair/llm.ts), tier deep
   'models.subagent',
   'models.expansion',
@@ -1442,6 +1447,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.brainstorm.judge',
   'models.eval.longmemeval', 'models.eval.cross_modal.slot_a', 'models.eval.cross_modal.slot_b', 'models.eval.cross_modal.slot_c', // #5872 D12 probe judge slots
   'facts.extraction_model',
+  'recall.question_admission', // recall `question` admission rule: reserve (default) | facts_arm (facts/question-recall.ts)
   // Brain-wide kill switch for fact extraction, read by
   // src/core/facts/extract.ts:isFactsExtractionEnabled and honored by
   // sweep.ts, operations.ts and transcripts/ingest-facts.ts. That function's
@@ -1453,6 +1459,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // google-source email pages (default ON for google sources; deterministic
   // thread detection is unaffected). `gbrain config set loops.extraction_enabled false`.
   'loops.extraction_enabled',
+  // #5445: brain-wide Gmail labels (names or ids, comma/JSON list) whose threads
+  // never enter paid loop extraction; a source's g_loops_exclude_labels wins.
+  'loops.extraction_exclude_labels',
+  // W14 P4.6b: USD per UTC day that loops_extract jobs may spend, brain-wide
+  // (default 2.00; 0 = no paid loop extraction). Validated in google/loops-spend.ts.
+  'loops.extraction_max_usd_per_day',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
   // Automatic facts drain caps (src/core/facts/drain.ts FACTS_DRAIN_KEYS).
@@ -1473,6 +1485,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // src/core/facts/visibility.ts; explicit caller values always win.
   'facts.default_visibility',
   'facts.entity_inference', // #5836: write-time subject inference kill switch (subject-infer.ts)
+  'facts.candidate_fusion', // C2: 'rrf_free' (default, cosine arm) | 'interleave' (cosine + keyword; facts/single-prepare.ts)
+  'facts.supersession_thresholds', // JSON {"provider:model@dims": number | "off"} (facts/supersession-threshold.ts)
   'facts.page_write_notability_filter', // #6231: tiers page-write extraction keeps (facts/notability-filter.ts)
   // Ambient memory writeback (opt-in, default OFF): 'off' | 'salient' | 'all'.
   // DUAL-PLANE: `gbrain config set` writes the DB plane (authoritative — the
@@ -1522,7 +1536,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.synthesize.link_manifest',
   'dream.synthesize.quote_verify',
   'dream.quote_verify',
-  'think.quote_verify',
+  'think.quote_verify', 'dream.attribution_checks', // #5425 [UC4] mechanical attribution checks, default off (cycle/attribution-checks.ts)
   'dream.synthesize.inline_concurrency',
   // #4152 triage knobs. The triage model's preferred key is
   // `models.dream.triage` (models.* prefix, registered via the models.dream.*
@@ -1581,6 +1595,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4702: per-pattern opt-out (JSON array or comma-separated names) —
   // finer than junk_patterns_enabled (all patterns) / disabled (kill-switch).
   'content_sanity.disabled_patterns',
+  // #5575 write gate (local-only): quarantine|flag|reject|off and flag|off; read by import-screen.ts.
+  'write_gate.external_mode',
+  'write_gate.agent_mode',
+  // #5575 read side (local-only): label|filter and suppress|allow; read by eligibility/policy.ts.
+  'trust.read_policy',
+  'trust.agent_activation',
   // MCP skill-catalog publishing (PR1)
   'mcp.publish_skills',
   'mcp.publish_skills_prompted',
@@ -1656,6 +1676,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // no_events; the cap is now configurable and truncation is surfaced.
   'chronicle.judge_max_tokens',
   'chronicle.job_budget_usd', 'chronicle.auto_daily_limit', 'chronicle.auto_recent_days', 'chronicle.auto_settle_seconds', // #5876 rails (chronicle/config.ts validates)
+  'chronicle.max_events_per_page', // #5329: events published per page extraction (default 25); the surplus is counted over_cap
   // Takes bootstrap (v0.41.18.0, A12). The onboard remediation's two-gate
   // consent reads this key, and enabling it is the documented path to
   // `gbrain takes extract --from-pages` — same unregistered-key class.
@@ -1728,6 +1749,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'persistence.limits.brain_recovery_bytes', 'persistence.limits.worktree_recovery_bytes',
   'persistence.receipt_retention_days', 'persistence.unbound_write', 'persistence.max_claim_ms', // #5254: persistence/unbound-source.ts; #6176: persistence/claim-phase.ts
   'persistence.sync_preparation_ms', 'persistence.maintenance_preparation_ms', 'persistence.preparation_ceiling_ms', 'persistence.max_preparation_attempts', 'persistence.preparation_deadlines', // #6278: persistence/preparation-budget.ts, switches.ts
+  'persistence.publication_ceiling_ms', // #6405: persistence/sync-drain.ts (in-pass publication ceiling)
   'persistence.single_consumer', // #6317: persistence/switches.ts, consumer-election.ts (one full consumer per host; off by default)
   // shared-skills migration inventory bounds (src/core/shared-skills/inventory-limits.ts)
   'shared_skills.inventory.max_files', 'shared_skills.inventory.max_total_bytes', 'shared_skills.inventory.max_file_bytes', 'shared_skills.inventory.max_entries',

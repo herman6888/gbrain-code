@@ -12,7 +12,8 @@
  *   - the duplicate-page guard: evidence and create_safety;
  *   - safety and provenance markers whenever present: injection_suspected,
  *     injection_p, unverified, content_flag, status, superseded, superseded_by,
- *     message_id, thread_id, source_subject; modality when not text; stale
+ *     message_id, thread_id, source_subject; trust_tier and origin (#5575);
+ *     modality when not text; stale
  *     only when set (true, or the held-file object from #5988);
  *   - `delivered: { truncated: true }` whenever evidence delivery truncated.
  * `fields: "full"`, the `mcp.result_rows: full` host config and gbrain's own
@@ -27,7 +28,9 @@ const KEPT_FIELDS: ReadonlySet<string> = new Set([
   'id', 'slug', 'title', 'type', 'chunk_text', 'score', 'effective_date', 'source_id', 'chunk_id',
   'evidence', 'create_safety',
   'injection_suspected', 'injection_p', 'unverified', 'content_flag', 'status', 'superseded', 'superseded_by',
-  'message_id', 'thread_id', 'source_subject', 'relational',
+  'message_id', 'thread_id', 'source_subject', 'relational', 'result_type', 'fact_id', 'page_slug', 'follow_up',
+  // #5575 A6: every row says how much it deserves influence.
+  'trust_tier', 'origin', 'unconfirmed',
   // Present only when the caller asked for `explain: true`.
   'score_details',
 ]);

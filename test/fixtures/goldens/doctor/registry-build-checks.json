@@ -330,6 +330,10 @@
         "name": "embedding_migration_state"
       },
       {
+        "category": "brain",
+        "name": "supersession_calibration"
+      },
+      {
         "category": "ops",
         "name": "chat_fallback_chain"
       },
@@ -395,6 +399,10 @@
       },
       {
         "category": "ops",
+        "name": "lost_caller_writes"
+      },
+      {
+        "category": "ops",
         "name": "persistence_session_timeouts"
       },
       {
@@ -412,6 +420,10 @@
       {
         "category": "brain",
         "name": "orphan_persistence_bindings"
+      },
+      {
+        "category": "brain",
+        "name": "foreign_ownership_marker"
       },
       {
         "category": "brain",
@@ -654,6 +666,10 @@
         "name": "git_convergence"
       },
       {
+        "category": "brain",
+        "name": "tracked_ownership_marker"
+      },
+      {
         "category": "ops",
         "name": "decide_health"
       },
@@ -703,6 +719,18 @@
       },
       {
         "category": "brain",
+        "name": "trust_tiers"
+      },
+      {
+        "category": "brain",
+        "name": "trust_scan"
+      },
+      {
+        "category": "brain",
+        "name": "trust_sources_unclaimed"
+      },
+      {
+        "category": "brain",
         "name": "core_memory"
       },
       {
@@ -720,6 +748,10 @@
       {
         "category": "ops",
         "name": "host_identity_mismatch"
+      },
+      {
+        "category": "brain",
+        "name": "extract_atoms_held_failed"
       },
       {
         "category": "brain",

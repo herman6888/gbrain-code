@@ -6,7 +6,7 @@
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -61,10 +61,10 @@ function recordClaims(e: BrainEngine): { claims: Map<string, number>; restore: (
   } as BrainEngine['executeRaw'];
   return { claims, restore: () => { e.executeRaw = execute; } };
 }
-function writer(source: string, slugs: string[], intervalMs = 0, go?: string, preparingHoldMs = 0) {
+function writer(source: string, slugs: string[], intervalMs = 0, go?: string, preparingHoldMs = 0, ready?: string) {
   const out = join(home, `worker-${randomUUID()}.json`);
   const child = Bun.spawn([process.execPath, join(import.meta.dir, 'fixtures', 'foreground-put-page-worker.ts')], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
-    env: { ...process.env, GBRAIN_HOME: home, WORKER_DATABASE_URL: databaseUrl, WORKER_SOURCE: source, WORKER_SLUGS: slugs.join(',') || '-', WORKER_INTERVAL_MS: String(intervalMs), WORKER_OUT: out, ...(go ? { WORKER_GO: go } : {}),
+    env: { ...process.env, GBRAIN_HOME: home, WORKER_DATABASE_URL: databaseUrl, WORKER_SOURCE: source, WORKER_SLUGS: slugs.join(',') || '-', WORKER_INTERVAL_MS: String(intervalMs), WORKER_OUT: out, ...(go ? { WORKER_GO: go } : {}), ...(ready ? { WORKER_READY: ready } : {}),
       ...(preparingHoldMs ? { WORKER_PREPARING_HOLD_MS: String(preparingHoldMs) } : {}) } });
   return async () => {
     const [stderr, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
@@ -98,9 +98,13 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
   // `laneHold`, once the write is sent each lane group that has applied its pages holds before its commit turn (no
   // counter lock held) until the write commits or `laneHold` ms pass, and `beside` records, for each foreground
   // publication in this process, whether a lane group was then open.
-  let laneOpen = 0, armed = false;
+  let laneOpen = 0, armed = false, holdStarts = false;
   const beside: boolean[] = [];
   const written = Promise.withResolvers<void>();
+  // Without `laneHold`, from the moment 4 unstarted groups are seen until `before` is read, each lane parks its group
+  // at `lane:applied`, so no lane starts another group and the groups queued ahead of the write stay queued however
+  // long the write takes to be admitted (each lane can take at most one more group before it parks).
+  const counted = Promise.withResolvers<void>();
   // With `preparingHoldMs`, whichever process claims the write holds its preparation that long, and this process stamps
   // its claims with another process's owner, so either way the write is claimed elsewhere and unpublished meanwhile.
   let heldHere: [number, number] | undefined;
@@ -118,6 +122,7 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
       laneOpen++;
       try { await Promise.race([written.promise, Bun.sleep(laneHold)]); } finally { laneOpen--; }
     }
+    if (!laneHold && holdStarts && point === 'lane:applied') await Promise.race([counted.promise, Bun.sleep(30_000)]);
     if (!laneHold && point === 'publication:before_commit' && detail.operation === 'submit_job') await Bun.sleep(150);
   });
   try {
@@ -131,7 +136,9 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
       const begun = new Set(all.filter(row => row.state !== 'queued').map(row => row.request_id));
       queued = all.filter(row => row.state === 'queued' && row.kind?.startsWith('managed_sync_') && !(row.grp && begun.has(row.grp)) && !begun.has(row.request_id));
       // With lanes the drain admits groups ahead; without them only the publishing group is out, so the write comes while one runs.
-      return all.some(row => row.state === 'committed') && (lanes > 1 ? queued.length >= 4 : all.some(row => row.state === 'running' && row.kind?.startsWith('managed_sync_')));
+      const ready = all.some(row => row.state === 'committed') && (lanes > 1 ? queued.length >= 4 : all.some(row => row.state === 'running' && row.kind?.startsWith('managed_sync_')));
+      if (ready && lanes > 1) holdStarts = true;
+      return ready;
     });
     const target = slug(queued.length ? queued : await rows(e, source).then(all => all.filter(row => row.state === 'queued')));
     armed = true;
@@ -149,10 +156,11 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
         && !(row.grp && started.has(row.grp)));
       return true;
     });
+    counted.resolve();
     const [written] = await finish();
     const result = await drain;
     return { source, target, before, written: written!, result, claims: recorder.claims, final: await rows(e, source), beside, held: heldHere ?? written!.held };
-  } finally { recorder.restore(); installFaultHook(undefined); setClaimOwnerForTest(undefined); }
+  } finally { counted.resolve(); recorder.restore(); installFaultHook(undefined); setClaimOwnerForTest(undefined); }
 }
 
 for (const lanes of [2, 1]) {
@@ -225,9 +233,15 @@ test('a stream of writes from another process still lets the drain publish a gro
   if (!engine) return;
   resetWriteSwitches();
   const e = engine, source = await fixture(e, 64);
+  // The writer process boots and connects before the drain starts, so the stream begins right after the first group
+  // commits instead of whenever a cold process gets going (by then a fast drain can have committed most of its groups).
+  const go = join(home, `go-${randomUUID()}`), ready = join(home, `ready-${randomUUID()}`);
+  const finish = writer(source, [], 0, go, 0, ready);
+  await until(async () => existsSync(ready));
   const drain = performSync(e, { sourceId: source, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 2 });
   await until(async () => (await rows(e, source)).some(row => row.state === 'committed' && row.kind === 'managed_sync_import'));
-  const written = await writer(source, Array.from({ length: 12 }, (_, i) => `notes/stream-${i}`))();
+  writeFileSync(go, Array.from({ length: 12 }, (_, i) => `notes/stream-${i}`).join(','));
+  const written = await finish();
   const result = await drain;
   expect(written.map(write => write.state)).toEqual(written.map(() => 'committed'));
   expect(result.status).toBe('first_sync');

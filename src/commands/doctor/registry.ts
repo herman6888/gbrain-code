@@ -92,17 +92,22 @@ import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
+import { supersessionCalibrationEntry } from './checks/supersession-calibration.ts';
 import { unlinkedFactsEntry } from './checks/unlinked-facts.ts';
 import { edgeValidityEntry } from './checks/edge-validity.ts';
 import { coreMemoryEntry } from './checks/core-memory.ts';
 import { plannerStatsEntry } from './checks/planner-stats.ts';
 import { revisionBackfillEntry } from './checks/revision-backfill.ts';
+import { trustTiersEntry } from './checks/trust-tiers.ts';
+import { trustScanEntry } from './checks/trust-scan.ts';
+import { trustSourcesUnclaimedEntry } from './checks/trust-sources-unclaimed.ts';
 import { harnessWiringDoctorEntry } from './checks/harness-wiring.ts';
 import { agentContractEntry } from './checks/agent-contract.ts';
 import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
 import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
+import { atomHeldFailedEntry } from './checks/atom-holds.ts';
 import { STOP_DOCTOR, type DoctorContext, type DoctorEntry } from './context.ts';
 import type { Check } from '../doctor.ts';
 import { infoCheck } from './check-fix.ts';
@@ -140,6 +145,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   embeddingQueryPrefixEntry,
   embeddingColumnRegistryEntry,
   embeddingEnvOverrideEntry,
+  supersessionCalibrationEntry,
   chatFallbackChainEntry,
   behaviorChangesEntry,
   graphCoverageEntry,
@@ -179,9 +185,13 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   retrievalFeedbackEntry,
   transcriptSecretExposureEntry,
   revisionBackfillEntry,
+  trustTiersEntry,
+  trustScanEntry,
+  trustSourcesUnclaimedEntry,
   coreMemoryEntry,
   managedSyncMovementEntry,
   persistenceConsumersEntry,
+  atomHeldFailedEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];
@@ -204,10 +214,10 @@ export function parseOnlyChecks(args: readonly string[]): Set<string> | null {
   return new Set(raw.flatMap((r) => r.split(',')).map((n) => n.trim()).filter(Boolean));
 }
 
-/** True when any requested check is a DB check (ordered after the DB-checks early stop). */
+/** True when any requested check is a DB check (after the DB-checks early stop) or a declared engine check of a pre-gate entry. */
 export function onlyNeedsEngine(only: ReadonlySet<string>): boolean {
   const gate = DOCTOR_CHECK_REGISTRY.indexOf(dbChecksGateEntry);
-  return DOCTOR_CHECK_REGISTRY.some((e, i) => i > gate && e.emits.some((n) => only.has(n)));
+  return DOCTOR_CHECK_REGISTRY.some((e, i) => (i > gate ? e.emits : e.engineChecks ?? []).some((n) => only.has(n)));
 }
 
 function selected(entry: DoctorEntry, only: ReadonlySet<string> | null | undefined): boolean {

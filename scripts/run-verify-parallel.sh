@@ -76,6 +76,8 @@ CHECKS=(
   "check:orphan-modules"
   # agent contract v1 (A2): generated docs/guides/error-codes.md matches the registry
   "check:error-codes"
+  # #5575 ENG-16: write-gate detector patterns are bounded and window-safe
+  "check:write-gate-regex"
   # agent contract v1 scanner (B9): shrink-only per-rule baselines
   "check:agent-contract"
   # No-op placeholder assertions (expect(true).toBe(true) and friends) in
@@ -169,6 +171,9 @@ CHECKS=(
   # #5595/#5475: no fsync of a read-only descriptor outside src/core/fs-durable.ts
   # (Windows refuses it with EPERM).
   "check:durable-flush"
+  # #4992: subprocess launches go through src/core/spawn.ts (windowsHide
+  # default); NOT_YET_MIGRATED is a ratchet that only shrinks.
+  "check:windows-hide"
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
@@ -293,16 +298,22 @@ spawn_check() {
       bun run "$c" > "$LOG_FILE" 2>&1 &
       pid=$!
       # The watchdog owns no caller pipes (an orphaned sleep holding stdout
-      # stalled spawnSync callers for the whole $TIMEOUT) and its TERM trap
-      # takes its sleep down with it, closing the window where pkill -P runs
-      # before the sleep is forked. A TERM that lands between the fork and
-      # `nap=$!` only records itself; the sleep is killed once its pid is known.
-      ( trap 'term=1' TERM
-        sleep "$TIMEOUT" & nap=$!
-        trap 'kill "$nap" 2>/dev/null; exit 0' TERM
-        [ -z "${term:-}" ] || { kill "$nap" 2>/dev/null; exit 0; }
-        wait "$nap" && kill -TERM "$pid" 2>/dev/null && \
-          sleep 5 && kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+      # stalled spawnSync callers for the whole $TIMEOUT). Each of its sleeps
+      # runs through `nap`: on TERM the watchdog kills that sleep and waits for
+      # it, so the sleep is gone before the watchdog exits and before the
+      # `wait "$cap_pid"` below returns. A TERM that lands between forking a
+      # sleep and recording its pid only sets `stop`, acted on once the pid is
+      # known (bash 3.2 has no signal masking).
+      ( nap() {
+          stop=
+          trap 'stop=1' TERM
+          sleep "$1" & n=$!
+          trap 'kill "$n" 2>/dev/null; wait "$n" 2>/dev/null; exit 0' TERM
+          if [ -n "$stop" ]; then kill "$n" 2>/dev/null; wait "$n" 2>/dev/null; exit 0; fi
+          wait "$n"
+        }
+        nap "$TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
+          nap 5 && kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
       cap_pid=$!
       wait "$pid" 2>/dev/null
       # Capture the check's exit code from ITS `wait`, before any watchdog

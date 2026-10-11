@@ -186,23 +186,14 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
 
-CREATE OR REPLACE FUNCTION gbrain_cjk_search_tokens(input_text TEXT) RETURNS TEXT
-LANGUAGE SQL IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS \$cjkfn\$
-  WITH chars AS (
-    SELECT ch, ord
-    FROM regexp_split_to_table(COALESCE(input_text, ''), '') WITH ORDINALITY AS t(ch, ord)
-    WHERE ch ~ '[一-鿿぀-ゟ゠-ヿ가-힯]'
-  )
-  SELECT COALESCE(string_agg(
-    CASE WHEN next_char.ch IS NOT NULL
-      THEN current_char.ch || ' ' || current_char.ch || next_char.ch
-      ELSE current_char.ch
-    END,
-    ' ' ORDER BY current_char.ord
-  ), '')
-  FROM chars current_char
-  LEFT JOIN chars next_char ON next_char.ord = current_char.ord + 1
-\$cjkfn\$;
+-- #6370: indexing and the title query read text through gbrain_fts_input(),
+-- which splits CJK/ASCII-alnum boundaries (a no-op on text without CJK).
+CREATE OR REPLACE FUNCTION gbrain_fts_input(t text) RETURNS text
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = pg_catalog
+AS \$fn\$
+  SELECT regexp_replace(regexp_replace(t, '([一-鿿぀-ゟ゠-ヿ가-힯])([A-Za-z0-9])', '\\1 \\2', 'g'), '([A-Za-z0-9])([一-鿿぀-ゟ゠-ヿ가-힯])', '\\1 \\2', 'g')
+\$fn\$;
+
 
 CREATE TABLE IF NOT EXISTS links (
   id             SERIAL PRIMARY KEY,
@@ -649,9 +640,9 @@ BEGIN
   WHERE page_id = NEW.id;
 
   NEW.search_vector :=
-    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.timeline, ''))), 'C') ||
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(timeline_text, ''))), 'C');
 
   RETURN NEW;
 END;
@@ -1275,6 +1266,7 @@ CREATE TABLE IF NOT EXISTS persistence_host_bindings (
     host_id uuid NOT NULL,
     local_path text NOT NULL,
     coordination_path text NOT NULL,
+    git_durability text CHECK (git_durability IN ('enabled','disabled')),
     PRIMARY KEY(worktree_id,host_id)
   );
 CREATE TABLE IF NOT EXISTS persistence_local_writers (
@@ -1383,7 +1375,9 @@ BEGIN
   IF TG_TABLE_NAME='pages' AND TG_OP='UPDATE' THEN
     IF (NEW.source_id,NEW.slug,NEW.type,NEW.page_kind,NEW.title,NEW.compiled_truth,NEW.timeline,NEW.frontmatter,NEW.deleted_at,NEW.knowledge_revision)
       IS NOT DISTINCT FROM
-       (OLD.source_id,OLD.slug,OLD.type,OLD.page_kind,OLD.title,OLD.compiled_truth,OLD.timeline,OLD.frontmatter,OLD.deleted_at,OLD.knowledge_revision) THEN RETURN NEW; END IF;
+       (OLD.source_id,OLD.slug,OLD.type,OLD.page_kind,OLD.title,OLD.compiled_truth,OLD.timeline,OLD.frontmatter,OLD.deleted_at,OLD.knowledge_revision)
+      -- The trust tier is guarded content (trust/schema.ts); read by key so brains before the column keep working.
+      AND row_data->'trust_tier' IS NOT DISTINCT FROM old_data->'trust_tier' THEN RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME='sources' THEN
     IF TG_OP='UPDATE' AND (NEW.id,NEW.incarnation,NEW.local_path,NEW.archived)
       IS NOT DISTINCT FROM (OLD.id,OLD.incarnation,OLD.local_path,OLD.archived) THEN
@@ -1404,10 +1398,11 @@ BEGIN
     END IF;
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
-    row_data := row_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
-    old_data := old_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
-    -- Embedding completion, retrieval telemetry and write attribution
-    -- (attribution-schema.ts; a journal backfill fills it) are physical projections.
+    row_data := row_data - ARRAY['embedding_model','embedded_text_hash','write_origin'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    old_data := old_data - ARRAY['embedding_model','embedded_text_hash','write_origin'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    -- Embedding completion, retrieval telemetry, write attribution
+    -- (attribution-schema.ts; a journal backfill fills it) and the write origin
+    -- record are physical projections. The trust tier is not: it stays guarded.
     IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
       = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
   END IF;
@@ -2105,7 +2100,194 @@ DO \$rls\$ BEGIN
   END IF;
 END \$rls\$;
 
+-- The purge guards (facts, takes, pages triggers) are installed by the memory_purge migration.
+CREATE TABLE IF NOT EXISTS fact_purges (
+  source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  visibility  TEXT NOT NULL CHECK (visibility IN ('private','world')),
+  subject     TEXT NOT NULL DEFAULT '*',
+  fact_hash   TEXT NOT NULL,
+  request_id  UUID,
+  actor       TEXT,
+  reason      TEXT,
+  purged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, visibility, subject, fact_hash)
+);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE fact_purges ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE TABLE IF NOT EXISTS take_purges (
+  source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  subject     TEXT NOT NULL DEFAULT '*',
+  claim_hash  TEXT NOT NULL,
+  request_id  UUID,
+  purged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, subject, claim_hash)
+);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE take_purges ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE TABLE IF NOT EXISTS page_purges (
+  source_id    TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  slug         TEXT NOT NULL,
+  request_id   UUID,
+  purged_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, content_hash)
+);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE page_purges ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE TABLE IF NOT EXISTS derivation_inputs (
+  derived_table TEXT NOT NULL,
+  derived_id    TEXT NOT NULL,
+  input_table   TEXT NOT NULL,
+  input_id      TEXT NOT NULL,
+  source_id     TEXT REFERENCES sources(id) ON DELETE CASCADE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (derived_table, derived_id, input_table, input_id)
+);
+CREATE INDEX IF NOT EXISTS idx_derivation_inputs_input ON derivation_inputs (input_table, input_id);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE derivation_inputs ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE TABLE IF NOT EXISTS needs_rederive (
+  derived_table TEXT NOT NULL,
+  derived_id    TEXT NOT NULL,
+  source_id     TEXT REFERENCES sources(id) ON DELETE CASCADE,
+  request_id    UUID,
+  reason        TEXT NOT NULL,
+  marked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (derived_table, derived_id)
+);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE needs_rederive ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
 
+CREATE INDEX IF NOT EXISTS fact_purges_subject_idx ON fact_purges (source_id, subject, fact_hash) INCLUDE (visibility, purged_at);
+CREATE INDEX IF NOT EXISTS fact_purges_all_subjects_idx ON fact_purges (source_id, purged_at) WHERE subject = '*';
+
+-- #5575 blocking write gate: verdict receipts and held facts/takes.
+CREATE TABLE IF NOT EXISTS write_gate_receipts (
+  id               BIGSERIAL PRIMARY KEY,
+  target_table     TEXT NOT NULL CHECK (target_table IN ('pages','facts','takes','timeline_entries','write_gate_holds')),
+  target_id        TEXT NOT NULL,
+  source_id        TEXT,
+  content_hash     TEXT NOT NULL,
+  tier             TEXT NOT NULL,
+  detector_version INTEGER NOT NULL,
+  verdict          TEXT NOT NULL CHECK (verdict IN ('flag','quarantine')),
+  reason_families  TEXT[] NOT NULL DEFAULT '{}',
+  reasons          TEXT[] NOT NULL DEFAULT '{}',
+  detector_error   BOOLEAN NOT NULL DEFAULT false,
+  request_id       TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS write_gate_receipts_target_idx ON write_gate_receipts (target_table, target_id, content_hash, detector_version);
+CREATE INDEX IF NOT EXISTS write_gate_receipts_seen_idx ON write_gate_receipts (last_seen_at);
+CREATE TABLE IF NOT EXISTS write_gate_holds (
+  id               BIGSERIAL PRIMARY KEY,
+  kind             TEXT NOT NULL CHECK (kind IN ('fact','take')),
+  source_id        TEXT NOT NULL,
+  slug             TEXT NOT NULL DEFAULT '',
+  fingerprint      TEXT NOT NULL,
+  detector_version INTEGER NOT NULL,
+  tier             TEXT NOT NULL,
+  reason_families  TEXT[] NOT NULL DEFAULT '{}',
+  reasons          TEXT[] NOT NULL DEFAULT '{}',
+  detector_error   BOOLEAN NOT NULL DEFAULT false,
+  payload          JSONB NOT NULL,
+  write_origin     JSONB,
+  request_id       TEXT,
+  status           TEXT NOT NULL DEFAULT 'held' CHECK (status IN ('held','released','dropped')),
+  seen_count       INTEGER NOT NULL DEFAULT 1,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  decided_at       TIMESTAMPTZ,
+  decided_by       TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS write_gate_holds_dedupe_idx ON write_gate_holds (source_id, slug, fingerprint, detector_version);
+CREATE INDEX IF NOT EXISTS write_gate_holds_status_idx ON write_gate_holds (status, source_id, id);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE write_gate_receipts ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE write_gate_holds ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+
+
+-- Pinned questions (C4): answers and their evidence pointers live outside pages.
+CREATE TABLE IF NOT EXISTS pinned_questions (
+  id                        BIGSERIAL PRIMARY KEY,
+  source_id                 TEXT NOT NULL,
+  slug                      TEXT NOT NULL,
+  question                  TEXT NOT NULL,
+  scope_slug_prefix         TEXT,
+  scope_entity              TEXT,
+  state                     TEXT NOT NULL DEFAULT 'active',
+  inactive_reason           TEXT,
+  publish_mode              TEXT NOT NULL DEFAULT 'publish',
+  model                     TEXT,
+  cooldown_days             REAL,
+  origin                    TEXT NOT NULL DEFAULT 'pin',
+  created_by                TEXT NOT NULL,
+  revision                  BIGINT NOT NULL DEFAULT 1,
+  answer_revision           INTEGER NOT NULL DEFAULT 0,
+  answer                    TEXT,
+  answer_model              TEXT,
+  last_refresh_at           TIMESTAMPTZ,
+  last_attempt_at           TIMESTAMPTZ,
+  last_error                TEXT,
+  watermark_generation      BIGINT,
+  watermark_fact_id         BIGINT,
+  watermark_at              TIMESTAMPTZ,
+  lease_token               TEXT,
+  lease_owner               TEXT,
+  lease_expires_at          TIMESTAMPTZ,
+  refresh_attempts          INTEGER NOT NULL DEFAULT 0,
+  spend_usd                 DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  archived_at               TIMESTAMPTZ,
+  CONSTRAINT pinned_questions_source_slug_key UNIQUE (source_id, slug)
+);
+CREATE INDEX IF NOT EXISTS pinned_questions_state_idx ON pinned_questions (state, source_id);
+CREATE TABLE IF NOT EXISTS question_evidence (
+  id                        BIGSERIAL PRIMARY KEY,
+  question_id               BIGINT NOT NULL,
+  answer_revision           INTEGER NOT NULL,
+  sentence_id               TEXT NOT NULL,
+  kind                      TEXT NOT NULL,
+  source_id                 TEXT NOT NULL,
+  page_id                   INTEGER,
+  page_slug                 TEXT,
+  page_generation           BIGINT,
+  page_revision             TEXT,
+  item_id                   BIGINT,
+  content_hash              TEXT,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS question_evidence_question_idx ON question_evidence (question_id, answer_revision);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE pinned_questions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE question_evidence ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
 
 `;
 

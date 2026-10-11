@@ -1,3 +1,5 @@
+import { throwIfHeld } from '../trust/gate-outcomes.ts';
+import { guardRemoteForget, remoteForgetRaced, supersessionGuarded } from '../trust/supersede-handlers.ts';
 import { randomUUID } from 'node:crypto';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError, OperationError, verbError } from '../ops/contract.ts';
@@ -23,6 +25,7 @@ import { requestAttribution } from './attribution.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { prepareMemoryMutation } from './memory-prepare.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
+import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 
 export { prepareMemoryMutation } from './memory-prepare.ts';
 /** Only semantic appends without an explicit caller revision can be recomputed. */
@@ -144,7 +147,7 @@ async function inferRememberTarget(ctx: OperationContext, sourceId: string, sour
 export async function submitRememberMutation(ctx: OperationContext, params: Record<string, unknown>, waitMs?: number): Promise<Record<string, unknown>> {
   registerMutationPreparer('remember', prepareMemoryMutation);
   const sub = await submission(ctx, 'remember', params);
-  if (sub.prior) return writeResponse(await waitForWrite(ctx.engine, sub.prior, ctx.config, waitMs ?? ctx.writeWaitMs));
+  if (sub.prior) return throwIfHeld(writeResponse(await waitForWrite(ctx.engine, sub.prior, ctx.config, waitMs ?? ctx.writeWaitMs)));
   const { p, sourceId, principal, callerIntent, requestId } = sub;
   const [source] = await ctx.engine.executeRaw<RememberSource>(
     "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
@@ -164,22 +167,23 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
     // Fail fast on an invalid target; the coordinator re-checks it under the row lock before publishing.
     const { decideReplacement } = await import('../facts/single-prepare.ts');
     await decideReplacement(ctx.engine, sourceId, { fact: String(p.fact).trim(), kind: (p.kind ?? 'fact') as never,
-      visibility: (p.visibility ?? 'world') as never, entity_slug: entitySlug }, Number(p.replaces), { pageSlug: slug, remote: ctx.remote !== false });
+      visibility: (p.visibility ?? 'world') as never, entity_slug: entitySlug }, Number(p.replaces),
+    { pageSlug: slug, remote: ctx.remote !== false, excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote) });
   }
   const row = await admitWrite(ctx.engine, { principal, operation: 'remember', sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, callerIntent,
     // The transport's session (MCP `_meta.session_id`) is recorded on the fact, as extract_facts records
     // it, so recall's session_id filter finds single facts too. Identity only — never a trust surface.
-    intent: { ...callerIntent, entity_slug: entitySlug, fence, valid_from: new Date().toISOString(), valid_until: validUntil?.toISOString() ?? null,
+    intent: { ...callerIntent, entity_slug: entitySlug, fence, valid_from: typeof p.valid_from === 'string' ? new Date(p.valid_from).toISOString() : new Date().toISOString(), valid_until: validUntil?.toISOString() ?? null,
       ...(linked ? { entity_inferred: linked.via } : {}), ...(inference && 'warning' in inference ? { entity_warning: inference.warning } : {}),
       session_id: ctx.sessionId ?? null },
     authority, worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null });
-  const response = writeResponse(await waitForWrite(ctx.engine, row, ctx.config, waitMs ?? ctx.writeWaitMs));
+  const response = throwIfHeld(writeResponse(await waitForWrite(ctx.engine, row, ctx.config, waitMs ?? ctx.writeWaitMs)));
   emitFenceNotice(ctx, response, row.slug);
   return response;
 }
 
-interface WithdrawalTarget { id: number; entity_slug: string | null; source_markdown_slug: string | null; expired_at: Date | null; }
+interface WithdrawalTarget { id: number; entity_slug: string | null; source_markdown_slug: string | null; expired_at: Date | null; trust_tier?: string | null; }
 
 /** Withdrawal commits independently of filesystem ownership and request FIFO. */
 export async function submitForgetMutation(ctx: OperationContext, operation: 'forget' | 'forget_fact', params: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -192,6 +196,9 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   const reason = typeof p.reason === 'string' && p.reason.trim() ? p.reason.trim() : null;
   if (!Number.isSafeInteger(id) || id <= 0) throw verbError(operation === 'forget' ? 'not_found' : 'fact_not_found',
     `No fact with id "${rawId}".`, 'Pass the fact id returned by remember or recall.');
+  const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+  // #5575 I3: a remote caller cannot forget a fact more trusted than its own writes; the owner is asked instead.
+  if (ctx.remote !== false && Number.isSafeInteger(id) && id > 0) await guardRemoteForget(ctx.engine, { sourceId, factId: id, principal, reason, excludePrivate });
   // Retry the whole withdrawal, so source/principal guards and the connection
   // are released before backoff. Admission must not retry a nested savepoint.
   let withdrawn: WithdrawalCommit['pages'] = [];
@@ -211,10 +218,11 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
       assertReplayIntent(prior, intentDigest({ operation, sourceId, slug: prior.slug, callerIntent }));
       return prior;
     }
-    const [fact] = await tx.executeRaw<WithdrawalTarget>(`SELECT id,entity_slug,source_markdown_slug,expired_at FROM facts
-      WHERE id=$1 AND source_id=$2 AND ($3::boolean=false OR visibility='world')`, [id, sourceId, ctx.remote !== false]);
+    const [fact] = await tx.executeRaw<WithdrawalTarget>(`SELECT id,entity_slug,source_markdown_slug,expired_at,trust_tier FROM facts
+      WHERE id=$1 AND source_id=$2 AND ($3::boolean=false OR visibility='world')${excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''} FOR UPDATE`, [id, sourceId, ctx.remote !== false]);
     if (!fact) throw verbError(operation === 'forget' ? 'not_found' : 'fact_not_found',
       `No fact with id "${rawId}".`, 'Ids come from remember/recall. Recall the entity first to find the right fact.');
+    if (ctx.remote !== false && supersessionGuarded('agent_written', fact.trust_tier)) throw remoteForgetRaced(id);
     const slug = fact.source_markdown_slug ?? fact.entity_slug ?? 'memory/unattributed';
     enforceClientSlugFence(ctx, slug, operation); enforceSubagentSlugFence(ctx, slug, operation);
     const authority = await submissionAuthority({ ...ctx, engine: tx }, operation, sourceId, source.incarnation, slug);
@@ -224,7 +232,7 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
     return withCoordinatedWrite(tx, [sourceId], async () => {
       // Even an expired legacy fact acquires a ledger so a stale import cannot
       // reactivate it. Internal affected-page identities never enter the receipt.
-      withdrawn = (await recordFactWithdrawal(tx, id, sourceId, ctx.remote !== false, { requestId: row.id, semanticReview })).pages;
+      withdrawn = (await recordFactWithdrawal(tx, id, sourceId, ctx.remote !== false, { requestId: row.id, semanticReview, excludePrivate })).pages;
       if (reason) await tx.executeRaw(`UPDATE facts SET context=concat_ws(' | ',NULLIF(context,''),$3::text)
         WHERE id=$1 AND source_id=$2`, [id, sourceId, `forgotten: ${reason}`]);
       if (operation === 'forget_fact' && fact.expired_at !== null) {
@@ -256,6 +264,7 @@ async function withSimilarActive(ctx: OperationContext, operation: 'forget' | 'f
     const { similarActiveAfterForget } = await import('../facts/similar-active.ts');
     const committed = (response.write_request as { state?: string } | undefined)?.state === 'committed' || response.state === 'committed';
     return { ...response, similar_active: await similarActiveAfterForget(ctx.engine, {
-      sourceId, factId, remote: ctx.remote !== false, committed, semanticReview: p.semantic_review !== false }) };
+      sourceId, factId, remote: ctx.remote !== false, committed, semanticReview: p.semantic_review !== false,
+      excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote) }) };
   } catch { return response; }
 }

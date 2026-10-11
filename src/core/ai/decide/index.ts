@@ -48,6 +48,14 @@ export interface DecideContext {
 
 const BACKGROUND_DEFAULT_MS = 60_000;
 
+let testClock: (() => number) | undefined;
+/** Drive runDecide's deadline arithmetic from `clock` when the caller passes no `now`; returns the restore. */
+export function __setDecideClockForTests(clock: (() => number) | undefined): () => void {
+  const prev = testClock;
+  testClock = clock;
+  return () => { testClock = prev; };
+}
+
 export async function loadDecideConfig(engine: BrainEngine | null, opts: { evalSlots?: string } = {}): Promise<DecideConfig> {
   return readDecideConfig(engine ? await loadConfigSnapshot(engine) : null, { ...opts, typesafeKey: hasTypesafeKey() });
 }
@@ -69,7 +77,7 @@ function emptyResult(provider: string, lane: DecideLane, refused: Record<string,
 }
 
 export async function runDecide(req: DecideRequest, ctx: DecideContext): Promise<DecideResult> {
-  const now = ctx.now ?? Date.now;
+  const now = ctx.now ?? testClock ?? Date.now;
   const started = now();
   const cfg = ctx.config ?? await loadDecideConfig(ctx.engine);
   const provider = req.provider ?? cfg.slots[req.slot].provider;

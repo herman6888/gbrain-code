@@ -61,6 +61,9 @@ writer coordination refusal, inspect `gbrain sources writer status --brain <id>
 --json` on the selected host first and report the owner, epoch, enabled state and
 blocked recovery to the operator. Do not claim a checkout, activate managed mode,
 transfer an owner, replace identities, or remove ownership markers as a repair.
+When the status reads `enabled: false` and the refusal says `unbound_source`,
+the brain is in classic mode on purpose: report that writes go through the
+checkout (file, commit, `gbrain sync`) and leave it classic.
 Deliberate administration requires a separately approved topology change and the
 action-specific intent plus reviewed state precondition described in
 `docs/architecture/topologies.md`. Neither a TTY nor `--yes` nor
@@ -153,7 +156,11 @@ lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orpha
 `fence_repair` runs right after `sync`, once per maintenance pass: it repairs
 the facts and takes fences sync held or pages store malformed (the same plan
 `gbrain repair fences` previews), for at most 300 s or a third of the job's
-remaining time, and resumes on the next run. Pause it with
+remaining time, and resumes on the next run. `content_repair` runs right after
+it (#6377): the rest of the content-repair lane, today the `slug-conflicts`
+kind that removes a stray frontmatter `slug:` or records a recommended merge
+for a person (`gbrain repair content` previews both kinds), for at most 120 s
+or a third of the remaining time. Pause both with
 `gbrain config set fences.repair.enabled false`.
 
 The two new phases consolidate yesterday's conversations into long-term memory:

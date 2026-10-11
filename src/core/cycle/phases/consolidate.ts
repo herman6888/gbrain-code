@@ -26,11 +26,16 @@
 import type { BrainEngine, FactRow } from '../../engine.ts';
 import type { PhaseResult } from '../../cycle.ts';
 import { cosineSimilarity } from '../../facts/classify.ts';
+import { claimsDiverge, EXPLICIT_DUPLICATE_THRESHOLD } from '../../facts/capture-dedup.ts';
 import { createHash } from 'node:crypto';
 import { isAborted } from '../../abort-check.ts';
 import { maintenancePreflight, submitMaintenanceConsolidation } from '../../persistence/prepared-maintenance.ts';
 import { managedPersistenceEnabled } from '../../persistence/ownership.ts';
-import { maintenanceTransaction } from '../../persistence/attribution.ts';
+import { declareDerivation, derivedMaintenanceTransaction, derivedWriteTrust, isExternalTier, readTaintInputs } from '../../trust/taint.ts';
+import { DEFAULT_WRITE_GATE_CONFIG, type WriteGateConfig } from '../../write-gate.ts';
+import { loadImportSanityConfig } from '../../import-screen.ts';
+import { decideTakeWrite, recordFlaggedRow, recordWriteGateHold, type GatedRowDecision } from '../../write-gate-store.ts';
+import type { TaintInput, WriteTrust } from '../../trust/tier.ts';
 
 export interface ConsolidatePhaseOpts {
   dryRun?: boolean;
@@ -42,8 +47,18 @@ export interface ConsolidatePhaseOpts {
    * force-evict instead of running to completion after cancellation.
    */
   signal?: AbortSignal;
-  /** Cosine cluster threshold. Overrides `cycle.consolidate.cluster_threshold`; default 0.85. */
+  /**
+   * Cosine cluster threshold for typed (metric) facts. Overrides
+   * `cycle.consolidate.cluster_threshold`; default 0.85. Untyped facts cluster
+   * at `max(threshold, EXPLICIT_DUPLICATE_THRESHOLD)` (#6023).
+   */
   clusterThreshold?: number;
+  /**
+   * Trust of the caller reading a dry-run preview. Fail-closed: only
+   * `remote === false` (the local CLI) sees the text of private facts in
+   * `details.clusters`; anything else sees their ids and visibility only.
+   */
+  remote?: boolean;
   /** Minimum facts per (source, entity) bucket before consolidation. Default 3. */
   minFactsPerBucket?: number;
   /** Minimum age (ms) of the OLDEST fact in a bucket before consolidation. Default 24h. */
@@ -73,19 +88,7 @@ export async function runPhaseConsolidate(
 ): Promise<PhaseResult> {
   const dryRun = opts.dryRun === true;
   const managed = await managedPersistenceEnabled(engine);
-  // #5363: the knob was unreachable (cycle.ts never passed it); the phase now
-  // reads its own config key. A malformed stored value keeps the default and
-  // is reported in details instead of failing the cycle.
-  let thresholdInvalid: string | undefined;
-  let threshold = opts.clusterThreshold;
-  if (threshold === undefined) {
-    const configured = await engine.getConfig(CLUSTER_THRESHOLD_KEY);
-    threshold = DEFAULT_CLUSTER_THRESHOLD;
-    if (configured != null && configured.trim() !== '') {
-      try { threshold = parseClusterThreshold(configured); }
-      catch { thresholdInvalid = configured; }
-    }
-  }
+  const { threshold, thresholdInvalid } = await resolveClusterThreshold(engine, opts.clusterThreshold);
   const minPerBucket = opts.minFactsPerBucket ?? 3;
   const minOldestAgeMs = opts.minOldestAgeMs ?? 24 * 60 * 60 * 1000;
 
@@ -94,6 +97,14 @@ export async function runPhaseConsolidate(
   let bucketsProcessed = 0;
   let bucketsSkipped = 0;
   let clustersSkippedRetired = 0;
+  let clustersGateHeld = 0;
+  let clustersGateRejected = 0;
+  // #6023: a dry run lists the clusters it would write so an operator can
+  // inspect them before `--yes`; capped so the envelope stays bounded.
+  const preview: ConsolidateClusterPreview[] = [];
+  const showPrivate = opts.remote === false;
+  // #5575 write gate: unmanaged takes are gated here (managed ones in takes-prepare); read once per run.
+  let gateConfig: WriteGateConfig | undefined;
 
   // Pull every (source_id, entity_slug) bucket of unconsolidated facts.
   // Uses the partial idx_facts_unconsolidated index.
@@ -165,7 +176,11 @@ export async function runPhaseConsolidate(
 
     bucketsProcessed += 1;
     const claims = await loadClaimShapes(engine, unconsolidated.map(f => f.id));
-    const clusters = clusterFacts(unconsolidated, threshold, claims);
+    // #5575 ENG-3: a take's tier is the least trusted fact in its cluster, so
+    // external facts cluster apart from owner facts and their takes are external.
+    const taint = new Map((await readTaintInputs(engine, unconsolidated.map(f => ({ table: 'facts' as const, id: f.id })))).map(i => [Number(i.id), i]));
+    const clusters = [false, true].flatMap(external =>
+      clusterFacts(unconsolidated.filter(f => isExternalTier(taint.get(f.id)!.tier) === external), threshold, claims));
 
     // Resolve entity_slug → page_id. If page missing in this source, skip.
     const pageRows = await engine.executeRaw<{ id: number }>(
@@ -195,18 +210,26 @@ export async function runPhaseConsolidate(
         .reduce((min, d) => (d < min ? d : min))
         .toISOString()
         .slice(0, 10);
+      const inputs = cluster.map(f => taint.get(f.id)!);
+      const derivation = { inputs, trust: derivedWriteTrust({ channel: 'derive:consolidate', inputs }) };
 
       if (dryRun) {
         // Pretend we did it.
         takesWritten += 1;
         factsConsolidated += cluster.length;
         nextRowNum += 1;
+        if (preview.length < DRY_RUN_CLUSTER_CAP) {
+          const text = (f: FactRow) => (showPrivate || f.visibility === 'world' ? f.fact : null);
+          preview.push({ source_id: b.source_id, entity_slug: b.entity_slug, claim: text(best),
+            members: cluster.map(f => ({ id: f.id, visibility: f.visibility, fact: text(f) })) });
+        }
         continue;
       }
 
       if (maintenance) {
         const receipt = await submitMaintenanceConsolidation(engine, maintenance, b.entity_slug, cluster,
-          { claim: best.fact, weight: clamp01(avgWeight), source: sources.slice(0, 200), since: sinceISO });
+          { claim: best.fact, weight: clamp01(avgWeight), source: sources.slice(0, 200), since: sinceISO },
+          declareDerivation(derivation.trust, inputs));
         factsConsolidated += Number(receipt.facts_consolidated ?? 0);
         takesWritten += Number(receipt.takes_written ?? 0);
         if (receipt.reason === 'retired_take') clustersSkippedRetired++;
@@ -247,73 +270,65 @@ export async function runPhaseConsolidate(
         [pageId, best.fact],
       );
 
-      let takeId: number;
-      if (existing.length > 0) {
-        // Re-promotion of a cluster we already wrote a take for. Refresh
-        // the source-aggregation string (new fact rows may carry new
-        // source_session values that the prior run didn't see); leave
-        // row_num + weight untouched to keep the take's identity stable.
-        takeId = existing[0].id;
-        // A resolved take is immutable everywhere else (the engines throw
-        // TAKE_RESOLVED_IMMUTABLE / TAKE_ALREADY_RESOLVED); this raw UPDATE
-        // would bypass that guard. Reuse its id so the facts still consolidate
-        // into it, but leave the row untouched.
-        if (existing[0].resolved_at === null) {
-          await maintenanceTransaction(engine, tx => tx.executeRaw(
-            `UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`,
-            [sources.slice(0, 200), takeId],
-          ));
+      // #5575: the take, its source refresh, the consolidation marks and the
+      // valid_until writeback are one maintenance transaction at the cluster's
+      // derived tier. A re-promotion changes no content column, so the take is
+      // lowered explicitly to min(existing, cluster): an external cluster
+      // cannot keep an owner take's tier. Edges: take -> every cluster fact.
+      // Write gate on a new take: reject skips the cluster; hold records it for review and leaves the facts unconsolidated.
+      const takeRow = { page_id: pageId, row_num: nextRowNum, claim: best.fact, kind: 'fact', holder: 'self', weight: clamp01(avgWeight),
+        since_date: sinceISO, source: sources.slice(0, 200), active: true };
+      const gate = existing.length ? null : await gateNewTake(engine, derivation, takeRow, { sourceId: b.source_id, slug: b.entity_slug },
+        gateConfig ??= (await loadImportSanityConfig(engine)).writeGate ?? DEFAULT_WRITE_GATE_CONFIG);
+      if (gate && gate.action !== 'insert') { if (gate.action === 'hold') clustersGateHeld++; else clustersGateRejected++; continue; }
+      const written = await derivedMaintenanceTransaction<{ created: boolean; takeId: number | null } | null>(engine, derivation, async tx => {
+        let takeId: number;
+        let created = false;
+        if (existing.length > 0) {
+          // Re-promotion of a cluster we already wrote a take for. Refresh
+          // the source-aggregation string (new fact rows may carry new
+          // source_session values that the prior run didn't see); leave
+          // row_num + weight untouched to keep the take's identity stable.
+          takeId = existing[0].id;
+          // A resolved take is immutable everywhere else (the engines throw
+          // TAKE_RESOLVED_IMMUTABLE / TAKE_ALREADY_RESOLVED); this raw UPDATE
+          // would bypass that guard. Reuse its id so the facts still consolidate
+          // into it, but leave the row untouched.
+          if (existing[0].resolved_at === null) {
+            await tx.executeRaw(`UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`, [sources.slice(0, 200), takeId]);
+          }
+        } else {
+          const inserted = await tx.addTakesBatch([takeRow]);
+          if (inserted < 1) return { result: null, rows: [] };
+          const idRows = await tx.executeRaw<{ id: number }>(
+            `SELECT id FROM takes WHERE page_id = $1 AND row_num = $2`,
+            [pageId, nextRowNum],
+          );
+          if (idRows.length === 0) return { result: { created: true, takeId: null }, rows: [] };
+          takeId = idRows[0].id;
+          created = true;
+          if (gate) await recordFlaggedRow(tx, gate, { table: 'takes', id: takeId, sourceId: b.source_id });
         }
-      } else {
-        const inserted = await maintenanceTransaction(engine, tx => tx.addTakesBatch([{
-          page_id: pageId,
-          row_num: nextRowNum,
-          claim: best.fact,
-          kind: 'fact',
-          holder: 'self',
-          weight: clamp01(avgWeight),
-          since_date: sinceISO,
-          source: sources.slice(0, 200),
-          active: true,
-        }]));
-        if (inserted < 1) continue;
 
-        const idRows = await engine.executeRaw<{ id: number }>(
-          `SELECT id FROM takes WHERE page_id = $1 AND row_num = $2`,
-          [pageId, nextRowNum],
-        );
-        if (idRows.length === 0) {
-          nextRowNum += 1;
-          continue;
-        }
-        takeId = idRows[0].id;
-        nextRowNum += 1;
-        takesWritten += 1;
-      }
-
-      // Mark all contributing facts consolidated.
-      await maintenanceTransaction(engine, async tx => {
+        // Mark all contributing facts consolidated.
         for (const f of cluster) await tx.consolidateFact(f.id, takeId);
-      });
-      factsConsolidated += cluster.length;
 
-      // v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
-      // Sort the cluster by (valid_from ASC, id ASC); walk consecutive
-      // pairs; stamp the older fact's valid_until = next_newer.valid_from.
-      // The newest fact keeps valid_until = NULL. This makes the facts
-      // table a proper bitemporal record without the contradiction probe
-      // having to mutate it (preserves auto-supersession.ts:4 invariant —
-      // see also R8 test guard).
-      //
-      // Idempotent: re-running on the same cluster produces the same
-      // chronological order and the same valid_until values. No-op if
-      // valid_until is already correct.
-      const chronological = [...cluster].sort((a, b) => {
-        const t = a.valid_from.getTime() - b.valid_from.getTime();
-        if (t !== 0) return t;
-        return a.id - b.id;
-      });
-      await maintenanceTransaction(engine, async tx => {
+        // v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
+        // Sort the cluster by (valid_from ASC, id ASC); walk consecutive
+        // pairs; stamp the older fact's valid_until = next_newer.valid_from.
+        // The newest fact keeps valid_until = NULL. This makes the facts
+        // table a proper bitemporal record without the contradiction probe
+        // having to mutate it (preserves auto-supersession.ts:4 invariant —
+        // see also R8 test guard).
+        //
+        // Idempotent: re-running on the same cluster produces the same
+        // chronological order and the same valid_until values. No-op if
+        // valid_until is already correct.
+        const chronological = [...cluster].sort((a, b) => {
+          const t = a.valid_from.getTime() - b.valid_from.getTime();
+          if (t !== 0) return t;
+          return a.id - b.id;
+        });
         for (let i = 0; i < chronological.length - 1; i++) {
           const older = chronological[i];
           const newer = chronological[i + 1];
@@ -328,7 +343,12 @@ export async function runPhaseConsolidate(
             [newer.valid_from, older.id],
           );
         }
+        return { result: { created, takeId }, rows: [{ table: 'takes' as const, id: Number(takeId), sourceId: b.source_id }] };
       });
+      if (written?.created) nextRowNum += 1;
+      if (!written?.takeId) continue;
+      if (written.created) takesWritten += 1;
+      factsConsolidated += cluster.length;
     }
   }
 
@@ -339,19 +359,39 @@ export async function runPhaseConsolidate(
     summary: dryRun
       ? `(dry-run) would promote ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets`
       : `promoted ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets` +
-        (clustersSkippedRetired ? `; skipped ${clustersSkippedRetired} clusters with retired takes` : ''),
+        (clustersSkippedRetired ? `; skipped ${clustersSkippedRetired} clusters with retired takes` : '') +
+        (clustersGateHeld ? `; held ${clustersGateHeld} takes for write-gate review` : '') +
+        (clustersGateRejected ? `; write gate rejected ${clustersGateRejected} takes` : ''),
     details: {
       dryRun,
       cluster_threshold: threshold,
+      untyped_cluster_threshold: untypedClusterThreshold(threshold),
       ...(thresholdInvalid !== undefined ? { cluster_threshold_invalid: thresholdInvalid } : {}),
+      ...(dryRun ? { clusters: preview } : {}),
       facts_consolidated: factsConsolidated,
       takes_written: takesWritten,
       buckets_processed: bucketsProcessed,
       buckets_skipped: bucketsSkipped,
       clusters_skipped_retired: clustersSkippedRetired,
+      clusters_gate_held: clustersGateHeld,
+      clusters_gate_rejected: clustersGateRejected,
       ...(factsConsolidated === 0 && clustersSkippedRetired > 0 ? { reason: 'retired_take' } : {}),
     },
   };
+}
+
+/**
+ * #5575 write gate on one new unmanaged take, assessed at its cluster's
+ * derived tier (the gate never assesses operator_curated or above). A hold is
+ * recorded here, in an attributed transaction at that tier; the caller
+ * inserts on `insert` (recording a flag receipt) and skips otherwise.
+ */
+async function gateNewTake(engine: BrainEngine, derivation: { trust: WriteTrust; inputs: readonly TaintInput[] },
+  takeRow: { claim: string; source: string } & Record<string, unknown>, at: { sourceId: string; slug: string }, cfg: WriteGateConfig): Promise<GatedRowDecision> {
+  const gate = decideTakeWrite({ claim: takeRow.claim, source: takeRow.source }, { ...at, payload: takeRow,
+    input: { tier: derivation.trust.tier, origin: derivation.trust.origin, requestId: null }, cfg });
+  if (gate.action === 'hold') await derivedMaintenanceTransaction(engine, derivation, async tx => ({ result: await recordWriteGateHold(tx, gate.hold!), rows: [] }));
+  return gate;
 }
 
 /** The typed-claim columns of a fact (FactRow does not carry them). */
@@ -384,10 +424,53 @@ export function claimsCompatible(a: ClaimShape | undefined, b: ClaimShape | unde
 }
 
 /**
+ * #5363: the knob was unreachable (cycle.ts never passed it); the phase reads
+ * its own config key. A malformed stored value keeps the default and is
+ * reported in details (`cluster_threshold_invalid`) instead of failing the cycle.
+ */
+async function resolveClusterThreshold(
+  engine: BrainEngine,
+  override: number | undefined,
+): Promise<{ threshold: number; thresholdInvalid?: string }> {
+  if (override !== undefined) return { threshold: override };
+  const configured = await engine.getConfig(CLUSTER_THRESHOLD_KEY);
+  if (configured == null || configured.trim() === '') return { threshold: DEFAULT_CLUSTER_THRESHOLD };
+  try { return { threshold: parseClusterThreshold(configured) }; }
+  catch { return { threshold: DEFAULT_CLUSTER_THRESHOLD, thresholdInvalid: configured }; }
+}
+
+/** One cluster a dry run would promote (`details.clusters`, capped at DRY_RUN_CLUSTER_CAP). */
+export interface ConsolidateClusterPreview {
+  source_id: string;
+  entity_slug: string;
+  /** The would-be take claim; null when the fact is private and the caller is not the local CLI. */
+  claim: string | null;
+  members: Array<{ id: number; visibility: string; fact: string | null }>;
+}
+export const DRY_RUN_CLUSTER_CAP = 50;
+
+/**
+ * #6023: untyped facts have no metric/unit/period guard, so two event facts
+ * that differ only in an identifier, date or amount could cluster on a 0.85
+ * embedding and the writeback would expire the older one. They cluster only
+ * at the explicit-duplicate bar (never below the configured threshold).
+ */
+export function untypedClusterThreshold(threshold: number): number {
+  return Math.max(threshold, EXPLICIT_DUPLICATE_THRESHOLD);
+}
+
+/**
  * Greedy cosine clustering. Iterate facts sorted by valid_from DESC; each
  * fact joins the first cluster whose centroid (the first member, for
  * simplicity) is within `threshold` cosine and whose typed claim is
  * compatible (#5363). Otherwise starts a new cluster.
+ *
+ * #6023: an untyped pair additionally needs cosine ≥ the explicit-duplicate
+ * bar (`untypedClusterThreshold`) and must not diverge in a negation, number,
+ * date or amount token (`claimsDiverge`): "Invoice A due Monday" and
+ * "Invoice B due Tuesday" stay two facts. Typed facts keep the configured
+ * threshold and no token guard, because a metric series is expected to
+ * differ in its values (that is the trajectory the writeback records).
  *
  * Facts with no embedding cluster on their own (single-element cluster);
  * the consolidate phase only writes takes from clusters of size ≥ 2, so
@@ -409,7 +492,9 @@ export function clusterFacts(facts: FactRow[], threshold: number, claims: Map<nu
         || head.embedded_text_hash !== createHash('md5').update(head.fact).digest('hex')
         || f.embedding.length !== head.embedding.length
         || !claimsCompatible(claims.get(f.id), claims.get(head.id))) continue;
-      if (cosineSimilarity(f.embedding, head.embedding) >= threshold) {
+      const untyped = (claims.get(f.id)?.metric ?? null) === null;
+      if (untyped && claimsDiverge(f.fact, head.fact)) continue;
+      if (cosineSimilarity(f.embedding, head.embedding) >= (untyped ? untypedClusterThreshold(threshold) : threshold)) {
         c.push(f);
         placed = true;
         break;

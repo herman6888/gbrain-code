@@ -1,5 +1,5 @@
 import { submitPageMutation } from '../persistence/page-mutations.ts';
-import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
+import { MERGE_PRECONDITION_PARAMS, WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 /**
  * Takes + think operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). Op consts stay module-private; `takesOperations` below lists
@@ -8,6 +8,8 @@ import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
  */
 
 import { opError, type Operation, type OperationContext } from './contract.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { stampRowTrust } from '../eligibility/stamp.ts';
 import { opTransport, paramUse } from './op-fix.ts';
 import {
   readPolicyOpts,
@@ -38,9 +40,11 @@ const takes_list: Operation = {
     sort_by: { type: 'string', description: 'weight | since_date | created_at (default created_at)' },
     limit: { type: 'number', description: 'Max rows (default 100, cap 500)' },
     offset: { type: 'number', description: 'Skip first N rows' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
-    return ctx.engine.listTakes({
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const rows = await ctx.engine.listTakes({
       // #2200-class: honor federated/source scope (via the take's page.source_id).
       ...await readPolicyOpts(ctx),
       page_slug: p.page_slug as string | undefined,
@@ -54,7 +58,9 @@ const takes_list: Operation = {
       // Per-token allow-list — server-side filter for MCP-bound calls.
       // Local CLI callers leave takesHoldersAllowList unset and see all holders.
       takesHoldersAllowList: readHolders(ctx),
+      eligibility,
     });
+    return stampRowTrust(ctx.engine, 'takes', rows, r => r.id);
   },
   cliHints: { name: 'takes-list' },
 };
@@ -69,13 +75,17 @@ const takes_search: Operation = {
   params: {
     query: { type: 'string', required: true, description: "Search text matched against take claim text via trigram similarity, e.g. 'valuation cap'. This is the search text param — there is no `text` param." },
     limit: { type: 'number', description: 'Max results (default 30, cap 100)' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
-    return ctx.engine.searchTakes(p.query as string, {
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const hits = await ctx.engine.searchTakes(p.query as string, {
       ...await readPolicyOpts(ctx),
       limit: p.limit as number | undefined,
       takesHoldersAllowList: readHolders(ctx),
+      eligibility,
     });
+    return stampRowTrust(ctx.engine, 'takes', hits, h => h.take_id);
   },
   cliHints: { name: 'takes-search', positional: ['query'] },
 };
@@ -215,7 +225,7 @@ const think: Operation = {
     save: { type: 'boolean', description: 'Persist a synthesis page (local-CLI only; ignored for MCP)' },
     take: { type: 'boolean', description: 'Append a take row to the anchor page (requires anchor)' },
     model: { type: 'string', description: 'Model override (alias or full id). Falls through models.think → models.default → GBRAIN_MODEL → opus.' },
-    since: { type: 'string', description: 'Start of temporal window (YYYY-MM-DD or YYYY-MM)' },
+    since: { type: 'string', description: 'Start of temporal window (YYYY-MM-DD or YYYY-MM). Omit both bounds and a question naming one explicit date (2026-09-15, 2026-09, September 2026) is bounded to it; the result says window_source.' },
     until: { type: 'string', description: 'End of temporal window' },
     reference_date: { type: 'string', description: 'YYYY-MM-DD the question\'s relative time words resolve against (default: today in brain.timezone).' },
   },
@@ -307,7 +317,7 @@ const think: Operation = {
     if (remote && (Boolean(p.save) || Boolean(p.take))) ctx.emitNotice?.(thinkNotSavedNotice());
     const { recordThinkAnswer, feedbackMetaFields } = await import('../feedback/record.ts');
     const feedbackMeta = feedbackMetaFields(await recordThinkAnswer(ctx, 'think', result));
-    delete result.feedback_evidence;
+    delete result.feedback_evidence; delete result.taint_refs;
     const { persist: _persist, ...visible } = result;
     return {
       ...visible,
@@ -372,6 +382,7 @@ const takes_add: Operation = {
     'allow-list (stdio default: world).',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug to attach the take to (page must exist).' },
     claim: { type: 'string', required: true, description: 'The claim text (one line).' },
@@ -404,6 +415,7 @@ const takes_update: Operation = {
     'allow-list; other rows present as not_found.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Take row number on the page (from takes_list).' },
@@ -434,6 +446,7 @@ const takes_supersede: Operation = {
     'Markdown-canonical; remote holder fencing as in takes_update.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Row number of the take being superseded.' },
@@ -468,6 +481,7 @@ const takes_resolve: Operation = {
     'must be in the caller\'s holder allow-list. Markdown-canonical.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Take row number to resolve.' },
@@ -500,6 +514,7 @@ const takes_remove: Operation = {
     'CLI: `gbrain takes remove <slug> --row N`.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
     slug: { type: 'string', required: true, description: 'Page slug.' },
     row_num: { type: 'number', required: true, description: 'Take row number to remove (from takes_list).' },

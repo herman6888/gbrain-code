@@ -248,6 +248,9 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_source_slug_key;
       ALTER TABLE pages ADD CONSTRAINT pages_slug_key UNIQUE (slug);
       DROP INDEX IF EXISTS idx_pages_source_id;
+      -- The v230 trust generation trigger's WHEN reads pages.source_id, slug and
+      -- deleted_at; a pre-v0.18 brain predates it (v230 recreates it).
+      DROP TRIGGER IF EXISTS trust_generation_update ON pages;
       ALTER TABLE pages DROP COLUMN IF EXISTS source_id;
       DROP TABLE IF EXISTS sources CASCADE;
 
@@ -411,6 +414,9 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_source_slug_key;
       ALTER TABLE pages ADD CONSTRAINT pages_slug_key UNIQUE (slug);
       DROP INDEX IF EXISTS idx_pages_source_id;
+      -- The v230 trust generation trigger's WHEN reads pages.source_id, slug and
+      -- deleted_at; a pre-v0.18 brain predates it (v230 recreates it).
+      DROP TRIGGER IF EXISTS trust_generation_update ON pages;
       ALTER TABLE pages DROP COLUMN IF EXISTS source_id;
       DROP TABLE IF EXISTS sources CASCADE;
       DROP INDEX IF EXISTS idx_links_source;
@@ -897,6 +903,16 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // the schema blob carries a comment, no CREATE TABLE column and no index
   // reads it, so there is no forward reference for the bootstrap to trip on.
   'content_chunks.embedding_pending_since',
+  // #5504 (wave 14 P4.1) open_loops.counterparty_source_id (migration
+  // open_loops_counterparty_source): same posture as embedding_pending_since,
+  // migration-only so fresh and upgraded brains share column ordinals; the
+  // partial index is built by the migration handler, never by the blob.
+  'open_loops.counterparty_source_id',
+  // #6202 oauth_clients.registered_via (migration oauth_client_registered_via):
+  // migration-only like min_trust, so fresh and upgraded catalogs keep the same
+  // column order; no blob statement or index reads it, and the DCR insert falls
+  // back to the unmarked insert while the column is missing.
+  'oauth_clients.registered_via',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so

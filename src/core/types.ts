@@ -64,6 +64,7 @@ export const ALL_PAGE_TYPES: readonly string[] = [
   // extractable:false (events are one-line atoms; diary is private interiority
   // never mined into the facts table). Pack entries in gbrain-base.yaml.
   'event', 'diary',
+  'question', // C4 pinned-question page (question + owner notes; owner-private, never evidence; src/core/questions/pages.ts)
 ] as const;
 
 /**
@@ -393,6 +394,10 @@ export interface PageReadScope {
   excludePrivate?: boolean;
   /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
   requireSafeChunks?: boolean;
+  /** #5575 read floor (eligibility/policy.ts): only pages at or above this tier; a chunk's tier is its page's. */
+  minTrust?: import('./trust/tier.ts').TrustTier;
+  /** #5575 CEO-20, proactive reads only: hide unconfirmed agent-written pages with an instruction-family gate flag. */
+  suppressFlagged?: boolean;
 }
 
 export interface PageReadPolicy extends PageReadScope {
@@ -828,6 +833,11 @@ export interface SearchResult {
    * Absent when the page is clean.
    */
   content_flag?: { reason: string; detail: string };
+  /** #5575 A6: the page's trust tier and short write origin (eligibility/stamp.ts), stamped after ranking. */
+  trust_tier?: import('./trust/tier.ts').TrustTier;
+  origin?: string;
+  /** #5575 CEO-20: unconfirmed agent-written content with an instruction-family gate flag (explicit reads only). */
+  unconfirmed?: true;
   /**
    * 2026-09 fix wave (#3617 follow-up): true when this row came from the
    * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
@@ -1069,6 +1079,18 @@ export interface SearchResult {
    * title_match_boost so the frozen EVIDENCE_ENUM is untouched.
    */
   exact_lookup?: 'slug' | 'title';
+  /**
+   * Set when `search.entity_anchoring` moved or added this row for an
+   * entity-scoped current-state query (search/entity-anchor.ts): the named
+   * entity's page, or a page that links to it or names it (newest first).
+   */
+  entity_anchored?: 'entity' | 'linked';
+  /** Set on a saved-fact row the `search.query_facts_arm` arm added (search/facts-arm.ts); page_id is 0. */
+  fact_row?: { id: number; valid_from: string; valid_until: string | null };
+  /** Fact rows only, and what callers see of them: never a page (no slug or id); follow with `follow_up`, read `page_slug` when the entity page exists. */
+  result_type?: 'fact'; fact_id?: string; page_slug?: string; follow_up?: { op: 'recall'; args: Record<string, string> };
+  /** A newer active fact covers the same entity and typed claim slot as a fact taken from this page. */
+  superseded_claim?: { fact_id: number; valid_from: string };
   /**
    * T4 — the strongest signal that surfaced this page (alias_hit >
    * exact_title_match > high_vector_match > keyword_exact > weak_semantic).
@@ -1665,6 +1687,8 @@ export interface TimelineInput {
 
 export interface TimelineOpts extends PageReadScope {
   limit?: number;
+  /** #5575 read eligibility (eligibility/sql.ts) for read ops. */
+  eligibility?: import('./eligibility/policy.ts').ReadEligibility;
   after?: string;
   before?: string;
   /**
@@ -1855,6 +1879,14 @@ export interface BrainHealth {
    * consumers can tell "0% coverage" from "no entities to grade".
    */
   entity_page_count: number;
+  /**
+   * #4772: `resolved` when the active schema pack of every source in scope
+   * chose the entity types (src/core/schema-pack/entity-types.ts);
+   * `pack_unavailable` when a pack did not load, so the entity filter was empty
+   * and entity_page_count 0 / null ratios are a degraded reading, never the
+   * legacy hardcoded list.
+   */
+  entity_types_status: 'resolved' | 'pack_unavailable';
   /**
    * Entity link coverage, or null when entity_page_count is below
    * MIN_ENTITY_PAGES_FOR_COVERAGE — a 0/0 or single-page ratio is

@@ -3,6 +3,7 @@ import { parseRelationalPlan } from '../search/relational-plan.ts';
 import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
+import { withFactDateHeaders } from '../search/evidence-date.ts';
 import { randomUUID } from 'node:crypto';
 import { readHolders } from './context.ts';
 /**
@@ -38,7 +39,16 @@ import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import type { SearchResult } from '../types.ts';
 import type { BrainEngine, FactRow } from '../engine.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { hasScope } from '../scope.ts';
+import { renderTrustedText } from '../eligibility/labels.ts';
+import { MEMORY_CONFIRM_SCOPE } from '../trust/confirm.ts';
+import { proactiveEligibility } from '../eligibility/registry.ts';
+import { activationSuppressionNotice, suppressionSummary } from '../eligibility/activation.ts';
+import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
+import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
+import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
@@ -190,6 +200,26 @@ function packingArm<T>(candidates: T[], kept: T[], cost: (item: T) => number) {
   return { candidates: candidates.length, kept: kept.length, dropped: candidates.length - kept.length, used: kept.reduce((sum, r) => sum + cost(r), 0) };
 }
 
+/** recall's budget_packing meta: only policy-supplied calls carry it. */
+function recallBudgetPacking<F extends { fact: string }>(policy: unknown, queryText: string | null, budgetTokens: number | null,
+  arms: { rows: F[]; packedFacts: F[]; searchResults: SearchResult[]; packedResults: SearchResult[] }) {
+  if (policy !== 'facts_first' && policy !== 'query_first') return undefined;
+  const queryFirst = policy === 'query_first' && queryText !== null && budgetTokens !== null;
+  const { rows, packedFacts, searchResults, packedResults } = arms;
+  return {
+    policy: queryFirst ? 'query_first' : 'facts_first',
+    applied: budgetTokens !== null && (queryFirst || (policy === 'facts_first' && budgetTokens > 0)),
+    reason: policy === 'query_first' && !queryText ? 'no_query'
+      : budgetTokens === null ? 'no_positive_finite_budget'
+        : budgetTokens === 0 ? 'budget_below_one'
+          : rows.length + searchResults.length === 0 ? 'no_candidates'
+            : packedFacts.length + packedResults.length === 0 ? 'first_items_exceed_budget'
+              : 'packed',
+    facts: packingArm(rows, packedFacts, r => estimateTokens(r.fact)),
+    results: packingArm(searchResults, packedResults, resultTokens),
+  };
+}
+
 /**
  * recall's evidence plan: budget_tokens budgets the delivered blocks before
  * recall's own packing. Without return_unit, budget_tokens or budget_policy
@@ -211,20 +241,22 @@ const recall: Operation = {
   outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
   description: 'MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.',
   params: {
-    entity: { type: 'string', description: 'Entity slug; facts about it, newest first.' },
-    query: { type: 'string', description: 'Also search pages (results[] arm).' },
+    entity: { type: 'string', description: 'Entity slug; its facts.' },
+    question: { type: 'string', description: 'Rank facts by relevance to it.' },
+    query: { type: 'string', description: 'Also search pages (results[]).' },
     budget_tokens: { type: 'number', description: 'Token budget; facts pack first.' },
-    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'facts_first (default) or query_first.' },
-    source_id: { type: 'string', description: 'Narrow to one source you may read.' },
-    since: { type: 'string', description: 'Facts since (ISO 8601 or "8 hours ago").' },
-    session_id: { type: 'string', description: 'Facts captured in this session.' },
-    include_expired: { type: 'boolean', description: 'Include expired facts.' },
-    supersessions: { type: 'boolean', description: 'Only the supersession audit log.' },
+    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Default facts_first.' },
+    source_id: { type: 'string', description: 'One source you may read.' },
+    since: { type: 'string', description: 'ISO 8601 or "8 hours ago".' },
+    session_id: { type: 'string', description: "This session's facts." },
+    include_expired: { type: 'boolean', description: 'Include expired.' },
+    supersessions: { type: 'boolean', description: 'Supersession log only.' },
     limit: { type: 'number', description: 'Per-arm max (default 50, cap 100).' },
-    grep: { type: 'string', description: 'Substring of the fact text.' },
-    include_pending: { type: 'boolean', description: 'Add pending count.' },
-    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'Evidence unit for results[] (see search).' },
+    grep: { type: 'string', description: 'Text substring.' },
+    include_pending: { type: 'boolean', description: 'Pending count.' },
+    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).' },
     return_window: { type: 'number', description: 'Window size 1-3.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   scope: 'read',
   verb: true,
@@ -267,6 +299,7 @@ const recall: Operation = {
         : scope.sourceId ? [scope.sourceId]
           : [sourceId],
     )];
+    const scalarSource = factSources.length === 1 ? factSources[0] : undefined;
 
     // Visibility filter: remote callers see world-only unless their token
     // grants elevated visibility (future-proofing; v0.31 ships world-only
@@ -275,6 +308,9 @@ const recall: Operation = {
       ctx.remote === false
         ? undefined
         : ['world'] as ('private' | 'world')[];
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
     type FactRows = Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>;
     type FactRowItem = FactRows[number];
@@ -319,26 +355,33 @@ const recall: Operation = {
         'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, or a duration such as "8 hours ago" / "2d".',
       );
     }
+    const question = parseQuestionParam(p);
     const entityParam = typeof p.entity === 'string' && p.entity.length > 0 ? (p.entity as string) : null;
     const sessionParam = typeof p.session_id === 'string' && p.session_id.length > 0 ? (p.session_id as string) : null;
+    let ranking: QuestionRecall | null = null;
     // Shared per-source opts for the fact-list arms (visibility, grep and the
     // audit exclusion all filter at the ENGINE level, before each source's
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
       activeOnly: !includeExpired,
       limit,
-      visibility,
+      visibility, excludePrivate,
       grep: grep ?? undefined,
-      excludeAuditRows: true,
+      excludeAuditRows: true, eligibility,
     };
 
-    if (p.supersessions === true) {
+    if (question !== null) {
+      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep,
+        scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
+      ({ rows, ambiguousEntity } = ranking);
+      for (const notice of questionRecallNotices(ranking)) ctx.emitNotice?.(notice);
+    } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
       // same as the sibling fact-list arms — a post-merge filter would let a
       // private newest row consume a limit slot and hide an older world row.
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
-          ctx.engine.listSupersessions(src, { since: since ?? undefined, limit, visibility }),
+          ctx.engine.listSupersessions(src, { since: since ?? undefined, limit, visibility, excludePrivate, eligibility }),
         )),
         // v0.46 (#3014): matches the engine's ORDER BY COALESCE(expired_at,
         // valid_until) — ontology supersessions carry valid_until only.
@@ -430,6 +473,7 @@ const recall: Operation = {
         ? Math.floor(p.budget_tokens)
         : null;
 
+    if (queryText && question === null && !entityParam && !sessionParam && !since && p.supersessions !== true) ctx.emitNotice?.(recallHintNotice(p, queryText));
     let searchResults: SearchResult[] = [];
     let searchDegraded: string | undefined;
     let delivery: DeliveryMeta | undefined;
@@ -440,11 +484,9 @@ const recall: Operation = {
       // like search/query/get_page/list_pages/resolve_slugs. sourceScopeOpts
       // alone pinned this arm to the scalar source, so a `federated: true`
       // source was invisible to recall while visible to every sibling read op.
-      const searchScope = federatedSearchScope(ctx, sourceIdParam);
+      const searchScope = { ...federatedSearchScope(ctx, sourceIdParam), ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
-      // untrusted callers (matches the facts arms' world-only filter above).
-      const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
-      const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+      // untrusted callers with the excludePrivate resolved above.
       const keywordOnly = await recallKeywordOnlyReason(ctx);
       if (keywordOnly) {
         searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope);
@@ -462,6 +504,7 @@ const recall: Operation = {
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
       const applied = effectivePlan(evidencePlan, searchResults);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
+      searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor);
     }
 
     // Pack what is delivered: results redacted for all; facts for remote only (localVerbatim).
@@ -499,23 +542,10 @@ const recall: Operation = {
       droppedCount = factsPack.meta.dropped + resultsPack.meta.dropped;
     }
 
-    const budgetPacking = p.budget_policy === 'facts_first' || p.budget_policy === 'query_first'
-      ? {
-          policy: queryFirst ? 'query_first' : 'facts_first',
-          applied: budgetTokens !== null && (queryFirst || (p.budget_policy === 'facts_first' && budgetTokens > 0)),
-          reason: p.budget_policy === 'query_first' && !queryText ? 'no_query'
-            : budgetTokens === null ? 'no_positive_finite_budget'
-              : budgetTokens === 0 ? 'budget_below_one'
-                : rows.length + searchResults.length === 0 ? 'no_candidates'
-                  : packedFacts.length + packedResults.length === 0 ? 'first_items_exceed_budget'
-                    : 'packed',
-          facts: packingArm(rows, packedFacts, r => estimateTokens(r.fact)),
-          results: packingArm(searchResults, packedResults, resultTokens),
-        }
-      : undefined;
+    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults });
 
     return {
-      facts: packedFacts.map(r => ({
+      facts: await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
         id: r.id,
         fact: r.fact,
         kind: r.kind,
@@ -545,8 +575,11 @@ const recall: Operation = {
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
         provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
-      })),
+        ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
+      })), f => f.id)),
       total: packedFacts.length,
+      facts_order: ranking ? 'relevance' : 'newest',
+      ...(ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
       ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
@@ -560,8 +593,11 @@ const recall: Operation = {
               evidence: r.evidence,
               create_safety: r.create_safety,
               provenance: r.slug,
+              // #4830: a row without a source takes the scope's single source; a federated read leaves it absent.
+              ...((r.source_id ?? scalarSource) ? { source_id: r.source_id ?? scalarSource } : {}),
               ...(r.delivered ? { delivered: r.delivered } : {}),
               ...(r.relational ? { relational: r.relational } : {}),
+              ...(r.trust_tier ? { trust_tier: r.trust_tier, origin: r.origin, ...(r.unconfirmed ? { unconfirmed: true } : {}) } : {}),
             })),
             ...(searchDegraded ? { search_degraded: searchDegraded } : {}),
             ...(searchDegraded ? {} : await searchAnswerFeedback(ctx, 'recall', packedResults)),
@@ -576,25 +612,7 @@ const recall: Operation = {
   },
 };
 
-type EntityCandidate = { source_id: string; entity_slug: string };
 const AMBIGUOUS_ENTITY_SUGGESTION = 'These are different entities in different sources. Pass source_id to read one, or link them with entity_identity_link if they are the same.';
-
-/**
- * The identity key is (source_id, slug): an entity name resolved in several
- * granted sources names different entities unless an entity-identity group
- * links their pages. Merging them would hand the caller a stranger's facts,
- * so federated recall refuses unlinked namesakes and names the candidates.
- * Returns null when the per-source fact lists are one entity.
- */
-async function unlinkedNamesakes(engine: BrainEngine, lists: FactRow[][]): Promise<EntityCandidate[] | null> {
-  const candidates = [...new Map(lists.flat().map((r): [string, EntityCandidate] =>
-    [`${r.source_id}:${r.entity_slug}`, { source_id: r.source_id, entity_slug: r.entity_slug as string }])).values()];
-  if (candidates.length < 2) return null;
-  const { identityIdsForPages } = await import('../entity-identity.ts');
-  const ids = await identityIdsForPages(engine, candidates.map(c => ({ sourceId: c.source_id, slug: c.entity_slug })));
-  const groups = new Set(candidates.map(c => ids.get(`${c.source_id}:${c.entity_slug}`) ?? null));
-  return groups.size === 1 && !groups.has(null) ? null : candidates;
-}
 
 /** Parse an `entities` param (comma-string or array) to a trimmed name list. */
 function parseEntityList(v: unknown): string[] {
@@ -636,6 +654,8 @@ const context_pack: Operation = {
     since: { type: 'string', description: 'Only open-thread events after this ISO time.' },
     session_id: { type: 'string', description: 'Opaque session id.' },
     include_private: { type: 'boolean', description: 'Local trusted callers only.' },
+    min_trust: MIN_TRUST_PARAM,
+    include_quarantined: { type: 'boolean', description: 'Admin or memory_confirm: quarantined cards.', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
@@ -667,6 +687,8 @@ const context_pack: Operation = {
       typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0
         ? Math.floor(p.budget_tokens)
         : null;
+    // #5575 (CEO-20, CEO-18): a proactive surface under the connection's floor.
+    const eligibility = await proactiveEligibility(ctx, 'context_pack', { minTrust: p.min_trust });
     const res = entities.length === 0
       ? { cards: [], facts: [], text: '', pointers: [], factsCount: 0 } as unknown as Awaited<ReturnType<typeof assembleContextPack>>
       : await assembleContextPack(ctx.engine, {
@@ -676,15 +698,21 @@ const context_pack: Operation = {
         sessionId: typeof p.session_id === 'string' ? p.session_id : undefined,
         includePrivate,
         maxEntities: PACK_DEFAULT_MAX_ENTITIES,
+        eligibility,
+        // #5575 ENG-15: same rule as get_page: quarantined cards only on an authorized explicit ask.
+        includeQuarantined: p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE)),
       });
     // Always-loaded core tier (core-memory.ts): owner-designated pages of
     // `default` plus this source, inside the caller's grant; it packs first.
     const { loadCoreBlock } = await import('../core-memory.ts');
     const allowed = ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
-    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate })
+    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, eligibility })
       .catch(() => null);
     const coreText = core?.text ?? '';
     const coreTokens = estimateTokens(coreText);
+    const withheld = (res.suppressed?.withheld ?? 0) + (core?.activation_withheld ?? 0);
+    const suppressionNotice = activationSuppressionNotice(withheld, 'this context pack');
+    if (suppressionNotice) ctx.emitNotice?.(suppressionNotice);
 
     // Pack, price and render the redacted presentation sets (one echo
     // dictionary); local callers get the delivered facts back raw below.
@@ -736,11 +764,14 @@ const context_pack: Operation = {
         slug: c.entity.slug,
         title: c.entity.title,
         type: c.entity.type,
-        summary: c.summary,
+        summary: c.quarantined && c.summary ? renderTrustedText(c.summary, { trust_tier: 'external_untrusted', origin: 'quarantined' }) : c.summary,
         open_threads: c.open_threads,
         edges: c.edges,
         backlink_count: c.backlink_count,
         ...(c.relationship_note ? { relationship_note: c.relationship_note } : {}),
+        ...(c.trust_tier ? { trust_tier: c.trust_tier, origin: c.origin } : {}),
+        ...(c.quarantined ? { quarantined: true } : {}),
+        ...(c.unconfirmed ? { unconfirmed: true } : {}),
         ...(c.newer_mentions ? { newer_mentions: c.newer_mentions } : {}),
       })),
       open_threads,
@@ -755,14 +786,19 @@ const context_pack: Operation = {
         // #6146: recall's v1 names, so a packed fact traces back to its record.
         fact_id: String(f.id),
         provenance: f.provenance,
+        ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
       text,
+      ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
       ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
         truncated: core.truncated, revision: core.revision } } : {}),
       ...(res.degradedReason ? { degraded_reason: res.degradedReason } : {}),
       ...(budgetTokens !== null
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
+      // C4: optional pinned answers (fresh sentences) and the withheld count (src/core/questions/service.ts).
+      ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, [...new Set([...(res.cards ?? []).map((c) => c.entity.slug), ...entities])])
+        .catch(() => null)),
     };
   },
 };
@@ -781,6 +817,7 @@ const delta: Operation = {
     budget_tokens: { type: 'number', description: 'Token budget; pages pack first.' },
     session_id: { type: 'string', description: 'Session id; keeps a cursor.' },
     include_private: { type: 'boolean', description: 'Local trusted callers only.' },
+    min_trust: MIN_TRUST_PARAM,
   },
   scope: 'read',
   verb: true,
@@ -913,6 +950,7 @@ const delta: Operation = {
       sessionId: sessionId ?? undefined,
       includePrivate,
       maxEntities: PACK_DEFAULT_MAX_ENTITIES,
+      eligibility: await resolveReadEligibility(ctx, { minTrust: p.min_trust }),
     });
 
     // Pages arrive OLDEST first by (updated_at, slug), facts OLDEST first by
@@ -1057,6 +1095,7 @@ const delta: Operation = {
         // #6146: recall's v1 names, so a packed fact traces back to its record.
         fact_id: String(f.id),
         provenance: f.provenance,
+        ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
       threads,
       text,
@@ -1276,7 +1315,7 @@ async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | 
  */
 async function keylessRecallRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
-  searchScope: { sourceId?: string; sourceIds?: string[] },
+  searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
 ): Promise<SearchResult[]> {
   if (await keylessChainQuestion(ctx, queryText)) {
     return hybridSearchCached(ctx.engine, queryText, {

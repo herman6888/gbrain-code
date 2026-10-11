@@ -87,6 +87,10 @@ Options:
   --skip-failed        Legacy sync only: acknowledge previously-recorded
                        sync failures so the bookmark can advance. Held files
                        never need it; managed sync refuses it.
+  --acknowledge-managed <request_id|path>
+                       Managed sync, owner host only: remove a recorded
+                       failure (for example a --full run's) that the imported
+                       commit already settles; refuses anything still unsynced.
   --retry-failed       Re-attempt previously-failed files; clear on success.
                        Not needed for held files, which re-screen on the next
                        sync when they change (or with 'gbrain sources
@@ -168,10 +172,12 @@ Subcommands:
                        committed in the last 10 minutes, each hold and the
                        last error with class / safe_actions / needs_human,
                        and the next action (for an operator agent's loop).
-  gbrain sync unblock --source <id> [--apply] [--json]
+  gbrain sync unblock --source <id> [--apply] [--no-llm] [--no-repair] [--json]
                        Performs the safe action for every hold (re-screens a
                        held file whose edit is now committed, retries a
-                       stalled preparation) and refuses the rest by name.
+                       stalled preparation, repairs a content hold through
+                       the content-repair lane with a hash-bound apply and
+                       a receipt per file) and refuses the rest by name.
                        Runbook: docs/guides/sync-unblock-runbook.md
 
 See also:

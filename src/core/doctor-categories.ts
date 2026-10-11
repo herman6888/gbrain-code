@@ -64,12 +64,17 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'connector_held_items',
   'git_held_files',
   'fence_integrity',
+  // #5575: stored trust tier counts, the legacy-row backfill, scan and source claims.
+  'trust_tiers',
+  'trust_scan',
+  'trust_sources_unclaimed',
   'credential_projection_pending',
   'derived_visibility',
   'extractor_facts_expired',
   'loop_facts_drift',
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
+  'foreign_ownership_marker',
   'safe_index_pending',
   'self_capture',
   'brain_score',
@@ -110,6 +115,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'entity_link_coverage',
   'eval_drift',
   'extract_atoms_backlog',
+  // #6325: managed atom origins held after repeated extraction failures.
+  'extract_atoms_held_failed',
   'extract_health',
   'facts_embedding_width_consistency',
   'facts_extraction_health',
@@ -151,12 +158,16 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'source_routing_health',
   'stale_mentions',
   'stub_guard_24h',
+  // Fact supersession threshold calibrated for the active embedding model (facts/supersession-threshold.ts).
+  'supersession_calibration',
   'sync_failures',
   // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
   'managed_sync_backlog',
   'sync_freshness',
   // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
   'git_convergence',
+  // #5186: an ownership marker committed to a source checkout's Git index.
+  'tracked_ownership_marker',
   'takes_count',
   'takes_weight_grid',
   // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).
@@ -248,6 +259,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'persistence_request_growth',
   'persistence_request_indexes',
   'persistence_write_stall',
+  'lost_caller_writes',
   'managed_sync_not_moving',
   'persistence_session_timeouts',
   // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).

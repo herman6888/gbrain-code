@@ -96,6 +96,8 @@ export interface SyncResult {
   bankedFiles?: number;
   /** #5984: the managed drain's verdict and the next step for the agent (see sync-drain.ts). */
   drain?: import('../core/persistence/sync-drain.ts').DrainReport;
+  /** #6349: this run synced a staged first-parent commit (`target`) short of `head`, because the delta to HEAD exceeded the cursor bound; `stages` counts the stages a CLI loop took. */
+  staged?: { target: string; head: string; stages?: number };
   /** #6278: the run stopped because too many writes stalled while preparing (one systemic diagnostic instead of a pile of holds). */
   breaker?: import('../core/persistence/sync-run.ts').ManagedSyncBreaker;
   /** #5984: managed cursor position (`index` of `total` manifest entries) and its active drain window. */
@@ -391,8 +393,9 @@ export async function runSync(engine: BrainEngine, args: string[]) {
   // #4888: under --json, stdout is reserved for the ONE JSON envelope (#4684:
   // the cost-gate status object rides inside it as `cost_gate`); every slog()
   // human line from performSync and its callees routes to stderr instead.
-  // serr/progress are stderr already, and the envelope's own
-  // console.log(JSON.stringify(..)) site is untouched by the wrap.
+  // serr/progress are stderr already. The envelope (sync/run.ts emitJson) and
+  // `sync status|unblock --json` (sync/operator.ts) write through
+  // writeJsonDocument, the guard's only stdout path.
   return args.includes('--json')
     ? withHumanLogsToStderr(() => runSyncInner(engine, args))
     : runSyncInner(engine, args);

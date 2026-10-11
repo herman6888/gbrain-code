@@ -1,15 +1,17 @@
 import type { BrainEngine } from '../engine.ts';
+import type { ProgressReporter } from '../progress.ts';
 import type { Chunk, ChunkInput, ResolvedColumn, PageKind } from '../types.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { CHUNKER_VERSION } from '../chunkers/code.ts';
 import { prepareMarkdownChunks } from '../markdown-chunks.ts';
+import { loadFenceChunkOverlay, type FenceChunkOverlay } from '../eligibility/fence-overlay.ts';
 import { prepareCodeChunks, installCodeChunkEdges } from '../code-chunks.ts';
 import { resolveMaxChunkTokens } from '../embedding-input-limit.ts';
 import { assertPageRevision, PageRevisionConflictError, type PageSnapshot } from './types.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { digest } from '../persistence/digest.ts';
 import { quoteIdentifier, resolveWriteColumnFromConfigRows, vectorCastSuffix } from '../search/embedding-column.ts';
-import { getFtsLanguage } from '../fts-language.ts';
+import { getFtsLanguage, pageSearchVectorSql } from '../fts-language.ts';
 import { getEmbeddingModel } from '../ai/gateway.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { belowSafeChunkFence } from '../search/safe-chunks.ts';
@@ -25,10 +27,26 @@ export async function sealPageTextProjection(engine: BrainEngine, slug: string, 
   const current = guarded ?? await engine.readPageSnapshot(slug, { sourceId });
   if (!current) return;
   await engine.executeRaw(`UPDATE pages SET text_projection_revision=knowledge_revision,
-    search_vector=setweight(to_tsvector('${getFtsLanguage()}',COALESCE(title,'')),'A') ||
-      setweight(to_tsvector('${getFtsLanguage()}',$3::text),'C')
+    search_vector=${pageSearchVectorSql('title', '$3')}
     WHERE source_id=$1 AND slug=$2 AND knowledge_revision=$4::uuid`,
   [sourceId, slug, sanitizeRemoteBody(current.page.timeline), current.revision]);
+}
+
+/**
+ * A coordinated import's one closing page write: the chunker version its apply
+ * deferred (`PreparedImportApplied.chunkerSeal`) and, when `live` is the page at
+ * its current revision, the text seal `sealPageTextProjection` would write. The
+ * chunker version is stamped whatever the revision, as the deferred seal was.
+ */
+export async function sealImportedPage(engine: BrainEngine, slug: string, sourceId: string, live: PageSnapshot | null,
+  chunkerSeal: number, pageId?: number): Promise<void> {
+  const rows = await engine.executeRaw<{ id: number }>(`UPDATE pages SET chunker_version=$5,
+    text_projection_revision=CASE WHEN knowledge_revision=$4::uuid THEN knowledge_revision ELSE text_projection_revision END,
+    search_vector=CASE WHEN knowledge_revision=$4::uuid THEN ${pageSearchVectorSql('title', '$3')} ELSE search_vector END
+    WHERE source_id=$1 AND slug=$2 RETURNING id`,
+  [sourceId, slug, live ? sanitizeRemoteBody(live.page.timeline) : '', live?.revision ?? null, chunkerSeal]);
+  if (rows.length === 0) throw new Error(`Page not found: ${slug} (source=${sourceId})`);
+  if (pageId !== undefined && Number(rows[0]!.id) !== Number(pageId)) throw new Error(`Page ${slug} (source=${sourceId}) is not the page this transaction wrote`);
 }
 
 export interface ProjectionSnapshot {
@@ -40,6 +58,8 @@ export interface ProjectionSnapshot {
   maxChunkTokens: number;
   maxChunkTokensOverride?: number;
   pageKind: PageKind;
+  /** #5575 ENG-1: held, purged and below-page-tier fence rows, read with the snapshot. */
+  fenceOverlay?: FenceChunkOverlay;
 }
 
 export type ProjectionConflictField = 'text_projection_revision' | 'chunk_digest' | 'indexing_context';
@@ -134,8 +154,10 @@ async function readGuardedProjectionSnapshot(tx: BrainEngine, slug: string, sour
   const snapshot = await tx.readPageSnapshot(slug, { sourceId, ...(opts.requireLiveSource && { requireLiveSource: true }) });
   if (!snapshot || (!opts.allowUnsealed && snapshot.page.text_projection_revision !== snapshot.revision)) return null;
   const context = await indexingContext(tx, snapshot, opts.maxChunkTokens);
+  const fenceOverlay = context.pageKind === 'markdown' ? await loadFenceChunkOverlay(tx, { sourceId, slug, compiled_truth: snapshot.page.compiled_truth, timeline: snapshot.page.timeline }) : undefined;
   return { snapshot, chunks: await tx.getChunks(slug, { sourceId, includeUnsealed: true }), indexingContext: context.key,
-    embeddingModel: context.model, embeddingColumn: context.column, maxChunkTokens: context.maxChunkTokens, maxChunkTokensOverride: opts.maxChunkTokens, pageKind: context.pageKind };
+    embeddingModel: context.model, embeddingColumn: context.column, maxChunkTokens: context.maxChunkTokens, maxChunkTokensOverride: opts.maxChunkTokens, pageKind: context.pageKind,
+    ...(fenceOverlay ? { fenceOverlay } : {}) };
 }
 
 /** No provider work under the guard. Delayed derived results lose to newer content. */
@@ -305,7 +327,7 @@ export async function preparePageProjection(prepared: ProjectionSnapshot) {
     return { chunks: code.chunks, code };
   }
   if (prepared.pageKind !== 'markdown') throw new Error('This page kind requires its source importer.');
-  return { chunks: await prepareMarkdownChunks(page, prepared.maxChunkTokens), code: undefined };
+  return { chunks: await prepareMarkdownChunks(page, prepared.maxChunkTokens, prepared.fenceOverlay), code: undefined };
 }
 
 // The job queue is usually empty or small while pages grows without bound, so
@@ -346,6 +368,8 @@ export interface ProjectionRebuildOptions {
   notAfter?: string;
   /** Skip failed rows inside their retry window (PROJECTION_RETRY_READY_SQL). */
   retryCooldown?: boolean;
+  /** Only rows whose queue reason is one of these. */
+  reasons?: readonly string[];
   /** Only these pages of one source. */
   pages?: { sourceId: string; slugs: readonly string[] };
   /** Receives each failed page; without it a generic stderr line is printed. */
@@ -370,6 +394,7 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
   const filters: string[] = [];
   if (opts.retryCooldown) filters.push(PROJECTION_RETRY_READY_SQL);
   if (opts.notAfter !== undefined) { params.push(opts.notAfter); filters.push(`j.updated_at<=$${params.length}::text::timestamptz`); }
+  if (opts.reasons) { params.push(opts.reasons); filters.push(`j.reason=ANY($${params.length}::text[])`); }
   if (opts.pages) { params.push(opts.pages.slugs); filters.push(`j.slug=ANY($${params.length}::text[])`); }
   const sourceFilter = opts.pages ? `WHERE s.id=$${params.push(opts.pages.sourceId)}` : '';
   const jobs = await engine.executeRaw<{ source_id: string; source_incarnation: string; slug: string; revision: string; page_kind: string }>(`SELECT s.id AS source_id,j.source_incarnation,j.slug,j.revision,p.page_kind
@@ -421,3 +446,47 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
   }
   return { rebuilt, superseded };
 }
+
+/** #6286: queued projections are rebuilt in batches of this many pages. */
+const DRAIN_BATCH = 100;
+
+export interface ProjectionDrainResult {
+  rebuilt: number;
+  superseded: number;
+  failed: ProjectionRebuildFailure[];
+  remaining: number;
+  limited: boolean;
+}
+
+export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[] } = {}): Promise<ProjectionDrainResult> {
+  const [{ runStart }] = await engine.executeRaw<{ runStart: string }>('SELECT now()::text AS "runStart"');
+  // PGLite's clock can be coarse: wait until it passes the run start, so a page
+  // that fails in this run is stamped after it and is not tried again.
+  while (!(await engine.executeRaw<{ passed: boolean }>('SELECT now()>$1::text::timestamptz AS passed', [runStart]))[0]?.passed) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const total = (await projectionBacklog(engine)).pending;
+  opts.progress?.start('projections.drain', opts.limit === undefined ? total : Math.min(total, opts.limit));
+  const failed: ProjectionRebuildFailure[] = [];
+  let rebuilt = 0;
+  let superseded = 0;
+  let tried = 0;
+  try {
+    while (opts.limit === undefined || tried < opts.limit) {
+      const failuresBefore = failed.length;
+      const batch = await rebuildPendingPageProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
+        { notAfter: runStart, reasons: opts.reasons, onFailure: failure => failed.push(failure) });
+      const attempted = batch.rebuilt + batch.superseded + failed.length - failuresBefore;
+      if (attempted === 0) break;
+      rebuilt += batch.rebuilt;
+      superseded += batch.superseded;
+      tried += attempted;
+      opts.progress?.tick(attempted, `${rebuilt} rebuilt, ${failed.length} failed`);
+    }
+  } finally {
+    opts.progress?.finish();
+  }
+  const remaining = (await projectionBacklog(engine)).pending;
+  return { rebuilt, superseded, failed, remaining, limited: opts.limit !== undefined && tried >= opts.limit && remaining > 0 };
+}
+

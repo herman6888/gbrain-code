@@ -3,10 +3,11 @@
  * Each stage reads the resolved request (HybridRequest, request.ts) and
  * writes its per-request accumulators only as `req.<field>`.
  */
+import { brainHasImageVectors } from '../image-vector-presence.ts';
 import type { ModalityMode } from '../query-intent.ts';
 import type { ExactLookupOpts } from '../exact-lookup.ts';
 import type { HybridRequest } from './request.ts';
-import { type PostFusionOpts, embedQueryBounded, makeQueryEmbedDeadline } from '../hybrid.ts';
+import { type PostFusionOpts, embedQueryBounded, lazyQueryEmbedDeadline } from '../hybrid.ts';
 import type { SearchOpts, SearchResult } from '../../types.ts';
 import { type VectorArm, pushVectorList } from '../fusion-lists.ts';
 import { buildRelationalArm } from '../relational-recall.ts';
@@ -39,6 +40,10 @@ export async function runLexicalArms(req: HybridRequest): Promise<LexicalArms> {
   // We classify modality early (it's also computed after for the modality
   // branch). The classification is pure regex via classifyQuery; running it
   // here is cheap.
+  // An inferred image/both modality on a brain with no image embeddings is
+  // text: the image arm has nothing to search and would only fail open (and
+  // 'image' would drop the keyword arm). Later stages read the same suggestion.
+  if (!(opts?.crossModal && opts.crossModal !== 'auto') && (suggestions.suggestedModality ?? 'text') !== 'text' && !await brainHasImageVectors(engine)) suggestions.suggestedModality = 'text';
   const earlyModality = (opts?.crossModal && opts.crossModal !== 'auto')
     ? opts.crossModal
     : (suggestions.suggestedModality ?? 'text');
@@ -171,6 +176,8 @@ export async function buildRelationalList(req: HybridRequest): Promise<SearchRes
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
+      minTrust: opts?.minTrust,
+      suppressFlagged: opts?.suppressFlagged,
       planner: resolvedMode.relational_planner,
       orientOneHop: resolvedMode.relational_orient_onehop ?? resolvedMode.relational_planner,
       onMeta: (m) => {
@@ -197,7 +204,8 @@ export async function resolveModalityAndQueries(req: HybridRequest) {
     explicitModality === undefined &&
     regexModality === 'text' &&
     resolvedMode.cross_modal_llm_intent &&
-    isAmbiguousModalityQuery(query)
+    isAmbiguousModalityQuery(query) &&
+    (await import('../../ai/multimodal-model.ts')).multimodalEmbeddingModel() !== null
   ) {
     try {
       const { classifyModalityWithLLM } = await import('../llm-intent.ts');
@@ -206,6 +214,8 @@ export async function resolveModalityAndQueries(req: HybridRequest) {
       // Fail-open: regex result stands.
     }
   }
+  // The tie-break may still pick image/both; a brain with no image embeddings has nothing for that arm.
+  if (explicitModality === undefined && regexModality !== 'text' && !await brainHasImageVectors(req.engine)) regexModality = 'text';
   const effectiveModality = regexModality;
   const unifiedRouting = resolvedMode.unified_multimodal === true;
 
@@ -376,7 +386,7 @@ export async function runVectorArms(
     // threaded from hybridSearchCached (so the cache-lookup embed + this one
     // share one ~6s budget); direct callers get a fresh deadline. On timeout
     // the embed rejects → salvage below (or keyword-only when all reject).
-    const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
+    const embedDl = opts?._queryEmbedDeadline ?? lazyQueryEmbedDeadline();
     // Hermetic eval canaries/CI: queryEmbedFn (non-semantic deterministic
     // embeddings) replaces the gateway query-embed for the text vector arm.
     // No deadline needed — it's a synchronous-ish local computation with no
@@ -384,7 +394,7 @@ export async function runVectorArms(
     const embedOneQuery = (q: string): Promise<Float32Array> =>
       opts?.queryEmbedFn
         ? Promise.resolve(opts.queryEmbedFn(q))
-        : embedQueryBounded(q, embedOpts, embedDl);
+        : embedQueryBounded(q, embedOpts, embedDl());
     if (!searchSalvageEnabled()) {
       // ENG-7 kill switch (GBRAIN_SEARCH_SALVAGE=off): pre-wave
       // all-or-nothing fan-outs — one variant's failure abandons every

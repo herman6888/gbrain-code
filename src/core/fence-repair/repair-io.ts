@@ -51,6 +51,7 @@ import { clearCandidateParts } from './census-store.ts';
 import { legacyCommitStep, recordUncommittedFenceRepair } from './uncommitted.ts';
 import type { FenceRepairReceipt } from './receipt.ts';
 import type { FenceCtx, FencePage } from './types.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 export type FenceRepairMode = 'managed' | 'legacy' | 'db' | 'mirror';
 
@@ -69,14 +70,15 @@ export interface FenceSource {
 }
 
 function inGit(root: string): boolean {
-  try { execFileSync('git', ['-C', root, 'rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' }); return true; } catch { return false; }
+  try { execFileSync('git', ['-C', root, 'rev-parse', '--is-inside-work-tree'], { env: gitChildEnv(), stdio: 'ignore' }); return true; } catch { return false; }
 }
 
 /**
- * This host's view of one source for fence repair; null when the source is gone or archived. `remote` (default
- * true, the fail-closed reading of an unknown caller) keeps local paths out of the owner refusal's text.
+ * This host's view of one source for fence repair (and, with `work`, the content repair that shares this loader);
+ * null when the source is gone or archived. `remote` (default true, the fail-closed reading of an unknown caller)
+ * keeps local paths out of the owner refusal's text.
  */
-export async function loadFenceSource(engine: BrainEngine, sourceId: string, opts: { remote?: boolean } = {}): Promise<FenceSource | null> {
+export async function loadFenceSource(engine: BrainEngine, sourceId: string, opts: { remote?: boolean; work?: string } = {}): Promise<FenceSource | null> {
   const [row] = await engine.executeRaw<{ id: string; incarnation: string; local_path: string | null }>(
     'SELECT id, incarnation::text AS incarnation, local_path FROM sources WHERE id=$1 AND archived IS NOT TRUE', [sourceId]);
   if (!row) return null;
@@ -90,7 +92,7 @@ export async function loadFenceSource(engine: BrainEngine, sourceId: string, opt
     if (binding) {
       const hostId = localHostId();
       const checked = checkOwner(binding, row.incarnation, hostId);
-      if (checked.reason) owner = ownerRefusal({ sourceId, reason: checked.reason, binding, incarnation: row.incarnation, hostId, remote: opts.remote !== false, work: 'fence repair' });
+      if (checked.reason) owner = ownerRefusal({ sourceId, reason: checked.reason, binding, incarnation: row.incarnation, hostId, remote: opts.remote !== false, work: opts.work ?? 'fence repair' });
       else root = join(checked.binding.local_path, checked.binding.relative_path);
     }
   } else {
@@ -274,7 +276,7 @@ export async function writeFenceRepair(ctx: OperationContext, src: FenceSource, 
     }
     if (target.hold) await clearGitHold(engine, { sourceId: src.id, incarnation: src.incarnation, path: target.path!, observedAt: new Date().toISOString() });
     await clearCensus();
-    const commitStep = inGit(root) ? legacyCommitStep(root, target.path!, receipt.classes) : null;
+    const commitStep = inGit(root) ? legacyCommitStep(root, target.path!, receipt.classes, receipt.tier) : null;
     if (commitStep) await recordUncommittedFenceRepair(engine, { source_id: src.id, incarnation: src.incarnation, path: target.path!, root, repaired_at: new Date().toISOString(),
       backup, commit_step: commitStep, receipt });
     return { ok: true, after_sha256: receipt.after_sha256, detail: { mode: 'legacy', path: target.path, backup, imported: imported.status, fence_repair: receipt,

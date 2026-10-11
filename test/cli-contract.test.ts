@@ -120,6 +120,10 @@ const JSON_ROWS: Record<string, JsonRow> = {
   // Lane H journey: import declares json (one document; a keyless brain's refusal is an embedding_disabled envelope).
   import: { ok: ['import', join(brainHome, 'loose'), '--no-embed', '--json'], fail: ['import', join(brainHome, 'loose'), '--json'], failOnBrain: true },
   'apply-migrations': { ok: ['apply-migrations', '--dry-run', '--json'], fail: ['apply-migrations', '--json', '--migration', '9.9.9'], failOnBrain: true },
+  // #5575: the backfill dry run is read-only; explaining a ref that names nothing is a not_found envelope.
+  trust: { ok: ['trust', 'backfill', '--dry-run', '--json'], fail: ['trust', 'explain', 'f999999', '--json'], failOnBrain: true },
+  // D8: the dry run resolves and prints the target without writing; an unwired harness id is a coded refusal.
+  setup: { ok: ['setup', 'claude-code', '--dry-run', '--json', '--gbrain-bin', process.execPath], fail: ['setup', 'codex', '--json'], okOnEmpty: true },
 };
 
 function parsedShape(mode: 'document' | 'ndjson', stdout: string): unknown[] {

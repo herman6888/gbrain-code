@@ -396,6 +396,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     const err = validateFenceConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  if (key.startsWith('loops.')) (await import('./config/loops-values.ts')).refuseInvalidLoopsConfigValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
     const err = validateMaxClaimConfigValue(key, value);
@@ -878,6 +879,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
   const positionals = args.filter((a) => a !== '--raw');
   const key = positionals[1];
   const value = positionals[2];
+  if ((action === 'get' || action === 'set') && key) (await import('../core/questions/auto-think-migration.ts')).noteAutoThinkReplacement(key);
 
   if (action === 'get' && (key === EMBEDDING_DISABLED_KEY || key === 'schema_pack')) {
     const effective = key === 'schema_pack' ? await effectiveSchemaPack(engine) : await effectiveEmbeddingDisabled(engine);
@@ -1201,6 +1203,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     const coverageOverride =
       args.includes('--coverage-override') || args.includes('--yes');
 
+    // #6290: provider_chat_options rows are one JSON object per selector; a dotted leaf would be inert.
+    if (key.startsWith('provider_chat_options.')) await import('../core/config-db-merge.ts').then(m => m.assertProviderChatOptionsSetValue(key, value)).catch((error: Error) => { console.error(`[config] ${error.message}`); process.exit(1); });
     // #5470: every admission parses the journal caps; a malformed value
     // would refuse all managed writes, so reject it here.
     const { JOURNAL_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');

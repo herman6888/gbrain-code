@@ -49,6 +49,13 @@ function bool(params: Record<string, unknown>, key: string): void {
   if (params[key] !== undefined && typeof params[key] !== 'boolean') throw invalid(`${key} must be a boolean.`,
     `Send ${key} as a JSON boolean (true or false); on the CLI it is the bare flag ${cliFlag(key)}, which takes no value.`);
 }
+/** #5914: `--confirm-relocated-root` only qualifies a self-transfer; alone it is a usage error, never a silent no-op. */
+function transferOptions(params: Record<string, unknown>): { selfTransfer: boolean; relocated: boolean } {
+  bool(params, 'confirm_relocated_root');
+  if (params.confirm_relocated_root === true && params.self_transfer !== true) throw invalid('confirm_relocated_root requires self_transfer.',
+    'Pass --confirm-relocated-root together with --self-transfer: it waives only the directory identity comparison of a self-transfer that repairs a checkout recreated at its recorded path.');
+  return { selfTransfer: params.self_transfer === true, relocated: params.confirm_relocated_root === true };
+}
 function keys(params: Record<string, unknown>, allowed: string[]) {
   const unknown = Object.keys(params).filter(key => !allowed.includes(key));
   if (unknown.length) throw invalid(`Unsupported administration parameters: ${unknown.join(', ')}.`,
@@ -119,6 +126,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     if (operation === 'company_brain_preview') return { ...await runtime.previewCompanyBrain(engine, input) };
     return { ...await runtime.connectCompanyBrain(engine, input) };
   }
+  if (operation === 'trust_read' || operation === 'trust_preview' || operation === 'trust_apply') return (await import('../trust/owner-ipc.ts')).runTrustAdministration(engine, operation, params, config);
   if (currentVerifiedLocalWriter()?.remote) throw trustedCliRequired('Writer administration requires a trusted local CLI caller.');
   if (operation === 'writer_lock' || operation === 'writer_unlock') {
     keys(params, []);
@@ -153,6 +161,12 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
   }
   if (operation === 'writer_reindex_code') return (await import('./reindex-administration.ts')).runAuthenticatedCodeReindex(engine, params);
   if (operation === 'writer_embed_facts') return (await import('./embed-facts-administration.ts')).runAuthenticatedFactEmbedding(engine, params, config);
+  if (operation === 'writer_git_durability') {
+    const { GIT_DURABILITY_PARAMS, runGitDurabilityAdministration } = await import('./git-durability-administration.ts');
+    keys(params, [...GIT_DURABILITY_PARAMS]);
+    source(params.source_id);
+    return runGitDurabilityAdministration(engine, params);
+  }
   if (operation === 'writer_retry_effects') {
     keys(params, ['source_id', 'request_id', 'dry_run']);
     if (!isWriteRequestId(params.request_id)) throw invalid('A valid original write request UUID is required.',
@@ -197,7 +211,8 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     const adminState = await writerAdminState(engine);
     const diagnostics = await writerDiagnostics(engine);
     const bindings = await engine.executeRaw(`SELECT b.source_id,b.source_incarnation,b.worktree_id,b.relative_path,b.topology_generation::text AS topology_generation,
-      w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state,w.manifest->>'digest' AS manifest_digest,h.local_path FROM persistence_source_bindings b
+      w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state,w.manifest->>'digest' AS manifest_digest,h.local_path,h.git_durability,
+      CASE h.git_durability WHEN 'enabled' THEN 'on' WHEN 'disabled' THEN 'off' ELSE 'unknown' END AS git_durability_state FROM persistence_source_bindings b
       JOIN persistence_worktrees w ON w.id=b.worktree_id
       LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid
       WHERE ($2::text IS NULL OR b.source_id=$2) ORDER BY b.source_id`, [existingLocalHostId(), params.source_id === undefined ? null : source(params.source_id)]);
@@ -288,9 +303,10 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       : uuid(params.request_id, 'A valid deactivation request UUID is required.', 'Pass --request-id as a UUID, or omit it and gbrain generates one.') }) };
   }
   if (operation === 'writer_transfer_prepare') {
-    keys(params, ['source_id', 'dry_run', 'admin_intent', 'expected_state', 'self_transfer']);
+    keys(params, ['source_id', 'dry_run', 'admin_intent', 'expected_state', 'self_transfer', 'confirm_relocated_root']);
     const sourceId = source(params.source_id);
     bool(params, 'self_transfer');
+    const transfer = transferOptions(params);
     if (params.dry_run) {
       const binding = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
       if (!binding || binding.owner_host_id !== existingLocalHostId() || !binding.local_path) {
@@ -298,11 +314,11 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
           `This host is not source ${sourceId}'s current owner. Run the transfer prepare on the owner host that writer status names; a transfer is a deliberate topology change the operator reviews.`,
           { fix: readFix(`Shows which host owns source ${sourceId}, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] }) });
       }
-      const { manifest } = await prepareWriterTransfer(engine, sourceId, existingLocalHostId()!, undefined, { selfTransfer: params.self_transfer === true, dryRun: true });
-      return { dry_run: true, action: operation, binding, manifest: { digest: manifest.digest, file_count: manifest.file_count } };
+      const { manifest } = await prepareWriterTransfer(engine, sourceId, existingLocalHostId()!, undefined, { ...transfer, dryRun: true });
+      return { dry_run: true, action: operation, binding, manifest: { digest: manifest.digest, file_count: manifest.file_count }, ...(transfer.relocated ? { relocated: true } : {}) };
     }
     const expectedState = await requireWriterAdminIntent(engine, operation, params);
-    const prepared = await prepareWriterTransfer(engine, sourceId, undefined, expectedState, { selfTransfer: params.self_transfer === true });
+    const prepared = await prepareWriterTransfer(engine, sourceId, undefined, expectedState, transfer);
     // #6099: a Git-scoped manifest covers tracked files only; untracked files Git does not ignore are reported as a count.
     const untracked = prepared.manifest.untracked_count ?? 0;
     return { prepared: true, source_id: sourceId, worktree_id: prepared.worktree_id, owner_epoch: prepared.owner_epoch,
@@ -310,15 +326,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       ...(untracked ? { untracked_files: untracked, warning: `${untracked} untracked file(s) in the checkout that Git does not ignore are not part of the transfer manifest and are not carried to the successor; commit them, or add them to .gitignore, before the successor clones.` } : {}) };
   }
   if (operation === 'writer_transfer_accept') {
-    keys(params, ['source_id', 'path', 'expected_epoch', 'manifest', 'dry_run', 'admin_intent', 'expected_state', 'self_transfer']);
+    keys(params, ['source_id', 'path', 'expected_epoch', 'manifest', 'dry_run', 'admin_intent', 'expected_state', 'self_transfer', 'confirm_relocated_root']);
     bool(params, 'self_transfer');
+    const transfer = transferOptions(params);
     const sourceId = source(params.source_id), root = path(params.path);
     if (typeof params.expected_epoch !== 'string' || !/^[1-9]\d{0,18}$/.test(params.expected_epoch)
       || BigInt(params.expected_epoch) > 9_223_372_036_854_775_807n) throw invalid('expected_epoch must be the prepared positive owner epoch.',
       `Pass --expected-epoch with the owner_epoch that gbrain sources writer transfer prepare ${sourceId} printed (a positive integer).`, transferStatusFix(sourceId));
     if (typeof params.manifest !== 'string' || !/^[a-f0-9]{64}$/.test(params.manifest)) throw invalid('manifest must be the prepared SHA-256 manifest digest.',
       `Pass --manifest with the 64-character manifest digest that gbrain sources writer transfer prepare ${sourceId} printed.`, transferStatusFix(sourceId));
-    if (params.dry_run && params.self_transfer === true) await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, existingLocalHostId()!, undefined, { selfTransfer: true, dryRun: true });
+    if (params.dry_run && params.self_transfer === true) await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, existingLocalHostId()!, undefined, { ...transfer, dryRun: true });
     if (params.dry_run) {
       const current = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
       const [prepared] = current ? await engine.executeRaw<{ manifest: StoredWorktreeManifest | null }>('SELECT manifest FROM persistence_worktrees WHERE id=$1::uuid', [current.worktree_id]) : [];
@@ -327,7 +344,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
         ...(candidate.scope ? { manifest_scope: candidate.scope } : {}), ...(candidate.untracked_count ? { untracked_files: candidate.untracked_count } : {}) };
     }
     const expectedState = await requireWriterAdminIntent(engine, operation, params);
-    await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, undefined, expectedState, { selfTransfer: params.self_transfer === true });
+    await acceptWriterTransfer(engine, sourceId, root, params.expected_epoch, params.manifest, undefined, expectedState, transfer);
     return { transferred: true, binding: await getWorktreeBinding(engine, sourceId) };
   }
   if (operation === 'local_writer_list') {

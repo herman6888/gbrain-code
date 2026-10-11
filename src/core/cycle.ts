@@ -52,6 +52,7 @@ import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, inspectLock, LockStolenError, type DbLockHandle } from './db-lock.ts';
 import { timeContainedPhase } from './cycle/phase-containment.ts';
 import { isManagedBrain } from './cycle/phase-table.ts';
+import { packGateSkip, resolvePackPhaseGate } from './cycle/pack-phase-gate.ts';
 import { managedPullWarning, type UpstreamRefresh } from './sync-upstream.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
@@ -68,6 +69,7 @@ export { anyAbortSignal } from './abort-signals.ts';
 export type CyclePhase =
   | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
   | 'fence_repair' // #6188: repairs held and stored malformed facts/takes fences (global maintenance lane)
+  | 'content_repair' // #6377: the rest of the content-repair lane (slug conflicts and later kinds), right after fence_repair
   | 'resolve_symbol_edges'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   // v0.36.1.0 Hindsight calibration wave:
@@ -83,6 +85,7 @@ export type CyclePhase =
   // soft-band takes against recent timeline evidence; report-only in v1
   // (writes reports/drift-<date>; auto_update mutates nothing).
   | 'drift'
+  | 'standing_questions' // C4 pinned questions (src/core/questions/phase.ts)
   // #5876 — Life Chronicle events from meeting/conversation/calendar pages (default ON).
   | 'chronicle'
   // Lane D — runs queued facts-absorb jobs on PGLite (no job worker there); bounded per run and per day.
@@ -125,6 +128,8 @@ export const ALL_PHASES: CyclePhase[] = [
   'sync',
   // #6188: right after sync, so a fence the sync just held is repaired before extract and extract_facts read the page.
   'fence_repair',
+  // #6377: the other content-repair kinds (src/core/repair/content-lane.ts) right after it, same reason.
+  'content_repair',
   'synthesize',
   'extract',
   // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
@@ -179,6 +184,7 @@ export const ALL_PHASES: CyclePhase[] = [
   // the calibration trio (fresh take resolutions) and BEFORE embed so the
   // drift report page gets embedded same-cycle. Report-only in v1.
   'drift',
+  'standing_questions', // C4 pinned questions (global); BEFORE embed so question pages embed same-cycle.
   // #5876 — Life Chronicle events (global). BEFORE embed so event pages embed same-cycle.
   'chronicle',
   // Lane D — automatic facts drain (PGLite). BEFORE embed so new facts embed same-cycle.
@@ -324,6 +330,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'backlinks',
   'sync',
   'fence_repair', // #6188: writes repaired fences through coordinated writes
+  'content_repair', // #6377: writes content repairs through the same coordinated file-repair path
   'synthesize',
   'extract',
   // v0.32.2 — wipes + re-inserts facts per affected page.
@@ -342,6 +349,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'calibration_profile',
   // #2653 — writes the reports/drift-<date> page.
   'drift',
+  'standing_questions', // C4: writes pinned answers and question pages.
   'edge_contradictions', // writes proposals and (apply mode) closure lines
   // #5876 — writes event pages, projections and the chronicle ledger.
   'chronicle',
@@ -485,6 +493,12 @@ export interface CycleReport {
 export interface CycleOpts {
   /** If true, no writes to filesystem or DB. All phases honor this. */
   dryRun?: boolean;
+  /**
+   * #6023: caller trust for the consolidate dry-run preview. Only the local
+   * CLI (`remote: false`) sees private fact text in `details.clusters`;
+   * minion handlers and anything else leave it unset (fail-closed).
+   */
+  remote?: boolean;
   /** Defaults to ALL_PHASES. Pass a subset for --phase lint etc. */
   phases?: CyclePhase[];
   /**
@@ -1234,18 +1248,12 @@ export async function resolveSourceForDir(
 export async function packDeclaresPhase(
   engine: BrainEngine,
   phase: CyclePhase,
+  sourceId?: string,
 ): Promise<boolean> {
-  try {
-    const { loadActivePack } = await import('./schema-pack/load-active.ts');
-    const { loadConfig } = await import('./config.ts');
-    const cfg = loadConfig();
-    const resolved = await loadActivePack({ cfg, remote: false });
-    const phases = resolved.manifest.phases ?? [];
-    return phases.includes(phase);
-  } catch {
-    return false;
-  }
+  return (await resolvePackPhaseGate(engine, phase, sourceId)).declared;
 }
+
+export { resolvePackPhaseGate, type PackPhaseGate } from './cycle/pack-phase-gate.ts';
 
 async function runPhaseSync(
   engine: BrainEngine,
@@ -1856,6 +1864,18 @@ async function runPhaseOrphans(engine: BrainEngine, sourceId?: string): Promise<
 
 // ─── Main ──────────────────────────────────────────────────────────
 
+
+/**
+ * #6188 / #6377: the two repair-lane phases that run right after `sync`, in this order. `runCycle` dispatches them
+ * through one loop; each phase module owns its gate, budget and report.
+ */
+const REPAIR_LANE_PHASES = ['fence_repair', 'content_repair'] as const;
+
+async function runRepairLanePhase(phase: typeof REPAIR_LANE_PHASES[number], engine: BrainEngine | null,
+  opts: { dryRun: boolean; signal?: AbortSignal; deadlineAtMs: number | null }): Promise<PhaseResult> {
+  return phase === 'fence_repair' ? (await import('./cycle/fence-repair.ts')).runFenceRepairPhase(engine, opts) : (await import('./cycle/content-repair.ts')).runContentRepairPhase(engine, opts);
+}
+
 /**
  * Run the brain maintenance cycle.
  *
@@ -2239,9 +2259,9 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    if (phases.includes('fence_repair')) { // #6188: one bounded run of the `fences` repair kind (src/core/cycle/fence-repair.ts)
-      checkAborted(cycleSignal);
-      const { result, duration_ms } = await timePhase(async () => (await import('./cycle/fence-repair.ts')).runFenceRepairPhase(engine, { dryRun, signal: cycleSignal, deadlineAtMs: opts.deadlineAtMs ?? null }), 'fence_repair');
+    for (const phase of REPAIR_LANE_PHASES) { // #6188 fence_repair, then #6377 content_repair: one bounded run each (src/core/cycle/{fence,content}-repair.ts)
+      if (!phases.includes(phase)) continue; checkAborted(cycleSignal);
+      const { result, duration_ms } = await timePhase(() => runRepairLanePhase(phase, engine, { dryRun, signal: cycleSignal, deadlineAtMs: opts.deadlineAtMs ?? null }), phase);
       phaseResults.push({ ...result, duration_ms }); await safeYield(opts.yieldBetweenPhases);
     }
 
@@ -2392,6 +2412,7 @@ export async function runCycle(
     // or borrow_from targets.
     if (phases.includes('extract_atoms')) {
       checkAborted(cycleSignal);
+      const xaSkip = engine ? await packGateSkip(engine, 'extract_atoms', cycleSourceId) : null;
       if (!engine) {
         phaseResults.push({
           phase: 'extract_atoms',
@@ -2400,19 +2421,13 @@ export async function runCycle(
           summary: 'no database connected',
           details: { reason: 'no_database' },
         });
-      } else if (!(await packDeclaresPhase(engine, 'extract_atoms'))) {
+      } else if (xaSkip) {
         // issue #1678: the routine cycle skip stays cheap (no per-tick backlog
         // count), but the detail is greppable — `pack_gated: true` lets the
         // `extract_atoms_backlog` doctor check / log scrapers tell a
         // deliberately-off phase apart from a phase that ran with no work. The
         // backlog signal itself lives in doctor (one count, on demand).
-        phaseResults.push({
-          phase: 'extract_atoms',
-          status: 'skipped',
-          duration_ms: 0,
-          summary: 'extract_atoms: active pack does not declare this phase in its phases: list — add it or activate a lens pack that ships it (gbrain-creator / gbrain-everything); run `gbrain dream --phase extract_atoms --drain` to drain a backlog',
-          details: { reason: 'not_in_active_pack', pack_gated: true },
-        });
+        phaseResults.push(xaSkip);
       } else {
         progress.start('cycle.extract_atoms');
         const { runPhaseExtractAtomsStamped: runPhaseExtractAtoms } = await import('./cycle/extract-atoms-stamp.ts');
@@ -2528,6 +2543,7 @@ export async function runCycle(
     // declared. Real body in T6 — synthesize-concepts.ts is a stub today.
     if (phases.includes('synthesize_concepts')) {
       checkAborted(cycleSignal);
+      const scSkip = engine ? await packGateSkip(engine, 'synthesize_concepts', cycleSourceId) : null;
       if (!engine) {
         phaseResults.push({
           phase: 'synthesize_concepts',
@@ -2536,18 +2552,12 @@ export async function runCycle(
           summary: 'no database connected',
           details: { reason: 'no_database' },
         });
-      } else if (!(await packDeclaresPhase(engine, 'synthesize_concepts'))) {
+      } else if (scSkip) {
         // issue #1678: same greppable marker as extract_atoms. (No doctor
         // backlog check for synthesize_concepts this wave — Codex #12: that
         // phase has no real eligibility predicate yet, so a check would be a
         // fake signal. Filed as a follow-up.)
-        phaseResults.push({
-          phase: 'synthesize_concepts',
-          status: 'skipped',
-          duration_ms: 0,
-          summary: 'synthesize_concepts: active pack does not declare this phase in its phases: list — add it or activate a lens pack that ships it (gbrain-creator / gbrain-everything)',
-          details: { reason: 'not_in_active_pack', pack_gated: true },
-        });
+        phaseResults.push(scSkip);
       } else {
         progress.start('cycle.synthesize_concepts');
         const { runPhaseSynthesizeConcepts } = await import('./cycle/synthesize-concepts.ts');
@@ -2636,6 +2646,7 @@ export async function runCycle(
         const { runPhaseConsolidate } = await import('./cycle/phases/consolidate.ts');
         const { result, duration_ms } = await racedTimePhase(() => runPhaseConsolidate(engine, {
           dryRun,
+          remote: opts.remote,
           sourceId: cycleSourceId,
           // W0 (Tier-1 #1): wrap the caller hook so this phase ALSO refreshes
           // the cycle lock (pre-fix these sites passed the raw — in production
@@ -2781,6 +2792,13 @@ export async function runCycle(
         phaseResults.push(result);
         progress.finish();
       }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    if (phases.includes('standing_questions')) { // C4 pinned questions (src/core/questions/phase.ts)
+      checkAborted(cycleSignal);
+      if (!engine) phaseResults.push({ phase: 'standing_questions', status: 'skipped', duration_ms: 0, summary: 'no database connected', details: { reason: 'no_database' } });
+      else { const { result, duration_ms } = await timePhase(async () => (await import('./questions/phase.ts')).runPhaseStandingQuestions(engine, { dryRun, signal: cycleSignal }), 'standing_questions'); phaseResults.push({ ...result, duration_ms }); }
       await safeYield(opts.yieldBetweenPhases);
     }
 

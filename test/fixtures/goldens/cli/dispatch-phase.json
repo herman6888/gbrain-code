@@ -1337,6 +1337,13 @@
           "list"
         ]
       },
+      "questions": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "recall": {
         "hasSwitchCase": true,
         "phase": "post-connect",
@@ -1618,6 +1625,25 @@
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
+      "setup": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'setup'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "setup"
+            ]
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "skillify": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -1896,6 +1922,23 @@
         "preConnectRules": [
           {
             "condition": "command === 'transcripts' && args[0] === 'recent' && !hasHelpFlag(args) && await (await import('../commands/transcripts.ts')).runDelegatedTranscriptsRecent(args.slice(1))",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          }
+        ],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "trust": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'trust' && await (await import('../commands/trust.ts')).maybeDelegateTrust(loadConfig(), args)",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,

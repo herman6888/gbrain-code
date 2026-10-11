@@ -1,5 +1,5 @@
 import { submitPageMutation } from '../persistence/page-mutations.ts';
-import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
+import { MERGE_PRECONDITION_PARAMS, WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 /**
  * Timeline operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). Op consts stay module-private; `timelineOperations` below
@@ -11,6 +11,8 @@ import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { opError, type Operation } from './contract.ts';
 import { opTransport } from './op-fix.ts';
 import { readPolicyOpts } from './context.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { stampRowTrust } from '../eligibility/stamp.ts';
 import {
   enforceSubagentSlugFence,
   enforceClientSlugFence,
@@ -25,6 +27,7 @@ const add_timeline_entry: Operation = {
   description: 'Append a dated entry to a page timeline. Replaying the same entry changes nothing. A page\'s Timeline section needs no call.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
     slug: { type: 'string', description: 'Page slug.', required: true },
     date: { type: 'string', required: true, description: 'YYYY-MM-DD.' },
     summary: { type: 'string', required: true, description: 'One line.' },
@@ -77,6 +80,7 @@ const get_timeline: Operation = {
     since: { type: 'string', description: 'Alias for after; accepted for agent callers' },
     until: { type: 'string', description: 'Alias for before; accepted for agent callers' },
     limit: { type: 'number', description: 'Maximum number of timeline entries to return' },
+    min_trust: MIN_TRUST_PARAM,
   },
   handler: async (ctx, p) => {
     // #2200: route through sourceScopeOpts so a federated grant reaches the
@@ -88,12 +92,15 @@ const get_timeline: Operation = {
     const after = typeof p.after === 'string' ? p.after : typeof p.since === 'string' ? p.since : undefined;
     const before = typeof p.before === 'string' ? p.before : typeof p.until === 'string' ? p.until : undefined;
     const limit = typeof p.limit === 'number' ? p.limit : undefined;
-    return ctx.engine.getTimeline(p.slug as string, {
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const entries = await ctx.engine.getTimeline(p.slug as string, {
       ...scope,
       ...(after ? { after } : {}),
       ...(before ? { before } : {}),
       ...(limit !== undefined ? { limit } : {}),
+      eligibility,
     });
+    return stampRowTrust(ctx.engine, 'timeline_entries', entries, e => (e as { id: number }).id);
   },
   scope: 'read',
   cliHints: { name: 'timeline', positional: ['slug'] },

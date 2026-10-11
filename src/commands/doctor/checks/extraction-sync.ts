@@ -12,7 +12,7 @@ import { probeSourceGitState } from '../../../core/git-head.ts';
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
 import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
-import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
+import { chunkerStamp } from '../../../core/chunkers/code.ts';
 import { effectiveLinkExtractorWatermark, smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
 import { previewMentionPass } from '../../../core/mentions/stale.ts';
 import { isUndefinedColumnError } from '../../../core/utils.ts';
@@ -27,7 +27,7 @@ import { resolveSourceLocalFilePath, sourceGitScope } from '../../../core/markdo
 import { scannerSlugRootMode } from '../../../core/write-through.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
 import { quarantineFilterFragment } from '../../../core/quarantine.ts';
-import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
+import { persistenceEnabledForHealth } from '../../../core/persistence/ownership.ts';
 import { upstreamFreshness } from '../../../core/sync-upstream.ts';
 import type { Check } from '../../doctor.ts';
 import { ownedContentFreshness } from '../../../core/shared-skills/content-freshness.ts';
@@ -710,10 +710,10 @@ export async function computeExtractAtomsBacklogCheck(
       return { name, status: 'warn', message: 'backlog query failed (could not count eligible pages)' };
     }
 
-    const { packDeclaresPhase } = await import('../../../core/cycle.ts');
+    const { resolvePackPhaseGate } = await import('../../../core/cycle.ts');
     const { extractAtomsPhaseStaleWarning } = await import('../../../core/cycle/extract-atoms-stamp.ts');
-    let declared = false;
-    try { declared = await packDeclaresPhase(engine, 'extract_atoms'); } catch { declared = false; }
+    const gate = await resolvePackPhaseGate(engine, 'extract_atoms').catch(() => ({ declared: false, consent_required: false }));
+    const declared = gate.declared && !gate.consent_required;
 
     if (backlog === 0) {
       return {
@@ -727,7 +727,7 @@ export async function computeExtractAtomsBacklogCheck(
     // it will grow forever without a signal. WARN with the drain command.
     if (!declared && backlog > 10) {
       const backlogBySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
-      const fix = buildExtractAtomsBacklogFixHint(backlogBySource);
+      const fix = gate.consent_required ? 'gbrain config set cycle.extract_atoms.enabled true' : buildExtractAtomsBacklogFixHint(backlogBySource);
       return {
         name, status: 'warn',
         message: `${backlog} pages eligible for atom extraction but the active pack does not run extract_atoms — backlog growing. Fix: ${fix}`,
@@ -1235,8 +1235,8 @@ export async function checkSyncFreshness(
     // v0.41.27.0: D7 narrowed predicate. The CHUNKER_VERSION caller-side
     // check mirrors sync.ts:1057's chunker-version gate so doctor agrees
     // with sync on "is there work to do?". `sources.chunker_version` is
-    // a TEXT column storing String(CHUNKER_VERSION).
-    const currentChunkerVersion = String(CHUNKER_VERSION);
+    // a TEXT column storing chunkerStamp().
+    const currentChunkerVersion = chunkerStamp();
 
     const issues: string[] = [];
     let ownedContent = new Set<string>();
@@ -1293,7 +1293,7 @@ export async function checkSyncFreshness(
     // machinery runs once, not once per source).
     const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
     let managed = false;
-    try { managed = await managedPersistenceEnabled(engine); } catch { /* pre-persistence brain */ }
+    try { managed = await persistenceEnabledForHealth(engine); } catch { /* pre-persistence brain */ }
     let upstream_unknown_count = 0;
     let upstream_behind_count = 0;
     for (const source of sources) {

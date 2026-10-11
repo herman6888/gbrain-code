@@ -2,10 +2,13 @@
   "golden": [
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 0,
@@ -17,10 +20,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 1,
@@ -32,10 +38,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 1,
@@ -47,10 +56,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -62,10 +74,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -77,10 +92,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -92,10 +110,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -107,10 +128,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -122,25 +146,31 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
-          "raw": 3,
+          "raw": 2,
           "reserved": 1,
-          "tx": 1
+          "tx": 2
         }
       },
       "step": "+ getBacklinkCounts in flight (executeRaw-backed, counted raw)"
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -152,10 +182,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 2,
@@ -167,10 +200,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
           "raw": 1,
@@ -182,10 +218,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 1,
@@ -197,10 +236,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 0,
@@ -212,10 +254,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 0,
@@ -227,10 +272,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 0,
@@ -242,10 +290,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 1,
@@ -257,10 +308,13 @@
     },
     {
       "diagnostics": {
+        "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
           "raw": 0,

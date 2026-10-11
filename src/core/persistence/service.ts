@@ -23,6 +23,7 @@ import { contentRefusalFromReceipt } from '../import-screen.ts';
 import { fenceIssuesFromDetail, fenceLocationFromDetail } from '../fence-repair/refusal.ts';
 import { heldFileDiagnostic } from './verb-errors.ts';
 import { isMissingPageMessage } from './page-identity.ts';
+import { registerPersistenceConsumerConfig } from '../embedding-disabled.ts';
 
 interface Service { consumer: PersistenceConsumerLike; heartbeat?: ConsumerHeartbeat; stopping: boolean; unregisterStop?: () => void; unregisterReopen?: () => void; }
 const services = new WeakMap<BrainEngine, Service>();
@@ -96,6 +97,7 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (row.operation === 'remember') return (await import('./memory-mutations.ts')).prepareMemoryMutation(e, row, cfg, signal);
   if (row.operation === 'loops_close' && row.intent?.kind === 'retire_loop_fact') return (await import('./loop-fact-retirement.ts')).prepareLoopFactRetirement(e, row, cfg);
   if (row.operation === 'decide_proposal') return (await import('../facts/proposal-supersede.ts')).prepareProposalMutation(e, row, cfg);
+  if (row.operation === 'trust_owner_page') return (await import('../trust/page-handlers.ts')).prepareTrustOwnerPageMutation(e, row, cfg);
   if (row.operation === 'relink_facts') return (await import('../facts/relink-publish.ts')).prepareRelinkMutation(e, row, cfg);
   if (['takes_add','takes_update','takes_supersede','takes_resolve','takes_remove'].includes(row.operation)) return (await import('./takes-prepare.ts')).prepareTakesMutation(e,row,cfg);
   if (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation)) return prepareSemanticPageMutation(e, row, cfg);
@@ -119,7 +121,7 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     return prior.consumer;
   }
   const full = () => new PersistenceConsumer(engine, config, preparePersistedMutation,
-    { onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
+    { drainNotice: claimOwnerKind() === 'serve', onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
   const kind = claimOwnerKind();
   const service: Service = kind !== 'serve' && RESIDENT_CONSUMER_KINDS.includes(kind) && engine.kind === 'postgres'
     ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId(), pool: () => enginePoolStats(engine) }), stopping: false }
@@ -183,6 +185,7 @@ export function persistenceConsumerConfig(engine: BrainEngine): GBrainConfig | u
   const service = services.get(engine);
   return service && !service.stopping ? service.consumer.config : undefined;
 }
+registerPersistenceConsumerConfig(persistenceConsumerConfig);
 export function persistenceConsumerStatus(engine: BrainEngine) {
   const service = services.get(engine);
   return service ? { state: service.stopping ? 'closing' : 'open', ...service.consumer.status() }

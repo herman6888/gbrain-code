@@ -35,6 +35,11 @@ describe('vendored Postgres driver packaging', () => {
       expect(index).toContain('completed.cancelPromise');
       expect(index).toContain('return poisoned(c)');
       expect(index).toContain('cancelActive(query, resolve, reject, Math.min(delay * 2, 1000))');
+      expect(index).toContain('function ondesync(c, info)');
+      const connection = readFileSync(new URL(`../vendor/postgres/${path}/connection.js`, import.meta.url), 'utf8');
+      expect(connection).not.toContain('while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))');
+      expect(connection).toContain('} else if (query.cancelled) {');
+      expect(connection).toContain('function answersStatement(xs, x)');
     }
   });
 });

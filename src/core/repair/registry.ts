@@ -44,6 +44,7 @@ import { requestIndexesRepair } from './request-indexes.ts';
 import { connectorFencesRepair } from './connector-fences.ts';
 import { takeSupersessionRepair } from './take-supersession.ts';
 import { orphanBindingsRepair } from './orphan-bindings.ts';
+import { managedSyncOrphansRepair } from './managed-sync-orphans.ts';
 import { embeddingEffectsRepair } from './embedding-effects.ts';
 import { googleFileModesRepair } from './google-file-modes.ts';
 import { staleAtomsRepair } from './stale-atoms.ts';
@@ -58,6 +59,7 @@ import { frontmatterRepair } from './frontmatter.ts';
 import { attributionBackfillRepair } from './attribution-backfill.ts';
 import { plannerStatsRepair } from './planner-stats.ts';
 import { fencesRepair } from './fences.ts';
+import { slugConflictsRepair } from './slug-conflicts.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
 
@@ -205,9 +207,9 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '(SQLSTATE XX000) as torn_pages without changing them. Bookkeeping only; no journal admission. Brain-wide; runs only when named.',
   },
   'failed-writes': {
-    handler: failedWritesRepair, embeds: 'effect', checks: [], explicit_only: true,
-    summary: 'Resubmit caller writes (put_page, add_timeline_entry, remember) that the managed writer guard refused before v0.60.38.0 (#5983), from the '
-      + 'intent their failed receipt retains until receipt compaction. A write is kept when a later request with the same intent committed (already_written) '
+    handler: failedWritesRepair, embeds: 'effect', checks: ['lost_caller_writes'], explicit_only: true,
+    summary: 'Resubmit caller writes (put_page, add_timeline_entry, remember) that the managed writer guard refused before v0.60.38.0 (#5983) or that ended '
+      + 'conflict with source_changed because the page\'s file and database differed (#6429), from the intent their terminal receipt retains until receipt compaction. A write is kept when a later request with the same intent committed (already_written) '
       + 'or is pending (duplicate), or a later write or delete of the page committed (superseded). Writes gbrain itself produced (sync and file imports, '
       + 'reconcile, relink, maintenance) are counted with the command that produces them again. Preview-bound: --apply --expect <hash> replays exactly '
       + 'the previewed set under new request ids, after re-checking each write\'s original authority; the failed receipts stay as history.',
@@ -234,11 +236,28 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'the commit step, database-only pages take a revision-bound write. --only/--skip <path> and --slug <slug> select; --no-llm keeps to the free '
       + 'tiers; --max-usd <n> lowers the model cap for this run. Preview-bound: --apply --expect <hash> applies exactly the previewed set.',
   },
+  'slug-conflicts': {
+    handler: slugConflictsRepair, embeds: 'effect', checks: [], preview_bound: true, spends: 'llm',
+    summary: 'Clear frontmatter_slug_conflict sync holds (#6377): a file whose frontmatter slug: names another page. A stray slug (no such page and no such '
+      + 'file, or a page of another type with no title word in common) loses the slug: line deterministically; anything else is judged by the content-repair '
+      + 'model (models.content_repair, else models.fence_repair, else the measured list) under the fences.repair caps and the same daily ledger as fences: '
+      + 'remove_slug applies the one-line edit, merge_into and needs_human write nothing and record the recommendation on the hold for a person '
+      + '(gbrain sync status shows the paragraph). Managed sources commit through the Git effect with a gbrain-repair: trailer, legacy sources back up and '
+      + 'print the commit step. --only/--skip <path> select; --no-llm keeps to the deterministic tier; --max-usd <n> lowers the model cap for this run. '
+      + 'Preview-bound: --apply --expect <hash> applies exactly the previewed set. gbrain repair content runs fences, then this kind.',
+  },
   'planner-stats': {
     handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'],
     summary: 'ANALYZE the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale (F4b), '
       + 'so search and graph reads stop planning as slow nested loops. PGLite also resets each table\'s pending row count; Postgres runs each '
       + 'ANALYZE with a 60 s statement and 2 s lock timeout. No journal admission and no user data changes. Brain-wide.',
+  },
+  'managed-sync-orphans': {
+    handler: managedSyncOrphansRepair, embeds: 'none', checks: ['sync_failures'], explicit_only: true, preview_bound: true,
+    summary: 'Retire managed sync bookkeeping nothing current can resume or clear (#5459): failure rows whose cursor key has no cursor, and unfinished '
+      + 'cursors recorded by a principal that is no longer an active local writer (or superseded pre-options cursors) whose pending request is terminal. '
+      + 'Bookkeeping only (op_checkpoints); no journal admission. The preview prints a hash; --apply --expect <hash> retires exactly that set. '
+      + 'A cursor with a live pending request, or one the live writer can still resume, is kept and counted.',
   },
 };
 

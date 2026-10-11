@@ -50,6 +50,9 @@ import { resolveCycleDate } from './cycle-date.ts';
 import { clearPatternsSourceDeaths, patternsBreakerSkip } from './dream-breaker.ts';
 import { dedupePatternClaimSources, withClaimSources } from './pattern-claim-sources.ts';
 import { publishOrHold } from '../persistence/accepted-pending.ts';
+import { derivedMaintenanceTransaction, isExternalTier, type DerivationDeclaration } from '../trust/taint.ts';
+import { storedTrustTier, type TaintInput } from '../trust/tier.ts';
+import { patternsDerivation, type Derivation } from './dream-taint.ts';
 
 export interface PatternsPhaseOpts {
   brainDir: string;
@@ -142,11 +145,10 @@ export async function runPhasePatterns(
   engine: BrainEngine,
   opts: PatternsPhaseOpts,
 ): Promise<PhaseResult> {
-  const start = Date.now();
-  let ownedPrivateQueue: { queue: MinionQueue; name: string } | null = null;
+  let config: PatternsConfig, evidenceKey: string, reflections: ReflectionRef[];
   try {
     throwIfAborted(opts.signal, '[dream] patterns');
-    const config = await loadPatternsConfig(engine);
+    config = await loadPatternsConfig(engine);
 
     if (!config.enabled) {
       if (!opts.once) {
@@ -160,10 +162,31 @@ export async function runPhasePatterns(
 
     const [source] = await managedPersistenceEnabled(engine)
       ? await engine.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1', [opts.sourceId ?? 'default']) : [];
-    const evidenceKey = source ? `${LAST_EVIDENCE_KEY}.${opts.sourceId ?? 'default'}.${source.incarnation}` : LAST_EVIDENCE_KEY;
+    evidenceKey = source ? `${LAST_EVIDENCE_KEY}.${opts.sourceId ?? 'default'}.${source.incarnation}` : LAST_EVIDENCE_KEY;
 
     // Gather reflections within lookback window.
-    const reflections = await gatherReflections(engine, config.lookbackDays, config.sourceSlugPrefix, opts.sourceId ?? 'default');
+    reflections = await gatherReflections(engine, config.lookbackDays, config.sourceSlugPrefix, opts.sourceId ?? 'default');
+  } catch (e) {
+    return failed(makeError('InternalError', 'PATTERNS_PHASE_FAIL',
+      e instanceof Error ? (e.message || 'patterns phase threw') : String(e)));
+  }
+  // #5575 ENG-3: an external_untrusted reflection never shares a prompt with the
+  // owner's reflections. External reflections get their own pass (only with
+  // enough evidence of their own), and that pass's pattern pages are external.
+  const external = reflections.filter(r => isExternalTier(r.taint?.tier ?? 'unknown'));
+  const owner = await runPatternsPass(engine, opts, config, reflections.filter(r => !external.includes(r)), evidenceKey);
+  if (!external.length) return owner;
+  const externalPass = external.length >= config.minEvidence
+    ? await runPatternsPass(engine, opts, config, external, `${evidenceKey}.external`) : null;
+  return mergeExternalPass(owner, externalPass, external.length);
+}
+
+/** One patterns child over one partition of the reflections; `evidenceKey` is that partition's watermark. */
+async function runPatternsPass(engine: BrainEngine, opts: PatternsPhaseOpts, config: PatternsConfig,
+  reflections: ReflectionRef[], evidenceKey: string): Promise<PhaseResult> {
+  const start = Date.now();
+  let ownedPrivateQueue: { queue: MinionQueue; name: string } | null = null;
+  try {
     if (reflections.length < config.minEvidence) {
       return skipped(
         'insufficient_evidence',
@@ -265,6 +288,8 @@ export async function runPhasePatterns(
       childQueueName, privateQueueOwnerToken, opts.yieldDuringPhase,
     );
     const cycleDate = opts.cycleDate ?? await resolveCycleDate(engine);
+    // #5575 ENG-3: decided at prompt-build time from exactly the reflections in the prompt.
+    const derivation = patternsDerivation(submitted);
     const data: SubagentHandlerData = {
       prompt: buildPatternsPrompt(submitted, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix, cycleDate),
       model: config.model,
@@ -327,6 +352,7 @@ export async function runPhasePatterns(
     );
 
     let outcome: MinionJobStatus | 'timeout';
+    let errorText: string | null = null;
     try {
       const final = await waitForCompletionRenewing(queue, job.id, {
         timeoutMs: budgets.waitTimeoutMs,
@@ -338,6 +364,7 @@ export async function runPhasePatterns(
       // throwing — unwind before treating it as an outcome.
       throwIfAborted(opts.signal, '[dream] patterns completion wait');
       outcome = final.status;
+      errorText = final.error_text ?? null;
     } catch (e) {
       if (e instanceof TimeoutError) {
         outcome = 'timeout';
@@ -353,7 +380,7 @@ export async function runPhasePatterns(
       }
     }
 
-    await recordPatternsLastRun(engine, { duration_ms: Date.now() - submittedAt, reflections: submitted.length, outcome }); // #6177: every child, timed out or failed too
+    await recordPatternsLastRun(engine, { duration_ms: Date.now() - submittedAt, reflections: submitted.length, outcome, error_text: errorText }); // #6177: every child, timed out or failed too
     if (outcome === 'completed' && submitOpts.idempotency_key) await clearPatternsSourceDeaths(engine, opts.sourceId ?? 'default'); // #6236: only consecutive deaths trip
 
     if (opts.yieldDuringPhase) {
@@ -371,21 +398,24 @@ export async function runPhasePatterns(
     // the reverse-write below dual-writes files).
     throwIfAborted(opts.signal, '[dream] patterns output');
     const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
+    // #6302 Part A [R17]: timeline appends are counted and reported, never quote-verified or provenance-stamped.
+    const appendedUnverified = await countChildTimelineAppends(engine, [job.id]);
 
     // #6052: `finalized` leaves out outputs whose managed publication is held (pending or contended); `held` counts them.
-    const { quoteVerify, finalized, held } = await stampPatternOutputs(engine, maintenance, writtenRefs, submitted, config, cycleSourceId, cycleDate, opts.signal);
+    const { quoteVerify, finalized, held } = await stampPatternOutputs(engine, maintenance, writtenRefs, submitted, derivation, config, cycleSourceId, cycleDate, opts.signal);
     const reverseWriteCount = maintenance ? await verifyMaintenanceOutputs(engine, maintenance, finalized)
       : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
     const details = { reflections_considered: submitted.length, reflections_selected: selected, plan_basis: plan.basis, patterns_written: finalized.length,
       ...(quoteVerify ? { quote_verify: quoteVerify } : {}), reverse_write_count: reverseWriteCount, publish_deferred: held,
-      child_outcome: outcome, job_id: job.id };
+      appended_unverified: appendedUnverified, child_outcome: outcome, job_id: job.id };
+    const appendedNote = appendedUnverified > 0 ? `; ${appendedUnverified} timeline entr${appendedUnverified === 1 ? 'y' : 'ies'} appended (unverified)` : '';
 
     // #2782: the phase status must reflect the child outcome. Pre-fix this
     // returned status:ok even when the subagent timed out (e.g. no
     // subagent-capable worker slot free for the whole wait window) and zero
     // pattern pages were written — a silent no-op for days.
     if (outcome !== 'completed') {
-      if (finalized.length === 0) {
+      if (finalized.length === 0 && appendedUnverified === 0) {
         return {
           phase: 'patterns',
           status: 'fail',
@@ -407,13 +437,13 @@ export async function runPhasePatterns(
         phase: 'patterns',
         status: 'warn',
         duration_ms: 0,
-        summary: `${finalized.length} pattern page(s) written but subagent job ${job.id} ended '${outcome}'`,
+        summary: `${finalized.length} pattern page(s) written${appendedNote} but subagent job ${job.id} ended '${outcome}'`,
         details,
       };
     }
     // A held output is unfinished: warn and leave the evidence watermark unstamped so the next cycle retries.
     if (held > 0) return { phase: 'patterns', status: 'warn', duration_ms: 0, details,
-      summary: `${finalized.length} pattern page(s) written; ${held} publication(s) held by the writer (pending or contended), retried next cycle` };
+      summary: `${finalized.length} pattern page(s) written${appendedNote}; ${held} publication(s) held by the writer (pending or contended), retried next cycle` };
 
     // #4879: stamp the EVIDENCE watermark (not now()) only on a completed
     // child — fail/warn/timeout above must retry next tick. A reflection
@@ -422,7 +452,7 @@ export async function runPhasePatterns(
     // named nothing; re-running it is exactly the spend bug.
     await engine.setConfig(evidenceKey, new Date(newestEvidenceMs).toISOString());
 
-    return ok(`${writtenRefs.length} pattern page(s) written/updated (${outcome})`, details);
+    return ok(`${writtenRefs.length} pattern page(s) written/updated${appendedNote} (${outcome})`, details);
   } catch (e) {
     return failed(makeError('InternalError', 'PATTERNS_PHASE_FAIL',
       e instanceof Error ? (e.message || 'patterns phase threw') : String(e)));
@@ -549,6 +579,8 @@ export interface ReflectionRef {
   updatedAt: Date;
   /** #4618: the seat the reflection was synthesized from, when stamped. */
   seat: string | null;
+  /** #5575: the reflection page's stored tier; never part of the submission key. */
+  taint?: TaintInput;
 }
 
 /** The submission key's reflection identity, unchanged by #4618's seat field
@@ -573,9 +605,9 @@ async function gatherReflections(
   // Reflections live under the configured source slug prefix (bound as a
   // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix).
   const rows = await engine.executeRaw<{
-    slug: string; title: string | null; compiled_truth: string | null; updated_at: string | Date; seat: string | null;
+    id: number | string; slug: string; title: string | null; compiled_truth: string | null; updated_at: string | Date; seat: string | null; trust_tier: string | null;
   }>(
-    `SELECT slug, title, compiled_truth, updated_at, frontmatter->>'seat' AS seat
+    `SELECT id, slug, title, compiled_truth, updated_at, frontmatter->>'seat' AS seat, trust_tier
        FROM pages
       WHERE slug LIKE $2
         AND source_id = $3 AND deleted_at IS NULL AND COALESCE(frontmatter->>'visibility','') <> 'private'
@@ -596,6 +628,7 @@ async function gatherReflections(
     // reflection containing emoji cannot abort the entire patterns phase.
     excerpt: truncateUtf8(r.compiled_truth ?? '', 600),
     seat: r.seat ?? null,
+    taint: { table: 'pages', id: Number(r.id), tier: storedTrustTier(r.trust_tier) },
   }));
 }
 
@@ -649,10 +682,11 @@ When done, briefly list the pattern slugs you wrote/updated in your final messag
  * publications all landed, and the number of pages whose publication is held for a later cycle.
  */
 async function stampPatternOutputs(engine: BrainEngine, maintenance: MaintenanceAuthority | null, written: Array<{ slug: string; source_id: string }>,
-  reflections: ReflectionRef[], config: { outputSlugPrefix: string; sourceSlugPrefix: string }, sourceId: string, cycleDate: string, signal?: AbortSignal) {
+  reflections: ReflectionRef[], derivation: Derivation & { declaration: DerivationDeclaration }, config: { outputSlugPrefix: string; sourceSlugPrefix: string },
+  sourceId: string, cycleDate: string, signal?: AbortSignal) {
   const heldSlugs = new Set<string>();
-  const quoteVerify = await groundPatternPages(engine, maintenance, written, reflections, config.outputSlugPrefix, sourceId, cycleDate, signal, heldSlugs);
-  await stampProvenance(engine, maintenance, written.filter(ref => ref.slug.startsWith(`${config.outputSlugPrefix}/`)), cycleDate, config.sourceSlugPrefix, sharedSeat(reflections), signal, heldSlugs);
+  const quoteVerify = await groundPatternPages(engine, maintenance, written, reflections, config.outputSlugPrefix, sourceId, cycleDate, signal, heldSlugs, derivation);
+  await stampProvenance(engine, maintenance, written.filter(ref => ref.slug.startsWith(`${config.outputSlugPrefix}/`)), cycleDate, config.sourceSlugPrefix, sharedSeat(reflections), signal, heldSlugs, derivation);
   // Holds are recorded for this cycle's source only, so a ref in any other source is never excused from verification.
   const finalized = written.filter(ref => ref.source_id !== sourceId || !heldSlugs.has(ref.slug));
   return { quoteVerify, finalized, held: heldSlugs.size };
@@ -660,15 +694,15 @@ async function stampPatternOutputs(engine: BrainEngine, maintenance: Maintenance
 
 async function stampProvenance(engine: BrainEngine, maintenance: MaintenanceAuthority | null,
   refs: Array<{ slug: string; source_id: string }>, cycleDate: string, sourceSlugPrefix: string, seat: string | undefined, signal: AbortSignal | undefined,
-  heldSlugs: Set<string>): Promise<void> {
+  heldSlugs: Set<string>, derivation: Derivation & { declaration: DerivationDeclaration }): Promise<void> {
   const reason = `derived from reflections under ${sourceSlugPrefix}/; raw traces live on the cited reflection pages`;
   // A pattern earns a seat only while its reflections share one, so a pattern without one drops a seat an earlier run stamped.
-  if (!maintenance) return stampDreamProvenance(engine, refs.map(ref => ({ ...ref, raw_trace_exempt_reason: reason, seat: seat ?? null })), cycleDate, signal);
+  if (!maintenance) return stampDreamProvenance(engine, refs.map(ref => ({ ...ref, raw_trace_exempt_reason: reason, seat: seat ?? null, derivation })), cycleDate, signal);
   for (const ref of refs) {
     throwIfAborted(signal, '[dream] patterns provenance');
     // A page whose grounding publish is held must not be stamped over the pending revision.
     if (heldSlugs.has(ref.slug)) continue;
-    if (await publishOrHold(() => stampMaintenancePage(engine, maintenance, ref.slug, cycleDate, undefined, reason, seat ?? null))) heldSlugs.add(ref.slug);
+    if (await publishOrHold(() => stampMaintenancePage(engine, maintenance, ref.slug, cycleDate, undefined, reason, seat ?? null, derivation.declaration))) heldSlugs.add(ref.slug);
   }
 }
 
@@ -683,9 +717,11 @@ async function stampProvenance(engine: BrainEngine, maintenance: MaintenanceAuth
  * dream.quote_verify (default on). Returns null when disabled. With `heldSlugs`
  * a managed publish that is pending or contended (publicationHold) is recorded
  * there and the loop moves on; without it every publish error propagates.
+ * `derivation` (#5575) is the pass's taint: a page this run wrote is written back at that tier.
  */
 export async function groundPatternPages(engine: BrainEngine, maintenance: MaintenanceAuthority | null, refs: Array<{ slug: string; source_id: string }>,
-  reflections: ReflectionRef[], outputSlugPrefix: string, sourceId: string, cycleDate: string, signal?: AbortSignal, heldSlugs?: Set<string>):
+  reflections: ReflectionRef[], outputSlugPrefix: string, sourceId: string, cycleDate: string, signal?: AbortSignal, heldSlugs?: Set<string>,
+  derivation?: Derivation & { declaration: DerivationDeclaration }):
   Promise<{ pages: number; quarantined: number; repaired: number } | null> {
   const { dreamQuoteVerifyEnabled, groundSource, verifyBody } = await import('./synthesize-verify.ts');
   if (!await dreamQuoteVerifyEnabled(engine)) return null;
@@ -702,6 +738,7 @@ export async function groundPatternPages(engine: BrainEngine, maintenance: Maint
   const { serializePageToMarkdown } = await import('../markdown.ts');
   for (const slug of slugs) {
     throwIfAborted(signal, '[dream] patterns quote verify');
+    const derived = derivation && refs.some(r => r.slug === slug) ? derivation : undefined;
     const snapshot = await engine.readPageSnapshot(slug, { sourceId });
     if (!snapshot) continue;
     const ct = verifyBody(snapshot.page.compiled_truth, sources, { checks: 'quotes' });
@@ -719,12 +756,15 @@ export async function groundPatternPages(engine: BrainEngine, maintenance: Maint
     const content = serializePageToMarkdown(page, snapshot.tags);
     if (maintenance) {
       const { publishMaintenancePage } = await import('../persistence/prepared-maintenance.ts');
-      const publish = () => publishMaintenancePage(engine, maintenance, slug, content, { expectedRevision: snapshot.revision });
+      const publish = () => publishMaintenancePage(engine, maintenance, slug, content, { expectedRevision: snapshot.revision,
+        ...(derived ? { derivation: derived.declaration } : {}) });
       if (!heldSlugs) await publish();
       else if (await publishOrHold(publish)) heldSlugs.add(slug);
     } else {
       const [{ importFromContent }, { isAvailable }] = await Promise.all([import('../import-file.ts'), import('../ai/gateway.ts')]);
-      await importFromContent(engine, slug, content, { noEmbed: !isAvailable('embedding'), sourceId, preserveGateMarkers: true });
+      const write = (tx: BrainEngine) => importFromContent(tx, slug, content, { noEmbed: !isAvailable('embedding'), sourceId, preserveGateMarkers: true });
+      if (!derived) await write(engine);
+      else await derivedMaintenanceTransaction(engine, derived, async tx => ({ result: await write(tx), rows: [{ table: 'pages' as const, id: snapshot.page.id, sourceId }] }));
     }
   }
   return stats;
@@ -757,6 +797,17 @@ async function collectChildPutPageSlugs(
     .map(r => r.slug)
     .filter((s): s is string => typeof s === 'string' && s.length > 0)
     .map(slug => ({ slug, source_id: sourceId }));
+}
+
+/** Completed `brain_add_timeline_entry` calls of the given children (#6302 Part A). */
+async function countChildTimelineAppends(engine: BrainEngine, childIds: number[]): Promise<number> {
+  if (childIds.length === 0) return 0;
+  const [row] = await engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM subagent_tool_executions
+      WHERE job_id = ANY($1::int[]) AND tool_name = 'brain_add_timeline_entry' AND status = 'complete'`,
+    [childIds],
+  );
+  return Number(row?.n ?? 0);
 }
 
 // ── Reverse-write ────────────────────────────────────────────────────
@@ -819,6 +870,25 @@ function renderPageToMarkdown(page: Page, tags: string[]): string {
 
 // ── Status helpers ───────────────────────────────────────────────────
 
+/**
+ * #5575: the owner pass is the phase result; the external pass (null when
+ * its reflections were below min_evidence) rides in `details.external_pass`
+ * and its pages count toward `patterns_written`. An owner pass skipped for
+ * lack of owner evidence takes the external pass's status; a failed or
+ * warned external pass turns an ok owner pass into a warning.
+ */
+function mergeExternalPass(owner: PhaseResult, external: PhaseResult | null, externalReflections: number): PhaseResult {
+  const details = { ...owner.details, reflections_external: externalReflections,
+    patterns_written: Number(owner.details.patterns_written ?? 0) + Number(external?.details.patterns_written ?? 0),
+    ...(external ? { external_pass: { status: external.status, summary: external.summary, details: external.details,
+      ...(external.error ? { error: external.error } : {}) } } : {}) };
+  if (!external) return { ...owner, details };
+  const summary = `${owner.summary}; external reflections pass: ${external.summary}`;
+  if (owner.status === 'skipped') return { ...external, summary, details };
+  const degraded = owner.status === 'ok' && (external.status === 'fail' || external.status === 'warn');
+  return { ...owner, summary, details, ...(degraded ? { status: 'warn' as const } : {}) };
+}
+
 function ok(summary: string, details: Record<string, unknown> = {}): PhaseResult {
   return { phase: 'patterns', status: 'ok', duration_ms: 0, summary, details };
 }
@@ -867,6 +937,7 @@ function makeError(cls: string, code: string, message: string, hint?: string): P
 // source-scoping contract (#1586) without driving a whole dream cycle.
 // Mirrors synthesize.ts's `__testing` block.
 export const __testing = {
+  countChildTimelineAppends,
   gatherReflections,
   collectChildPutPageSlugs,
   reverseWriteRefs,
