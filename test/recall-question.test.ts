@@ -78,8 +78,11 @@ for (const kind of testBackends()) {
       providerCalls = [];
     }
     function keyless(): void {
+      // Keyless by construction, not by environment: a provider key the lane
+      // keeps (the full E2E runs with GBRAIN_TEST_KEEP_PROVIDER_KEYS=1) must
+      // not turn the keyword-only branch into a real embed.
       __setEmbedTransportForTests(null);
-      resetGateway();
+      configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: dims, env: {} });
     }
 
     async function fact(name: string, f: {
@@ -127,7 +130,7 @@ for (const kind of testBackends()) {
         entity: null, daysAgo: 3, embed: false,
       });
     }, 180_000);
-    afterAll(async () => { keyless(); await close?.(); });
+    afterAll(async () => { __setEmbedTransportForTests(null); resetGateway(); await close?.(); });
     beforeEach(() => { notices = []; __resetPrivateVisibilityCacheForTests(); keyed(); });
 
     test('without question: facts stay newest first and facts_order says so', async () => {

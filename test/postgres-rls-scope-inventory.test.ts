@@ -23,7 +23,9 @@
  * and #5824 moves searchVector's ANN-attempt call into runVectorAttempt
  * (shared with explainVectorSearch): 23 call sites, 23 methods. GBRA-67's
  * readPageSnapshotsBatch (the batched extract / derived-link snapshot read)
- * adds one: 24 call sites, 24 methods. The golden pins the exact numbers.
+ * adds one: 24 call sites, 24 methods; master pins 25. Cat 40 Hard F2 adds the
+ * scoped keyword count and keyword-mode page reads (countKeywordPages,
+ * searchKeywordPages): 27 and 27. The golden pins the exact numbers.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -152,8 +154,8 @@ describe('EO4 RLS scope inventory (master)', () => {
     const scoping = astScoping(capture.ast);
 
     const callSites = Object.values(capture.ast).reduce((a, m) => a + m.directCallSites, 0);
-    expect(callSites).toBe(25);
-    expect(Object.values(capture.ast).filter((m) => m.directCallSites > 0).length).toBe(25);
+    expect(callSites).toBe(27);
+    expect(Object.values(capture.ast).filter((m) => m.directCallSites > 0).length).toBe(27);
 
     const byMethod = new Map<string, RuntimeObservation[]>();
     for (const [key, obs] of Object.entries(capture.runtime)) {

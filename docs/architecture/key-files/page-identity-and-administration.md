@@ -70,3 +70,7 @@ and only a page still at that revision without `validate: false` fails the
 phase. The installed-lifecycle
 test and `test/e2e/grandfather-projection-postgres.test.ts` cover the actual
 upgrade consequence and engine parity respectively.
+
+## Write request ids
+
+- `src/core/persistence/preconditions.ts` — `parseWriteRequestId`, the one place a write op's `request_id` is normalized (F6, Cat 40 Hard): a UUID passes through lowercased, any other id of 1-128 printable ASCII characters maps to its RFC 4122 UUIDv5 under `CLIENT_REQUEST_ID_NAMESPACE` (no operation name, so receipt lookups find a write by the client's string); `clientRequestIdOf` is the string admissions store in `persistence_requests.client_request_id` (v238, outside the intent digest, kept by compaction) and receipts echo as `client_request_id`. Administration writer/deactivation ids keep strict UUID checks. `remember(items)` derives child ids from the root string as sent (`childRequestId`). Tests: `test/persistence-client-request-id.test.ts`, `test/e2e/persistence-client-request-id-postgres.test.ts`.

@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 230438,
-    "stdoutSha256": "9a3dc5c29fd6080932aa7461f7ca2e9f2579a917182e92565c312b781c99fc10",
+    "stdoutBytes": 230679,
+    "stdoutSha256": "dc9a2b59ffbb454139bd202eb28d827cd45dc57b91605771d154625920306eda",
     "toolNames": [
       "remember",
       "entity",
@@ -255,11 +255,11 @@
               "type": "string"
             },
             "replaces": {
-              "description": "fact_id this fact replaces (same entity).",
+              "description": "fact_id this fact replaces (same entity, or none).",
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "source_id": {
@@ -289,25 +289,31 @@
         "scope": "write"
       },
       {
-        "description": "MEMORY VERB (v1): person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches and create_safety. Facts: recall.",
+        "description": "MEMORY VERB (v1): person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches (create_safety). Facts: recall.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "entity",
         "parameters": {
-          "name": "string"
+          "name": "string?",
+          "names": "array?"
         },
         "required_scopes": [],
         "schema": {
           "properties": {
             "name": {
-              "description": "Name, alias or slug (e.g. \"Alice Example\").",
+              "description": "Name, alias or slug.",
               "type": "string"
+            },
+            "names": {
+              "description": "Or up to 50 names/codes at once: compact rows.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
-          "required": [
-            "name"
-          ],
+          "required": [],
           "type": "object"
         },
         "scope": "read"
@@ -370,7 +376,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "semantic_review": {
@@ -520,7 +526,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -582,7 +588,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -602,7 +608,7 @@
         "scope": "write"
       },
       {
-        "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows (remote max 100); a full page may be truncated: continue with updated_after + updated_after_slug from the last row.",
+        "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; a full page may be truncated: continue with updated_after + updated_after_slug from the last row.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -694,7 +700,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -741,7 +747,7 @@
         "scope": "admin"
       },
       {
-        "description": "Quick note (\"just remember this\"): auto-slugged under inbox/ by date + content hash, so recapturing is idempotent. Use put_page to control slug or type; remember for facts about entities.",
+        "description": "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. Use put_page to control slug or type; remember for facts about entities.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -799,7 +805,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -919,7 +925,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -941,7 +947,7 @@
         "scope": "write"
       },
       {
-        "description": "Write up to 50 complete Markdown pages (8 MB total) in one call; use instead of put_page for more than 3 pages. Each page replaces its whole page, like put_page. Keep one request_id UUID per batch: replaying the identical call never writes twice, and put_pages with ONLY request_id reports progress without resending content. Waits up to wait_ms (default 25000) for commits; follow the returned `next`. Needs put_page permission.",
+        "description": "Write up to 50 complete Markdown pages (8 MB total) in one call; use instead of put_page for more than 3 pages. Each page replaces its whole page, like put_page. Keep one request_id per batch: replaying the identical call never writes twice, and put_pages with ONLY request_id reports progress without resending content. Waits up to wait_ms (default 25000) for commits; follow the returned `next`. Needs put_page permission.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -990,7 +996,7 @@
               "type": "array"
             },
             "request_id": {
-              "description": "Batch UUID; reuse it to replay or poll.",
+              "description": "Batch id; reuse only to replay or poll.",
               "type": "string"
             },
             "source_id": {
@@ -1022,7 +1028,7 @@
         "schema": {
           "properties": {
             "request_id": {
-              "description": "The UUID you sent with the write.",
+              "description": "The id you sent, or the receipt's.",
               "type": "string"
             }
           },
@@ -1079,7 +1085,7 @@
         "schema": {
           "properties": {
             "request_id": {
-              "description": "The UUID you sent with the write.",
+              "description": "The id you sent, or the receipt's.",
               "type": "string"
             }
           },
@@ -1091,14 +1097,16 @@
         "scope": "write"
       },
       {
-        "description": "Cheap hybrid search (vector + keyword), no LLM expansion, top 20: for exact tokens, names, field values. Results are NOT proof of coverage: concepts or landscape, use `query`; exhaustive lists, list_pages. return_unit returns whole sections or conversations. Personal: get_recent_salience; saved facts: recall. fields: \"full\" adds diagnostics.",
+        "description": "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "search",
         "parameters": {
+          "cursor": "string?",
           "fields": "string?",
           "limit": "number?",
+          "match": "string?",
           "min_trust": "string?",
           "mode": "string?",
           "offset": "number?",
@@ -1115,6 +1123,10 @@
         "required_scopes": [],
         "schema": {
           "properties": {
+            "cursor": {
+              "description": "From next.",
+              "type": "string"
+            },
             "fields": {
               "description": "lean (remote default) or full.",
               "enum": [
@@ -1124,8 +1136,16 @@
               "type": "string"
             },
             "limit": {
-              "description": "Max results (default 20).",
+              "description": "Default 20.",
               "type": "number"
+            },
+            "match": {
+              "description": "keyword: every match, paged.",
+              "enum": [
+                "hybrid",
+                "keyword"
+              ],
+              "type": "string"
             },
             "min_trust": {
               "description": "Lowest trust tier to return (the connection floor still applies).",
@@ -1152,7 +1172,7 @@
               "type": "string"
             },
             "recency": {
-              "description": "Boost recent pages (default: auto).",
+              "description": "Boost recent pages.",
               "enum": [
                 "off",
                 "on",
@@ -1161,7 +1181,7 @@
               "type": "string"
             },
             "return_unit": {
-              "description": "auto (default) returns whole conversations.",
+              "description": "Default auto: whole conversations.",
               "enum": [
                 "chunk",
                 "window",
@@ -1172,11 +1192,11 @@
               "type": "string"
             },
             "return_window": {
-              "description": "Neighbor chunks each side for window (1-3).",
+              "description": "Window radius 1-3.",
               "type": "number"
             },
             "salience": {
-              "description": "Boost emotional pages (default: auto).",
+              "description": "Boost emotional pages.",
               "enum": [
                 "off",
                 "on",
@@ -1185,7 +1205,7 @@
               "type": "string"
             },
             "snippet_chars": {
-              "description": "Max chars per chunk_text (0 = full).",
+              "description": "Chars per row (0 = full).",
               "type": "number"
             },
             "source_id": {
@@ -1193,7 +1213,7 @@
               "type": "string"
             },
             "token_budget": {
-              "description": "Evidence token cap (default 6000).",
+              "description": "Default 6000.",
               "type": "number"
             },
             "types": {
@@ -1212,7 +1232,7 @@
         "scope": "read"
       },
       {
-        "description": "Hybrid search plus multi-query expansion for concept/landscape questions (expansion recovers synonym phrasings). Still top-K; return_unit returns whole sections/conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; host transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows aren't pages: use follow_up. fields: \"full\" adds diagnostics.",
+        "description": "Hybrid search plus multi-query expansion for concept/landscape questions (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1254,11 +1274,11 @@
         "schema": {
           "properties": {
             "adaptive_return": {
-              "description": "true when one answer is wanted (fewer rows; never returns empty); omit for breadth.",
+              "description": "true for one answer (fewer rows, never empty); omit for breadth.",
               "type": "boolean"
             },
             "autocut": {
-              "description": "Default on (never returns empty); false gives full top-K for breadth, unlike adaptive_return.",
+              "description": "Default on (never empty); false: full top-K for breadth.",
               "type": "boolean"
             },
             "cross_modal": {
@@ -1344,7 +1364,7 @@
               "type": "string"
             },
             "recency": {
-              "description": "Boost recent pages (default: auto).",
+              "description": "Boost recent pages.",
               "enum": [
                 "off",
                 "on",
@@ -1357,7 +1377,7 @@
               "type": "boolean"
             },
             "return_unit": {
-              "description": "auto (default) returns whole conversations.",
+              "description": "Default auto: whole conversations.",
               "enum": [
                 "chunk",
                 "window",
@@ -1368,11 +1388,11 @@
               "type": "string"
             },
             "return_window": {
-              "description": "Neighbor chunks each side for window (1-3).",
+              "description": "Window radius 1-3.",
               "type": "number"
             },
             "salience": {
-              "description": "Boost emotional pages (default: auto).",
+              "description": "Boost emotional pages.",
               "enum": [
                 "off",
                 "on",
@@ -1385,7 +1405,7 @@
               "type": "string"
             },
             "snippet_chars": {
-              "description": "Max chars per chunk_text (0 = full).",
+              "description": "Chars per row (0 = full).",
               "type": "number"
             },
             "source_id": {
@@ -1478,7 +1498,7 @@
               "type": "string"
             },
             "return_window": {
-              "description": "Neighbor chunks each side for window (1-3).",
+              "description": "Window radius 1-3.",
               "type": "number"
             },
             "token_budget": {
@@ -1679,7 +1699,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -1724,7 +1744,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -2153,7 +2173,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -2345,7 +2365,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -4302,7 +4322,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "since": {
@@ -4365,7 +4385,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "row_num": {
@@ -4446,7 +4466,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "resolved_by": {
@@ -4533,7 +4553,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "row_num": {
@@ -4596,7 +4616,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "row_num": {
@@ -4630,7 +4650,7 @@
         "schema": {
           "properties": {
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -4840,7 +4860,7 @@
         "scope": "read"
       },
       {
-        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client; stdio: this session).",
+        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client or stdio session).",
         "idempotent": false,
         "local_only": false,
         "mutating": true,
@@ -5698,7 +5718,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout. Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior.",
+              "description": "Optional; reuse only to retry. Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior.",
               "type": "string"
             },
             "session_id": {
@@ -5993,7 +6013,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             }
           },
@@ -6055,7 +6075,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "UUID; retry with it on timeout.",
+              "description": "Optional; reuse only to retry.",
               "type": "string"
             },
             "source_id": {
@@ -7276,7 +7296,7 @@
         "scope": "write"
       },
       {
-        "description": "Stop a coaching or info notice (or first_run_decisions) from appearing for this client; muted: false unmutes.",
+        "description": "Mute a coaching or info notice (or first_run_decisions) for this client; muted: false unmutes.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,

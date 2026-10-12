@@ -42,7 +42,7 @@ export async function captureOffPath(engine: BrainEngine): Promise<Record<string
   const run = async (label: string, name: string, params: Record<string, unknown>, overrides: Partial<OperationContext> = {}) => {
     const meta: Record<string, unknown>[] = [];
     const result = await op(name).handler(ctxOf(engine, meta, overrides), params);
-    out[label] = JSON.stringify({ result, meta });
+    out[label] = JSON.stringify({ result, meta: meta.map(m => m.key === 'retrieval' ? { ...m, value: withoutCounts(m.value as Record<string, unknown>) } : m) });
   };
   for (const variant of [{}, { return_unit: 'chunk' }]) {
     const tag = Object.keys(variant).length ? ':chunk' : '';
@@ -87,12 +87,21 @@ export async function captureOffPath(engine: BrainEngine): Promise<Record<string
  * rather than left as `{}`.
  */
 export function offPathMcpBytes(res: { content: { type: string; text: string }[]; _meta?: Record<string, unknown> }): string {
-  const content = res.content.filter(c => !c.text.startsWith('[gbrain notice '));
+  // Cat 40 Hard F2's keyword count line and fields and F4's row-date line are additive too
+  // (pinned in test/search-keyword-paging.test.ts and test/search-date-labels.test.ts).
+  const content = res.content.filter(c => !/^\[gbrain (notice |search\] |dates\] )/.test(c.text));
   const { gbrain_notices: _notices, ...meta } = res._meta ?? {};
+  if (meta.retrieval) meta.retrieval = withoutCounts(meta.retrieval as Record<string, unknown>);
   return JSON.stringify({ ...res, content, ...(res._meta ? { _meta: Object.keys(meta).length > 0 ? meta : undefined } : {}) });
 }
 
 const leanRetrieval = (meta: Record<string, unknown>) => ({ ...meta, rows: 'lean' });
+
+/** Cat 40 Hard F2's additive keyword count fields, compared in test/search-keyword-paging.test.ts instead. */
+function withoutCounts(meta: Record<string, unknown>): Record<string, unknown> {
+  const { keyword_total: _t, keyword_truncated: _r, keyword_total_capped: _c, ...rest } = meta;
+  return rest;
+}
 
 /** Recall's additive `facts_order` (MEMORY_VERBS v1), which every response carries right after `total`; these captures are all newest-first. */
 function withFactsOrder(payload: Record<string, unknown>): Record<string, unknown> {

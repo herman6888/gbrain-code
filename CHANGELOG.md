@@ -10,6 +10,97 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.175.0] - 2026-10-11
+
+**CI test shards are balanced again, and the nightly run stops failing its shard-timing check.** CI splits each test lane across several machines using the recorded run time of every test file. A test file with no recorded time is packed blind, and 11.1% of E2E files had none, past the 10% bound the nightly enforces. This release re-measures every lane from green master runs. No product behaviour changes.
+
+### Itemized changes
+
+| Lane | Files with no recorded time, before | After | Bound | Source run |
+|---|---|---|---|---|
+| Unit | 150 of 3197 (4.7%) | 21 of 3197 (0.7%) | 5% | Test 38154037814 |
+| Serial | 12 of 387 (3.1%) | 2 of 387 (0.5%) | 10% | Test 38154037814 |
+| E2E | 62 of 557 (11.1%) | 6 of 557 (1.1%) | 10% | E2E 38154063181 (full profile) |
+
+- `scripts/test-weights.json`, `scripts/serial-weights.json` and `scripts/e2e-weights.json`, plus their `.metadata.json` provenance files, are re-mined with `bun run weights:mine` from master runs whose test jobs all passed. `GITHUB_EVENT_NAME=schedule bun scripts/check-weight-coverage.ts` now reports OK with no dead entries.
+
+## [0.60.174.0] - 2026-10-11
+
+**gbrain now knows every name an account goes by, tells your agent how many records match, and says why a write or a rerank failed.**
+
+On a company brain, most records never repeat a customer's full name. They use a nickname, a code or a name filed on a different page. Before this release an agent asked gbrain for the customer's card, saw the name and the code, and believed it had every alias, so it missed the records filed under the nickname. Now the card shows every other name the customer's pages declare, with the line that declares it; search also searches those names on its own; and every search says how many pages match its keywords, with a way to list them all. Saved memories fail less, and when one fails the answer says why. In the preregistered Cat 40 Hard confirmation, gbrain beat plain files by +7.7 points (95% CI +2.7 to +12.7) on a fresh 55k-document world and by +13.0 points (+7.7 to +18.3) on a sealed world, pooled over Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol ([results](https://github.com/garrytan/gbrain-evals/blob/plan/cat40-hard-fix/docs/plans/2026-10-07-cat40-hard-fix/RESULTS.md), gbrain-evals #93).
+
+### What changes for your agent
+
+| Where | What changed |
+|---|---|
+| Instructions and `search` | The answering clause keeps separate parts of a question in separate searches but batches lists of names or codes (`entity` with `names`, or one keyword `search` for `"A" OR "B" OR …`) and asks for independent calls in the same turn; `search` says keyword mode takes OR across quoted names. In the development rounds the reader that wrote keyword OR searches solved as many cells in a third of the calls of one that searched one name at a time. |
+| `entity` names | `names` (up to 50 names, codes or aliases) resolves a whole list in one call, one compact row per name with the page, its names, its opening lines (`lead`) and its identity siblings. Opus resolved account codes and nicknames from handoff mails one search at a time and ran out of turns; on the development world's account pages one call resolved the 43 names one such run looked up separately, in 1.4 s. |
+| `entity` card | New `identity_siblings` (pages about the same subject under another title prefix, each with its own aliases, never merged), `identity_excerpt` (verbatim lines that may carry another name, with the page they came from), `aka_sources` and `alias_guidance` (what `aka` covers, which names to search). `aka` is unchanged. |
+| Alias learning | Prose cues ("also known as", "goes by", "formerly", "doing business as", a quoted name after "calls it"), alias label lines and table rows ("Internal nickname: Copper Fox"), labels later in a line ("Account: Widget Co. Nickname used by the team: Copper Fox."), multi-word names, and 2-3 character codes the page declares for itself ("Also called JOF in my notes", `a.k.a.`, `known as`, `short for` or an alias label; common capitals and acronyms such as `IT`, `US`, `OK`, `AI` never count). The short-code rule comes from the Program Primary Hard root cause (gbrain-evals#109), where mails naming a customer only by its code never linked to it. A name two sibling pages share now links mentions to both instead of neither. A cue counts as one of the page's names only when it attaches to the page itself ("Widget Co (formerly Gearbox Labs)", "The company is also known as ..."), so another company's old name, a place or a product nickname in the page's prose is not stored: on one real brain that took stored aliases from 47 correct of 72 to 25 of 25. |
+| Saved facts | A fact saved by an account's name links to the account even when its sheet and CRM record share the name; the card's `recent_facts` and `recall {entity}` show facts saved under either page or the bare name, and a search naming the entity lists its newest saved facts first, then facts of an entity they point to. |
+| `search` / `query` | When a query names an entity, gbrain also searches up to 4 of its other names (keyword-only, rows carry `matched_alias`). Every search adds one line: the rows are a ranked top-K, and `keyword_total` pages match the keywords (up to "10000+"). |
+| `search` `match: "keyword"` | On an entity's name or alias it lists pages using any of its names in one walk. Otherwise lists every keyword match, page by page, with `total`, `truncated` and a ready-to-send `next`. Remote agents can use it. A per-call `mode` is refused with a fix naming `match: "keyword"`; an offset over 10,000 is refused. |
+| Search rows | `effective_date_source` survives lean rows, and one line says whether each date is a document, event or fallback date (never a contract's effective date). Pages gbrain generated (`dream_generated`, `extract_receipt`) carry `provenance: "generated"` and rank below a primary record about the same entity. |
+| `remember` and write tools | Any `request_id` of 1 to 128 printable characters is accepted (echoed as `client_request_id`; `request_id` stays a UUID). Re-saving a claim that was forgotten is refused straight away with `fact_withdrawn` and the write that works (`entity` plus `replaces`), instead of being accepted and failing later. Re-saving a claim with its entity links the copy saved without one (`status: superseded`, `superseded_fact_id`, also on batch receipts) instead of keeping a duplicate. Failed receipts and `get_write_request` name the cause. |
+| `forget` | Forgetting a fact saved without an entity is refused with `claim_linked` while the same claim is active on entity-linked facts, naming them. It used to withdraw those facts as well, and a withdrawn claim cannot be saved again. Forget the linked facts first to withdraw the claim everywhere. |
+| Degraded reranking | The `degraded_recall` notice and `_meta.retrieval.rerank_degraded` carry the reason (`timeout`, `budget`, `rate_limited`, `unreachable`, `auth`, `provider_error`), the fallback and the session's count, with a fix per reason. |
+
+Example card fields for an account whose CRM record and account sheet share a subject:
+
+```json
+{
+  "aka": ["wgco", "widget co"],
+  "aka_sources": [{ "origin": "declared", "slug": "crm/widget-co" }, { "origin": "subject", "slug": "crm/widget-co" }],
+  "identity_siblings": { "capped": false, "pages": [{ "slug": "accounts/widget-co", "title": "Account sheet: Widget Co", "type": "account", "aka": ["Copper Fox", "Widget Co"] }] },
+  "identity_excerpt": [{ "slug": "accounts/widget-co", "line": "Internal nickname: Copper Fox" }]
+}
+```
+
+### How to use it
+
+```bash
+gbrain extract --stale --catch-up                     # re-derive aliases and rescan mentions once (autopilot does this too)
+gbrain extract mentions --explain crm/widget-co       # every name a page derives, rejected candidates, the sibling decision
+gbrain config set mentions.alias_deny "Copper Fox"    # drop a derived name (or frontmatter alias_deny: on one page)
+gbrain config set search.alias_fanout_max 0           # turn the alias fan-out off
+```
+
+**Say to your agent:** *"Find every record about the Acme account, under any name it goes by."*
+
+### Things to watch
+
+- **One-time rescan.** The alias and mention extractor versions moved (`MENTION_EXTRACTOR_VERSION` 5, `ALIAS_DERIVATION_VERSION` 4), so every brain re-derives aliases and rescans mentions once on its next `gbrain extract --stale`; cards show `coverage: pending` until it finishes, even on a brain where no page changed.
+- **Migration v238** adds `persistence_requests.client_request_id` (nullable).
+- **Search output grew** by one count line and one date line per call; the starter tool list stays within its 25,000-character budget.
+- **Settings:** `mentions.multiword_aliases`, `mentions.sibling_merge`, frontmatter `identity: separate`, `search.demote_generated` (all on by default) are the off switches.
+- **Latency.** Alias fan-out measured 16 ms p50 on a 3,100-page PGLite brain. The keyword count runs beside the search with a 2-second deadline; a late count says "unavailable", never zero. Per-cell latency on the benchmark was harness scheduling (slot queue and restore), not gbrain; the slowest gbrain searches were email-typed filters on the real corpus, filed for profiling.
+- **Not in this release:** owner-based names ("Dana's freight account"), recall that follows "A now uses B's code" chains, and the other items filed in TODOS.
+
+### Itemized changes
+
+- Alias grammar (`src/core/mentions/aliases.ts`, spec `docs/designs/ALIAS_CONVENTIONS.md`): `declarationsIn` with prose cues, label lines, table rows and quoted defined terms; up to 4-token captures with possessive, common-word and relational-noun guards; `mentions.alias_deny`, frontmatter `alias_deny`, `mentions.multiword_aliases`.
+- Identity siblings (`src/core/mentions/siblings.ts`): one rule for the card, the fan-out and the gazetteer; `buildGazetteer` keeps a name claimed by a sibling group and `findMentionedEntities` links every sibling; `identity_siblings_capped` notice.
+- Entity card identity fields (`src/core/verbs/entity-card-identity.ts`), excerpt cut from `sanitizeRemoteBody`.
+- Alias fan-out (`src/core/search/alias-fanout.ts`): `resolveQueryEntity`, alias-required keyword queries via `SearchOpts.rankQuery` on both engines, `fanout` meta, `alias_fanout` notice; search and query emit `mention_index` when the resolved entity's source is still being indexed.
+- Version-aware mention coverage without a migration (`src/core/mentions/coverage.ts`, `pass.ts`): pending counts version-behind pages, the policy fingerprint covers the new settings, post-upgrade names the sweep.
+- Keyword counts and paging (`src/core/search/keyword-paging.ts`, `keyword-statement.ts`, `src/core/engine-sql/keyword-pages.ts`): `countKeywordPages`, `searchKeywordPages`, keyset `next`, `keyword_count_unavailable` stage; errors `search_mode_local_only`, `search_cursor_requires_keyword`, `search_offset_over_cap`.
+- Date labels (`src/core/search/date-labels.ts`) and lean rows keep `effective_date_source`, `matched_alias`, `provenance`, `evidence_omitted`.
+- Generated-page demotion (`src/core/search/provenance-demotion.ts`) in the identity-boost stage; corrections exempt.
+- Write ids (`src/core/persistence/preconditions.ts` `parseWriteRequestId`, UUIDv5 under a fixed namespace); `client_request_id` stored and echoed; `remember(items)` children still derive from the root string.
+- `remember` refuses a withdrawn claim before admission (`fact_withdrawn`); `replaces` accepts a target with no entity; failed receipts name their code.
+- Rerank failure reasons (`src/core/ai/gateway.ts`, `src/core/search/rerank.ts`, `src/core/interop-notices.ts`): a rerank timeout is reported as `timeout` (it was filed as a network failure); `reranker_health` names `provider_base_urls.<provider>` after repeated `unreachable` failures.
+- `docs/what-schemas-unlock.md` is linked, not inlined, in `llms-full.txt`.
+
+## [0.60.173.0] - 2026-10-11
+
+**Two memory tests stop failing on the scheduled full E2E run, which keeps real provider keys.** Both asserted the keyless branch (`degraded_dedup: true` on `writeSingleFact`, `facts_degraded.reason: keyword_only_no_embedding_provider` on `recall`) while reading the gateway's key state from the process environment, so the nightly lane, which runs with `GBRAIN_TEST_KEEP_PROVIDER_KEYS=1` and an `OPENAI_API_KEY`, embedded for real and reported the keyed result. No product behaviour changes; both branches are now pinned on every lane.
+
+### Itemized changes
+
+- `test/write-single-dedup.test.ts`: the gateway is configured keyless (`env: {}`) before each test, so a provider key in the environment cannot turn the degraded branch on; a new case installs a stubbed embed transport and asserts the keyed branch (`degraded_dedup: false`, the text embedded once per write, an exact repeat still `duplicate`). Forced probe: `GBRAIN_TEST_KEEP_PROVIDER_KEYS=1 bun test test/write-single-dedup.test.ts` fails on the previous file (1 of 6) and passes now (7 of 7).
+- `test/recall-question.test.ts`: the `keyless()` helper configures a keyless gateway instead of resetting it, so the keyword-only ranking assertions hold with provider keys present; the same probe fails before (2 of 54, both engines) and passes after.
+
 ## [0.60.172.0] - 2026-10-11
 
 **Two decide timing tests stop failing on slow runners.** Each one measured wall-clock time that included work outside the budget under test. Both budgets are unchanged.

@@ -13,7 +13,11 @@
  * already dedups an entity-less repeat.
  * Fails when: the helper runs cosine-only dedup gated on entity + embedding
  * (two rows), or writes the slugified fallback as the entity.
- * Seams: none. PGLite always, Postgres when DATABASE_URL is set.
+ * Seams: the gateway is configured keyless (`env: {}`) so `degraded_dedup:
+ * true` is pinned even on lanes that keep real provider keys (the scheduled
+ * full E2E runs with `GBRAIN_TEST_KEEP_PROVIDER_KEYS=1`); the keyed branch
+ * uses `__setEmbedTransportForTests`. PGLite always, Postgres when
+ * DATABASE_URL is set.
  * Dedup is sequential: the exact check runs before, not inside, the insert
  * transaction, so two identical submissions racing each other may both insert.
  */
@@ -21,7 +25,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { PostgresEngine } from '../src/core/postgres-engine.ts';
-import { resetGateway } from '../src/core/ai/gateway.ts';
+import { __setEmbedTransportForTests, configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { requirePostgresTestDatabase, testBackends } from './helpers/test-backends.ts';
@@ -45,7 +49,15 @@ for (const backend of testBackends()) {
       await engine.initSchema();
     }, 180_000);
 
+    beforeEach(() => {
+      // Keyless by construction: a provider key in the process environment
+      // (the full E2E lane keeps them) must not turn the degraded branch on.
+      __setEmbedTransportForTests(null);
+      configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: {} });
+    });
+
     afterAll(async () => {
+      __setEmbedTransportForTests(null);
       resetGateway();
       await engine.disconnect();
     });
@@ -73,6 +85,22 @@ for (const backend of testBackends()) {
       const second = await writeSingleFact(engine, 'default', { fact: `  ${CLAIM}  `, provenance: 'fixture', entity: 'people/alice-example', remote: false });
       expect(first).toMatchObject({ status: 'inserted', entity_slug: 'people/alice-example', degraded_dedup: true });
       expect(second).toMatchObject({ status: 'duplicate', id: first.id, degraded_dedup: true });
+      expect(await rows()).toHaveLength(1);
+    });
+
+    test('with an embedding provider the write embeds and reports degraded_dedup: false; an exact repeat is still a duplicate', async () => {
+      const embedded: string[] = [];
+      configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+      __setEmbedTransportForTests((async ({ values }: { values: string[] }) => {
+        embedded.push(...values);
+        return { embeddings: values.map(() => [1, ...new Array(1535).fill(0)]) };
+      }) as never);
+      await engine.putPage('people/alice-example', { type: 'person', title: 'Alice Example', compiled_truth: 'Alice.' }, { sourceId: 'default' });
+      const first = await writeSingleFact(engine, 'default', { fact: CLAIM, provenance: 'fixture', entity: 'people/alice-example', remote: false });
+      const second = await writeSingleFact(engine, 'default', { fact: CLAIM, provenance: 'fixture', entity: 'people/alice-example', remote: false });
+      expect(first).toMatchObject({ status: 'inserted', entity_slug: 'people/alice-example', degraded_dedup: false });
+      expect(second).toMatchObject({ status: 'duplicate', id: first.id, degraded_dedup: false });
+      expect(embedded).toEqual([CLAIM, CLAIM]);
       expect(await rows()).toHaveLength(1);
     });
 

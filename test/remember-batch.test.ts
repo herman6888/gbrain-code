@@ -38,15 +38,23 @@ describe('remember items[] batch', () => {
     expect(writes[1].request_id).toBe(childRequestId(rid, 1));
   });
 
-  test('a non-UUID request_id refuses the batch before any write (#6280)', async () => {
-    for (const request_id of ['not-a-uuid', 'r1', '', 42]) {
+  test('an unusable request_id refuses the batch before any write (#6280)', async () => {
+    for (const request_id of ['', 42, null, 'has space', 'x'.repeat(129)]) {
       const { handler, writes } = fakeSingle();
       let err: unknown;
       try { await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }] }, handler, ve); } catch (e) { err = e; }
       expect(err).toBeInstanceOf(OperationError);
       expect((err as OperationError).code).toBe('invalid_params');
-      expect((err as Error).message).toContain('request_id must be a UUID');
+      expect((err as Error).message).toContain('request_id must be 1 to 128 printable ASCII characters');
       expect(writes).toHaveLength(0);
+    }
+  });
+
+  test('a client request_id (F6) is accepted; children derive from the string as sent', async () => {
+    for (const request_id of ['not-a-uuid', 'r1']) {
+      const { handler, writes } = fakeSingle();
+      await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }, { fact: 'b' }] }, handler, ve);
+      expect(writes.map(w => w.request_id)).toEqual([childRequestId(request_id, 0), childRequestId(request_id, 1)]);
     }
   });
 
