@@ -170,9 +170,9 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   if (p.replaces !== undefined && p.replaces !== null) {
     // Fail fast on an invalid target; the coordinator re-checks it under the row lock before publishing.
     await decideReplacement(ctx.engine, sourceId, factIntent, Number(p.replaces),
-      { pageSlug: slug, remote: ctx.remote !== false, excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote) });
+      { pageSlug: slug, remote: ctx.remote !== false, excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote), slugPrefixes: authority.slugPrefixes });
   }
-  await assertFactNotWithdrawn(ctx.engine, sourceId, factIntent);
+  await assertFactNotWithdrawn(ctx.engine, sourceId, factIntent, { excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote) });
   const row = await admitWrite(ctx.engine, { principal, operation: 'remember', sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, clientRequestId, callerIntent,
     // The transport's session (MCP `_meta.session_id`) is recorded on the fact, as extract_facts records
@@ -193,19 +193,36 @@ interface WithdrawalTarget { id: number; entity_slug: string | null; source_mark
  * withdrawal reaches the claim under every entity. When that claim is active
  * on entity-linked facts, forgetting the unlinked copy would silently withdraw
  * them too, and a withdrawn claim cannot be remembered again; refuse and name them.
+ * A caller that cannot read private pages never withdraws an active copy it
+ * cannot see: the refusal is then one fixed text that names no fact.
  */
-async function refuseUnlinkedForgetOfLinkedClaim(tx: BrainEngine, sourceId: string, id: number, remote: boolean): Promise<void> {
-  const linked = await tx.executeRaw<{ id: number; entity_slug: string }>(`SELECT l.id,l.entity_slug FROM facts u
-    JOIN facts l ON l.source_id=u.source_id AND l.visibility=u.visibility AND l.entity_slug IS NOT NULL AND l.id<>u.id
+async function refuseForgetReachingOtherCopies(tx: BrainEngine, sourceId: string, fact: WithdrawalTarget, remote: boolean, excludePrivate: boolean): Promise<void> {
+  const id = fact.id;
+  if (fact.entity_slug === null) {
+    const linked = await tx.executeRaw<{ id: number; entity_slug: string }>(`SELECT l.id,l.entity_slug FROM facts u
+      JOIN facts l ON l.source_id=u.source_id AND l.visibility=u.visibility AND l.entity_slug IS NOT NULL AND l.id<>u.id
+        AND l.expired_at IS NULL AND (l.valid_until IS NULL OR l.valid_until > now())
+        AND gbrain_fact_fingerprint(l.fact)=gbrain_fact_fingerprint(u.fact)
+      WHERE u.id=$1 AND u.source_id=$2 AND ($3::boolean=false OR l.visibility='world')${excludePrivate ? ` AND ${privateProvenanceFilterFragment('l')}` : ''}
+      ORDER BY l.id LIMIT 5`, [id, sourceId, remote]);
+    if (linked.length) {
+      const named = linked.map(row => `#${row.id} (${row.entity_slug})`).join(', ');
+      throw verbError('invalid_params',
+        `claim_linked: fact #${id} was saved without an entity, and the same claim is active as ${named}. Forgetting #${id} would withdraw those facts too, so nothing was forgotten.`,
+        `Keep the linked ${linked.length === 1 ? 'fact' : 'facts'}: the copy without an entity needs no cleanup (remember the claim with entity and replaces: "${id}" retires it). To withdraw the claim everywhere, forget ${linked.map(row => `#${row.id}`).join(', ')} first, then #${id}.`);
+    }
+  }
+  if (!excludePrivate) return;
+  const hidden = await tx.executeRaw(`SELECT 1 FROM facts u
+    JOIN facts l ON l.source_id=u.source_id AND l.visibility=u.visibility AND l.id<>u.id
+      AND (u.entity_slug IS NULL OR l.entity_slug=u.entity_slug)
       AND l.expired_at IS NULL AND (l.valid_until IS NULL OR l.valid_until > now())
       AND gbrain_fact_fingerprint(l.fact)=gbrain_fact_fingerprint(u.fact)
-    WHERE u.id=$1 AND u.source_id=$2 AND ($3::boolean=false OR l.visibility='world')
-    ORDER BY l.id LIMIT 5`, [id, sourceId, remote]);
-  if (!linked.length) return;
-  const named = linked.map(row => `#${row.id} (${row.entity_slug})`).join(', ');
+    WHERE u.id=$1 AND u.source_id=$2 AND NOT (${privateProvenanceFilterFragment('l')}) LIMIT 1`, [id, sourceId]);
+  if (!hidden.length) return;
   throw verbError('invalid_params',
-    `claim_linked: fact #${id} was saved without an entity, and the same claim is active as ${named}. Forgetting #${id} would withdraw those facts too, so nothing was forgotten.`,
-    `Keep the linked ${linked.length === 1 ? 'fact' : 'facts'}: the copy without an entity needs no cleanup (remember the claim with entity and replaces: "${id}" retires it). To withdraw the claim everywhere, forget ${linked.map(row => `#${row.id}`).join(', ')} first, then #${id}.`);
+    `claim_linked: the same claim as fact #${id} is active elsewhere in this brain. Forgetting #${id} would withdraw it there too, so nothing was forgotten.`,
+    'Keep the fact. To withdraw the claim everywhere, ask the user to forget it on the brain host.');
 }
 
 /** Withdrawal commits independently of filesystem ownership and request FIFO. */
@@ -246,7 +263,7 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
     if (!fact) throw verbError(operation === 'forget' ? 'not_found' : 'fact_not_found',
       `No fact with id "${rawId}".`, 'Ids come from remember/recall. Recall the entity first to find the right fact.');
     if (ctx.remote !== false && supersessionGuarded('agent_written', fact.trust_tier)) throw remoteForgetRaced(id);
-    if (fact.entity_slug === null) await refuseUnlinkedForgetOfLinkedClaim(tx, sourceId, id, ctx.remote !== false);
+    await refuseForgetReachingOtherCopies(tx, sourceId, fact, ctx.remote !== false, excludePrivate);
     const slug = fact.source_markdown_slug ?? fact.entity_slug ?? 'memory/unattributed';
     enforceClientSlugFence(ctx, slug, operation); enforceSubagentSlugFence(ctx, slug, operation);
     const authority = await submissionAuthority({ ...ctx, engine: tx }, operation, sourceId, source.incarnation, slug);

@@ -8,6 +8,8 @@ import { cosineVerdict } from './capture-dedup.ts';
 import { interleaveFusion } from '../search/fusion-lists.ts';
 import { readSupersessionThreshold } from './supersession-threshold.ts';
 import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
+import { pageNotVisibleError } from '../persistence/page-visibility.ts';
+import { slugUnderBoundPrefixes } from '../ops/context.ts';
 
 export type FactCandidate = FactRow & { source_markdown_slug: string | null; row_num: number | null };
 export interface FactDecision { status: 'inserted' | 'duplicate' | 'superseded'; candidate: FactCandidate | null; }
@@ -27,11 +29,26 @@ export async function prepareFactEmbedding(fact: string, signal?: AbortSignal, d
   }
   return { embedding: null, embedding_model: null, degraded: true };
 }
-export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: string, input: SingleFactIntent): Promise<void> {
+/**
+ * `excludePrivate`: the caller cannot read private pages. A withdrawal whose withdrawn rows all sit on pages it
+ * cannot read is refused exactly as a page it may not see is, so the refusal never confirms a claim it cannot see.
+ */
+export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: string, input: SingleFactIntent, opts: { excludePrivate?: boolean } = {}): Promise<void> {
   await assertFactNotPurged(engine, sourceId, input);
-  if (await isFactWithdrawn(engine, sourceId, input.visibility, input.fact, input.entity_slug)) {
-    throw verbError('invalid_params', FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION);
+  if (!await isFactWithdrawn(engine, sourceId, input.visibility, input.fact, input.entity_slug)) return;
+  if (opts.excludePrivate) {
+    const [backing] = await engine.executeRaw<{ visible: boolean; hidden: boolean }>(`SELECT
+        COALESCE(bool_or(${privateProvenanceFilterFragment('f')}), false) AS visible,
+        COALESCE(bool_or(NOT (${privateProvenanceFilterFragment('f')})), false) AS hidden
+      FROM facts f JOIN fact_withdrawals w ON w.source_id=f.source_id AND w.visibility=f.visibility
+        AND w.fact_hash IN (gbrain_fact_fingerprint(f.fact),gbrain_fact_fingerprint_v1(f.fact))
+        AND (w.subject='*' OR w.subject=COALESCE(f.entity_slug,'*'))
+      WHERE f.source_id=$1 AND f.visibility=$2 AND f.expired_at IS NOT NULL
+        AND gbrain_fact_fingerprint(f.fact)=gbrain_fact_fingerprint($3) AND (w.subject='*' OR w.subject=$4::text)`,
+    [sourceId, input.visibility, input.fact, input.entity_slug]);
+    if (backing?.hidden && !backing.visible) throw pageNotVisibleError();
   }
+  throw verbError('invalid_params', FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION);
 }
 export const CANDIDATE_FUSION_KEY = 'facts.candidate_fusion';
 export type CandidateFusion = 'rrf_free' | 'interleave';
@@ -105,7 +122,7 @@ export async function decideSingleFact(engine: BrainEngine, sourceId: string, in
  * duplicate. `lock` takes the target row lock inside the publishing transaction.
  */
 export async function decideReplacement(engine: BrainEngine, sourceId: string, input: SingleFactIntent, targetId: number,
-  opts: { pageSlug: string; remote: boolean; lock?: boolean; excludePrivate?: boolean }): Promise<FactDecision> {
+  opts: { pageSlug: string; remote: boolean; lock?: boolean; excludePrivate?: boolean; slugPrefixes?: string[] | null }): Promise<FactDecision> {
   const notFound = () => verbError('not_found', `No fact with id "${targetId}" to replace.`,
     'Pass the fact_id of an active fact from recall (facts[].fact_id) about the same entity, or omit replaces to save a new fact.');
   const [target] = await engine.executeRaw<FactCandidate & { withdrawn: boolean }>(`SELECT f.*,
@@ -115,6 +132,8 @@ export async function decideReplacement(engine: BrainEngine, sourceId: string, i
     FROM facts f WHERE f.id=$1 AND f.source_id=$2${opts.excludePrivate ? ` AND ${privateProvenanceFilterFragment('f')}` : ''}${opts.lock ? ' FOR UPDATE OF f' : ''}`, [targetId, sourceId]);
   if (!target || (opts.remote && target.visibility !== 'world')) throw notFound();
   if (target.visibility !== input.visibility) throw notFound();
+  // #5913 [R2]: a slug-bound writer learns nothing about a fact outside its prefixes; the answer is the missing-id one.
+  if (opts.slugPrefixes && [target.entity_slug, target.source_markdown_slug].some(slug => slug && !slugUnderBoundPrefixes(opts.slugPrefixes!, slug))) throw notFound();
   const candidate: FactCandidate = { ...target, id: Number(target.id) };
   if (target.withdrawn) {
     throw verbError('invalid_params', `target_withdrawn: fact #${targetId} was forgotten, so it cannot be replaced.`,

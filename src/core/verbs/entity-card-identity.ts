@@ -17,6 +17,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { pageSnapshotKey } from '../page-snapshot-batch.ts';
+import type { PageSnapshot } from '../page-state/types.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { ALIAS_ORIGIN_RANK, declarationsIn, titleName, type AliasOrigin } from '../mentions/aliases.ts';
 import { readIdentitySiblings, SIBLING_GROUP_CAP } from '../mentions/siblings.ts';
@@ -110,8 +112,8 @@ const GUIDANCE_VERBS = 'aka lists names gbrain recognized as declared on this pa
 /** The card's identity fields for `row`. Fail-soft: a failed read leaves the field out. */
 export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   row: { slug: string; title: string | null; compiled_truth: string | null },
-  opts: { excludePrivate: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full'; aka: string[] }): Promise<CardIdentity> {
-  const siblings = await readIdentitySiblings(engine, sourceId, row, { excludePrivate: opts.excludePrivate });
+  opts: { excludePrivate: boolean; excludeQuarantined?: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full'; aka: string[] }): Promise<CardIdentity> {
+  const siblings = await readIdentitySiblings(engine, sourceId, row, { excludePrivate: opts.excludePrivate, excludeQuarantined: opts.excludeQuarantined });
   const slugs = [row.slug, ...siblings.pages.map(p => p.slug)];
   const aliasRows = await engine.executeRaw<{ slug: string; alias_norm: string; origin: string | null; alias_text: string | null }>(
     `SELECT slug, alias_norm, origin, alias_text FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[]) ORDER BY alias_norm`,
@@ -127,12 +129,13 @@ export async function readCardIdentity(engine: BrainEngine, sourceId: string,
       capped: siblings.capped,
     };
   }
-  const bodies = new Map<string, { title: string; body: string }>([[row.slug, { title: row.title ?? row.slug, body: row.compiled_truth ?? '' }]]);
-  if (siblings.pages.length) {
-    const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
-      `SELECT slug, title, compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`,
-      [sourceId, siblings.pages.map(p => p.slug)]).catch(() => []);
-    for (const r of rows) bodies.set(r.slug, { title: r.title ?? r.slug, body: r.compiled_truth ?? '' });
+  // Snapshot reads carry the withdrawal overlay get_page shows, so a forgotten fence row is struck and the sanitizer drops it.
+  const { snapshots } = await engine.readPageSnapshotsBatch(slugs.map(slug => ({ slug, sourceId })))
+    .catch(() => ({ snapshots: new Map<string, PageSnapshot>() }));
+  const bodies = new Map<string, { title: string; body: string }>();
+  for (const slug of slugs) {
+    const snapshot = snapshots.get(pageSnapshotKey(sourceId, slug));
+    if (snapshot) bodies.set(slug, { title: snapshot.page.title ?? slug, body: snapshot.page.compiled_truth ?? '' });
   }
   const excerpt: IdentityExcerptLine[] = [];
   const omitted: string[] = [];

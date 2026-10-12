@@ -64,7 +64,7 @@ export interface IdentitySiblings {
  * candidate (untrusted callers).
  */
 export async function readIdentitySiblings(engine: BrainEngine, sourceId: string, page: { slug: string; title: string | null },
-  opts: { excludePrivate: boolean; policy?: MentionPolicy; pack?: PackTypes | null }): Promise<IdentitySiblings> {
+  opts: { excludePrivate: boolean; excludeQuarantined?: boolean; policy?: MentionPolicy; pack?: PackTypes | null }): Promise<IdentitySiblings> {
   const subject = normalizeAlias(titleName(page.title ?? ''));
   if (!subject) return { pages: [], capped: false, verdict: 'subject_mismatch' };
   try {
@@ -73,7 +73,9 @@ export async function readIdentitySiblings(engine: BrainEngine, sourceId: string
     const pack = opts.pack !== undefined ? opts.pack : await loadSourcePack(engine, sourceId);
     const types = linkableTypesFor(pack, policy);
     const { privatePagesFilterFragment } = await import('../search/private-visibility.ts');
-    const privacy = opts.excludePrivate ? ` AND ${privatePagesFilterFragment('pages')}` : '';
+    const { quarantineFilterFragment } = await import('../quarantine.ts');
+    const privacy = (opts.excludePrivate ? ` AND ${privatePagesFilterFragment('pages')}` : '')
+      + (opts.excludeQuarantined ? ` AND ${quarantineFilterFragment('pages')}` : '');
     const like = `%: ${subject.replace(/[\\%_]/g, m => `\\${m}`)}`;
     const rows = await engine.executeRaw<{ slug: string; title: string | null; type: string | null; identity: unknown }>(
       `SELECT slug, title, type, frontmatter->>'identity' AS identity FROM pages

@@ -83,7 +83,8 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted entity was deleted or recreated.');
   if (p.expected_revision !== undefined) assertPageRevision(snapshot, engineMutationPrecondition(parseMutationPrecondition(p)));
   const observedRevision = snapshot?.revision ?? null;
-  await assertFactNotWithdrawn(engine, row.source_id, input);
+  const excludePrivate = await resolveExcludePrivatePages(engine, row.authority.remote === true);
+  await assertFactNotWithdrawn(engine, row.source_id, input, { excludePrivate });
   signal?.throwIfAborted();
   const embeddingConfigSql = "SELECT key,value FROM config WHERE key IN ('embedding_model','embedding_dimensions') ORDER BY key";
   const observedEmbeddingConfig = JSON.stringify(await engine.executeRaw(embeddingConfigSql));
@@ -93,9 +94,8 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   const dedupEmbedding = p.entity_inferred ? null : embedding;
   // `replaces`: the caller names the fact this one replaces (checked; the cosine rule does not apply).
   const replaces = p.replaces !== undefined && p.replaces !== null ? Number(p.replaces) : null;
-  const excludePrivate = await resolveExcludePrivatePages(engine, row.authority.remote === true);
   const replace = (e: BrainEngine, target: number, lock: boolean) =>
-    decideReplacement(e, row.source_id, input, target, { pageSlug: row.slug, remote: row.authority.remote === true, lock, excludePrivate });
+    decideReplacement(e, row.source_id, input, target, { pageSlug: row.slug, remote: row.authority.remote === true, lock, excludePrivate, slugPrefixes: row.authority.slugPrefixes });
   const decide = async (e: BrainEngine, lock = false) => {
     if (replaces !== null) return replace(e, replaces, lock);
     // The same claim saved earlier without an entity is this fact unlinked: linking it supersedes that copy,
@@ -117,7 +117,7 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   const lexicalOld = await lexical(engine);
   const contestedOld = contested ? decision.candidate! : lexicalOld;
   const validate = async (tx: BrainEngine) => {
-    await assertFactNotWithdrawn(tx, row.source_id, input);
+    await assertFactNotWithdrawn(tx, row.source_id, input, { excludePrivate });
     if (embedding && JSON.stringify(await tx.executeRaw(`${embeddingConfigSql} FOR SHARE`)) !== observedEmbeddingConfig) conflict(row);
     const current = await decide(tx, true);
     if (candidateState(current) !== candidateState(decision)) conflict(row);

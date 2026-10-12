@@ -2,8 +2,8 @@
  * `entity` with `names`: resolve a list of names, codes and aliases in one
  * call, the way a reader resolves the account codes and nicknames a batch of
  * handoff mails names. Each name resolves exactly as `entity name:` does
- * (buildEntityCard's alias, slug, title and fuzzy arms, private pages hidden
- * from remote callers) and returns a compact row: the page, its names, the
+ * (buildEntityCard's alias, slug, title and fuzzy arms; private and
+ * quarantined pages, siblings included, hidden from remote callers) and returns a compact row: the page, its names, the
  * opening lines of its body (`lead`) and its identity siblings with theirs.
  * No references, facts or open threads: a full card per name is `entity name:`.
  *
@@ -48,7 +48,7 @@ export async function lookupEntityNames(engine: BrainEngine, sourceId: string, n
 
 async function lookupOne(engine: BrainEngine, sourceId: string, name: string,
   opts: { remote: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full' }): Promise<EntityNameRow> {
-  const result = await buildEntityCard(engine, sourceId, name, { remote: opts.remote, includeReferences: false });
+  const result = await buildEntityCard(engine, sourceId, name, { remote: opts.remote, includeReferences: false, omitQuarantined: opts.remote });
   if (!result.found || !result.card) {
     const suggestions = (result.suggestions ?? []).slice(0, 3).map(s => ({ slug: s.slug, title: s.title }));
     return { name, found: false, ...(suggestions.length ? { suggestions } : {}) };
@@ -58,7 +58,7 @@ async function lookupOne(engine: BrainEngine, sourceId: string, name: string,
     'SELECT slug, title, compiled_truth FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [sourceId, entity.slug]);
   const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
   const excludePrivate = await resolveExcludePrivatePages(engine, opts.remote ? undefined : false);
-  const identity = row ? await readCardIdentity(engine, sourceId, row, { excludePrivate, surfaceCeiling: opts.surfaceCeiling, aka }).catch(() => null) : null;
+  const identity = row ? await readCardIdentity(engine, sourceId, row, { excludePrivate, excludeQuarantined: opts.remote, surfaceCeiling: opts.surfaceCeiling, aka }).catch(() => null) : null;
   const siblingPages = identity?.identity_siblings?.pages ?? [];
   const bodies = new Map<string, string | null>([[entity.slug, row?.compiled_truth ?? null]]);
   if (siblingPages.length) {

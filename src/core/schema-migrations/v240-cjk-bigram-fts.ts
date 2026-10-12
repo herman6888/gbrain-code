@@ -1,7 +1,7 @@
 import type { Migration } from './types.ts';
 
-export const v239: Migration = {
-  // Local fork patch (renumbered v150→v184→v187→v204→v206→v225→v238→v239 (v225 claimed; v238 claimed by upstream persistence-client-request-id in v0.60.175.0; v238 claimed by upstream drop-duplicate-embedding-null-index in v0.60.172.0) —
+export const v240: Migration = {
+  // Local fork patch (renumbered v150→v184→v187→v204→v206→v225→v238→v239→v240 (v225 claimed; v239 claimed by upstream extract-rollup-halt-reasons in v0.60.177.0; v238 claimed by upstream persistence-client-request-id in v0.60.175.0; v238 claimed by upstream drop-duplicate-embedding-null-index in v0.60.172.0) —
   // upstream claimed v150 for canonical_page_revisions_and_guards).
   // Chinese-first search (PMBrain v109 port): extend the existing
   // GIN-backed content_chunks.search_vector with CJK unigram +
@@ -11,7 +11,7 @@ export const v239: Migration = {
   // both functions, DROP TRIGGER IF EXISTS before re-create, and the
   // backfill recomputes search_vector from the source columns, so a
   // re-run converges to the same state.
-  version: 239,
+  version: 240,
   name: 'cjk_bigram_fts',
   idempotent: true,
   sql: `

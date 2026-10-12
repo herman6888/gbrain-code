@@ -81,6 +81,32 @@ describe('entity names[]', () => {
     expect((await call({ names: ['Kite Co'] }, false)).body.results[0]).toMatchObject({ found: true, slug: 'crm/kite-co' });
   });
 
+  test('a quarantined page stays a remote miss by exact slug, exact title and slug suffix, and is found locally', async () => {
+    await accounts();
+    await engine.executeRaw(`UPDATE pages SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || '{"quarantine":{"reason":"junk_pattern","detail":"test","assessed_at":"2026-10-07T00:00:00Z"}}'::jsonb WHERE slug = 'crm/kite-co'`);
+    const names = ['crm/kite-co', 'CRM record: Kite Co', 'kite-co'];
+    const remote = (await call({ names })).body;
+    expect(remote.results.map((r: { found: boolean }) => r.found)).toEqual([false, false, false]);
+    expect(JSON.stringify(remote)).not.toContain('LATAM');
+    const local = (await call({ names }, false)).body;
+    expect(local.results.every((r: { found: boolean; slug?: string }) => r.found && r.slug === 'crm/kite-co')).toBe(true);
+  });
+
+  test('a quarantined identity sibling is left out for remote callers, in the batch rows and the single-name card', async () => {
+    await accounts();
+    await engine.executeRaw(`UPDATE pages SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || '{"quarantine":{"reason":"junk_pattern","detail":"test","assessed_at":"2026-10-07T00:00:00Z"}}'::jsonb WHERE slug = 'accounts/widget-co'`);
+    const batch = (await call({ names: ['WGCO'] })).body;
+    expect(batch.results[0]).toMatchObject({ found: true, slug: 'crm/widget-co' });
+    expect(batch.results[0].siblings ?? []).toEqual([]);
+    expect(JSON.stringify(batch)).not.toContain('Copper Fox');
+    const card = (await call({ name: 'WGCO' })).body;
+    expect(card.found).toBe(true);
+    expect(JSON.stringify(card)).not.toContain('accounts/widget-co');
+    expect(JSON.stringify(card)).not.toContain('Copper Fox');
+    const local = (await call({ names: ['WGCO'] }, false)).body;
+    expect(local.results[0].siblings.map((s: { slug: string }) => s.slug)).toEqual(['accounts/widget-co']);
+  });
+
   test('the lead drops headings and private fences, redacts secrets and is bounded', () => {
     const body = '# Heading\n\nFirst line.\n\n## Facts\n\n<!--- gbrain:facts:begin -->\n| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |\n|---|---|---|---|---|---|---|---|---|---|\n| 1 | Private note | fact | 1.0 | private | medium | 2026-01-01 |  | test |  |\n<!--- gbrain:facts:end -->\n\nSecond line. ' + 'x'.repeat(400);
     const lead = pageLead(body);

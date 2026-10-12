@@ -56,6 +56,20 @@ describe('identity siblings on the card', () => {
     expect(card.alias_guidance.requires_surface).toBeUndefined();
   });
 
+  test('a soft-deleted sibling contributes no excerpt line', async () => {
+    await pair();
+    await page(engine, 'accounts/widget-co', 'account', 'Account sheet: Widget Co', 'Segment: freight\nInternal nickname: Copper Fox');
+    await sweep(engine);
+    expect((await call('entity', { name: 'WGCO' })).json.card.identity_excerpt).toContainEqual({ slug: 'accounts/widget-co', line: 'Internal nickname: Copper Fox' });
+    await engine.executeRaw("UPDATE pages SET deleted_at = now() WHERE source_id = 'default' AND slug = 'accounts/widget-co'");
+    for (const caller of [local, remote]) {
+      const card = (await call('entity', { name: 'WGCO' }, caller)).json.card;
+      expect(card.entity.slug).toBe('crm/widget-co');
+      expect((card.identity_excerpt ?? []).filter((l: { slug: string }) => l.slug === 'accounts/widget-co')).toEqual([]);
+      expect(JSON.stringify(card)).not.toContain('Copper Fox');
+    }
+  });
+
   test('a name both siblings claim links to every candidate; a document naming only the subject reaches referenced_by', async () => {
     await pair();
     await page(engine, 'notes/n1', 'note', 'Renewal call', 'Talked to Widget Co about the renewal.');

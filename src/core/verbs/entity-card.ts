@@ -325,7 +325,7 @@ export async function buildEntityCard(
   const card = await assembleCard(engine, sourceId, best.row, opts.remote, excludePrivate, opts.eligibility ?? {});
   if (opts.includeReferences) {
     Object.assign(card, await cardReferences(engine, sourceId, best.row, opts, excludePrivate, entityTypes),
-      await readCardIdentity(engine, sourceId, best.row, { excludePrivate, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
+      await readCardIdentity(engine, sourceId, best.row, { excludePrivate, excludeQuarantined: opts.omitQuarantined === true, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
   }
   return {
     found: true,
