@@ -239,11 +239,8 @@ import { v235 } from './v235-pinned-questions.ts';
 import { v236 } from './v236-open-loops-counterparty-source.ts';
 import { v237 } from './v237-facts-question-recall-indexes.ts';
 import { v238 } from './v238-persistence-client-request-id.ts';
-<<<<<<< HEAD
-import { v239 } from './v239-cjk-bigram-fts.ts';
-=======
 import { v239 } from './v239-extract-rollup-halt-reasons.ts';
->>>>>>> v0.60.178.0
+import { v240 } from './v240-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -482,4 +479,5 @@ export const MIGRATIONS: Migration[] = [
   v237,
   v238,
   v239,
+  v240,
 ];
