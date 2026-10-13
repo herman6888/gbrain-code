@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { PoolStallWatch } from '../core/postgres-engine/pool-stall-watch.ts';
+import { installRestartRequiredExit, recordServeTransport, resolveRestartRequiredExitSeconds, SERVE_RESTART_REQUIRED_EXIT_ENV } from './serve-health.ts';
+import { SERVE_UNHEALTHY_EXIT_CODE } from '../core/exit-codes.ts';
 import type { BrainEngine } from '../core/engine.ts';
 // C10: `--fail-fast` / GBRAIN_SERVE_FAIL_FAST=1 — exit with the classified envelope instead of status-only/degraded mode (decided in src/cli.ts's connect path; F4's status mode consults it too).
 export { serveFailFastRequested, writeServeFailFastEnvelope } from '../core/serve-fail-fast.ts';
@@ -246,8 +248,21 @@ export async function runServe(
     console.error(`[gbrain serve] ignoring GBRAIN_SURFACE="${resolved.invalidEnv}" (use verbs | starter | full)`);
   }
   console.error(`[gbrain serve] surface=${surface} (source: ${SURFACE_SOURCE_LABEL[resolved.source]})`);
+  void (await import('../core/serve-behavior-notice.ts')).logServeBehaviorNotice(engine, loadConfig());
+  // #6543 (A6): serve's stuck, desync and recovery events go to the pool-recovery audit `doctor --only pool_reap_health` reads.
+  if (engine.kind === 'postgres') {
+    const { logPoolRecovery } = await import('../core/audit/pool-recovery-audit.ts');
+    (await import('../core/pool-gauge.ts')).setPoolIncidentAudit((kind, detail) => logPoolRecovery(kind, undefined, detail));
+  }
   // #6383: the pool stall line (Postgres only; the watch reports nothing for an engine without pool numbers).
   if (engine.kind === 'postgres') new PoolStallWatch(engine, (line) => console.error(line)).start();
+  // #6543: the read pool's transport facts, logged once and kept for /health?deep=1; the opt-in unhealthy exit.
+  if (engine.kind === 'postgres') void recordServeTransport(engine, (line) => console.error(line));
+  const restartRequiredExitSeconds = resolveRestartRequiredExitSeconds(process.env[SERVE_RESTART_REQUIRED_EXIT_ENV]);
+  if (restartRequiredExitSeconds !== null) {
+    installRestartRequiredExit(engine, restartRequiredExitSeconds, { log: (line) => console.error(line), exit: opts.exit ?? ((code: number) => { process.exit(code); }) });
+    console.error(`[gbrain serve] ${SERVE_RESTART_REQUIRED_EXIT_ENV}=${restartRequiredExitSeconds}: exits ${SERVE_UNHEALTHY_EXIT_CODE} after persistence_restart_required holds that long (at most 3 self-exits per hour)`);
+  }
   // #4768: stdio read-only access ceiling. HTTP refuses it: per-token grants
   // (auth rescope-token --operations / rescope-client) are its operation control.
   const access = parseAccessFlag(args);

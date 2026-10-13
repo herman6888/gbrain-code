@@ -10,6 +10,7 @@ import { affectsRecall } from '../core/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, enforceBoundClientOpAllowList, opError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
+import type { OperationMeta } from '../core/ops/contract.ts';
 import { loadConfig } from '../core/config.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { getCliOptions } from '../core/cli-options.ts';
@@ -21,8 +22,9 @@ import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTes
 import { logVerbUsage } from '../core/verbs/usage-log.ts';
 import { searchCountLine } from '../core/search/keyword-paging.ts';
 import { dateLabelLine } from '../core/search/date-labels.ts';
-import { localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
-import { hiddenToolHint } from './hidden-tool-hint.ts';
+import { hiddenTakesNotice, localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
+import { hiddenToolHint, hiddenToolNext, hiddenToolRoute, type ToolConnection } from './hidden-tool-hint.ts';
+import { opAllowedForBoundClient } from '../core/ops/context.ts';
 import { takePostUpgradeMcpNotice } from '../core/post-upgrade-notice.ts';
 import { takeHttpBehaviorNotice, takeLocalBehaviorNotice } from '../core/behavior-change-notice.ts';
 import { takeChatFallbackHopNotices } from '../core/ai/fallback-hop-queue.ts';
@@ -269,6 +271,12 @@ export interface DispatchOpts {
   stdioSurface?: OperationContext['stdioSurface'];
   /** Threaded into OperationContext.revealTools (stdio session tool reveal). */
   revealTools?: (names: string[]) => void;
+  /**
+   * D2: whether this connection's tools/list shows a callable tool (the
+   * advertised surface can list fewer tools than the callable set). Unset =
+   * every callable tool counts as listed.
+   */
+  isListed?: (op: OperationMeta) => Promise<boolean>;
   /** #5232: commit wait for coordinated writes (OperationContext.writeWaitMs); unset = agent default. */
   writeWaitMs?: number;
   /** C1: search/query row shape chosen by the transport (OperationContext.resultRows); unset = lean for remote callers. */
@@ -540,18 +548,18 @@ export function requestLogStatusForResult(result: ToolResult): RequestLogStatus 
  * gate state is unknown here, and a suggestion naming a hidden/gated op
  * would be the exact existence oracle this envelope exists to prevent.
  */
-export function unknownToolEnvelope(name: string, opts: DispatchOpts, legacyError?: 'unknown_operation'): ToolResult {
+export function unknownToolEnvelope(name: string, opts: DispatchOpts, legacyError?: 'unknown_operation', notices: Notice[] = []): ToolResult {
   const allowedOps = opts.allowedOps;
   const candidates = operations
     .filter(op => !op.localOnly && !op.publishGateKey && (allowedOps ? allowedOps.has(op.name) : true))
     .map(op => op.name);
   const nearest = suggestNearest(name, candidates);
-  const hint = hiddenToolHint(operations.find(o => o.name === name), opts, dispatchRenderContext(opts).isCallable('request_tools') && opts.stdioSurface?.widenAllowed !== false); // F6: owner's stdio pipe only
+  const hint = hiddenToolHint(operations.find(o => o.name === name), { ...opts, readOnly: opts.stdioSurface?.readOnly }, toolConnection(opts).canWiden); // F6: owner's stdio pipe only
   const suggestion = hint?.suggestion ?? (nearest
     ? `Did you mean "${nearest}"?`
     : 'List the tools this connection can call (tools/list) and use one of those names.');
   return errorResult(opError('unknown_tool', legacyError ? `Unknown: ${name}` : `Unknown tool: ${name}`, suggestion,
-    { ...(legacyError ? { legacy_error: legacyError } : {}), ...(hint ? { fix: hint.fix } : {}) }), opts);
+    { ...(legacyError ? { legacy_error: legacyError } : {}), ...(hint ? { fix: hint.fix } : {}) }), opts, { notices: admitNotices(notices, opts) });
 }
 
 /**
@@ -574,7 +582,7 @@ export function dispatchRenderContext(opts: DispatchOpts): RenderContext {
       const op = byName.get(opName);
       return !!op && isCallable(op, {
         transport, surface, scopes: opts.auth?.scopes ?? [], publishGates: {}, allowedOps: opts.allowedOps,
-      });
+      }) && (transport === 'cli' || opAllowedForBoundClient(opts.auth, op));
     },
     preapproved: () => false,
     ...(opts.auth?.clientId ? { principal: opts.auth.clientId } : {}),
@@ -600,7 +608,7 @@ function noticeAudience(opts: DispatchOpts): NoticeAudience {
   return { transport: opts.transport === 'stdio' ? 'stdio' : opts.remote === false ? 'cli' : 'http', principal: opts.auth?.clientId, sessionId: opts.sessionId };
 }
 
-function admitNotices(notices: Notice[], opts: DispatchOpts): Notice[] {
+export function admitNotices(notices: Notice[], opts: DispatchOpts): Notice[] {
   if (notices.length === 0) return notices;
   try {
     const audience = noticeAudience(opts);
@@ -609,6 +617,104 @@ function admitNotices(notices: Notice[], opts: DispatchOpts): Notice[] {
   } catch {
     return notices;
   }
+}
+
+/**
+ * The hidden-tool route inputs for one dispatch caller (F6 and D2 share
+ * them): stdio widens its own session when widening is on; an HTTP OAuth
+ * client widens its own surface up to the server ceiling unless the brain
+ * owner pinned it; the grant (scopes, snapshot, fence) bounds both.
+ */
+export function toolConnection(opts: DispatchOpts): ToolConnection {
+  const render = dispatchRenderContext(opts);
+  const http = render.transport === 'http';
+  const auth = opts.auth;
+  return {
+    transport: render.transport,
+    surface: opts.surface ?? 'full',
+    readOnly: opts.stdioSurface?.readOnly,
+    ceiling: http ? opts.surfaceCeiling ?? opts.surface ?? 'full' : 'full',
+    canWiden: render.isCallable('request_tools') && (http
+      ? auth?.principal?.kind === 'oauth_client' && auth.surfaceSetBy !== 'operator'
+      : opts.stdioSurface?.widenAllowed !== false),
+    isCallable: render.isCallable,
+    grantAllows: op => opAllowedForBoundClient(auth, op) && (!http || operationScopesAllowed(auth?.scopes ?? [], op)),
+  };
+}
+
+/** Reads whose result never shows the takes table to an agent-facing reader. */
+const HIDDEN_TAKES_OPS: ReadonlySet<string> = new Set(['get_page', 'search', 'query']);
+
+/**
+ * D2 `hidden_tool_content`: a page read or search that left out takes says
+ * so, with the next step this connection can actually take (the
+ * hidden-tool route): call takes_list (stdio also lists it), widen with
+ * request_tools, or the brain owner's repair. Silent when takes_list is
+ * already in this connection's tool list. Never throws.
+ */
+async function hiddenContentNotices(engine: BrainEngine, name: string, result: unknown, ctx: OperationContext, opts: DispatchOpts): Promise<Notice[]> {
+  if (opts.remote === false || !HIDDEN_TAKES_OPS.has(name)) return [];
+  try {
+    const op = operations.find(o => o.name === 'takes_list');
+    const conn = toolConnection(opts);
+    const route = hiddenToolRoute(op, conn);
+    if (!op || !route) return [];
+    if (route.kind === 'callable' && (!opts.isListed || await opts.isListed(op))) return [];
+    const { takesHiddenFromResult } = await import('../core/ops/takes.ts');
+    const hidden = await takesHiddenFromResult(ctx, name, result);
+    if (!hidden) return [];
+    const host = route.kind === 'host' && conn.transport === 'http' && opts.auth
+      ? (await import('../core/harness/capabilities.ts')).grantRepairAction(await sessionGrantDiagnosis(engine, opts)) : null;
+    const what = `the takes on ${hidden.pages[0]}`;
+    const fix = hiddenToolNext(op, { tool: op.name, arguments: { page_slug: hidden.pages[0] } }, route, conn, what, host);
+    if (route.kind === 'callable') opts.revealTools?.([op.name]);
+    return [hiddenTakesNotice(hidden, route.kind, fix)];
+  } catch {
+    return [];
+  }
+}
+
+/** A refusal a grant explains: a missing scope or an operation outside the grant's snapshot or fence. */
+function refusedByGrant(e: unknown): boolean {
+  return e instanceof OperationError && (e.code === 'insufficient_scope' || e.code === 'permission_denied');
+}
+
+/**
+ * D4 `grant_blocked_operations` on the connection's own authenticated path:
+ * the shared capabilities resolver diagnoses the verifier's principal
+ * (never a display name) and the notice reaches it once per (principal,
+ * transport session); a stateless call with no session id counts once per
+ * (principal, grant revision), so three stateless calls get one notice and a
+ * rescoped grant is diagnosed afresh. A missing scope is reported only on a
+ * refused call. Never throws; a failure delivers nothing.
+ */
+export async function grantBlockedNotices(engine: BrainEngine, opts: DispatchOpts, refused: boolean): Promise<Notice[]> {
+  const auth = opts.auth;
+  const principal = auth?.principal;
+  if (!auth || !principal || opts.remote === false) return [];
+  try {
+    const { grantBlockedNotice } = await import('../core/harness/capabilities.ts');
+    const notice = grantBlockedNotice(await sessionGrantDiagnosis(engine, opts), { refused });
+    return notice && (opts.noticeLedger ?? processNoticeLedger()).claim(`grant_blocked_operations|${grantSessionKey(auth, principal, opts.sessionId)}`) ? [notice] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The D4 session: (principal, transport session), or (principal, grant revision) for a stateless call. */
+function grantSessionKey(auth: AuthInfo, principal: NonNullable<AuthInfo['principal']>, sessionId: string | undefined): string {
+  const revision = Number.isSafeInteger(auth.grantRevision) ? String(auth.grantRevision) : 'none';
+  return `${principal.kind}:${principal.id}|${sessionId ? `session:${sessionId.slice(0, SESSION_ID_MAX_CHARS)}` : `revision:${revision}`}`;
+}
+
+/** The shared capabilities resolver's diagnosis for this caller, computed once per D4 session and grant revision. */
+async function sessionGrantDiagnosis(engine: BrainEngine, opts: DispatchOpts) {
+  const auth = opts.auth!;
+  const { resolveGrantDiagnosis } = await import('../core/harness/capabilities.ts');
+  const revision = Number.isSafeInteger(auth.grantRevision) ? String(auth.grantRevision) : 'none';
+  const compute = () => resolveGrantDiagnosis(auth, engine, opts.config ?? loadConfig() ?? { engine: 'postgres' }, { surfaceCeiling: opts.surfaceCeiling });
+  if (!auth.principal) return compute();
+  return (opts.noticeLedger ?? processNoticeLedger()).memoize(`grant_diagnosis|${grantSessionKey(auth, auth.principal, opts.sessionId)}|${revision}`, compute);
 }
 
 /**
@@ -713,6 +819,7 @@ export function buildOperationContext(
     (typeof opts.sessionId === 'string' && opts.sessionId.length > 0
       ? opts.sessionId.slice(0, SESSION_ID_MAX_CHARS)
       : undefined) ?? metaSessionIdFrom(params);
+  let render: RenderContext | undefined;
   return {
     engine,
     config: opts.config ?? loadConfig() ?? { engine: 'postgres' },
@@ -734,6 +841,7 @@ export function buildOperationContext(
     ...(opts.revealTools ? { revealTools: opts.revealTools } : {}),
     ...(opts.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
     ...(opts.resultRows ? { resultRows: opts.resultRows } : {}),
+    isCallable: (opName: string) => (render ??= dispatchRenderContext(opts)).isCallable(opName),
     auth: opts.auth,
   };
 }
@@ -771,7 +879,7 @@ export async function dispatchToolCall(
   // on every transport, not just unlisted. Same envelope as unknown ops so
   // the surface doesn't leak which names exist.
   if (opts.allowedOps && !opts.allowedOps.has(name)) {
-    return unknownToolEnvelope(name, opts);
+    return unknownToolEnvelope(name, opts, undefined, await grantBlockedNotices(engine, opts, true));
   }
 
   const op = operations.find(o => o.name === name);
@@ -781,7 +889,7 @@ export async function dispatchToolCall(
     // plain `Error: ...` string here breaks the contract on every
     // unknown-op path and the resulting test failure looked like a
     // transport bug.
-    return unknownToolEnvelope(name, opts);
+    return unknownToolEnvelope(name, opts, undefined, await grantBlockedNotices(engine, opts, true));
   }
 
   // localOnly backstop at the SHARED layer (WP1/D7): localOnly ops reach the
@@ -792,7 +900,7 @@ export async function dispatchToolCall(
   // serve-http path also filters these at list time; the legacy bearer
   // transport at surface 'full' had no gate at all before this line.
   if (op.localOnly && opts.transport !== 'stdio') {
-    return unknownToolEnvelope(name, opts);
+    return unknownToolEnvelope(name, opts, undefined, await grantBlockedNotices(engine, opts, true));
   }
   // F5: an owner-only op is never listed on MCP; a call gets the exact CLI command.
   if (op.cliOnly && opts.remote !== false) return errorResult(cliOnlyRefusal(op), opts, { op: name });
@@ -981,6 +1089,7 @@ export async function dispatchToolCall(
     const rerankDegradedCalls = recordRerankDegradation(responseMeta, opts);
     notices.push(...recallInteropNotices(name, result, responseMeta, safeParams,
       { config: ctx.config, transport: dispatchRenderContext(opts).transport, binding: ctx.explicitReadBinding, rerankDegradedCalls }));
+    notices.push(...await hiddenContentNotices(engine, name, result, ctx, opts));
     // Monthly backup-coverage: one AGGREGATE notice per process (counts only —
     // never a local path or source id). The refresher runs on the stdio
     // transport ONLY — the WP1/D7 locality axis localOnly ops use; 'http' or
@@ -999,6 +1108,7 @@ export async function dispatchToolCall(
     if (opts.transport === 'stdio' && opts.remote !== false) notices.push(...await mcpOnboardingNotices({ engine, op: name, result, meta: responseMeta, config: ctx.config, render: dispatchRenderContext(opts) }));
     if (opts.transport === 'stdio' && opts.remote !== false) { const drain = takeFactsDrainNotice(); if (drain) notices.push(drain); } // Lane D facts drain
     notices.push(...await sessionSafetyNotices(engine, opts, ctx.config));
+    notices.push(...await grantBlockedNotices(engine, opts, false));
     const out: ToolResult = toolResultWithNotices(result, admitNotices(notices, opts), dispatchRenderContext(opts));
     if (evidenceBlocks.length > 0) out.content.splice(1, 0, ...evidenceBlocks.map(text => ({ type: 'text' as const, text })));
     if (opts.transport === 'stdio') {
@@ -1034,6 +1144,7 @@ export async function dispatchToolCall(
     // which redacts raw messages, keeps verbs on their frozen v1 codes, and
     // never tells a mutating op with an unknown outcome to retry.
     notices.push(...await sessionSafetyNotices(engine, opts, ctx.config));
+    notices.push(...await grantBlockedNotices(engine, opts, refusedByGrant(e)));
     return errorResult(e, opts, { op: name, mutating: op.mutating === true, idempotent: op.idempotent === true, notices: admitNotices(notices, opts) });
   }
 }

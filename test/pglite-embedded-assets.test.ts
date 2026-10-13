@@ -15,7 +15,8 @@ import { describe, test, expect } from 'bun:test';
 import { existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { resolvePgliteAssetPaths, getEmbeddedPgliteOptions } from '../src/core/pglite-embedded-assets.ts';
+import { PGlite } from '@electric-sql/pglite';
+import { resolvePgliteAssetPaths, getEmbeddedPgliteOptions, PGLITE_START_PARAM_OVERRIDES } from '../src/core/pglite-embedded-assets.ts';
 
 describe('resolvePgliteAssetPaths (#4116)', () => {
   test('dev checkout resolves via the embedded anchor with all five assets present', async () => {
@@ -48,5 +49,11 @@ describe('resolvePgliteAssetPaths (#4116)', () => {
     expect(opts.fsBundle).toBeInstanceOf(Blob);
     expect(opts.extensions.vector.name).toBe('pgvector');
     expect(opts.extensions.pg_trgm.name).toBe('pg_trgm');
+  });
+
+  test('startParams are PGLite defaults first, then the HNSW/WAL overrides (#6512 lazy import keeps the order)', async () => {
+    const opts = await getEmbeddedPgliteOptions();
+    expect(opts.startParams).toEqual([...PGlite.defaultStartParams, ...PGLITE_START_PARAM_OVERRIDES]);
+    expect(PGLITE_START_PARAM_OVERRIDES).toEqual(['-c', 'max_parallel_maintenance_workers=0', '-c', 'max_wal_size=8GB']);
   });
 });

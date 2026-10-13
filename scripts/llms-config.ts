@@ -174,6 +174,13 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/live-sync.md",
       },
       {
+        title: "docs/guides/shared-checkout-git.md",
+        description:
+          "Committing and pushing when several agents share one brain checkout: `gbrain git commit-push` / `scripts/brain-commit-push.sh` (writer lock, path-scoped commit, in-memory merge, fast-forward-only advance), the outcome table, conflict resolution with --resolve, recovering a stuck rebase, the lock contract for host daemons, and the git commands never to run there.",
+        path: "docs/guides/shared-checkout-git.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/sync-unblock-runbook.md",
         description: "Operator-agent loop for a managed catch-up on a live checkout: gbrain sync status --json (cursor, committed_last_10m, each hold and the last error with class / safe_actions / needs_human), gbrain sync unblock --apply, and the decision table (page / connection / systemic) behind them.",
         path: "docs/guides/sync-unblock-runbook.md",

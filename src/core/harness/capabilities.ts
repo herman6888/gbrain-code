@@ -5,6 +5,7 @@ import type { GBrainConfig } from '../config.ts';
 import { TOKEN_TTL_MAX_SECONDS, TOKEN_TTL_MIN_SECONDS, normalizeGrantBrain, validGrantPrefixes } from '../grants/model.ts';
 import { shellQuote } from '../mcp-registration.ts';
 import type { CatalogProvenance } from '../grants/profiles.ts';
+import type { Action, Notice } from '../agent-output.ts';
 
 type GrantSurface = 'verbs' | 'starter' | 'full';
 
@@ -202,6 +203,65 @@ export function describeGrantDiagnosis(gaps: GrantGaps, opts: {
       all_operations: { argv: argvs.all_operations, label: ALL_OPERATIONS_CHOICE },
     } : null,
   };
+}
+
+export type GrantDiagnosis = ReturnType<typeof describeGrantDiagnosis>;
+
+const GRANT_DOCS = 'docs/guides/repair.md#grant-blocked-operations';
+const GRANT_VERIFY = { argv: ['gbrain', 'doctor', '--only', 'grant_new_ops_available', '--json'], mcp: { tool: 'whoami', arguments: {} } };
+
+/**
+ * The host-owned repair for a grant diagnosis as an agent-contract Action:
+ * the preview command, then the apply command, relayed to the user (the
+ * agent never runs it). A server ceiling alone gets the read-only doctor
+ * check that names the setting, because no grant change lifts it.
+ */
+export function grantRepairAction(d: GrantDiagnosis): Action | null {
+  if (d.fix) {
+    return {
+      argv: d.fix.argv, consent: ['credentials'], actor: 'host_admin', requires_exclusive: false,
+      why: 'Previews the grant change on the brain host; the brain owner reviews it, then runs the command in `then`. Changing a grant widens what this credential can do, so nothing changes automatically.',
+      user_message: d.fix.user_message, docs: GRANT_DOCS, verify: GRANT_VERIFY,
+      ...(d.fix.inputs ? { inputs: d.fix.inputs } : {}),
+      then: { argv: d.fix.then_argv, consent: ['credentials'], actor: 'host_admin', requires_exclusive: false, why: 'Applies the previewed grant change.' },
+    };
+  }
+  if (!d.blockers.some(b => b.blocker === 'server_ceiling')) return null;
+  return {
+    argv: GRANT_VERIFY.argv, consent: [], actor: 'user', requires_exclusive: false, docs: GRANT_DOCS, verify: GRANT_VERIFY,
+    why: 'The server tool surface (config mcp_surface, `gbrain serve --surface` or GBRAIN_MCP_FORCE_SURFACE) caps this connection, and no grant change lifts it; this read-only check on the brain host names the setting.',
+    user_message: 'This gbrain connection is capped by the server\'s tool surface setting on the brain host. Running the command shown there names the setting; changing it is the brain owner\'s call.',
+  };
+}
+
+function blockerPhrase(b: Record<string, unknown>): string {
+  if (b.blocker === 'operation_snapshot') return `its operation snapshot (${b.excluded_count})`;
+  if (b.blocker === 'client_pin') return `its stored ${b.surface} tool surface${b.set_by === 'operator' ? ', which the brain owner pinned' : ''} (${b.excluded_count})`;
+  return `the server's ${b.surface} tool surface (${b.excluded_count})`;
+}
+
+/**
+ * D4 `grant_blocked_operations`: the in-band stale-grant notice. Counts per
+ * blocker, never operation names; the inferred grant age kept apart. A
+ * missing scope is reported only on a refused call (it is how the grant was
+ * issued, not a fault). Null when nothing applies.
+ */
+export function grantBlockedNotice(d: GrantDiagnosis, opts: { refused: boolean }): Notice | null {
+  const reachable = d.blockers.filter(b => b.blocker !== 'scope');
+  const scope = d.blockers.find(b => b.blocker === 'scope') as { missing_scopes: string[] } | undefined;
+  const parts: string[] = [];
+  if (reachable.length && d.unreachable_count > 0) {
+    const n = d.unreachable_count;
+    const age = 'statement' in d.grant_age ? ` ${d.grant_age.statement}` : '';
+    parts.push(`This connection's grant cannot call ${n} operation${n === 1 ? '' : 's'} its scopes allow, blocked by ${reachable.map(blockerPhrase).join(' and by ')} (counted per blocker; an operation can sit behind more than one).${age}`
+      + ' Only the brain owner can change this on the brain host, and nothing widens automatically; whoami reports the same diagnosis as grant_diagnosis.');
+  }
+  if (opts.refused && scope) {
+    parts.push(`This grant has no ${scope.missing_scopes.join(' or ')} scope, so operations that need it are refused on this connection; that is how the grant was issued, and only the brain owner can change it.`);
+  }
+  if (!parts.length) return null;
+  const fix = reachable.length ? grantRepairAction(d) : null;
+  return { code: 'grant_blocked_operations', kind: 'info', why: parts.join(' '), ...(fix ? { fix } : {}) };
 }
 
 /**

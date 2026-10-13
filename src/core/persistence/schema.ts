@@ -19,6 +19,16 @@ export const PERSISTENCE_SYNC_RUN_INDEXES = [
   { name: 'persistence_requests_sync_run_committed', sql: PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL },
 ] as const;
 /**
+ * #6511: the page purge's lookup of stored intents for a slug (`findRequestsForSlugs`: source, slug, uncompacted rows
+ * with an intent) ran as a sequential scan of the request table inside the 5 s purge transaction. Postgres builds it
+ * CONCURRENTLY in the persistence_request_slug_intent_index migration (`transaction: false`); PGLite inline. `gbrain repair request-indexes` rebuilds it.
+ */
+export const PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_slug_intent
+  ON persistence_requests(source_id,slug,sequence) WHERE intent IS NOT NULL AND NOT compacted`;
+export const PERSISTENCE_REQUEST_SLUG_INTENT_INDEX = { name: 'persistence_requests_slug_intent', table: 'persistence_requests', sql: PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL } as const;
+/** Every request-table index built online (a migration, then `gbrain repair request-indexes` and doctor `persistence_request_indexes`). */
+export const PERSISTENCE_REQUEST_ONLINE_INDEXES = [...PERSISTENCE_SYNC_RUN_INDEXES, PERSISTENCE_REQUEST_SLUG_INTENT_INDEX] as const;
+/**
  * #6317: the movement watermark (the newest committed receipt of a worktree)
  * that `writer movement`, `data_moving` and doctor `managed_sync_not_moving`
  * read; the baseline indexes cover pending, recovery and principal reads
@@ -85,6 +95,7 @@ export const PERSISTENCE_CONSUMERS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS persi
 /** Indexes the Postgres blob omits because a migration builds them CONCURRENTLY. */
 export const POSTGRES_CONCURRENT_PERSISTENCE_INDEXES: ReadonlySet<string> = new Set([
   PERSISTENCE_DATABASE_PENDING_INDEX_SQL, PERSISTENCE_SYNC_RUN_OPEN_INDEX_SQL, PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL, PERSISTENCE_SYNC_WATERMARK_INDEX_SQL, PERSISTENCE_COMPACTABLE_INDEX_SQL,
+  PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL,
 ]);
 /** Durable infrastructure: never reconstruct or discard these rows during page reindexing. */
 export const PERSISTENCE_SCHEMA_STATEMENTS = [
@@ -178,6 +189,7 @@ export const PERSISTENCE_SCHEMA_STATEMENTS = [
   PERSISTENCE_SYNC_RUN_COMMITTED_INDEX_SQL,
   PERSISTENCE_SYNC_WATERMARK_INDEX_SQL,
   PERSISTENCE_COMPACTABLE_INDEX_SQL,
+  PERSISTENCE_REQUEST_SLUG_INTENT_INDEX_SQL,
   `CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC)`,
   `CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,

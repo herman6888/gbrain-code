@@ -183,9 +183,11 @@ and publishes a checksummed archive with POSIX mode `0600`. On Windows, built-in
 Windows PowerShell establishes and verifies access for the current owner and
 SYSTEM before writing backup payloads. It protects only newly created backup
 paths, never changes existing parent permissions, and refuses with
-`private_backup_path_unavailable` if enforcement is unavailable. Use a new private
-destination on a local filesystem with Windows ACL support and permitted
-Windows PowerShell. A busy database or a
+`private_backup_path_unavailable` when that protection could not be established
+or verified at the destination (some locations' inherited permissions prevent
+it; a new path inside your user profile works). The destination must be on a
+local filesystem with Windows ACL support, with built-in Windows PowerShell
+permitted. A busy database or a
 changing file fails the operation instead of publishing a success receipt.
 
 Before the dump, the command removes gbrain's own IPC socket files
@@ -195,9 +197,12 @@ later backups; each removal is listed in the archive's `omitted` inventory.
 Any other socket, FIFO or symlink in the data dir is left alone and the
 command refuses with `backup_dump_failed` naming it: stop the process that
 uses it (or move it out of the data dir) and run the same command again.
-This cleanup is verified on Linux and macOS; on Windows a stale socket is
-removed through the native lock binding and has not been exercised on a
-native runner.
+On Windows the runtime cannot inspect a stale AF_UNIX socket (`lstat` fails),
+so the sweep probes and claims such an entry without classifying it and removes
+it only through the native binding's tag check; an entry nothing can verify is
+kept and named in the refusal (`an entry this runtime cannot inspect`), never
+deleted blind. The Linux and macOS lanes cover the sweep; the `windows-latest`
+row of `test.yml` runs the stale-socket test natively.
 
 | Included | Excluded or inventoried for reconnection |
 | --- | --- |

@@ -121,11 +121,12 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
   }
 }
 
-/** #6288: a successful managed sync clears this source's recorded failures its imported commit already settles; best effort. */
+/** #6288: a successful managed sync clears this source's recorded failures its imported commit already settles (#6543 D5: legacy ledger rows too); best effort. */
 async function clearSettledFailures(engine: BrainEngine, sourceId: string): Promise<void> {
   try {
     const { clearSettledManagedSyncFailures, readManagedSyncImported } = await import('../../core/persistence/sync-failures.ts');
     const imported = await readManagedSyncImported(engine, sourceId);
     if (imported) await clearSettledManagedSyncFailures(engine, imported);
+    if (imported) await (await import('../../core/persistence/legacy-sync-failures.ts')).settleLegacySyncFailures(engine, imported);
   } catch { }
 }

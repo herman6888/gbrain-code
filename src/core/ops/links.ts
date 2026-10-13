@@ -526,7 +526,7 @@ const traverse_graph: Operation = {
   params: {
     slug: { type: 'string', description: 'Start page slug.', required: true },
     depth: { type: 'number', description: `Max depth (cap ${TRAVERSE_DEPTH_CAP}).` },
-    link_type: { type: 'string', description: 'Follow only this link type.' },
+    link_type: { type: 'string', description: 'Only this link type.' },
     direction: { type: 'string', description: 'Remote default both.', enum: ['in', 'out', 'both'] },
     hops: {
       type: 'array',

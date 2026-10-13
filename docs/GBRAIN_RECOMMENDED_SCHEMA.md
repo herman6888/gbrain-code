@@ -720,8 +720,12 @@ For **"Alex from Meridian Labs"** (mentioned in the meeting but not an attendee)
 
 **Step 8: Commit and notify.**
 ```bash
-cd /data/brain && git add -A && git commit -m "meetings: 2026-04-07 product review, investor sync" && git push
+cd /data/brain && scripts/brain-commit-push.sh "meetings: 2026-04-07 product review, investor sync" \
+  meetings/ people/alex-rivera.md people/.raw/alex-rivera.json companies/meridian-labs.md ops/tasks.md
 ```
+The helper commits only the files this run touched and pushes; on a non-zero
+exit the agent stops and reports the error code instead of posting the
+summary ([outcomes](guides/shared-checkout-git.md#outcomes)).
 Posts summary to the Meetings notification channel: "Processed 2 meetings. Created 1 new person page (Alex Rivera). Updated 4 entity pages. 5 action items extracted."
 
 **Files touched in this run:**
@@ -913,9 +917,9 @@ Once you have cron jobs, ingest jobs, and sub-agents all touching the brain repo
 
 Practical mitigations:
 - **Treat index.md as derived, not hand-maintained.** Instead of updating it in every ingest workflow, rebuild it periodically (daily or on-demand) by scanning the directory tree. This eliminates it as a write hotspot.
-- **Make log.md append-safe.** Each entry is a self-contained line with a timestamp prefix. Concurrent appends to the end of the file rarely conflict. If they do, both sides are correct — just keep both lines.
+- **Make log.md append-safe.** Each entry is a self-contained line with a timestamp prefix. Two machines that append to the end of the file at the same time do conflict; both sides are correct, so keep both lines (resolve with a merged copy: [conflicts](guides/shared-checkout-git.md#conflicts)).
 - **Commit in batches, not per-page.** When an ingest job updates 10 entity pages, commit once at the end, not 10 times. This reduces conflict surface.
-- **Pull before push.** Every workflow should `git pull --rebase` before pushing. With append-only log and independent entity pages, rebases almost always auto-resolve.
+- **Commit and push through the shared-checkout helper.** Every workflow commits with `scripts/brain-commit-push.sh "<msg>" <paths>` (or `gbrain git commit-push`), and pulls with its `--pull` mode. It takes one writer lock per checkout, commits only the named paths and merges remote commits in memory, so it never stashes or rebases files other workflows are writing. With an append-only log and independent entity pages, those merges almost always succeed ([shared-checkout git](guides/shared-checkout-git.md)).
 - **Entity pages rarely conflict.** Two workflows updating `people/jane-doe.md` at the same time is rare because they're triggered by different signals about different people. The real conflict hotspots are the shared files (index.md, log.md), which is why those should be append-only or derived.
 
 ## Maintenance (Lint)

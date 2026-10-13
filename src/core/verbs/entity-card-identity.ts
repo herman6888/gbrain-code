@@ -22,6 +22,7 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { ALIAS_ORIGIN_RANK, declarationsIn, titleName, type AliasOrigin } from '../mentions/aliases.ts';
 import { readIdentitySiblings, SIBLING_GROUP_CAP } from '../mentions/siblings.ts';
+import type { MentionPolicy, PackTypes } from '../mentions/policy.ts';
 import type { Notice } from '../agent-output.ts';
 
 export const EXCERPT_PAGE_CHARS = 600;
@@ -109,26 +110,47 @@ const GUIDANCE = 'aka lists names gbrain recognized as declared on this page (ak
 const GUIDANCE_VERBS = 'aka lists names gbrain recognized as declared on this page (aka_sources says where); it is not proof the list is complete. '
   + 'Before a history or as-of answer, also look for records under every name shown in aka, identity_siblings and identity_excerpt; searching needs the search tool on the starter surface.';
 
+export interface SiblingIdentity {
+  /** Alias rows of the page and its siblings, by alias_norm. */
+  aliasRows: Array<{ slug: string; alias_norm: string; origin: string | null; alias_text: string | null }>;
+  /** The siblings with their own aliases; absent when there is no group and no cap. */
+  identity_siblings?: NonNullable<CardIdentity['identity_siblings']>;
+}
+
+/**
+ * The identity siblings of `row` with their own aliases (the `entity names[]`
+ * rows read only these). `policy` and `pack`, when a batch already read them,
+ * skip the per-page reads. Fail-soft.
+ */
+export async function readSiblingIdentity(engine: BrainEngine, sourceId: string, row: { slug: string; title: string | null },
+  opts: { excludePrivate: boolean; excludeQuarantined?: boolean; policy?: MentionPolicy; pack?: PackTypes | null }): Promise<SiblingIdentity> {
+  const siblings = await readIdentitySiblings(engine, sourceId, row, opts);
+  const aliasRows = await engine.executeRaw<SiblingIdentity['aliasRows'][number]>(
+    `SELECT slug, alias_norm, origin, alias_text FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[]) ORDER BY alias_norm`,
+    [sourceId, [row.slug, ...siblings.pages.map(p => p.slug)]]).catch(() => []);
+  if (!siblings.pages.length && !siblings.capped) return { aliasRows };
+  return {
+    aliasRows,
+    identity_siblings: {
+      pages: siblings.pages.map(p => ({ ...p, aka: [...new Set(aliasRows.filter(a => a.slug === p.slug).map(a => a.alias_text ?? a.alias_norm))] })),
+      capped: siblings.capped,
+    },
+  };
+}
+
 /** The card's identity fields for `row`. Fail-soft: a failed read leaves the field out. */
 export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   row: { slug: string; title: string | null; compiled_truth: string | null },
   opts: { excludePrivate: boolean; excludeQuarantined?: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full'; aka: string[] }): Promise<CardIdentity> {
-  const siblings = await readIdentitySiblings(engine, sourceId, row, { excludePrivate: opts.excludePrivate, excludeQuarantined: opts.excludeQuarantined });
-  const slugs = [row.slug, ...siblings.pages.map(p => p.slug)];
-  const aliasRows = await engine.executeRaw<{ slug: string; alias_norm: string; origin: string | null; alias_text: string | null }>(
-    `SELECT slug, alias_norm, origin, alias_text FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[]) ORDER BY alias_norm`,
-    [sourceId, slugs]).catch(() => []);
+  const { aliasRows, identity_siblings } = await readSiblingIdentity(engine, sourceId, row, { excludePrivate: opts.excludePrivate, excludeQuarantined: opts.excludeQuarantined });
+  const siblingPages = identity_siblings?.pages ?? [];
+  const slugs = [row.slug, ...siblingPages.map(p => p.slug)];
   const own = aliasRows.filter(a => a.slug === row.slug);
   const bestOrigin = (norm: string) => own.filter(a => a.alias_norm === norm).map(a => a.origin ?? 'frontmatter')
     .sort((x, y) => (ALIAS_ORIGIN_RANK[x as AliasOrigin] ?? 0) - (ALIAS_ORIGIN_RANK[y as AliasOrigin] ?? 0))[0] ?? 'frontmatter';
   const aka_sources = opts.aka.map(norm => ({ origin: bestOrigin(norm), slug: row.slug }));
   const out: CardIdentity = { aka_sources };
-  if (siblings.pages.length || siblings.capped) {
-    out.identity_siblings = {
-      pages: siblings.pages.map(p => ({ ...p, aka: [...new Set(aliasRows.filter(a => a.slug === p.slug).map(a => a.alias_text ?? a.alias_norm))] })),
-      capped: siblings.capped,
-    };
-  }
+  if (identity_siblings) out.identity_siblings = identity_siblings;
   // Snapshot reads carry the withdrawal overlay get_page shows, so a forgotten fence row is struck and the sanitizer drops it.
   const { snapshots } = await engine.readPageSnapshotsBatch(slugs.map(slug => ({ slug, sourceId })))
     .catch(() => ({ snapshots: new Map<string, PageSnapshot>() }));
@@ -150,7 +172,7 @@ export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   }
   if (excerpt.length) out.identity_excerpt = excerpt;
   if (omitted.length) out.identity_excerpt_omitted = omitted;
-  if (opts.aka.length || siblings.pages.length || excerpt.length) {
+  if (opts.aka.length || siblingPages.length || excerpt.length) {
     out.alias_guidance = opts.surfaceCeiling === 'verbs' ? { text: GUIDANCE_VERBS, requires_surface: 'starter' } : { text: GUIDANCE };
   }
   return out;

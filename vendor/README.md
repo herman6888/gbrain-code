@@ -74,6 +74,13 @@ to share types in: GBrain passes one per database target, so every pool in a
 process that reaches one database shares it, and `src/core/pg-type-cache.ts`
 saves it for the next process.
 
+Each statement's row count resets at its ReadyForQuery. Stock postgres.js
+resets it only at CommandComplete. A statement that streams rows and then fails
+never gets there: a runtime error after its first rows, or a cancel or timeout
+while it is still producing them. The next statement on that connection then
+stored its rows after that many empty slots, so a one-row read came back as
+`[empty, row]` (`test/e2e/postgres-driver-row-count-postgres.test.ts`).
+
 ## Reproduce and update
 
 Run `bash vendor/update-postgres.sh --check` to download the pinned upstream

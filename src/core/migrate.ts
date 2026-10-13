@@ -251,7 +251,12 @@ export async function runMigrationSQL(
         // Falling through means the DDL runs with the server default.
       }
       // #5227 (W14 P1.6): no transaction here, so the lock bound is session-level on this reserved backend and restored after.
-      await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${m.version}` });
+      // #6543 (A4): the raised statement_timeout is restored too, so the connection does not carry this migration's budget back to the pool.
+      try {
+        await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${m.version}` });
+      } finally {
+        await conn.executeRaw('RESET statement_timeout').catch(() => {});
+      }
     }, { selfContained: true });
   }
 }

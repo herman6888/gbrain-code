@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 231140,
-    "stdoutSha256": "bb979a78c5e89bb88016cc8af97c2215136976a11b8fdba6de37d572d83dc54d",
+    "stdoutBytes": 231878,
+    "stdoutSha256": "483f72a8533acf46fd7ff62602c053a1d78c6b77b872d60e56b3982d63df1ed9",
     "toolNames": [
       "remember",
       "entity",
@@ -259,7 +259,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "source_id": {
@@ -376,7 +376,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "semantic_review": {
@@ -526,7 +526,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -559,7 +559,7 @@
         "scope": "write"
       },
       {
-        "description": "Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.",
+        "description": "Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the next sync imports the file's current content into the surviving page. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -588,7 +588,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -608,7 +608,7 @@
         "scope": "write"
       },
       {
-        "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; a full page may be truncated: continue with updated_after + updated_after_slug from the last row.",
+        "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; truncated: continue with updated_after + updated_after_slug from the last row.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -662,7 +662,7 @@
               "type": "string"
             },
             "updated_after": {
-              "description": "Only pages updated after this ISO time.",
+              "description": "Pages updated after this ISO time.",
               "type": "string"
             },
             "updated_after_slug": {
@@ -700,7 +700,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -747,7 +747,7 @@
         "scope": "admin"
       },
       {
-        "description": "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. Use put_page to control slug or type; remember for facts about entities.",
+        "description": "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. put_page controls slug or type; remember is for facts about entities.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -758,11 +758,14 @@
           "depth": "string?",
           "expected_revision": "string?",
           "force": "boolean?",
+          "ingested_via": "string?",
           "kind": "string?",
           "local_file": "string?",
           "request_id": "string?",
           "slug": "string?",
           "source_id": "string?",
+          "source_kind": "string?",
+          "source_uri": "string?",
           "type": "string?",
           "what": "string?",
           "where": "string?",
@@ -796,6 +799,10 @@
               "description": "Ignore the revision.",
               "type": "boolean"
             },
+            "ingested_via": {
+              "description": "Trusted local CLI provenance (capture-cli); a remote caller's value is replaced by the server-stamped mcp:capture.",
+              "type": "string"
+            },
             "kind": {
               "description": "Event kind.",
               "type": "string"
@@ -805,7 +812,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -816,8 +823,16 @@
               "description": "Write source.",
               "type": "string"
             },
+            "source_kind": {
+              "description": "Trusted local CLI provenance (capture-cli); a remote caller's value is replaced by the server-stamped mcp:capture.",
+              "type": "string"
+            },
+            "source_uri": {
+              "description": "Trusted local CLI provenance (stdin, cli-positional); a remote caller's value is replaced by the server-stamped mcp:capture.",
+              "type": "string"
+            },
             "type": {
-              "description": "Schema-pack page type (default note).",
+              "description": "Page type (default note).",
               "type": "string"
             },
             "what": {
@@ -908,7 +923,7 @@
                     "type": "string"
                   },
                   "old_text": {
-                    "description": "Exact text to replace (must occur once).",
+                    "description": "Exact text to replace.",
                     "type": "string"
                   }
                 },
@@ -921,11 +936,11 @@
               "type": "array"
             },
             "expected_revision": {
-              "description": "revision from get_page include_content:true.",
+              "description": "From get_page include_content:true.",
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -1016,7 +1031,7 @@
         "scope": "write"
       },
       {
-        "description": "Read your write's receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.",
+        "description": "Your write's receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1040,7 +1055,7 @@
         "scope": "write"
       },
       {
-        "description": "List your write receipts in one source, newest first, for a lost request_id.",
+        "description": "Your write receipts in one source, newest first (for a lost request_id).",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1054,7 +1069,7 @@
         "schema": {
           "properties": {
             "before": {
-              "description": "next cursor from the previous page.",
+              "description": "Previous page's next cursor.",
               "type": "string"
             },
             "limit": {
@@ -1073,7 +1088,7 @@
         "scope": "write"
       },
       {
-        "description": "Cancel your accepted write before it publishes. Returns the actual receipt.",
+        "description": "Cancel your accepted write before it publishes; returns the receipt.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -1097,7 +1112,7 @@
         "scope": "write"
       },
       {
-        "description": "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.",
+        "description": "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape or people/companies/projects by topic: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1232,7 +1247,7 @@
         "scope": "read"
       },
       {
-        "description": "Hybrid search plus multi-query expansion for concept/landscape questions (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
+        "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; expand adds multi-query expansion (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1300,7 +1315,7 @@
               "type": "string"
             },
             "expand": {
-              "description": "Default true; false skips the LLM expansion.",
+              "description": "Default per search mode (tokenmax on).",
               "type": "boolean"
             },
             "explain": {
@@ -1699,7 +1714,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -1744,7 +1759,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -2081,7 +2096,7 @@
               "type": "array"
             },
             "link_type": {
-              "description": "Follow only this link type.",
+              "description": "Only this link type.",
               "type": "string"
             },
             "slug": {
@@ -2173,7 +2188,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -2365,7 +2380,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -2571,7 +2586,7 @@
         "schema": {
           "properties": {
             "expected_brain_id": {
-              "description": "Version 2 brain id to assert.",
+              "description": "Brain id to assert.",
               "type": "string"
             },
             "name": {
@@ -2595,7 +2610,7 @@
               "type": "number"
             },
             "source_id": {
-              "description": "Fetch a brain-resident pack skill from this source.",
+              "description": "Brain-resident pack skill from this source.",
               "type": "string"
             },
             "source_incarnation": {
@@ -2609,7 +2624,7 @@
         "scope": "read"
       },
       {
-        "description": "Skillpacks this brain ships, with skills and a scaffold spec to offer the user.",
+        "description": "Skillpacks this brain ships: skills and a scaffold spec to offer the user.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -2654,7 +2669,7 @@
         "scope": "admin"
       },
       {
-        "description": "Read an approved file from an exact skill revision (data only; never executed).",
+        "description": "Read an approved file from an exact skill revision (data, never executed).",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -3332,7 +3347,7 @@
         "schema": {
           "properties": {
             "partial": {
-              "description": "Partial slug or title, e.g. 'alice-ex'.",
+              "description": "Partial slug or title.",
               "type": "string"
             },
             "source_id": {
@@ -4327,7 +4342,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "since": {
@@ -4390,7 +4405,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "row_num": {
@@ -4471,7 +4486,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "resolved_by": {
@@ -4558,7 +4573,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "row_num": {
@@ -4621,7 +4636,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "row_num": {
@@ -4655,7 +4670,7 @@
         "schema": {
           "properties": {
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "slug": {
@@ -4865,7 +4880,7 @@
         "scope": "read"
       },
       {
-        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client or stdio session).",
+        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per client or stdio session).",
         "idempotent": false,
         "local_only": false,
         "mutating": true,
@@ -4887,7 +4902,7 @@
               "type": "string"
             },
             "tools": {
-              "description": "Tool names to fetch schemas for.",
+              "description": "Tool names to fetch.",
               "items": {
                 "description": "A tool name from the catalog.",
                 "type": "string"
@@ -4932,7 +4947,7 @@
               "type": "string"
             },
             "slugPrefix": {
-              "description": "Slug prefix, e.g. 'wiki/people'.",
+              "description": "Slug prefix.",
               "type": "string"
             }
           },
@@ -5723,7 +5738,7 @@
               "type": "boolean"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry. Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior.",
+              "description": "Reuse only to retry. Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior.",
               "type": "string"
             },
             "session_id": {
@@ -5755,7 +5770,7 @@
         "scope": "write"
       },
       {
-        "description": "MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.",
+        "description": "MEMORY VERB (v1): read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -5802,7 +5817,7 @@
               "type": "string"
             },
             "include_expired": {
-              "description": "Include expired.",
+              "description": "Also expired; question ranks them.",
               "type": "boolean"
             },
             "include_pending": {
@@ -5845,7 +5860,7 @@
               "type": "string"
             },
             "return_window": {
-              "description": "Window size 1-3.",
+              "description": "Window 1-3.",
               "type": "number"
             },
             "session_id": {
@@ -5857,7 +5872,7 @@
               "type": "string"
             },
             "source_id": {
-              "description": "One source you may read.",
+              "description": "One readable source.",
               "type": "string"
             },
             "supersessions": {
@@ -5921,7 +5936,7 @@
               "type": "string"
             },
             "since": {
-              "description": "Only open-thread events after this ISO time.",
+              "description": "Open-thread events after this ISO time.",
               "type": "string"
             }
           },
@@ -6018,7 +6033,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             }
           },
@@ -6080,7 +6095,7 @@
               "type": "string"
             },
             "request_id": {
-              "description": "Optional; reuse only to retry.",
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "source_id": {
@@ -7301,7 +7316,7 @@
         "scope": "write"
       },
       {
-        "description": "Mute a coaching or info notice (or first_run_decisions) for this client; muted: false unmutes.",
+        "description": "Mute a coaching or info notice (or first_run_decisions) for this client.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -7314,7 +7329,7 @@
         "schema": {
           "properties": {
             "code": {
-              "description": "Notice code, the word after `[gbrain notice` in the block.",
+              "description": "The word after `[gbrain notice` in the block.",
               "type": "string"
             },
             "muted": {

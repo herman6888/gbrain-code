@@ -76,7 +76,9 @@ export function prepareLocalIpcPath(legacyPath: string, createParent = false, pr
 }
 
 /** A live server retains this kernel claim across probe/unlink/listen and until actual close. */
-export async function claimLocalIpcBinding(legacyPath: string): Promise<{ socketPath: string; release(): Promise<void>; removeStaleWindowsSocket?(): void } | null> {
+export async function claimLocalIpcBinding(legacyPath: string): Promise<{ socketPath: string; release(): Promise<void>;
+  /** Windows only: verifies the leaf's AF_UNIX reparse tag through the retained claim and deletes it; false when the leaf is not such a socket (left in place). */
+  removeStaleWindowsSocket?(): boolean } | null> {
   const socketPath = prepareLocalIpcPath(legacyPath, true);
   // Bun's older Windows pipe listener misclassifies a competing bind and can
   // crash during its failed-listen cleanup. Claim before any probe or listen.
@@ -86,7 +88,7 @@ export async function claimLocalIpcBinding(legacyPath: string): Promise<{ socket
   }
   const lock = await tryAcquireNativeLock(`${resolve(socketPath)}.bind.lock`);
   return lock ? { socketPath, release: () => lock.release(),
-    ...(process.platform === 'win32' ? { removeStaleWindowsSocket: () => { removeNativeWindowsUnixSocket(resolve(socketPath), lock); } } : {}),
+    ...(process.platform === 'win32' ? { removeStaleWindowsSocket: () => removeNativeWindowsUnixSocket(resolve(socketPath), lock) } : {}),
   } : null;
 }
 

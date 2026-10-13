@@ -725,24 +725,38 @@ agreement, end it on the database host with `SELECT pg_terminate_backend(<pid>)`
 then rerun the same command. Test: `test/e2e/init-schema-lock-blocked.test.ts`.
 
 <a id="pg-connection-stuck"></a>**`pg_connection_stuck`** (warn). A pooled
-statement waited past the pool's `statement_timeout` plus a grace with nothing
-coming back from the server, so the vendored driver retired that connection:
+statement ran past its in-flight budget, either with nothing coming back from
+the server (`reason=idle`) or while bytes kept arriving (`reason=age`, #6543),
+so the vendored driver retired that connection:
 the statement and every statement queued behind it failed with the driver error
 `CONNECTION_STUCK`, the connection left the pool before its socket closed, and
-the pool reconnected on its own (#6383). A legitimate statement cannot outlive
-the server-side timeout, so only a wedged connection reaches the budget: a
-pipeline the client and server no longer agree on, a transaction-mode pooler
-that swallowed a `CancelRequest` and left the backend in `ClientRead`, or a
-dead peer. The budget is the pool's own startup `statement_timeout` (5 min on
+the pool reconnected on its own (#6383). Usually only a wedged connection
+reaches the budget: a pipeline the client and server no longer agree on, a
+transaction-mode pooler that swallowed a `CancelRequest` and left the backend
+in `ClientRead`, or a dead peer. It is not proof: behind a transaction-mode
+pooler (port 6543) the startup `statement_timeout` never reaches the backend
+(`SHOW statement_timeout` reads `0`; `/health?deep=1` reports it as
+`transport.session_timeouts_not_applied`), so a legitimately slow statement can
+reach the budget too (#6543). The budget is the pool's own startup `statement_timeout` (5 min on
 the read pool, 30 min on the direct pool, `GBRAIN_STATEMENT_TIMEOUT` for the
 read pool) plus `GBRAIN_PG_STUCK_GRACE_MS` (default `30000`); it follows the
-configured timeout even through a pooler that drops the startup parameter, so a
-statement that must run longer raises `GBRAIN_STATEMENT_TIMEOUT`, and
-`GBRAIN_PG_STUCK_GRACE_MS=0` or `off` disables the watchdog. The clock restarts
-on every byte the server sends, so a long result set or a `COPY` is never cut
-short. The line names the pool, `age_ms`, `queued` (statements that failed with
-it) and the statement by first keyword and table (`sql=SELECT_pages`), never its
-text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
+configured timeout even through a pooler that drops the startup parameter, and
+`GBRAIN_PG_STUCK_GRACE_MS=0` or `off` disables the watchdog. Two clocks run
+against it: the idle clock restarts on every byte the server sends, the age
+clock never does, so a statement that keeps streaming rows or notices past the
+budget is retired too. The budget is derived per statement and travels with the
+operation: a statement after a `SET [LOCAL] statement_timeout` or
+`set_config('statement_timeout', …)` on its connection (inside a transaction,
+on a reserved connection, or in the same simple query) gets
+`max(budget, that timeout + grace)`, and a declared `0` (an index build, a bulk
+copy) has no cap. The driver reads the declaration from the statements it
+sends, so it holds behind a transaction-mode pooler that never applies a
+session `SET`; a transaction's `SET LOCAL` ends with it, `RESET` restores the
+pool's budget. An operation that must run longer declares its own timeout that
+way; `GBRAIN_STATEMENT_TIMEOUT` raises it for every read-pool statement. The
+line names the pool, `reason`, `age_ms`, `budget_ms` (that statement's own
+cap), `queued` (statements that failed with it) and the statement by first
+keyword and table (`sql=SELECT_pages`), never its text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
 engine; `/health?deep=1` reports them as `stuck_discards`. Retry the failed
 call; if the line repeats, run `gbrain doctor --json` and report the warn lines
 with the operations that preceded them.
@@ -758,6 +772,20 @@ the last statement written on it by first keyword and table, never its text or
 parameters. Notices, notifications and parameter changes never trigger it.
 `getPoolDiagnostics().desyncDiscards` counts retirements per engine;
 `/health?deep=1` reports them as `desync_discards`.
+
+<a id="pg-connection-recovery-failed"></a>**`pg_connection_recovery_failed`**
+(warn). A connection the driver retired after an incident (stuck, desynced, or
+closed under running statements, for example by `pg_terminate_backend` or a
+pooler reap) could not reconnect; statements waiting for it failed with the
+connect error, and the next statement retries. The line names the pool, the
+driver's connection id, the incident (`cause=stuck|desync|closed`) and the
+error code. `getPoolDiagnostics()` counts reconnects of retired connections as
+`recovered` and failures as `recoveryFailed`; `/health?deep=1` reports them as
+`recovered` and `recovery_failed` (#6543). A resident `gbrain serve` writes its
+stuck, desync and recovery events to the pool-recovery audit
+(`~/.gbrain/audit/pool-recovery-YYYY-Www.jsonl`), so
+`gbrain doctor --only pool_reap_health` fails on a recovery failure and warns
+on a stuck or desynced connection in the last hour.
 Retry the failed call; if the line repeats, run `gbrain doctor --json` and
 report the warn lines.
 
@@ -766,15 +794,22 @@ statement could not be built from its parameters (`error=UNDEFINED_VALUE`: a
 parameter was `undefined`; `error=MAX_PARAMETERS_EXCEEDED`: more than 65534
 parameters). It was answered in its place in the pipeline by a query the server
 refuses, so only it failed and a transaction it was part of was aborted rather
-than committed without it. No other statement was affected: before #6383 the same failure, when the statement was
+than committed without it. Before #6383 the same failure, when the statement was
 pipelined behind another on its connection, rejected that other statement with
 its error, left the culprit queued with nothing on the wire, and delivered every
 later reply one statement late until the process restarted (the
 `null is not an object (evaluating 'query.statement.types')` line and a backend
 stuck `active / ClientRead` were that desync). The line names the pool and the
-statement by first keyword and table; the call site that bound `undefined` is a
-gbrain bug, so report the line. `getPoolDiagnostics().buildFailures` counts
-them.
+statement by first keyword and table, and an `UNDEFINED_VALUE` line names the
+parameter (`param=$2`, or `param=?` for an array element). Behind a
+transaction-mode pooler (port 6543, `?prepare=false`) a build failure usually
+means a misrouted answer: the statement bound a value read from a row that
+belonged to another statement, so earlier reads on that pool are suspect too.
+Check `/health?deep=1` `transport.max_pipeline` (gbrain sends `0` there since
+v0.60.187.0; `PGMAX_PIPELINE=0` forces it) and audit the window with
+[the pooler misroute audit](guides/pooler-misroute-audit.md). Elsewhere the
+call site that bound `undefined` is a gbrain bug, so report the line.
+`getPoolDiagnostics().buildFailures` counts them.
 
 <a id="pg-pool-stalled"></a>**`pg_pool_stalled`** (warn, resident processes).
 `gbrain serve` reads its pool every 30 s; when connections are checked out or
@@ -789,20 +824,85 @@ the only trace a wedged pool leaves. A line that keeps repeating with no
 recovery means the database or pooler is unreachable from the process:
 `gbrain doctor --json` from a fresh process, then restart the stalled one.
 
-**`/health?deep=1`** (`gbrain serve --http`). Plain `/health` stays the fast
+<a id="serve-deep-health"></a>**`/health?deep=1`** (`gbrain serve --http`). Plain `/health` stays the fast
 liveness probe, and it runs its `SELECT 1` on a reserved connection, which the
 driver only ever claims from idle connections; a wedged connection sits in the
 busy queue where handler statements are routed, so `/health` answered 200
 through the whole #6383 incident. `/health?deep=1` runs `SELECT 1` through the
 ordinary pooled dispatch (no reservation, 3 s budget) and answers 503 when the
-probe does not return in time, when `inflight_oldest_ms` is past the read
-pool's in-flight budget, or when an earlier deep probe is still pending (one
+probe does not return in time, when a pooled statement is past its own
+in-flight budget (the same per-statement budget the watchdog retires at, so a
+transaction that declared a longer `statement_timeout` is measured against it;
+the block's `inflight_over_budget_ms`), or when an earlier deep probe is still pending (one
 deep probe per engine at a time). Its body carries the pool block:
 `{ checked_out, max, waiters, inflight_oldest_ms, completed, poisoned_discards,
-stuck_discards, build_failures, desync_discards }`. It is cheap enough for a two-minute cron. The
+stuck_discards, build_failures, desync_discards, recovered, recovery_failed }`. It is cheap enough for a two-minute cron. The
 same pool numbers ride the persistence consumer's heartbeat row, so
 `gbrain sources writer status --json` shows `pool.inflight_oldest_ms` for the
 owner process.
+
+Every 503 body carries a stable `code` with `fix` and `docs` from the error
+registry (#6543):
+
+- `persistence_restart_required`: this serve's persistence consumer reports
+  `restart_required` (an abandoned preparation or a publication past its
+  deadline), so it claims no write until the process restarts. Restart serve.
+- `pool_inflight_over_budget`: a pooled statement has run past its own
+  in-flight budget without being retired (the watchdog is off, or the serve
+  runs a driver without per-statement budgets). Restart serve; behind a transaction-mode pooler read
+  `transport` first and set `PGMAX_PIPELINE=0` if `max_pipeline` is not `0`.
+  No request id or statement text reaches either body: the endpoint is
+  unauthenticated.
+- `deep_health_probe_failed` with `reason` `pending`, `timeout` or `error`: the
+  pooled `SELECT 1` did not answer. Retry; if it persists, `gbrain doctor --json`.
+
+Both 200 and 503 bodies carry `transport`, read once at startup through the
+read pool and logged as a `[gbrain serve] transport` line:
+`{ pooler_mode, prepare, max_pipeline, max_pipeline_reason, statement_timeout,
+session_timeouts_not_applied, fix?, application_name? }`. `prepare` and
+`max_pipeline` are the live pool's options; `max_pipeline_reason` says why
+(`transaction_pooler_port`, `url_prepare_false`, `gbrain_prepare_off`,
+`url_max_pipeline`, `env_pgmax_pipeline` or `default`): gbrain builds the read
+pools with `max_pipeline: 0` for a transaction-mode URL (port 6543 or
+`?prepare=false`) or `GBRAIN_PREPARE=0` since v0.60.187.0, and a URL
+`?max_pipeline=` or a non-empty `PGMAX_PIPELINE` always wins.
+PgBouncer in transaction mode carries pipelined statements correctly, so a
+PgBouncer deployment on port 6543 or with `?prepare=false` can opt back in with
+`?max_pipeline=100`: on a 3-connection pool with 8 concurrent workers at about
+40 ms round trip, pipelining off measured about 37% fewer statements per second
+(1185 vs 1890 in 30 s); at localhost latency there was no measurable cost. Do
+not opt back in behind Supavisor.
+`application_name: "Supavisor"` appears when the backend names Supavisor.
+`session_timeouts_not_applied: true` means gbrain configured a
+`statement_timeout` but it reads `0` through the pool (a transaction-mode
+pooler drops startup parameters), so no server-side timeout bounds an
+autocommit statement; `fix` is the same `ALTER ROLE` the
+doctor's `persistence_session_timeouts` check prints
+([troubleshooting](guides/troubleshooting.md#session-timeouts-not-applied)).
+The endpoint is unauthenticated, so it only reports: it never retires a
+connection or restarts anything.
+
+<a id="serve-unhealthy-exit"></a>To let a supervisor recover a wedged serve
+without a human, set `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=<n>` (off by default;
+`n` must be a whole number of at least `120`, and a smaller value refuses to
+start with `invalid_params`). When `persistence_restart_required` has held
+continuously for `n` seconds (read in-process; the hold restarts whenever the
+stuck work settles and the flag clears), serve logs
+`[gbrain serve] error code=serve_unhealthy_exit cause=persistence_restart_required`,
+disconnects under a 5 s deadline (the consumer's stop waits on the stuck work,
+so the exit never depends on it draining) and exits `69`.
+`pool_inflight_over_budget` never triggers the exit (the variable is named for
+its one trigger): restart serve yourself or from your health check. A loop
+guard records each self-exit in `serve-self-exit.json` under the gbrain home;
+after 3 self-exits within an hour serve stops exiting, logs
+`serve_self_exit_suppressed`, and the deep-health 503 carries
+`self_exit_suppressed: true` with a fix that asks for a manual restart and a
+look at `gbrain sources writer status --json`.
+The service `gbrain mcp expose` installs restarts it (systemd `Restart=always`,
+launchd `KeepAlive`), so a fresh serve comes up; the floor keeps a restart loop
+under the systemd unit's start limit (10 starts per 300 s). For the installed service put the variable
+in `~/.gbrain/env`; for a foreground serve set it in the shell or your own
+supervisor's environment. A foreground serve with no supervisor just exits.
 
 <a id="backfill-rollback-failed"></a>**`backfill_rollback_failed`** (error).
 A `gbrain backfill` batch failed, and its `ROLLBACK` failed too. The run stops

@@ -57,7 +57,7 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
   { code: 'file_too_large', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'Split the file or exclude it with sync.exclude.' },
   { code: 'content_rejected', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The content-sanity gate rejected the file; remove the junk or change junk_disposition.' },
   { code: 'parser_regression', class: 'page', safe_actions: ['upgrade'], needs_human: true, escalate: 'always: a gbrain bug', human_reason: 'Report the file and gbrain version, then upgrade or pin the last good release.' },
-  { code: 'managed_image_sync_unsupported', class: 'page', safe_actions: ['none'], needs_human: false, escalate: 'never: images stay held by design', human_reason: 'Leave images held, or exclude them with sync.exclude.' },
+  { code: 'managed_image_sync_unsupported', class: 'page', safe_actions: ['none'], needs_human: false, escalate: 'never: images stay held while multimodal embedding is off', human_reason: 'Leave images held, exclude them with sync.exclude, or set GBRAIN_EMBEDDING_MULTIMODAL=true so the next sync imports them.' },
   // Older releases recorded these as run failures; a rerun on this release holds the page instead.
   { code: 'revision_conflict', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
   { code: 'page_identity_changed', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
@@ -70,6 +70,8 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
   { code: 'database_contention', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'three reruns in a row stop on it' },
   { code: 'write_capacity', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'writer status shows the cap held by requests that never settle' },
   { code: 'storage_error', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'the same error after a rerun (then it is not a dropped connection)' },
+  // #6513: the engine-graduation fence (SQLSTATE 55000) refuses every write until the move finishes; the cursor and manifest stand.
+  { code: 'graduation_in_progress', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'gbrain migrate --status --json reports no running move and the fence still refuses' },
   // Systemic class: a retry alone changes nothing.
   { code: 'preparation_systemic', class: 'systemic', safe_actions: ['upgrade', 'retry'], needs_human: true, escalate: 'always', human_reason: 'Several writes could not finish preparing: the write owner is the likely cause. Writer status names it; fix, restart or upgrade it.' },
   { code: 'drain_stalled', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The write at the head of the source is wedged in its owner; restart the owner process writer status names.' },
@@ -79,6 +81,8 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
   { code: 'permission_denied', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'This principal may not sync the source; the owner grants it.' },
   { code: 'plan_stale', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The approved company-brain manifest changed; inspect and approve the repository again.' },
   { code: 'invalid_params', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The resume options conflict with the stored cursor; use the resume command the error prints.' },
+  // #6518: bookkeeping of an incarnation the source no longer has; a retry selects a different key, so only the repair clears it.
+  { code: 'cursor_incarnation_retired', class: 'systemic', safe_actions: ['repair'], needs_human: false, escalate: 'the repair preview lists nothing to retire, or the same code returns after the apply' },
 ];
 
 const BY_CODE = new Map(SYNC_FAULT_TABLE.map(rule => [rule.code, rule]));

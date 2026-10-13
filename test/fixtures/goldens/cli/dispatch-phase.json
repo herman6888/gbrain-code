@@ -916,6 +916,25 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "git": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'git'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "git"
+            ]
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "google": {
         "hasSwitchCase": false,
         "phase": "pre-connect",

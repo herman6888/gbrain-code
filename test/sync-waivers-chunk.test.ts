@@ -36,7 +36,7 @@ function fakeEngine(opts: { busySlugs?: Set<string> } = {}) {
       if (sql.includes('FROM persistence_source_bindings')) return [{ owner_epoch: '3' }];
       if (sql.startsWith('SELECT id,slug,deleted_at')) return (params[1] as string[]).map(slug => ({ id: Number(slug.slice(1)) + 1, slug, deleted: true, knowledge_revision: '7' }));
       if (sql === UNFINISHED_PAGE_REQUEST_SQL) { unfinishedReads++; return statement(opts.busySlugs?.has(String(params[3])) ? [{ id: 'busy' }] : []); }
-      if (sql.startsWith('SELECT id,slug,source_path FROM pages')) { const path = (params[1] as string[])[0]!; const i = Number(/p(\d+)\.md/.exec(path)![1]); return statement([{ id: i + 1, slug: `p${i}`, source_path: path }]); }
+      if (sql.startsWith('SELECT id,slug,source_path,deleted_at FROM pages')) { const path = (params[1] as string[])[0]!; const i = Number(/p(\d+)\.md/.exec(path)![1]); return statement([{ id: i + 1, slug: `p${i}`, source_path: path }]); }
       throw new Error(`unexpected SQL: ${sql.slice(0, 60)}`);
     },
   };

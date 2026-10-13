@@ -88,7 +88,7 @@ async function rpc(base: string, token: string, method: string, params?: unknown
   return JSON.parse(dataLine ? dataLine.slice('data:'.length) : text).result;
 }
 
-const FULL_SURFACE_KEYS = ['auth', 'logger', 'metaHook', 'noticeLedger', 'remote', 'resultRows', 'sourceId', 'surface', 'surfaceCeiling', 'takesHoldersAllowList', 'transport'];
+const FULL_SURFACE_KEYS = ['auth', 'isListed', 'logger', 'metaHook', 'noticeLedger', 'remote', 'resultRows', 'sourceId', 'surface', 'surfaceCeiling', 'takesHoldersAllowList', 'transport'];
 
 describe('POST /mcp dispatch context', () => {
   test('full surface: remote http dispatch with the verified auth and token source scope', async () => {

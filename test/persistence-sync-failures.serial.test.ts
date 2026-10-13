@@ -268,7 +268,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
     const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
     const execute = engine.executeRaw;
     engine.executeRaw = function (this: BrainEngine, sql: string, params?: unknown[]) {
-      if (sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
+      if (sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
       return execute.call(this, sql, params);
     } as BrainEngine['executeRaw'];
     let thrown: Error | undefined;
@@ -312,7 +312,7 @@ test('checkpoint, discovery, and freeze failures remain diagnosable without a fi
     const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
     const execute = engine.executeRaw;
     engine.executeRaw = function (this: BrainEngine, sql: string, params?: unknown[]) {
-      if (sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
+      if (sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages') && params?.[0] === d.id) throw new OperationError('storage_error', 'Synthetic discovery failure');
       return execute.call(this, sql, params);
     } as BrainEngine['executeRaw'];
     try {

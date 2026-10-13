@@ -318,6 +318,7 @@ export const timelineHistoryEntry: DoctorEntry = {
     'writer_version',
     'self_capture',
     'vector_plan',
+    'keyword_plan',
     'stale_embedding_effects',
     'google_file_modes',
     'extractor_facts_expired',

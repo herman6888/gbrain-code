@@ -14,6 +14,7 @@ import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { appendContextNote, type InferredVia } from '../facts/subject-infer.ts';
 import { inferenceNote } from '../facts/subject-infer-write.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
+import { FACT_WITHDRAWN_MESSAGE, isFactWithdrawn, withdrawnFromDetail } from '../facts/withdrawal.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { authorizeStoredRequest, authorizeWrite, submissionAuthority } from './authority.ts';
@@ -35,6 +36,10 @@ import type { TaintInput, WriteTrust } from '../trust/tier.ts';
 
 export interface ManagedFactsResult {
   inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; write_requests: WriteReceipt[];
+  /** #6506: candidates the automatic extraction skipped because the exact claim was forgotten in this source and visibility. */
+  withdrawn_skipped?: number;
+  /** #6333 shadow: same-page rewordings the managed preparer counted; nothing was dropped. */
+  would_dedup_same_page?: number;
 }
 export interface ManagedFactOrigin { slug: string; pageId: number; revision: string; }
 export type FrozenExtractedFact = Omit<NewFact, 'embedding' | 'valid_from' | 'valid_until' | 'expired_at'> & {
@@ -48,6 +53,13 @@ export interface ManagedFactIntent extends Record<string, unknown> {
   expected_revision?: string; facts?: FrozenExtractedFact[]; children?: string[];
   /** Direct single-fact writes keep writeSingleFact's supersession rule. */
   supersede?: true;
+  /**
+   * #6506: automatic extraction only. A candidate whose exact claim was forgotten in this source and visibility is
+   * skipped and counted (`withdrawn_skipped`) instead of refusing the entity's whole group; a purge tombstone still
+   * refuses. Explicit writers (remember, the fence writers) never set it and keep the refusal. Frozen in the stored
+   * intent, so a replay and a resumed batch decide exactly as the admission did.
+   */
+  withdrawn?: 'skip';
   /**
    * writeSingleFact only: a `memory/unattributed` row keeps the resolver's
    * fallback slug as its entity (no row number), so dedup stays per entity.
@@ -66,6 +78,8 @@ export interface ManagedFactsSession {
   embedding?: FactEmbeddingSignature | null;
   /** #6048: the batch is keyed by its input alone and the caller asked to re-admit facts the canonical file check refused. */
   fileRefusalRetry?: boolean;
+  /** #6506: the batch is keyed by its input alone (no request id), so a stored withdrawal refusal would replay on every run. */
+  inputKeyed?: boolean;
   /** #6091: set when the facts come from an ambient capture lane. */
   captureSource?: string;
   derivation?: DerivationDeclaration;
@@ -259,6 +273,7 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
     batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
     fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
+    inputKeyed: seed === inputDigest,
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
     ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) };
   const prior = await getWriteRequest(engine, authority.principal, session.completionRequestId);
@@ -282,6 +297,8 @@ async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSes
       result.duplicate += Number(out.duplicate ?? 0);
       result.superseded += Number(out.superseded ?? 0);
       result.fact_ids.push(...(out.fact_ids as number[] ?? []));
+      if (out.withdrawn_skipped) result.withdrawn_skipped = (result.withdrawn_skipped ?? 0) + Number(out.withdrawn_skipped);
+      if (out.would_dedup_same_page) result.would_dedup_same_page = (result.would_dedup_same_page ?? 0) + Number(out.would_dedup_same_page);
       if (out.inserted && out.fenced) result.entity_slugs.push(row.slug);
     }
   }
@@ -290,7 +307,9 @@ async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSes
 
 export async function resumeManagedFacts(engine: BrainEngine, session: ManagedFactsSession): Promise<ManagedFactsResult | null> {
   const stored = await storedBatch(engine, session);
-  return stored && collectManagedFacts(engine, session, session.fileRefusalRetry ? await followFileRefusals(engine, session, stored) : stored);
+  if (!stored) return null;
+  const rows = session.fileRefusalRetry ? await followFileRefusals(engine, session, stored) : stored;
+  return collectManagedFacts(engine, session, session.inputKeyed ? await followWithdrawalRefusals(engine, session, rows) : rows);
 }
 
 /** Every request journaled under the session's batch key, once its completion receipt validates; null when nothing was accepted. */
@@ -320,18 +339,49 @@ const isEntityRequest = (row: WriteRequest) => (row.intent?.kind ?? row.outcome?
  * all requests of the latest one, for collectManagedFacts to report.
  */
 async function followFileRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[]): Promise<WriteRequest[]> {
+  return followRefusals(engine, session, stored, 'file-refusal-retry', row => row.error_code === 'source_changed', readmitRefusedFacts);
+}
+
+/**
+ * #6506 (UC1): the same walk for an input-keyed batch whose entity request was
+ * refused because a candidate's exact claim had been forgotten. Older batches
+ * were admitted before automatic extraction skipped withdrawn candidates, so
+ * the stored refusal (`invalid_params` with the fact_withdrawn message, or the
+ * typed `error_detail.origin = 'withdrawal'`, which a withdrawal committed
+ * between preparation and locked validation also leaves) would replay on every
+ * run of the unchanged input. The follow-up re-admits the retained facts under
+ * `withdrawn: 'skip'`; no extraction runs again and the historical receipts
+ * stay as they were.
+ */
+async function followWithdrawalRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[]): Promise<WriteRequest[]> {
+  return followRefusals(engine, session, stored, 'withdrawal-retry', withdrawalRefusal, readmitWithdrawnFacts);
+}
+
+function withdrawalRefusal(row: WriteRequest): boolean {
+  return withdrawnFromDetail(row.error_detail) !== undefined || row.error_code === 'invalid_params' && row.error_message === FACT_WITHDRAWN_MESSAGE;
+}
+
+/**
+ * While every request of the latest batch is terminal and each uncommitted
+ * entity request is a `refused` refusal that kept its facts for this input,
+ * look for the next follow-up batch (`digest([batchKey, label, n])`), or admit
+ * it through `readmit`, at most MAX_FILE_REFUSAL_RETRIES times.
+ */
+async function followRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[], label: string,
+  refused: (row: WriteRequest) => boolean,
+  readmit: (engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]) => Promise<WriteRequest[] | null>): Promise<WriteRequest[]> {
   const carried: WriteRequest[] = [];
   let latest = stored;
   for (let retry = 1; retry <= MAX_FILE_REFUSAL_RETRIES; retry++) {
     if (latest.some(row => !isTerminal(row))) break;
-    const refused = latest.filter(row => isEntityRequest(row) && row.state !== 'committed');
-    const retained = refused.map(row => row.intent as ManagedFactIntent | null);
-    if (!refused.length || refused.some((row, i) => row.error_code !== 'source_changed' || !retained[i]?.facts?.length
+    const uncommitted = latest.filter(row => isEntityRequest(row) && row.state !== 'committed');
+    const retained = uncommitted.map(row => row.intent as ManagedFactIntent | null);
+    if (!uncommitted.length || uncommitted.some((row, i) => !refused(row) || !retained[i]?.facts?.length
       || retained[i]!.inputDigest !== session.inputDigest || !sameSignature(retained[i]!.embedding, retained[0]!.embedding))) break;
-    const followUpKey = digest([session.batchKey, 'file-refusal-retry', retry]);
+    const followUpKey = digest([session.batchKey, label, retry]);
     const followUp: ManagedFactsSession = { ...session, batchKey: followUpKey, embedding: retained[0]!.embedding ?? null,
       completionRequestId: managedFactRequestId(followUpKey, '__managed_facts_complete__') };
-    const admitted = await storedBatch(engine, followUp) ?? await readmitRefusedFacts(engine, followUp, refused);
+    const admitted = await storedBatch(engine, followUp) ?? await readmit(engine, followUp, uncommitted);
     if (!admitted) break;
     carried.push(...latest.filter(row => isEntityRequest(row) && row.state === 'committed'));
     latest = admitted;
@@ -374,9 +424,37 @@ async function readmitRefusedFacts(engine: BrainEngine, followUp: ManagedFactsSe
   return admitManagedFactsBatch(engine, followUp, entities, entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
 }
 
+/**
+ * #6506: admit the refused requests' retained facts as `followUp` with
+ * `withdrawn: 'skip'`. Each refused request must still be authorized under
+ * its stored authority and its page under the current writer grant; facts
+ * target the entity page's current revision (the retained origin revision is
+ * re-checked at preparation) and are never wider than the current default
+ * visibility. No extraction runs again.
+ */
+async function readmitWithdrawnFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
+  const { sourceId } = followUp.authority;
+  const privateOnly = await resolveDefaultVisibility(engine) === 'private';
+  // A fact forgotten at its retained visibility keeps that visibility, so preparation skips and counts it; narrowing it
+  // to private would re-save a forgotten claim under a visibility the ledger never covered.
+  const narrowed = async (fact: FrozenExtractedFact): Promise<FrozenExtractedFact> => privateOnly && fact.visibility !== 'private'
+    && !await isFactWithdrawn(engine, sourceId, fact.visibility ?? 'private', fact.fact, fact.entity_slug ?? null) ? { ...fact, visibility: 'private' } : fact;
+  const entities: ManagedFactsEntityInput[] = [];
+  for (const row of refused) {
+    await authorizeStoredRequest(engine, row);
+    await authorizeWrite(engine, followUp.authority, 'extract_facts', row.slug);
+    const page = await engine.readPageSnapshot(row.slug, { sourceId });
+    const { expected_revision: _refusedRevision, facts, ...kept } = row.intent as ManagedFactIntent;
+    if (!page && (row.page_id !== null || facts!.some(fact => fact.entity_slug === row.slug))) return null;
+    entities.push({ slug: row.slug, pageId: page?.page.id ?? null, intent: { ...kept, batchKey: followUp.batchKey, withdrawn: 'skip',
+      ...(page ? { expected_revision: page.revision } : {}), facts: await Promise.all(facts!.map(narrowed)) } });
+  }
+  return admitManagedFactsBatch(engine, followUp, entities, entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
+}
+
 export async function publishManagedFacts(engine: BrainEngine, session: ManagedFactsSession, ctx: FactsBackstopCtx,
   facts: ExtractedFact[], visibility: 'private' | 'world', pageSlug?: string,
-  options: { supersede?: boolean; explicitContext?: boolean; attributeFallback?: boolean } = {}): Promise<ManagedFactsResult> {
+  options: { supersede?: boolean; explicitContext?: boolean; attributeFallback?: boolean; withdrawn?: 'skip' } = {}): Promise<ManagedFactsResult> {
   const embedded = facts.some(fact => fact.embedding !== null && fact.embedding !== undefined);
   if (embedded) await assertManagedFactsEmbedding(engine, session.config, session.embedding);
   const sourceId = session.authority.sourceId;
@@ -408,6 +486,7 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
       inputDigest: session.inputDigest, origin: session.origin, originalRequestId: session.originalRequestId,
       embedding: session.embedding ?? null, ...(options.supersede ? { supersede: true as const } : {}),
       ...(options.attributeFallback ? { attribute_fallback: true as const } : {}),
+      ...(options.withdrawn === 'skip' ? { withdrawn: 'skip' as const } : {}),
       ...(session.captureSource ? { capture_source: session.captureSource } : {}),
       ...(session.derivation ? { derivation: session.derivation } : {}),
       ...(snapshot ? { expected_revision: snapshot.revision } : {}), facts: group } });

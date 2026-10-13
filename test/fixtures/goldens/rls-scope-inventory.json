@@ -2873,11 +2873,13 @@
       },
       "searchKeywordChunks#cjk": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2886,11 +2888,13 @@
       },
       "searchKeywordChunks#cjk+sourceId": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2899,11 +2903,13 @@
       },
       "searchKeywordChunks#fts": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2978,11 +2984,13 @@
       },
       "searchTitles#default": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -3569,6 +3577,7 @@
         "invalidateContentDriftEmbeddings": "none",
         "invalidateStaleSignatureEmbeddings": "none",
         "jitOffRead": "none",
+        "keywordStatementTimeoutSetting": "none",
         "listActiveTakesForPages": "none",
         "listAllPageRefs": "none",
         "listAllSources": "none",

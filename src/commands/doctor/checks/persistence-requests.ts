@@ -185,11 +185,12 @@ export async function sessionTimeoutsCheck(engine: BrainEngine): Promise<Check> 
     const details = { configured, applied, docs, ...(pooler ? { pooler: 'transaction_mode' } : {}) };
     if (applied !== '0') return { name: 'persistence_session_timeouts', status: pooler ? 'warn' : 'ok', details: pooler ? { ...details, reason: 'transaction_mode_pooler' } : details,
       message: `The session statement_timeout (${applied}) reaches the server.${poolerNote}` };
-    return { name: 'persistence_session_timeouts', status: 'warn', details: { ...details, reason: 'session_timeouts_not_applied' },
+    const roleFix = `ALTER ROLE <gbrain role> SET statement_timeout = '${configured}'`;
+    return { name: 'persistence_session_timeouts', status: 'warn', details: { ...details, reason: 'session_timeouts_not_applied', role_fix: roleFix },
       message: `session_timeouts_not_applied: gbrain configured statement_timeout=${configured} as a connection startup parameter, but SHOW statement_timeout through the configured URL `
         + 'reads 0. A transaction-mode pooler (PgBouncer, Supavisor) drops startup parameters, so statements outside a transaction have no server-side bound; GBRAIN_STATEMENT_TIMEOUT is '
         + 'ignored there. Preparation reads are bounded by their own transaction-local timeout (the preparation budget covers the gap); a long autocommit statement elsewhere still runs '
-        + `until it finishes. To restore the session default, set it on the role: ALTER ROLE <gbrain role> SET statement_timeout = '${configured}' (the pooler cannot be told to keep it).${poolerNote}` };
+        + `until it finishes. To restore the session default, set it on the role: ${roleFix} (the pooler cannot be told to keep it).${poolerNote}` };
   } catch (error) {
     return checkError('persistence_session_timeouts', 'read the session statement_timeout', error, { details: { configured, health: 'unknown', docs } });
   }

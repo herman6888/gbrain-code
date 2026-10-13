@@ -31,6 +31,7 @@ test/autopilot-shutdown-engine-close.test.ts	autopilot.ts graceful engine shutdo
 test/autopilot-supervisor-wiring.test.ts	autopilot.ts ↔ ChildWorkerSupervisor wiring	7	source-surface-helper
 test/backup-cli.serial.test.ts	runBackupCli — PGLite lock fallback	3	readFileSync,source-surface-helper
 test/backup-invalidation.serial.test.ts	bootstrap repo — recordRepoInReceipt contract (source-text pin)	2	readFileSync
+test/backup-private-path-text-5312.test.ts	(file-level)	3	readFileSync
 test/book-mirror.test.ts	gbrain book-mirror — source file invariants	2	readFileSync
 test/bootstrap-codex-door.test.ts	Codex door — rendered AGENTS.md pull protocol (Gate 3)	2	readFileSync
 test/bootstrap-contract.test.ts	bootstrap same-turn write-back contract	6	readFileSync
@@ -107,7 +108,7 @@ test/destructive-guard.test.ts	assessDestructiveImpact	5	readFileSync
 test/destructive-guard.test.ts	formatters (display helpers)	4	readFileSync
 test/destructive-guard.test.ts	purgeExpiredSources — clone cleanup containment	1	readFileSync
 test/detached-stderr.test.ts	jobs.ts detach branch (source pin, #4418)	2	source-surface-helper
-test/divergence-safe-pull-5429.serial.test.ts	--no-autostash (#5429, bug fix)	3	readFileSync
+test/divergence-safe-pull-5429.serial.test.ts	--no-autostash (#5429, bug fix)	4	readFileSync
 test/docs-mcp-deploy.test.ts	DEPLOY.md documents the owner magic-link flow (#5007)	1	readFileSync,source-surface-helper
 test/docs-navigation.test.ts	primary documentation navigation	1	readFileSync
 test/doctor-atom-provenance-drift.test.ts	computeAtomProvenanceDriftCheck	19	doctor-source-helper
@@ -194,9 +195,10 @@ test/gbrain-owned-page-types.test.ts	#5881 gbrain-owned page types are declared 
 test/get-page-federated-scope.test.ts	#2555 get_chunks federated scope	5	source-surface-helper
 test/get-page-federated-scope.test.ts	#4275 alias hop scope: archived sources, include_deleted, fuzzy precedence, grant precedence	5	source-surface-helper
 test/harness-onboarding.test.ts	harness identity and private handoff	6	readFileSync
-test/hook-command.serial.test.ts	user-prompt	16	source-surface-helper
+test/hook-command.serial.test.ts	user-prompt	17	source-surface-helper
 test/hook-push-spawn-env.test.ts	spawnDetachedPush env handoff	2	readFileSync
 test/hook-push-spawn-env.test.ts	tryExecAsync env handoff	1	readFileSync
+test/init-mode-picker.test.ts	cost matrix: newest models, priced from model-pricing	6	readFileSync
 test/integrations-install.test.ts	installRecipeIntoHostRepo — happy path	6	readFileSync
 test/integrations.test.ts	CLI integration	3	source-surface-helper
 test/jobs-embed-background-parity.serial.test.ts	embed job background parity (D7)	2	readFileSync,source-surface-helper
@@ -255,7 +257,7 @@ test/pglite-repair-command.serial.test.ts	gbrain pglite-repair — interactive c
 test/pglite-wal-repair.serial.test.ts	WAL auto-repair — real-brain regression (#223/#1670/#2575)	6	source-surface-helper
 test/physical-root-birth-tolerance-6501.test.ts	physical root birth drift (${kind})	5	readFileSync
 test/physical-root-birth-tolerance-6501.test.ts	samePhysicalBirth (#6501)	5	readFileSync
-test/postgres-driver-vendor.test.ts	vendored Postgres driver packaging	3	readFileSync
+test/postgres-driver-vendor.test.ts	vendored Postgres driver packaging	5	readFileSync
 test/postgres-engine.test.ts	postgres-engine / search date filtering	2	source-surface-helper
 test/postgres-engine.test.ts	postgres-engine / search path timeout isolation	7	source-surface-helper
 test/private-visibility.test.ts	shared private predicate lives once (#4352 remediation)	1	readFileSync
@@ -278,6 +280,7 @@ test/schema-pack/suggest.test.ts	runSuggest — source-text contract (structural
 test/scripts/build-schema-migrations.test.ts	generator diagnostics (FAIL/Why/Fix/See)	9	exec-scan
 test/scripts/build-schema-migrations.test.ts	out-of-order landing check	2	exec-scan
 test/scripts/check-function-size.test.ts	check-function-size.ts rules	11	readFileSync
+test/scripts/ci-bounded-run.test.ts	(file-level)	7	readFileSync
 test/scripts/ci-executed-counts.test.ts	CLI	2	readFileSync
 test/scripts/ci-gates.test.ts	CI execution evidence	6	readFileSync
 test/scripts/ci-gates.test.ts	test:full exit status	0	readFileSync
@@ -316,10 +319,11 @@ test/scripts/serial-files.test.ts	scripts/serial-files.tsv (serial lane manifest
 test/scripts/stress-gate.test.ts	docs anchors	1	readFileSync
 test/scripts/stress-gate.test.ts	gate plan	5	readFileSync
 test/scripts/stress-plan.test.ts	execution profiles	3	readFileSync
-test/scripts/test-env-opt-ins-guard.test.ts	check-test-env-opt-ins	2	readFileSync
+test/scripts/test-env-opt-ins-guard.test.ts	check-test-env-opt-ins	5	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — LPT balance contract	5	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — exclusion contract	7	readFileSync
 test/search/graph-signals-wire-integration.test.ts	v0.40.4 — source-grep regression guard	1	source-surface-helper
+test/serve-behavior-notice-6543.test.ts	(file-level)	3	readFileSync
 test/serve-http-admin-route-guard.test.ts	(file-level)	6	readFileSync
 test/serve-http-github-webhook.test.ts	handler wiring (source pin)	1	source-surface-helper
 test/serve-http-mcp-transport-cleanup.test.ts	POST /mcp transport cleanup (#2844)	2	source-surface-helper

@@ -1,6 +1,6 @@
 import { pageMutationSource, submitPageMutation, validateMutationSlug } from '../persistence/page-mutations.ts';
 import { suffixedSlugDryRun } from '../persistence/suffixed-slug.ts';
-import { AGENT_CONTENT_PARAMS, PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, WRITE_WAIT_PARAM } from '../persistence/params.ts';
+import { AGENT_CONTENT_PARAMS, PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, CAPTURE_CLI_PROVENANCE_PARAMS, WRITE_WAIT_PARAM } from '../persistence/params.ts';
 import { assertPurgeParams } from '../persistence/purge-params.ts';
 /**
  * Page CRUD operation cluster — pure move from operations.ts (v0.46.x
@@ -236,7 +236,7 @@ const fetch_page: Operation = {
   handler: async (ctx, p) => {
     const id = p.id as string;
     if (typeof id !== 'string' || !id.trim()) {
-      throw opError('invalid_params', 'fetch requires a non-empty id', 'Pass the `id` field from a `search` result.');
+      throw opError('invalid_params', 'fetch requires a non-empty id', 'Pass the `id` field from a `search` result. Search rows carry `id` only when `fetch` is callable on this connection, so a row from a search run before `fetch` was callable has none: re-run `search` now that `fetch` is callable, or pass the row\'s `slug` as `id` (accepted when it is unambiguous within your read scope).');
     }
     let identity: ReturnType<typeof decodeDeepResearchId>;
     try { identity = decodeDeepResearchId(id); }
@@ -383,7 +383,7 @@ const delete_page: Operation = {
   name: 'delete_page',
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the next sync imports the file\'s current content into the surviving page. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.',
   params: {
     ...PAGE_MUTATION_PARAMS,
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },
@@ -474,7 +474,7 @@ const list_pages: Operation = {
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
-      description: 'Only pages updated after this ISO time.',
+      description: 'Pages updated after this ISO time.',
     },
     updated_after_slug: {
       type: 'string',
@@ -648,11 +648,11 @@ const capture: Operation = {
   description: CAPTURE_DESCRIPTION,
   params: {
     ...AGENT_CONTENT_PARAMS,
-    ...CAPTURE_EVENT_PARAMS,
+    ...CAPTURE_EVENT_PARAMS, ...CAPTURE_CLI_PROVENANCE_PARAMS,
     content: { type: 'string', required: true, description: 'Markdown or text (not a file path).' },
     local_file: { type: 'string', description: 'Local CLI only.', required: false },
     slug: { type: 'string', required: false, description: 'Default inbox/<date>-<hash>.' },
-    type: { type: 'string', required: false, description: 'Schema-pack page type (default note).' },
+    type: { type: 'string', required: false, description: 'Page type (default note).' },
   },
   scope: 'write',
   mutating: true,

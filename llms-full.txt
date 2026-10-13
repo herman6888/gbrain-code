@@ -1191,9 +1191,11 @@ and publishes a checksummed archive with POSIX mode `0600`. On Windows, built-in
 Windows PowerShell establishes and verifies access for the current owner and
 SYSTEM before writing backup payloads. It protects only newly created backup
 paths, never changes existing parent permissions, and refuses with
-`private_backup_path_unavailable` if enforcement is unavailable. Use a new private
-destination on a local filesystem with Windows ACL support and permitted
-Windows PowerShell. A busy database or a
+`private_backup_path_unavailable` when that protection could not be established
+or verified at the destination (some locations' inherited permissions prevent
+it; a new path inside your user profile works). The destination must be on a
+local filesystem with Windows ACL support, with built-in Windows PowerShell
+permitted. A busy database or a
 changing file fails the operation instead of publishing a success receipt.
 
 Before the dump, the command removes gbrain's own IPC socket files
@@ -1203,9 +1205,12 @@ later backups; each removal is listed in the archive's `omitted` inventory.
 Any other socket, FIFO or symlink in the data dir is left alone and the
 command refuses with `backup_dump_failed` naming it: stop the process that
 uses it (or move it out of the data dir) and run the same command again.
-This cleanup is verified on Linux and macOS; on Windows a stale socket is
-removed through the native lock binding and has not been exercised on a
-native runner.
+On Windows the runtime cannot inspect a stale AF_UNIX socket (`lstat` fails),
+so the sweep probes and claims such an entry without classifying it and removes
+it only through the native binding's tag check; an entry nothing can verify is
+kept and named in the refusal (`an entry this runtime cannot inspect`), never
+deleted blind. The Linux and macOS lanes cover the sweep; the `windows-latest`
+row of `test.yml` runs the stale-socket test natively.
 
 | Included | Excluded or inventoried for reconnection |
 | --- | --- |
@@ -1476,7 +1481,7 @@ are one principal. See [shared brain skills](shared-brain-skills.md).
 
 A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation, the named shared-skill scopes, or owner dashboard/client-management authority. Starter includes authorized skill discovery and membership; the exact seven-tool `verbs` surface is memory-only. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
 
-Clients granted a memory profile before the full-surface default keep their stored `starter` surface; no migration or repair widens it, and only an explicit `--profile` application regrants it. New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. The connection's own `whoami` reports `grant_diagnosis`: which blocker applies (scope, operation snapshot, client pin or server ceiling) and how many operations it hides, without naming them; `gbrain doctor` on the host reports the same as `grant_new_ops_available` with the commands. A grant written before snapshots recorded their operation catalog says "original intent unknown" rather than claiming it predates the operations. Explicitly regrant to include them: `gbrain auth rescope --client <client_id> --operations <op,...> --surface full --dry-run` (then without `--dry-run`; `--surface full` only when the stored surface also blocks) for OAuth clients, or `gbrain auth rescope-token <name> --refresh-operations` (preview) then `--add <op,...>` for legacy tokens ([grants that cannot reach new operations](../mcp/ADMIN.md#grants-that-cannot-reach-new-operations)). `gbrain auth rescope --client <client_id> --operations all` (alias: `gbrain auth rescope-client <client_id> --allowed-operations all`) stores no snapshot and clears the profile instead, so the scopes and the surface alone decide, including operations later upgrades add. `gbrain auth clients` marks such a client `operations: "all"` with `includes_future_operations: true` and the command that re-pins it. A `bootstrap harness` re-run carries the replaced token's grants and does not widen its snapshot ([legacy token grants](../mcp/ADMIN.md#legacy-token-grants)). Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
+Clients granted a memory profile before the full-surface default keep their stored `starter` surface; no migration or repair widens it, and only an explicit `--profile` application regrants it. New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. The connection's own `whoami` reports `grant_diagnosis`: which blocker applies (scope, operation snapshot, client pin or server ceiling) and how many operations it hides, without naming them; `gbrain doctor` on the host reports the same as `grant_new_ops_available` with the commands. The connection is also told once per session, in band, by the `grant_blocked_operations` notice (same blockers and counts, the owner's preview-then-apply command as `fix`, `next: tell_user_to_run`; once per grant revision for stateless HTTP calls), and a read that left out takes a hidden tool serves carries `hidden_tool_content` with the next step that connection can actually take ([connection notices](repair.md#connection-notices)). Neither notice changes what the connection can call. A grant written before snapshots recorded their operation catalog says "original intent unknown" rather than claiming it predates the operations. Explicitly regrant to include them: `gbrain auth rescope --client <client_id> --operations <op,...> --surface full --dry-run` (then without `--dry-run`; `--surface full` only when the stored surface also blocks) for OAuth clients, or `gbrain auth rescope-token <name> --refresh-operations` (preview) then `--add <op,...>` for legacy tokens ([grants that cannot reach new operations](../mcp/ADMIN.md#grants-that-cannot-reach-new-operations)). `gbrain auth rescope --client <client_id> --operations all` (alias: `gbrain auth rescope-client <client_id> --allowed-operations all`) stores no snapshot and clears the profile instead, so the scopes and the surface alone decide, including operations later upgrades add. `gbrain auth clients` marks such a client `operations: "all"` with `includes_future_operations: true` and the command that re-pins it. A `bootstrap harness` re-run carries the replaced token's grants and does not widen its snapshot ([legacy token grants](../mcp/ADMIN.md#legacy-token-grants)). Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
 
 Snapshot-bound clients write through approved MCP operations such as `remember`, `capture`, or `put_page`. They cannot use the legacy `POST /ingest` webhook, whose queued writes do not yet enforce operation snapshots. Existing webhook clients with a `NULL` snapshot keep their legacy behavior.
 
@@ -1729,7 +1734,13 @@ start here.
    default but printed a 9-cell cost matrix (mode × downstream model)
    preceded by `[AGENT]` markers. You MUST relay the matrix to the operator
    and confirm their choice before continuing. Cost spread between corners
-   is 25x — silent acceptance is the wrong default. See
+   is about 200x — silent acceptance is the wrong default. After
+   `gbrain setup <harness>` the harness is already wired when the matrix
+   appears in setup's one first-run settings block, so there is nothing left
+   to continue: relay the matrix and the other settings in the reply that
+   reports the install, as the settings in effect and how to change them,
+   and apply the user's choice when they give it. Don't end the install on a
+   question that needs another turn before memory works. See
    [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) Step 3.5 for the
    exact ask-the-user protocol. The same banner fires on `gbrain post-upgrade`
    for a brain created before v0.32.3, when search modes arrived.
@@ -1750,6 +1761,35 @@ or authorized `add_link` calls. Configured model
 providers can receive text; Markdown export is not a full database backup.
 Read [memory boundaries](docs/guides/memory-boundaries.md) before promising
 portability, graph freshness, privacy, or recovery.
+
+<!-- BEGIN multi-agent-rules (identical in AGENTS.md, BOOTSTRAP_FOR_AGENTS.md and INSTALL_FOR_AGENTS.md; bun run check:shared-tree-git) -->
+## Multi-agent rules for a shared brain checkout
+
+Several agents, crons and hooks often commit to one brain checkout on the same
+machine. In such a checkout:
+
+1. **Commit and push with one command, naming your files:**
+   `scripts/brain-commit-push.sh "<msg>" <paths>`, or
+   `gbrain git commit-push -m "<msg>" -- <paths>` when the brain has no helper.
+   It takes the checkout's writer lock, commits only those paths, merges remote
+   commits without touching anyone else's files, and fails loudly if the push
+   does not land.
+2. **Bring remote commits in with `--pull`** (`scripts/brain-commit-push.sh --pull`
+   or `gbrain git commit-push --pull`) at session start and before a batch of writes.
+3. **On a non-zero exit, read the code.** Retry once on `commit_lock_busy`.
+   Stop and relay to the user on `integrate_conflict` (they choose which
+   version wins) and on `writer_coordinator_required` (a managed brain: save
+   pages with `put_page` instead). `pushed_checkout_lagging` is a success.
+<!-- gbrain-allow-shared-tree-git-begin: the forbidden commands, named so agents avoid them -->
+4. **Never run** `git pull --rebase`, `git stash`, `--autostash`, `git add -A`,
+   `git commit -a`, `git reset --hard` or `git push --force` there, and never
+   fall back to them when the command fails. Never delete `.git/rebase-merge`
+   before saving its autostash with `git stash store`.
+<!-- gbrain-allow-shared-tree-git-end -->
+
+Outcomes, conflict recovery, a stuck rebase and the lock contract for host
+daemons: [docs/guides/shared-checkout-git.md](docs/guides/shared-checkout-git.md).
+<!-- END multi-agent-rules -->
 
 ## Agent operator protocol
 
@@ -2175,8 +2215,8 @@ from recurring:
 Confirm the user's mode choice during installation; relay the matrix in
 `INSTALL_FOR_AGENTS.md` Step 3.5. The current command-level expansion and cost
 contract lives in [search modes](docs/guides/search-modes.md), not a second knob
-table here. `query` expands in every mode unless explicitly disabled; `search`
-and memory verbs do not. Semantic result reuse is disabled.
+table here. `query` expands only when the mode says so (on in `tokenmax`;
+`--expand` / `--no-expand` win); `search` and memory verbs never do. Semantic result reuse is disabled.
 
 Read `docs/eval/SEARCH_MODE_METHODOLOGY.md` for eval methodology and
 `docs/eval/METRIC_GLOSSARY.md` for metric definitions. Eval audit records stay in
@@ -2506,7 +2546,7 @@ Read this file, then follow the path appropriate to the user’s request. Defaul
 
 > **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide: the recommended shape keeps the brain on the user's own computer, published with `gbrain mcp expose --funnel` ([remote MCP](docs/guides/remote-mcp.md)), and installs the thin CLI inside the agent; `scripts/setup-in-agent.sh` is the in-agent alternative, and its receipt tracks repair and native enablement. To make a brain on this computer reachable from the user's other devices, apps, or cloud agents over MCP, follow the **[remote MCP guide](docs/guides/remote-mcp.md)** (`gbrain mcp expose`; confirm the plan before installing Tailscale or a service; `--funnel` only for cloud agents). For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, choose the harness's native OAuth/PKCE flow or a private machine handoff. Owner login, client management, permissions, and revocation use the separate [MCP administration](docs/mcp/ADMIN.md) path. This guide covers a local brain for other existing agents.
 >
-> **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory. Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
+> **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory (with `gbrain setup <harness>`, initialize and connect are one command and the search-mode choice is relayed in the reply that reports the install). Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
 >
 > Only if the user asks for a **new persistent personal agent** with identity and a private repo, follow `BOOTSTRAP_FOR_AGENTS.md`.
 
@@ -2609,16 +2649,22 @@ comes from agent-authored `## Facts` fences and the `remember` verb.
 
 ## Step 3: Create the Brain
 
-**If you are Claude Code**, one command does Step 3 and the MCP registration:
+**If you are Claude Code or Codex**, one command does Step 3 and the MCP registration
+(use `codex` in place of `claude-code` on Codex):
 
 ```bash
 gbrain setup claude-code --dry-run --json   # the resolved target; writes nothing
 gbrain setup claude-code --json             # brain (if none) + MCP + read-context hooks, verified
 ```
 
-It runs `gbrain init --pglite --no-embedding` only when no brain exists, and its
-`--json` document carries init's first-run decision bundle in `notices`: relay
-the search-mode matrix (Step 3.5) and the decisions in one reply. Capture
+It runs `gbrain init --pglite --no-embedding` only when no brain exists and
+prints init's first-run decision bundle once, after the wiring and its smoke
+check (an `[AGENT]` block in human output, `notices` in `--json`), without
+`harness_wiring`, which setup just did. Relay the search-mode matrix (Step 3.5)
+and the other settings in the reply that reports the install, as the settings
+in effect and how to change them; nothing waits on the answer, so don't end
+the install on a question, and apply an answer with its option's command
+whenever the user gives one. Capture
 (`--capture`) and providers (`--providers`) stay off unless the user accepts
 them. A coded refusal (`setup_owner_conflict`, `setup_hosted_connection`) means
 another owner or a hosted brain holds the target; follow its `fix`.
@@ -2730,26 +2776,39 @@ loop; full reference in `docs/ENGINES.md` ("Engine detection and access repair")
 ## Step 3.5: Confirm search mode with the user (DO NOT SKIP)
 
 This is the `search_mode` decision from the first-run bundle.
-`gbrain init` auto-applied a default search mode (`tokenmax` unless your subagent
-tier is Haiku-class or no expansion-capable API key — Anthropic, OpenAI, or
-Google — is configured). The init output included the cost matrix below preceded
-by `[AGENT]` markers. You must NOT silently accept the default. Stop and ask the
-operator.
+`gbrain init` auto-applied a default search mode: `tokenmax` with a chat key
+(Anthropic, OpenAI or Google), `balanced` with a ready reranker but no chat key,
+and `conservative` when your subagent tier is Haiku-class or neither exists. The init output
+included the cost matrix below preceded by `[AGENT]` markers. You must NOT
+silently accept the default. Stop and ask the operator.
+
+After `gbrain setup <harness>` the harness is already wired when the matrix
+appears, so there is nothing to stop before: show the matrix and the applied
+mode in the reply that reports the install, as a choice the user can make at
+any time, and run `gbrain config set search.mode <mode>` when they pick one.
+Don't hold the install open for the answer.
+
+If you already know the operator's choice, record it at install time instead:
+`gbrain init --search-mode <conservative|balanced|tokenmax>` stores it as the
+operator's (`search.mode_source: operator`) and init asks no `search_mode`
+question. On an existing brain with a different mode it refuses unless you pass
+`--force`.
 
 **Present this matrix verbatim:**
 
-<!-- Cost matrix: keep this block aligned with src/commands/init-mode-picker.ts; CLAUDE.md links here rather than duplicating it. -->
+<!-- Cost matrix: generated by costMatrixLines() in src/core/search/mode-advice.ts (prices from src/core/model-pricing.ts); test/init-mode-picker.test.ts keeps this block in sync. -->
 ```
-Per-query cost @ 10K queries/mo (typical single-user volume):
+Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 
-                  Haiku 4.5     Sonnet 4.6    Opus 4.7
-                  ($1/M)        ($3/M)        ($5/M)
-  conservative    $40/mo        $120/mo       $200/mo
-  balanced        $100/mo       $300/mo       $500/mo
-  tokenmax        $200/mo       $600/mo       $1,000/mo
+                  Haiku 5.5     Sonnet 5.5    Opus 5.5
+                  ($0.10/M in)  ($2/M in)     ($4/M in)
+  conservative    $4/mo         $80/mo        $160/mo
+  balanced        $10/mo        $200/mo       $400/mo
+  tokenmax        $20/mo        $400/mo       $800/mo
 
-(scales linearly: ×10 for 100K/mo, ÷10 for 1K. 25x corner-to-corner spread.
- Natural diagonal pairings — cheap/cheap → frontier/frontier — span ~4x.)
+  Assumed payload per query: conservative 4K, balanced 10K, tokenmax 20K tokens.
+  Scales linearly: x10 for 100K queries/mo, /10 for 1K. 200x corner-to-corner spread.
+  Embedding, reranking and query expansion are separate provider charges.
 ```
 
 **Ask the operator (paraphrase if needed):**
@@ -2758,19 +2817,19 @@ Per-query cost @ 10K queries/mo (typical single-user volume):
 > a one-time setup decision that controls retrieval payload size. Which mode
 > do you want?
 >
->   1) conservative — tight 4K budget, 10 chunks max.
+>   1) conservative — tight 4K budget, 10 chunks max, no reranker.
 >      Best for Haiku subagents, cost-sensitive setups, high-volume loops.
 >
->   2) balanced — 12K budget, 25 chunks. Sonnet-tier sweet spot.
+>   2) balanced — 12K budget, 25 chunks, reranked.
 >
->   3) tokenmax (recommended default — preserves v0.31.x retrieval shape) —
->      no budget, 50 chunks. Best for Opus/frontier models.
+>   3) tokenmax (recommended with a chat key) — no budget, 50 chunks, reranked,
+>      `gbrain query` expands by default. The widest retrieval.
 >
-> Expansion is command-specific, not mode-specific: `gbrain search` and the
-> memory verbs do not expand; `gbrain query` expands in every mode unless you
-> pass `--no-expand` (`expand: false` over MCP). The `search.expansion` bundle
-> setting does not change these shipped command paths. See
-> [search modes](docs/guides/search-modes.md) for the current contract.
+> Expansion follows the mode for `gbrain query` only: on in `tokenmax`, off in
+> `balanced` and `conservative`; `--expand` (`expand: true` over MCP) forces it
+> and `--no-expand` (`expand: false`) skips it. `gbrain search` and the memory
+> verbs never expand. See [search modes](docs/guides/search-modes.md) for the
+> current contract.
 >
 > Cost depends on BOTH the mode AND the downstream model you run. See the
 > matrix above for the 9-cell breakdown.
@@ -2795,7 +2854,7 @@ result cache; budget for fresh retrieval. Read the command-level caveats in
 [search modes](docs/guides/search-modes.md) rather than treating a mode choice as
 a guarantee of zero paid calls.
 
-**Why this matters:** the cost spread between corners of the matrix is 25x.
+**Why this matters:** the cost spread between corners of the matrix is about 200x.
 An agent that silently accepts the default and starts running queries against
 a user who didn't expect tokenmax-class context loads can rack up surprise
 spend. Confirm before continuing.
@@ -3064,6 +3123,35 @@ gbrain onboard --check --json
 
 See "The onboard surface" below for what the recommendations mean and the
 consent gates around unattended remediation.
+
+<!-- BEGIN multi-agent-rules (identical in AGENTS.md, BOOTSTRAP_FOR_AGENTS.md and INSTALL_FOR_AGENTS.md; bun run check:shared-tree-git) -->
+## Multi-agent rules for a shared brain checkout
+
+Several agents, crons and hooks often commit to one brain checkout on the same
+machine. In such a checkout:
+
+1. **Commit and push with one command, naming your files:**
+   `scripts/brain-commit-push.sh "<msg>" <paths>`, or
+   `gbrain git commit-push -m "<msg>" -- <paths>` when the brain has no helper.
+   It takes the checkout's writer lock, commits only those paths, merges remote
+   commits without touching anyone else's files, and fails loudly if the push
+   does not land.
+2. **Bring remote commits in with `--pull`** (`scripts/brain-commit-push.sh --pull`
+   or `gbrain git commit-push --pull`) at session start and before a batch of writes.
+3. **On a non-zero exit, read the code.** Retry once on `commit_lock_busy`.
+   Stop and relay to the user on `integrate_conflict` (they choose which
+   version wins) and on `writer_coordinator_required` (a managed brain: save
+   pages with `put_page` instead). `pushed_checkout_lagging` is a success.
+<!-- gbrain-allow-shared-tree-git-begin: the forbidden commands, named so agents avoid them -->
+4. **Never run** `git pull --rebase`, `git stash`, `--autostash`, `git add -A`,
+   `git commit -a`, `git reset --hard` or `git push --force` there, and never
+   fall back to them when the command fails. Never delete `.git/rebase-merge`
+   before saving its autostash with `git stash store`.
+<!-- gbrain-allow-shared-tree-git-end -->
+
+Outcomes, conflict recovery, a stuck rebase and the lock contract for host
+daemons: [docs/guides/shared-checkout-git.md](docs/guides/shared-checkout-git.md).
+<!-- END multi-agent-rules -->
 
 ## Upgrade
 
@@ -3481,7 +3569,7 @@ stdout (`--json`):
       "decisions": [
         {
           "id": "search_mode",
-          "question": "Which search mode should this brain use? Per-query search payload cost at 10K queries/month (Haiku 4.5 / Sonnet 4.6 / Opus 4.7): conservative $40 / $120 / $200, balanced $100 / $300 / $500, tokenmax $200 / $600 / $1,000 per month.",
+          "question": "Which search mode should this brain use? Estimated downstream input cost of the retrieved payload at 10K queries/month (Haiku 5.5 / Sonnet 5.5 / Opus 5.5): conservative $4 / $80 / $160, balanced $10 / $200 / $400, tokenmax $20 / $400 / $800 per month.",
           "options": [
             {
               "id": "conservative",
@@ -3518,7 +3606,7 @@ stdout (`--json`):
             }
           ],
           "default": "conservative",
-          "default_reason": "No expansion-capable API key (Anthropic/OpenAI/Google) — start with a tight result budget; semantic result caching is temporarily disabled."
+          "default_reason": "No chat key (Anthropic/OpenAI/Google) and no ready reranker — conservative keeps a tight 4K budget; balanced's reranker could not run."
         },
         {
           "id": "writeback",
@@ -3951,12 +4039,20 @@ final document.
 | `coaching` | the setup limits what the user is trying to do | mention it once, at a natural point; follow `fix.next` if the user wants it |
 | `info` | context for this result | use it; no action needed |
 
-**Dedupe and budget.** On stdio, a notice shows once per server process. HTTP
-is stateless, so dedupe is per authenticated client and session, and
-`degraded` and `safety` notices ride every affected call. At most 2
-`coaching` notices per session. Notices that describe one call's result
-(`empty_retrieval`, `unknown_param`, `listing_truncated`, `delta_incomplete`, `facts_unembedded`)
-are never deduped.
+**Dedupe and budget.** On stdio and the CLI, a notice shows once per process,
+except the notices that describe one call's result. HTTP is stateless, so
+dedupe is per authenticated client and session, and `degraded` and `safety`
+notices ride every affected call. At most 2 `coaching` notices per session.
+Notices that describe one call's result (`degraded_recall`, `empty_retrieval`,
+`unknown_param`, `listing_truncated`, `delta_incomplete`, `facts_unembedded`)
+are never deduped on any transport, with one exception: a `degraded_recall`
+whose only stages come from the brain's configuration (`embed_unavailable` on
+a keyless brain, which degrades every search the same way) shows once per
+stdio or CLI session. A transient degradation (`rerank_failed`,
+`embed_timeout`, a failed keyword or title arm, or any other stage) shows on
+every affected call, so a failure, a recovery and the same failure again show
+the notice twice. A notice missing from a later call never means that call
+was healthy: `_meta.retrieval.degraded` records every call's stages.
 
 **Degraded retry hint.** A `degraded` notice whose fix has `actor: provider`
 renders `next: wait`: repeat the same call (the fix carries it) after the delay
@@ -3990,7 +4086,7 @@ instead.
 | `behavior_changes` (safety) | the first tool result per brain | the first tool result per authenticated client (names no chain entries or providers) | once, on stderr, on the first command; `gbrain doctor --only behavior_changes` reads it again |
 | `chat_fallback_hop` (safety) | the first fallback hop of the server process | never | the first hop of the command |
 | `backup_coverage` | once per process | never | the CLI startup rail |
-| `degraded_recall`, `empty_retrieval`, `source_binding_narrowed` and the other per-call notices | every affected call | every affected call (redacted) | the command's own notices |
+| `degraded_recall`, `empty_retrieval`, `source_binding_narrowed` and the other per-call notices | every affected call (a keyless brain's configuration-only `degraded_recall`: once per session) | every affected call (redacted) | the command's own notices |
 
 HTTP gets no onboarding coaching because the counts are brain-wide (they cross
 source-scoped grants) and every remedy runs on the brain host, which a remote
@@ -4741,14 +4837,14 @@ before restarting services with this version.
 > Run `gbrain apply-migrations --yes --no-autopilot-install`; exit 1 means it's still
 > behind: run `gbrain doctor --json`, not `--yes` again.
 
-**Claude Code, fastest path:**
+**Claude Code or Codex, fastest path:**
 
 ```bash
 bun install -g github:garrytan/gbrain
-gbrain setup claude-code   # --dry-run previews, --remove undoes
+gbrain setup claude-code   # or codex; --dry-run previews, --remove undoes
 ```
 
-`setup` shows the brain, source, launcher and owner it resolved before writing, runs `gbrain init --pglite --no-embedding` only when no brain exists, writes the stdio MCP entry and read-context hooks (owned by hash) and smoke-tests them. Capture and providers stay off unless accepted; a hosted brain keeps `gbrain connect --install`. [Setup guide](docs/guides/setup.md).
+`setup` shows the brain, source, launcher and owner it resolved before writing, runs `gbrain init --pglite --no-embedding` only when no brain exists, writes the stdio MCP entry and read-context hooks (owned by hash, plus Codex hook trust) and smoke-tests them. Capture and providers stay off unless accepted; a hosted brain keeps `gbrain connect --install`. [Setup guide](docs/guides/setup.md).
 
 Start with the agent you already use. For Grok Bot and Muse, the dedicated guides above install an isolated launcher, repairable runtime, and memory in a verified persistent directory. For a coding agent, paste:
 
@@ -4823,7 +4919,7 @@ The agent starts with keyless memory and verifies it. API keys, automatic captur
 
 ### Lighter ways in
 
-**Just want a memory for your coding agent — no identity, no repo.** On Claude Code run `gbrain setup claude-code` (above). By hand: `gbrain init --pglite --no-embedding`, then `codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full` (`claude mcp add` takes the same argv; `--surface verbs` or `starter` for a harness that caps its tool count). Saved memories are brain-wide by default; pass `visibility: "private"` for local-only facts.
+**Just want a memory for your coding agent — no identity, no repo.** On Claude Code or Codex use `gbrain setup` (above). By hand: `gbrain init --pglite --no-embedding`, then `codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full` (`claude mcp add` takes the same argv; `--surface verbs` or `starter` for a harness that caps its tool count). Saved memories are brain-wide by default; pass `visibility: "private"` for local-only facts.
 
 **Already have a brain on a remote host** (OpenClaw, Hermes, or any `gbrain serve --http`)? Point your laptop agents at it with one command each — `--install` wires it up and smoke-tests the token before handoff:
 
@@ -5833,24 +5929,38 @@ agreement, end it on the database host with `SELECT pg_terminate_backend(<pid>)`
 then rerun the same command. Test: `test/e2e/init-schema-lock-blocked.test.ts`.
 
 <a id="pg-connection-stuck"></a>**`pg_connection_stuck`** (warn). A pooled
-statement waited past the pool's `statement_timeout` plus a grace with nothing
-coming back from the server, so the vendored driver retired that connection:
+statement ran past its in-flight budget, either with nothing coming back from
+the server (`reason=idle`) or while bytes kept arriving (`reason=age`, #6543),
+so the vendored driver retired that connection:
 the statement and every statement queued behind it failed with the driver error
 `CONNECTION_STUCK`, the connection left the pool before its socket closed, and
-the pool reconnected on its own (#6383). A legitimate statement cannot outlive
-the server-side timeout, so only a wedged connection reaches the budget: a
-pipeline the client and server no longer agree on, a transaction-mode pooler
-that swallowed a `CancelRequest` and left the backend in `ClientRead`, or a
-dead peer. The budget is the pool's own startup `statement_timeout` (5 min on
+the pool reconnected on its own (#6383). Usually only a wedged connection
+reaches the budget: a pipeline the client and server no longer agree on, a
+transaction-mode pooler that swallowed a `CancelRequest` and left the backend
+in `ClientRead`, or a dead peer. It is not proof: behind a transaction-mode
+pooler (port 6543) the startup `statement_timeout` never reaches the backend
+(`SHOW statement_timeout` reads `0`; `/health?deep=1` reports it as
+`transport.session_timeouts_not_applied`), so a legitimately slow statement can
+reach the budget too (#6543). The budget is the pool's own startup `statement_timeout` (5 min on
 the read pool, 30 min on the direct pool, `GBRAIN_STATEMENT_TIMEOUT` for the
 read pool) plus `GBRAIN_PG_STUCK_GRACE_MS` (default `30000`); it follows the
-configured timeout even through a pooler that drops the startup parameter, so a
-statement that must run longer raises `GBRAIN_STATEMENT_TIMEOUT`, and
-`GBRAIN_PG_STUCK_GRACE_MS=0` or `off` disables the watchdog. The clock restarts
-on every byte the server sends, so a long result set or a `COPY` is never cut
-short. The line names the pool, `age_ms`, `queued` (statements that failed with
-it) and the statement by first keyword and table (`sql=SELECT_pages`), never its
-text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
+configured timeout even through a pooler that drops the startup parameter, and
+`GBRAIN_PG_STUCK_GRACE_MS=0` or `off` disables the watchdog. Two clocks run
+against it: the idle clock restarts on every byte the server sends, the age
+clock never does, so a statement that keeps streaming rows or notices past the
+budget is retired too. The budget is derived per statement and travels with the
+operation: a statement after a `SET [LOCAL] statement_timeout` or
+`set_config('statement_timeout', …)` on its connection (inside a transaction,
+on a reserved connection, or in the same simple query) gets
+`max(budget, that timeout + grace)`, and a declared `0` (an index build, a bulk
+copy) has no cap. The driver reads the declaration from the statements it
+sends, so it holds behind a transaction-mode pooler that never applies a
+session `SET`; a transaction's `SET LOCAL` ends with it, `RESET` restores the
+pool's budget. An operation that must run longer declares its own timeout that
+way; `GBRAIN_STATEMENT_TIMEOUT` raises it for every read-pool statement. The
+line names the pool, `reason`, `age_ms`, `budget_ms` (that statement's own
+cap), `queued` (statements that failed with it) and the statement by first
+keyword and table (`sql=SELECT_pages`), never its text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
 engine; `/health?deep=1` reports them as `stuck_discards`. Retry the failed
 call; if the line repeats, run `gbrain doctor --json` and report the warn lines
 with the operations that preceded them.
@@ -5866,6 +5976,20 @@ the last statement written on it by first keyword and table, never its text or
 parameters. Notices, notifications and parameter changes never trigger it.
 `getPoolDiagnostics().desyncDiscards` counts retirements per engine;
 `/health?deep=1` reports them as `desync_discards`.
+
+<a id="pg-connection-recovery-failed"></a>**`pg_connection_recovery_failed`**
+(warn). A connection the driver retired after an incident (stuck, desynced, or
+closed under running statements, for example by `pg_terminate_backend` or a
+pooler reap) could not reconnect; statements waiting for it failed with the
+connect error, and the next statement retries. The line names the pool, the
+driver's connection id, the incident (`cause=stuck|desync|closed`) and the
+error code. `getPoolDiagnostics()` counts reconnects of retired connections as
+`recovered` and failures as `recoveryFailed`; `/health?deep=1` reports them as
+`recovered` and `recovery_failed` (#6543). A resident `gbrain serve` writes its
+stuck, desync and recovery events to the pool-recovery audit
+(`~/.gbrain/audit/pool-recovery-YYYY-Www.jsonl`), so
+`gbrain doctor --only pool_reap_health` fails on a recovery failure and warns
+on a stuck or desynced connection in the last hour.
 Retry the failed call; if the line repeats, run `gbrain doctor --json` and
 report the warn lines.
 
@@ -5874,15 +5998,22 @@ statement could not be built from its parameters (`error=UNDEFINED_VALUE`: a
 parameter was `undefined`; `error=MAX_PARAMETERS_EXCEEDED`: more than 65534
 parameters). It was answered in its place in the pipeline by a query the server
 refuses, so only it failed and a transaction it was part of was aborted rather
-than committed without it. No other statement was affected: before #6383 the same failure, when the statement was
+than committed without it. Before #6383 the same failure, when the statement was
 pipelined behind another on its connection, rejected that other statement with
 its error, left the culprit queued with nothing on the wire, and delivered every
 later reply one statement late until the process restarted (the
 `null is not an object (evaluating 'query.statement.types')` line and a backend
 stuck `active / ClientRead` were that desync). The line names the pool and the
-statement by first keyword and table; the call site that bound `undefined` is a
-gbrain bug, so report the line. `getPoolDiagnostics().buildFailures` counts
-them.
+statement by first keyword and table, and an `UNDEFINED_VALUE` line names the
+parameter (`param=$2`, or `param=?` for an array element). Behind a
+transaction-mode pooler (port 6543, `?prepare=false`) a build failure usually
+means a misrouted answer: the statement bound a value read from a row that
+belonged to another statement, so earlier reads on that pool are suspect too.
+Check `/health?deep=1` `transport.max_pipeline` (gbrain sends `0` there since
+v0.60.187.0; `PGMAX_PIPELINE=0` forces it) and audit the window with
+[the pooler misroute audit](guides/pooler-misroute-audit.md). Elsewhere the
+call site that bound `undefined` is a gbrain bug, so report the line.
+`getPoolDiagnostics().buildFailures` counts them.
 
 <a id="pg-pool-stalled"></a>**`pg_pool_stalled`** (warn, resident processes).
 `gbrain serve` reads its pool every 30 s; when connections are checked out or
@@ -5897,20 +6028,85 @@ the only trace a wedged pool leaves. A line that keeps repeating with no
 recovery means the database or pooler is unreachable from the process:
 `gbrain doctor --json` from a fresh process, then restart the stalled one.
 
-**`/health?deep=1`** (`gbrain serve --http`). Plain `/health` stays the fast
+<a id="serve-deep-health"></a>**`/health?deep=1`** (`gbrain serve --http`). Plain `/health` stays the fast
 liveness probe, and it runs its `SELECT 1` on a reserved connection, which the
 driver only ever claims from idle connections; a wedged connection sits in the
 busy queue where handler statements are routed, so `/health` answered 200
 through the whole #6383 incident. `/health?deep=1` runs `SELECT 1` through the
 ordinary pooled dispatch (no reservation, 3 s budget) and answers 503 when the
-probe does not return in time, when `inflight_oldest_ms` is past the read
-pool's in-flight budget, or when an earlier deep probe is still pending (one
+probe does not return in time, when a pooled statement is past its own
+in-flight budget (the same per-statement budget the watchdog retires at, so a
+transaction that declared a longer `statement_timeout` is measured against it;
+the block's `inflight_over_budget_ms`), or when an earlier deep probe is still pending (one
 deep probe per engine at a time). Its body carries the pool block:
 `{ checked_out, max, waiters, inflight_oldest_ms, completed, poisoned_discards,
-stuck_discards, build_failures, desync_discards }`. It is cheap enough for a two-minute cron. The
+stuck_discards, build_failures, desync_discards, recovered, recovery_failed }`. It is cheap enough for a two-minute cron. The
 same pool numbers ride the persistence consumer's heartbeat row, so
 `gbrain sources writer status --json` shows `pool.inflight_oldest_ms` for the
 owner process.
+
+Every 503 body carries a stable `code` with `fix` and `docs` from the error
+registry (#6543):
+
+- `persistence_restart_required`: this serve's persistence consumer reports
+  `restart_required` (an abandoned preparation or a publication past its
+  deadline), so it claims no write until the process restarts. Restart serve.
+- `pool_inflight_over_budget`: a pooled statement has run past its own
+  in-flight budget without being retired (the watchdog is off, or the serve
+  runs a driver without per-statement budgets). Restart serve; behind a transaction-mode pooler read
+  `transport` first and set `PGMAX_PIPELINE=0` if `max_pipeline` is not `0`.
+  No request id or statement text reaches either body: the endpoint is
+  unauthenticated.
+- `deep_health_probe_failed` with `reason` `pending`, `timeout` or `error`: the
+  pooled `SELECT 1` did not answer. Retry; if it persists, `gbrain doctor --json`.
+
+Both 200 and 503 bodies carry `transport`, read once at startup through the
+read pool and logged as a `[gbrain serve] transport` line:
+`{ pooler_mode, prepare, max_pipeline, max_pipeline_reason, statement_timeout,
+session_timeouts_not_applied, fix?, application_name? }`. `prepare` and
+`max_pipeline` are the live pool's options; `max_pipeline_reason` says why
+(`transaction_pooler_port`, `url_prepare_false`, `gbrain_prepare_off`,
+`url_max_pipeline`, `env_pgmax_pipeline` or `default`): gbrain builds the read
+pools with `max_pipeline: 0` for a transaction-mode URL (port 6543 or
+`?prepare=false`) or `GBRAIN_PREPARE=0` since v0.60.187.0, and a URL
+`?max_pipeline=` or a non-empty `PGMAX_PIPELINE` always wins.
+PgBouncer in transaction mode carries pipelined statements correctly, so a
+PgBouncer deployment on port 6543 or with `?prepare=false` can opt back in with
+`?max_pipeline=100`: on a 3-connection pool with 8 concurrent workers at about
+40 ms round trip, pipelining off measured about 37% fewer statements per second
+(1185 vs 1890 in 30 s); at localhost latency there was no measurable cost. Do
+not opt back in behind Supavisor.
+`application_name: "Supavisor"` appears when the backend names Supavisor.
+`session_timeouts_not_applied: true` means gbrain configured a
+`statement_timeout` but it reads `0` through the pool (a transaction-mode
+pooler drops startup parameters), so no server-side timeout bounds an
+autocommit statement; `fix` is the same `ALTER ROLE` the
+doctor's `persistence_session_timeouts` check prints
+([troubleshooting](guides/troubleshooting.md#session-timeouts-not-applied)).
+The endpoint is unauthenticated, so it only reports: it never retires a
+connection or restarts anything.
+
+<a id="serve-unhealthy-exit"></a>To let a supervisor recover a wedged serve
+without a human, set `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=<n>` (off by default;
+`n` must be a whole number of at least `120`, and a smaller value refuses to
+start with `invalid_params`). When `persistence_restart_required` has held
+continuously for `n` seconds (read in-process; the hold restarts whenever the
+stuck work settles and the flag clears), serve logs
+`[gbrain serve] error code=serve_unhealthy_exit cause=persistence_restart_required`,
+disconnects under a 5 s deadline (the consumer's stop waits on the stuck work,
+so the exit never depends on it draining) and exits `69`.
+`pool_inflight_over_budget` never triggers the exit (the variable is named for
+its one trigger): restart serve yourself or from your health check. A loop
+guard records each self-exit in `serve-self-exit.json` under the gbrain home;
+after 3 self-exits within an hour serve stops exiting, logs
+`serve_self_exit_suppressed`, and the deep-health 503 carries
+`self_exit_suppressed: true` with a fix that asks for a manual restart and a
+look at `gbrain sources writer status --json`.
+The service `gbrain mcp expose` installs restarts it (systemd `Restart=always`,
+launchd `KeepAlive`), so a fresh serve comes up; the floor keeps a restart loop
+under the systemd unit's start limit (10 starts per 300 s). For the installed service put the variable
+in `~/.gbrain/env`; for a foreground serve set it in the shell or your own
+supervisor's environment. A foreground serve with no supervisor just exits.
 
 <a id="backfill-rollback-failed"></a>**`backfill_rollback_failed`** (error).
 A `gbrain backfill` batch failed, and its `ROLLBACK` failed too. The run stops
@@ -6352,9 +6548,13 @@ command drains the whole backlog:
 gbrain sync --source <id> --no-pull --json
 ```
 
-`--no-pull` is required on managed brains: the checkout is fast-forwarded by
+Managed sync never pulls: the checkout is fast-forwarded by
 `gbrain sources refresh <id>`, never by sync. Sync then catches the index up
-to whatever the checkout holds.
+to whatever the checkout holds. The CLI implies `--no-pull` on a managed brain
+(single source, `--all` and serve-delegated runs alike) and prints one stderr
+line naming `gbrain sources refresh <id>`; `--json` stdout stays one document.
+An explicit pull through the library or MCP (`sync_brain` with
+`no_pull: false`) still refuses with `writer_coordinator_required`.
 
 The run prints one line before the first write and a progress line about
 every 10 seconds on stderr:
@@ -6803,7 +7003,10 @@ vars — incident-time escape hatches, not everyday knobs.
    (`N uncommitted file(s) not synced`), the sync result object carries an
    `uncommitted` summary (surfaced via `sync_brain` over MCP and in
    `gbrain dream --json` phase details), and the nightly dream cycle reports
-   the sync phase as `warn` instead of a clean run. The fix is to commit the files. If your
+   the sync phase as `warn` instead of a clean run. The fix is to commit the
+   files, naming them: `gbrain git commit-push -m "<msg>" -- <paths>` (or the
+   brain's `scripts/brain-commit-push.sh`), which is safe when other agents
+   share the checkout ([shared-checkout git](shared-checkout-git.md)). If your
    workflow legitimately writes without committing, opt in to importing
    uncommitted state with `gbrain sync --working-tree` (one run) or
    `gbrain config set sync.include_working_tree true` (standing config,
@@ -6814,7 +7017,7 @@ vars — incident-time escape hatches, not everyday knobs.
    `--include-gitignored` for those).
 
 8. **A managed brain pulls only through `gbrain sources refresh`.** Managed
-   sync refuses to pull (`gbrain sync` needs `--no-pull`) and a cycle asked to
+   sync never pulls (the CLI implies `--no-pull`) and a cycle asked to
    pull syncs the checkout as it is, because a Git merge rewrites files that
    accepted writes may be publishing into. To take new upstream commits, run
    on the owner host:
@@ -6840,8 +7043,10 @@ vars — incident-time escape hatches, not everyday knobs.
    **Say to your agent:** *"Bring my notes source up to date with its remote."*
 
 9. **Turn automatic pulls off for every source.** On an unmanaged brain,
-   autopilot's freshness sync and its per-source cycle run `git pull` for a
-   source that has a remote URL. A checkout you keep current yourself (a
+   autopilot's freshness sync and its per-source cycle pull a source that has
+   a remote URL: a fetch, then a fast-forward under the checkout's writer lock
+   with autostash off, so the pull never stashes or rebases files another
+   agent is writing ([shared-checkout git](shared-checkout-git.md)). A checkout you keep current yourself (a
    deploy script, a mirror, a branch you rebase by hand) should not be
    pulled behind your back:
 
@@ -6862,7 +7067,9 @@ vars — incident-time escape hatches, not everyday knobs.
 ## How to Verify
 
 1. **Edit a file and search for the change.** Edit a brain markdown file,
-   commit, and push. Wait for the next sync cycle (cron interval or `--watch`
+   then commit and push it with `gbrain git commit-push -m "<msg>" -- <file>`
+   (it must exit 0; on an error code follow
+   [outcomes](shared-checkout-git.md#outcomes)). Wait for the next sync cycle (cron interval or `--watch`
    poll). Run `gbrain search "<text from the edit>"`. The updated content
    should appear in results. If it returns old content, sync failed.
 
@@ -7021,7 +7228,7 @@ Every hold and error has three fields, from one table
 | `file_too_large` | page | none | yes | always |
 | `content_rejected` | page | none | yes | always |
 | `parser_regression` | page | upgrade | yes | always: a gbrain bug |
-| `managed_image_sync_unsupported` | page | none | no | never: images stay held by design |
+| `managed_image_sync_unsupported` | page | none | no | never: images stay held while multimodal embedding is off |
 | `revision_conflict` | page | retry | no | the same path fails again after a rerun |
 | `page_identity_changed` | page | retry | no | the same path fails again after a rerun |
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
@@ -7032,6 +7239,7 @@ Every hold and error has three fields, from one table
 | `database_contention` | connection | retry | no | three reruns in a row stop on it |
 | `write_capacity` | connection | retry | no | writer status shows the cap held by requests that never settle |
 | `storage_error` | connection | retry | no | the same error after a rerun (then it is not a dropped connection) |
+| `graduation_in_progress` | connection | retry | no | gbrain migrate --status --json reports no running move and the fence still refuses |
 | `preparation_systemic` | systemic | upgrade, retry | yes | always |
 | `drain_stalled` | systemic | none | yes | always |
 | `recovery_required` | systemic | none | yes | always |
@@ -7040,6 +7248,7 @@ Every hold and error has three fields, from one table
 | `permission_denied` | systemic | none | yes | always |
 | `plan_stale` | systemic | none | yes | always |
 | `invalid_params` | systemic | none | yes | always |
+| `cursor_incarnation_retired` | systemic | repair | no | the repair preview lists nothing to retire, or the same code returns after the apply |
 <!-- sync-fault-table:end -->
 
 A `cancelled` error whose group was released by a lane fault (`lock_timeout`
@@ -8618,21 +8827,23 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
 - `entity` scopes the FACTS arm; `query` runs the hybrid-search arm over
   pages; both present ⇒ both arms run.
 - `since`: ISO 8601 date/datetime — filters the FACTS arm only in v1. (The
-  reference implementation also accepts relative phrases like `"8 hours ago"`
-  as a convenience; only ISO 8601 is part of the frozen contract.) The window
+  reference implementation also accepts relative phrases like `"8 hours ago"`,
+  `"6 weeks ago"` and `"last month"` as a convenience; only ISO 8601 is part
+  of the frozen contract.) The window
   is measured on event time (`valid_from`, falling back to `created_at`) and
   composes with `entity` and `session_id` in the same query, before the
   per-arm limit. An unparseable value is rejected with `invalid_params`.
 - `limit` is a PER-ARM cap (facts and search results each).
 - `question`: optional string (at most 2,000 characters). The FACTS arm then
-  returns active facts ranked by relevance to the question instead of newest
+  returns active facts (every fact, expired and superseded included, with
+  `include_expired: true`) ranked by relevance to the question instead of newest
   first: cosine to the question's embedding plus whole-word term share, plus
   0.1 when the fact carries a writer-supplied date. Facts below the admission
   rule are not returned, so an empty `facts[]` is a valid answer. `entity`,
   `session_id`, `since` and `grep` filter before ranking. `question` does not
-  search pages; `query` does, and both may be passed. `supersessions: true` or
-  `include_expired: true` with `question` is `invalid_params` (ranking covers
-  active facts only); the error's `fix.mcp` is the call without them. One query
+  search pages; `query` does, and both may be passed. `supersessions: true`
+  with `question` is `invalid_params` (the supersession log is not ranked); the
+  error's `fix.mcp` is the call without it. One query
   embedding per call, no model call. Without an embedding provider, with
   embeddings turned off, or when the embed fails, facts rank by term share and
   `facts_degraded.reason` says why. A server without question ranking ignores
@@ -8779,7 +8990,10 @@ Save ONE fact with mandatory attribution.
   (default).
 - `visibility`: `world` (DEFAULT — readable by every agent connected to this
   brain; required for the remote remember→recall round-trip) \| `private`
-  (local CLI reads only). The init quickstart carries the consent line.
+  (local CLI reads only; session hooks push world facts only, so a private
+  fact never reaches a new agent session, and a local private save carries the
+  `private_fact_not_pushed` notice saying so). The init quickstart carries the
+  consent line.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —
@@ -8799,6 +9013,18 @@ prefix `fact_withdrawn`: remembering the same text again does not restore it,
 and a claim forgotten without an entity is withdrawn for every entity. To link
 a fact saved without an entity, do not forget it; remember it with `entity`
 and `replaces` set to its id.
+
+#### remember withdrawn refusal detail (additive)
+
+A `fact_withdrawn` refusal may carry `withdrawn: { at, subject, visibility }`:
+`at` is when the claim was forgotten (ISO 8601), `subject` the entity slug it
+was forgotten for or `all_entities` (forgotten without an entity), and
+`visibility` the forgotten fact's. When several withdrawals match, the one for
+the named entity wins over `all_entities`, then the newest. The same object
+rides the immediate refusal, the `items[]` error, the failed write receipt and
+`get_write_request`. It covers the exact normalized claim only, never a
+paraphrase, and its absence carries no meaning: the message prefix, code and
+suggestion are unchanged.
 
 #### remember replaces (additive)
 
@@ -9668,9 +9894,13 @@ This is the real test. Edit a brain page, push, wait, search.
 ```bash
 # Example: fix a line in alice-example's page
 cd /data/brain
-# Make a small edit to any .md file
-git add -A && git commit -m "test: verify live sync" && git push
+# Make a small edit to one .md file, then commit and push only that file
+gbrain git commit-push -m "test: verify live sync" -- people/alice-example.md
 ```
+
+It must exit 0 and print `pushed <sha> to origin/<branch>`. On any other
+result, stop the test and follow [outcomes](guides/shared-checkout-git.md#outcomes)
+(retry once on `commit_lock_busy`; ask the user on `integrate_conflict`).
 
 2. Wait for the next sync cycle (cron interval or `--watch` poll).
 
@@ -9942,6 +10172,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | [`queue_capacity`, `persistence_capacity` or `persistence_request_growth`](#write-capacity) | run the printed `gbrain config set persistence.limits.<limit> <value>` | brain host | none | `gbrain doctor --only persistence_capacity,persistence_request_growth --json` |
 | [`dream_paid_loop`, or dream keeps skipping one transcript](#dream-paid-loop) | fix the cause, then `gbrain dream reset-key --list` and `gbrain dream reset-key '<key>'` | agent, after the user agrees | `paid` (the key is retried) | `gbrain doctor --only dream_paid_loop --json` |
 | [Search answers look keyword-only on a large Postgres brain](#hybrid-search-returns-only-keyword-hits) | read doctor's `vector_plan`; run the index command it prints | brain host | none | `gbrain doctor --only vector_plan --json` |
+| [Broad keyword queries take about 8 s and come back vector-only (`keyword_arm_failed`) on a large Postgres brain](#keyword-search-times-out-on-a-large-postgres-brain) | read doctor's `keyword_plan`; narrow with `--source-id`, or raise `search.keyword_statement_timeout_ms` on the brain host and restart the serving process | brain host | none | `gbrain doctor --only keyword_plan --json` |
 | A second `gbrain serve` cannot open the brain | the readiness `harness_wiring` fix: every session shares one `gbrain serve --http` | user | `persistent_install`, `credentials` | `gbrain doctor --only harness_wiring --json` |
 | `harness_wiring` reports `http_serve_unreachable` or `http_serve_unhealthy` for an HTTP registration | nothing automatic: doctor probed the registered `/health` without credentials and the endpoint did not answer as a healthy gbrain server; check the URL in the harness config and the server it points at (a hosted brain is its operator's). A `wired_running` verdict with `mcp_access: unverified` proves a listener only: confirm tools in a new session | user | none | `gbrain doctor --only harness_wiring --json` |
 | A tool the fix names is missing after a serve recovered | restart the gbrain MCP server in the harness, or start a new session ([why](../protocol/AGENT_OPERATOR_v1.md#tool-catalog-changes-toolslist_changed)) | user | none | list the tools again |
@@ -10000,7 +10231,7 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 `bootstrap_push_health` and `gbrain bootstrap status` report only the push record of the workspace named by this machine's bootstrap receipt; another workspace's stale or failed push is listed as such (a warn naming that workspace), never as this workspace's state. `reranker_health` auth warnings are audit-log history (`details.live_probe_performed: false`), not a live check of the key. These warns can appear while every other check reads green; each one names a check that did not run.
 
-<a id="git-convergence"></a>**`gbrain doctor` warns or fails `git_convergence`, or `bootstrap_push_health` warns that a workspace is ahead?** A Git checkout the brain syncs from (a source's `local_path` or `sync.repo_path`) has commits its upstream does not have, or uncommitted changes, so the system of record on the remote is behind the brain (#5063). Commits not on the upstream warn after 6 hours and fail after 24; uncommitted changes older than 6 hours warn. Doctor compares with the local `@{u}` ref and never fetches, so it is only as fresh as the last fetch; checkouts without an upstream and connector sources are skipped. Commit and push the checkout (`gbrain sources push --path <root>` for a bootstrap workspace, `git push` otherwise). `bootstrap_push_health` no longer reports `ok` on a recent successful push while the workspace still has commits not on origin.
+<a id="git-convergence"></a>**`gbrain doctor` warns or fails `git_convergence`, or `bootstrap_push_health` warns that a workspace is ahead?** A Git checkout the brain syncs from (a source's `local_path` or `sync.repo_path`) has commits its upstream does not have, or uncommitted changes, so the system of record on the remote is behind the brain (#5063). Commits not on the upstream warn after 6 hours and fail after 24; uncommitted changes older than 6 hours warn. Doctor compares with the local `@{u}` ref and never fetches, so it is only as fresh as the last fetch; checkouts without an upstream and connector sources are skipped. Commit and push the checkout (`gbrain sources push --path <root>` for a bootstrap workspace; otherwise commit your files with `gbrain git commit-push -m "<msg>" -- <paths>` and publish waiting commits with `gbrain git commit-push --push-only`, see [shared-checkout git](shared-checkout-git.md#outcomes)). `bootstrap_push_health` no longer reports `ok` on a recent successful push while the workspace still has commits not on origin.
 
 <a id="tracked-ownership-marker"></a>**`gbrain doctor` warns `tracked_ownership_marker`, or `gbrain sources push` / `bootstrap verify` refuses a `.gbrain-owner*.json` or `.gbrain-bootstrap.lock/` path?** An ownership marker (`.gbrain-owner.json`, the `.gbrain-owner-<hash>.json` reservation beside a root, a `.gbrain-owner.json.<uuid>.tmp` staging file) or the bootstrap lock directory was committed to a source checkout (#5186). These files are this machine's claim on the checkout, never brain content, and must not reach a remote. Since this fix gbrain appends their patterns to the checkout's `.git/info/exclude` whenever it stamps or adopts a root, the bootstrap `.gitignore` template lists them, and the push deny list refuses a tracked one while an untracked one is excluded from the commit (`excludedUntracked`). None of that un-tracks a file already in the index: run the `git -C <root> rm --cached <paths>` the check prints (the files stay on disk, gbrain keeps reading them), commit, push, then `gbrain doctor --only tracked_ownership_marker --json`. A root stamped before this fix gains the exclude rule on its next stamp or transfer; until then the deny list is the backstop, and `bootstrap verify`'s `deny_globs` treats a merely-on-disk marker as fine. If a marker already reached a remote, rotate it the same way you would any published credential: the token alone is not remote authority (the reservation that proves ownership lives outside the root), but treat the history as exposed.
 
@@ -10258,6 +10489,56 @@ report the regression:
 The guard is temporary. The release that retires it prints a one-time notice
 when the inert setting is still present.
 
+## Keyword search times out on a large Postgres brain
+
+**Symptom.** On a large Postgres brain (hundreds of thousands of pages), a
+broad `gbrain search` or `gbrain query` with common words takes about 8
+seconds and comes back with only vector hits; search metadata carries
+`keyword_arm_failed`, and the server log says `canceling statement due to
+statement timeout` (SQLSTATE 57014). The strict keyword statement ranks every
+matching chunk before its `LIMIT`, so its cost grows with how common the terms
+are, and the commonest terms cannot finish inside the keyword statement bound.
+An arm that timed out is not evidence of absence: the pages exist, the arm
+could not rank them in time.
+
+**Say to your agent:** *"Check whether keyword search is hitting its time
+limit"* — the agent runs `gbrain doctor` and reads the `keyword_plan` check.
+
+`gbrain doctor` reports `keyword_plan` (Postgres only):
+
+- `ok`: the brain's commonest keyword term (from the planner's statistics for
+  `content_chunks.search_vector`) is counted inside half of the bound; the
+  message shows the plan the planner chose for it.
+- skipped: PGLite (no statement timeout), fewer than 10,000 chunks, or no
+  planner statistics yet (run `ANALYZE content_chunks` on the brain host, or
+  let the next sync refresh them).
+- warn, `canary_timed_out` or `canary_slow`: the commonest term's bounded count
+  did not finish in 2 s, or took more than half of the bound. Broad queries on
+  this brain will hit the bound. One canary term is not workload coverage, and
+  a timed-out count is never "no matches".
+
+**The bound is an operator knob.** `search.keyword_statement_timeout_ms`
+(integer milliseconds, default 8000, range 1000 to 60000) is the
+transaction-local `statement_timeout` the Postgres engine sets around every
+keyword, keyword-count, keyword-page, title and CJK search statement. A remote
+caller cannot change it, and `gbrain config set` refuses a value outside the
+range (exit 2, nothing written). It is read once per connection, so:
+
+1. Set it on the brain host: `gbrain config set search.keyword_statement_timeout_ms 20000`
+   (or `search.keyword_statement_timeout_ms` under `search` in the config file,
+   which wins over the database value).
+2. Restart the process that runs searches (`gbrain serve`, autopilot, job
+   workers); the next CLI command picks it up by itself.
+3. Confirm with `gbrain doctor --only keyword_plan --json`: `details.timeout_ms`
+   shows the value in effect.
+
+A longer bound buys time, not a cheaper statement: a query whose terms match
+most of the corpus still reads and ranks every match, so prefer narrowing with
+`--source-id` (MCP `source_id`) or `match: "keyword"` paging, and follow
+[#6495](https://github.com/garrytan/gbrain/issues/6495) for the bounded
+candidate set that will answer broad terms from a capped set instead of
+failing open.
+
 ## Global maintenance timeouts
 
 **Doctor warns `global_maintenance_timeouts`, or late maintenance phases
@@ -10321,6 +10602,7 @@ the exit code first, then reads the JSON document (`--json`) for the details:
 | 3 | `confirmation_required`: nothing ran | consent payload (`effects`, `user_message`, `fix`) | stop, relay `user_message` to the user, run `fix.command` only after they agree |
 | 10 | the write was accepted and is still pending | write receipt | poll the receipt (`gbrain write-request -- <id>`); `--accept-pending` maps this to 0 |
 | 11 | partial, resumable budget stop | result with `remaining_*` and `resume_command` | run `resume_command` (it is safe to re-run) |
+| 69 | `gbrain serve` exited on its own after its persistence consumer reported `restart_required` for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS` (`serve_unhealthy_exit`; opt-in) | `[gbrain serve] error code=serve_unhealthy_exit` line on stderr | nothing: the supervisor (the installed service restarts on failure) starts a fresh serve; if it repeats, follow [the unhealthy exit](../ENGINES.md#serve-unhealthy-exit) |
 | 75 | another runner holds the migration lock, or an engine graduation owns the brain (`graduation_in_progress`) | error envelope | wait for the other runner, then retry |
 | 124 | the command's own deadline elapsed | error envelope | inspect what is still running (the message names the status command) |
 | 130 | interrupted (SIGINT) | error envelope | ask the user whether to re-run |

@@ -13,7 +13,8 @@ import { importFromContent, importCodeFile, verifyPageReadable } from '../import
 import { screenImportContent, screenNormalized, type ContentRefusal, type ImportScreenResult, type ImportSanityConfig } from '../import-screen.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
 import { parseMarkdown, resolveParsedSubtype, serializePageToMarkdown, type ParseOpts } from '../markdown.ts';
-import { resolveSlugForPath, slugifyPath, isCodeFilePath } from '../sync.ts';
+import { resolveSlugForPath, slugifyPath, isCodeFilePath, isImageFilePath } from '../sync.ts';
+import { prepareManagedSyncImage } from './sync-image.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
 import { sameCanonicalImport } from '../page-state/import-guard.ts';
 import { assertPageRevision } from '../page-state/types.ts';
@@ -37,6 +38,7 @@ import { companyBrainProfile } from '../company-brain/profile.ts';
 import { companyBrainPolicyFingerprint } from '../company-brain/policy.ts';
 import { isUnboundSourcePage, UNBOUND_COLLISION_MESSAGE } from './unbound-source.ts';
 import { checkpointRetryCommand, findIncompleteSyncReceipt } from './checkpoint-validation.ts';
+import { checkpointCursorReplaced } from './sync-checkpoint-replaced.ts';
 import { frontmatterSlugConflictMessage } from './verb-errors.ts';
 import { chunkerStamp } from '../chunkers/code.ts';
 import { clearGitHold, countGitHolds, recordSyncImportProvenance } from './sync-holds.ts';
@@ -315,6 +317,53 @@ async function recordSliceCursor(tx: BrainEngine, row: WriteRequest, p: { syncOp
   if (settled) await clearSyncSlice(tx, row.source_id, row.source_incarnation, p.syncOptions);
   else await writeSyncSlice(tx, row.source_id, row.source_incarnation, p.syncOptions, p.slice!);
 }
+
+/** The code-file branch of `prepareManagedSyncMutation`: `importCodeFile` with `prepare`, text embedding deferred to `embed --stale` (the image branch is `sync-image.ts`). */
+async function prepareManagedSyncCode(engine: BrainEngine, row: WriteRequest, p: { content: string; sourcePath: string; rawHash: string | null; lineEndingOnly?: boolean; companyApproval: boolean },
+  ctx: { snapshot: Snapshot | null; validate: (tx: BrainEngine) => Promise<void>; releaseHold: (tx: BrainEngine) => Promise<void>; clock?: ClaimPhaseClock;
+    refuse: (code: RegistryCode, message: string, cause: string) => OperationError; contentRefusal: (refusal: ContentRefusal) => OperationError }): Promise<PreparedMutation> {
+  const { snapshot, validate, releaseHold, clock, refuse } = ctx;
+  if (p.companyApproval) throw refuse('profile_incompatible', 'Company source approval permits only committed Markdown content.',
+    `A company-brain source imports only committed Markdown, and ${row.slug} is a code file; remove it from the approved revision.`);
+  if (snapshot && !p.lineEndingOnly && p.rawHash !== sha256(p.content) && snapshot.page.compiled_truth !== p.content) {
+    throw refuse('source_changed', 'Newer code file bytes disagree with the pinned import.',
+      `The working tree holds newer bytes for ${row.slug} than the pinned import; sync did not overwrite them. Preserve the local edit and commit it.`);
+  }
+  const codeScreen = screenImportContent({ content: p.content, path: p.sourcePath });
+  if (codeScreen.status === 'refused') throw ctx.contentRefusal(codeScreen.refusal);
+  let prepared: PreparedContentImport | undefined;
+  enterClaimStep(clock, 'code_import', undefined, 'db');
+  const result = await importCodeFile(engine, p.sourcePath, p.content, { sourceId: row.source_id, noEmbed: true,
+    prepare: async value => { prepared = value; return value.result; } });
+  if (!prepared || prepared.slug !== row.slug) throw refuse('invalid_params', result.error ?? 'The code file identity could not be prepared.',
+    `The code file could not be prepared as page ${row.slug}.`);
+  const ready = prepared;
+  if (ready.observedRevision !== (snapshot?.revision ?? null)) throw refuse('revision_conflict', 'The code page changed during preparation.',
+    `Page ${row.slug} changed while this sync was being prepared.`);
+  return { observedRevision: ready.observedRevision, trust: await ownerImportTrust(engine, row, null, p.sourcePath),
+    validate: async tx => { await validate(tx); await ready.validate(tx); },
+    noop: ready.noop, deferEmbedding: true, apply: async tx => {
+    await ready.apply(tx);
+    await releaseHold(tx);
+    return { status: ready.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
+      chunks: result.chunks, noop: ready.noop, imported_file: true };
+  } };
+}
+
+/**
+ * Whether the import must rewrite its file with `canonicalFile` (its sanitized form). Working-tree bytes that are the
+ * pinned bytes (or differ only by line endings) take the write; bytes that already are the canonical file need none
+ * (#6513: gbrain's own writeback, published before the request that carried it settled); any other newer bytes are
+ * refused, and the run holds the file `worktree_dirty` (sync-page-fault.ts `pinnedWorktreeConflict`).
+ */
+function canonicalWritebackNeeded(row: WriteRequest, p: SyncIntent, pinned: string, canonicalFile: string | null): canonicalFile is string {
+  if (canonicalFile === null) return false;
+  if (p.lineEndingOnly || p.rawHash === sha256(pinned)) return true;
+  if (p.rawHash === sha256(canonicalFile)) return false;
+  throw syncPublicationRefusal('source_changed', 'Canonical sanitization cannot overwrite newer working-tree bytes.', row, p,
+    `The canonical correction for ${row.slug} would overwrite newer working-tree bytes; preserve the local edit and commit it.`);
+}
+
 export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock?: ClaimPhaseClock,
   screening?: { unsaved: true }): Promise<PreparedMutation> {
   const engine = boundedReads(unbounded, clock);
@@ -371,6 +420,9 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
       async () => { if (await earlierGroupMemberFailed(tx, row)) throw syncPublicationRefusal('revision_conflict', 'An earlier page of this sync did not commit.', row, p, `Request ${row.request_id} follows a page of the same bulk group that did not commit, so this page must not publish after it.`); },
       async () => {
         const cursor = await shared;
+        // #6513: a checkpoint whose cursor another run replaced is superseded, not conflicted; a page keeps `revision_conflict`.
+        const replaced = checkpointCursorReplaced(p, cursor?.run_id, row.source_id);
+        if (replaced) throw syncPublicationRefusal(replaced.code, replaced.message, row, p, replaced.cause);
         if (cursor && (cursor.run_id !== p.runId || (cursor.request_id !== row.request_id && !cursor.group?.includes(row.request_id) && !(screening?.unsaved && cursor.request_id == null)))) throw syncPublicationRefusal('revision_conflict', 'The accepted sync cursor changed before publication.', row, p,
           `Another sync run of ${row.source_id} replaced the cursor this request belongs to.`);
       },
@@ -402,6 +454,9 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   if (p.kind === 'managed_sync_checkpoint') return { sourceExclusive: true, observedRevision: null, validate, apply: async tx => {
     const [cursor] = await tx.executeRaw<{ completed_keys: [{ runId: string; index: number; total: number }] }>(
       "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1 FOR UPDATE", [p.cursorKey]);
+    // #6513: validation passed under this run; a replacement that landed since is the same supersession, not an index lag.
+    const replaced = checkpointCursorReplaced(p, cursor?.completed_keys[0]?.runId, row.source_id);
+    if (replaced) throw syncPublicationRefusal(replaced.code, replaced.message, row, p, replaced.cause);
     if (!cursor || cursor.completed_keys[0].runId !== p.runId || cursor.completed_keys[0].index !== p.total || cursor.completed_keys[0].total !== p.total) {
       throw syncPublicationRefusal('revision_conflict', 'The sync cursor is not fully committed.', row, p,
         `Not every page write of this sync run has committed, so the checkpoint of ${row.source_id} did not advance.`);
@@ -454,33 +509,14 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
     } };
   if (typeof p.content !== 'string' || typeof p.sourcePath !== 'string' || typeof p.path !== 'string') throw syncPublicationRefusal('storage_error', 'The frozen import content is missing.', row, p,
     'The stored intent has no frozen file content to import.');
-  if (isCodeFilePath(p.sourcePath)) {
-    if (p.companyApproval) throw syncPublicationRefusal('profile_incompatible', 'Company source approval permits only committed Markdown content.', row, p,
-      `A company-brain source imports only committed Markdown, and ${row.slug} is a code file; remove it from the approved revision.`);
-    if (snapshot && !p.lineEndingOnly && p.rawHash !== sha256(p.content) && snapshot.page.compiled_truth !== p.content) {
-      throw syncPublicationRefusal('source_changed', 'Newer code file bytes disagree with the pinned import.', row, p,
-        `The working tree holds newer bytes for ${row.slug} than the pinned import; sync did not overwrite them. Preserve the local edit and commit it.`);
-    }
-    const codeScreen = screenImportContent({ content: p.content, path: p.sourcePath });
-    if (codeScreen.status === 'refused') throw syncContentRefusal(codeScreen.refusal, row, p);
-    let prepared: PreparedContentImport | undefined;
-    enterClaimStep(clock, 'code_import', undefined, 'db');
-    const result = await importCodeFile(engine, p.sourcePath, p.content, { ...source, noEmbed: true,
-      prepare: async value => { prepared = value; return value.result; } });
-    if (!prepared || prepared.slug !== row.slug) throw syncPublicationRefusal('invalid_params', result.error ?? 'The code file identity could not be prepared.', row, p,
-      `The code file could not be prepared as page ${row.slug}.`);
-    const ready = prepared;
-    if (ready.observedRevision !== (snapshot?.revision ?? null)) throw syncPublicationRefusal('revision_conflict', 'The code page changed during preparation.', row, p,
-      `Page ${row.slug} changed while this sync was being prepared.`);
-    return { observedRevision: ready.observedRevision, trust: await ownerImportTrust(engine, row, null, p.sourcePath),
-      validate: async tx => { await validate(tx); await ready.validate(tx); },
-      noop: ready.noop, deferEmbedding: true, apply: async tx => {
-      await ready.apply(tx);
-      await releaseHold(tx);
-      return { status: ready.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
-        chunks: result.chunks, noop: ready.noop, imported_file: true };
-    } };
+  // #6529: an image entry (frozen as base64 bytes) takes the coordinated image importer; its text embedding waits for embed --stale.
+  if (isImageFilePath(p.sourcePath)) {
+    return prepareManagedSyncImage(engine, row, { content: p.content, sourcePath: p.sourcePath, path: p.path, rawHash: p.rawHash, lineEndingOnly: p.lineEndingOnly },
+      { root, snapshot, ...(moved && moved.slug !== row.slug ? { renamedFrom: { slug: moved.slug } } : {}), noEmbed: p.processingOptions?.noEmbed === true, companyApproval: !!p.companyApproval, validate, releaseHold, clock, screening: !!screening,
+        refuse: (code, message, cause) => syncPublicationRefusal(code, message, row, p, cause) });
   }
+  if (isCodeFilePath(p.sourcePath)) return prepareManagedSyncCode(engine, row, { content: p.content, sourcePath: p.sourcePath, rawHash: p.rawHash, lineEndingOnly: p.lineEndingOnly, companyApproval: !!p.companyApproval },
+    { snapshot, validate, releaseHold, clock, refuse: (code, message, cause) => syncPublicationRefusal(code, message, row, p, cause), contentRefusal: refusal => syncContentRefusal(refusal, row, p) });
   const schema = p.companyApproval?.schema;
   if (schema && p.processingOptions?.noSchemaPack) throw syncPublicationRefusal('profile_incompatible', 'Company source approval requires its pinned schema pack.', row,
     { ...p, processingOptions: { ...p.processingOptions!, noSchemaPack: false } },
@@ -556,9 +592,8 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   // #5409: a read-only mirror keeps its canonical metadata in the database only; its checkout stays the remote's bytes.
   enterClaimStep(clock, 'mirror_check', undefined, 'db');
   const mirrorReadOnly = overlay && await sourceMirrorReadOnly(engine, row.source_id);
-  const writeback = overlay && !mirrorReadOnly;
-  if (writeback && !p.lineEndingOnly && p.rawHash !== sha256(p.content)) throw syncPublicationRefusal('source_changed', 'Canonical sanitization cannot overwrite newer working-tree bytes.', row, p,
-    `The canonical correction for ${row.slug} would overwrite newer working-tree bytes; preserve the local edit and commit it.`);
+  const canonicalFile = overlay && !mirrorReadOnly ? serializePageToMarkdown(renderedPage, tags) : null;
+  const writeback = canonicalWritebackNeeded(row, p, p.content, canonicalFile);
   // A rename projects against the moved page (same id), so its pinned timeline rows carry over.
   enterClaimStep(clock, 'canonical_projections', undefined, 'db');
   const project = await prepareCanonicalProjections(engine, ready.parsedPage, row.slug, row.source_id, base, p.companyApproval ? 'immutable' : 'file');
@@ -568,7 +603,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
     ...(renamed ? { additionalPageKeys: [{ sourceId: row.source_id, slug: renamed.slug }] } : {}),
     validate: async tx => { await validate(tx); await ready.validate(tx); },
     deferEmbedding: p.processingOptions?.noEmbed,
-    ...(writeback ? { file: { root, path: join(root, p.path), content: serializePageToMarkdown(renderedPage, tags), expectedBeforeHash: p.rawHash } } : {}),
+    ...(writeback ? { file: { root, path: join(root, p.path), content: canonicalFile, expectedBeforeHash: p.rawHash } } : {}),
     ...(mirrorReadOnly ? { databaseOnlyReason: 'mirror_read_only' as const } : {}),
     apply: async (tx, preimage) => {
       let applied = ready;

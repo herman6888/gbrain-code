@@ -397,6 +397,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
   if (key.startsWith('loops.')) (await import('./config/loops-values.ts')).refuseInvalidLoopsConfigValue(key, value);
+  if (key.startsWith('search.')) (await import('./config/keyword-timeout-value.ts')).refuseInvalidKeywordTimeoutValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
     const err = validateMaxClaimConfigValue(key, value);
@@ -1445,8 +1446,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // set that already persisted.
     if (key === 'search.mode') {
       try {
-        const { runModeSwitchUx } = await import('../core/search/mode-switch-ux.ts');
-        const { isSearchMode } = await import('../core/search/mode.ts');
+        const [{ runModeSwitchUx }, { isSearchMode }] = await Promise.all([import('../core/search/mode-switch-ux.ts'), import('../core/search/mode.ts')]);
+        if (isSearchMode(value)) await engine.setConfig('search.mode_source', 'operator');
         await runModeSwitchUx({
           oldMode: oldSearchMode && isSearchMode(oldSearchMode) ? oldSearchMode : null,
           newMode: value,

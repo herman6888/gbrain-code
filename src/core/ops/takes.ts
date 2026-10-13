@@ -22,6 +22,41 @@ import { embedQuery } from '../embedding.ts';
 import { ALL_SOURCES } from '../source-id.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
+/** Result pages whose takes D2 checks: the page a get_page read returned, or the first distinct pages of a search/query. */
+const HIDDEN_TAKES_PAGE_CAP = 3;
+
+/**
+ * D2: page reads, search and query never show the takes table to an
+ * agent-facing reader. For the pages this result returned, the takes
+ * `takes_list` would list on this connection (same source scope, holder
+ * allow-list and read eligibility), counted, capped at 100 per page. Null
+ * when the result has no page with such takes. Slugs come from the result.
+ */
+export async function takesHiddenFromResult(ctx: OperationContext, op: string, result: unknown): Promise<{ pages: string[]; count: number } | null> {
+  if (ctx.remote === false) return null;
+  const rows = op === 'get_page' ? [result] : (op === 'search' || op === 'query') && Array.isArray(result) ? result : [];
+  const pages = new Map<string, string | undefined>();
+  for (const row of rows) {
+    if (pages.size >= HIDDEN_TAKES_PAGE_CAP) break;
+    const r = row as { slug?: unknown; source_id?: unknown; result_type?: unknown } | null;
+    if (!r || typeof r.slug !== 'string' || (r.result_type !== undefined && r.result_type !== 'page')) continue;
+    const source = typeof r.source_id === 'string' ? r.source_id : undefined;
+    const key = `${source ?? ''}\u0000${r.slug}`;
+    if (!pages.has(key)) pages.set(key, source);
+  }
+  if (pages.size === 0) return null;
+  const eligibility = await resolveReadEligibility(ctx, {});
+  const counted = await Promise.all([...pages].map(async ([key, source]) => {
+    const slug = key.slice(key.indexOf('\u0000') + 1);
+    const policy = await readPolicyOpts(ctx, ...(source ? [{ sourceId: source }] : []));
+    const takes = await ctx.engine.listTakes({ ...policy, page_slug: slug, takesHoldersAllowList: readHolders(ctx), eligibility, limit: 100 });
+    return { slug, count: takes.length };
+  }));
+  const withTakes = counted.filter(c => c.count > 0);
+  if (!withTakes.length) return null;
+  return { pages: [...new Set(withTakes.map(c => c.slug))], count: withTakes.reduce((n, c) => n + c.count, 0) };
+}
+
 // --- v0.28: Takes ---
 
 const takes_list: Operation = {

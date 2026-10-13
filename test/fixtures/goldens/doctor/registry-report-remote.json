@@ -255,6 +255,10 @@
       },
       {
         "category": "ops",
+        "name": "keyword_plan"
+      },
+      {
+        "category": "ops",
         "name": "stale_embedding_effects"
       }
     ],

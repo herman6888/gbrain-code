@@ -21,6 +21,7 @@ import { receiptDeliveredHint } from './connector-errors.ts';
 import type { PgAccessReason } from '../pg-access-classify.ts';
 import { contentRefusalFromReceipt } from '../import-screen.ts';
 import { fenceIssuesFromDetail, fenceLocationFromDetail } from '../fence-repair/refusal.ts';
+import { withdrawnFromDetail } from '../facts/withdrawal.ts';
 import { heldFileDiagnostic } from './verb-errors.ts';
 import { isMissingPageMessage } from './page-identity.ts';
 import { registerPersistenceConsumerConfig } from '../embedding-disabled.ts';
@@ -353,6 +354,8 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
     }
     if (content.key || content.line !== undefined) error.detail = [content.key ? `key ${content.key}` : '', content.line !== undefined ? `line ${content.line}` : ''].filter(Boolean).join(', ');
   }
+  const withdrawn = isTerminal(row) ? withdrawnFromDetail(row.error_detail) : undefined;
+  if (withdrawn) error.withdrawn = withdrawn;
   if (reason === 'page_identity_changed' && isMissingPageMessage(row.error_message)) error.canonical = 'page_not_found';
   error.receiptFields = { operation: row.operation, source_id: row.source_id, slug: row.slug || null, principal_kind: row.principal_kind, principal_id: row.principal_id };
   error.writeRequest = receipt as WriteReceipt;

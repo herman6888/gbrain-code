@@ -5,8 +5,8 @@
  * Agent operator contract v1 table (docs/guides/exit-codes.md):
  *   0 ok · 1 failed (class/retryable in JSON) · 2 usage / invalid input ·
  *   3 confirmation_required (its ONLY meaning) · 10 write pending ·
- *   11 resumable budget stop · 75 migration lock held · 124 timeout ·
- *   130 interrupted. `test/exit-codes.test.ts` enumerates every literal
+ *   11 resumable budget stop · 69 serve exited unhealthy · 75 migration
+ *   lock held · 124 timeout · 130 interrupted. `test/exit-codes.test.ts` enumerates every literal
  *   exit 3 in src/ so a new one cannot reuse it.
  */
 
@@ -43,3 +43,10 @@ export const PENDING_WRITE_EXIT_CODE = 10;
  * from 3, which agent-facing commands reserve for "ask the user first".
  */
 export const BUDGET_STOP_EXIT_CODE = 11;
+
+/**
+ * #6543: `gbrain serve` exited on its own because its persistence consumer
+ * reported `restart_required` continuously for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS`
+ * (`serve_unhealthy_exit`). EX_UNAVAILABLE: a supervisor restarts it.
+ */
+export const SERVE_UNHEALTHY_EXIT_CODE = 69;

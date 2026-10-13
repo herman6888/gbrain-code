@@ -460,6 +460,25 @@ describe('full apply', () => {
     expect(readFileSync(f2.codexConfig, 'utf8')).toContain('http://192.168.1.50:3131/mcp');
   });
 
+  test('registrar mode wires no Codex capture hook, the same recorded consent as the Claude lane (MCP only)', async () => {
+    const f = makeFake();
+    const code = await applyHarness(flags(['--url', 'http://192.168.1.50:3131/mcp', '--token', TOKEN_A, '--harness', 'codex']), f.deps);
+    expect(code).toBe(0);
+    expect(f.out.join('\n')).toContain('No hooks are wired by this invocation.');
+    expect(existsSync(join(dirname(f.codexConfig), 'hooks.json'))).toBe(false);
+    expect(readFileSync(f.codexConfig, 'utf8')).not.toContain('gbrain:codex-hooks-trust');
+  });
+
+  test('--no-capture declines the Codex SessionEnd capture hook (capture is its own consent item)', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex', '--no-capture']), f.deps)).toBe(0);
+    expect(existsSync(join(dirname(f.codexConfig), 'hooks.json'))).toBe(false);
+    const g = makeFake();
+    expect(await applyHarness(flags(['--harness', 'codex']), g.deps)).toBe(0);
+    expect(g.out.join('\n')).toMatch(/Codex session-transcript capture/);
+    expect(readFileSync(join(dirname(g.codexConfig), 'hooks.json'), 'utf8')).toContain('hook session-end --harness codex');
+  });
+
   test('--project must exist [F4]', async () => {
     const f = makeFake();
     const code = await applyHarness(flags(['--project', '/definitely/not/a/dir']), f.deps);

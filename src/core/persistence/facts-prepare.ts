@@ -7,7 +7,9 @@ import type { Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { parseFactsFence, upsertFactRow, formatFenceDate, renderFactsTable, replaceOrInsertFactsFence } from '../facts-fence.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { assertFactNotWithdrawn, decideSingleFact, type FactCandidate } from '../facts/single-prepare.ts';
+import { assertFactNotWithdrawn, decideSingleFact, factWithdrawnRefusal, type FactCandidate } from '../facts/single-prepare.ts';
+import { assertFactNotPurged, isFactWithdrawn } from '../facts/withdrawal.ts';
+import { samePageRewording, warnSamePageShadow } from '../facts/same-page-shadow.ts';
 import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
 import { authorizeWrite } from './authority.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
@@ -116,14 +118,18 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
   const additionalPageKeys = p.origin ? [{ sourceId: row.source_id, slug: p.origin.slug }] : [];
   if (p.kind === 'managed_facts_complete') return { observedRevision: null, noop: true, additionalPageKeys, validate, apply: async tx => {
     const children = p.children ?? [];
-    const done = await tx.executeRaw<{ outcome: { inserted?: number; duplicate?: number; fact_ids?: number[] } }>(`SELECT outcome FROM persistence_requests WHERE id=ANY($1::uuid[]) AND source_incarnation=$2::uuid
+    const done = await tx.executeRaw<{ outcome: { inserted?: number; duplicate?: number; fact_ids?: number[]; withdrawn_skipped?: number; would_dedup_same_page?: number } }>(`SELECT outcome FROM persistence_requests WHERE id=ANY($1::uuid[]) AND source_incarnation=$2::uuid
       AND state='committed' AND COALESCE(intent->>'batchKey',outcome->>'batch_key')=$3 AND operation='extract_facts'`, [children, row.source_incarnation, p.batchKey]);
     if (done.length !== children.length) throw factsRefusal('revision_conflict', 'Some extracted facts have not committed.', row,
       `${children.length - done.length} of the batch's ${children.length} per-entity fact requests have not committed, so the extraction cannot be recorded as complete.`,
       'once the entity requests are final, run extract_facts again for the same turn with a new request_id only if facts are still missing.');
+    const withdrawnSkipped = done.reduce((sum, item) => sum + Number(item.outcome.withdrawn_skipped ?? 0), 0);
+    const wouldDedupSamePage = done.reduce((sum, item) => sum + Number(item.outcome.would_dedup_same_page ?? 0), 0);
     return { status: 'completed', entity_requests: children.length, kind: p.kind, batch_key: p.batchKey, input_digest: p.inputDigest,
       inserted: done.reduce((sum, item) => sum + Number(item.outcome.inserted ?? 0), 0),
       duplicate: done.reduce((sum, item) => sum + Number(item.outcome.duplicate ?? 0), 0),
+      ...(withdrawnSkipped ? { withdrawn_skipped: withdrawnSkipped } : {}),
+      ...(wouldDedupSamePage ? { would_dedup_same_page: wouldDedupSamePage } : {}),
       fact_ids: done.flatMap(item => item.outcome.fact_ids ?? []) };
   } };
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
@@ -152,13 +158,24 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
   const taint = await managedFactsTrust(engine, p);
   const gateCfg = taint ? await derivedGateConfig(engine) : null;
   const blocked: GatedRowDecision[] = [];
+  // #6506: automatic extraction skips a forgotten claim and keeps the rest of the group; a purge tombstone still
+  // refuses the group, as it does for every writer; explicit writers (no flag) refuse the forgotten claim.
+  let withdrawnSkipped = 0;
+  // #6333 shadow (managed mirror of the backstop's counter): a same-page rewording is counted on the entity outcome
+  // and named on stderr; nothing is dropped. The count is frozen in the receipt, so a replay reports it, not recounts it.
+  let wouldDedupSamePage = 0;
   for (const fact of facts) {
-    await assertFactNotWithdrawn(engine, row.source_id, fact);
+    if (p.withdrawn === 'skip') {
+      await assertFactNotPurged(engine, row.source_id, fact);
+      if (await isFactWithdrawn(engine, row.source_id, fact.visibility, fact.fact, fact.entity_slug)) { withdrawnSkipped++; continue; }
+    } else await assertFactNotWithdrawn(engine, row.source_id, fact);
     const key = JSON.stringify([fact.fact, fact.visibility, fact.entity_slug]);
     const earlier = (seen.get(key) ?? []).find(i => attributionCompatible(entries[i].fact.attributed_to, fact.attributed_to));
     if (earlier !== undefined) { entries.push({ fact, duplicateId: null, duplicateOf: earlier }); continue; }
     seen.set(key, [...(seen.get(key) ?? []), entries.length]);
     const decision = await decideSingleFact(engine, row.source_id, fact, dedupEmbedding(fact), fact.embedding_model, fact.source);
+    const shadow = decision.candidate ? null : await samePageRewording(engine, row.source_id, fact, dedupEmbedding(fact));
+    if (shadow) { wouldDedupSamePage++; warnSamePageShadow(fact.source_session ?? null, shadow.id, shadow.score); }
     const supersedes = p.supersede === true && decision.status === 'superseded' ? decision.candidate! : undefined;
     if (decision.candidate && !supersedes) { entries.push({ fact, duplicateId: decision.candidate.id }); continue; }
     const gate = taint ? decideFactWrite(fact, { sourceId: row.source_id, slug: row.slug, payload: { ...fact, embedding: null },
@@ -204,14 +221,26 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
     ...(taint ? { trust: taint.trust } : {}),
     additionalPageKeys, validate: async tx => {
       await validate(tx, true);
-      await page?.validate?.(tx);
       for (const entry of entries) {
-        await assertFactNotWithdrawn(tx, row.source_id, entry.fact);
+        // #6506 (R15): under `withdrawn: 'skip'` a claim forgotten between preparation and this locked validation is a
+        // terminal revision_conflict whose detail names the withdrawal (the fence body is already rendered, and an
+        // extract_facts request is never re-prepared); an input-keyed batch recovers through its follow-up batch.
+        if (p.withdrawn !== 'skip') await assertFactNotWithdrawn(tx, row.source_id, entry.fact);
+        else {
+          await assertFactNotPurged(tx, row.source_id, entry.fact);
+          if (await isFactWithdrawn(tx, row.source_id, entry.fact.visibility, entry.fact.fact, entry.fact.entity_slug)) {
+            const refusal = factsRefusal('revision_conflict', 'A claim was forgotten after these facts were prepared.', row,
+              `A claim in this group was forgotten in source ${row.source_id} after the facts were prepared, so none of these facts were published; the forgotten claim stays withdrawn.`);
+            refusal.withdrawn = (await factWithdrawnRefusal(tx, row.source_id, entry.fact)).withdrawn;
+            throw refusal;
+          }
+        }
         if (entry.duplicateOf !== undefined) continue;
         const current = await decideSingleFact(tx, row.source_id, entry.fact, dedupEmbedding(entry.fact), entry.fact.embedding_model, entry.fact.source);
         if ((current.candidate?.id ?? null) !== (entry.duplicateId ?? entry.supersedes?.id ?? null)) throw factsRefusal('revision_conflict', 'The fact deduplication state changed before publication.', row,
           `A matching fact in source ${row.source_id} was added or retired before publication, so the deduplication decision for ${row.slug} is stale and none of these facts were published.`);
       }
+      await page?.validate?.(tx);
     }, apply: async tx => {
       if (page) await withPageTierKept(tx, { sourceId: row.source_id, slug: row.slug }, () => page!.apply(tx));
       const ids: number[] = [];
@@ -238,6 +267,8 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
       const write_gate = emptyGateTally();
       for (const gate of blocked) await applyGateDecision(tx, gate, { table: 'facts', sourceId: row.source_id }, async () => null, write_gate);
       return { status: 'completed', inserted, duplicate: entries.length - inserted, superseded, fact_ids: ids, ...(blocked.length ? { write_gate } : {}),
+        ...(withdrawnSkipped ? { withdrawn_skipped: withdrawnSkipped } : {}),
+        ...(wouldDedupSamePage ? { would_dedup_same_page: wouldDedupSamePage } : {}),
         fenced: page !== undefined, kind: p.kind, batch_key: p.batchKey, input_digest: p.inputDigest,
         ...(page && target?.fixes.length ? { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: target.fixes,
           writer: row.principal_kind, path: snapshot?.page.source_path ?? null, remote: row.authority.remote }) } : {}) };

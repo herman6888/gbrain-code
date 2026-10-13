@@ -126,6 +126,23 @@ and [isolated local backup guide](in-agent-setup.md#6-back-up-the-complete-local
 the same source and visibility, and its row is struck in the page's Markdown.
 The text stays in the row, the file, page history and backups.
 
+Automatic extraction (sync import, `put_page`, `extract_facts`, the sweep)
+skips a candidate whose exact claim was forgotten in that source and visibility
+and still saves the other facts it found about the same entity; the entity and
+completion write receipts and the extraction result count the skips as
+`withdrawn_skipped`, and a group of only forgotten claims completes with nothing
+inserted. Explicitly remembering the forgotten claim still refuses with
+`fact_withdrawn`, and a purge tombstone still refuses the whole write with
+`purged_content`. A claim forgotten after an extraction's facts were prepared
+refuses that entity's write with `revision_conflict` and a detail naming the
+withdrawal; nothing is published. An extraction keyed by its input alone (sync
+import or the sweep, which have no request id) recovers on its next run from
+such a refusal, and from a batch an older release refused for a forgotten
+claim, by re-admitting the retained facts without another model call (at most
+three follow-ups per batch, each visible as its own write receipt; the refused
+receipts stay as they were). An extraction admitted under a request id replays
+its receipt; give it a new `request_id` to extract again.
+
 `gbrain forget <id> --purge` **purges**: an owner-only command on the brain
 host that removes the claim from the live stores gbrain controls and returns a
 receipt. It is a separate operation (`purge_fact`), never a mode of the

@@ -8,6 +8,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -26,6 +28,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -44,6 +48,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -62,6 +68,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -80,6 +88,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -98,6 +108,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -116,6 +128,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -134,6 +148,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -152,6 +168,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -170,6 +188,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -188,6 +208,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -206,6 +228,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 1,
@@ -224,6 +248,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -242,6 +268,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -260,6 +288,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -278,6 +308,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -296,6 +328,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,
@@ -314,6 +348,8 @@
         "pool": null,
         "poolMax": 10,
         "prepare": null,
+        "recovered": 0,
+        "recoveryFailed": 0,
         "stuckDiscards": 0,
         "tracked": {
           "direct": 0,

@@ -23,9 +23,13 @@ command drains the whole backlog:
 gbrain sync --source <id> --no-pull --json
 ```
 
-`--no-pull` is required on managed brains: the checkout is fast-forwarded by
+Managed sync never pulls: the checkout is fast-forwarded by
 `gbrain sources refresh <id>`, never by sync. Sync then catches the index up
-to whatever the checkout holds.
+to whatever the checkout holds. The CLI implies `--no-pull` on a managed brain
+(single source, `--all` and serve-delegated runs alike) and prints one stderr
+line naming `gbrain sources refresh <id>`; `--json` stdout stays one document.
+An explicit pull through the library or MCP (`sync_brain` with
+`no_pull: false`) still refuses with `writer_coordinator_required`.
 
 The run prints one line before the first write and a progress line about
 every 10 seconds on stderr:
@@ -474,7 +478,10 @@ vars — incident-time escape hatches, not everyday knobs.
    (`N uncommitted file(s) not synced`), the sync result object carries an
    `uncommitted` summary (surfaced via `sync_brain` over MCP and in
    `gbrain dream --json` phase details), and the nightly dream cycle reports
-   the sync phase as `warn` instead of a clean run. The fix is to commit the files. If your
+   the sync phase as `warn` instead of a clean run. The fix is to commit the
+   files, naming them: `gbrain git commit-push -m "<msg>" -- <paths>` (or the
+   brain's `scripts/brain-commit-push.sh`), which is safe when other agents
+   share the checkout ([shared-checkout git](shared-checkout-git.md)). If your
    workflow legitimately writes without committing, opt in to importing
    uncommitted state with `gbrain sync --working-tree` (one run) or
    `gbrain config set sync.include_working_tree true` (standing config,
@@ -485,7 +492,7 @@ vars — incident-time escape hatches, not everyday knobs.
    `--include-gitignored` for those).
 
 8. **A managed brain pulls only through `gbrain sources refresh`.** Managed
-   sync refuses to pull (`gbrain sync` needs `--no-pull`) and a cycle asked to
+   sync never pulls (the CLI implies `--no-pull`) and a cycle asked to
    pull syncs the checkout as it is, because a Git merge rewrites files that
    accepted writes may be publishing into. To take new upstream commits, run
    on the owner host:
@@ -511,8 +518,10 @@ vars — incident-time escape hatches, not everyday knobs.
    **Say to your agent:** *"Bring my notes source up to date with its remote."*
 
 9. **Turn automatic pulls off for every source.** On an unmanaged brain,
-   autopilot's freshness sync and its per-source cycle run `git pull` for a
-   source that has a remote URL. A checkout you keep current yourself (a
+   autopilot's freshness sync and its per-source cycle pull a source that has
+   a remote URL: a fetch, then a fast-forward under the checkout's writer lock
+   with autostash off, so the pull never stashes or rebases files another
+   agent is writing ([shared-checkout git](shared-checkout-git.md)). A checkout you keep current yourself (a
    deploy script, a mirror, a branch you rebase by hand) should not be
    pulled behind your back:
 
@@ -533,7 +542,9 @@ vars — incident-time escape hatches, not everyday knobs.
 ## How to Verify
 
 1. **Edit a file and search for the change.** Edit a brain markdown file,
-   commit, and push. Wait for the next sync cycle (cron interval or `--watch`
+   then commit and push it with `gbrain git commit-push -m "<msg>" -- <file>`
+   (it must exit 0; on an error code follow
+   [outcomes](shared-checkout-git.md#outcomes)). Wait for the next sync cycle (cron interval or `--watch`
    poll). Run `gbrain search "<text from the edit>"`. The updated content
    should appear in results. If it returns old content, sync failed.
 

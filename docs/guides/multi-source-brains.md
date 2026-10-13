@@ -302,7 +302,7 @@ Fix it with:
 
 ```bash
 git -C <path> init
-git -C <path> add -A
+git -C <path> add -A   # gbrain-allow-shared-tree-git: first commit of a brand-new repo nobody else writes yet
 git -C <path> commit -m "initial import"
 gbrain sources add <id> --path <path>
 ```
@@ -459,25 +459,34 @@ gbrain sources unharden wiki
 
 What hardening guarantees:
 
-- **Pull-first, conflict-safe.** Every pull is a divergence-safe rebase. A
-  dirty working tree is skipped (your in-progress edits are never touched; the
-  pull runs with `--no-autostash`, so a `rebase.autoStash` setting never
-  stashes and replays edits under it); a rebase conflict is aborted cleanly and
-  flagged for attention, never left half-applied. A brain whose intermediate
-  snapshot commits conflict under rebase replay while the two tips merge
-  cleanly can record `gbrain sources set-pull-strategy <id> merge`: pulls of
-  that source then fast-forward when possible and otherwise make a merge
-  commit, and a real conflict is aborted with `merge --abort`. The setting
-  lives in the source's config (`sources list --json` shows `pull_strategy`),
-  so a repository or global `pull.rebase` never changes it; `--path` pulls with
-  no source row keep `rebase`.
+- **Pull-first, safe in a shared checkout.** Nothing rebases or stashes the
+  working tree. A pull fetches, then, under the checkout's writer lock,
+  fast-forwards, or for a diverged branch merges the remote commits in memory
+  into a merge commit (`gbrain: merge origin/<branch> into <branch>`) and
+  fast-forwards to it. A real conflict changes nothing and is flagged for
+  attention ([conflicts](shared-checkout-git.md#conflicts)). `gbrain sources
+  pull`, which the unattended 30-minute cron runs, keeps its conservative
+  rule: a checkout with any local edit is skipped (`skipped_dirty`), so it
+  never moves files under a writer, and a checkout whose writer lock is busy
+  is skipped until the next run. An explicit `scripts/brain-commit-push.sh --pull`
+  (or `gbrain git commit-push --pull`) advances a dirty checkout unless a
+  dirty file is one the pull must change; then it changes nothing and its
+  notice names the files. `gbrain sources set-pull-strategy <id> <rebase|merge>`
+  is still accepted and recorded, but both strategies now integrate by merge,
+  because the shared tree is never rebased.
 - **Push is never deferred.** `scripts/brain-commit-push.sh "<msg>" <path>`
-  commits and pushes, and refuses to report success without a successful push
-  or confirmation that the exact destination branch at every effective origin
-  push URL contains the attempted commit. A rejected push can still succeed when another process
-  already pushed that commit; a stale local tracking ref is not confirmation.
-  The post-commit hook is a best-effort background fallback; the helper is
-  the guarantee.
+  delegates to `gbrain git commit-push`: it takes the checkout's writer lock,
+  commits only the named paths, merges a rejected push in memory, and refuses
+  to report success without a push the remote accepted. Other agents'
+  uncommitted files are never staged, stashed or touched. The post-commit
+  hook is a best-effort background fallback (it only publishes, never pulls);
+  the helper is the guarantee. Outcomes and what to do on each:
+  [shared-checkout git](shared-checkout-git.md#outcomes).
+- **One writer at a time per checkout.** Harden also sets
+  `rebase.autoStash=false`, `merge.autoStash=false` and `pull.ff=only` in the
+  checkout's local git config, so a stray `git pull` refuses instead of
+  autostashing. Host daemons that commit the same checkout join through the
+  [lock contract](shared-checkout-git.md#lock-contract).
 - **No silent staleness.** A 30-minute background pull keeps an idle session
   current. It runs DB-free, so it never contends with a live brain for the
   PGLite single-writer lock.

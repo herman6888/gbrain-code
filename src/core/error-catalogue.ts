@@ -33,6 +33,9 @@ export interface CatalogueEntry {
 
 export const ERROR_CATALOGUE = {
   legacy_jobs_active: { code: 'legacy_jobs_active', docs: 'docs/guides/repair.md#legacy-jobs-active' },
+  // D4 / D2 notice codes (agent-output Notice through the notice ledger).
+  grant_blocked_operations: { code: 'grant_blocked_operations', docs: 'docs/guides/repair.md#grant-blocked-operations' },
+  hidden_tool_content: { code: 'hidden_tool_content', docs: 'docs/guides/repair.md#hidden-tool-content' },
   legacy_job_selection_invalid: { code: 'legacy_job_selection_invalid', docs: 'docs/guides/repair.md#legacy-job-selection-invalid' },
   legacy_job_authority: { code: 'permission_denied', docs: 'docs/guides/repair.md#legacy-job-authority' },
   preview_changed: { code: 'preview_changed', docs: 'docs/guides/repair.md#preview-changed' },
@@ -76,6 +79,7 @@ export const ERROR_CATALOGUE = {
   sync_drain_preparation_systemic: { code: 'preparation_systemic', docs: 'docs/guides/write-refusals.md#preparation_systemic' },
   sync_drain_write_capacity: { code: 'queue_capacity', docs: 'docs/guides/write-refusals.md#drain-write-capacity' },
   sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
+  sync_drain_head_blocked: { code: 'drain_stalled', docs: 'docs/guides/write-refusals.md#head-blocked' },
   // D8 `gbrain setup <harness>` (src/commands/setup.ts).
   setup_harness_unsupported: { code: 'setup_harness_unsupported', docs: 'docs/guides/repair.md#setup-harness-unsupported' },
   setup_owner_conflict: { code: 'setup_owner_conflict', docs: 'docs/guides/repair.md#setup-owner-conflict' },

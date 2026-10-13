@@ -32,6 +32,8 @@ export interface AtomOrigin {
   revision: string | null;
   visibility: 'private' | 'world';
   generation?: number;
+  /** #6503: the model read only the first `partialInputChars` characters; the batch records a partial disposition, not a completion. */
+  partialInputChars?: number;
 }
 export interface ManagedAtomSession {
   sourceId: string;
@@ -47,8 +49,8 @@ export interface ManagedAtomSession {
 }
 /** The run key a batch is admitted under and, for a retry, the checkpoint it advances (compare-and-set). */
 interface AtomClaim { runKey: string; checkpointKey?: string; expectedCheckpoint?: unknown }
-/** One `managed-atoms` checkpoint row. `attempts` counts completed failures of its content; `held` marks the bound. */
-interface AtomCheckpoint { requestId?: string; failure?: string; attempts?: number; held?: boolean }
+/** One `managed-atoms` checkpoint row. `attempts` counts completed failures of its content; `held` marks the bound; `partial` the input cap a cut item was read under (#6503). */
+interface AtomCheckpoint { requestId?: string; failure?: string; attempts?: number; held?: boolean; partial?: number }
 export type AtomResume = 'run' | 'done' | 'held';
 export interface AtomIntent extends Record<string, unknown> {
   kind: 'managed_atom_page' | 'managed_atom_delete' | 'managed_atom_complete';
@@ -237,7 +239,9 @@ export async function bumpAtomGeneration(tx: BrainEngine, sourceId: string, inca
  * the drain and for an explicit retry (#5699).
  */
 function atomInput(session: ManagedAtomSession, origin: AtomOrigin): unknown[] {
-  return ['managed-atoms-v1', session.incarnation, origin.kind, origin.locator, origin.pageId, origin.contentHash];
+  // #6503: a cut item's run is keyed by the cap it was read under, so a raised cap is a new run (the partial checkpoint is released first).
+  return ['managed-atoms-v1', session.incarnation, origin.kind, origin.locator, origin.pageId, origin.contentHash,
+    ...(origin.partialInputChars ? ['partial', origin.partialInputChars] : [])];
 }
 
 /** A retirement's regeneration generation enters the drain's key above 0, so earlier receipts are not replayed. */
@@ -407,7 +411,8 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
       ...(target.revision ? { expected_revision: target.revision } : {}), content: atom.content, links: atom.links } as AtomIntent });
   }
   const originKey = origin.kind === 'page' ? 'source_slug' : 'source_path';
-  const retirements = failure ? [] : reviewedRetirements ?? await engine.executeRaw<ManagedAtomRetirement>(
+  // #6503: a partial extraction read only the head, so it retires nothing an earlier extraction produced.
+  const retirements = failure || origin.partialInputChars ? [] : reviewedRetirements ?? await engine.executeRaw<ManagedAtomRetirement>(
     `SELECT slug,id AS "pageId",knowledge_revision::text AS revision FROM pages
       WHERE source_id=$1 AND type='atom' AND deleted_at IS NULL
         AND frontmatter->>'${originKey}'=$2
@@ -526,7 +531,8 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
         if (!snapshot) throw opError('revision_conflict', 'The accepted atom source page changed.',
           `Page ${p.origin.locator} in source ${row.source_id} is gone since atom batch ${row.request_id} was accepted, so the batch was not marked complete. Read the page to confirm; nothing more is extracted from a removed page.`,
           { fix: pageFix(row.source_id, p.origin.locator) });
-        await writeAtomPageState(tx, row.source_id, { slug: p.origin.locator, content: snapshot.page.compiled_truth,
+        // #6503: a partial batch stamps nothing; its checkpoint below carries the disposition.
+        if (p.failure || !p.origin.partialInputChars) await writeAtomPageState(tx, row.source_id, { slug: p.origin.locator, content: snapshot.page.compiled_truth,
           contentHash: p.origin.contentHash, identity: { pageId: p.origin.pageId!, sourceIncarnation: row.source_incarnation,
             revision: p.origin.revision! } }, p.failure ? 'failure' : 'complete');
       }
@@ -535,7 +541,8 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
       const attempts = (prior?.failure ? Number(prior.attempts ?? 1) : 0) + 1;
       const checkpoint = JSON.stringify([{ sourceId: row.source_id, incarnation: row.source_incarnation, requestId: row.request_id,
         kind: p.origin.kind, locator: p.origin.locator, pageId: p.origin.pageId, contentHash: p.origin.contentHash,
-        ...(p.failure ? { failure: p.failure, attempts, ...(attempts >= MAX_DETERMINISTIC_FAILURES ? { held: true } : {}) } : {}) }]);
+        ...(p.failure ? { failure: p.failure, attempts, ...(attempts >= MAX_DETERMINISTIC_FAILURES ? { held: true } : {}) }
+          : p.origin.partialInputChars ? { partial: p.origin.partialInputChars } : {}) }]);
       await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-atoms',$1,$2::text::jsonb)
         ON CONFLICT(op,fingerprint) DO NOTHING`, [p.runKey, checkpoint]);
       if (p.checkpointKey) {
@@ -547,7 +554,8 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
           `Another atom run completed source ${row.source_id}'s atom checkpoint after retry ${row.request_id} was accepted, so the retry was not recorded. Read the retry receipt; the later run's atoms stand.`,
           { fix: receiptFix(row.request_id) });
       }
-      return { status: p.failure ? 'failed' : 'completed',
+      return { status: p.failure ? 'failed' : p.origin.partialInputChars ? 'partial' : 'completed',
+        ...(p.origin.partialInputChars && !p.failure ? { partial_input_chars: p.origin.partialInputChars } : {}),
         atoms: committed.filter(child => child.kind === 'managed_atom_page').length,
         retired: committed.filter(child => child.kind === 'managed_atom_delete').length,
         ...(p.failure ? { failure: p.failure } : {}) };

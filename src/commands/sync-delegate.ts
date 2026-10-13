@@ -500,8 +500,13 @@ export type ManagedDelegationOutcome =
   | { kind: 'own_consumer'; reason: 'opted_out' | 'not_host' | 'not_postgres' | 'not_managed' | 'no_owner' | 'owner_not_serve' | 'probe_failed'
       | 'kill_switch' | 'unsupported_flag' | 'no_socket' | 'older_serve' | 'serve_refused' | 'serve_lost' | 'serve_no_admission'; line: string | null };
 
-const fallbackLine = (pid: number, cause: string, fix = 'Restart that serve on this gbrain version to remove the second consumer.'): string =>
-  `[sync] ${cause}; this run uses its own consumer beside the serve (PID ${pid}). ${fix}`;
+/**
+ * #6543: only a forced rung (the serve cannot take the run) really runs a consumer beside the serve; on the others this
+ * process admits its writes and, with persistence.single_consumer on, the serve's consumer publishes them.
+ */
+const fallbackLine = (pid: number, cause: string, forced: boolean, fix = 'Restart that serve on this gbrain version to run the catch-up inside it.'): string => forced
+  ? `[sync] ${cause}; this run uses its own consumer beside the serve (PID ${pid}). ${fix}`
+  : `[sync] ${cause}; this run does not delegate to the serve (PID ${pid}): it admits its own writes, and with persistence.single_consumer on the serve's consumer publishes them. ${fix}`;
 
 /**
  * The Postgres rung of the delegation ladder (#6317). Called with the connected
@@ -513,12 +518,16 @@ const fallbackLine = (pid: number, cause: string, fix = 'Restart that serve on t
  */
 export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args: string[], opts: SyncOpts, deps: ManagedDelegationDeps = {}): Promise<ManagedDelegationOutcome> {
   const env = deps.env ?? process.env;
-  const own = (reason: Extract<ManagedDelegationOutcome, { kind: 'own_consumer' }>['reason'], line: string | null = null): ManagedDelegationOutcome => {
+  // #6543: `force` makes "this run uses its own consumer" true where the serve cannot take the run (the opt-out, a serve
+  // not answering its socket, an older serve): with persistence.single_consumer on, this process would otherwise run
+  // waiter-only behind the serve it bypassed. A healthy serve beside a kill switch or an unsupported flag keeps consuming.
+  const own = async (reason: Extract<ManagedDelegationOutcome, { kind: 'own_consumer' }>['reason'], line: string | null = null, force = false): Promise<ManagedDelegationOutcome> => {
     if (line) serr(line);
+    if (force) (await import('../core/persistence/consumer-election.ts')).forceOwnConsumer(reason);
     return { kind: 'own_consumer', reason, line };
   };
   // 0. Opt-outs bypass the ladder before anything is probed or classified.
-  if (args.includes('--no-delegate') || env.GBRAIN_SYNC_NO_DELEGATE === '1') return own('opted_out');
+  if (args.includes('--no-delegate') || env.GBRAIN_SYNC_NO_DELEGATE === '1') return own('opted_out', null, true);
   const { resolveBrainId } = await import('../core/brain-resolver.ts');
   const { getCliOptions } = await import('../core/cli-options.ts');
   if (resolveBrainId(getCliOptions().brain) !== 'host') return own('not_host');
@@ -546,18 +555,18 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
     return own('owner_not_serve', `[sync] the live write owner on this host is a ${owner.kind} process (PID ${pid}), which cannot host a delegated sync; this run uses its own consumer beside it.`);
   }
   if (env.GBRAIN_SERVE_SYNC_IPC === '0') {
-    return own('kill_switch', fallbackLine(pid, 'GBRAIN_SERVE_SYNC_IPC=0 turns serve-delegated sync off', 'Unset it to run the catch-up inside the serve.'));
+    return own('kill_switch', fallbackLine(pid, 'GBRAIN_SERVE_SYNC_IPC=0 turns serve-delegated sync off', false, 'Unset it to run the catch-up inside the serve.'));
   }
   // 3. Argv gate (default-deny). On Postgres an unsupported flag keeps today's own consumer instead of refusing.
   const parsed = parseDelegatedSyncArgs(args);
   if (!parsed.ok) {
-    return own('unsupported_flag', fallbackLine(pid, `\`${parsed.refused}\` isn't supported through serve-delegated sync`, 'Drop the flag to run the catch-up inside the serve.'));
+    return own('unsupported_flag', fallbackLine(pid, `\`${parsed.refused}\` isn't supported through serve-delegated sync`, false, 'Drop the flag to run the catch-up inside the serve.'));
   }
   // 4. Socket + secret: the serve bound to this source, else the legacy URL-keyed socket.
   const { sock, secret } = deps.socket ? await deps.socket(sourceId)
     : { sock: await hookResolveSocketForConfig(cfg, sourceId), secret: readIpcSecretForConfig(cfg) };
   if (!sock || !existsSync(sock) || !secret) {
-    return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)'));
+    return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false));
   }
   // 5. The hand-off: this CLI's durable writer registration (the one its own consumer would run under).
   const { registerLocalWriter } = await import('../core/persistence/identity.ts');
@@ -585,19 +594,20 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   let start = await requestSyncStart(sock, { secret, clientToken, options, registration });
   if (start === IPC_UNAVAILABLE && await ownerAlive()) start = await requestSyncStart(sock, { secret, clientToken, options, registration });
   if (start === IPC_UNAVAILABLE) {
-    return own('no_socket', fallbackLine(pid, 'the running gbrain serve is not answering its IPC socket'));
+    return own('no_socket', fallbackLine(pid, 'the running gbrain serve is not answering its IPC socket', true), true);
   }
   if ('degraded' in (start as object)) {
-    return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync'));
+    return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync', true), true);
   }
   const startResp = start as Exclude<SyncStartIpcResult, typeof IPC_UNAVAILABLE | { degraded: string }>;
   if (!startResp.ok) {
     if (startResp.refusal) throw operationErrorFromEnvelope(startResp.refusal);
     if (startResp.error === 'unsupported_kind') {
-      return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync, or runs with GBRAIN_SERVE_SYNC_IPC=0'));
+      // #6543: a current serve that echoes the protocol with unsupported_kind is healthy with delegation off on its side: it keeps consuming.
+      return own('older_serve', fallbackLine(pid, 'the running gbrain serve runs with serve-delegated managed sync off (GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false, 'Unset it on the serve to run the catch-up inside it.'));
     }
     if (startResp.error === 'permission_denied') throw operationErrorFromEnvelope({ error: 'permission_denied', message: 'The serve refused this CLI\'s writer registration.' });
-    return own('serve_refused', fallbackLine(pid, startRefusalText(startResp).replace(/\.$/, ''), 'Fix that, or let this run finish with its own consumer.'));
+    return own('serve_refused', fallbackLine(pid, startRefusalText(startResp).replace(/\.$/, ''), false, 'Fix that, or let this run finish without the serve.'));
   }
   const jobId = startResp.jobId!;
   serr(startResp.completed

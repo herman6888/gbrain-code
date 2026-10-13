@@ -1,9 +1,10 @@
 /**
  * The `managedWrite` diagnostic of a managed sync result: what a page request's terminal receipt (or its pending state)
  * means for the operator, with the retry command and, for a pinned-worktree conflict, whether only line endings differ.
- * Moved out of `sync-run.ts` unchanged (#6340 kept that module under its size cap).
+ * Moved out of `sync-run.ts` unchanged (#6340 kept that module under its size cap; `writeWaitOf` followed for #6513).
  */
 import type { ManagedSyncWriteDiagnostic } from './sync-run.ts';
+import type { WriteWait } from './service.ts';
 import type { SyncCursorOptions, SyncIntent } from './sync-prepare.ts';
 import type { WriteRequest } from './model.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
@@ -43,4 +44,15 @@ export function managedSyncWriteDiagnostic(cursor: { sourceId: string; root: str
     } catch {}
   }
   return diagnostic;
+}
+
+/** DX-A3 / ENG-A12: how the wait for a still-unfinished sync write ended, with its request ID kept. */
+export type ManagedSyncWriteWait = { status: 'pending'; request_id: string }
+  | { status: 'blocked'; request_id: string; cause: string; command: string }
+  | { status: 'read_failed'; request_id: string; reason: string; transient: boolean; sqlstate?: string; attempts: number; message: string; why: string };
+export function writeWaitOf(wait: WriteWait): ManagedSyncWriteWait {
+  if (wait.kind === 'blocked') return { status: 'blocked', request_id: wait.request_id, cause: wait.cause, command: wait.command };
+  if (wait.kind !== 'read_failed') return { status: 'pending', request_id: wait.row.request_id };
+  const { kind: _kind, row: _row, ...failure } = wait;
+  return { status: 'read_failed', ...failure };
 }

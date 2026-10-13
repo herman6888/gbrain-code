@@ -47,6 +47,7 @@ async function runInitBranches(args: string[]) {
 
   validateInitFlags(args);
   registrationSurface = (await import('../mcp/surface.ts')).parseSurfaceFlag(args) ?? undefined;
+  searchModeChoice = (await import('./init-mode-picker.ts')).searchModeChoiceFromArgs(args, failInitFlag);
 
   const isSupabase = args.includes('--supabase');
   const isPGLite = args.includes('--pglite');
@@ -260,6 +261,7 @@ const INIT_VALUE_FLAGS = new Set([
   '--oauth-client-id',
   '--oauth-client-secret',
   '--surface',
+  '--search-mode',
 ]);
 
 function validateInitFlags(args: string[]) {
@@ -1268,7 +1270,7 @@ export async function initPGLite(opts: {
     // Non-TTY auto-selects; --json emits a structured event.
     const { runModePicker } = await import('./init-mode-picker.ts');
     let searchMode: { mode: SearchModeName; reason: string } | undefined;
-    await runModePicker(engine, { jsonOutput: opts.jsonOutput, onDecision: d => { searchMode = d; } });
+    await runModePicker(engine, { jsonOutput: opts.jsonOutput, ...searchModeChoice, onDecision: d => { searchMode = d; } });
 
     const stats = await engine.getStats();
 
@@ -1320,6 +1322,7 @@ const INIT_EMBEDDING_HINT = 'Pick an embedding model whose dimensions match (`gb
  * "More:" footer so they never compete with the primary action.
  */
 let registrationSurface: McpSurface | undefined;
+let searchModeChoice: import('./init-mode-picker.ts').SearchModeChoice = {};
 function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boolean } = {}): void {
   const register = harnessRegistrationCommand(registrationSurface);
   console.log('');
@@ -1601,7 +1604,7 @@ export async function initPostgresCore(opts: {
     // PGLite path above — runs AFTER initSchema, idempotent on re-init.
     const { runModePicker: runPostgresModePicker } = await import('./init-mode-picker.ts');
     let searchMode: { mode: SearchModeName; reason: string } | undefined;
-    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput, onDecision: d => { searchMode = d; } });
+    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput, ...searchModeChoice, onDecision: d => { searchMode = d; } });
 
     const stats = await engine.getStats();
 
@@ -1856,6 +1859,7 @@ OPTIONS
                         Default subagent driver (v0.27+)
   --no-embedding        Defer embedding setup (skips the embedding-key check)
   --surface <verbs|starter|full>  Tool surface the printed harness registration pins (default full)
+  --search-mode <conservative|balanced|tokenmax>  Record the operator's search mode (no first-run ask; an existing brain's mode needs --force)
   --skip-embed-check    Skip the init-time embedding-key validation (config +
                         live test-embed). Also via GBRAIN_INIT_SKIP_EMBED_CHECK=1
 

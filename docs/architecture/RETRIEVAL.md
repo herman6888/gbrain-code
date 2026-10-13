@@ -176,12 +176,12 @@ outvote it on small-k retrieval.
 
 Budget-normalized weighted RRF, composed in `src/core/search/fusion-lists.ts`. Every vector list is a role-tagged arm (`original` | `variant` | `clause` | `image`) — tagged objects, never a positional convention, so a failed arm or a fell-open image branch can't mis-tag a list. The `original` arm always fuses at weight 1; the non-empty `variant`/`clause` arms share ONE total weight budget, `search.expansion_variant_budget` (`weight_i = b / n_voting_arms`, each row scored `weight / (k + rank)`), so total expansion influence is exactly `b` however many variants the LLM produced. `null`, the default in all three mode bundles, is equal-weight fusion (every list weight 1). A budget in (0, 4] is set with `gbrain config set search.expansion_variant_budget <b>`, per call via `HybridSearchOpts.expansionVariantBudget`, or pinned per eval arm with `gbrain eval longmemeval --expansion-variant-budget <b>` (sweep it against frozen `--expansion-replay` variants so cells differ only in `b`). Arithmetic: two variants agreeing on a distractor at rank 0 tie the original's rank-0 vote exactly at `b = 1.0`; equal weighting with two variants is ≈ `b = 2.0`; `b = 0.5` subordinates them. The knob is a no-op when expansion is off and folds into the query-cache key (`evb=`). Measured 2026-09-06 with recorded Haiku variants replayed at every budget: the mechanism is real — strict `recall_all@5` rises from 255/470 at equal weighting to 394/470 at budget 0.25 — but its pre-registered rule (≥ plain hybrid − 2 on the 430-question decision set, no type losing > 1) failed at every budget (0.25: −43; plain hybrid 439/470), so every bundle sets `expansion_variant_budget: null` and the knob is an operator lever. The receipts point at a trigger rather than a weight (expand only when the original query's evidence is weak) as the next mechanism to pre-register.
 
-The mode bundles retain a core-library `expansion` default (`tokenmax` true;
-`balanced` and `conservative` false). It applies only when a library caller
-leaves `expansion` unset and supplies an `expandFn`. Shipped operations set
-their own policy: `query` requests expansion in every mode, with
-`expand: false` / `--no-expand` as the explicit opt-out; `search` never
-expands. Neither inherits `search.expansion`. Keyless and image-only paths
+The mode bundles carry an `expansion` default (`tokenmax` true; `balanced`
+and `conservative` false). It applies when a caller leaves `expansion` unset
+and supplies an `expandFn`. The `query` operation leaves it unset unless the
+caller passes `expand`, so `query` expands by default only in `tokenmax`;
+`expand: true` / `--expand` forces it and `expand: false` / `--no-expand`
+skips it. `search` never expands; `search.expansion` overrides the mode default for `query` only. Keyless and image-only paths
 skip expansion, and `expansion_applied` reports actual variant use. The
 [search-mode guide](../guides/search-modes.md) is the authoritative rule for
 defaults, overrides and provider costs; `gbrain search modes` prints the
@@ -197,8 +197,8 @@ relational recall arm remains available.
 intent classify (query-intent.ts — deterministic, no LLM)
        │
        ▼
-expansion (query: requested by default in every mode; --no-expand opts out;
-           search: off; keyless and image-only paths skip it)
+expansion (query: the mode's default, on only in tokenmax; --expand forces,
+           --no-expand skips; search: off; keyless and image-only paths skip it)
        │
        ▼
 hybrid recall + fusion:
@@ -220,10 +220,13 @@ hybrid recall + fusion:
 graph augment (optional two-pass structural expansion — walkDepth > 0)
        │
        ▼
-deduplication (4-layer: per-page cap, same-page Jaccard, type diversity)
+deduplication (4-layer: per-page cap, same-page Jaccard, type diversity;
+   with search.diverse_pool_depth N > 0, one row per session — off by default,
+   src/core/search/diverse-pool.ts)
        │
        ▼
-reranker (cross-encoder — balanced/tokenmax; fail-open)
+reranker (cross-encoder — balanced/tokenmax; fail-open; reads
+   reranker.top_n_in rows, at least N with search.diverse_pool_depth)
        │
        ▼
 feedback (use-attributed page weights × the ordering score, bounded ±λ;

@@ -912,17 +912,17 @@ export class PGLiteEngine implements BrainEngine {
           ...embedded,
         }),
       ));
-      // Snapshot-timezone parity: dumpDataDir bakes the BUILD process's
-      // TimeZone into the restored cluster's defaults, so a snapshot-loaded
-      // engine would run sessions in the build machine's zone while a
-      // cold-init engine follows this process (bun test pins TZ=UTC; bun run
-      // follows the host). That divergence shifted every naive-timestamp
-      // day-boundary comparison by the offset — date-dependent tests failed
-      // only in the evening, only under the snapshot. Pin the session to the
-      // RUNTIME zone so restored engines behave exactly like cold ones.
+      // Snapshot parity: dumpDataDir bakes the BUILD process's TimeZone into
+      // the cluster defaults (date-dependent tests failed only in the evening,
+      // only under the snapshot) and the BUILD time into the seeded sources'
+      // created_at (a CI-cached snapshot over an hour old made every fresh
+      // test brain fail the behavior_changes fresh-install grace, which reads
+      // MIN(sources.created_at)). Pin the RUNTIME zone and stamp now(), so
+      // restored engines behave like cold ones (bun test pins TZ=UTC).
       if (this._snapshotLoaded && this._db) {
         const runtimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
         await this._db.query(`SELECT set_config('TimeZone', $1, false)`, [runtimeZone]);
+        await this._db.query(`UPDATE sources SET created_at = now()`);
       }
       // Healthy open: close any repair episode left open by a prior failed
       // attempt (red-team: episodes otherwise stayed open forever — doctor

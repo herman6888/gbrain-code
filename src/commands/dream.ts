@@ -657,6 +657,13 @@ async function runDrain(
       `[drain] ${result.failure_count} item failure(s)${omitted}${result.last_error ? `; last error: ${result.last_error}` : ''}\n`,
     );
   }
+  // #6503: cut items are not failures and not complete; say so once per drain.
+  if ((result.input_truncated ?? 0) > 0) {
+    process.stderr.write(
+      `[drain] ${result.input_truncated} item(s) cut at cycle.extract_atoms.max_input_chars: the model did not read their tail; ` +
+      'head atoms are kept, the items are not marked complete and are skipped until the cap rises (gbrain config set cycle.extract_atoms.max_input_chars <n>)\n',
+    );
+  }
   const { drainBudgetNotice, usd } = await import('../core/cycle/extract-atoms-budget-notice.ts');
   const budgetNotice = result.stopped === 'budget' ? drainBudgetNotice(result) : null;
   if (opts.json) {

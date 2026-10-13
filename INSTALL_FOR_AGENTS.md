@@ -4,7 +4,7 @@ Read this file, then follow the path appropriate to the user’s request. Defaul
 
 > **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide: the recommended shape keeps the brain on the user's own computer, published with `gbrain mcp expose --funnel` ([remote MCP](docs/guides/remote-mcp.md)), and installs the thin CLI inside the agent; `scripts/setup-in-agent.sh` is the in-agent alternative, and its receipt tracks repair and native enablement. To make a brain on this computer reachable from the user's other devices, apps, or cloud agents over MCP, follow the **[remote MCP guide](docs/guides/remote-mcp.md)** (`gbrain mcp expose`; confirm the plan before installing Tailscale or a service; `--funnel` only for cloud agents). For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, choose the harness's native OAuth/PKCE flow or a private machine handoff. Owner login, client management, permissions, and revocation use the separate [MCP administration](docs/mcp/ADMIN.md) path. This guide covers a local brain for other existing agents.
 >
-> **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory. Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
+> **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory (with `gbrain setup <harness>`, initialize and connect are one command and the search-mode choice is relayed in the reply that reports the install). Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
 >
 > Only if the user asks for a **new persistent personal agent** with identity and a private repo, follow `BOOTSTRAP_FOR_AGENTS.md`.
 
@@ -107,16 +107,22 @@ comes from agent-authored `## Facts` fences and the `remember` verb.
 
 ## Step 3: Create the Brain
 
-**If you are Claude Code**, one command does Step 3 and the MCP registration:
+**If you are Claude Code or Codex**, one command does Step 3 and the MCP registration
+(use `codex` in place of `claude-code` on Codex):
 
 ```bash
 gbrain setup claude-code --dry-run --json   # the resolved target; writes nothing
 gbrain setup claude-code --json             # brain (if none) + MCP + read-context hooks, verified
 ```
 
-It runs `gbrain init --pglite --no-embedding` only when no brain exists, and its
-`--json` document carries init's first-run decision bundle in `notices`: relay
-the search-mode matrix (Step 3.5) and the decisions in one reply. Capture
+It runs `gbrain init --pglite --no-embedding` only when no brain exists and
+prints init's first-run decision bundle once, after the wiring and its smoke
+check (an `[AGENT]` block in human output, `notices` in `--json`), without
+`harness_wiring`, which setup just did. Relay the search-mode matrix (Step 3.5)
+and the other settings in the reply that reports the install, as the settings
+in effect and how to change them; nothing waits on the answer, so don't end
+the install on a question, and apply an answer with its option's command
+whenever the user gives one. Capture
 (`--capture`) and providers (`--providers`) stay off unless the user accepts
 them. A coded refusal (`setup_owner_conflict`, `setup_hosted_connection`) means
 another owner or a hosted brain holds the target; follow its `fix`.
@@ -228,26 +234,39 @@ loop; full reference in `docs/ENGINES.md` ("Engine detection and access repair")
 ## Step 3.5: Confirm search mode with the user (DO NOT SKIP)
 
 This is the `search_mode` decision from the first-run bundle.
-`gbrain init` auto-applied a default search mode (`tokenmax` unless your subagent
-tier is Haiku-class or no expansion-capable API key — Anthropic, OpenAI, or
-Google — is configured). The init output included the cost matrix below preceded
-by `[AGENT]` markers. You must NOT silently accept the default. Stop and ask the
-operator.
+`gbrain init` auto-applied a default search mode: `tokenmax` with a chat key
+(Anthropic, OpenAI or Google), `balanced` with a ready reranker but no chat key,
+and `conservative` when your subagent tier is Haiku-class or neither exists. The init output
+included the cost matrix below preceded by `[AGENT]` markers. You must NOT
+silently accept the default. Stop and ask the operator.
+
+After `gbrain setup <harness>` the harness is already wired when the matrix
+appears, so there is nothing to stop before: show the matrix and the applied
+mode in the reply that reports the install, as a choice the user can make at
+any time, and run `gbrain config set search.mode <mode>` when they pick one.
+Don't hold the install open for the answer.
+
+If you already know the operator's choice, record it at install time instead:
+`gbrain init --search-mode <conservative|balanced|tokenmax>` stores it as the
+operator's (`search.mode_source: operator`) and init asks no `search_mode`
+question. On an existing brain with a different mode it refuses unless you pass
+`--force`.
 
 **Present this matrix verbatim:**
 
-<!-- Cost matrix: keep this block aligned with src/commands/init-mode-picker.ts; CLAUDE.md links here rather than duplicating it. -->
+<!-- Cost matrix: generated by costMatrixLines() in src/core/search/mode-advice.ts (prices from src/core/model-pricing.ts); test/init-mode-picker.test.ts keeps this block in sync. -->
 ```
-Per-query cost @ 10K queries/mo (typical single-user volume):
+Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 
-                  Haiku 4.5     Sonnet 4.6    Opus 4.7
-                  ($1/M)        ($3/M)        ($5/M)
-  conservative    $40/mo        $120/mo       $200/mo
-  balanced        $100/mo       $300/mo       $500/mo
-  tokenmax        $200/mo       $600/mo       $1,000/mo
+                  Haiku 5.5     Sonnet 5.5    Opus 5.5
+                  ($0.10/M in)  ($2/M in)     ($4/M in)
+  conservative    $4/mo         $80/mo        $160/mo
+  balanced        $10/mo        $200/mo       $400/mo
+  tokenmax        $20/mo        $400/mo       $800/mo
 
-(scales linearly: ×10 for 100K/mo, ÷10 for 1K. 25x corner-to-corner spread.
- Natural diagonal pairings — cheap/cheap → frontier/frontier — span ~4x.)
+  Assumed payload per query: conservative 4K, balanced 10K, tokenmax 20K tokens.
+  Scales linearly: x10 for 100K queries/mo, /10 for 1K. 200x corner-to-corner spread.
+  Embedding, reranking and query expansion are separate provider charges.
 ```
 
 **Ask the operator (paraphrase if needed):**
@@ -256,19 +275,19 @@ Per-query cost @ 10K queries/mo (typical single-user volume):
 > a one-time setup decision that controls retrieval payload size. Which mode
 > do you want?
 >
->   1) conservative — tight 4K budget, 10 chunks max.
+>   1) conservative — tight 4K budget, 10 chunks max, no reranker.
 >      Best for Haiku subagents, cost-sensitive setups, high-volume loops.
 >
->   2) balanced — 12K budget, 25 chunks. Sonnet-tier sweet spot.
+>   2) balanced — 12K budget, 25 chunks, reranked.
 >
->   3) tokenmax (recommended default — preserves v0.31.x retrieval shape) —
->      no budget, 50 chunks. Best for Opus/frontier models.
+>   3) tokenmax (recommended with a chat key) — no budget, 50 chunks, reranked,
+>      `gbrain query` expands by default. The widest retrieval.
 >
-> Expansion is command-specific, not mode-specific: `gbrain search` and the
-> memory verbs do not expand; `gbrain query` expands in every mode unless you
-> pass `--no-expand` (`expand: false` over MCP). The `search.expansion` bundle
-> setting does not change these shipped command paths. See
-> [search modes](docs/guides/search-modes.md) for the current contract.
+> Expansion follows the mode for `gbrain query` only: on in `tokenmax`, off in
+> `balanced` and `conservative`; `--expand` (`expand: true` over MCP) forces it
+> and `--no-expand` (`expand: false`) skips it. `gbrain search` and the memory
+> verbs never expand. See [search modes](docs/guides/search-modes.md) for the
+> current contract.
 >
 > Cost depends on BOTH the mode AND the downstream model you run. See the
 > matrix above for the 9-cell breakdown.
@@ -293,7 +312,7 @@ result cache; budget for fresh retrieval. Read the command-level caveats in
 [search modes](docs/guides/search-modes.md) rather than treating a mode choice as
 a guarantee of zero paid calls.
 
-**Why this matters:** the cost spread between corners of the matrix is 25x.
+**Why this matters:** the cost spread between corners of the matrix is about 200x.
 An agent that silently accepts the default and starts running queries against
 a user who didn't expect tokenmax-class context loads can rack up surprise
 spend. Confirm before continuing.
@@ -562,6 +581,35 @@ gbrain onboard --check --json
 
 See "The onboard surface" below for what the recommendations mean and the
 consent gates around unattended remediation.
+
+<!-- BEGIN multi-agent-rules (identical in AGENTS.md, BOOTSTRAP_FOR_AGENTS.md and INSTALL_FOR_AGENTS.md; bun run check:shared-tree-git) -->
+## Multi-agent rules for a shared brain checkout
+
+Several agents, crons and hooks often commit to one brain checkout on the same
+machine. In such a checkout:
+
+1. **Commit and push with one command, naming your files:**
+   `scripts/brain-commit-push.sh "<msg>" <paths>`, or
+   `gbrain git commit-push -m "<msg>" -- <paths>` when the brain has no helper.
+   It takes the checkout's writer lock, commits only those paths, merges remote
+   commits without touching anyone else's files, and fails loudly if the push
+   does not land.
+2. **Bring remote commits in with `--pull`** (`scripts/brain-commit-push.sh --pull`
+   or `gbrain git commit-push --pull`) at session start and before a batch of writes.
+3. **On a non-zero exit, read the code.** Retry once on `commit_lock_busy`.
+   Stop and relay to the user on `integrate_conflict` (they choose which
+   version wins) and on `writer_coordinator_required` (a managed brain: save
+   pages with `put_page` instead). `pushed_checkout_lagging` is a success.
+<!-- gbrain-allow-shared-tree-git-begin: the forbidden commands, named so agents avoid them -->
+4. **Never run** `git pull --rebase`, `git stash`, `--autostash`, `git add -A`,
+   `git commit -a`, `git reset --hard` or `git push --force` there, and never
+   fall back to them when the command fails. Never delete `.git/rebase-merge`
+   before saving its autostash with `git stash store`.
+<!-- gbrain-allow-shared-tree-git-end -->
+
+Outcomes, conflict recovery, a stuck rebase and the lock contract for host
+daemons: [docs/guides/shared-checkout-git.md](docs/guides/shared-checkout-git.md).
+<!-- END multi-agent-rules -->
 
 ## Upgrade
 

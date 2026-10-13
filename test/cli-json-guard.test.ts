@@ -185,7 +185,7 @@ describe('D2 command migrations: doctor, sync, embed on a keyless brain', () => 
     const ok = await cli(['sync', '--source', 'notes', '--no-pull', '--json']);
     expect(ok.exitCode).toBe(0);
     expect(onlyDocument(ok.stdout)).toMatchObject({ schema_version: 1, source_id: 'notes', added: 1 });
-    const bad = await cli(['sync', '--source', 'notes', '--json']);
+    const bad = await cli(['sync', '--source', 'no-such-source', '--no-pull', '--json']);
     expect(bad.exitCode).toBe(1);
     const doc = onlyDocument(bad.stdout);
     expect(typeof doc.code).toBe('string');

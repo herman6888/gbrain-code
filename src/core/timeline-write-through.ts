@@ -420,7 +420,7 @@ export async function writeTimelineEntryThrough(
             committed = commitWriteThroughFile(writeRoot, filePath, slug);
             if (committed) {
               pushed = 'pending';
-              lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));
+              lastPushStatus = getLastPushOutcome(currentBranch(writeRoot), writeRoot);
             }
           }
         } catch { /* best-effort */ }

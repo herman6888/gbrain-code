@@ -126,17 +126,27 @@ export function pageChangedHold(entry: HoldEntry, slug: string, pageId: number |
  * so discovery re-screens the hold when a later commit changes the file, and `sources retry-held` re-screens it once
  * the edit is committed.
  */
-export function worktreeDirtyHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid' | 'rawHash'>): HeldEntry {
+export function worktreeDirtyHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid' | 'rawHash'>,
+  conflict: 'page' | 'writeback' = 'page'): HeldEntry {
+  const what = conflict === 'writeback' ? `has uncommitted working-tree bytes newer than the pinned commit, which the import's canonical correction would overwrite`
+    : 'has uncommitted working-tree bytes that match neither the pinned commit nor the current page';
   return base(entry, slug, pageId, 'worktree_dirty',
-    `${entry.path} has uncommitted working-tree bytes that match neither the pinned commit nor the current page, so its import is held and the rest of the source synced; the local edit was not overwritten. Commit the file (or restore it) and the next sync imports it.`,
+    `${entry.path} ${what}, so its import is held and the rest of the source synced; the local edit was not overwritten. Commit the file (or restore it) and the next sync imports it.`,
     typeof intent.content === 'string' ? intent.content : null, typeof intent.blobOid === 'string' ? intent.blobOid : null,
     { ...(intent.rawHash ? { working_hash: intent.rawHash } : {}) });
 }
 
-/** The receipt of a `managed_sync_import` that publication refused as `pinned_git_worktree_conflict` (sync-prepare.ts `newerWorkingTree`). */
+/** The sync-prepare.ts refusal of a canonical correction (writeback) whose target file holds newer uncommitted bytes (#6513). */
+export const CANONICAL_WRITEBACK_CONFLICT = 'Canonical sanitization cannot overwrite newer working-tree bytes.';
+
+/**
+ * The receipt of a `managed_sync_import` that publication refused as `pinned_git_worktree_conflict`: sync-prepare.ts
+ * `newerWorkingTree`, or (#6513) its canonical-writeback refusal, which until then blocked the cursor with no exit
+ * because `--retry-failed` replays the same pin against the same newer bytes.
+ */
 export function pinnedWorktreeConflict(done: Pick<WriteRequest, 'state' | 'error_code' | 'error_message'>): boolean {
   return done.state !== 'committed' && done.error_code === 'source_changed'
-    && ['Newer working-tree bytes and the current page disagree with this pinned Git import.', 'Newer code file bytes disagree with the pinned import.'].includes(done.error_message ?? '');
+    && ['Newer working-tree bytes and the current page disagree with this pinned Git import.', 'Newer code file bytes disagree with the pinned import.', CANONICAL_WRITEBACK_CONFLICT].includes(done.error_message ?? '');
 }
 
 /** The receipt of an import whose file bytes changed between admission and publication (`raw_file_changed` in verb-errors.ts). */
@@ -167,7 +177,7 @@ export async function receiptPageFaultHold(engine: Pick<BrainEngine, 'executeRaw
   if (proof) return concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof);
   const moved = await pageMovedSinceAdmission(engine, input.sourceId, pending, done);
   if (moved) return pageChangedHold(entry, pending.slug, pending.pageId, pending.intent, { proof: null, revision: moved.revision, why: `page ${pending.slug} changed in the database` });
-  return page && pinnedWorktreeConflict(done) ? worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent) : null;
+  return page && pinnedWorktreeConflict(done) ? worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent, done.error_message === CANONICAL_WRITEBACK_CONFLICT ? 'writeback' : 'page') : null;
 }
 
 /**

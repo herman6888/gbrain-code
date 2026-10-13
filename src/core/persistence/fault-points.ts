@@ -15,7 +15,11 @@ import type { WriteRequest } from './model.ts';
 export type PublicationBoundary = Parameters<NonNullable<PublicationHooks['boundary']>>[0];
 export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${EffectKind}:mid` | 'effect:embedding:settle'
   | 'effect_recovery:before_clear' | 'publication_recovery:before_clear' | 'sync:mid_checkpoint' | 'sync:before_group_admission' | 'sync:mid_waiver_run' | 'consumer:prepared'
-  | 'consumer:preparing' | 'lane:applied';
+  | 'consumer:preparing' | 'lane:applied'
+  // #6511: the page purge's in-transaction journal lookups (page-purge.ts `journalLookup`); a hook that throws a 57014 models a statement timeout there.
+  | 'purge:slug_lookup' | 'purge:tail_recheck' | 'purge:pending_recheck' | 'purge:redaction_read'
+  // #6511: before each keyset chunk of the preparation-time journal sweep (a stalling hook models a slow chunk), and the fact purge's planning read.
+  | 'purge:sweep_chunk' | 'purge:carrying_lookup';
 /**
  * `signal` (#6278, `consumer:preparing` only): the preparation's abort signal, so
  * a stalling hook can model both the reporter's cases: a preparer that honours

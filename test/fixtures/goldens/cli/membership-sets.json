@@ -142,6 +142,7 @@
         "founder",
         "friction",
         "frontmatter",
+        "git",
         "google",
         "graph-query",
         "hook",
@@ -255,6 +256,7 @@
         "founder",
         "friction",
         "frontmatter",
+        "git",
         "google",
         "graph-query",
         "hook",
@@ -352,6 +354,7 @@
       ],
       "STARTUP_HOOK_SKIP_COMMANDS": [
         "check-update",
+        "git",
         "hook",
         "post-upgrade",
         "self-upgrade",

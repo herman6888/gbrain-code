@@ -72,8 +72,9 @@ export async function assessBackupRepository(
   previous?: BackupAssetVerdict,
 ): Promise<BackupAssetVerdict> {
   const asset: BackupAssetVerdict = { kind, id, state: 'unknown', fix_argv: null, verification: { state: 'not_checked' } };
+  let failedPush = false;
   try {
-    const failedPush = readPushStatusForRoot(root)?.ok === false;
+    failedPush = readPushStatusForRoot(root)?.ok === false;
     // #6083: a managed canonical worktree is committed and pushed by its persistence owner; `sources push` refuses there.
     const managed = managedFilesystemRootFor(root);
     const managedFix = managed ? ['gbrain', 'sources', 'writer', 'status', ...(managed.sourceId ? [managed.sourceId] : []), '--probe', '--json'] : null;
@@ -165,6 +166,10 @@ export async function assessBackupRepository(
     }
     return asset;
   } catch {
+    // A later local probe that failed (a 2 s git timeout on a loaded host) cannot undo a finding already
+    // established: a recorded failed push, or commits/edits a completed probe saw. It never certifies `ok`.
+    if (failedPush) return { ...asset, state: 'failing', detail: 'last_push_failed', verification: { state: 'unavailable' } };
+    if (asset.state === 'unpushed' || asset.state === 'dirty') return { ...asset, verification: { state: 'unavailable' } };
     return { ...asset, state: 'unknown', detail: 'probe_failed', verification: { state: 'unavailable' } };
   }
 }

@@ -37,7 +37,9 @@ import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, pub
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { SYNC_CURSOR_REPLACED } from './sync-checkpoint-replaced.ts';
 import { fenceFailureDetail } from '../fence-repair/refusal.ts';
+import { withdrawalFailureDetail } from '../facts/withdrawal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
 import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
 
@@ -52,7 +54,9 @@ interface PreparedMutationBase {
   contentUnchanged?: boolean;
   deferEmbedding?: boolean;
   /** Why a page write bound to a worktree publishes no file (receipt `write_through.skipped`). */
-  databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only' | 'sync_excluded';
+  databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only' | 'sync_excluded' | 'shared_origin';
+  /** #6517: the receipt's `write_through.warning` for a database-only publication, set by `validate` under the publication guards. */
+  databaseOnlyWarning?: string;
   /**
    * Must perform only transaction-composable database work. `preimage` (#5984)
    * is the publisher's read of the page under its page guard, after the revision
@@ -126,8 +130,8 @@ export { fileHash as persistenceFileHash, publishFile as publishPersistenceFile 
 function requestError(error: unknown): PublicationFailure {
   if (error instanceof OperationError) {
     // #6188: a typed fence refusal keeps its location in the bounded detail, which outlives receipt compaction.
-    const fence = fenceFailureDetail(error);
-    return { code: error.code, message: error.message, ...(fence ? { detail: fence } : {}) };
+    const detail = fenceFailureDetail(error) ?? withdrawalFailureDetail(error);
+    return { code: error.code, message: error.message, ...(detail ? { detail } : {}) };
   }
   const refusal = databaseRefusal(error);
   if (refusal) return refusal;
@@ -139,7 +143,7 @@ function requestError(error: unknown): PublicationFailure {
   if (code === 'revision_backfill_pending' && error instanceof Error) return { code, message: error.message };
   return ownerExceptionFailure(error);
 }
-function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed'].includes(code); }
+function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed',SYNC_CURSOR_REPLACED].includes(code); }
 export function transientDatabaseFailure(error: unknown): boolean {
   return ['40001','40P01','55P03','57014','53300','57P01','57P02','57P03','08000','08003','08006','08001','08004',
     'ECONNRESET','ECONNREFUSED','ETIMEDOUT','CONNECTION_CLOSED','CONNECTION_ENDED'].includes(String((error as {code?:string})?.code));
@@ -224,6 +228,7 @@ export function decoratePublicationOutcome(row: WriteRequest, prepared: Prepared
   if ((outcome.write_through as { skipped?: string }).skipped === 'unbound_source') {
     outcome.write_through = { ...outcome.write_through as object, warning: unboundWriteWarning(row.operation, row.source_id, row.authority.databaseOnlyReason === 'unbound_source') };
   }
+  if (prepared.databaseOnlyWarning) outcome.write_through = { ...outcome.write_through as object, warning: prepared.databaseOnlyWarning };
 }
 
 /**

@@ -21,7 +21,7 @@ const resolve_slugs: Operation = {
   outputRedaction: 'no_stored_text',
   description: 'Fuzzy-match a partial slug or title to page slugs. Use when a slug is uncertain. Needs read scope.',
   params: {
-    partial: { type: 'string', required: true, description: "Partial slug or title, e.g. 'alice-ex'." },
+    partial: { type: 'string', required: true, description: 'Partial slug or title.' },
     source_id: {
       type: 'string',
       description: "One source, or '__all__'.",

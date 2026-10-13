@@ -56,7 +56,7 @@ function countDiscoveries(engine: BrainEngine, sourceId: string): { count: () =>
   const executeRaw = engine.executeRaw;
   let reads = 0;
   engine.executeRaw = async function (this: BrainEngine, sql: string, params?: unknown[]) {
-    if (params?.[0] === sourceId && sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages')) reads++;
+    if (params?.[0] === sourceId && sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages')) reads++;
     return executeRaw.call(this, sql, params);
   } as BrainEngine['executeRaw'];
   return { count: () => reads, restore: () => { engine.executeRaw = executeRaw; } };
@@ -141,6 +141,102 @@ test('an uncommitted edit under the catch-up is held worktree_dirty with the pin
     expect(after).toMatchObject({ status: 'synced', toCommit: head, modified: 1 });
     expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('private edit still in progress');
     expect(await readGitHold(engine, f.id, source.incarnation, 'b.md')).toBeNull();
+  }
+}), 120_000);
+
+// #6513: a pinned import whose canonical correction (a fixable facts fence: `partnership` maps to `fact`) must rewrite the
+// file, when the file already holds newer uncommitted bytes.
+const FB = '<!--- gbrain:facts:begin -->', FBE = '<!--- gbrain:facts:end -->';
+const FH = '| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |\n|---|---|---|---|---|---|---|---|---|---|';
+const fixable = (body = 'A synthetic page.') => `---\ntitle: Fixable\n---\n${body}\n\n${FB}\n${FH}\n| 1 | Sentinelzq8 partners with an example vendor | partnership | 1.0 | private | medium | 2026-01-01 |  | chat |  |\n${FBE}\n`;
+const WRITEBACK_CONFLICT = 'Canonical sanitization cannot overwrite newer working-tree bytes.';
+
+test('#6513: a canonical writeback refused for newer uncommitted bytes is held worktree_dirty instead of blocking the cursor; the committed edit imports next', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'a.md': note('Alpha one.'), 'b.md': note('Beta one.') });
+    expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
+    writeFileSync(join(f.root, 'a.md'), note('Alpha two.')); writeFileSync(join(f.root, 'b.md'), note('Beta two.'));
+    mkdirSync(join(f.root, 'people')); writeFileSync(join(f.root, 'people/fixable.md'), fixable());
+    const pin = commit(f.root, 'version two with a fixable fence');
+    await interruptedAfter(engine, f.opts, 1);
+    // An agent edits the new page before the catch-up reaches it: the pinned import wants to rewrite the fence, the file is newer.
+    const edit = fixable('A synthetic page, edited while the catch-up drained.');
+    writeFileSync(join(f.root, 'people/fixable.md'), edit);
+    const resumed = await performManagedSync(engine, f.opts);
+    expect(resumed).toMatchObject({ status: 'synced', toCommit: pin, held_count: 1, held: [{ path: 'people/fixable.md', code: 'worktree_dirty' }] });
+    expect(resumed.managedWrite).toBeUndefined();
+    expect(resumed.held![0]!.message).toContain('canonical correction');
+    expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('Beta two.');
+    expect(await engine.getPage('people/fixable', { sourceId: f.id })).toBeNull();
+    expect(readFileSync(join(f.root, 'people/fixable.md'), 'utf8')).toBe(edit);
+    expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
+    expect(pinnedWorktreeConflict({ state: 'conflict', error_code: 'source_changed', error_message: WRITEBACK_CONFLICT })).toBe(true);
+    // The cursor is finished, so the checkout is movable again; the agent commits and the next sync imports (and corrects) its edit.
+    const head = commit(f.root, 'the agent commits its edit');
+    const after = await performManagedSync(engine, f.opts);
+    expect(after).toMatchObject({ status: 'synced', toCommit: head, added: 1 });
+    expect((await engine.getPage('people/fixable', { sourceId: f.id }))?.compiled_truth).toContain('edited while the catch-up drained');
+    expect((await engine.getPage('people/fixable', { sourceId: f.id }))?.compiled_truth).toContain('| fact |');
+    const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [f.id]);
+    expect(await readGitHold(engine, f.id, source.incarnation, 'people/fixable.md')).toBeNull();
+  }
+}), 120_000);
+
+test('#6513: working-tree bytes that already are the canonical correction import without a second writeback', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    // The correction gbrain itself writes for this fence, taken from a clean sync of the same bytes.
+    const reference = await fixture(engine, { 'people/fixable.md': fixable() });
+    expect((await performManagedSync(engine, reference.opts)).status).toBe('first_sync');
+    const canonical = readFileSync(join(reference.root, 'people/fixable.md'), 'utf8');
+    expect(canonical).not.toBe(fixable()); expect(canonical).toContain('| fact |');
+
+    const f = await fixture(engine, { 'a.md': note('Alpha one.'), 'b.md': note('Beta one.') });
+    expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
+    writeFileSync(join(f.root, 'a.md'), note('Alpha two.')); writeFileSync(join(f.root, 'b.md'), note('Beta two.'));
+    mkdirSync(join(f.root, 'people')); writeFileSync(join(f.root, 'people/fixable.md'), fixable());
+    const pin = commit(f.root, 'version two with a fixable fence');
+    await interruptedAfter(engine, f.opts, 1);
+    // The writeback landed on disk but the request that carried it never settled: the file is the correction, the page is not there.
+    writeFileSync(join(f.root, 'people/fixable.md'), canonical);
+    const resumed = await performManagedSync(engine, f.opts);
+    expect(resumed).toMatchObject({ status: 'synced', toCommit: pin });
+    expect(resumed.held_count ?? 0).toBe(0); expect(resumed.managedWrite).toBeUndefined();
+    expect((await engine.getPage('people/fixable', { sourceId: f.id }))?.compiled_truth).toContain('| fact |');
+    expect(readFileSync(join(f.root, 'people/fixable.md'), 'utf8')).toBe(canonical);
+    expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
+    // Once the correction is committed, the pin..HEAD diff re-imports the same bytes as a no-op.
+    const head = commit(f.root, 'the correction is committed');
+    expect(await performManagedSync(engine, f.opts)).toMatchObject({ status: 'synced', toCommit: head, added: 0, modified: 0 });
+  }
+}), 120_000);
+
+test('#6513: a cursor an older run left blocked on the canonical-writeback conflict converts in place under --retry-failed', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'a.md': note('Alpha one.'), 'b.md': note('Beta one.') });
+    expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
+    writeFileSync(join(f.root, 'a.md'), note('Alpha two.')); writeFileSync(join(f.root, 'b.md'), note('Beta two.'));
+    mkdirSync(join(f.root, 'people')); writeFileSync(join(f.root, 'people/fixable.md'), fixable());
+    commit(f.root, 'version two with a fixable fence');
+    const edit = fixable('A synthetic page, edited while the catch-up drained.');
+    writeFileSync(join(f.root, 'people/fixable.md'), edit);
+    // The old release: holds off, the refusal blocked the run and left the failed request on the cursor.
+    await engine.setConfig('sync.holds', 'fail');
+    let blocked;
+    try { blocked = await performManagedSync(engine, f.opts); } finally { await engine.executeRaw("DELETE FROM config WHERE key='sync.holds'"); }
+    expect(blocked).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_error: 'source_changed', reason: 'pinned_git_worktree_conflict' },
+      failures: [{ path: 'people/fixable.md', code: 'source_changed', message: WRITEBACK_CONFLICT }] });
+    const before = await cursorOf(engine, f.id);
+    expect(before.done).toBeFalsy();
+    const discoveries = countDiscoveries(engine, f.id);
+    let converted;
+    try { converted = await performManagedSync(engine, { ...f.opts, retryFailed: true }); }
+    finally { discoveries.restore(); }
+    expect(discoveries.count()).toBe(0);
+    expect(converted).toMatchObject({ status: 'synced', held_count: 1, held: [{ path: 'people/fixable.md', code: 'worktree_dirty' }], converted_from_failed: [blocked.managedWrite!.write_request.request_id] });
+    expect((await cursorOf(engine, f.id))?.run_id).toBe(before.run_id);
+    expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('Beta two.');
+    expect(readFileSync(join(f.root, 'people/fixable.md'), 'utf8')).toBe(edit);
+    expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
   }
 }), 120_000);
 

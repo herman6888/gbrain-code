@@ -99,9 +99,10 @@ Options:
                        checkpoint; unchanged pages are not admitted again.
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
-  --no-pull            Skip 'git pull' before the sync. Required on managed
-                       brains: 'gbrain sources refresh <id>' moves the
-                       checkout, and sync catches the index up to it.
+  --no-pull            Skip 'git pull' before the sync. Implied on managed
+                       brains, which never pull during sync: 'gbrain sources
+                       refresh <id>' moves the checkout, and sync catches the
+                       index up to it.
   --no-bulk            Managed Postgres sync: publish one page per transaction
                        instead of bulk groups (each page keeps its own write
                        request either way). Persist with

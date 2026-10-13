@@ -86,6 +86,8 @@ function Postgres(a, b) {
         ended: ended.length,
         queued: queries.length,
         inflight_oldest_ms: connections.reduce((age, c) => c.inflightSince ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
+        // GBrain (#6543 A4): the oldest head statement past its own budget (the cap the driver retires it at), 0 when none is.
+        inflight_over_budget_ms: connections.reduce((age, c) => c.inflightSince && c.inflightCap && now - c.inflightSince > c.inflightCap ? Math.max(age, Math.round(now - c.inflightSince)) : age, 0),
         completed: options.shared.completed
       }
     }
@@ -631,7 +633,7 @@ function parseOptions(a, b) {
   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
 
-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'inflight_timeout']
+  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'inflight_timeout', 'inflight_max', 'inflight_grace']
   const defaults = {
     max             : globalThis.Cloudflare ? 3 : 10,
     ssl             : false,
@@ -641,6 +643,8 @@ function parseOptions(a, b) {
     max_lifetime    : max_lifetime,
     max_pipeline    : 100,
     inflight_timeout: null,
+    inflight_max    : null,
+    inflight_grace  : null,
     backoff         : backoff,
     keep_alive      : 60,
     prepare         : true,
@@ -683,6 +687,8 @@ function parseOptions(a, b) {
     onstuck         : o.onstuck,
     onbuilderror    : o.onbuilderror,
     ondesync        : o.ondesync,
+    onrecovered     : o.onrecovered,
+    onrecoveryfailed: o.onrecoveryfailed,
     shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
     onparameter     : o.onparameter,
     socket          : o.socket,

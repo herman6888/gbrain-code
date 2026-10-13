@@ -374,6 +374,11 @@ export function stdioToolListing(advertised: () => Promise<McpSurface | null>, s
       const listed = advertisedOps(visible, session.surface, await advertised());
       return listed.length === visible.length ? visible : visible.filter(op => revealed.has(op.name) || listed.includes(op));
     },
+    /** D2: whether tools/list shows this (callable) tool now. */
+    async isListed(op: OperationMeta): Promise<boolean> {
+      if (session.surface !== startSurface || revealed.has(op.name)) return true;
+      return advertisedOps([op], session.surface, await advertised()).length > 0;
+    },
     reveal(names: string[]): void {
       const before = revealed.size;
       for (const name of names) revealed.add(name);

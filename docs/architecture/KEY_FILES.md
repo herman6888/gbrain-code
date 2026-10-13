@@ -24,12 +24,12 @@ link it here rather than raising the cap.
 | Subsystem | Entry range / scope |
 |---|---|
 | [Page identity and writer administration](key-files/page-identity-and-administration.md) | Opaque result IDs, current grants, state-bound ownership changes |
-| [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, derived atom state, receipt diagnostics |
+| [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, derived atom state, sync discovery and the origin rule (`sync-origin.ts`, `file-claims.ts`) |
 | [Company-brain ingestion](key-files/company-brain.md) | Inspection, admission, receipts, derived relationships and schema; [operator guide](../guides/company-brain-ingestion.md) |
 | [Agent operator contract](key-files/agent-contract.md) | `agent-output.ts`, error registry + docs, notice ledger, `isCallable`, `--json` guard, contract scanner |
 | [Commands (1/6)](key-files/commands-1.md) | `src/commands/agent-logs.ts` through `src/commands/db-repair.ts` |
 | [Commands (2/6)](key-files/commands-2.md) | `src/commands/doctor.ts` and `src/commands/doctor/` |
-| [Commands (2/6, continued)](key-files/commands-2-continued.md) | `doctor/checks/routing-federation.ts`, `git-convergence.ts`, `dream-retriage.ts` to `embed.ts` |
+| [Commands (2/6, continued)](key-files/commands-2-continued.md) | `doctor/checks/routing-federation.ts`, `git-convergence.ts`, `keyword-plan.ts`, `dream-retriage.ts` to `embed.ts` |
 | [Commands (3/6)](key-files/commands-3.md) | `src/commands/engine-status.ts` through `src/commands/extract-timeline-db.ts` |
 | [Commands (3/6, continued)](key-files/commands-3-continued.md) | `src/commands/features.ts` through `src/commands/frontmatter-install-hook.ts` |
 | [Commands (4/6)](key-files/commands-4.md) | `src/commands/frontmatter.ts` through `src/commands/pglite-repair.ts` |
@@ -45,11 +45,14 @@ link it here rather than raising the cap.
 | [Core Minions (1/2)](key-files/core-minions-1.md) | `src/core/minions/` through `src/core/minions/rss-default.ts` |
 | [Core Minions (2/2)](key-files/core-minions-2.md) | `src/core/minions/run-child.ts` through `src/core/minions/worker.ts` |
 | [Core Persistence](key-files/core-persistence.md) | `src/core/persistence/` write journal, coordinator, effects, canonical projections and managed sync |
-| [Core Persistence (continued)](key-files/core-persistence-continued.md) | `worktree-refresh*.ts`, `persistence/connector-*.ts`, `connectors/item-holds*.ts`, checkpoint validation, no-op kernel, accepted-pending receipts, verb types/errors, attribution, purge-deleted, fact retirement, sync orphans |
+| [Core Persistence (continued)](key-files/core-persistence-continued.md) | `worktree-refresh*.ts`, `persistence/connector-*.ts`, `connectors/item-holds*.ts`, receipts |
+| [Core Persistence (request indexes, fault seams)](key-files/core-persistence-request-indexes.md) | `checkpoint-validation.ts`, `fault-points.ts` |
+| [Core Persistence (managed facts)](key-files/core-persistence-facts.md) | `facts-maintenance.ts`, `facts-prepare.ts`, `derived-facts.ts`, `facts/same-page-shadow.ts` |
 | [Core Persistence (engine graduation)](key-files/core-persistence-graduation.md) | `engine-graduation*.ts`, `graduation-*.ts`, `src/commands/migrate-graduation.ts`, its doctor finding |
 | [Managed sync and persistence stalls](key-files/persistence-stalls.md) | preparation budgets, `claim-phase.ts`, `consumer.ts`, `group-publish.ts`, `journal.ts`, `diagnostics.ts`, `worktree-manifest.ts` |
+| [Managed sync bookkeeping](key-files/managed-sync-bookkeeping.md) | `sync-failures.ts`, `managed-sync-orphans.ts`, `sync-checkpoint-replaced.ts` |
 | [Core Search (1/2)](key-files/core-search-1.md) | `src/core/search/` through `src/core/search/read-policy-sql.ts` |
-| [Core Search (2/2)](key-files/core-search-2.md) | `src/core/search/rerank.ts` through `src/core/search/vector-pool.ts`, the relational arm and multi-hop chain modules, `hub-dampening.ts` |
+| [Core Search (2/2)](key-files/core-search-2.md) | `src/core/search/rerank.ts` through `src/core/search/vector-pool.ts`, the relational arm and multi-hop chain modules, `hub-dampening.ts`, `crag.ts` |
 | [Core Services (1/3)](key-files/core-services-1.md) | `src/core/advisor/{types,run,render,recommended-set,history,apply,collect-*}.ts` through `src/core/connectors/` |
 | [Core Services (1/3, continued)](key-files/core-services-1-continued.md) | `src/core/context/` through `src/core/context/ipc-path.ts` |
 | [Core Services (2/3)](key-files/core-services-2.md) | `src/core/conversation-parser/` through `src/core/ops/sources.ts`, except `src/core/persistence/` |
@@ -83,5 +86,6 @@ link it here rather than raising the cap.
 | [Open loops](key-files/open-loops-engine.md) | detect, extract, store |
 | [Always-loaded core memory](key-files/core-memory.md) | Core tier, write-path guard and lock order, delivery lanes, pressure notice |
 | [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts |
+| [Secret and sensitivity scanning](key-files/secret-scan.md) | `secret-scan*.ts`: detection, allowlist, scan counters |
 | [Ambient capture consent gate](key-files/ambient-capture.md) | `memory.auto_writeback` capture lanes |
 | [Quarantine](key-files/quarantine.md) | Gate-marker strip; quarantined pages in facts, reads, writes |

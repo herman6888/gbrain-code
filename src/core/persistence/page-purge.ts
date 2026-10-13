@@ -14,14 +14,29 @@
  * `page_purges` keeps (source_id, content_hash, slug): the pages guard raises
  * typed `purged_content` when a page with that content hash is written again
  * under any slug, until `gbrain pages unpurge <slug>` clears it.
+ *
+ * #6511: the search for historical requests carrying the page's claims is an
+ * O(journal) substring scan that no index serves, so it runs at preparation
+ * (`preparePagePurge`, under the preparation budget) and the publication
+ * transaction only reconciles the tail past the scanned ceiling and the rows
+ * that were pending at scan time (`recheckRequestsCarrying`). A statement
+ * timeout inside one of the remaining in-transaction lookups is deterministic
+ * on a large journal, not contention: it ends the request `failed` with the
+ * typed `purge_lookup_timeout` (the queue behind it moves) instead of being
+ * released as `database_contention` and retried without bound.
  */
 
 import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
-import { opError } from '../ops/contract.ts';
+import { opError, type OperationError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import type { WriteRequest } from './model.ts';
-import { findRequestsCarrying, findRequestsForSlugs, redactRequestIntents } from './intent-redaction.ts';
+import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
+import { PERSISTENCE_REQUEST_SLUG_INTENT_INDEX } from './schema.ts';
+import { readRequestIndexStates, REQUEST_INDEXES_REPAIR_COMMAND, type RequestIndexState } from './checkpoint-validation.ts';
+import { faultPoint } from './fault-points.ts';
+import { findRequestsForSlugs, recheckRequestsCarrying, redactRequestIntents, sweepRequestsCarrying, type JournalSweep } from './intent-redaction.ts';
 import { dropPurgedFenceRows } from '../facts/purge-overlay.ts';
 import { contentHash } from '../utils.ts';
 
@@ -44,8 +59,61 @@ const purgeContext = new Map<string, { needles: string[]; factIds: number[]; pag
 const PURGE_CONTEXT_LIMIT = 64;
 const purgeReceipts = new Map<string, { receipt: Record<string, unknown>; purge: Record<string, unknown> }>();
 
+/** The page's claims (facts filed on it, its takes) that the journal sweep searches for, bounded, trimmed, deduplicated. */
+async function readPurgeClaims(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slug: string, pageId: number) {
+  const factRows = await engine.executeRaw<{ id: number; fact: string }>('SELECT id,fact FROM facts WHERE source_id=$1 AND source_markdown_slug=$2 ORDER BY id LIMIT 1000', [sourceId, slug]);
+  const takeRows = await engine.executeRaw<{ id: number; claim: string }>('SELECT id,claim FROM takes WHERE page_id=$1 ORDER BY id LIMIT 1000', [pageId]);
+  const needles = [...new Set([...factRows.map(f => f.fact), ...takeRows.map(t => t.claim)].map(t => t.trim()).filter(t => t.length >= 8))].slice(0, 32);
+  return { factRows, takeRows, needles };
+}
+
+/** What the delete preparation hands the purge apply: the claims it searched for, the journal census, and the slug index's state for the failure hint. */
+export interface PreparedPagePurge { needles: string[]; sweep: JournalSweep; slugIndex: RequestIndexState['state'] }
+/**
+ * #6511: at preparation, before the root lock and outside any transaction: the page's claims, the slug index's state and
+ * the keyset journal sweep under the preparation budget (the clock between chunks; `boundedReads` on Postgres).
+ */
+export async function preparePagePurge(engine: BrainEngine, row: WriteRequest, snapshot: PageSnapshot, clock: ClaimPhaseClock | undefined): Promise<PreparedPagePurge> {
+  enterClaimStep(clock, 'purge_claims', undefined, 'db');
+  const { needles } = await readPurgeClaims(engine, row.source_id, snapshot.page.slug, snapshot.page.id);
+  const [slugIndex] = await readRequestIndexStates(engine, [PERSISTENCE_REQUEST_SLUG_INTENT_INDEX]);
+  const sweep = await sweepRequestsCarrying(engine, row.source_id, needles, { clock, exclude: row.id,
+    onChunk: () => faultPoint('purge:sweep_chunk', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation }) });
+  return { needles, sweep, slugIndex: slugIndex?.state ?? 'missing' };
+}
+
+/** The in-transaction journal lookups a statement timeout ends as `purge_lookup_timeout` (also the purge's fault-point seams). */
+export type PurgeLookupPoint = 'slug_lookup' | 'tail_recheck' | 'pending_recheck' | 'redaction_read';
+const LOOKUP_LABEL: Record<PurgeLookupPoint, string> = { slug_lookup: 'lookup of stored intents for the slug', tail_recheck: 're-check of requests admitted after its preparation scan',
+  pending_recheck: 're-check of requests that were pending at its preparation scan', redaction_read: 'locking read of the requests to redact' };
+export const PURGE_LOOKUP_TIMEOUT_MESSAGE = 'This purge could not finish; later writes to the source can move again. Do not assume the requested content was erased.';
+/** [R6] The failure's `fix` names the index repair only when the slug index is missing or invalid; otherwise a fresh request id. */
+export function purgeLookupTimeout(row: Pick<WriteRequest, 'request_id' | 'slug' | 'source_id'>, point: PurgeLookupPoint, slugIndex: RequestIndexState['state']): OperationError {
+  const broken = slugIndex === 'missing' || slugIndex === 'invalid';
+  const next = broken
+    ? `The request-table slug index ${PERSISTENCE_REQUEST_SLUG_INTENT_INDEX.name} is ${slugIndex === 'invalid' ? 'INVALID' : 'missing'}: rebuild it (${REQUEST_INDEXES_REPAIR_COMMAND}), then submit the purge again with a new request_id.`
+    : 'Submit the purge again with a new request_id (a retry with the same id returns this failure); if it times out again, report the request and attach the persistence_request_indexes and persistence_request_growth entries of gbrain doctor --json.';
+  // The journal keeps code and message only, so the next step rides the message (the receipt is what `gbrain write-request` shows).
+  return opError('purge_lookup_timeout', `${PURGE_LOOKUP_TIMEOUT_MESSAGE} ${next}`,
+    `The purge's ${LOOKUP_LABEL[point]} (request ${row.request_id}, page ${row.slug} in source ${row.source_id}) exceeded the publication transaction's statement budget, so the transaction rolled back: `
+    + 'no row, file or tombstone of the page was removed and nothing in the journal was redacted.',
+    { fix: broken
+      ? { argv: ['gbrain', 'repair', 'request-indexes', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Previews the missing or invalid request-table indexes without changing anything.' }
+      : readFix(`Reads request ${row.request_id}'s durable receipt: its state and recorded error, read-only.`, { argv: ['gbrain', 'write-request', '--', row.request_id] }) });
+}
+/** Runs one in-transaction journal lookup behind its fault-point seam; a 57014 from it is the terminal typed failure, never transient contention. */
+async function journalLookup<T>(row: WriteRequest, point: PurgeLookupPoint, slugIndex: RequestIndexState['state'], fn: () => Promise<T>): Promise<T> {
+  try {
+    await faultPoint(`purge:${point}`, { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
+    return await fn();
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code !== '57014') throw error;
+    throw purgeLookupTimeout(row, point, slugIndex);
+  }
+}
+
 /** Inside the coordinated delete transaction, before the page row is deleted. */
-export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest, snapshot: PageSnapshot): Promise<Record<string, unknown>> {
+export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest, snapshot: PageSnapshot, prepared: PreparedPagePurge): Promise<Record<string, unknown>> {
   const page = snapshot.page, sourceId = row.source_id, slug = page.slug;
   const actor = `${row.principal_kind}:${row.principal_id}`;
   const [stored] = await tx.executeRaw<{ content_hash: string | null }>('SELECT content_hash FROM pages WHERE id=$1', [page.id]);
@@ -71,10 +139,8 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   }
   await tx.executeRaw(`INSERT INTO page_purges(source_id,content_hash,slug,request_id) SELECT $1,h,$3,$4::uuid FROM unnest($2::text[]) AS h
     ON CONFLICT (source_id,content_hash) DO UPDATE SET slug=EXCLUDED.slug,request_id=EXCLUDED.request_id,purged_at=now()`, [sourceId, [...hashes], slug, row.id]);
-  const factRows = await tx.executeRaw<{ id: number; fact: string }>('SELECT id,fact FROM facts WHERE source_id=$1 AND source_markdown_slug=$2 ORDER BY id LIMIT 1000', [sourceId, slug]);
-  const takeRows = await tx.executeRaw<{ id: number; claim: string }>('SELECT id,claim FROM takes WHERE page_id=$1 ORDER BY id LIMIT 1000', [page.id]);
+  const { factRows, takeRows, needles } = await readPurgeClaims(tx, sourceId, slug, page.id);
   const factIds = factRows.map(f => Number(f.id)), takeIds = takeRows.map(t => Number(t.id));
-  const needles = [...new Set([...factRows.map(f => f.fact), ...takeRows.map(t => t.claim)].map(t => t.trim()).filter(t => t.length >= 8))].slice(0, 32);
   const count = async (sql: string, params: unknown[]) => (await tx.executeRaw(sql, params)).length;
   const refs = factIds.map(String);
   const removed: Record<string, number> = {
@@ -95,9 +161,15 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   removed.take_proposals = await count('DELETE FROM take_proposals WHERE source_id=$1 AND page_slug=$2 RETURNING 1', [sourceId, slug]);
   removed.open_loops = await count('DELETE FROM open_loops WHERE source_id=$1 AND page_slug=$2 RETURNING 1', [sourceId, slug]);
   removed.core_edit_notices = await count('DELETE FROM core_edit_notices WHERE source_id=$1 AND slug=$2 RETURNING 1', [sourceId, slug]);
-  const carrying = needles.length ? (await Promise.all(needles.map(n => findRequestsCarrying(tx, sourceId, n)))).flat() : [];
-  const requests = [...new Map([...await findRequestsForSlugs(tx, sourceId, [slug]), ...carrying].map(r => [r.id, r])).values()];
-  removed.persistence_requests = await redactRequestIntents(tx, requests, row.id, { skipPending: true, needles });
+  // #6511 [R2]: the preparation sweep's targets, plus the tail past its ceiling and the rows pending at scan time, re-tested here.
+  const lookup = <T>(point: PurgeLookupPoint, fn: () => Promise<T>) => journalLookup(row, point, prepared.slugIndex, fn);
+  const recheck = await lookup('tail_recheck', () => recheckRequestsCarrying(tx, sourceId, needles, prepared.sweep,
+    { exclude: row.id, beforePending: () => faultPoint('purge:pending_recheck', { requestId: row.request_id, sourceId, operation: row.operation }) }));
+  const forSlug = await lookup('slug_lookup', () => findRequestsForSlugs(tx, sourceId, [slug]));
+  const requests = [...new Map([...forSlug, ...prepared.sweep.targets, ...recheck.targets].map(r => [r.id, r])).values()];
+  removed.persistence_requests = await lookup('redaction_read', () => redactRequestIntents(tx, requests, row.id, { skipPending: true, needles }));
+  const journalSweep = { scanned: prepared.sweep.scanned, ceiling: prepared.sweep.ceiling, tail: recheck.tail, pending_rechecked: recheck.pendingRechecked,
+    complete: prepared.sweep.complete && recheck.complete };
   const files = await tx.executeRaw<{ storage_path: string }>(`DELETE FROM files WHERE (page_id=$1 OR (page_slug=$2 AND (source_id=$3 OR source_id IS NULL)))
     RETURNING storage_path`, [page.id, slug, sourceId]);
   removed.files = files.length;
@@ -111,7 +183,7 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   purgeContext.delete(key);
   purgeContext.set(key, { needles, factIds, pageId: page.id, paths });
   while (purgeContext.size > PURGE_CONTEXT_LIMIT) purgeContext.delete(purgeContext.keys().next().value!);
-  return { status: 'purged', slug, source_id: sourceId, residuals: PURGE_RESIDUALS,
+  return { status: 'purged', slug, source_id: sourceId, residuals: PURGE_RESIDUALS, journal_sweep: journalSweep,
     purge: { content_hash8: storedHash?.slice(0, 8) ?? null, tombstoned: hashes.size > 0, content_hashes_tombstoned: hashes.size, removed,
       blobs: files.map(f => f.storage_path).filter(Boolean) } };
 }

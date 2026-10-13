@@ -15,6 +15,7 @@ Under contract v1 an `error` value never changes. Where a surface sends a legacy
 
 | `error` (frozen) | `code` (canonical) | Meaning |
 |---|---|---|
+| `invalid_params` | `fact_withdrawn` | `remember` refused a claim that was explicitly forgotten for this subject (wire `invalid_params`, message prefix `fact_withdrawn:`); nothing was saved. |
 | `permission_denied` | `insufficient_scope` | The connection lacks the OAuth scope the operation requires. |
 | `invalid_params` | `invalid_fence` | A facts or takes fence in the page cannot be imported without dropping or guessing rows, so the page (or the file) was not written. |
 | `invalid_params` | `not_found` | The requested resource does not exist or is not visible to this caller. |
@@ -516,6 +517,26 @@ More: [docs/guides/write-refusals.md#colon_slug_windows_write_through](../../doc
 |---|---|---|---|---|---|---|
 | The command failed before it wrote its JSON result. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
 
+### commit_lock_busy
+
+<a id="commit_lock_busy"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Another writer held the checkout's commit lock for the whole wait, so nothing was committed. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/shared-checkout-git.md#outcomes](../../docs/guides/shared-checkout-git.md#outcomes)
+
+### commit_paths_invalid
+
+<a id="commit_paths_invalid"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The commit was refused before staging: no paths, a path outside the checkout, the whole checkout, or a path git would not stage. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-checkout-git.md#outcomes](../../docs/guides/shared-checkout-git.md#outcomes)
+
 ### concurrent_write
 
 <a id="concurrent_write"></a>
@@ -694,6 +715,16 @@ More: [docs/guides/core-memory.md#remote-edits](../../docs/guides/core-memory.md
 |---|---|---|---|---|---|---|
 | Cost preview requires yes. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
 
+### cursor_incarnation_retired
+
+<a id="cursor_incarnation_retired"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| An unfinished managed sync cursor of this source was recorded under a source incarnation the source no longer has (it was re-pointed at a new checkout, or removed and added again), so no current sync selects or resumes it. | The cursor key digests the incarnation; every incarnation-joined reader drops the old rows while the local ledger mirror and the source-id-only cursor read still showed them. Retiring the bookkeeping says nothing about whether the current source's files are imported. | Preview gbrain repair managed-sync-orphans --source <id> and apply it with the hash it prints; then gbrain sync status --source <id> --json shows the current cursor, if any. Run: gbrain repair managed-sync-orphans --source '{source_id}' | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/repair.md#managed-sync-orphans](../../docs/guides/repair.md#managed-sync-orphans)
+
 ### cycle_failed
 
 <a id="cycle_failed"></a>
@@ -717,6 +748,18 @@ More: [docs/guides/core-memory.md#remote-edits](../../docs/guides/core-memory.md
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The brain database could not be reached or refused the operation. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### deep_health_probe_failed
+
+<a id="deep_health_probe_failed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The pooled `SELECT 1` of `/health?deep=1` did not answer: an earlier probe is still pending, it timed out, or it failed. | The deep probe runs through the ordinary pooled dispatch, where handler statements wait, so a saturated or wedged pool fails it while plain /health (a reserved idle connection) may still answer 200. One deep probe runs per engine at a time. | Retry in a few seconds; if it keeps failing, run gbrain doctor --json from a fresh process to check the database and pooler, then restart this gbrain serve. | agent | `repeat the read that failed` | 1 | yes |
+
+Reasons: `pending`, `timeout`, `error`.
+
+More: [docs/ENGINES.md#serve-deep-health](../../docs/ENGINES.md#serve-deep-health)
 
 ### delta_cursor_upgrade_required
 
@@ -954,6 +997,14 @@ More: [docs/guides/move-to-postgres.md#graduated-datastore](../../docs/guides/mo
 |---|---|---|---|---|---|---|
 | Fact not found. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### fact_withdrawn
+
+<a id="fact_withdrawn"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `remember` refused a claim that was explicitly forgotten for this subject (wire `invalid_params`, message prefix `fact_withdrawn:`); nothing was saved. | A forgotten claim stays withdrawn: remembering the same normalized text does not restore it, and a claim forgotten without an entity is withdrawn for every entity. The additive `withdrawn` object (`at`, `subject`: an entity slug or `all_entities`, `visibility`) says when and how widely the exact claim was forgotten; it covers that exact claim only, and its absence carries no meaning. | Do not retry the same text. Tell the user the claim was forgotten (withdrawn.at, withdrawn.subject); if it is still true, remember it in new words. To link a fact saved without an entity, remember it with entity and replaces set to its fact id instead of forgetting it. | agent | `repeat the read that failed` | 1 | no |
+
 ### facts_absorb_write_refused
 
 <a id="facts_absorb_write_refused"></a>
@@ -1155,6 +1206,16 @@ More: [docs/guides/shared-brain-skills.md#approve-publication-following-and-edit
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Git index stale. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### git_operation_in_progress
+
+<a id="git_operation_in_progress"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A rebase, merge, cherry-pick or revert is in progress in the checkout, so gbrain will not commit or move it. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-checkout-git.md#stuck-rebase](../../docs/guides/shared-checkout-git.md#stuck-rebase)
 
 ### git_push_unavailable
 
@@ -1368,6 +1429,18 @@ More: [docs/guides/bootstrap.md#harness_hook_duplicates](../../docs/guides/boots
 
 More: [docs/guides/bootstrap.md#harness_hook_unowned](../../docs/guides/bootstrap.md#harness_hook_unowned)
 
+### head_blocked
+
+<a id="head_blocked"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The queued write at the head of a managed source cannot be claimed by any consumer, and its blocker needs an operator; a managed sync drain stops `drain_stalled` with `cause: head_blocked` and `blocked_by` names the predicate. | #6543: the drain used to wait the whole no-progress window and print a constant `claimable here: no`. The head probe evaluates each predicate of the claim query for the head itself. Only intervention-required blockers stop the drain, after one governor tick of confirmation: a refresh fence no refresh process holds, or a running request ahead held by a process that reports restart_required. Live blockers (a foreground publication, a lapsed lease, a refresh or recovery making progress) keep the progress-aware wait. | Run next.fix: for refresh_fence resume the refresh (gbrain sources refresh <source> --resume); for zombie_publication restart the named gbrain process on the brain host. Then rerun the same sync. Run: gbrain sources writer status --source '{source_id}' --json | host_admin | `gbrain doctor --json` | 1 | no |
+
+Reasons: `refresh_fence`, `zombie_publication`.
+
+More: [docs/guides/write-refusals.md#head-blocked](../../docs/guides/write-refusals.md#head-blocked)
+
 ### held_failed
 
 <a id="held_failed"></a>
@@ -1425,6 +1498,16 @@ More: [docs/guides/troubleshooting.md#host-identity-mismatch](../../docs/guides/
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The connection lacks the OAuth scope the operation requires. | Only the operator of the brain host can change what blocks this. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### integrate_conflict
+
+<a id="integrate_conflict"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Local and remote commits changed the same file; nothing was merged and the checkout is unchanged. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-checkout-git.md#conflicts](../../docs/guides/shared-checkout-git.md#conflicts)
 
 ### internal
 
@@ -2036,6 +2119,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | This caller is not authorized for the operation. | Only the operator of the brain host can change what blocks this. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
 
+### persistence_restart_required
+
+<a id="persistence_restart_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| This gbrain serve's persistence consumer reports restart_required, so it claims no write until the process restarts; `/health?deep=1` answers 503 with this code. | A preparation abandoned past the ceiling (a zombie) or a publication that never settled past its deadline makes the owner stop claiming on every root, because the abandoned work may still hold locks or write files; only a process exit releases it. The deep health probe reports it so a supervisor can restart serve; it never acts on its own (GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS opts into an exit). | Restart the serve process (for the installed service: systemctl --user restart gbrain-serve; otherwise stop and start it in the foreground); to let a supervisor do it unattended, set GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=300 in the serve environment (~/.gbrain/env for the installed service). Then run gbrain sources writer status --json. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/ENGINES.md#serve-deep-health](../../docs/ENGINES.md#serve-deep-health)
+
 ### persistence_write_stall
 
 <a id="persistence_write_stall"></a>
@@ -2046,13 +2139,23 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 
 More: [docs/guides/troubleshooting.md#persistence-write-stall](../../docs/guides/troubleshooting.md#persistence-write-stall)
 
+### pg_connection_recovery_failed
+
+<a id="pg_connection_recovery_failed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A Postgres connection the driver retired after an incident (stuck, desynced, or closed under running statements) could not reconnect; statements waiting for it failed with the connect error. | The database or pooler refused or dropped the new connection (unreachable host, exhausted connection slots, rotated credentials). The next statement retries the connect, and the connection stays marked until one succeeds, so a repeating line means the pool is not recovering on its own. | Check the database and pooler from the serve host (gbrain doctor --only pool_reap_health --json); a serve that keeps logging this line needs the database reachable again, then a restart if the pool never recovers. Run: gbrain doctor --only pool_reap_health --json | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/ENGINES.md#pg-connection-recovery-failed](../../docs/ENGINES.md#pg-connection-recovery-failed)
+
 ### pg_connection_stuck
 
 <a id="pg_connection_stuck"></a>
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A pooled Postgres statement waited past the pool's statement_timeout plus grace with nothing coming back from the server, so the driver retired that connection; the statement and everything queued behind it failed with CONNECTION_STUCK. | A legitimate statement cannot outlive the server-side statement_timeout, so a connection that is still waiting past it is wedged: a pipeline the server and client no longer agree on, a transaction-mode pooler that swallowed a CancelRequest and left the backend in ClientRead, or a dead peer. Before #6383 such a connection held its queue forever while /health answered 200. The pool reconnects on its own; the warn line names the pool, the age, the queue depth and the statement by keyword and table. | Retry the failed call. If the line repeats, run gbrain doctor --json and report the warn lines with the operations that preceded them; GBRAIN_PG_STUCK_GRACE_MS raises the grace, and off disables the watchdog. Run: gbrain doctor --json | agent | `repeat the read that failed` | 1 | yes |
+| A pooled Postgres statement ran past its in-flight budget (the pool's statement_timeout plus grace, or the longer statement_timeout its operation declared) with nothing coming back from the server (reason=idle) or while bytes kept arriving (reason=age), so the driver retired that connection; the statement and everything queued behind it failed with CONNECTION_STUCK. | Nothing arriving for that long usually means the connection is wedged: a pipeline the server and client no longer agree on, a transaction-mode pooler that swallowed a CancelRequest and left the backend in ClientRead, or a dead peer. It is not proof: behind a transaction-mode pooler the startup statement_timeout never applies (SHOW statement_timeout reads 0), so a legitimately slow statement can reach the budget too. reason=age is a statement that kept streaming rows or notices past its budget (#6543); an operation that needs longer declares it with SET LOCAL statement_timeout (0 for no limit), which the driver tracks per statement. Before #6383 such a connection held its queue forever while /health answered 200. The pool reconnects on its own; the warn line names the pool, the age, the queue depth and the statement by keyword and table. | Retry the failed call. If the line repeats, run gbrain doctor --json and report the warn lines with the operations that preceded them; GBRAIN_PG_STUCK_GRACE_MS raises the grace, and off disables the watchdog. Run: gbrain doctor --json | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/ENGINES.md#pg-connection-stuck](../../docs/ENGINES.md#pg-connection-stuck)
 
@@ -2072,7 +2175,7 @@ More: [docs/ENGINES.md#pg-pool-stalled](../../docs/ENGINES.md#pg-pool-stalled)
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A Postgres statement could not be built from its parameters (UNDEFINED_VALUE: a parameter was undefined; MAX_PARAMETERS_EXCEEDED: more than 65534 parameters) and was answered in its place in the pipeline by a query the server refuses; only it failed, and a transaction it was part of was aborted rather than committed without it. | This is a gbrain programming error at the call site the warn line names by keyword and table. Before #6383 the same failure, when it happened behind another statement on the connection, rejected that other statement, desynced the connection and left every later statement on it hanging; the driver now answers the culprit in its place (the approach of porsager/postgres#1236), so only it rejects and a transaction it was in aborts. | The call that got this error failed cleanly and can be retried with corrected input; report the warn line (it names the statement) as a gbrain bug so the call site gets a null where it bound undefined. | host_admin | `gbrain doctor --json` | 1 | no |
+| A Postgres statement could not be built from its parameters (UNDEFINED_VALUE: a parameter was undefined; MAX_PARAMETERS_EXCEEDED: more than 65534 parameters) and was answered in its place in the pipeline by a query the server refuses; it failed, and a transaction it was part of was aborted rather than committed without it. | Either a gbrain programming error at the call site the warn line names by keyword and table (and by `param=$n`), or, behind a transaction-mode pooler (port 6543, prepare off), a value read from a row that belonged to another statement: a pooler that misroutes pipelined answers hands a statement someone else's row, and binding one of its missing columns fails here. Before #6383 the same failure, when it happened behind another statement on the connection, rejected that other statement, desynced the connection and left every later statement on it hanging; the driver now answers the culprit in its place (the approach of porsager/postgres#1236), so only it rejects and a transaction it was in aborts. | On a transaction-mode pooler, check /health?deep=1 transport (max_pipeline should be 0; PGMAX_PIPELINE=0 on the serve environment forces it) and treat earlier reads as suspect (docs/guides/pooler-misroute-audit.md); otherwise report the warn line (it names the statement and parameter) as a gbrain bug so the call site gets a null where it bound undefined. | host_admin | `gbrain doctor --json` | 1 | no |
 
 More: [docs/ENGINES.md#pg-statement-build-failed](../../docs/ENGINES.md#pg-statement-build-failed)
 
@@ -2111,6 +2214,16 @@ More: [docs/ENGINES.md#pglite-vector-index-ceiling](../../docs/ENGINES.md#pglite
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The saved plan has no valid repository identity. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### pool_inflight_over_budget
+
+<a id="pool_inflight_over_budget"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A pooled statement of this gbrain serve has run longer than its in-flight budget (the read pool's statement_timeout plus grace, or the longer statement_timeout its operation declared); `/health?deep=1` answers 503 with this code. | Since #6543 the in-flight watchdog retires a statement past its budget whether or not bytes keep arriving (reason=age), so this code means the watchdog is off (GBRAIN_PG_STUCK_GRACE_MS=off), the serve runs a driver without per-statement budgets, or the retirement is still in progress; a transaction that declared a longer statement_timeout, or an index build that declared 0, is measured against its own budget and not reported. Through a transaction-mode pooler a pipelined answer can also be misrouted. The probe reports it and never retires the connection, because the endpoint is unauthenticated. | Restart this gbrain serve. On a transaction-mode pooler check the transport block of /health?deep=1: max_pipeline should read 0 (set PGMAX_PIPELINE=0 in the serve environment to force it) and session_timeouts_not_applied names the ALTER ROLE fix. GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS does not act on this code: restart serve yourself or from your health check. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/ENGINES.md#serve-deep-health](../../docs/ENGINES.md#serve-deep-health)
 
 ### port_in_use
 
@@ -2194,6 +2307,16 @@ More: [docs/guides/repair.md#projection-owner-resident](../../docs/guides/repair
 
 More: [docs/guides/memory-boundaries.md#purge](../../docs/guides/memory-boundaries.md#purge)
 
+### purge_lookup_timeout
+
+<a id="purge_lookup_timeout"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A page purge's in-transaction journal lookup hit the publication transaction's statement budget, so the purge failed terminally; nothing was removed, tombstoned or redacted, and later writes to the source move again. | The lookup is deterministic on a large request table, not contention: retrying it as `database_contention` requeued the same purge forever and held every later write to its source behind it. The substring search for the page's claims now runs at preparation under the preparation budget; this code is for the lookups that still run inside the transaction (the slug lookup, the tail and pending re-checks, the locking read). | Do not assume the requested content was erased. If the receipt names the slug index as missing or INVALID, run gbrain repair request-indexes --apply first; then submit the purge again with a new request_id (a retry with the same id returns this failure). Run: gbrain repair request-indexes --json | host_admin | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#purge_lookup_timeout](../../docs/guides/write-refusals.md#purge_lookup_timeout)
+
 ### purged_content
 
 <a id="purged_content"></a>
@@ -2203,6 +2326,16 @@ More: [docs/guides/memory-boundaries.md#purge](../../docs/guides/memory-boundari
 | The content matches a purged fact, take or page in this source, so it was not saved. | A purge leaves a text-free tombstone (the claim fingerprint or the page content hash) so stale files, re-syncs, reverts and re-extraction cannot bring purged content back. | Do not retry the same content. Write it in new words if it is still true, or ask the user to clear the tombstone on the brain host (gbrain pages purges list, then gbrain pages unpurge <slug> for a page). | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/memory-boundaries.md#purge](../../docs/guides/memory-boundaries.md#purge)
+
+### push_unconfirmed
+
+<a id="push_unconfirmed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The commit is durable locally but no push destination confirmed it. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 4 | yes |
+
+More: [docs/guides/shared-checkout-git.md#outcomes](../../docs/guides/shared-checkout-git.md#outcomes)
 
 ### question_not_found
 
@@ -2570,6 +2703,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | gbrain serve --http could not listen: another process already holds that host and port. | A capability this request needs is not configured or not reachable on this brain. | Stop the process on that port, or start the server with another --port and point the harnesses at it. | agent | `gbrain doctor --json` | 1 | no |
 
+### serve_self_exit_suppressed
+
+<a id="serve_self_exit_suppressed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain serve stayed at restart_required past GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS but did not exit, because it had already exited on its own 3 times within the hour; `/health?deep=1` reports self_exit_suppressed. | The opt-in self-exit keeps a durable ledger (serve-self-exit.json under the gbrain home). A serve that reaches restart_required again right after every restart has a cause a restart does not fix, so after 3 self-exits in an hour it keeps serving reads and leaves the decision to a human instead of looping. | Run gbrain sources writer status --json and gbrain doctor --json, report both with the serve log lines, then restart serve by hand. | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/ENGINES.md#serve-unhealthy-exit](../../docs/ENGINES.md#serve-unhealthy-exit)
+
 ### serve_status_only
 
 <a id="serve_status_only"></a>
@@ -2579,6 +2722,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | gbrain serve is in status-only mode: its brain is locked by another server, missing, damaged, or its config is unreadable. | A capability this request needs is not configured or not reachable on this brain. | Call gbrain_status for the cause, the fix and what to tell the user. | agent | `gbrain doctor --json` | 1 | no |
 
 Reasons: `lock_held`, `no_brain`, `config_unreadable`, `missing_brain`, `brain_unopenable`, `repair_failed`, `unavailable`.
+
+### serve_unhealthy_exit
+
+<a id="serve_unhealthy_exit"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain serve exited on its own because its persistence consumer reported restart_required continuously for GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS. | Opt-in (off by default, at least 120 s): a supervisor that restarts on failure, such as the installed gbrain-serve service, then starts a fresh serve without a human. Cleanup is bounded (5 s) because the consumer's stop waits on the stuck work, so the process exits even when it cannot drain. Abandoned claims lapse with the exited process's heartbeat; journaled writes resume on the next owner. | Let the supervisor restart serve; if it exits this way again soon after, run gbrain doctor --json and gbrain sources writer status --json and report both with the exit line. | agent | `gbrain doctor --json` | 69 | no |
+
+More: [docs/ENGINES.md#serve-unhealthy-exit](../../docs/ENGINES.md#serve-unhealthy-exit)
 
 ### setup_harness_unsupported
 
@@ -2793,6 +2946,14 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Reading or writing durable storage failed. | Usually a dropped connection or a failed statement; the same error after a rerun is not transient. `detail: persistence_mode_unknown` (#6482): the persistence_brain singleton is missing, duplicated or carries a non-boolean `enabled`, so gbrain cannot tell whether the brain is managed and refuses every write, sync, connector run and activation step that depends on it rather than route a managed brain through the unmanaged writer; only a well-formed `enabled: false` row selects the unmanaged path. | For persistence_mode_unknown: run gbrain sources writer status --probe --json on the brain host (it reports the malformed state instead of refusing), fix the persistence_brain row it names, then gbrain doctor --json. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### sync_cursor_replaced
+
+<a id="sync_cursor_replaced"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Another sync run of the source replaced the managed-sync cursor before this checkpoint published, so the checkpoint had nothing left to publish. | The replacing run (a --retry-failed rediscovery or a newer sync of the source) covers the source from its own discovery; the superseded checkpoint's receipt is a conflict, no managed-sync failure is recorded for it, and the run that awaited it goes on with the winning cursor. A same-run index lag still reports revision_conflict. | Nothing to repair: let the current sync finish. gbrain sync status --source <id> --json shows the cursor that now covers the source. | agent | `repeat the read that failed` | 1 | no |
 
 ### sync_in_progress
 

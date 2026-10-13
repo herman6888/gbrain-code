@@ -277,7 +277,7 @@ stdout (`--json`):
       "decisions": [
         {
           "id": "search_mode",
-          "question": "Which search mode should this brain use? Per-query search payload cost at 10K queries/month (Haiku 4.5 / Sonnet 4.6 / Opus 4.7): conservative $40 / $120 / $200, balanced $100 / $300 / $500, tokenmax $200 / $600 / $1,000 per month.",
+          "question": "Which search mode should this brain use? Estimated downstream input cost of the retrieved payload at 10K queries/month (Haiku 5.5 / Sonnet 5.5 / Opus 5.5): conservative $4 / $80 / $160, balanced $10 / $200 / $400, tokenmax $20 / $400 / $800 per month.",
           "options": [
             {
               "id": "conservative",
@@ -314,7 +314,7 @@ stdout (`--json`):
             }
           ],
           "default": "conservative",
-          "default_reason": "No expansion-capable API key (Anthropic/OpenAI/Google) — start with a tight result budget; semantic result caching is temporarily disabled."
+          "default_reason": "No chat key (Anthropic/OpenAI/Google) and no ready reranker — conservative keeps a tight 4K budget; balanced's reranker could not run."
         },
         {
           "id": "writeback",
@@ -747,12 +747,20 @@ final document.
 | `coaching` | the setup limits what the user is trying to do | mention it once, at a natural point; follow `fix.next` if the user wants it |
 | `info` | context for this result | use it; no action needed |
 
-**Dedupe and budget.** On stdio, a notice shows once per server process. HTTP
-is stateless, so dedupe is per authenticated client and session, and
-`degraded` and `safety` notices ride every affected call. At most 2
-`coaching` notices per session. Notices that describe one call's result
-(`empty_retrieval`, `unknown_param`, `listing_truncated`, `delta_incomplete`, `facts_unembedded`)
-are never deduped.
+**Dedupe and budget.** On stdio and the CLI, a notice shows once per process,
+except the notices that describe one call's result. HTTP is stateless, so
+dedupe is per authenticated client and session, and `degraded` and `safety`
+notices ride every affected call. At most 2 `coaching` notices per session.
+Notices that describe one call's result (`degraded_recall`, `empty_retrieval`,
+`unknown_param`, `listing_truncated`, `delta_incomplete`, `facts_unembedded`)
+are never deduped on any transport, with one exception: a `degraded_recall`
+whose only stages come from the brain's configuration (`embed_unavailable` on
+a keyless brain, which degrades every search the same way) shows once per
+stdio or CLI session. A transient degradation (`rerank_failed`,
+`embed_timeout`, a failed keyword or title arm, or any other stage) shows on
+every affected call, so a failure, a recovery and the same failure again show
+the notice twice. A notice missing from a later call never means that call
+was healthy: `_meta.retrieval.degraded` records every call's stages.
 
 **Degraded retry hint.** A `degraded` notice whose fix has `actor: provider`
 renders `next: wait`: repeat the same call (the fix carries it) after the delay
@@ -786,7 +794,7 @@ instead.
 | `behavior_changes` (safety) | the first tool result per brain | the first tool result per authenticated client (names no chain entries or providers) | once, on stderr, on the first command; `gbrain doctor --only behavior_changes` reads it again |
 | `chat_fallback_hop` (safety) | the first fallback hop of the server process | never | the first hop of the command |
 | `backup_coverage` | once per process | never | the CLI startup rail |
-| `degraded_recall`, `empty_retrieval`, `source_binding_narrowed` and the other per-call notices | every affected call | every affected call (redacted) | the command's own notices |
+| `degraded_recall`, `empty_retrieval`, `source_binding_narrowed` and the other per-call notices | every affected call (a keyless brain's configuration-only `degraded_recall`: once per session) | every affected call (redacted) | the command's own notices |
 
 HTTP gets no onboarding coaching because the counts are brain-wide (they cross
 source-scoped grants) and every remedy runs on the brain host, which a remote

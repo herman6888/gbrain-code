@@ -266,6 +266,9 @@ CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_replace(slug, '^.*/', '')));
+-- v240: the entity name lookups (exact title, alias title check, slug suffix) as index scans.
+CREATE INDEX IF NOT EXISTS idx_pages_source_title_lower ON pages (source_id, lower(title));
+CREATE INDEX IF NOT EXISTS idx_pages_slug_trgm ON pages USING GIN (slug gin_trgm_ops);
 -- v0.13.1 #170: avoids 14.6s seqscan on large brains when listing pages newest-first.
 CREATE INDEX IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC);
 -- v0.18.0: source-scoped scans (per /plan-eng-review Section 4).
@@ -1024,6 +1027,9 @@ CREATE TABLE IF NOT EXISTS extract_atoms_transcript_state (
   fail_count   INTEGER     NOT NULL DEFAULT 0,
   tombstoned   BOOLEAN     NOT NULL DEFAULT FALSE,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #6503 (migration v240): the max_input_chars cap a cut transcript was read
+  -- under; discovery skips it until the cap rises. NULL when not partial.
+  partial_input_chars INTEGER,
   PRIMARY KEY (source_id, file_path, content_hash)
 );
 CREATE INDEX IF NOT EXISTS extract_atoms_transcript_state_tombstoned_idx
@@ -1921,6 +1927,9 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
   fail_count INTEGER NOT NULL DEFAULT 0 CHECK (fail_count >= 0),
   tombstoned BOOLEAN NOT NULL DEFAULT false,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #6503 (migration v240): the max_input_chars cap a cut page was read under;
+  -- discovery skips it until the cap rises. NULL when not partial.
+  partial_input_chars INTEGER,
   PRIMARY KEY (source_incarnation, page_id, content_hash)
 );
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx

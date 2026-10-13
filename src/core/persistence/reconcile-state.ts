@@ -1,16 +1,18 @@
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { basename, join, relative } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join, relative } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { loadConfig, loadConfigWithEngine } from '../config.ts';
 import { loadOperatorLiterals } from '../content-sanity-literals.ts';
-import { parseMarkdown, resolveSourceLocalFilePath } from '../markdown.ts';
+import { parseMarkdown } from '../markdown.ts';
 import { parseDataFrontmatter } from '../data-frontmatter.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
+import { findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
+import { sharedOriginExit } from './sync-origin.ts';
+export { fileClaimCandidatesSql } from './file-claims.ts';
 import { localHostId } from './identity.ts';
 import { isDatabaseOnlyPage, slugDerivedOrigin } from './unbound-pages.ts';
 import { isUnboundSourcePage } from './unbound-source.ts';
@@ -67,67 +69,16 @@ export async function reconcilePolicyDigest(engine: BrainEngine, sourceId: strin
 export function staleReconcile(what: string): never {
   throw new OperationError('source_changed', `Reconciliation preview is stale: ${what}.`, 'Generate a fresh preview; submit a corrected intent with a new request ID.');
 }
-function recordedReconcilePath(root: string, page: { slug: string; source_path?: string | null; source_uri?: string | null },
-  mode: 'git-root' | 'source-root'): string | null {
-  const path = resolveSourceLocalFilePath(root, page.source_path, page.slug, mode);
-  if (path) return path;
-  const recorded = recordedPathFromFileUri(page.source_uri, root);
-  return recorded ? join(root, recorded) : null;
-}
 /**
- * The paged census query of {@link assertSoleFileClaim}: $1 source, $2 the page itself, $3/$4 the id
- * window, $5 the file name, $6 its name after the last backslash (POSIX) or the name (Windows), $7 the
- * file-URI names. Exported so the Postgres plan test runs the exact text.
+ * Refuses when another live page of the source records the reconciled file as its own
+ * (`findLiveFileClaimants`, file-claims.ts: the paged same-name census, realpath deciding).
+ * #6517: the refusal names the exit, a soft delete of the page that should not own the file.
  */
-export function fileClaimCandidatesSql(platform: NodeJS.Platform = process.platform): string {
-  const pathMatch = platform === 'win32'
-    ? `source_path IS NOT NULL AND regexp_replace(replace(btrim(source_path), chr(92), '/'), '^.*/', '')=$6`
-    : `source_path IS NOT NULL AND regexp_replace(replace(btrim(source_path), chr(92), '/'), '^.*/', '')=$6 AND regexp_replace(btrim(source_path),'^.*/','')=$5`;
-  return `SELECT id,slug,source_path,source_uri FROM pages WHERE source_id=$1 AND id<>$2 AND id>$3 AND id<=$4 AND (
-    (${pathMatch}) OR (source_uri LIKE 'file:%' AND regexp_replace(source_uri, '^.*/', '')=ANY($7::text[])))
-    ORDER BY id LIMIT 100`;
-}
-/**
- * Refuses when another page of the source records the reconciled file as its own.
- *
- * #6222/#6254: every page whose recorded path or file URI shares the file's
- * name is a candidate, and realpath decides each one. The census is paged
- * (100 rows per batch, keyset on id) below the source's highest page id read
- * once, so a common name like `2015-09.md` no longer refuses, and concurrent
- * imports cannot make it endless; preparation re-reads this state inside the
- * coordinated write. Both name predicates match the expression indexes of
- * migration v219 (`pages_source_path_name_idx`, `pages_file_uri_name_idx`):
- * the path index normalizes backslashes, so on POSIX the slash-only basename
- * is rechecked on the rows it finds.
- */
-async function assertSoleFileClaim(engine: BrainEngine, target: { sourceId: string; slug: string; pageId: number; root: string;
-  mode: 'git-root' | 'source-root'; path: string; canonicalPath: string; recordedUri: string | null }): Promise<void> {
-  const { sourceId, slug, root, mode, canonicalPath } = target;
-  const fileName = basename(target.path), uriName = pathToFileURL(target.path).pathname.split('/').pop()!;
-  const indexedName = fileName.replace(/^.*\\/s, '');
-  const uriNames = [...new Set([fileName, uriName, ...(target.recordedUri ? [target.recordedUri.replace(/^.*\//s, '')] : [])])];
-  const [ceiling] = await engine.executeRaw<{ id: number | string | null }>('SELECT max(id) AS id FROM pages WHERE source_id=$1', [sourceId]);
-  const maxId = Number(ceiling?.id ?? 0);
-  for (let afterId = 0; ;) {
-    const candidates = await engine.executeRaw<{ id: number | string; slug: string; source_path: string | null; source_uri: string | null }>(
-      fileClaimCandidatesSql(),
-      [sourceId, target.pageId, afterId, maxId, fileName, process.platform === 'win32' ? fileName : indexedName, uriNames]);
-    for (const candidate of candidates) {
-      const candidatePath = recordedReconcilePath(root, candidate, mode);
-      if (!candidatePath || !isWriteTargetContained(candidatePath, root)) continue;
-      let canonicalCandidate: string;
-      try { canonicalCandidate = realpathSync(candidatePath); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw opError('source_changed', 'A candidate canonical file origin could not be verified.',
-          `Nothing changed. Page ${candidate.slug} in '${sourceId}' records a file that could not be resolved; check that the source checkout is readable, then preview ${slug} again.`);
-      }
-      if (canonicalCandidate === canonicalPath) throw opError('source_changed', 'Several pages claim the recorded canonical file.',
-        `Nothing changed. Pages ${slug} and ${candidate.slug} in '${sourceId}' both record the same file, so reconcile cannot tell which owns it; decide with the user which page owns the file before reconciling either.`);
-    }
-    if (candidates.length < 100) return;
-    afterId = Number(candidates[candidates.length - 1]!.id);
-  }
+async function assertSoleFileClaim(engine: BrainEngine, target: FileClaimTarget): Promise<void> {
+  const [claimant] = await findLiveFileClaimants(engine, target);
+  if (claimant) throw opError('source_changed', 'Several pages claim the recorded canonical file.',
+    `Nothing changed. Pages ${target.slug} and ${claimant.slug} in '${target.sourceId}' both record the same file, so reconcile cannot tell which owns it; decide with the user which page owns the file before reconciling either. `
+    + sharedOriginExit(target.sourceId, [target.slug, claimant.slug]) + ' Then preview again.');
 }
 /**
  * #6394: `adoptSlugPath` lets a live page with no recorded origin and no database-only marker reconcile against the file

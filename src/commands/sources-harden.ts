@@ -179,6 +179,7 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
     case 'up_to_date': console.log(`up to date (${branch})`); break;
     case 'advanced': console.log(`advanced ${outcome.from.slice(0, 7)}→${outcome.to.slice(0, 7)} (${branch})`); break;
     case 'skipped_dirty': console.log(`skipped — working tree dirty (${branch})`); break;
+    case 'skipped_busy': console.log(`skipped — another writer holds the commit lock (${branch})`); break;
     case 'conflict_aborted':
       console.error(`[gbrain] ${outcome.detail}`);
       process.exit(FAILED_EXIT_CODE);

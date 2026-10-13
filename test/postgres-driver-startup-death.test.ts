@@ -54,19 +54,21 @@ const fatalTerminated = frame('E', Buffer.concat([
   Buffer.from('M'), cstr('terminating connection due to administrator command'), Buffer.from([0]),
 ]));
 
+type Script = { kill?: boolean; killAt?: number };
 /**
  * Answers the extended protocol with empty results (ParseComplete, BindComplete, NoData, CommandComplete, ReadyForQuery)
- * and a simple Query with CommandComplete. `kill` ends the connection with FATAL 57P01 at its first statement.
+ * and a simple Query with CommandComplete. `kill` ends the connection with FATAL 57P01 at its first statement, `killAt`
+ * at its n-th (1-based).
  */
-function serve(socket: Socket, buffered: Buffer, mode: { kill?: boolean }, onStatement: () => void): Buffer {
+function serve(socket: Socket, buffered: Buffer, mode: Script, onStatement: () => number): Buffer {
   let rest: Buffer = buffered;
   for (;;) {
     if (rest.length < 5) return rest;
     const type = String.fromCharCode(rest[0]!), length = rest.readInt32BE(1);
     if (rest.length < length + 1) return rest;
     rest = rest.subarray(length + 1);
-    if (type === 'P' || type === 'Q') onStatement();
-    if (mode.kill) { socket.write(fatalTerminated); socket.end(); return Buffer.alloc(0); }
+    const statement = type === 'P' || type === 'Q' ? onStatement() : 0;
+    if (mode.kill || (statement > 0 && statement === mode.killAt)) { socket.write(fatalTerminated); socket.end(); return Buffer.alloc(0); }
     if (type === 'P') socket.write(frame('1'));
     else if (type === 'B') socket.write(frame('2'));
     else if (type === 'D') socket.write(frame('n'));
@@ -81,7 +83,7 @@ let server: Server | undefined;
 afterEach(() => new Promise<void>(resolve => { server ? server.close(() => resolve()) : resolve(); server = undefined; }));
 
 /** A scripted server; `script(n)` chooses how the n-th connection (1-based) behaves. */
-async function listen(script: (connection: number) => { kill?: boolean }): Promise<{ port: number; connections: { statements: number }[] }> {
+async function listen(script: (connection: number) => Script): Promise<{ port: number; connections: { statements: number }[] }> {
   const connections: { statements: number }[] = [];
   server = createServer(socket => {
     const connection = { statements: 0 };
@@ -97,18 +99,18 @@ async function listen(script: (connection: number) => { kill?: boolean }): Promi
         buffered = buffered.subarray(length); started = true;
         socket.write(startupReply);
       }
-      buffered = serve(socket, buffered, mode, () => { connection.statements++; });
+      buffered = serve(socket, buffered, mode, () => ++connection.statements);
     });
     socket.on('error', () => undefined);
   });
   await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', () => resolve()));
   return { port: (server.address() as { port: number }).port, connections };
 }
-function client(port: number): { sql: ReturnType<typeof postgres>; socket: () => ScriptedSocket } {
+function client(port: number, extra: Record<string, unknown> = {}): { sql: ReturnType<typeof postgres>; socket: () => ScriptedSocket } {
   let current: ScriptedSocket | undefined;
   // A socket option hands the driver a connecting socket (the driver then skips its own connect step); the option is not in the public types.
   const options = { host: '127.0.0.1', port, user: 'u', password: 'p', database: 'd', ssl: false, max: 1, prepare: false, fetch_types: true, connect_timeout: 2, onnotice() {},
-    socket: () => (current = new ScriptedSocket()).connect(port, '127.0.0.1') };
+    socket: () => (current = new ScriptedSocket()).connect(port, '127.0.0.1'), ...extra };
   const sql = postgres(options as unknown as Parameters<typeof postgres>[0]);
   return { sql, socket: () => current! };
 }
@@ -153,5 +155,23 @@ test('forced probe: a close delivered while a statement\'s bytes wait for the wr
     expect([...await sql.unsafe('select 3')]).toEqual([]);
     expect(connections.length).toBe(2);
     expect(connections[1]!.statements).toBeGreaterThanOrEqual(2);
+  } finally { await sql.end({ timeout: 1 }); }
+}, 15_000);
+
+test('forced probe (#6543): a backend terminated under a running statement does not hand its 57P01 to the first statement of the replacement connection', async () => {
+  // The serve wedge's `recovery_scan reason=57P01`: a FATAL that arrived before the close stayed in the connection's
+  // state, and the reconnect's startup ReadyForQuery delivered it to the statement the pool had queued for the slot.
+  // `max_pipeline: 0` keeps that statement in the pool's queue, so it is written only on the replacement connection.
+  const { port, connections } = await listen(connection => (connection === 1 ? { killAt: 2 } : {}));
+  const { sql } = client(port, { fetch_types: false, max_pipeline: 0 });
+  const settled = (query: PromiseLike<unknown>) => Promise.resolve(query).then(rows => ({ rows: [...rows as unknown[]] }), (error: { code?: string }) => ({ code: error.code }));
+  try {
+    expect([...await sql.unsafe('select 1')]).toEqual([]);
+    const head = settled(sql.unsafe('select 2'));
+    const queued = settled(sql.unsafe('select 3'));
+    expect(await head).toEqual({ code: 'CONNECTION_CLOSED' });
+    expect(await queued).toEqual({ rows: [] });
+    expect(connections.length).toBe(2);
+    expect(connections[1]!.statements).toBe(1);
   } finally { await sql.end({ timeout: 1 }); }
 }, 15_000);

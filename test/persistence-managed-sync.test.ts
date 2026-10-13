@@ -254,7 +254,7 @@ test('repeated slices reuse one manifest and hold an intervening page identity c
     const executeRaw = engine.executeRaw;
     let manifestReads = 0;
     engine.executeRaw = async function (this: BrainEngine, sql: string, params?: unknown[]) {
-      if (params?.[0] === f.id && sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages')) manifestReads++;
+      if (params?.[0] === f.id && sql.includes('SELECT id,slug,source_path,knowledge_revision,deleted_at FROM pages')) manifestReads++;
       return executeRaw.call(this, sql, params);
     } as BrainEngine['executeRaw'];
     try {

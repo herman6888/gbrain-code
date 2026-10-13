@@ -690,7 +690,18 @@ Retry-After: 5
   (`checked_out`, `waiters`, `inflight_oldest_ms`, `stuck_discards`, …) and
   answers 503 when the probe times out or a statement is past the pool's
   in-flight budget ([pool diagnostics](../ENGINES.md#pg-connection-stuck)). A
-  two-minute interval is fine; one deep probe runs at a time.
+  two-minute interval is fine; one deep probe runs at a time. Every 503 names a
+  stable `code` (`persistence_restart_required`, `pool_inflight_over_budget`,
+  `deep_health_probe_failed`) with `fix` and `docs`, and both answers carry the
+  `transport` block (pooler mode, `max_pipeline`, the server
+  `statement_timeout`); the probe only reports
+  ([serve deep health](../ENGINES.md#serve-deep-health)).
+- To have serve restart itself when it stays unhealthy, set
+  `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS=<n>` (at least `120`; in `~/.gbrain/env`
+  for the service `gbrain mcp expose` installs). After `n` continuous seconds
+  of `persistence_restart_required` it exits `69` (`serve_unhealthy_exit`,
+  cleanup bounded at 5 s; at most 3 self-exits per hour) and the supervisor starts a fresh one
+  ([unhealthy exit](../ENGINES.md#serve-unhealthy-exit)).
 - A second `gbrain serve --http` on a port another server already holds exits
   with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
   path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).

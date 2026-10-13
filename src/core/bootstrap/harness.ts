@@ -547,6 +547,7 @@ export function buildConsentBlock(p: {
   wireOpencode: boolean;
   hooks: boolean;
   capture: boolean;
+  codexCapture?: boolean; // Codex SessionEnd capture hook (hooks.json + its config.toml trust entry)
   hookScope: string;
   name: string;
   userSettingsPath: string;
@@ -599,6 +600,7 @@ export function buildConsentBlock(p: {
       `  ${n++}. Codex (user-global): write [mcp_servers.${p.name}] with the bearer token INLINE into ` +
         `${p.codexConfig} (0600) — framework-spawned codex inherits no shell env, so an env-var token would not reach it.`,
     );
+    if (p.codexCapture) lines.push(`  ${n++}. Codex session-transcript capture: a SessionEnd hook (hooks.json + its trust entry in ${p.codexConfig}) secret-scans and captures every Codex session's transcript into the brain's corpus. Opt out with the no-capture flag.`);
   }
   if (p.wireOpencode) {
     lines.push(
@@ -624,8 +626,8 @@ export function buildConsentBlock(p: {
     ...(p.wireOpencode ? ['opencode'] : []),
   ];
   const hosts = `EVERY ${hostNames.join(' and ')} session`;
-  const hookLine = !p.wireClaude || !p.hooks
-    ? 'No hooks are wired by this invocation.'
+  const hookLine = !(p.wireClaude && p.hooks)
+    ? (p.codexCapture ? 'One hook is wired: Codex SessionEnd transcript capture.' : 'No hooks are wired by this invocation.')
     : p.capture
       ? 'Hooks run in every Claude Code session (context injection + transcript capture); auto-commit/push lanes stay inert outside gbrain agent workspaces.'
       : 'Hooks run in every Claude Code session (context injection only — capture is OFF); auto-commit/push lanes stay inert outside gbrain agent workspaces.';
@@ -939,11 +941,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   // serve, but hooks always talk to the LOCAL brain (gbrain bin + local
   // config) — wiring them here would split-brain the box. MCP only.
   const registrarMode = flags.url !== undefined && !isLoopbackHostname(hostname);
-  if (registrarMode && !flags.noHooks && wireClaude) {
-    d.log(
-      'registrar mode (non-loopback url): hooks are NOT wired — they would talk to the LOCAL brain, ' +
-        'not the registered remote serve. MCP registration only.',
-    );
+  if (registrarMode && !flags.noHooks && (wireClaude || wireCodex)) {
+    d.log('registrar mode (non-loopback url): hooks are NOT wired — they would talk to the LOCAL brain, not the registered remote serve. MCP registration only.');
   }
   const health = await probeServeHealth(url, d.fetchFn);
   if (!health.ok) {
@@ -979,7 +978,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     : [];
 
   // 3. Consent (connect --install shape; never the interview/A8 ledger).
-  const wireHooks = wireClaude && !flags.noHooks && !registrarMode;
+  const wireHooks = wireClaude && !flags.noHooks && !registrarMode; // Codex capture below: same consent, never registrar
+  const wireCodexCapture = wireCodex && !flags.noHooks && !flags.noCapture && !registrarMode;
   const priorState = readHarnessReceiptState(d.gbrainHome);
   const prior = priorState.state === 'ok' ? priorState.receipt : null;
   const skillsPolicy = flags.skills ?? prior?.skills_policy ?? (priorState.state === 'absent' ? 'follow' : 'memory-only');
@@ -995,6 +995,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     wireOpencode,
     hooks: wireHooks,
     capture: !flags.noCapture,
+    codexCapture: wireCodexCapture,
     hookScope,
     name: flags.name,
     userSettingsPath: d.userSettingsPath,
@@ -1558,7 +1559,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       // (codex-hooks.ts) — idempotent, so a workspace-lane bootstrap and this
       // harness lane converge on the same entry. No GBRAIN_SOURCE in the
       // command (machine-global file; session-end resolves from the payload).
-      if (!flags.noHooks) {
+      if (wireCodexCapture) {
         const hooksBin = flags.gbrainBin ?? d.gbrainBin;
         if (!hooksBin) {
           d.logError('codex hooks skipped: cannot resolve an absolute gbrain binary path — pass --gbrain-bin <abs path>.');

@@ -56,7 +56,7 @@ async function fixture(e: BrainEngine, count: number) {
 }
 const imports = (e: BrainEngine, source: string) => e.executeRaw<{ slug: string; state: string; blocked_reason: string | null; error_code: string | null; preparation_attempts: number; error_message: string | null }>(
   `SELECT slug,state,blocked_reason,error_code,preparation_attempts,error_message FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_import' ORDER BY sequence`, [source]);
-const ORIGIN_CHECK_SQL = 'SELECT id,slug,source_path FROM pages WHERE source_id=$1 AND ';
+const ORIGIN_CHECK_SQL = 'SELECT id,slug,source_path,deleted_at FROM pages WHERE source_id=$1 AND ';
 
 /**
  * Holds the origin check of `path` open until `onHold(attempt)` resolves, then lets the statement run. The statement

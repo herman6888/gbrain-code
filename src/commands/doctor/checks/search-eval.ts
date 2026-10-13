@@ -27,7 +27,7 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
     const overrides = await engine.listConfigKeys('search.');
     // Exclude search.mode itself + the upgrade-notice state key from the
     // override roster — they aren't knobs.
-    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown');
+    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown' && k !== 'search.mode_source');
 
     const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
     const loaded = await loadSearchModeConfig(engine);

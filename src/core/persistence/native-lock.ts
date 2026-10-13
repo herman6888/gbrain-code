@@ -1,9 +1,10 @@
 /** Stable OS locks for cooperating writers on one owner host. No TTL takeover. */
 import { mkdir } from 'node:fs/promises';
+import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { constants as osConstants } from 'node:os';
-import { family, GLIBC, MUSL } from 'detect-libc';
+import { familySync, GLIBC, MUSL } from 'detect-libc';
 
 export interface NativeExportPublisher {
   beginExport(absoluteDestination: string): object;
@@ -66,6 +67,12 @@ export interface NativeLockHandle {
   release(): Promise<void>;
 }
 
+/** #6530: a lock taken by {@link acquireNativeLockSync}; release is synchronous and idempotent. */
+export interface NativeLockSyncHandle {
+  readonly released: boolean;
+  release(): void;
+}
+
 export interface NativeLockOptions {
   /** A zero budget tries once. Defaults to five seconds. */
   timeoutMs?: number;
@@ -75,16 +82,22 @@ export interface NativeLockOptions {
 }
 
 let bindingPromise: Promise<NativeBinding> | undefined;
+let bindingLoaded: NativeBinding | undefined;
 const windowsSocketRemovers = new WeakMap<NativeLockHandle, (path: string) => boolean>();
 
 async function loadBinding(): Promise<NativeBinding> {
+  return loadBindingSync();
+}
+
+function loadBindingSync(): NativeBinding {
+  if (bindingLoaded) return bindingLoaded;
   const arch = process.arch;
   if (arch !== 'x64' && arch !== 'arm64') throw new NativeLockUnavailableError(`Native writer locking does not support ${process.platform}/${arch}`);
   let binding: NativeBinding;
   let target: string;
   try {
     if (process.platform === 'linux') {
-      const libc = await family();
+      const libc = familySync();
       if (libc !== GLIBC && libc !== MUSL) throw new NativeLockUnavailableError('Cannot identify the Linux C runtime for writer locking');
       target = `linux-${arch}-${libc}`;
       // Literal requires are intentional: Bun embeds each .node asset in its
@@ -112,6 +125,7 @@ async function loadBinding(): Promise<NativeBinding> {
     if (process.platform === 'win32' && (typeof binding.openIpcMutex !== 'function' || typeof binding.removeWindowsUnixSocket !== 'function')) {
       throw new NativeLockUnavailableError('Installed native writer lock addon lacks Windows IPC support');
     }
+    bindingLoaded = binding;
     return binding;
   } catch (cause) {
     if (cause instanceof NativeLockUnavailableError) throw cause;
@@ -185,6 +199,48 @@ export async function acquireNativeLock(path: string, options: NativeLockOptions
     }
   } catch (error) {
     await release();
+    throw error;
+  }
+}
+
+/**
+ * #6530: the same OS lock for synchronous callers (git write paths that run
+ * inside sync code). Blocks the thread between attempts, so callers pass a
+ * short budget.
+ */
+export function acquireNativeLockSync(path: string, options: { timeoutMs?: number; pollMs?: number } = {}): NativeLockSyncHandle | null {
+  if (!isAbsolute(path) || path.includes('\0')) throw new TypeError('Native lock path must be absolute and contain no NUL');
+  const timeoutMs = budget(options.timeoutMs, 5000, 0);
+  const pollMs = budget(options.pollMs, 25, 1);
+  const binding = loadBindingSync();
+  let handle: object;
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    handle = binding.openLock(path);
+  } catch (cause) {
+    throw new NativeLockUnavailableError('Cannot open the stable writer lock file', cause, 'open');
+  }
+  let released = false;
+  const releaseSync = () => {
+    if (released) return;
+    released = true;
+    try { binding.close(handle); }
+    catch (cause) { throw new NativeLockUnavailableError('Cannot close the writer lock handle; this host must stop publishing', cause); }
+  };
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = performance.now() + timeoutMs;
+  try {
+    for (;;) {
+      let acquired: boolean;
+      try { acquired = binding.tryLock(handle); }
+      catch (cause) { throw new NativeLockUnavailableError('The OS could not acquire the writer lock', cause); }
+      if (acquired) return { get released() { return released; }, release: releaseSync };
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) { releaseSync(); return null; }
+      Atomics.wait(sleeper, 0, 0, Math.min(pollMs, remaining));
+    }
+  } catch (error) {
+    releaseSync();
     throw error;
   }
 }

@@ -78,17 +78,42 @@ export function readPersistenceCliRegistration(brainId: string): PersistenceIpcR
 
 export type LocalDelegationResult = { handled: false } | { handled: true; result: unknown };
 
+/** How long a caller waits for a serve that already holds the datastore to bind its owner socket. */
+export const OWNER_STARTUP_WAIT_MS = 3_000;
+
+/**
+ * The resident owner's capabilities. A `gbrain serve` takes the datastore lock before it binds its persistence
+ * socket (the MCP handshake sits in between), so a call that lands in that window finds a serve holder and no
+ * socket. That is an owner starting, not an owner gone: the probe is repeated for a bounded wait while the same
+ * serve still holds the lock; a holder that is not a serve, a released lock or any answer other than "no socket"
+ * ends the wait at once. Never falls through to the engine path.
+ */
+async function residentOwnerCapabilities(socketPath: string, databasePath: string, holder: ReturnType<typeof inspectLockHolder>,
+  startupWaitMs = OWNER_STARTUP_WAIT_MS): Promise<PersistenceIpcCapabilities> {
+  const deadline = Date.now() + startupWaitMs;
+  for (;;) {
+    try { return await requestPersistenceCapabilities(socketPath); }
+    catch (error) {
+      const starting = error instanceof PersistenceIpcTransportError && !error.sent && holder.serve === true && Date.now() < deadline;
+      if (!starting) throw error;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const again = inspectLockHolder(databasePath);
+      if (!again.held || again.serve !== true || again.pid !== holder.pid) throw error;
+    }
+  }
+}
+
 /** Administration uses a separate CLI-only envelope and never manufactures a new credential. */
 export async function maybeDelegateLocalAdministration(
   operation: PersistenceAdminOperation, params: Record<string, unknown>, config: GBrainConfig,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; startupWaitMs?: number } = {},
 ): Promise<LocalDelegationResult> {
   if (config.engine !== 'pglite' || !config.database_path || config.database_url) return { handled: false };
   const holder = inspectLockHolder(config.database_path);
   if (!holder.held) return { handled: false };
   const socketPath = persistenceSocketPathForConfig(config);
   if (!socketPath) throw noDiscoveryPath('The PGLite owner has no persistence discovery path.', holder);
-  const capability = await requestPersistenceCapabilities(socketPath);
+  const capability = await residentOwnerCapabilities(socketPath, config.database_path, holder, options.startupWaitMs);
   if (!capability.administration?.includes(operation)) throw new OperationError('owner_unavailable',
     'The running owner does not support this local administration command.', 'Upgrade and restart the owner before administering this brain.');
   const registration = readPersistenceCliRegistration(capability.brain_id);
@@ -115,7 +140,7 @@ export async function maybeDelegateLocalOperation(
   operation: string,
   params: Record<string, unknown>,
   hostConfig: GBrainConfig | null,
-  options: { brain?: string | null; source?: string | null; cwd?: string; timeoutMs?: number; writeWaitMs?: number } = {},
+  options: { brain?: string | null; source?: string | null; cwd?: string; timeoutMs?: number; writeWaitMs?: number; startupWaitMs?: number } = {},
 ): Promise<LocalDelegationResult> {
   if (!isPersistenceIpcOperation(operation)) return { handled: false };
   if (isPersistenceIpcMutation(operation)) {
@@ -139,7 +164,7 @@ export async function maybeDelegateLocalOperation(
   if (sourceInParams) delete wireParams.source;
   delete wireParams.json;
   let capability: PersistenceIpcCapabilities;
-  try { capability = await requestPersistenceCapabilities(socketPath); }
+  try { capability = await residentOwnerCapabilities(socketPath, config.database_path, holder, options.startupWaitMs); }
   catch (error) {
     // A holder that is not a serve and answers no owner socket is another
     // command, such as a concurrent CLI call: the engine path waits for its lock.

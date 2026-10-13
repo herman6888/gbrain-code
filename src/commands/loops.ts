@@ -27,6 +27,25 @@ import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { ALL_SOURCES } from '../core/source-id.ts';
 import { exitCliError, usageError, writeCliError } from '../cli/cli-error.ts';
 import { opError } from '../core/ops/contract.ts';
+import { LOOPS_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+
+export { LOOPS_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
+
+export function printUsage(): void {
+  process.stdout.write(
+    [
+      'gbrain loops — inspect and manage open loops',
+      '  list  [--status open|done|dropped|stale] [--type <loop_type>] [--source <id>] [--json]',
+      '  show  <id> [--json]',
+      '  done  <id> [--note <text>]   mark handled',
+      '  drop  <id> [--note <text>]   not going to do it',
+      '  mute  sender <email> | thread <thread-id>   [--source <id>]',
+      '  unmute sender <email> | thread <thread-id>  [--source <id>]   undo a mute',
+      '',
+      'The ranked digest lives at: gbrain waiting',
+    ].join('\n') + '\n',
+  );
+}
 
 function sourceFlag(args: string[]): string | undefined {
   const i = args.indexOf('--source');
@@ -189,23 +208,13 @@ async function showLoop(
 }
 
 export async function runLoops(engine: BrainEngine, args: string[]): Promise<void> {
-  const [sub, ...rest] = args;
+  const [first, ...rest] = args;
+  const sub = first as (typeof LOOPS_SUBCOMMANDS)[number] | undefined;
   const json = rest.includes('--json') || args.includes('--json');
 
-  if (!sub || sub === '--help' || sub === '-h' || sub === 'help') {
-    process.stdout.write(
-      [
-        'gbrain loops — inspect and manage open loops',
-        '  list  [--status open|done|dropped|stale] [--type <loop_type>] [--source <id>] [--json]',
-        '  show  <id> [--json]',
-        '  done  <id> [--note <text>]   mark handled',
-        '  drop  <id> [--note <text>]   not going to do it',
-        '  mute  sender <email> | thread <thread-id>   [--source <id>]',
-        '  unmute sender <email> | thread <thread-id>  [--source <id>]   undo a mute',
-        '',
-        'The ranked digest lives at: gbrain waiting',
-      ].join('\n') + '\n',
-    );
+  // cli.ts answers help before dispatch (#6114 router, #6521: `loops show --help` used to exit 2 "needs a loop id").
+  if (!sub || subcommandHelpRequested(args, ROUTERS.loops)) {
+    printUsage();
     return;
   }
 

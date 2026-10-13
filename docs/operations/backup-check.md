@@ -135,7 +135,7 @@ export is not used, and the remote's host key must already be in `known_hosts`.
 | `verification.state` | Meaning | What to do |
 |---|---|---|
 | `verified` | The remote branch HEAD matches a clean local HEAD. | Nothing. |
-| `missing_ref` | The remote answered but has no such branch. | `git push -u origin <branch>`, then `gbrain backup check`. |
+| `missing_ref` | The remote answered but has no such branch. | `git push -u origin <branch>` <!-- gbrain-allow-shared-tree-git: one-time first push that creates the remote branch and sets its upstream -->, then `gbrain backup check`. |
 | `mismatch` | The remote HEAD differs from the local HEAD, or the tree changed during the probe. | Push or pull until they match, then `gbrain backup check`. |
 | <a id="remote-unavailable"></a>`unavailable` | `git ls-remote` failed: no network, authentication refused, or an unknown host key. `cause` says which kind: `timeout` (the remote did not answer within its full two-second slot) or `exit` (git exited with an error). The probe passes only `HOME`, `PATH`, `XDG_CONFIG_HOME`, `SSH_AUTH_SOCK`, `GIT_CONFIG_GLOBAL`, `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`, `NO_PROXY`/`no_proxy` (and `USERPROFILE`, `APPDATA`, `SystemRoot` on Windows). | Run `git -C <root> ls-remote origin` in the same shell; credentials must come from your Git config, a credential helper, `~/.ssh/config` or the SSH agent, not from a prompt or `GIT_SSH_COMMAND`. |
 | `budget_exhausted` | The sweep's eight-probe or eight-second budget ran out first, or this remote would not have received its full two-second slot. | Run `gbrain backup check` again. |
@@ -189,7 +189,7 @@ source id. Full per-asset detail (which repo, which fix) is local-only:
 - Workspace with no repo: `gbrain bootstrap repo` (creates a private repo,
   verifies privacy, pushes).
 - A source repo with no remote:
-  `git remote add origin git@github.com:you/your-brain-repo.git && git push -u origin main`,
+  `git remote add origin git@github.com:you/your-brain-repo.git && git push -u origin main`, <!-- gbrain-allow-shared-tree-git: one-time first push that creates the remote branch and sets its upstream -->
   then `gbrain sources harden <source-id>` for auto-push durability.
 - Unpushed workspace work: for a managed canonical worktree, inspect the managed writer with `gbrain sources writer status --probe --json` (legacy bulk push is refused there); otherwise `gbrain sources push --path <workspace>`.
   On a managed worktree the persistence coordinator commits and pushes as Git effects; the probe lists `effects`, `blocking_effects` and `recent_failures`, and a parked push is retried with `gbrain sources writer retry-effects <source> --request-id <id>`. gbrain's own ownership stamp (`.gbrain-owner.json`) never counts as uncommitted work, the session hooks never start `sources push` there, and a root with no `origin` remote reads `no_remote` (add one: `git remote add origin <url>`) even after a recorded push refusal. A recorded push failure stops warning once the tree matches its origin branch with nothing uncommitted.

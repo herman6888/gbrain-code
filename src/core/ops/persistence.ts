@@ -112,11 +112,13 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
     processingOptions: intent?.processingOptions, syncOptions: intent?.syncOptions, repoPath: intent?.repoPath }) : null;
   // #5929: a trusted local reader learns when the owner that ran the attempt is on another build.
   const mismatch = ctx.remote === false ? (await import('../persistence/publication-failure.ts')).ownerBuildMismatch(row.error_detail, (await import('../../version.ts')).VERSION) : null;
+  const withdrawn = (await import('../facts/withdrawal.ts')).withdrawnFromDetail(row.error_detail);
   return {
     ...publicWriteReceipt(receiptFor(row, facts)),
     operation: row.operation, source_id: row.source_id, slug: row.slug,
     ...(mismatch ? { owner_build: mismatch } : {}),
     ...(isWriteErrorCode(row.error_code) ? { write_error: row.error_code, write_error_message: writeFailureDiagnostic(row.error_code, row.error_message).message } : {}),
+    ...(withdrawn ? { withdrawn } : {}),
     ...(checkpoint ? { detail: checkpoint.detail, suggestion: checkpoint.suggestion, docs: checkpoint.docs } : {}),
     effects: (await publicEffectsForRequest(ctx.engine, row.id)).map(effect => {
       const hint = effect.reason ? receiptDeliveredHint({ error_code: effect.reason, source_id: row.source_id, slug: row.slug }) : null;
@@ -138,7 +140,7 @@ export const persistenceOperations: Operation[] = [
     name: 'get_write_request',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'Read your write\'s receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.',
+    description: 'Your write\'s receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.',
     params: { request_id: requestParam },
     scope: 'write', mutating: false, area: 'pages',
     cliHints: { name: 'write-request', positional: ['request_id'] },
@@ -155,11 +157,11 @@ export const persistenceOperations: Operation[] = [
     name: 'list_write_requests',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'List your write receipts in one source, newest first, for a lost request_id.',
+    description: 'Your write receipts in one source, newest first (for a lost request_id).',
     params: {
       source_id: { type: 'string', description: 'Default: yours.' },
       limit: { type: 'number', default: 25, description: '1-100 (default 25).' },
-      before: { type: 'string', description: 'next cursor from the previous page.' },
+      before: { type: 'string', description: "Previous page's next cursor." },
     },
     scope: 'write', mutating: false, area: 'pages',
     cliHints: { name: 'write-requests' },
@@ -188,7 +190,7 @@ export const persistenceOperations: Operation[] = [
     name: 'cancel_write_request',
     idempotent: true,
     outputRedaction: 'no_stored_text',
-    description: 'Cancel your accepted write before it publishes. Returns the actual receipt.',
+    description: 'Cancel your accepted write before it publishes; returns the receipt.',
     params: { request_id: requestParam },
     scope: 'write', mutating: true, area: 'pages',
     cliHints: { name: 'cancel-write-request', positional: ['request_id'] },

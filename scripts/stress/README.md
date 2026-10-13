@@ -59,7 +59,9 @@ passed, 1 a failure, 2 a usage or setup error, 130/143 cancelled.
 
 Paid-provider files (`*.live.test.ts`, `test/live/`,
 `scripts/e2e-live-key-only.txt`) are listed as not stressed. A file whose
-every test skips on this platform, skips without an unavailable secret, or
+every test skips on this platform, skips without an unavailable secret
+(including a credentialed external-service URL no CI job holds, such as
+`GBRAIN_SUPAVISOR_URL`), or
 skips without a prerequisite its owning job in `heavy-tests.yml`,
 `native-locks.yml` or `macos-validation.yml` installs, or skips without the
 PgBouncer fixture (`GBRAIN_PGBOUNCER_URL`) that a workflow step setting

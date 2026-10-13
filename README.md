@@ -100,14 +100,14 @@ before restarting services with this version.
 > Run `gbrain apply-migrations --yes --no-autopilot-install`; exit 1 means it's still
 > behind: run `gbrain doctor --json`, not `--yes` again.
 
-**Claude Code, fastest path:**
+**Claude Code or Codex, fastest path:**
 
 ```bash
 bun install -g github:garrytan/gbrain
-gbrain setup claude-code   # --dry-run previews, --remove undoes
+gbrain setup claude-code   # or codex; --dry-run previews, --remove undoes
 ```
 
-`setup` shows the brain, source, launcher and owner it resolved before writing, runs `gbrain init --pglite --no-embedding` only when no brain exists, writes the stdio MCP entry and read-context hooks (owned by hash) and smoke-tests them. Capture and providers stay off unless accepted; a hosted brain keeps `gbrain connect --install`. [Setup guide](docs/guides/setup.md).
+`setup` shows the brain, source, launcher and owner it resolved before writing, runs `gbrain init --pglite --no-embedding` only when no brain exists, writes the stdio MCP entry and read-context hooks (owned by hash, plus Codex hook trust) and smoke-tests them. Capture and providers stay off unless accepted; a hosted brain keeps `gbrain connect --install`. [Setup guide](docs/guides/setup.md).
 
 Start with the agent you already use. For Grok Bot and Muse, the dedicated guides above install an isolated launcher, repairable runtime, and memory in a verified persistent directory. For a coding agent, paste:
 
@@ -182,7 +182,7 @@ The agent starts with keyless memory and verifies it. API keys, automatic captur
 
 ### Lighter ways in
 
-**Just want a memory for your coding agent — no identity, no repo.** On Claude Code run `gbrain setup claude-code` (above). By hand: `gbrain init --pglite --no-embedding`, then `codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full` (`claude mcp add` takes the same argv; `--surface verbs` or `starter` for a harness that caps its tool count). Saved memories are brain-wide by default; pass `visibility: "private"` for local-only facts.
+**Just want a memory for your coding agent — no identity, no repo.** On Claude Code or Codex use `gbrain setup` (above). By hand: `gbrain init --pglite --no-embedding`, then `codex mcp add gbrain -- "$(command -v gbrain)" serve --surface full` (`claude mcp add` takes the same argv; `--surface verbs` or `starter` for a harness that caps its tool count). Saved memories are brain-wide by default; pass `visibility: "private"` for local-only facts.
 
 **Already have a brain on a remote host** (OpenClaw, Hermes, or any `gbrain serve --http`)? Point your laptop agents at it with one command each — `--install` wires it up and smoke-tests the token before handoff:
 

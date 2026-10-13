@@ -184,9 +184,13 @@ This is the real test. Edit a brain page, push, wait, search.
 ```bash
 # Example: fix a line in alice-example's page
 cd /data/brain
-# Make a small edit to any .md file
-git add -A && git commit -m "test: verify live sync" && git push
+# Make a small edit to one .md file, then commit and push only that file
+gbrain git commit-push -m "test: verify live sync" -- people/alice-example.md
 ```
+
+It must exit 0 and print `pushed <sha> to origin/<branch>`. On any other
+result, stop the test and follow [outcomes](guides/shared-checkout-git.md#outcomes)
+(retry once on `commit_lock_busy`; ask the user on `integrate_conflict`).
 
 2. Wait for the next sync cycle (cron interval or `--watch` poll).
 

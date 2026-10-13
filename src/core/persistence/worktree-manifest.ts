@@ -146,20 +146,35 @@ const outsideCheckout = (canonical: string) => unsafe('Canonical worktree transf
   `The Git index of ${canonical} lists a path that leaves the checkout (a hand-edited or corrupted index), so no manifest was recorded and nothing outside the checkout was read. `
     + 'Ask the user to replace the checkout with a fresh git clone of the same repository at the same commit, then run the step again.');
 
-/** The working-tree bytes of a tracked path; null when it is missing on disk (counted as deleted). */
+/**
+ * The working-tree bytes of a tracked path; null when it is missing on disk (counted as deleted).
+ *
+ * #6510: the symlink check is `lstat` on every directory component between the canonical root and the leaf, then
+ * the leaf, on every read; a symlink anywhere refuses. The earlier `realpath(path) === path` proxy conflated "resolves
+ * through a link" with "the filesystem spells this name differently", which is legal on a normalization-insensitive
+ * volume (APFS answers an NFC request with the NFD entry) and on a case-insensitive one, and falsely refused with
+ * `writer_manifest_unsafe`. The bytes are read through the Git spelling, never through an alias. No component is
+ * cached across files: a parent replaced by a symlink after the first file of a manifest would otherwise let a later
+ * leaf read outside the root.
+ */
 function trackedBytes(canonical: string, rel: string): Buffer | null {
   if (!insideCheckout(rel)) throw outsideCheckout(canonical);
-  const path = join(canonical, ...rel.split('/'));
+  const parts = rel.split('/');
+  const path = join(canonical, ...parts);
   const within = relative(canonical, path);
   if (within === '' || within.split(sep)[0] === '..' || isAbsolute(within)) throw outsideCheckout(canonical);
-  let real: string;
-  try { real = realpathSync(path); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return null;
-    throw error;
+  let component = canonical;
+  for (let i = 0; i < parts.length; i++) {
+    component = join(component, parts[i]!);
+    let info;
+    try { info = lstatSync(component); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return null;
+      throw error;
+    }
+    if (info.isSymbolicLink()) throw unsafe('The canonical checkout manifest requires a symlink-free checkout.',
+      `${rel} in the checkout resolves through a symlink, so no manifest was recorded. Ask the user to replace the link with a real file or directory (or remove it), then run the step again.`);
+    if (i < parts.length - 1 ? !info.isDirectory() : !info.isFile()) return null;
   }
-  if (real !== path || lstatSync(path).isSymbolicLink()) throw unsafe('The canonical checkout manifest requires a symlink-free checkout.',
-    `${rel} in the checkout resolves through a symlink, so no manifest was recorded. Ask the user to replace the link with a real file or directory (or remove it), then run the step again.`);
-  if (!lstatSync(path).isFile()) return null;
   return readFileSync(path);
 }
 

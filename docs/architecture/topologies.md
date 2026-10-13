@@ -740,13 +740,13 @@ Git effect commits only the page paths it wrote (`git commit --only`) and then
 pushes HEAD. Everything else in the checkout (`MEMORY.md`, daily notes,
 `AGENTS.md`, scripts) is the operator's: `git add` and `git commit` it with
 plain git in the checkout. Those commits reach the remote on the owner's next
-push, because the owner pushes HEAD, or sooner with a hand `git push` from the
+push, because the owner pushes HEAD, or sooner with a hand `git push` from the <!-- gbrain-allow-shared-tree-git: managed worktrees refuse gbrain git commit-push; a plain push of HEAD is the documented path for non-page files -->
 checkout; `gbrain sources push` refuses on a managed root and its secret scan
 does not run on a hand push. A hand push and the owner's push race only by
 ordinary Git semantics (both push the same HEAD; a push the remote rejects is
 retried by the owner and, after repeated failures, parked, which
 `writer status --json` shows). Never
-`git pull --rebase`, `git reset` or `git checkout` page paths in the checkout:
+`git pull --rebase`, `git reset` or `git checkout` page paths in the checkout: <!-- gbrain-allow-shared-tree-git: names what never to run -->
 the owner never pulls, and moving files under it is what `source_changed`
 guards against; bring remote commits in with `gbrain sources refresh <source>`.
 The durability block `sources harden` writes into `AGENTS.md`/`RESOLVER.md`

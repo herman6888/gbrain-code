@@ -83,7 +83,7 @@ const get_skill: Operation = {
   params: {
     schema_version: { type: 'number', description: '2 for an exact canonical revision.' },
     qualified_id: { type: 'string', description: 'Version 2 skill id.' },
-    expected_brain_id: { type: 'string', description: 'Version 2 brain id to assert.' },
+    expected_brain_id: { type: 'string', description: 'Brain id to assert.' },
     source_incarnation: { type: 'string', description: 'From discovery.' },
     pack_id: { type: 'string', description: 'Pack id.' },
     revision: { type: 'string', description: 'Exact revision (default: head).' },
@@ -93,7 +93,7 @@ const get_skill: Operation = {
     },
     source_id: {
       type: 'string',
-      description: 'Fetch a brain-resident pack skill from this source.',
+      description: 'Brain-resident pack skill from this source.',
     },
   },
   handler: async (ctx, p) => {
@@ -139,7 +139,7 @@ const sharedSkillMutationParams: Operation['params'] = {
   expected_revision: { type: 'string', description: 'Current revision UUID; JSON null for creation.' },
 };
 const get_skill_asset: Operation = {
-  name: 'get_skill_asset', description: 'Read an approved file from an exact skill revision (data only; never executed).',
+  name: 'get_skill_asset', description: 'Read an approved file from an exact skill revision (data, never executed).',
   mutating: false,
   idempotent: true,
   outputRedaction: { exempt: 'skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions' },
@@ -241,7 +241,7 @@ const list_brain_skillpack: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: { exempt: 'skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions' },
-  description: 'Skillpacks this brain ships, with skills and a scaffold spec to offer the user.',
+  description: 'Skillpacks this brain ships: skills and a scaffold spec to offer the user.',
   publishGateKey: 'mcp.publish_skills',
   params: {},
   handler: async (ctx) => {

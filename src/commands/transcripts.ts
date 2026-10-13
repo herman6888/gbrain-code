@@ -17,6 +17,7 @@
 
 import { homedir } from 'node:os';
 import type { BrainEngine } from '../core/engine.ts';
+import { helpFlagRequested } from '../cli/subcommands.ts';
 import type { CliDispatchContext } from '../cli/command-table.ts';
 import type { RecentTranscript } from '../core/transcripts.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
@@ -605,6 +606,8 @@ export async function runTranscripts(engine: BrainEngine, args: string[], dispat
     return;
   }
   if (sub === 'status') {
+    // #6521: `status` has no parser of its own, so its help flag reached runStatus and the (null) engine.
+    if (helpFlagRequested(args.slice(1))) { console.log(HELP); return; }
     await runStatus(engine, args.slice(1));
     return;
   }

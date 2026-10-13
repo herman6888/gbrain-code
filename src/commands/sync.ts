@@ -47,7 +47,7 @@ export interface SyncResult {
    */
   malformedSkipped?: number;
   /** #5751: unchanged managed working-tree files skipped although a no-op publication cannot resolve their admit reason. */
-  legacySkips?: { contextualMode: number; canonicalBytes: number }; /** #5984: managed entries advanced without a write (DX-A7), and how a still-unfinished managed write's wait ended (DX-A3). */ waived?: { imports: number; deletes: number }; writeWait?: import('../core/persistence/sync-run.ts').ManagedSyncWriteWait;
+  legacySkips?: { contextualMode: number; canonicalBytes: number }; /** #5984: managed entries advanced without a write (DX-A7), and how a still-unfinished managed write's wait ended (DX-A3). */ waived?: { imports: number; deletes: number }; writeWait?: import('../core/persistence/sync-write-diagnostic.ts').ManagedSyncWriteWait;
   /** Managed sync: files skipped because another origin keeps their slug, and links derived after the checkpoint. */
   slugCollisions?: import('../core/persistence/sync-discovery.ts').SyncSlugCollision[];
   fileRefusals?: import('../core/persistence/sync-discovery.ts').SyncFileRefusal[]; links?: import('../core/persistence/links-maintenance.ts').ManagedLinkExtraction;

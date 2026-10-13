@@ -50,6 +50,7 @@ import { isAvailable } from '../ai/gateway.ts';
 import { withAIInvocationPreflight } from '../ai/invocation-guard.ts';
 import { decideSingleFact } from './single-prepare.ts';
 import { cosineVerdict, dedupCapturedFacts, withCaptureDrops, wouldDedupSamePage } from './capture-dedup.ts';
+import { warnSamePageShadow } from './same-page-shadow.ts';
 import { readSupersessionThreshold } from './supersession-threshold.ts';
 import { assertAmbientCaptureAdmissible, type FactsBackstopSource } from './capture-sources.ts';
 import { appendContextNote, type InferredVia } from './subject-infer.ts';
@@ -173,6 +174,8 @@ export type FactsBackstopResult =
       fence_refused?: number;
       /** #6333 shadow (never a drop): facts the same-page rewording rule would have treated as duplicates. */
       would_dedup_same_page?: number;
+      /** #6506: candidates skipped because the exact claim was forgotten in this source and visibility. */
+      withdrawn_skipped?: number;
     };
 
 /** One pipeline run's input: the turn text plus its page provenance and observation date. */
@@ -225,10 +228,6 @@ function warnOnce(key: string, msg: string): void {
   console.warn(msg);
 }
 /** #6333 [UC2] shadow only: name the pair the same-page rewording rule would have deduplicated; the fact is inserted as today. */
-function warnSamePageShadow(sessionId: string | null, matchedId: number, score: number): void {
-  // eslint-disable-next-line no-console
-  console.warn(`[facts-backstop] #6333 shadow: new fact in session ${sessionId} rewords fact ${matchedId} (cosine ${score.toFixed(3)}); both kept`);
-}
 /** Test-only: reset the once-per-process warning memo. */
 export function __resetBackstopWarningsForTests(): void {
   _warnedKeys.clear();
@@ -543,6 +542,8 @@ export async function runFactsPipeline(
   fence_refused?: number;
   /** #6333 shadow (never a drop): facts the same-page rewording rule would have treated as duplicates. */
   would_dedup_same_page?: number;
+  /** #6506: candidates skipped because the exact claim was forgotten in this source and visibility. */
+  withdrawn_skipped?: number;
 }> {
   return runPipelineWithBody({
     turnText,
@@ -564,7 +565,7 @@ async function runPipeline(
   parsedPage: ParsedPageInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
-): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number }> {
+): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number; withdrawn_skipped?: number }> {
   return runPipelineWithBody(
     {
       turnText: parsedPage.compiled_truth,
@@ -611,7 +612,7 @@ async function runPipelineWithBody(
   input: PipelineInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
-): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number }> {
+): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number; withdrawn_skipped?: number }> {
   // #4210: outside a withBudgetTracker scope (extract_facts op, sweep,
   // put_page backstop, checkpoint harvest, file/code import) the gateway's
   // chat/embed calls were budget no-ops — real spend, zero audit rows.
@@ -631,6 +632,14 @@ async function runPipelineWithBody(
     return withBudgetTracker(fallback, () => runPipelineBodyInner(input, ctx, abortSignal));
   }
   return runPipelineBodyInner(input, ctx, abortSignal);
+}
+
+/** The unmanaged pipeline's running counters; `withdrawn_skipped` rides along only once a forgotten claim was skipped. */
+interface PipelineCounts { inserted: number; duplicate: number; superseded: number; fact_ids: number[]; withdrawn_skipped?: number }
+
+/** #6506: the unmanaged pipeline counts a skipped forgotten claim the way the managed publisher does (B-10 kept it silent). */
+function countWithdrawnSkip(counts: PipelineCounts): void {
+  counts.withdrawn_skipped = (counts.withdrawn_skipped ?? 0) + 1;
 }
 
 /**
@@ -674,7 +683,7 @@ async function runPipelineBodyInner(
   input: PipelineInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
-): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number }> {
+): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number; withdrawn_skipped?: number }> {
   const { extractFactsFromTurnWithOutcome, FactsExtractionError } = await import('./extract.ts');
   const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
@@ -756,9 +765,9 @@ async function runPipelineBodyInner(
   // #5888: one exact-duplicate check for the capture lanes, before either writer.
   const { facts, dropped } = await dedupCapturedFacts(ctx, await inferMissingSubjects(ctx, outcome.facts, visibility, input.pageSlug, managed), visibility, resolveEntitySlugWithSource);
   if (!managed) await assertAmbientCaptureAdmissible(ctx.engine, ctx.source);
-  if (managed) return withCaptureDrops(dropped, facts.length || !dropped.length ? await publishManagedFacts(ctx.engine, managed, ctx, facts, visibility, input.pageSlug) : null);
+  if (managed) return withCaptureDrops(dropped, facts.length || !dropped.length ? await publishManagedFacts(ctx.engine, managed, ctx, facts, visibility, input.pageSlug, { withdrawn: 'skip' }) : null);
 
-  const counts = { inserted: 0, duplicate: dropped.length, superseded: 0, fact_ids: [...dropped] };
+  const counts: PipelineCounts = { inserted: 0, duplicate: dropped.length, superseded: 0, fact_ids: [...dropped] };
   let wouldDedupSamePageCount = 0;
   const writer = await derivedFactWriter(ctx, input, derivation, counts);
   const { insertDerivedFact, write_gate } = writer;
@@ -790,7 +799,7 @@ async function runPipelineBodyInner(
 
     // B-10: a withdrawn claim for this entity is never re-written; the
     // fence writer rechecks under its page lock.
-    if (await isFactWithdrawn(ctx.engine, ctx.sourceId, visibility, f.fact, resolvedSlug)) continue;
+    if (await isFactWithdrawn(ctx.engine, ctx.sourceId, visibility, f.fact, resolvedSlug)) { countWithdrawnSkip(counts); continue; }
 
     // Dedup against DB candidates (correct per Codex Q7: fence rows
     // have no embeddings; FS lock + sync invariant means DB == fence

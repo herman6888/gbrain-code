@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { atomicWriteTextFile } from '../bootstrap/atomic-write.ts';
+import { ownedEntryFingerprint } from '../bootstrap/adopted-connections.ts';
 import { acquireBootstrapLock } from '../bootstrap/lock.ts';
 import { buildClaudeHookCommand, classifyHarnessHook, hookEntryHash, removeClaudeHooksAt, writeClaudeHooksAt } from '../bootstrap/hooks.ts';
 import {
@@ -110,11 +111,7 @@ export interface ClaudeInspection {
   hooksCurrent: boolean;
 }
 
-const canonical = (v: unknown): unknown =>
-  Array.isArray(v) ? v.map(canonical)
-    : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, canonical((v as Record<string, unknown>)[k])]))
-      : v;
-export const entryHash = (v: unknown): string => createHash('sha256').update(JSON.stringify(canonical(v))).digest('hex');
+export const entryHash = ownedEntryFingerprint;
 
 export function claudeSetupPaths(plan: Pick<ClaudeSetupPlan, 'name' | 'scope' | 'projectDir'>): { configPath: string; settingsPath: string; receiptPath: string } {
   const configPath = claudeUserMcpConfigPath();

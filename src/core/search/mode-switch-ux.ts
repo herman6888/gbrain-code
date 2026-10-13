@@ -134,15 +134,19 @@ export function summarizeTransition(
     };
   }
 
-  // Narrowing: dropping a feature (e.g. balanced → conservative drops
-  // reranker + expansion). Cache will refill within TTL; no backfill.
+  // Narrowing: dropping a feature (e.g. balanced → conservative drops the
+  // reranker; tokenmax → balanced drops default expansion and synopsis
+  // context). Semantic result caching is off, so nothing refills; no backfill.
   if (oldMode && narrowness(newMode) < narrowness(oldMode)) {
     return {
       kind: 'narrowing',
       reindex_required: false,
       callout_lines: [
         `Switched to ${newMode}. Some features dropped from prior mode.`,
-        `Cache refills within TTL (default 1h). No backfill required.`,
+        ...(oldMode === 'tokenmax'
+          ? ['New chunks embed with title context instead of per-chunk synopses; existing vectors keep serving until they are replaced.']
+          : []),
+        `The next search uses ${newMode} (semantic result caching is disabled). No backfill required.`,
       ],
     };
   }
@@ -155,7 +159,7 @@ export function summarizeTransition(
       `Switched to ${newMode}.`,
       oldMode
         ? `Existing wrapped embeddings (if any) continue serving queries.`
-        : `First-time mode set. Cache will populate as queries run.`,
+        : `First-time mode set; the next search uses it.`,
     ],
   };
 }

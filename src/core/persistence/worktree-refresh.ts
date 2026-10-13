@@ -137,7 +137,7 @@ async function configuredMs(engine: BrainEngine, flag: number | undefined, env: 
   return Math.floor(raw);
 }
 
-function refreshLockPath(worktreeId: string): string { return join(persistenceHome(), 'locks', `refresh-${worktreeId}.lock`); }
+export function refreshLockPath(worktreeId: string): string { return join(persistenceHome(), 'locks', `refresh-${worktreeId}.lock`); }
 
 async function readActiveRefresh(engine: BrainEngine, worktreeId: string): Promise<WorktreeRefreshRow | null> {
   const [row] = await engine.executeRaw<WorktreeRefreshRow>(`SELECT * FROM persistence_worktree_refreshes

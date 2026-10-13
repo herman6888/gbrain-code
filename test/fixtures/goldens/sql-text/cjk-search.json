@@ -5,10 +5,6 @@
       "searchKeyword": {
         "cjk": [
           {
-            "event": "begin",
-            "lane": "tx"
-          },
-          {
             "lane": "pool",
             "params": [
               "array<string>",
@@ -18,6 +14,22 @@
             "textSha256": "2f0ade4889d6952ec2f8fd51f66c747ad56df2971e5bd05f0c2f493beabc3a81"
           },
           {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT value FROM config WHERE key = 'search.keyword_statement_timeout_ms'",
+            "textSha256": "9efd937ed20b1352a9344e9229cf4e02bddf1aca4057f62ecb5bc2cd786f7310"
+          },
+          {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT reltuples::float8 AS reltuples FROM pg_class WHERE oid = 'pages'::regclass",
+            "textSha256": "9c89987a1c9f30be99f46a92c89f688c1b78d3fd58c024eb6cb075cc948c3dc0"
+          },
+          {
+            "event": "begin",
+            "lane": "tx"
+          },
+          {
             "lane": "tx",
             "params": [],
             "sql": "SET LOCAL jit = off",
@@ -25,15 +37,11 @@
           },
           {
             "lane": "tx",
-            "params": [],
-            "sql": "SET LOCAL statement_timeout = '8s'",
-            "textSha256": "7346ddf58ceeb31a31fd4f44990faf92a5bf015f93c675513e2bc17e5c3619db"
-          },
-          {
-            "lane": "pool",
-            "params": [],
-            "sql": "SELECT reltuples::float8 AS reltuples FROM pg_class WHERE oid = 'pages'::regclass",
-            "textSha256": "9c89987a1c9f30be99f46a92c89f688c1b78d3fd58c024eb6cb075cc948c3dc0"
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config('statement_timeout', $1, true)",
+            "textSha256": "4ff5eea87475148656b3e4c0a62fb90fdc1e96997a8b96873e48285836003675"
           },
           {
             "lane": "tx",
@@ -61,10 +69,6 @@
         ],
         "cjk+sourceIds+detailLow": [
           {
-            "event": "begin",
-            "lane": "tx"
-          },
-          {
             "lane": "pool",
             "params": [
               "array<string>",
@@ -74,6 +78,22 @@
             "textSha256": "2f0ade4889d6952ec2f8fd51f66c747ad56df2971e5bd05f0c2f493beabc3a81"
           },
           {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT value FROM config WHERE key = 'search.keyword_statement_timeout_ms'",
+            "textSha256": "9efd937ed20b1352a9344e9229cf4e02bddf1aca4057f62ecb5bc2cd786f7310"
+          },
+          {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT reltuples::float8 AS reltuples FROM pg_class WHERE oid = 'pages'::regclass",
+            "textSha256": "9c89987a1c9f30be99f46a92c89f688c1b78d3fd58c024eb6cb075cc948c3dc0"
+          },
+          {
+            "event": "begin",
+            "lane": "tx"
+          },
+          {
             "lane": "tx",
             "params": [],
             "sql": "SET LOCAL jit = off",
@@ -81,15 +101,11 @@
           },
           {
             "lane": "tx",
-            "params": [],
-            "sql": "SET LOCAL statement_timeout = '8s'",
-            "textSha256": "7346ddf58ceeb31a31fd4f44990faf92a5bf015f93c675513e2bc17e5c3619db"
-          },
-          {
-            "lane": "pool",
-            "params": [],
-            "sql": "SELECT reltuples::float8 AS reltuples FROM pg_class WHERE oid = 'pages'::regclass",
-            "textSha256": "9c89987a1c9f30be99f46a92c89f688c1b78d3fd58c024eb6cb075cc948c3dc0"
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config('statement_timeout', $1, true)",
+            "textSha256": "4ff5eea87475148656b3e4c0a62fb90fdc1e96997a8b96873e48285836003675"
           },
           {
             "lane": "tx",
@@ -121,6 +137,12 @@
       "searchKeywordChunks": {
         "cjk": [
           {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT value FROM config WHERE key = 'search.keyword_statement_timeout_ms'",
+            "textSha256": "9efd937ed20b1352a9344e9229cf4e02bddf1aca4057f62ecb5bc2cd786f7310"
+          },
+          {
             "event": "begin",
             "lane": "tx"
           },
@@ -132,9 +154,11 @@
           },
           {
             "lane": "tx",
-            "params": [],
-            "sql": "SET LOCAL statement_timeout = '8s'",
-            "textSha256": "7346ddf58ceeb31a31fd4f44990faf92a5bf015f93c675513e2bc17e5c3619db"
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config('statement_timeout', $1, true)",
+            "textSha256": "4ff5eea87475148656b3e4c0a62fb90fdc1e96997a8b96873e48285836003675"
           },
           {
             "lane": "tx",
@@ -161,6 +185,12 @@
         ],
         "cjk+sourceId": [
           {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT value FROM config WHERE key = 'search.keyword_statement_timeout_ms'",
+            "textSha256": "9efd937ed20b1352a9344e9229cf4e02bddf1aca4057f62ecb5bc2cd786f7310"
+          },
+          {
             "event": "begin",
             "lane": "tx"
           },
@@ -172,9 +202,11 @@
           },
           {
             "lane": "tx",
-            "params": [],
-            "sql": "SET LOCAL statement_timeout = '8s'",
-            "textSha256": "7346ddf58ceeb31a31fd4f44990faf92a5bf015f93c675513e2bc17e5c3619db"
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config('statement_timeout', $1, true)",
+            "textSha256": "4ff5eea87475148656b3e4c0a62fb90fdc1e96997a8b96873e48285836003675"
           },
           {
             "lane": "tx",

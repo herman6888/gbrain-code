@@ -63,9 +63,16 @@ export type AdoptedConnectionState =
 
 const canonical = (v: unknown): unknown => Array.isArray(v) ? v.map(canonical)
   : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v as object).sort().map(k => [k, canonical((v as Record<string, unknown>)[k])])) : v;
+/**
+ * THE harness-entry fingerprint: sha256 hex over the canonical JSON (keys
+ * sorted recursively) of exactly the value given. `gbrain setup` stores one
+ * per owned entry (an MCP table or JSON entry, a hook entry or group, a Codex
+ * trust table) in its connection receipt and compare-and-swaps on it; this
+ * sidecar hashes a redacted projection of an adopted server through it.
+ */
+export const ownedEntryFingerprint = (value: unknown): string => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 /** sha256 over canonical JSON of what identifies the connection; header values are excluded by construction. */
-export const connectionFingerprint = (parts: { type: string; target: string; header_names: string[] }): string =>
-  createHash('sha256').update(JSON.stringify(canonical(parts))).digest('hex');
+export const connectionFingerprint = (parts: { type: string; target: string; header_names: string[] }): string => ownedEntryFingerprint(parts);
 
 export function adoptedConnectionsPath(gbrainHomeDir: string): string {
   return join(gbrainHomeDir, 'bootstrap', 'adopted-connections.json');

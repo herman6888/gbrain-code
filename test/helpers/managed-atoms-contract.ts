@@ -10,7 +10,7 @@ import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { isPhysicalRootMetadata } from '../../src/core/persistence/physical-root.ts';
 import { __setMaintenanceWriteWaitForTests } from '../../src/core/persistence/maintenance-wait.ts';
-import { testWaitMs } from './wait-for.ts';
+import { testWaitMs, waitFor } from './wait-for.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration, type LocalGrant } from '../../src/core/persistence/identity.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
@@ -245,6 +245,12 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
       // #6325: a malformed batch is retried automatically (one strike per completed failure).
       expect(calls).toBe(scenario === 'malformed' ? 2 : 1);
       expect(replay.status).toBe(scenario === 'malformed' ? 'warn' : 'ok');
+      // A short maintenance wait returns the phase while the consumer is still committing the batch (`write_pending`
+      // is progress, #5601); the final state below is the settled batch, so wait for the source's writes to end first.
+      if (scenario === 'deferred') {
+        await waitFor(async () => (await engine.executeRaw("SELECT 1 FROM persistence_requests WHERE source_id=$1 AND state IN ('queued','running','recovering')", [sourceId])).length === 0,
+          { timeoutMs: 10_000, label: 'deferred atom batch settles' });
+      }
       const atoms = await engine.executeRaw<{ slug: string; visibility: string }>("SELECT slug,frontmatter->>'visibility' AS visibility FROM pages WHERE source_id=$1 AND type='atom'", [sourceId]);
       expect(atoms).toHaveLength(scenario === 'zero_yield' || scenario === 'malformed' ? 0 : 1);
       if (atoms.length) {

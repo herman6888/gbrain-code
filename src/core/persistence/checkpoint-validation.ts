@@ -19,7 +19,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { opError } from '../ops/contract.ts';
-import { PERSISTENCE_SYNC_RUN_INDEXES } from './schema.ts';
+import { PERSISTENCE_REQUEST_ONLINE_INDEXES, PERSISTENCE_SYNC_RUN_INDEXES } from './schema.ts';
 import { docsAnchor } from './connector-errors.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
 import type { SyncCursorOptions } from './sync-prepare.ts';
@@ -67,9 +67,13 @@ export interface RequestIndexState {
   progress?: { phase: string; blocks_done: number; blocks_total: number };
 }
 
-/** A fresh read of the #5762 indexes: valid, missing, INVALID, or still being built by another session. */
-export async function readRequestIndexStates(engine: Pick<BrainEngine, 'executeRaw' | 'kind'>): Promise<RequestIndexState[]> {
-  const names = PERSISTENCE_SYNC_RUN_INDEXES.map(index => index.name);
+/**
+ * A fresh read of the online-built request indexes (#5762's checkpoint pair and #6511's slug index by default): valid,
+ * missing, INVALID, or still being built by another session. The checkpoint timeout hint reads the pair it depends on.
+ */
+export async function readRequestIndexStates(engine: Pick<BrainEngine, 'executeRaw' | 'kind'>,
+  indexes: ReadonlyArray<{ name: string }> = PERSISTENCE_REQUEST_ONLINE_INDEXES): Promise<RequestIndexState[]> {
+  const names = indexes.map(index => index.name);
   if (engine.kind !== 'postgres') {
     const rows = await engine.executeRaw<{ name: string; present: boolean }>(
       'SELECT n.name, to_regclass(n.name) IS NOT NULL AS present FROM unnest($1::text[]) AS n(name)', [names]);
@@ -126,5 +130,5 @@ export function formatCheckpointTimeoutHint(indexes: RequestIndexState[], input:
 }
 
 export async function checkpointTimeoutHint(engine: Pick<BrainEngine, 'executeRaw' | 'kind'>, input: Parameters<typeof formatCheckpointTimeoutHint>[1]): Promise<CheckpointTimeoutHint> {
-  return formatCheckpointTimeoutHint(await readRequestIndexStates(engine), input);
+  return formatCheckpointTimeoutHint(await readRequestIndexStates(engine, PERSISTENCE_SYNC_RUN_INDEXES), input);
 }

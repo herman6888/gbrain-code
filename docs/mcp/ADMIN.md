@@ -245,6 +245,22 @@ in `whoami` (`grant_diagnosis`) and `gbrain://capabilities`; operations outside
 the grant's scopes are never counted. On the host, `gbrain doctor` reports
 `grant_new_ops_available` with each grant's blockers and the operation names.
 
+The connection is also told in band, without asking: the
+`grant_blocked_operations` notice arrives once per session (once per
+(principal, transport session); for a stateless HTTP call with no session id,
+once per (principal, grant revision), so three stateless calls get one notice
+and a rescope is diagnosed afresh). It names the same blockers with counts,
+keeps grant age apart, and its `fix` (`next: tell_user_to_run`) is the preview
+command, then the apply command in `then`, for the owner to run on the host;
+`fix.verify` is this doctor check or `whoami` on the same connection. A
+missing scope is named only on a refused call. When the server surface alone
+blocks, the fix is the read-only doctor check, because no grant change lifts
+it. A result that left out takes a hidden tool serves carries
+`hidden_tool_content`, whose `fix` is the step that connection can take:
+calling `takes_list`, one `request_tools {surface}` widen (within the server
+ceiling, never past an operator pin), or this grant repair
+([connection notices](../guides/repair.md#connection-notices)).
+
 Grant age is reported apart from those blockers. A snapshot written before
 this release carries no record of the operation catalog it was written
 against, so an old profile snapshot and a deliberate restriction look the

@@ -116,6 +116,7 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
   private transition: Promise<void> | undefined;
   private delayMs: number;
   private wakeRequested = false;
+  private overlapRead: Promise<void> | undefined;
   private readonly self = consumerIdentity();
   /** The probe reads through the consumer's statement route (the direct lane when the engine has one). */
   private readonly statements: BrainEngine;
@@ -231,8 +232,18 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
       inner.start();
       if (mode === 'full') { if (this.timer) clearTimeout(this.timer); this.timer = undefined; }
       if (reason !== 'no_live_owner' && reason !== 'single_consumer_off' && reason !== 'single_process_engine') this.log(`phase=consumer_probe reason=${mode} message="${reason}"`);
+      if (reason.startsWith('forced:')) this.overlapRead = this.reportServeOverlap(reason);
     })().finally(() => { this.transition = undefined; });
     return this.transition;
+  }
+  /** #6543: a forced consumer skipped the election, so it says once when a live serve consumer of this host claims beside it. */
+  private async reportServeOverlap(reason: string): Promise<void> {
+    try {
+      const signal = AbortSignal.timeout(this.opts.phaseMs ?? 5000);
+      const rows = await (this.opts.readConsumers ? this.opts.readConsumers(signal) : listHostConsumers(this.statements, this.opts.hostId, { signal }));
+      const serve = rows.find(row => row.kind === 'serve' && !(row.pid === this.self.pid && row.nonce === this.self.nonce) && row.renewed_age_ms < CONSUMER_LIVE_MS);
+      if (serve) this.log(`phase=consumer_probe reason=two_consumers_on_host message="this ${this.opts.kind} process consumes beside serve pid ${serve.pid} on this host (${reason}); both claim writes until one exits"`);
+    } catch { /* best-effort: doctor's two_consumers_on_host reports the overlap too */ }
   }
   private drainBack(owner: ListedConsumer): Promise<void> {
     if (this.transition) return this.transition;
@@ -275,6 +286,7 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     await this.tickPromise;
     await this.transition;
+    await this.overlapRead;
     await this.inner?.stop();
     await this.heartbeat?.stop();
   }

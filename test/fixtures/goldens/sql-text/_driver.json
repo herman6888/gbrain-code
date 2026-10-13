@@ -1012,11 +1012,12 @@
           },
           {
             "paramCount": 0,
-            "via": "tagged"
-          },
-          {
-            "paramCount": 0,
-            "via": "tagged"
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
           },
           {
             "paramCount": 0,
@@ -1026,6 +1027,14 @@
               "simple": true
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "via": "tagged"
+          },
+          {
+            "paramCount": 1,
+            "via": "tagged"
           },
           {
             "paramCount": 8,
@@ -1048,11 +1057,12 @@
           },
           {
             "paramCount": 0,
-            "via": "tagged"
-          },
-          {
-            "paramCount": 0,
-            "via": "tagged"
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
           },
           {
             "paramCount": 0,
@@ -1062,6 +1072,14 @@
               "simple": true
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 0,
+            "via": "tagged"
+          },
+          {
+            "paramCount": 1,
+            "via": "tagged"
           },
           {
             "paramCount": 10,
@@ -1077,10 +1095,19 @@
         "cjk": [
           {
             "paramCount": 0,
-            "via": "tagged"
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
           },
           {
             "paramCount": 0,
+            "via": "tagged"
+          },
+          {
+            "paramCount": 1,
             "via": "tagged"
           },
           {
@@ -1095,10 +1122,19 @@
         "cjk+sourceId": [
           {
             "paramCount": 0,
-            "via": "tagged"
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": true
+            },
+            "via": "unsafe"
           },
           {
             "paramCount": 0,
+            "via": "tagged"
+          },
+          {
+            "paramCount": 1,
             "via": "tagged"
           },
           {

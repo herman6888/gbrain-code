@@ -476,7 +476,7 @@ async function assertWorktreeNotRefreshing(tx: BrainEngine, input: WriteAdmissio
  * database-only incarnation) is matched by the caller with columns the pending indexes cover,
  * so each probe is an index range scan rather than a walk of every pending row.
  */
-const EARLIER_HEAD = (earlier: string, r: string, priority: string, laneRoots: string) => `${earlier}.sequence<${r}.sequence
+export const EARLIER_HEAD = (earlier: string, r: string, priority: string, laneRoots: string) => `${earlier}.sequence<${r}.sequence
         AND ${earlier}.state IN ('queued','running','recovering') AND NOT ${PASSES_QUEUED_SYNC(earlier, r, priority, laneRoots)}`;
 /**
  * The rows `claimNextWrite` may claim, over `persistence_requests r LEFT JOIN
@@ -486,7 +486,7 @@ const EARLIER_HEAD = (earlier: string, r: string, priority: string, laneRoots: s
  * unfinished withdrawal mirror of its page (of every page, for an untargeted
  * mirror), so the mirror never rewrites a file under an accepted request.
  */
-const SYNC_KIND = (row: string) => `COALESCE(${row}.intent->>'kind','') LIKE 'managed_sync_%'`;
+export const SYNC_KIND = (row: string) => `COALESCE(${row}.intent->>'kind','') LIKE 'managed_sync_%'`;
 /** Whether sync row `sync` names the page of request `write`: its slug, page id or rename source. */
 const NAMES_PAGE = (sync: string, write: string) => `(${sync}.source_id=${write}.source_id AND (${sync}.slug=${write}.slug
   OR ${sync}.page_id=${write}.page_id OR ${sync}.intent->'renameFrom'->>'slug'=${write}.slug))`;

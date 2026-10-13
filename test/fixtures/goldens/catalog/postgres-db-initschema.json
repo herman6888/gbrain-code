@@ -783,7 +783,9 @@
       "idx_pages_frontmatter": "CREATE INDEX idx_pages_frontmatter ON public.pages USING gin (frontmatter)",
       "idx_pages_search": "CREATE INDEX idx_pages_search ON public.pages USING gin (search_vector)",
       "idx_pages_slug_basename": "CREATE INDEX idx_pages_slug_basename ON public.pages USING btree (source_id, regexp_replace(slug, '^.*/'::text, ''::text))",
+      "idx_pages_slug_trgm": "CREATE INDEX idx_pages_slug_trgm ON public.pages USING gin (slug gin_trgm_ops)",
       "idx_pages_source_id": "CREATE INDEX idx_pages_source_id ON public.pages USING btree (source_id)",
+      "idx_pages_source_title_lower": "CREATE INDEX idx_pages_source_title_lower ON public.pages USING btree (source_id, lower(title))",
       "idx_pages_trgm": "CREATE INDEX idx_pages_trgm ON public.pages USING gin (title gin_trgm_ops)",
       "idx_pages_type": "CREATE INDEX idx_pages_type ON public.pages USING btree (type)",
       "idx_pages_updated_at_desc": "CREATE INDEX idx_pages_updated_at_desc ON public.pages USING btree (updated_at DESC)",
@@ -1475,7 +1477,8 @@
           "3 content_hash text/text NOT NULL",
           "4 fail_count integer/int4 NOT NULL DEFAULT 0",
           "5 tombstoned boolean/bool NOT NULL DEFAULT false",
-          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 partial_input_chars integer/int4 NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -1486,7 +1489,8 @@
           "3 content_hash text/text NOT NULL",
           "4 fail_count integer/int4 NOT NULL DEFAULT 0",
           "5 tombstoned boolean/bool NOT NULL DEFAULT false",
-          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 partial_input_chars integer/int4 NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

@@ -110,7 +110,8 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'remove` rewrites config.toml wholesale and drops comments, so the ' +
       'stdio lane (runHooks) must never manage a name the harness block ' +
       'owns, and vice versa. Codex 0.147.0 also ships a real hook system ' +
-      '(hooks.json; PreToolUse…SessionEnd) — gbrain wires SessionEnd only ' +
+      '(hooks.json; PreToolUse…SessionEnd) — bootstrap wires SessionEnd; ' +
+      '`gbrain setup codex` also wires SessionStart/UserPromptSubmit, hash-owned ' +
       '(CODEX_HAS_HOOKS=true; codex-hooks.ts owns the two-file write incl. ' +
       'the config.toml trust entry, see CODEX_HOOKS_SPEC_TARGET there). ' +
       'Some codex builds gate HTTP MCP servers behind ' +

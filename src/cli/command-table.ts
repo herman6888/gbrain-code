@@ -194,6 +194,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // update cache would spawn a detached network-touching check-update child per prompt and emit
   // UPGRADE_AVAILABLE stderr per turn. NOTE: this path no-ops under NODE_ENV=test, so membership is
   // pinned by a source grep (test/hook-command.serial.test.ts), not a runtime test.
+  // CLI_ONLY (#6530): shared-checkout-safe commit/push/pull; DB-free, pushes with host git credentials, never MCP.
+  { name: 'git', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/git.ts') },
   { name: 'hook', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/hook.ts') },
   // CLI_ONLY: Monthly backup-coverage check (engine via thunk — pre-engine branch, lock-safe).
   // selfHelp: backup ships its own HELP (runBackupCli guard, engine-free — the command dispatches in

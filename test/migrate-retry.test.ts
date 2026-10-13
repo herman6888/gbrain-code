@@ -34,6 +34,20 @@ class FakeDeadlock extends Error {
   constructor() { super('deadlock detected'); this.name = 'FakeDeadlock'; }
 }
 
+/**
+ * Deterministic clock through the `_hooks.now`/`_hooks.sleep` seam: `sleep` advances `now` by exactly `ms`, so the
+ * poll loop's deadline arithmetic is exact and a loaded runner's slow `setTimeout(1)` (7-10 ms, which admitted 3 polls
+ * in 30 ms on CI) cannot change the count. Forced probe: a `sleep` that also stalls 10 ms of real time gives 4
+ * `hasPending` calls on the real clock and 31 here.
+ */
+function fakeClock() {
+  let t = 0;
+  return {
+    now: () => t,
+    hooks: { now: () => t, sleep: async (ms: number) => { t += ms; } },
+  };
+}
+
 class FakeStatementTimeout extends Error {
   code = '57014';
   constructor() {
@@ -190,11 +204,13 @@ describe('tryRunPendingMigrations', () => {
   test('returns race_resolved when both attempts deadlock but hasPending flips to false', async () => {
     let initCalls = 0;
     let pendingCallCount = 0;
+    const clock = fakeClock();
     const result = await tryRunPendingMigrations(fakeEngine, {
       retryBackoffMs: 0,
       pollIntervalMs: 5,
       deadlineMs: 100,
       _hooks: {
+        ...clock.hooks,
         hasPending: async () => {
           pendingCallCount++;
           // Entry-call always pending; after a couple of poll iterations,
@@ -209,16 +225,21 @@ describe('tryRunPendingMigrations', () => {
     if (result.status === 'race_resolved') {
       expect(result.attempts).toBe(2); // exhausted retries
       expect(result.pollIterations).toBeGreaterThan(0);
+      // Entry call + three pending polls, then the fourth poll sees the other runner finish: t = 3 × 5 ms.
+      expect(result.pollIterations).toBe(3);
+      expect(clock.now()).toBe(15);
     }
     expect(initCalls).toBe(2);
   });
 
   test('returns persistent when both attempts deadlock + hasPending stays true past deadline', async () => {
+    const clock = fakeClock();
     const result = await tryRunPendingMigrations(fakeEngine, {
       retryBackoffMs: 0,
       pollIntervalMs: 10,
       deadlineMs: 50, // tight deadline for test speed
       _hooks: {
+        ...clock.hooks,
         hasPending: async () => true, // never resolves
         initSchema: async () => { throw new FakeDeadlock(); },
       },
@@ -227,6 +248,7 @@ describe('tryRunPendingMigrations', () => {
     if (result.status === 'persistent') {
       expect(result.attempts).toBe(2);
       expect(result.pollIterations).toBeGreaterThan(0);
+      expect(result.pollIterations).toBe(5); // 50 ms deadline / 10 ms interval, exactly
       expect(isDeadlockError(result.error)).toBe(true);
     }
   });
@@ -263,11 +285,13 @@ describe('tryRunPendingMigrations', () => {
 
   test('honors custom pollIntervalMs (test seam allows tight intervals)', async () => {
     let pollCalls = 0;
+    const clock = fakeClock();
     const result = await tryRunPendingMigrations(fakeEngine, {
       retryBackoffMs: 0,
       pollIntervalMs: 1,
       deadlineMs: 30,
       _hooks: {
+        ...clock.hooks,
         hasPending: async () => { pollCalls++; return true; },
         initSchema: async () => { throw new FakeDeadlock(); },
       },
@@ -275,5 +299,8 @@ describe('tryRunPendingMigrations', () => {
     expect(result.status).toBe('persistent');
     // pollCalls = 1 (initial check) + many polling iterations.
     expect(pollCalls).toBeGreaterThan(5);
+    // On the fake clock the count is exact: 30 ms deadline / 1 ms interval, plus the entry call.
+    if (result.status === 'persistent') expect(result.pollIterations).toBe(30);
+    expect(pollCalls).toBe(31);
   });
 });

@@ -15,7 +15,7 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 | `get_status_snapshot` | Snapshot for `gbrain status` thin-client mode: sync freshness + last cycle + queue depths + worker liveness. | admin |  |  |
 | `get_usage` | Aggregate chat usage + cost from the chat_usage_log ledger (per-model and per-phase token counts, cache reads/writes, USD estimates) with explicit coverage fields. | admin |  |  |
 | `get_write_attribution` | Admin read: who created and who last changed a page, or one of its facts, takes or timeline entries. | admin |  |  |
-| `mute_notice` | Mute a coaching or info notice (or first_run_decisions) for this client; muted: false unmutes. | write | yes |  |
+| `mute_notice` | Mute a coaching or info notice (or first_run_decisions) for this client. | write | yes |  |
 | `quarantine_list` | List quarantined (hidden) and optionally content-flagged pages by scanning page frontmatter, newest-updated first. | admin |  |  |
 | `run_doctor` | Run brain health checks and return a structured DoctorReport (thin-client doctor surface). | admin |  |  |
 | `run_onboard` | Probe brain health + optionally submit onboard remediations. | admin |  |  |
@@ -52,7 +52,7 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `request_tools` | More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client or stdio session). | read | yes |  |
+| `request_tools` | More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per client or stdio session). | read | yes |  |
 
 ## entities
 
@@ -150,7 +150,7 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 | `delta` | MEMORY VERB (v1): pages, facts, thread events changed since a cursor, zero LLM. | read | yes |  |
 | `entity` | MEMORY VERB (v1): person/company/account card, zero LLM. | read | yes |  |
 | `forget` | MEMORY VERB (v1): expire a remembered fact by its fact_id (never a page slug). | write | yes |  |
-| `recall` | MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. | read | yes |  |
+| `recall` | MEMORY VERB (v1): read facts by entity, since or session_id; `query` also searches pages. | read | yes |  |
 | `remember` | MEMORY VERB (v1): save facts with provenance. | write | yes |  |
 | `synthesize` | [EXPENSIVE / SLOW: LLM calls, costs money] MEMORY VERB (v1): answer a broad question across pages with citations. | read | yes |  |
 
@@ -167,7 +167,7 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `cancel_write_request` | Cancel your accepted write before it publishes. | write | yes |  |
+| `cancel_write_request` | Cancel your accepted write before it publishes; returns the receipt. | write | yes |  |
 | `capture` | Quick note ("just remember this"): slugged under inbox/ by date + content hash, so recapturing is idempotent. | write | yes |  |
 | `delete_page` | Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). | write |  |  |
 | `edit_page` | Change part of a page: prefer this over put_page for small changes. | write | yes |  |
@@ -176,10 +176,10 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 | `get_page` | Read a page by slug. | read | yes |  |
 | `get_raw_data` | Retrieve raw data for a page. | read |  |  |
 | `get_versions` | Page version history, newest snapshot first. | read |  |  |
-| `get_write_request` | Read your write's receipt by request_id (after write_pending or a lost reply). | write | yes |  |
+| `get_write_request` | Your write's receipt by request_id (after write_pending or a lost reply). | write | yes |  |
 | `list_page_purges` | Owner-only (`gbrain pages purges list`). | admin |  |  |
 | `list_pages` | List pages with filters. | read | yes |  |
-| `list_write_requests` | List your write receipts in one source, newest first, for a lost request_id. | write | yes |  |
+| `list_write_requests` | Your write receipts in one source, newest first (for a lost request_id). | write | yes |  |
 | `put_page` | Complete content REPLACES the whole page: read get_page include_content:true; send its revision as expected_revision. | write | yes |  |
 | `put_pages` | Write up to 50 complete Markdown pages (8 MB total) in one call; use instead of put_page for more than 3 pages. | write |  |  |
 | `put_raw_data` | Store a raw provider payload (API response JSON) alongside a page, keyed by source. | write |  |  |
@@ -218,7 +218,7 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 |---|---|---|---|---|
 | `assemble_evidence` | Deliver whole evidence for an ordered list of search hits (each {source_id, slug, chunk_id} from a prior search/query result): the same windows, sections or pages `query` returns with return_unit, packed into token_budget. | read |  |  |
 | `cache_stats` | Semantic query-cache introspection: resolved knobs (enabled, similarity threshold, TTL) plus row counts and total hits. | admin |  |  |
-| `query` | Hybrid search plus multi-query expansion for concept/landscape questions (expansion recovers synonyms). | read | yes |  |
+| `query` | Hybrid search for concept/landscape questions and people/companies/projects by topic; expand adds multi-query expansion (expansion recovers synonyms). | read | yes |  |
 | `rate_answer` | Rate how useful an answer's retrieved evidence was, so this brain ranks better next time (zero LLM calls). | write |  |  |
 | `search` | Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. | read | yes |  |
 | `search_by_image` | Image-as-query retrieval. | read |  |  |
@@ -232,11 +232,11 @@ Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **S
 |---|---|---|---|---|
 | `delete_skill` | CAS-delete a canonical shared skill and revoke future managed activation. | write + skill_editor | yes |  |
 | `get_skill` | Fetch a skill's prose and follow it: when it says search or store, call the same-named MCP tool here. | read | yes | `mcp.publish_skills` |
-| `get_skill_asset` | Read an approved file from an exact skill revision (data only; never executed). | read | yes | `mcp.publish_skills` |
+| `get_skill_asset` | Read an approved file from an exact skill revision (data, never executed). | read | yes | `mcp.publish_skills` |
 | `get_skill_policy` | Read the owner publication policy and CAS epoch, including when sharing is disabled. | admin + skill_publisher |  |  |
 | `join_brain` | Enroll this authenticated principal to follow approved shared skills. | read + skills_member_self | yes |  |
 | `leave_brain` | Stop only this principal’s enrollment. | read + skills_member_self | yes |  |
-| `list_brain_skillpack` | Skillpacks this brain ships, with skills and a scaffold spec to offer the user. | read | yes | `mcp.publish_skills` |
+| `list_brain_skillpack` | Skillpacks this brain ships: skills and a scaffold spec to offer the user. | read | yes | `mcp.publish_skills` |
 | `list_skills` | Skills: prose instruction sets (NOT executable code) for tasks with this server's tools, with triggers, usable_tools and unavailable_tools. | read | yes | `mcp.publish_skills` |
 | `put_skill` | Publish a complete file-canonical skill revision with CAS and a durable receipt. | write + skill_editor | yes |  |
 | `set_skill_policy` | Explicitly approve a versioned shared-skill disclosure and follow policy. | admin + skill_publisher |  |  |

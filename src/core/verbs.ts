@@ -199,6 +199,10 @@ const remember: Operation = {
       const { degradedDedupNotice } = await import('./interop-notices.ts');
       ctx.emitNotice?.(degradedDedupNotice(ctx.config));
     }
+    if (visibility === 'private' && ctx.remote === false && (result as { status?: string } | null)?.status !== 'duplicate') {
+      const { privateFactNotice } = await import('./interop-notices.ts');
+      ctx.emitNotice?.(privateFactNotice((result as { id?: string | number } | null)?.id));
+    }
     return result;
   },
   cliHints: { name: 'remember', positional: ['fact'] },
@@ -229,7 +233,7 @@ const entity: Operation = {
           `Pass either name: "Alice Example" for one full card, or names: ["Alice Example", "WGCO"] (up to ${ENTITY_NAMES_MAX}) for compact rows.`);
       }
       const t0 = Date.now();
-      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false, surfaceCeiling: ctx.surfaceCeiling });
+      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false });
       return { protocol_version: 1, latency_ms: Date.now() - t0, ...out };
     }
     const name = typeof p.name === 'string' ? p.name.trim() : '';
@@ -987,5 +991,15 @@ export const ERROR_SCHEMA: Record<string, unknown> = {
     protocol_version: { type: 'integer', const: MEMORY_VERBS_VERSION },
     write_request: WRITE_RECEIPT_SCHEMA,
     write_error: { type: 'string', enum: [...WRITE_ERROR_CODES] },
+    withdrawn: {
+      type: 'object',
+      required: ['at', 'subject', 'visibility'],
+      description: 'Additive, on a fact_withdrawn refusal: when and for which subject (an entity slug, or all_entities) the exact claim was forgotten. Absence carries no meaning.',
+      properties: {
+        at: { type: 'string' },
+        subject: { type: 'string' },
+        visibility: { type: 'string', enum: ['world', 'private'] },
+      },
+    },
   },
 };

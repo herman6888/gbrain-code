@@ -22,6 +22,9 @@ import {
 } from '../core/core-memory.ts';
 import { serializePageToMarkdown } from '../core/markdown.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import { CORE_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
+
+export { CORE_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
 
 /** Core is opt-in: marking a page does nothing for sessions until the owner turns delivery on. */
 const CORE_OFF_HINT = 'Core memory is off (the default), so sessions do not load it yet. If the user wants it always loaded: gbrain config set memory.core.enabled true';
@@ -37,6 +40,10 @@ const USAGE = `Usage: gbrain core <list|show|status|add|remove|diff|ack|init|sug
   init    [--source <id>] [--slug <slug>]
   suggest [--source <id>] [--apply] [--json]
 Docs: ${CORE_DOCS}`;
+
+export function printUsage(): void {
+  console.log(USAGE);
+}
 
 function flag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -125,7 +132,9 @@ function lineDiff(before: string, after: string): string {
 }
 
 export async function runCore(engine: BrainEngine, args: string[]): Promise<void> {
-  const sub = args[0];
+  // cli.ts answers help before dispatch (#6114 router); this covers direct callers.
+  if (subcommandHelpRequested(args, ROUTERS.core)) { printUsage(); return; }
+  const sub = args[0] as (typeof CORE_SUBCOMMANDS)[number] | undefined;
   const json = args.includes('--json');
   const sourceId = flag(args, '--source') ?? 'default';
   const slug = positional(args);
@@ -253,8 +262,8 @@ export async function runCore(engine: BrainEngine, args: string[]): Promise<void
       return;
     }
     default:
-      console.log(USAGE);
-      if (sub && sub !== '--help' && sub !== '-h' && sub !== 'help') setCliExitVerdict(1);
+      printUsage();
+      if (sub) setCliExitVerdict(1);
   }
 }
 

@@ -105,7 +105,7 @@ const JSON_ROWS: Record<string, JsonRow> = {
   errors: { ok: ['errors', 'unknown_flag', '--json'], fail: ['errors', 'definitely_not_a_code', '--json'], okOnEmpty: true },
   init: { ok: ['init', '--pglite', '--no-embedding', '--json'], fail: ['init', '--mcp-only', '--json', '--mcp-url', 'http://127.0.0.1:1/mcp'], okOnEmpty: true },
   doctor: { ok: ['doctor', '--json', '--fast'], fail: ['doctor', '--json'] },
-  sync: { ok: ['sync', '--source', 'notes', '--no-pull', '--json'], fail: ['sync', '--source', 'notes', '--json'], failOnBrain: true },
+  sync: { ok: ['sync', '--source', 'notes', '--no-pull', '--json'], fail: ['sync', '--source', 'no-such-source', '--no-pull', '--json'], failOnBrain: true },
   embed: { ok: ['embed', '--stale', '--json'], fail: ['embed', '--all', '--json'], failOnBrain: true },
   'db-repair': { ok: ['db-repair', '--json'], fail: ['db-repair', '--json'], failOnBrain: true, okE2E: 'test/e2e/cli-json-commands-postgres.test.ts' },
   dream: { ok: ['dream', '--json', '--phase', 'lint'], fail: ['dream', '--json', '--phase', 'garbage'] },

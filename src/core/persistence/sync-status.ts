@@ -51,8 +51,11 @@ export interface SyncStatusHold extends SyncFaultVerdict {
 
 export interface SyncStatusError extends SyncFaultVerdict {
   code: string;
+  /** A refinement of `code`: a lane fault (`cancelled`), or #6513 the closed `reason` of a database refusal. */
   detail?: string;
   message: string;
+  /** #6513: the receipt's public failure detail (origin, sqlstate, raiser, table, the closed reason; never message text). */
+  write_error_detail?: Record<string, unknown>;
   slug?: string;
   path?: string;
   request_id?: string;
@@ -83,10 +86,18 @@ interface CursorHeader { runId: string; index: number; total: number; target: st
   progress?: { startedAt: number; startIndex: number; lastAt: number; lastIndex: number };
   processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean }; syncOptions?: Parameters<typeof managedSyncResumeArgs>[0]['syncOptions'] }
 
-async function cursorHeader(engine: BrainEngine, sourceId: string): Promise<CursorHeader | null> {
+/** The newest cursor a current sync of the source can select: #6518, one recorded under its current incarnation. */
+async function cursorHeader(engine: BrainEngine, sourceId: string, incarnation: string): Promise<CursorHeader | null> {
   const rows = await engine.executeRaw<{ header: CursorHeader }>(
-    `SELECT completed_keys->0 AS header FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 ORDER BY updated_at DESC LIMIT 1`, [sourceId]);
+    `SELECT completed_keys->0 AS header FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->>'incarnation'=$2 ORDER BY updated_at DESC LIMIT 1`, [sourceId, incarnation]);
   return rows[0]?.header ?? null;
+}
+
+/** #6518: whether an unfinished cursor of the source stands under an incarnation it no longer has (nothing current resumes it). */
+async function retiredCursorStands(engine: BrainEngine, sourceId: string, incarnation: string): Promise<{ first_seen: string } | null> {
+  const [row] = await engine.executeRaw<{ first_seen: string }>(`SELECT to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS first_seen FROM op_checkpoints
+    WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->>'incarnation'<>$2 AND COALESCE(completed_keys->0->>'done','false')<>'true' ORDER BY updated_at LIMIT 1`, [sourceId, incarnation]);
+  return row ?? null;
 }
 
 /**
@@ -119,7 +130,7 @@ function holdStatus(record: GitHoldRecord, auto?: FenceAutoRepair): SyncStatusHo
 export async function readSyncStatus(engine: BrainEngine, sourceId: string): Promise<SyncStatus> {
   const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1 AND archived IS NOT TRUE', [sourceId]);
   if (!source) throw Object.assign(new Error(`Source ${sourceId} does not exist.`), { code: 'not_found' });
-  const header = await cursorHeader(engine, sourceId);
+  const header = await cursorHeader(engine, sourceId, source.incarnation);
   const [committed] = await engine.executeRaw<{ n: number | string }>(`SELECT count(*) AS n FROM persistence_requests WHERE source_id=$1 AND state='committed'
     AND intent->>'kind' IN ('managed_sync_import','managed_sync_delete') AND completed_at > now() - interval '10 minutes'`, [sourceId]);
   const records = ((await readGitSourceHolds(engine, { sourceIds: [sourceId] }))[0]?.holds ?? []).filter(hold => hold.incarnation === source.incarnation);
@@ -128,9 +139,16 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string): Pro
   const repairable = records.filter(record => contentHoldDisposition(record, auto).action === 'repair').length;
   const failures = (await readManagedSyncFailures(engine, [sourceId])).filter(failure => failure.code !== 'sync_incomplete');
   const failure = failures[0];
-  const laneFault = failure?.code === 'cancelled' ? laneFaultInMessage(failure.message) : null;
-  const lastError: SyncStatusError | null = failure ? { code: failure.code, ...(laneFault ? { detail: laneFault } : {}), message: failure.message, path: failure.path, phase: failure.phase, first_seen: failure.first_seen, attempts: failure.attempts,
-    ...(failure.request_id ? { request_id: failure.request_id } : {}), ...classifySyncFault({ code: failure.code, detail: laneFault, message: failure.message }) } : null;
+  const reason = typeof failure?.write_error_detail?.reason === 'string' ? failure.write_error_detail.reason : null;
+  const laneFault = (failure?.code === 'cancelled' ? laneFaultInMessage(failure.message) : null) ?? reason;
+  const retired = failure || header ? null : await retiredCursorStands(engine, sourceId, source.incarnation);
+  const repairPreview: Action = { argv: ['gbrain', 'repair', 'managed-sync-orphans', '--source', sourceId], consent: [], actor: 'agent', requires_exclusive: false,
+    why: 'Previews the sync bookkeeping nothing current can resume or clear (an old incarnation\'s cursor and failure rows, stale mirror rows) with the hash its --apply takes; writes nothing.' };
+  const lastError: SyncStatusError | null = failure ? { code: failure.code, ...(laneFault ? { detail: laneFault } : {}), message: failure.message, ...(failure.write_error_detail ? { write_error_detail: failure.write_error_detail } : {}),
+    path: failure.path, phase: failure.phase, first_seen: failure.first_seen, attempts: failure.attempts,
+    ...(failure.request_id ? { request_id: failure.request_id } : {}), ...classifySyncFault({ code: failure.code, detail: laneFault, message: failure.message }) }
+    : retired ? { code: 'cursor_incarnation_retired', message: `An unfinished sync cursor of ${sourceId} was recorded under an incarnation the source no longer has; no current sync selects it, and it says nothing about whether the current files are imported. `
+      + `Retire it with ${repairPreview.argv!.join(' ')} (preview, then --apply with the printed hash).`, phase: 'resume', first_seen: retired.first_seen, attempts: 1, ...classifySyncFault({ code: 'cursor_incarnation_retired' }) } : null;
   const unfinished = !!header && !header.done;
   const remaining = header ? Math.max(0, Number(header.total) - Number(header.index)) : null;
   const p = header?.progress;
@@ -147,6 +165,7 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string): Pro
         why: `${actionable.length} held file(s) have a safe action: unblock schedules each one whose condition holds (a committed edit, a stalled preparation) for a re-screen`
           + `${repairable ? `, repairs the ${repairable} content hold(s) the content-repair lane clears (hash-bound repairs under the fences.repair caps, one receipt per file, then the re-screen)` : ''}`
           + ' and names the sync to run; it refuses the rest by name and drops nothing.' }
+      : retired ? { ...repairPreview, verify }
       : unfinished || lastError
         ? { argv: ['gbrain', 'sync', ...resume, ...(lastError ? ['--retry-failed'] : [])], consent: [], actor: 'agent', requires_exclusive: false, verify,
           why: lastError ? `The last run recorded ${lastError.code} (${lastError.class}); this release holds or retries it, and --retry-failed converts the stopped entry in place without re-freezing the manifest.`
@@ -228,7 +247,7 @@ export async function unblockSync(engine: BrainEngine, sourceId: string, opts: U
   const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1 AND archived IS NOT TRUE', [sourceId]);
   if (!source) throw Object.assign(new Error(`Source ${sourceId} does not exist.`), { code: 'not_found' });
   const holds = ((await readGitSourceHolds(engine, { sourceIds: [sourceId] }))[0]?.holds ?? []).filter(hold => hold.incarnation === source.incarnation);
-  const header = await cursorHeader(engine, sourceId);
+  const header = await cursorHeader(engine, sourceId, source.incarnation);
   const resume = managedSyncResumeArgs({ sourceId, processingOptions: header?.processingOptions, syncOptions: header?.syncOptions });
   const context = holds.some(hold => hold.code === 'worktree_dirty') ? await resolveManagedSyncContext(engine, { sourceId, noPull: true }).catch(() => null) : null;
   const auto = await fenceAutoRepairFor(engine, holds);

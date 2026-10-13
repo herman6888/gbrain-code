@@ -24,6 +24,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import { faultPoint } from '../persistence/fault-points.ts';
 import { contentHash, rowToPage } from '../utils.ts';
 import { discoverWithdrawalTargets, withdrawalDiscoveryFailure } from './withdrawal-discovery.ts';
 import { dropPurgedFenceRows } from './purge-overlay.ts';
@@ -108,7 +109,15 @@ export async function planFactPurge(engine: BrainEngine, target: PurgeTarget, al
   const pages = [...discovered, ...takePages.map(p => ({ ...p, page_id: Number(p.page_id) }))].sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
   const [versions] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM page_versions v JOIN pages p ON p.id=v.page_id
     WHERE p.source_id=$1 AND (strpos(lower(v.compiled_truth),$2)>0 OR strpos(lower(COALESCE(v.timeline,'')),$2)>0)`, [target.source_id, target.fact.toLowerCase()]);
-  const requests = await findRequestsCarrying(engine, target.source_id, target.fact);
+  // #6511 [R5]: a statement timeout of this unindexable substring search is deterministic on a large journal, not contention: the typed code, not a retry.
+  const requests = await faultPoint('purge:carrying_lookup', { sourceId: target.source_id, operation: PURGE_OPERATION })
+    .then(() => findRequestsCarrying(engine, target.source_id, target.fact)).catch(error => {
+    if ((error as { code?: unknown } | null)?.code !== '57014') throw error;
+    throw opError('purge_lookup_timeout', 'This purge could not finish; nothing was purged. Do not assume the requested content was erased.',
+      `The lookup of historical write requests carrying fact ${target.id} in source ${target.source_id} exceeded its statement budget while the purge was planned, so no plan was made and nothing was removed, tombstoned or redacted. `
+      + 'Run the dry run again later (a smaller or compacted journal finishes it); if it times out again, report it with the persistence_request_indexes and persistence_request_growth entries of gbrain doctor --json.',
+      { fix: readFix('Lists the request-table indexes and their state, read-only.', { argv: ['gbrain', 'repair', 'request-indexes', '--json'] }) });
+  });
   const inputs: DerivationRef[] = [...factIds.map(id => ({ table: 'facts', id })), ...takes.map(t => ({ table: 'takes', id: t.id }))];
   const derived = await derivedRowsFrom(engine, inputs);
   const [counts] = await engine.executeRaw<{ q: number; rp: number; dp: number }>(`SELECT

@@ -114,6 +114,8 @@ export interface ExtractAtomsDrainDeps {
     failures?: Array<{ source: string; reason: string }>;
     budgetSkipped?: number;
     budget?: { spentUsd: number; capUsd: number };
+    /** #6503: items the batch cut at `cycle.extract_atoms.max_input_chars` (partial disposition, not complete). */
+    inputTruncated?: number;
   }>;
   /**
    * Count remaining eligible-but-unextracted pages, or null on query error.
@@ -213,6 +215,8 @@ export interface ExtractAtomsDrainResult {
   /** #6425: on a `budget` stop, the attempt's spend and its per-run cap (`cycle.extract_atoms.budget_usd`). */
   spent_usd?: number;
   budget_usd?: number;
+  /** #6503: items cut at the input cap across every batch; the model did not read their tails and they are not marked complete. */
+  input_truncated?: number;
 }
 
 /**
@@ -255,6 +259,7 @@ export async function runExtractAtomsDrain(
   let lastCount: number | null = null;
   let lockSignal: AbortSignal | null = null;
   let budget: { spentUsd: number; capUsd: number } | undefined;
+  let inputTruncated = 0;
   const result = (stopped: DrainStop, remaining: number | null): ExtractAtomsDrainResult => ({
     phase: 'extract_atoms',
     status: providerFailure ? 'provider_failure' : 'ok',
@@ -268,6 +273,7 @@ export async function runExtractAtomsDrain(
     omitted_failure_count: failureCount - failures.length,
     last_error: lastError,
     ...(stopped === 'budget' && budget ? { spent_usd: budget.spentUsd, budget_usd: budget.capUsd } : {}),
+    input_truncated: inputTruncated,
   });
   try {
     return await deps.withLock(async (signal) => {
@@ -322,6 +328,7 @@ export async function runExtractAtomsDrain(
           const r = await deps.runBatch({ signal: hard.signal, stopSignal: soft.signal });
           extracted += r.extracted;
           skipped += r.skipped;
+          inputTruncated += Math.max(0, Math.floor(Number(r.inputTruncated ?? 0)) || 0);
           batches++;
           // #4730: preserve typed per-item records (bounded, sanitized) while
           // keeping failure_count exact and reconcilable — count-only adapters
@@ -533,6 +540,7 @@ export async function runExtractAtomsDrainForSource(
           failures: typedFailures,
           budgetSkipped: Number(d.pages_skipped_budget ?? 0) + Number(d.transcripts_skipped_budget ?? 0),
           budget: { spentUsd: Number(d.estimated_spend_usd ?? 0), capUsd: Number(d.budget_usd ?? 0) },
+          inputTruncated: Number(d.input_truncated ?? 0),
         };
       },
       countRemaining: (signal) => countExtractAtomsBacklog(engine, extractionSourceId, { signal }),

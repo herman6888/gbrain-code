@@ -454,6 +454,30 @@ describe('user-prompt', () => {
     expect(STARTUP_HOOK_SKIP_COMMANDS.has('hook')).toBe(true);
   });
 
+  test('--harness codex confines the transcript to the Codex rollout store and parses it as a rollout (#5941)', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    const savedCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(tmp, 'codex');
+    try {
+      const day = join(tmp, 'codex', 'sessions', '2026', '10', '12');
+      mkdirSync(day, { recursive: true });
+      const rollout = join(day, 'rollout-2026-10-12T00-00-00-s-codex.jsonl');
+      writeFileSync(rollout, `${JSON.stringify({ timestamp: 't1', type: 'event_msg', payload: { type: 'user_message', message: 'earlier question about Acme' } })}\n`);
+      const out = collectStdout();
+      expect(await runHook(['user-prompt', '--harness', 'codex'], { ...out.io, stdin: JSON.stringify({ prompt: 'and now?', transcript_path: rollout, session_id: 's-codex' }) })).toBe(0);
+      expect((await lastHeartbeat())?.reason).not.toBe('transcript_outside_projects_dir');
+      expect(seen).toHaveLength(1);
+      expect(seen[0].window.map((t) => t.text)).toEqual(['earlier question about Acme', 'and now?']);
+      expect(JSON.parse(out.get()).hookSpecificOutput.additionalContext).toContain('ok');
+    } finally {
+      if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = savedCodexHome;
+    }
+  });
+
   test('confinement rejection aborts: heartbeat + exit 0 empty [S3#8]', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);

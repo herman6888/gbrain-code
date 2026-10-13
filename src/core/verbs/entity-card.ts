@@ -34,7 +34,7 @@ import { safeSynopsis } from '../context/retrieval-reflex.ts';
 import { stampEvidence, markKeywordHits } from '../search/evidence.ts';
 import type { Link, SearchResult } from '../types.ts';
 import type { NewerMentions } from '../mentions/newer-mentions.ts';
-import { loadLinkableTypes } from '../mentions/policy.ts';
+import { linkableTypesFor, loadLinkableTypes, loadSourcePack, readMentionPolicy, type MentionPolicy, type PackTypes } from '../mentions/policy.ts';
 import { readMentionCoverage, type MentionCoverage } from '../mentions/coverage.ts';
 import { encodeCursor, readReferrerGroups, PAGE_DEFAULT_LIMIT, type ReferenceRow } from '../mentions/referrers.ts';
 import { readCardIdentity, type CardIdentity } from './entity-card-identity.ts';
@@ -179,7 +179,7 @@ export interface EntityCardOpts {
   omitQuarantined?: boolean;
 }
 
-interface CardPageRow {
+export interface CardPageRow {
   slug: string;
   // v0.43 merge: retrieval-reflex's exported PageRow (safeSynopsis's param)
   // now requires source_id (federated push-context wave #2095). The card row
@@ -198,24 +198,52 @@ const ARM_ALIAS = 0;
 const ARM_EXACT = 1;
 const ARM_SUFFIX = 2;
 
-export async function buildEntityCard(
+/**
+ * The per-call invariants of a name lookup: whether this caller is kept from
+ * private pages (#4352: untrusted callers never resolve a `visibility:
+ * private` page into a card or a near-miss suggestion; local callers are
+ * unchanged), the mention policy and source pack (undefined policy: it could
+ * not be read), and the pack's linkable entity types (the exact-title
+ * tie-break; empty without a policy). A batch reads them once.
+ */
+export interface EntityLookupScope {
+  excludePrivate: boolean;
+  entityTypes: ReadonlySet<string>;
+  policy: MentionPolicy | undefined;
+  pack: PackTypes | null;
+}
+
+export async function entityLookupScope(engine: BrainEngine, sourceId: string, remote: boolean): Promise<EntityLookupScope> {
+  const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+  const excludePrivate = await resolveExcludePrivatePages(engine, remote ? undefined : false);
+  const policy = await readMentionPolicy(engine).catch(() => undefined);
+  const pack = await loadSourcePack(engine, sourceId);
+  return { excludePrivate, entityTypes: new Set(policy ? linkableTypesFor(pack, policy) : []), policy, pack };
+}
+
+/**
+ * Candidate selection for one name: `hit` with the best page row (its
+ * `compiled_truth` included) and up to SUGGESTION_CAP runners-up; `miss` with
+ * keyword near-miss suggestions; `withheld` when every match is a quarantined
+ * page `omitQuarantined` leaves out (no suggestion names it).
+ */
+export type EntityCandidates =
+  | { kind: 'hit'; row: CardPageRow; runnersUp: EntitySuggestion[] }
+  | { kind: 'miss'; suggestions: EntitySuggestion[] }
+  | { kind: 'withheld' };
+
+/** Resolve a trimmed, non-empty name to its candidates. Every arm is fail-soft. */
+export async function selectEntityCandidates(
   engine: BrainEngine,
   sourceId: string,
-  name: string,
-  opts: EntityCardOpts,
-): Promise<EntityCardResult> {
-  const trimmed = (name ?? '').trim();
-  if (!trimmed) return { found: false, suggestions: [] };
-
-  // #4352 — untrusted callers never resolve a `visibility: private` page into
-  // a card (or a near-miss suggestion). Trust + config gate resolve through
-  // the shared helper; local (remote:false) callers are unchanged. Covers
-  // entity, context_pack, and delta (all route through buildEntityCard).
-  const { resolveExcludePrivatePages, privatePagesFilterFragment } = await import('../search/private-visibility.ts');
-  const excludePrivate = await resolveExcludePrivatePages(engine, opts.remote ? undefined : false);
+  trimmed: string,
+  scope: EntityLookupScope,
+  opts: { omitQuarantined?: boolean } = {},
+): Promise<EntityCandidates> {
+  const { privatePagesFilterFragment } = await import('../search/private-visibility.ts');
   // Predicate text lives ONCE (private-visibility.ts) — both card queries
   // below select `FROM pages` unaliased, so qualify with the table name.
-  const privatePredicate = excludePrivate ? ` AND ${privatePagesFilterFragment('pages')}` : '';
+  const privatePredicate = scope.excludePrivate ? ` AND ${privatePagesFilterFragment('pages')}` : '';
 
   const norm = normalizeAlias(trimmed);
   const titleLc = trimmed.toLowerCase();
@@ -290,8 +318,7 @@ export async function buildEntityCard(
   // prefer a linkable entity page (the source pack's entity types) over
   // transcript/note containers. Recency remains the final tie-break within
   // the same match shape.
-  const { types: linkable } = await loadLinkableTypes(engine, sourceId).catch(() => ({ types: [] as string[], pack: null }));
-  const entityTypes = new Set(linkable);
+  const entityTypes = scope.entityTypes;
   const candidates = [...rankBySlug.entries()]
     .map(([s, rank]) => ({ slug: s, rank, row: rowBySlug.get(s) }))
     .filter((c): c is { slug: string; rank: number; row: CardPageRow } => c.row !== undefined)
@@ -304,28 +331,48 @@ export async function buildEntityCard(
 
   if (opts.omitQuarantined && candidates.some(c => isQuarantined(c.row.frontmatter))) {
     const live = candidates.filter(c => !isQuarantined(c.row.frontmatter));
-    if (live.length === 0) return { found: false, suggestions: [] };
+    if (live.length === 0) return { kind: 'withheld' };
     candidates.splice(0, candidates.length, ...live);
   }
-  if (candidates.length === 0) {
+  if (candidates.length === 0) return { kind: 'miss', suggestions: await nearMissSuggestions(engine, sourceId, trimmed, scope.excludePrivate) };
+
+  return {
+    kind: 'hit',
+    row: candidates[0].row,
+    runnersUp: candidates.slice(1, 1 + SUGGESTION_CAP).map(c => ({
+      slug: c.slug,
+      title: c.row.title ?? c.slug,
+      // A page that resolved through the precision arms exists by definition.
+      create_safety: 'exists',
+    })),
+  };
+}
+
+export async function buildEntityCard(
+  engine: BrainEngine,
+  sourceId: string,
+  name: string,
+  opts: EntityCardOpts,
+): Promise<EntityCardResult> {
+  const trimmed = (name ?? '').trim();
+  if (!trimmed) return { found: false, suggestions: [] };
+
+  // Covers entity, context_pack, and delta (all route through buildEntityCard).
+  const scope = await entityLookupScope(engine, sourceId, opts.remote);
+  const selected = await selectEntityCandidates(engine, sourceId, trimmed, scope, { omitQuarantined: opts.omitQuarantined });
+  if (selected.kind === 'withheld') return { found: false, suggestions: [] };
+  if (selected.kind === 'miss') {
     return {
-      found: false, suggestions: await nearMissSuggestions(engine, sourceId, trimmed, excludePrivate),
+      found: false, suggestions: selected.suggestions,
       ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [sourceId]).catch(() => undefined) } : {}),
     };
   }
 
-  const best = candidates[0];
-  const runnersUp: EntitySuggestion[] = candidates.slice(1, 1 + SUGGESTION_CAP).map(c => ({
-    slug: c.slug,
-    title: c.row.title ?? c.slug,
-    // A page that resolved through the precision arms exists by definition.
-    create_safety: 'exists',
-  }));
-
-  const card = await assembleCard(engine, sourceId, best.row, opts.remote, excludePrivate, opts.eligibility ?? {});
+  const { row, runnersUp } = selected;
+  const card = await assembleCard(engine, sourceId, row, opts.remote, scope.excludePrivate, opts.eligibility ?? {});
   if (opts.includeReferences) {
-    Object.assign(card, await cardReferences(engine, sourceId, best.row, opts, excludePrivate, entityTypes),
-      await readCardIdentity(engine, sourceId, best.row, { excludePrivate, excludeQuarantined: opts.omitQuarantined === true, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
+    Object.assign(card, await cardReferences(engine, sourceId, row, opts, scope.excludePrivate, scope.entityTypes),
+      await readCardIdentity(engine, sourceId, row, { excludePrivate: scope.excludePrivate, excludeQuarantined: opts.omitQuarantined === true, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
   }
   return {
     found: true,
@@ -402,13 +449,7 @@ async function assembleCard(
   // applies, so a private or derived page never surfaces its slug, its
   // links.context sentence, or a count.
   const [aka, outLinks, inEdges, backlinkCount, timeline, facts, activeFactCount] = await Promise.all([
-    engine
-      .executeRaw<{ alias_norm: string }>(
-        `SELECT alias_norm FROM page_aliases WHERE source_id = $1 AND slug = $2 ORDER BY alias_norm`,
-        [sourceId, pageSlug],
-      )
-      .then(rs => rs.map(r => r.alias_norm))
-      .catch(() => [] as string[]),
+    readAka(engine, sourceId, pageSlug),
     engine.getLinks(pageSlug, { ...(remote ? { sourceIds: [sourceId] } : { sourceId }), excludePrivate, temporal: { status: 'all' } }).catch(() => []),
     engine
       .executeRaw<{ from_slug: string; link_type: string; context: string | null }>(
@@ -581,6 +622,17 @@ async function assembleCard(
       ...(f.entity_slug && f.entity_slug !== pageSlug ? { entity_slug: f.entity_slug } : {}),
     })) } : {}),
   };
+}
+
+/** The card's `aka`: the page's normalized aliases (page_aliases reverse lookup); empty on a pre-migration brain. */
+export async function readAka(engine: BrainEngine, sourceId: string, slug: string): Promise<string[]> {
+  return engine
+    .executeRaw<{ alias_norm: string }>(
+      `SELECT alias_norm FROM page_aliases WHERE source_id = $1 AND slug = $2 ORDER BY alias_norm`,
+      [sourceId, slug],
+    )
+    .then(rs => rs.map(r => r.alias_norm))
+    .catch(() => [] as string[]);
 }
 
 function factTime(f: FactRow): number {

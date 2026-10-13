@@ -5,6 +5,12 @@
  * operator contract; every affected call's `_meta.retrieval` records the same
  * without `fields: "full"`.
  *
+ * Low-hanging-fruit item 3: a transient degradation (rerank_failed,
+ * embed_timeout, a failed keyword or title arm) shows on every affected call
+ * on stdio too; only a configuration-persistent `embed_unavailable` (a
+ * keyless brain) shows once per session, keyed by an unrendered
+ * `dedupe_key` that never reaches the wire. HTTP stays per call.
+ *
  * Drives the REAL dispatch path (dispatchToolCall → search op handler) with
  * hybridSearchCached mocked to report the degradation.
  *
@@ -20,13 +26,15 @@ import { DEGRADED_REASONS } from '../src/core/types.ts';
 import type { RerankFailedReason } from '../src/core/search/rerank.ts';
 
 let nextReason: string | undefined = 'unreachable';
+/** When set, the stages the next search reports instead of `rerank_failed: nextReason`. */
+let nextDegraded: Array<{ stage: string; reason?: string }> | undefined;
 
 mock.module('../src/core/search/hybrid.ts', () => ({
   ...realHybrid,
   hybridSearchCached: async (_engine: unknown, _query: string, opts: { onMeta?: (m: unknown) => void }) => {
     opts.onMeta?.({
       vector_enabled: true, expansion_applied: false, detail_resolved: null, retrieved_count: 1,
-      degraded: nextReason === undefined ? [] : [{ stage: 'rerank_failed', reason: nextReason }],
+      degraded: nextDegraded ?? (nextReason === undefined ? [] : [{ stage: 'rerank_failed', reason: nextReason }]),
     });
     return [{ page_id: 1, source_id: 'default', slug: 'notes/a', title: 'A', type: 'note', chunk_text: 'a text', score: 1 }];
   },
@@ -110,7 +118,7 @@ describe('rerank_failed notice per reason', () => {
 });
 
 describe('dispatch: per-call meta and session count', () => {
-  test('stdio: the notice shows once with the count, every call meta records reason, fallback and the running count', async () => {
+  test('stdio: the notice rides every affected call with the running count, and every call meta records reason, fallback and count', async () => {
     const noticeLedger = new NoticeLedger();
     nextReason = 'unreachable';
     const opts = { remote: true, transport: 'stdio' as const, sourceId: 'default', noticeLedger };
@@ -119,10 +127,10 @@ describe('dispatch: per-call meta and session count', () => {
     const metas = outs.map(o => (o._meta as Record<string, any>).retrieval);
     expect(metas.map(m => m.rerank_degraded)).toEqual([1, 2, 3].map(n => ({ reason: 'unreachable', fallback: 'fused_order', calls_this_session: n })));
     expect(metas.every(m => m.degraded.some((d: { stage: string; reason: string }) => d.stage === 'rerank_failed' && d.reason === 'unreachable'))).toBe(true);
-    expect(noticeBlock(outs[0])).toContain('rerank_failed: unreachable');
-    expect(noticeBlock(outs[0])).toContain('reranker-degraded calls this session: 1');
-    expect(noticeBlock(outs[1])).toBeUndefined();
-    expect(noticeBlock(outs[2])).toBeUndefined();
+    for (const [i, out] of outs.entries()) {
+      expect(noticeBlock(out)).toContain('rerank_failed: unreachable');
+      expect(noticeBlock(out)).toContain(`reranker-degraded calls this session: ${i + 1}`);
+    }
   });
 
   test('HTTP: the notice rides every affected call with the session running count; a healthy call adds nothing', async () => {
@@ -142,5 +150,79 @@ describe('dispatch: per-call meta and session count', () => {
     expect((second._meta as Record<string, any>).retrieval.rerank_degraded).toEqual({ reason: 'timeout', fallback: 'fused_order', calls_this_session: 2 });
     const other = await dispatchToolCall(engineStub, 'search', { query: 'which account' }, { ...opts, sessionId: 's2' } as any);
     expect((other._meta as Record<string, any>).retrieval.rerank_degraded.calls_this_session).toBe(1);
+  });
+});
+
+describe('degraded_recall dedupe: transient per call, configuration-persistent once per session', () => {
+  const stdio = () => ({ remote: true, transport: 'stdio' as const, sourceId: 'default', noticeLedger: new NoticeLedger() });
+  const search = (opts: Record<string, unknown>, degraded: Array<{ stage: string; reason?: string }>) => {
+    nextDegraded = degraded;
+    return dispatchToolCall(engineStub, 'search', { query: 'which account' }, opts as never);
+  };
+  const KEYLESS = [{ stage: 'embed_unavailable', reason: 'no_provider' }];
+
+  test('stdio: embed_timeout then a rerank failure shows two notices', async () => {
+    const opts = stdio();
+    try {
+      const first = await search(opts, [{ stage: 'embed_timeout', reason: 'timeout' }]);
+      const second = await search(opts, [{ stage: 'rerank_failed', reason: 'timeout' }]);
+      expect(noticeBlock(first)).toContain('embed_timeout');
+      expect(noticeBlock(second)).toContain('rerank_failed: timeout');
+    } finally { nextDegraded = undefined; }
+  });
+
+  test('stdio: failure, recovery, then the same failure shows the notice both times', async () => {
+    const opts = stdio();
+    try {
+      const failed = await search(opts, [{ stage: 'keyword_arm_failed', reason: 'provider_error' }]);
+      const healthy = await search(opts, []);
+      const again = await search(opts, [{ stage: 'keyword_arm_failed', reason: 'provider_error' }]);
+      expect(noticeBlock(failed)).toContain('keyword_arm_failed');
+      expect(noticeBlock(healthy)).toBeUndefined();
+      expect(noticeBlock(again)).toContain('keyword_arm_failed');
+      const title = await search(opts, [{ stage: 'title_arm_failed', reason: 'timeout' }]);
+      expect(noticeBlock(await search(opts, [{ stage: 'title_arm_failed', reason: 'timeout' }]))).toContain('title_arm_failed');
+      expect(noticeBlock(title)).toContain('title_arm_failed');
+    } finally { nextDegraded = undefined; }
+  });
+
+  test('stdio: two keyless searches show one notice; a transient failure on top still shows', async () => {
+    const opts = stdio();
+    try {
+      const first = await search(opts, KEYLESS);
+      const second = await search(opts, KEYLESS);
+      expect(noticeBlock(first)).toContain('embed_unavailable');
+      expect(noticeBlock(second)).toBeUndefined();
+      const mixed = await search(opts, [...KEYLESS, { stage: 'rerank_failed', reason: 'timeout' }]);
+      expect(noticeBlock(mixed)).toContain('rerank_failed: timeout');
+      expect(noticeBlock(await search(opts, KEYLESS))).toBeUndefined();
+    } finally { nextDegraded = undefined; }
+  });
+
+  test('HTTP stays per call, keyless included', async () => {
+    const opts = { remote: true, transport: 'http' as const, sourceId: 'default', noticeLedger: new NoticeLedger(), auth: { clientId: 'client-a', scopes: ['read'] }, sessionId: 's1' };
+    try {
+      for (let i = 0; i < 2; i++) expect(noticeBlock(await search(opts, KEYLESS))).toContain('embed_unavailable');
+      for (let i = 0; i < 2; i++) expect(noticeBlock(await search(opts, [{ stage: 'embed_timeout', reason: 'timeout' }]))).toContain('embed_timeout');
+    } finally { nextDegraded = undefined; }
+  });
+
+  test('dedupe_key is built from sorted unique stage/reason pairs, only for configuration-persistent stages, and never reaches the wire', async () => {
+    expect(degradedRecallNotice([{ stage: 'embed_unavailable', reason: 'no_provider' }, { stage: 'embed_unavailable', reason: 'no_provider' }], { transport: 'stdio' })!.dedupe_key)
+      .toBe('embed_unavailable:no_provider');
+    expect(degradedRecallNotice([{ stage: 'embed_unavailable', reason: 'no_provider' }, { stage: 'embed_unavailable', reason: 'embedding_disabled' }], { transport: 'stdio' })!.dedupe_key)
+      .toBe('embed_unavailable:embedding_disabled|embed_unavailable:no_provider');
+    expect(degradedRecallNotice(['keyword_only_no_embedding_provider'], { transport: 'stdio' })!.dedupe_key).toBe('keyword_only_no_embedding_provider:');
+    for (const transient of [
+      [{ stage: 'embed_unavailable', reason: 'provider_error' }], [{ stage: 'embed_timeout', reason: 'timeout' }], [{ stage: 'rerank_failed', reason: 'auth' }],
+      [{ stage: 'keyword_arm_failed', reason: 'timeout' }], [{ stage: 'title_arm_failed' }], [...KEYLESS, { stage: 'rerank_failed', reason: 'timeout' }], ['embed_unavailable'],
+    ]) expect(degradedRecallNotice(transient, { transport: 'stdio' })!.dedupe_key, JSON.stringify(transient)).toBeUndefined();
+    const opts = stdio();
+    try {
+      const out = await search(opts, KEYLESS);
+      expect(noticeBlock(out)).toBeDefined();
+      expect(JSON.stringify(out)).not.toContain('dedupe_key');
+      expect(JSON.stringify(out)).not.toContain('embed_unavailable:no_provider');
+    } finally { nextDegraded = undefined; }
   });
 });

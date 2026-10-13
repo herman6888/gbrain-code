@@ -2,17 +2,20 @@
  * `entity` with `names`: resolve a list of names, codes and aliases in one
  * call, the way a reader resolves the account codes and nicknames a batch of
  * handoff mails names. Each name resolves exactly as `entity name:` does
- * (buildEntityCard's alias, slug, title and fuzzy arms; private and
- * quarantined pages, siblings included, hidden from remote callers) and returns a compact row: the page, its names, the
- * opening lines of its body (`lead`) and its identity siblings with theirs.
- * No references, facts or open threads: a full card per name is `entity name:`.
+ * (the card's candidate selection, `selectEntityCandidates`: alias, slug,
+ * title and suffix arms; private and quarantined pages, siblings included,
+ * hidden from remote callers) and returns a compact row: the page, its names,
+ * the opening lines of its body (`lead`, from the candidate row) and its
+ * identity siblings with theirs. No card is assembled (no references, facts or
+ * open threads: a full card per name is `entity name:`), and the private-page
+ * setting, mention policy and source pack are read once per batch.
  *
  * Bounded: at most ENTITY_NAMES_MAX names, ENTITY_LEAD_CHARS per lead,
  * duplicates resolved once.
  */
 import type { BrainEngine } from '../engine.ts';
-import { buildEntityCard } from './entity-card.ts';
-import { readCardIdentity } from './entity-card-identity.ts';
+import { entityLookupScope, readAka, selectEntityCandidates, type EntityLookupScope } from './entity-card.ts';
+import { readSiblingIdentity } from './entity-card-identity.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { redactFindings } from '../secret-scan.ts';
 
@@ -35,32 +38,31 @@ export function pageLead(body: string | null, max = ENTITY_LEAD_CHARS): string {
 }
 
 export async function lookupEntityNames(engine: BrainEngine, sourceId: string, names: string[],
-  opts: { remote: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full' }): Promise<{ results: EntityNameRow[]; found: number; missing: number }> {
+  opts: { remote: boolean }): Promise<{ results: EntityNameRow[]; found: number; missing: number }> {
   const unique = [...new Set(names.map(n => n.trim()).filter(Boolean))];
+  const scope = await entityLookupScope(engine, sourceId, opts.remote);
   const rows = new Map<string, EntityNameRow>();
   for (let i = 0; i < unique.length; i += CONCURRENCY) {
-    await Promise.all(unique.slice(i, i + CONCURRENCY).map(async name => rows.set(name, await lookupOne(engine, sourceId, name, opts))));
+    await Promise.all(unique.slice(i, i + CONCURRENCY).map(async name => rows.set(name, await lookupOne(engine, sourceId, name, scope, opts))));
   }
   const results = unique.map(n => rows.get(n)!);
   const found = results.filter(r => r.found).length;
   return { results, found, missing: results.length - found };
 }
 
-async function lookupOne(engine: BrainEngine, sourceId: string, name: string,
-  opts: { remote: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full' }): Promise<EntityNameRow> {
-  const result = await buildEntityCard(engine, sourceId, name, { remote: opts.remote, includeReferences: false, omitQuarantined: opts.remote });
-  if (!result.found || !result.card) {
-    const suggestions = (result.suggestions ?? []).slice(0, 3).map(s => ({ slug: s.slug, title: s.title }));
+async function lookupOne(engine: BrainEngine, sourceId: string, name: string, scope: EntityLookupScope,
+  opts: { remote: boolean }): Promise<EntityNameRow> {
+  const selected = await selectEntityCandidates(engine, sourceId, name, scope, { omitQuarantined: opts.remote });
+  if (selected.kind !== 'hit') {
+    const suggestions = (selected.kind === 'miss' ? selected.suggestions : []).slice(0, 3).map(s => ({ slug: s.slug, title: s.title }));
     return { name, found: false, ...(suggestions.length ? { suggestions } : {}) };
   }
-  const { entity, aka } = result.card;
-  const [row] = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
-    'SELECT slug, title, compiled_truth FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [sourceId, entity.slug]);
-  const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
-  const excludePrivate = await resolveExcludePrivatePages(engine, opts.remote ? undefined : false);
-  const identity = row ? await readCardIdentity(engine, sourceId, row, { excludePrivate, excludeQuarantined: opts.remote, surfaceCeiling: opts.surfaceCeiling, aka }).catch(() => null) : null;
-  const siblingPages = identity?.identity_siblings?.pages ?? [];
-  const bodies = new Map<string, string | null>([[entity.slug, row?.compiled_truth ?? null]]);
+  const { row } = selected;
+  const aka = await readAka(engine, sourceId, row.slug);
+  const { identity_siblings } = await readSiblingIdentity(engine, sourceId, row,
+    { excludePrivate: scope.excludePrivate, excludeQuarantined: opts.remote, policy: scope.policy, pack: scope.pack });
+  const siblingPages = identity_siblings?.pages ?? [];
+  const bodies = new Map<string, string | null>([[row.slug, row.compiled_truth]]);
   if (siblingPages.length) {
     const sib = await engine.executeRaw<{ slug: string; compiled_truth: string | null }>(
       'SELECT slug, compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL',
@@ -68,7 +70,7 @@ async function lookupOne(engine: BrainEngine, sourceId: string, name: string,
     for (const s of sib) bodies.set(s.slug, s.compiled_truth);
   }
   return {
-    name, found: true, slug: entity.slug, title: entity.title, type: entity.type, aka, lead: pageLead(bodies.get(entity.slug) ?? null),
+    name, found: true, slug: row.slug, title: row.title ?? row.slug, type: row.type ?? null, aka, lead: pageLead(bodies.get(row.slug) ?? null),
     ...(siblingPages.length ? { siblings: siblingPages.map(p => ({ slug: p.slug, title: p.title, type: p.type, aka: p.aka, lead: pageLead(bodies.get(p.slug) ?? null) })) } : {}),
   };
 }

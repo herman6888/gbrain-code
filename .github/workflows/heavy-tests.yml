@@ -71,13 +71,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
-      - run: bun install --frozen-lockfile
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
       # The 10k graduation fixture is cached as a PGLite data-dir tarball keyed
       # by the fixture sources (scripts/persistence/graduation-fixture.ts
       # verifies its own key; a stale entry is rebuilt, never reused).
@@ -173,13 +175,15 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
-      - run: bun install --frozen-lockfile
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
 
       - name: Credential gate (visible skip without provider secrets)
         id: keys
@@ -282,13 +286,15 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
-      - run: bun install --frozen-lockfile
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
 
       # `runner.temp` is not an allowed context in job-level env, so the
       # evidence dir is derived here and exported for every later step (the
@@ -532,13 +538,15 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
-      - run: bun install --frozen-lockfile
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
 
       - name: Prepare evidence dir
         run: |
@@ -758,8 +766,10 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.3
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
 
       - name: Build gbrain (compile once for the doors)
         run: |
@@ -854,8 +864,10 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.3
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
 
       - name: Prepare evidence dir
         run: |
@@ -1066,8 +1078,10 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.3
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
       - name: Build gbrain
         run: |
           bun build --compile --no-compile-autoload-bunfig --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts

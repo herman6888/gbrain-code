@@ -292,6 +292,7 @@
         "invalidateContentDriftEmbeddings",
         "invalidateStaleSignatureEmbeddings",
         "jitOffRead",
+        "keywordStatementTimeoutSetting",
         "listActiveTakesForPages",
         "listAllPageRefs",
         "listAllSources",

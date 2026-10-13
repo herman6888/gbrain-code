@@ -16,6 +16,7 @@ the exit code first, then reads the JSON document (`--json`) for the details:
 | 3 | `confirmation_required`: nothing ran | consent payload (`effects`, `user_message`, `fix`) | stop, relay `user_message` to the user, run `fix.command` only after they agree |
 | 10 | the write was accepted and is still pending | write receipt | poll the receipt (`gbrain write-request -- <id>`); `--accept-pending` maps this to 0 |
 | 11 | partial, resumable budget stop | result with `remaining_*` and `resume_command` | run `resume_command` (it is safe to re-run) |
+| 69 | `gbrain serve` exited on its own after its persistence consumer reported `restart_required` for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS` (`serve_unhealthy_exit`; opt-in) | `[gbrain serve] error code=serve_unhealthy_exit` line on stderr | nothing: the supervisor (the installed service restarts on failure) starts a fresh serve; if it repeats, follow [the unhealthy exit](../ENGINES.md#serve-unhealthy-exit) |
 | 75 | another runner holds the migration lock, or an engine graduation owns the brain (`graduation_in_progress`) | error envelope | wait for the other runner, then retry |
 | 124 | the command's own deadline elapsed | error envelope | inspect what is still running (the message names the status command) |
 | 130 | interrupted (SIGINT) | error envelope | ask the user whether to re-run |

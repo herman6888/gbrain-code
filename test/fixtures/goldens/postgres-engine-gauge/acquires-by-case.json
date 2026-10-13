@@ -315,17 +315,19 @@
     "revertToVersion#default": {},
     "revertToVersion#sourceId": {},
     "searchKeyword#cjk": {
-      "raw": 2,
+      "raw": 3,
       "tx": 1
     },
     "searchKeyword#cjk+sourceIds+detailLow": {
-      "raw": 2,
+      "raw": 3,
       "tx": 1
     },
     "searchKeywordChunks#cjk": {
+      "raw": 1,
       "tx": 1
     },
     "searchKeywordChunks#cjk+sourceId": {
+      "raw": 1,
       "tx": 1
     },
     "searchTakes#default": {},

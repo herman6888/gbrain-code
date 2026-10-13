@@ -62,6 +62,16 @@ export const DEGRADED_STAGE_GUIDANCE: Readonly<Record<RecallStage, StageGuidance
   facts_embedding_column_missing: { why: 'the facts table has no embedding column, so saved facts were ranked by word overlap alone', fix: 'doctor' },
 };
 
+/**
+ * Stage/reason pairs that come from the brain's configuration, not from this
+ * call: a keyless install (`--no-embedding`, or no embedding provider)
+ * degrades every search the same way, so its notice shows once per session.
+ * Every other recall stage is transient and rides each affected call.
+ */
+const CONFIGURATION_PERSISTENT_STAGES: ReadonlySet<string> = new Set([
+  'embed_unavailable:embedding_disabled', 'embed_unavailable:no_provider', 'keyword_only_no_embedding_provider:',
+]);
+
 const NOT_ABSENCE = 'Treat a thin or empty result as "not found with a degraded search", never as "the brain has nothing on this".';
 
 /** Why each `rerank_failed` reason happened (closed vocabulary: RerankFailedReason). */
@@ -129,6 +139,8 @@ function embeddingsFix(cfg: GBrainConfig | null | undefined, transport: 'stdio' 
 
 /**
  * One `degraded_recall` notice for the recall-affecting stages of this call; null when none applies.
+ * It rides every affected call, except when all its stage/reason pairs are configuration-persistent:
+ * then it carries an unrendered `dedupe_key` (the sorted unique pairs) and shows once per session.
  * A `rerank_failed` stage names its reason, the fallback (fused order) and, when the caller counts them
  * (`rerankDegradedCalls`), this session's reranker-degraded calls; its fix follows the reason (`retry`
  * is the call to repeat after a transient failure) when no other stage needs a fix.
@@ -142,6 +154,8 @@ export function degradedRecallNotice(
     .filter(s => affectsRecall(s) && (s.stage as string) in DEGRADED_STAGE_GUIDANCE)
     .map(s => s.stage as RecallStage))];
   if (names.length === 0) return null;
+  const pairs = [...new Set(entries.filter(s => names.includes(s.stage as RecallStage)).map(s => `${s.stage}:${s.reason ?? ''}`))].sort();
+  const persistent = pairs.every(p => CONFIGURATION_PERSISTENT_STAGES.has(p));
   const rerank = names.includes('rerank_failed') ? rerankReason(entries.find(s => s.stage === 'rerank_failed')?.reason) : undefined;
   const labels = names.map(n => (n === 'rerank_failed' ? `rerank_failed: ${rerank}` : n));
   const whys = names.map(n => (n === 'rerank_failed'
@@ -161,6 +175,7 @@ export function degradedRecallNotice(
     why: `Recall was degraded (${labels.join(', ')}): ${whys.join('; ')}. ${NOT_ABSENCE}${choice}`,
     ...(fix ? { fix } : {}),
     ...(fix?.user_message ? { user_message: fix.user_message } : {}),
+    ...(persistent ? { dedupe_key: pairs.join('|') } : {}),
   };
 }
 
@@ -253,6 +268,16 @@ export function degradedDedupNotice(cfg?: GBrainConfig | null): Notice {
     kind: 'info',
     why: 'No embedding provider is configured, so remember detects only exact duplicates; a near-duplicate phrasing of an existing fact inserts a second fact. Recall first when unsure whether a fact is already saved.',
     ...(fix?.consent.length ? { fix } : {}),
+  };
+}
+
+/** Local CLI remember with visibility private: recall-only, never pushed into agent sessions (#6606). */
+export function privateFactNotice(factId?: string | number): Notice {
+  const forget = factId !== undefined ? ` (then \`gbrain forget ${factId}\` drops the private copy; replaces cannot change visibility)` : '';
+  return {
+    code: 'private_fact_not_pushed',
+    kind: 'info',
+    why: `This fact is private: only local CLI recall reads it. Session hooks push world-visible facts only, so it will not reach a new agent session, and MCP agents cannot recall it. If the user wants their agents to know it without looking it up, ask them before saving it again with visibility world${forget}.`,
   };
 }
 
@@ -368,6 +393,29 @@ export function localTranscriptsNotice(presence: { dirs: string[]; count: number
       + 'Read them with the command in fix (from a shell on this machine; otherwise ask the user to run it), or read those .txt files directly if you have a shell here. Never answer "no transcripts" or "no notes" from a page search alone.',
     fix: localTranscriptsFix(),
     user_message: 'Your recent session transcripts are on this machine but not in the searchable pages. I can read them with `gbrain transcripts recent --json`; want me to, or can you run it and share the output?',
+  };
+}
+
+// ── content a hidden tool serves (D2) ─────────────────────────────────────
+
+/**
+ * `hidden_tool_content`: this result left out takes (page reads, search and
+ * query never show the takes table to an agent-facing reader) that a tool
+ * outside this connection's tool list serves. The fix is the hidden-tool
+ * route's next step (`hiddenToolNext`); a connection with none gets the
+ * reason alone. Counts and the result's own slugs only, never take text.
+ */
+export function hiddenTakesNotice(hidden: { pages: string[]; count: number }, route: 'callable' | 'widen' | 'host', fix: Action | null): Notice {
+  const n = hidden.count >= 100 ? '100+' : String(hidden.count);
+  const pages = hidden.pages.length === 1 ? hidden.pages[0] : `${hidden.pages.slice(0, -1).join(', ')} and ${hidden.pages[hidden.pages.length - 1]}`;
+  const reach = route === 'callable' ? 'takes_list lists them: call it as fix shows.'
+    : route === 'widen' ? 'One request_tools call makes takes_list available here, as fix shows.'
+      : fix ? 'This connection cannot list them; fix says who can change that.' : 'This connection cannot list them, and only the brain owner can change that.';
+  return {
+    code: 'hidden_tool_content',
+    kind: 'info',
+    why: `This result leaves out ${n} take${n === '1' ? '' : 's'} (attributed claims such as forecasts, estimates and bets) on ${pages}: page reads and search never include the takes table, so their absence here does not mean the brain has none. ${reach}`,
+    ...(fix ? { fix } : {}),
   };
 }
 

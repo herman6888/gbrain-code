@@ -13,7 +13,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { VERSION } from '../version.ts';
-import { OperationError, __registerOperationErrorRenderer } from './ops/contract.ts';
+import { OperationError, __registerOperationErrorRenderer, type WithdrawnDetail } from './ops/contract.ts';
 import { StructuredAgentError } from './errors.ts';
 import { canonicalCodeFor, codeEntry, codeClass, codeRetryable, exitCodeForCode } from './error-catalogue.ts';
 import { VERB_NAMES } from './verbs.ts';
@@ -76,6 +76,13 @@ export interface Notice {
   fix?: Action;
   user_message?: string;
   decisions?: Decision[];
+  /**
+   * Unrendered: the NoticeLedger's dedupe identity. A per-call code carrying
+   * one is deduped per session under `code` + this key instead of riding
+   * every call; any code carrying one dedupes under it instead of `code`
+   * alone. renderNotice never copies it, so it never reaches the wire.
+   */
+  dedupe_key?: string;
 }
 export interface RenderedNotice extends Omit<Notice, 'fix'> { fix?: RenderedAction; contract_version: 1 }
 
@@ -97,6 +104,8 @@ export interface AgentEnvelope {
   detail?: string; protocol_version?: 1; write_request?: unknown; write_error?: string;
   /** #6188: a fence refusal's location and blocking issues (location and class only). */
   fence?: Record<string, unknown>; fence_issues?: Array<Record<string, unknown>>;
+  /** A `fact_withdrawn` refusal's withdrawal (`at`, `subject`, `visibility`). */
+  withdrawn?: WithdrawnDetail;
 }
 
 export interface RenderContext {
@@ -368,6 +377,7 @@ export interface EnvelopeParts {
   retryable?: boolean;
   fence?: Record<string, unknown>;
   fence_issues?: Array<Record<string, unknown>>;
+  withdrawn?: WithdrawnDetail;
 }
 
 /** Replace each occurrence of `bare` that is a whole command (not followed by a word, path or more flags). */
@@ -416,6 +426,7 @@ export function buildEnvelope(p: EnvelopeParts, ctx: RenderContext): AgentEnvelo
     ...(p.write_error !== undefined ? { write_error: p.write_error } : {}),
     ...(p.fence !== undefined ? { fence: p.fence } : {}),
     ...(p.fence_issues?.length ? { fence_issues: p.fence_issues } : {}),
+    ...(p.withdrawn !== undefined ? { withdrawn: p.withdrawn } : {}),
     ...(p.reason !== undefined ? { reason: p.reason } : {}),
     ...(p.why !== undefined ? { why: p.why } : {}),
     ...(fix ? { fix } : {}),
@@ -558,6 +569,7 @@ const ROWS: Row[] = [
         protocol_version: e.protocolVersion === 1 ? 1 : undefined,
         write_request: j.write_request, write_error: e.writeError,
         ...(e.fence ? { fence: e.fence } : {}), ...(e.fenceIssues?.length ? { fence_issues: e.fenceIssues } : {}),
+        ...(e.withdrawn ? { withdrawn: e.withdrawn } : {}),
         ...(e.retryable !== undefined ? { retryable: e.retryable } : {}),
       };
     },

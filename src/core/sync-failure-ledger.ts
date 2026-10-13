@@ -667,10 +667,12 @@ export function mirrorManagedSyncFailure(failure: { source_id: string; path: str
   });
 }
 
-export function clearManagedSyncFailure(key: string): void {
-  withLedgerLock(() => {
+/** Removes the mirror row(s) under a managed cursor key; true when one was there. */
+export function clearManagedSyncFailure(key: string): boolean {
+  return withLedgerLock(() => {
     const entries = loadSyncFailures(), kept = entries.filter(row => row.managed_cursor_key !== key);
     if (kept.length !== entries.length) _writeAll(kept);
+    return kept.length !== entries.length;
   });
 }
 

@@ -142,6 +142,7 @@ export async function runMemoryWrite<T>(run: () => Promise<T>): Promise<T> {
       const frozen = frozenVerbWriteError(error.writeRequest, error.writeError, error.message);
       // #6188: the frozen v1 code stays; the fence refusal's reason, location and issues ride along additively.
       if (error.canonicalCode === 'invalid_fence') Object.assign(frozen, { reason: error.reason, fence: error.fence, fenceIssues: error.fenceIssues });
+      if (error.withdrawn) frozen.withdrawn = error.withdrawn;
       throw frozen;
     }
     // #5575: the frozen wire code stays invalid_params; the envelope's canonical code is purged_content.

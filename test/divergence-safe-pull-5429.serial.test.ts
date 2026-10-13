@@ -89,27 +89,35 @@ beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gd-5429-')); });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('--no-autostash (#5429, bug fix)', () => {
-  test('the pull git runs carries --no-autostash, in rebase mode and in merge mode', () => {
+  test('#6530: no git pull or rebase runs; the only working-tree move is merge --ff-only with merge.autoStash=false, in rebase mode and in merge mode', () => {
     const { bare, work } = makePair();
     const other = secondClone(bare);
     commitFile(other, 'remote.txt', 'r\n', 'remote');
     git(other, 'push', '-q', 'origin', 'main');
-    const pulls: string[][] = [];
+    const calls: string[][] = [];
     const spy = spyOn(childProcess, 'execFileSync');
     try {
       divergenceSafePull(work, 'main');
+      commitFile(other, 'remote2.txt', 'r2\n', 'remote 2');
+      git(other, 'push', '-q', 'origin', 'main');
       divergenceSafePull(work, 'main', { strategy: 'merge' });
     } finally {
       for (const call of spy.mock.calls) {
         const args = call[1] as string[] | undefined;
-        if (call[0] === 'git' && Array.isArray(args) && args.includes('pull')) pulls.push(args);
+        if (call[0] === 'git' && Array.isArray(args)) calls.push(args);
       }
       spy.mockRestore();
     }
-    expect(pulls).toHaveLength(2);
-    for (const argv of pulls) expect(argv.slice(argv.indexOf('pull'))).toContain('--no-autostash');
-    expect(pulls[0]!.slice(pulls[0]!.indexOf('pull'))).toContain('--rebase');
-    expect(pulls[1]!.slice(pulls[1]!.indexOf('pull'))).toContain('--no-rebase');
+    expect(calls.some(argv => argv.includes('pull') || argv.includes('rebase') || argv.includes('stash'))).toBe(false);
+    const moves = calls.filter(argv => argv.includes('merge') && !argv.includes('merge-base') && !argv.includes('merge-tree'));
+    expect(moves).toHaveLength(2);
+    for (const argv of moves) {
+      expect(argv.slice(argv.indexOf('merge'))).toContain('--ff-only');
+      const off = argv.indexOf('merge.autoStash=false');
+      expect(argv[off - 1]).toBe('-c');
+      expect(off).toBeLessThan(argv.indexOf('merge'));
+    }
+    expect(existsSync(join(work, 'remote2.txt'))).toBe(true);
   });
 
   test('git itself: with rebase.autoStash=true the old argv stashes and replays a dirty edit; --no-autostash refuses and leaves the stash list empty', () => {
@@ -137,6 +145,22 @@ describe('--no-autostash (#5429, bug fix)', () => {
     }
   });
 
+  test('git itself: with merge.autoStash=true, the advance argv (-c merge.autoStash=false merge --ff-only) refuses a dirty must-change file and stashes nothing', () => {
+    const { bare, work } = makePair();
+    const other = secondClone(bare);
+    commitFile(other, 'README.md', 'remote edit\n', 'remote');
+    git(other, 'push', '-q', 'origin', 'main');
+    git(work, 'config', 'merge.autoStash', 'true');
+    writeFileSync(join(work, 'README.md'), 'in-flight local edit\n');
+    git(work, 'fetch', '-q', 'origin', 'main');
+    let exit = 0;
+    try { git(work, '-c', 'merge.autoStash=false', 'merge', '--ff-only', '--quiet', 'origin/main'); }
+    catch (error) { exit = (error as { status: number }).status; }
+    expect(exit).not.toBe(0);
+    expect(readFileSync(join(work, 'README.md'), 'utf8')).toBe('in-flight local edit\n');
+    expect(git(work, 'stash', 'list')).toBe('');
+  });
+
   test('a dirty tree with rebase.autoStash=true is skipped_dirty in both modes, nothing stashed', () => {
     for (const strategy of ['rebase', 'merge'] as const) {
       const { work } = makePair();
@@ -150,26 +174,21 @@ describe('--no-autostash (#5429, bug fix)', () => {
 });
 
 describe('pull_strategy: merge (#5429, feature)', () => {
-  test('tip-equivalent divergence: rebase mode conflict_aborted, merge mode advanced with both histories as ancestors', () => {
-    const rebase = tipEquivalentDivergence();
-    const before = treeBytes(rebase.work);
-    const out = divergenceSafePull(rebase.work, 'main');
-    expect(out.status).toBe('conflict_aborted');
-    expect(git(rebase.work, 'rev-parse', 'HEAD')).toBe(rebase.localHead);
-    expect(existsSync(join(rebase.work, '.git', 'rebase-merge'))).toBe(false);
-    expect(treeBytes(rebase.work)).toEqual(before);
-
-    const merge = tipEquivalentDivergence();
-    const merged = divergenceSafePull(merge.work, 'main', { strategy: 'merge' });
-    expect(merged.status).toBe('advanced');
-    if (merged.status !== 'advanced') throw new Error('unreachable');
-    expect(merged.from).toBe(merge.localHead);
-    const head = git(merge.work, 'rev-parse', 'HEAD');
-    expect(merged.to).toBe(head);
-    expect(git(merge.work, 'merge-base', '--is-ancestor', merge.remoteHead, head)).toBe('');
-    expect(git(merge.work, 'merge-base', '--is-ancestor', merge.localHead, head)).toBe('');
-    expect(readFileSync(join(merge.work, 'page.md'), 'utf8')).toBe('v2\n');
-    expect(existsSync(join(merge.work, '.git', 'MERGE_HEAD'))).toBe(false);
+  test('tip-equivalent divergence: both modes merge the tips in memory (#6530; rebase replay used to conflict) with both histories as ancestors', () => {
+    for (const strategy of ['rebase', 'merge'] as const) {
+      const merge = tipEquivalentDivergence();
+      const merged = divergenceSafePull(merge.work, 'main', { strategy });
+      expect(merged.status).toBe('advanced');
+      if (merged.status !== 'advanced') throw new Error('unreachable');
+      expect(merged.from).toBe(merge.localHead);
+      const head = git(merge.work, 'rev-parse', 'HEAD');
+      expect(merged.to).toBe(head);
+      expect(git(merge.work, 'merge-base', '--is-ancestor', merge.remoteHead, head)).toBe('');
+      expect(git(merge.work, 'merge-base', '--is-ancestor', merge.localHead, head)).toBe('');
+      expect(readFileSync(join(merge.work, 'page.md'), 'utf8')).toBe('v2\n');
+      expect(existsSync(join(merge.work, '.git', 'MERGE_HEAD'))).toBe(false);
+      expect(existsSync(join(merge.work, '.git', 'rebase-merge'))).toBe(false);
+    }
   });
 
   test('merge mode fast-forwards when the local branch is behind and reports up_to_date when level', () => {

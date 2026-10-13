@@ -10,7 +10,7 @@ import { claimWorktree, getWorktreeBinding } from '../../src/core/persistence/ow
 import { performManagedSync } from '../../src/core/persistence/sync-run.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { INCOMPLETE_SYNC_RECEIPT_SQL, readRequestIndexStates } from '../../src/core/persistence/checkpoint-validation.ts';
-import { PERSISTENCE_SYNC_RUN_INDEXES } from '../../src/core/persistence/schema.ts';
+import { PERSISTENCE_REQUEST_ONLINE_INDEXES, PERSISTENCE_SYNC_RUN_INDEXES } from '../../src/core/persistence/schema.ts';
 import { SCHEMA_SQL } from '../../src/core/schema-embedded.generated.ts';
 import { v179 } from '../../src/core/schema-migrations/v179-persistence-request-sync-run-indexes.ts';
 import { requestIndexesCheck, requestGrowthCheck } from '../../src/commands/doctor/checks/persistence-requests.ts';
@@ -31,6 +31,9 @@ let close: () => Promise<void>;
 const env = { GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_SOURCE: undefined, OPENAI_API_KEY: undefined, VOYAGE_API_KEY: undefined, ANTHROPIC_API_KEY: undefined };
 const git = (root: string, ...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const NAMES = PERSISTENCE_SYNC_RUN_INDEXES.map(index => index.name);
+// #6511 added the purge slug index to the online-built set; `readRequestIndexStates` lists it after the pair.
+const ALL_NAMES = PERSISTENCE_REQUEST_ONLINE_INDEXES.map(index => index.name);
+const states = async (names: readonly string[] = ALL_NAMES) => (await readRequestIndexStates(engine, names.map(name => ({ name })))).map(index => index.state);
 const ctx = () => ({ engine, config: { engine: 'postgres' }, remote: false, dryRun: false, logger: { info() {}, warn() {}, error() {} } }) as unknown as OperationContext;
 
 beforeAll(async () => {
@@ -92,10 +95,10 @@ test('#5762 on a 512k-row request table every probe is an index scan, and the fo
 }), 300_000);
 
 test('#5762 the Postgres blob never builds the indexes; v179 builds them concurrently, one at a time', async () => withEnv(env, async () => {
-  for (const name of NAMES) expect(SCHEMA_SQL).not.toContain(name);
+  for (const name of ALL_NAMES) expect(SCHEMA_SQL).not.toContain(name);
   for (const name of NAMES) await engine.executeRaw(`DROP INDEX IF EXISTS ${name}`);
   await engine.runMigration(0, SCHEMA_SQL);
-  expect((await readRequestIndexStates(engine)).map(index => index.state)).toEqual(['missing', 'missing']);
+  expect(await states(NAMES)).toEqual(['missing', 'missing']);
   const statements: string[] = [];
   const reserve = engine.withReservedConnection.bind(engine);
   engine.withReservedConnection = (async (fn: Parameters<PostgresEngine['withReservedConnection']>[0]) => reserve(conn => fn({
@@ -104,23 +107,23 @@ test('#5762 the Postgres blob never builds the indexes; v179 builds them concurr
   try { await v179.handler!(engine); } finally { engine.withReservedConnection = reserve; }
   expect(statements.filter(sql => sql.startsWith('CREATE INDEX CONCURRENTLY IF NOT EXISTS')).map(sql => sql.split(/\s+/)[6])).toEqual(NAMES);
   expect(statements.filter(sql => /^(SET|RESET)\b/i.test(sql))).toEqual([]);
-  expect((await readRequestIndexStates(engine)).map(index => index.state)).toEqual(['valid', 'valid']);
+  expect(await states()).toEqual(['valid', 'valid', 'valid']);
 }), 120_000);
 
 test('#5762 gbrain repair request-indexes rebuilds a dropped and an INVALID index on a current schema; a second run is a no-op', async () => withEnv(env, async () => {
   await engine.executeRaw('DROP INDEX persistence_requests_sync_run_open');
   await engine.executeRaw("UPDATE pg_index SET indisvalid=false WHERE indexrelid='persistence_requests_sync_run_committed'::regclass");
-  expect(await readRequestIndexStates(engine)).toEqual([{ name: NAMES[0], state: 'missing' }, { name: NAMES[1], state: 'invalid' }]);
+  expect(await readRequestIndexStates(engine)).toEqual([{ name: NAMES[0], state: 'missing' }, { name: NAMES[1], state: 'invalid' }, { name: ALL_NAMES[2], state: 'valid' }]);
   const doctor = await requestIndexesCheck(engine);
   expect(doctor).toMatchObject({ name: 'persistence_request_indexes', status: 'warn', details: { count: 2, command: 'gbrain repair request-indexes --apply' } });
   expect(doctor.message).toContain('persistence_requests_sync_run_committed is INVALID');
   const scope = await resolveRepairScope(engine);
   const preview = await runRepair(ctx(), requestIndexesRepair, scope, { apply: false });
   expect(preview).toMatchObject({ affected: 2, cost: { lifetime_ids: 0 }, apply_command: 'gbrain repair request-indexes --apply' });
-  expect((await readRequestIndexStates(engine)).map(index => index.state)).toEqual(['missing', 'invalid']);
+  expect(await states()).toEqual(['missing', 'invalid', 'valid']);
   const applied = await runRepair(ctx(), requestIndexesRepair, scope, { apply: true });
   expect(applied).toMatchObject({ applied: 2, complete: true });
-  expect((await readRequestIndexStates(engine)).map(index => index.state)).toEqual(['valid', 'valid']);
+  expect(await states()).toEqual(['valid', 'valid', 'valid']);
   expect((await requestIndexesCheck(engine)).status).toBe('ok');
   expect(await runRepair(ctx(), requestIndexesRepair, scope, { apply: true })).toMatchObject({ affected: 0, applied: 0, complete: true });
 }), 120_000);
@@ -139,7 +142,7 @@ test('#5762 a build that leaves the index INVALID (a concurrent caller failed fi
   try { await expect(buildIndexOnline(engine, 0, index)).rejects.toThrow(`Index ${index.name} is not valid after its concurrent build`); }
   finally { engine.withReservedConnection = reserve; }
   expect(await buildIndexOnline(engine, 0, index)).toBe('rebuilt');
-  expect((await readRequestIndexStates(engine)).map(state => state.state)).toEqual(['valid', 'valid']);
+  expect(await states()).toEqual(['valid', 'valid', 'valid']);
 }), 60_000);
 
 test('#5762 recovery journey: a checkpoint timeout with a dropped index is fixed by the two printed commands', async () => withEnv(env, async () => {

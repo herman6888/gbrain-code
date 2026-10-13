@@ -38,7 +38,7 @@
 
 import postgres from '#postgres'
 import { traceSqlOptions } from './sql-trace.ts';
-import { gbrainApplicationName, resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, endPoolBounded, poolHealthOptions, type PoolHealthHooks } from './db.ts';
+import { gbrainApplicationName, readPoolPipelineOptions, resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, endPoolBounded, poolHealthOptions, type PoolHealthHooks } from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 
@@ -80,9 +80,6 @@ export interface ConnectionManagerOpts {
 
 /** Default direct-pool size (P1 raised from 2 to 3). Override via env. */
 export const DEFAULT_DIRECT_POOL_SIZE = 3;
-
-/** Search statement timeout (F5 consolidation) — was 8s scattered. */
-export const SEARCH_STMT_TIMEOUT_MS = 8000;
 
 /** DDL pool default statement_timeout (Fix 1). */
 const DDL_STMT_TIMEOUT_MS = 30 * 60 * 1000; // 30min
@@ -355,6 +352,7 @@ export class ConnectionManager {
       types: { bigint: postgres.BigInt },
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       shared_types: resolveSharedTypes(this.opts.url),
+      ...readPoolPipelineOptions(this.opts.url),
     };
     const timeouts = resolveSessionTimeouts();
     Object.assign(opts, poolHealthOptions({ ...this.opts.health?.('read'), onpoisoned: (status: string) => this.opts.onpoisoned?.('read', status) }, timeouts.statement_timeout));

@@ -24,6 +24,8 @@ import { composeAbortSignals } from '../../core/sync-reconcile.ts';
 import { acknowledgeFailures, unacknowledgedSyncFailures } from '../../core/sync.ts';
 import type { SyncResult, SyncOpts } from '../sync.ts';
 import { printSyncHelp, parseSyncFlags, parseSyncFanoutFlags } from './args.ts';
+import { implyManagedNoPull } from './managed-no-pull.ts';
+import { legacyLedgerRows } from '../../core/persistence/legacy-sync-failures.ts';
 import type { SyncFlags, SyncFanoutFlags } from './args.ts';
 import { manageGitignoreAtGitRoot } from './gitignore.ts';
 import { partitionMissingPathSources } from './missing-path.ts';
@@ -103,6 +105,7 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   const cli = await resolveCliSyncSource(engine, args, { repoPath, syncAll, dryRun, jsonOut, noEmbed });
   const { sourceId, companyPolicy, embeddingCredentialError } = cli;
   noEmbed = cli.noEmbed;
+  await implyManagedNoPull(engine, flags, syncAll ? null : sourceId);
 
   // --skip-failed: acknowledge pre-existing unacked failures BEFORE the sync
   // runs, not only ones the current run produces. Without this, the common
@@ -133,6 +136,10 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   const { syncResumeCommand } = await import('../../core/sync-reconcile.ts');
   const { getCliOptions } = await import('../../core/cli-options.ts');
   const resumeCommand = syncResumeCommand(args, getCliOptions().brain);
+  // #6543: --all never delegates, so its opt-out keeps this process's own consumer here (single-source runs: sync-delegate.ts).
+  if (syncAll && (args.includes('--no-delegate') || process.env.GBRAIN_SYNC_NO_DELEGATE === '1')) {
+    (await import('../../core/persistence/consumer-election.ts')).forceOwnConsumer('opted_out');
+  }
   if (syncAll) return await runSyncAll(engine, { ...flags, ...fanout }, { noEmbed, embeddingCredentialError, resumeCommand });
 
   return await runSingleSourceSync(engine, { ...flags, ...fanout }, { sourceId, companyPolicy, noEmbed, resumeCommand, args });
@@ -832,8 +839,10 @@ async function runSingleSourceSync(
         for (const command of new Set(other.map(f => managedSyncRetryCommand(f)))) slog(`  ${command}`);
       }
     }
+    const legacyRows = managedBrain ? legacyLedgerRows(sourceId).length : 0;
+    if (legacyRows) slog(`${legacyRows} legacy ledger row(s) of this source were recorded by the pre-managed sync and are not retried by a managed sync; this run settles every one whose file it imports.`);
     if (failures.length === 0) {
-      slog('No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
+      slog(legacyRows ? 'No managed sync failures recorded; checking the durable sync cursor for unfinished or failed writes.' : 'No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
     } else {
       slog(`Retrying ${failures.length} previously-failed file(s)...`);
     }

@@ -113,6 +113,43 @@ export function resolvePrepare(url: string): boolean | undefined {
   return undefined;
 }
 
+/** Why a read-side pool got its `max_pipeline` (#6543); `/health?deep=1` reports it beside the live value. */
+export type ReadPoolPipelineReason = 'url_max_pipeline' | 'env_pgmax_pipeline' | 'transaction_pooler_port' | 'url_prepare_false' | 'gbrain_prepare_off' | 'default';
+
+/**
+ * #6543: the `max_pipeline` a read-side pool (the module singleton, an engine's
+ * instance pool, the connection manager's read pool) is built with. A
+ * transaction-mode pooler cannot carry statements pipelined on one client
+ * connection across transaction boundaries: through Supavisor they hung or came
+ * back with another statement's rows. So a transaction-mode URL (port 6543 or
+ * `?prepare=false`, read from the URL itself because `GBRAIN_PREPARE` wins
+ * inside `resolvePrepare`) or `GBRAIN_PREPARE=0` gets `0`. A session-mode
+ * pooler (Supabase's :5432) keeps pipelining. The driver lets the options
+ * object outrank the URL and `PGMAX_PIPELINE`, so `value` is null (the option
+ * stays unset and the driver reads them, default 100) whenever the URL names
+ * `max_pipeline` or `PGMAX_PIPELINE` is set and non-empty. The direct pool
+ * never calls this.
+ */
+export function resolveReadPoolPipeline(url: string): { value: number | null; reason: ReadPoolPipelineReason } {
+  const [beforeFragment = ''] = url.split('#', 1);
+  const queryAt = beforeFragment.indexOf('?');
+  const params = new URLSearchParams(queryAt >= 0 ? beforeFragment.slice(queryAt + 1) : '');
+  if (params.has('max_pipeline')) return { value: null, reason: 'url_max_pipeline' };
+  if ((process.env.PGMAX_PIPELINE ?? '').trim() !== '') return { value: null, reason: 'env_pgmax_pipeline' };
+  let port = '';
+  try { port = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://')).port; } catch { /* unparseable: no port */ }
+  if (AUTO_DETECT_PORTS.has(port)) return { value: 0, reason: 'transaction_pooler_port' };
+  if (params.get('prepare') === 'false') return { value: 0, reason: 'url_prepare_false' };
+  if (process.env.GBRAIN_PREPARE === 'false' || process.env.GBRAIN_PREPARE === '0') return { value: 0, reason: 'gbrain_prepare_off' };
+  return { value: null, reason: 'default' };
+}
+
+/** The read-side pool option `resolveReadPoolPipeline` decides: `{ max_pipeline: 0 }` or nothing. */
+export function readPoolPipelineOptions(url: string): { max_pipeline?: number } {
+  const { value } = resolveReadPoolPipeline(url);
+  return value === null ? {} : { max_pipeline: value };
+}
+
 /**
  * Seconds a pool waits for a connection before giving up with CONNECT_TIMEOUT
  * when its URL names no `connect_timeout` of its own.
@@ -274,16 +311,17 @@ export function resolveMaxLifetimeSeconds(
  * Set any env var to '0' or 'off' to disable that GUC entirely.
  *
  * Delivered via postgres.js's `connection` option, which sends these as
- * startup parameters in the initial connection packet. Works correctly
- * with PgBouncer session mode AND transaction mode: startup parameters
- * pass through to the backend on connection creation and persist for the
- * backend's lifetime (unlike `SET` commands which transaction-mode
- * PgBouncer strips between transactions).
+ * startup parameters in the initial connection packet. A direct server and a
+ * session-mode pooler apply them for the backend's lifetime. A transaction-mode
+ * pooler does not: PgBouncer and Supavisor (Supabase :6543) drop or ignore
+ * startup parameters, so `SHOW statement_timeout` through them reads `0` and no
+ * server-side timeout bounds an autocommit statement (#6543; doctor's
+ * `persistence_session_timeouts` and serve's transport line report it, and
+ * `ALTER ROLE ... SET statement_timeout` is the fix there).
  *
  * Supersedes the v0.21.0 `setSessionDefaults(sql)` helper, which used
- * a post-pool `SET` command. That approach is unreliable in PgBouncer
- * transaction mode (transaction-mode poolers strip session-state SETs
- * between transactions); startup parameters are durable.
+ * a post-pool `SET` command; transaction-mode poolers strip session-state
+ * SETs between transactions.
  */
 const DEFAULT_STATEMENT_TIMEOUT = '5min';
 const DEFAULT_IDLE_TX_TIMEOUT = '5min';
@@ -305,16 +343,23 @@ export function gbrainApplicationName(): string {
  * set per pool. `PoolHealthHooks` is what an engine passes to every pool it
  * opens; `poolHealthOptions` turns it into postgres.js options.
  */
-export interface StuckConnectionInfo { age_ms: number; queued: number; statement: string }
+/** #6543 (A4): `reason` is `age` when the statement kept receiving bytes past its budget, `idle` when nothing came back; `budget_ms` is that statement's own cap. */
+export interface StuckConnectionInfo { age_ms: number; queued: number; statement: string; reason?: 'age' | 'idle'; budget_ms?: number }
+/** #6543 (A6): a connection the driver retired for an incident (`stuck`, `desync`, `closed` under statements) reconnected, or failed to. */
+export interface ConnectionRecoveryInfo { connection: number; cause: 'stuck' | 'desync' | 'closed'; code?: string }
 export interface PoolHealthHooks {
   /** #5730: a connection came back to the pool inside a transaction and was discarded. */
   onpoisoned?: (status: string) => void;
   /** #6383: the in-flight watchdog retired a connection whose statement never answered. */
   onstuck?: (info: StuckConnectionInfo) => void;
-  /** #6383: a statement failed to build (`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`) and was rejected alone. */
-  onbuilderror?: (code: string, statement: string) => void;
+  /** #6383: a statement failed to build (`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`) and was rejected alone; #6543: `parameter` is the undefined one's 1-based index. */
+  onbuilderror?: (code: string, statement: string, parameter?: number) => void;
   /** An answer arrived on a connection with no statement waiting for it; the driver retired the connection. */
   ondesync?: (info: DesyncConnectionInfo) => void;
+  /** #6543 (A6): a connection retired by an incident completed a new startup. */
+  onrecovered?: (info: ConnectionRecoveryInfo) => void;
+  /** #6543 (A6): the reconnect of a connection retired by an incident failed. */
+  onrecoveryfailed?: (info: ConnectionRecoveryInfo) => void;
 }
 export interface DesyncConnectionInfo { message: string; connection: number; statement: string }
 
@@ -332,30 +377,48 @@ export function gucMilliseconds(value: string | undefined): number | null {
 }
 
 /**
- * #6383: seconds a head statement may wait with nothing coming back before the
- * driver retires its connection: the pool's `statement_timeout` plus
- * `GBRAIN_PG_STUCK_GRACE_MS` (default 30000). A legitimate statement cannot
- * outlive the server-side timeout, so only a wedged connection (a desynced
- * pipeline, a pooler that swallowed a CancelRequest, a dead peer) reaches it.
- * Null, which disables the watchdog, when the statement timeout is off or the
- * grace is `0`/`off`.
+ * #6383: the pool's in-flight budget in seconds: its `statement_timeout` plus
+ * `GBRAIN_PG_STUCK_GRACE_MS` (default 30000). The driver retires a connection
+ * whose head statement waits that long with nothing coming back (`reason=idle`)
+ * or, since #6543, runs that long in total while bytes keep arriving
+ * (`reason=age`). A statement whose operation declared a longer
+ * `statement_timeout` on its connection gets that timeout plus the grace; a
+ * declared 0 has no cap. Null, which disables the watchdog, when the statement
+ * timeout is off or the grace is `0`/`off`.
  */
 export function resolveInflightTimeoutSeconds(statementTimeout: string | undefined): number | null {
-  const raw = process.env.GBRAIN_PG_STUCK_GRACE_MS;
-  if (raw === '0' || raw === 'off') return null;
-  const grace = raw !== undefined && Number.isFinite(Number(raw)) && Number(raw) > 0 ? Number(raw) : DEFAULT_STUCK_GRACE_MS;
+  const grace = resolveStuckGraceMs();
   const budget = gucMilliseconds(statementTimeout);
-  return budget === null ? null : Math.ceil((budget + grace) / 1000);
+  return budget === null || grace === null ? null : Math.ceil((budget + grace) / 1000);
 }
 
-/** The postgres.js options for `PoolHealthHooks` on a pool whose connections start with `connection.statement_timeout`. */
+/** `GBRAIN_PG_STUCK_GRACE_MS` (default 30000), or null when it is `0`/`off` (the watchdog is disabled). */
+export function resolveStuckGraceMs(): number | null {
+  const raw = process.env.GBRAIN_PG_STUCK_GRACE_MS;
+  if (raw === '0' || raw === 'off') return null;
+  return raw !== undefined && Number.isFinite(Number(raw)) && Number(raw) > 0 ? Number(raw) : DEFAULT_STUCK_GRACE_MS;
+}
+
+/**
+ * The postgres.js options for `PoolHealthHooks` on a pool whose connections start with `connection.statement_timeout`.
+ * #6543 (A4): the same budget caps a statement's total age (`inflight_max`, never reset by received bytes) and its
+ * silence (`inflight_timeout`). The driver raises both for a statement whose operation declared a longer
+ * `statement_timeout` on its connection (to that timeout plus `inflight_grace`) and drops both for a declared 0, so
+ * the budget travels with the operation and does not depend on a session `SET` reaching the backend.
+ */
 export function poolHealthOptions(hooks: PoolHealthHooks | undefined, statementTimeout: string | undefined): Record<string, unknown> {
+  const seconds = resolveInflightTimeoutSeconds(statementTimeout);
+  const grace = resolveStuckGraceMs();
   return {
     onpoisoned: hooks?.onpoisoned,
     onstuck: hooks?.onstuck,
     onbuilderror: hooks?.onbuilderror,
     ondesync: hooks?.ondesync,
-    inflight_timeout: resolveInflightTimeoutSeconds(statementTimeout),
+    onrecovered: hooks?.onrecovered,
+    onrecoveryfailed: hooks?.onrecoveryfailed,
+    inflight_timeout: seconds,
+    inflight_max: seconds,
+    inflight_grace: seconds === null || grace === null ? null : grace / 1000,
   };
 }
 
@@ -454,13 +517,14 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       ...poolHealthOptions(hooks, timeouts.statement_timeout),
       shared_types: resolveSharedTypes(url),
+      ...readPoolPipelineOptions(url),
     };
     opts.connection = { ...timeouts, application_name: gbrainApplicationName() };
     if (typeof prepare === 'boolean') {
       opts.prepare = prepare;
       if (!prepare) {
         console.warn(
-          '[gbrain] Prepared statements disabled (PgBouncer transaction-mode convention on port 6543). Override with GBRAIN_PREPARE=true if your pooler runs in session mode.',
+          '[gbrain] Prepared statements and statement pipelining disabled (transaction-mode pooler convention: port 6543, ?prepare=false or GBRAIN_PREPARE=0). If your pooler runs in session mode, connect on its session port (Supabase: 5432); GBRAIN_PREPARE=true re-enables prepared statements only, and ?max_pipeline= or PGMAX_PIPELINE sets the pipeline depth.',
         );
       }
     }

@@ -191,6 +191,10 @@ CHECKS=(
   # W7 (refactor wave 1): workflow phrases the wave retired stay out of the
   # docs agents follow (CLAUDE.md, AGENTS.md, CONTRIBUTING.md, docs/, skills/).
   "check:retired-phrases"
+  # #6530: skills, recipes, templates, docs, plugin trees and agent docs never
+  # teach git pull --rebase, stash, autostash, repo-wide add/commit, reset
+  # --hard or a bare/force push for a shared brain checkout (~0.5s).
+  "check:shared-tree-git"
   "check:schema-migration-order"
   "check:structural-manifest"
   # Every generated artifact's freshness in one place (GBRA-47 B8); its Fix

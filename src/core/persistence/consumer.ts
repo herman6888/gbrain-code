@@ -63,6 +63,14 @@ function failureLogText(row: WriteRequest): string | undefined {
   return row.error_message || extra ? `${row.error_message ?? ''}${extra}`.replaceAll('"', "'") : undefined;
 }
 
+/** #6543 F1: the identity of the request a consumer line is about; control characters, spaces and quotes become `_`. */
+function requestLogFields(row: Pick<WriteRequest, 'request_id' | 'operation' | 'source_id' | 'slug' | 'principal_kind' | 'created_at'>): string {
+  const clean = (value: unknown) => String(value ?? '').replace(/[\x00-\x20"\x7f-\x9f]/g, '_').slice(0, 200);
+  const elapsed = Date.now() - new Date(row.created_at).getTime();
+  return ` request_id=${clean(row.request_id)} operation=${clean(row.operation)} source=${clean(row.source_id)} slug=${clean(row.slug)}`
+    + ` principal=${clean(row.principal_kind)}${Number.isFinite(elapsed) ? ` elapsed_ms=${Math.max(0, elapsed)}` : ''}`;
+}
+
 function errorDetail(error: unknown): string | undefined {
   const message = (error as { message?: unknown } | null)?.message;
   if (typeof message !== 'string' || !message.trim()) return undefined;
@@ -201,6 +209,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private unobserveCheckout: (() => void) | undefined;
   private phaseAttempts = 0;
   private lastLog: { key: string; at: number } | undefined;
+  private readonly requestLogs = new Map<string, number>();
   private lastPhaseError: string | undefined;
   private preparationAttempts = 0;
   private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
@@ -620,7 +629,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private track(row: WriteRequest, done: () => void, key: string): void {
     let progressed = false;
     const root: RootHold = {};
-    const task = this.executeOrGroup(row, root).then(result => { progressed = result; }).catch(error => this.report(error)).finally(() => {
+    const task = this.executeOrGroup(row, root).then(result => { progressed = result; }).catch(error => this.report(error, row)).finally(() => {
       if (!progressed) this.rootRetryAfter.set(key, Date.now() + (root.retryAfterMs ?? this.opts.pollMs ?? 250));
       else { this.progressWake = true; this.publishedSinceMaintenance++; }
       this.active.delete(task);
@@ -685,12 +694,12 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     return { ceilingMs,
       onOverdue: () => {
         if (clock) clock.waitingOn = 'publication_deadline';
-        this.log('publication', 'publication_deadline', `request ${row.request_id}: publishing past the ${ceilingMs} ms ceiling; its transaction's server-side timeouts end it on Postgres`);
+        this.log('publication', 'publication_deadline', `request ${row.request_id}: publishing past the ${ceilingMs} ms ceiling; on Postgres its transaction-local timeouts end it only if the server sees the transaction idle, not when the client connection is wedged`, '', row);
       },
       onStuck: settled => {
         this.stuckPublications.set(row.id, { request_id: row.request_id, stuck_at: new Date().toISOString() });
         void settled.then(() => { this.stuckPublications.delete(row.id); });
-        this.log('publication', 'restart_required', `request ${row.request_id}: the publication has not settled past the ceiling and its grace; restart this process (its root stays held until then)`);
+        this.log('publication', 'restart_required', `request ${row.request_id}: the publication has not settled past the ceiling and its grace; restart this process (its root stays held until then)`, '', row);
       } };
   }
   status() {
@@ -768,7 +777,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     }
     finally { clearTimeout(timer); this.abort.signal.removeEventListener('abort', stop); this.phaseObservation = undefined; }
   }
-  private report(error: unknown): void {
+  private report(error: unknown, row?: WriteRequest): void {
     if (this.stopping && error === this.abort.signal.reason) return;
     if (error instanceof PhaseDeadlineError) {
       // The timer already logged deadline_exceeded for this phase: record it under the phase, hand it to onError
@@ -782,15 +791,24 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     this.lastError = { code: typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || isWriteErrorCode(code)) ? code : 'storage_error', at: new Date().toISOString(),
       ...(this.lastPhaseError ? { phase: this.lastPhaseError } : {}) };
     if (this.opts.onError) this.opts.onError(error);
-    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined);
+    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined, row);
     this.lastPhaseError = undefined;
     this.lastPhaseTiming = undefined;
   }
-  private log(phase: string, code: string, detail?: string, timing = ''): void {
+  /** #6543 F1: a line about one request is throttled per request (30 s per phase and code); other lines keep the shared throttle. */
+  private log(phase: string, code: string, detail?: string, timing = '', row?: WriteRequest): void {
     const key = `${phase}:${code}`, at = Date.now();
-    if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
-    this.lastLog = { key, at };
-    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${detail ? ` message="${detail}"` : ''}${timing}`
+    if (row) {
+      const requestKey = `${key}:${row.id}`;
+      if (at - (this.requestLogs.get(requestKey) ?? -Infinity) < 30_000) return;
+      if (this.requestLogs.size >= 256) for (const [stale, loggedAt] of this.requestLogs) if (at - loggedAt >= 30_000) this.requestLogs.delete(stale);
+      if (this.requestLogs.size >= 256) return;
+      this.requestLogs.set(requestKey, at);
+    } else {
+      if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
+      this.lastLog = { key, at };
+    }
+    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${detail ? ` message="${detail}"` : ''}${timing}${row ? requestLogFields(row) : ''}`
       + '; unfinished work remains tracked; fix: gbrain sources writer status --json; docs: docs/ENGINES.md#persistence-consumer-log\n');
   }
   /** #5373: tracks work that outlived its claim until it settles; the returned promise never rejects. */
@@ -848,7 +866,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       this.zombies.set(row.id, { request_id: row.request_id, operation: row.operation, step: clock.step, waiting_on: clock.waitingOn,
         claimed_at: new Date(clock.claimedAt).toISOString(), abandoned_at: at, outlived_ceiling_at: at });
       void settled.then(() => { this.zombies.delete(row.id); });
-      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id}${claimTripleText(clock)}${this.restartRequired() ? ' restart_required' : ''}`);
+      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id}${claimTripleText(clock)}${this.restartRequired() ? ' restart_required' : ''}`, '', row);
       await floorPreparationAttempts(this.statements, row.id, this.policy.maxAttempts).catch(error => this.report(error));
     });
   }
@@ -870,7 +888,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       try {
         const previous = claimStateOf({ state: 'running', claim_phase: row.previous_claim_phase, execution_token: previousToken(row.previous_claim_phase) });
         const done = await finishPreparationStalled(this.engine, row, { step: previous?.step ?? null, waiting_on: previous?.waiting_on ?? 'unknown', limit: policy.maxAttempts }, false);
-        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText({ step: previous?.step ?? null, waitingOn: previous?.waiting_on ?? 'unknown' })}`);
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText({ step: previous?.step ?? null, waitingOn: previous?.waiting_on ?? 'unknown' })}`, '', row);
         return this.settled(done);
       } finally { this.preparing.delete(row.id); this.executing.delete(row.id); }
     }
@@ -881,7 +899,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       return this.prepare(this.engine.kind === 'postgres' && singleWrite(row)
         && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true) ? await preparationConfigView(this.engine) : this.engine,
       row, this.config, budget !== undefined && preparationKind(row) === 'foreground' ? signal : undefined, clock);
-    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded', `request ${row.request_id}${claimTripleText(clock)}`); } });
+    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded', `request ${row.request_id}${claimTripleText(clock)}`, '', row); } });
     const stop = () => prep.abort({ code: 'consumer_stopping' });
     this.abort.signal.addEventListener('abort', stop, { once: true });
     const lease = startClaimLease(
@@ -897,7 +915,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.statements, row, releaseReason()); return false; }
       if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
         const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
-        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText(clock)}`);
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText(clock)}`, '', row);
         return this.settled(done);
       }
       await releaseUnpublishedClaim(this.statements, row, 'preparation_deadline', { charge: true });
@@ -923,10 +941,10 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       enterClaimPhase(clock, 'publishing');
       await faultPoint('consumer:prepared', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
       const { done, settled } = await boundPublication(() => this.publishSingle(row, prepared), this.publicationBound(row, await readPublicationCeilingMs(this.engine), clock));
-      if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', failureLogText(done));
+      if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', failureLogText(done), '', row);
       if (done.state === 'queued' && done.blocked_reason === 'writer_lock_unavailable') {
         root.retryAfterMs = INSPECT_OWNER_RETRY_MS;
-        this.log('publication', 'writer_lock_unavailable', `request ${row.request_id}: this process cannot open source ${row.source_id}'s worktree lock${lockOpenOsError(row.worktree_id) ? ` (${lockOpenOsError(row.worktree_id)})` : ''}; left for an owner process`);
+        this.log('publication', 'writer_lock_unavailable', `request ${row.request_id}: this process cannot open source ${row.source_id}'s worktree lock${lockOpenOsError(row.worktree_id) ? ` (${lockOpenOsError(row.worktree_id)})` : ''}; left for an owner process`, '', row);
       }
       if (done.state === 'committed' && row.worktree_id && !String(row.intent?.kind).startsWith('managed_sync_')) {
         this.foregroundCounts.set(row.worktree_id, this.foregroundCompletions(row.worktree_id) + 1);
@@ -947,7 +965,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       const current = await getWriteRequestById(this.engine, row.id);
       if (current && !isTerminal(current) && current.execution_token === row.execution_token && !current.recovery) {
         const done = await finishUnpublishedFailure(this.engine, current, error, preparationActive ? 'preparation' : 'publication');
-        if (done.state === 'failed') this.log(preparationActive ? 'preparation' : 'publication', done.error_code ?? 'storage_error', failureLogText(done));
+        if (done.state === 'failed') this.log(preparationActive ? 'preparation' : 'publication', done.error_code ?? 'storage_error', failureLogText(done), '', row);
         return this.settled(done);
       }
       throw error;

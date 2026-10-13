@@ -17,6 +17,15 @@
  *
  * Every credential-shaped value is synthetic and runtime-joined from >= 2
  * fragments; constant names keep scanner keywords away from the `=`.
+ *
+ * The `high_entropy_assignment` bounds are the backtracking guard, and the
+ * absolute bound is the ONLY guard on per-character cost: the entropy gate's
+ * histogram and a regex's inner loop are not countable by the ScanWork
+ * counters (test/secret-scan-work-counters.test.ts pins the counts of execs,
+ * candidates, gated chars and claims instead). Measured on a 4-core cloud box
+ * (wave 16 G4.1): the 250 × 4096 segments cost ~80 ms each with the former
+ * two-pass `correctedEntropy` (Set pass ~65 ms of it) and ~25 ms with the
+ * one-pass histogram, so a loaded shard VM at 3-4× no longer reaches 300 ms.
  */
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'crypto';

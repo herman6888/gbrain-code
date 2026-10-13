@@ -134,10 +134,11 @@ export async function writeSingleFact(
   // resolver returned nothing (fail-closed — no live page was verified).
   const resolutionSource = resolved?.source ?? null;
 
-  const { FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION, isFactWithdrawn } = await import('./withdrawal.ts');
+  const { isFactWithdrawn } = await import('./withdrawal.ts');
   if (await isFactWithdrawn(engine, sourceId, visibility, factText, resolvedSlug)) {
-    const { verbError } = await import('../ops/contract.ts');
-    throw verbError('invalid_params', FACT_WITHDRAWN_MESSAGE, FACT_WITHDRAWN_SUGGESTION);
+    const { factWithdrawnRefusal } = await import('./single-prepare.ts');
+    throw await factWithdrawnRefusal(engine, sourceId, { fact: factText, kind, visibility, entity_slug: resolvedSlug },
+      { excludePrivate: await resolveExcludePrivatePages(engine, input.remote) });
   }
 
   // Embedding (NOT an LLM call): powers dedup + downstream recall. Fail-soft —

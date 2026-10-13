@@ -752,7 +752,9 @@
       "idx_pages_frontmatter": "CREATE INDEX idx_pages_frontmatter ON public.pages USING gin (frontmatter)",
       "idx_pages_search": "CREATE INDEX idx_pages_search ON public.pages USING gin (search_vector)",
       "idx_pages_slug_basename": "CREATE INDEX idx_pages_slug_basename ON public.pages USING btree (source_id, regexp_replace(slug, '^.*/'::text, ''::text))",
+      "idx_pages_slug_trgm": "CREATE INDEX idx_pages_slug_trgm ON public.pages USING gin (slug gin_trgm_ops)",
       "idx_pages_source_id": "CREATE INDEX idx_pages_source_id ON public.pages USING btree (source_id)",
+      "idx_pages_source_title_lower": "CREATE INDEX idx_pages_source_title_lower ON public.pages USING btree (source_id, lower(title))",
       "idx_pages_trgm": "CREATE INDEX idx_pages_trgm ON public.pages USING gin (title gin_trgm_ops)",
       "idx_pages_type": "CREATE INDEX idx_pages_type ON public.pages USING btree (type)",
       "idx_rate_leases_key_expires": "CREATE INDEX idx_rate_leases_key_expires ON public.subagent_rate_leases USING btree (key, expires_at)",
@@ -835,6 +837,7 @@
       "persistence_requests_principal_kind_principal_id_request_id_key": "CREATE UNIQUE INDEX persistence_requests_principal_kind_principal_id_request_id_key ON public.persistence_requests USING btree (principal_kind, principal_id, request_id)",
       "persistence_requests_recovery": "CREATE INDEX persistence_requests_recovery ON public.persistence_requests USING btree (worktree_id, sequence) WHERE (recovery IS NOT NULL)",
       "persistence_requests_sequence_key": "CREATE UNIQUE INDEX persistence_requests_sequence_key ON public.persistence_requests USING btree (sequence)",
+      "persistence_requests_slug_intent": "CREATE INDEX persistence_requests_slug_intent ON public.persistence_requests USING btree (source_id, slug, sequence) WHERE ((intent IS NOT NULL) AND (NOT compacted))",
       "persistence_requests_sync_run_committed": "CREATE INDEX persistence_requests_sync_run_committed ON public.persistence_requests USING btree (source_id, ((intent ->> 'runId'::text)), ((intent ->> 'index'::text))) WHERE ((state = 'committed'::text) AND (intent ? 'runId'::text))",
       "persistence_requests_sync_run_open": "CREATE INDEX persistence_requests_sync_run_open ON public.persistence_requests USING btree (worktree_id, ((intent ->> 'runId'::text))) WHERE ((state <> 'committed'::text) AND ((intent ->> 'kind'::text) = ANY (ARRAY['managed_sync_import'::text, 'managed_sync_delete'::text])))",
       "persistence_requests_sync_watermark": "CREATE INDEX persistence_requests_sync_watermark ON public.persistence_requests USING btree (worktree_id, source_incarnation, completed_at DESC) WHERE ((state = 'committed'::text) AND (COALESCE((intent ->> 'kind'::text), ''::text) ~~ 'managed_sync_%'::text))",
@@ -1406,7 +1409,8 @@
           "3 content_hash text/text NOT NULL",
           "4 fail_count integer/int4 NOT NULL DEFAULT 0",
           "5 tombstoned boolean/bool NOT NULL DEFAULT false",
-          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 partial_input_chars integer/int4 NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -1417,7 +1421,8 @@
           "3 content_hash text/text NOT NULL",
           "4 fail_count integer/int4 NOT NULL DEFAULT 0",
           "5 tombstoned boolean/bool NOT NULL DEFAULT false",
-          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "6 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 partial_input_chars integer/int4 NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

@@ -215,6 +215,10 @@
       },
       {
         "category": "ops",
+        "name": "provider_consent"
+      },
+      {
+        "category": "ops",
         "name": "harness_wiring"
       },
       {
@@ -443,6 +447,10 @@
       },
       {
         "category": "ops",
+        "name": "keyword_plan"
+      },
+      {
+        "category": "ops",
         "name": "stale_embedding_effects"
       },
       {
@@ -620,6 +628,10 @@
       {
         "category": "brain",
         "name": "ocr_health"
+      },
+      {
+        "category": "brain",
+        "name": "image_embedding_coverage"
       },
       {
         "category": "brain",

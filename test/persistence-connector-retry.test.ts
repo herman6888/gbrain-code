@@ -249,6 +249,24 @@ test('a retry pointer survives real purge and compaction without silently renewi
   }
 }), 120_000);
 
+test('a pooled connection whose last statement failed after streaming a row does not stop the retry run before its sweep', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    if (engine.kind !== 'postgres') continue;
+    const f = await retryFixture(engine, 'google', false);
+    await engine.executeRaw('UPDATE connector_retry_faults SET pages=true WHERE source_id=$1', [f.id]);
+    await expect(f.run()).rejects.toMatchObject({ code: 'storage_error' });
+    await disposePersistenceConsumer(engine);
+    // Every pooled connection's last statement streams one row and then fails (as a cancel at consumer stop can).
+    await Promise.allSettled(Array.from({ length: 16 }, () =>
+      engine.executeRaw('SELECT g, 1 / (g - 2) AS v FROM (SELECT g FROM generate_series(1, 2) g, pg_sleep(0.2)) s')));
+    await expect(f.run(true)).rejects.toMatchObject({ code: 'storage_error', writeRequest: { state: 'failed' } });
+    await disposePersistenceConsumer(engine);
+    const failures = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND state='failed' ORDER BY sequence", [f.id]);
+    expect(failures).toHaveLength(2);
+    expect(failures[1].intent?.retryOf).toBe(failures[0].request_id);
+  }
+}), 120_000);
+
 test('concurrent connector approvals and a restarted paused owner retain one pending replacement receipt', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await retryFixture(engine, 'github', true);

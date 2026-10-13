@@ -14,7 +14,8 @@ USAGE
 SETUP
   mcp grant <name> --help           Grant hosted access; private credential handoff
   mcp verify --help                 Verify connection, permissions, and memory
-  setup claude-code [--dry-run]      Give an agent memory: brain + MCP + hooks, verified (--remove undoes)
+  setup claude-code|codex [--dry-run]
+                                     Give an agent memory: brain + MCP + hooks, verified (--remove undoes)
   init [--pglite|--supabase|--url]   Create brain (PGLite default, no server)
   init --prefer-postgres [--allow-docker]
                                      Postgres-first install ladder (env URL >
@@ -32,6 +33,12 @@ SETUP
   doctor [--json] [--fast] [--probe-pglite]  Health check (resolver, skills, pgvector, RLS, embeddings; --probe-pglite runs the scratch-store probe)
   integrations [subcommand]          Manage integration recipes (senses + reflexes)
 
+MEMORY (facts agents recall; MEMORY_VERBS v1)
+  remember "<fact>" --entity <slug>  Save a fact the user stated, with --provenance; world-visible
+                                     facts are pushed into new agent sessions (private: recall only)
+  recall [<entity>] [--query <q>]    Find saved facts
+  forget <fact-id>                   Withdraw a fact
+
 PAGES
   get <slug>                         Read a page
   put <slug> [< file.md]             Write/update a page
@@ -41,8 +48,8 @@ PAGES
 
 SEARCH
   search <query>                     Keyword search (tsvector)
-  query <question> [--no-expand]     Hybrid search (RRF + expansion)
-  ask <question> [--no-expand]       Alias for query
+  query <question> [--expand]        Hybrid search (RRF; expansion per search mode)
+  ask <question> [--expand]          Alias for query
 
 IMPORT/EXPORT
   import <dir> [--no-embed]          Import markdown directory
@@ -126,7 +133,8 @@ OPEN LOOPS (Gmail/Calendar/Contacts connector — v0.47)
   creds list|remove|export|import    Generic credential vault (redacted output; encrypted bundles)
 
 BRAIN (capture / ideate / explore — v0.37/v0.38)
-  capture [content] [--file PATH]    Single entrypoint for getting content into the brain
+  capture [content] [--file PATH]    Single entrypoint for getting content into the brain (a page;
+                                     a fact to recall later is \`remember\`)
         [--stdin] [--slug s] [--type t]   Inline content / file / stdin; writes to inbox/ by default
         [--source ID] [--quiet|--json]    Multi-source brains: route to a non-default source
   brainstorm <question> [--json]     Bisociation idea generator (hybrid search + far-set + judge)
@@ -149,6 +157,8 @@ SOURCES (multi-repo / multi-brain)
                                      current, federate, set-cr-mode, webhook, harden, ...)
   sync --all                         Sync all sources with a local_path
   sync --source <id>                 Sync one specific source
+  git commit-push -m <m> -- <paths>  Commit + push only those paths in a shared checkout
+                                     (lock, in-memory merge, no rebase/stash); --pull, --push-only
   repos ...                          DEPRECATED alias for 'sources' (v0.19.0)
 
 CODE INDEXING (v0.19.0 / v0.20.0 Cathedral II)

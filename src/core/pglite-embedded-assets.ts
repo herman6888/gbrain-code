@@ -50,7 +50,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { PGlite, type Extension } from '@electric-sql/pglite';
+import type { Extension } from '@electric-sql/pglite';
 
 /** The five on-disk asset paths PGLite's runtime needs, however they were found. */
 export interface PgliteAssetPaths {
@@ -163,7 +163,9 @@ export interface EmbeddedPgliteOptions {
 }
 
 /**
- * Backend start parameters, appended to PGLite's defaults. PGLite is one
+ * Backend start parameters, appended to PGLite's defaults by `build()`
+ * (`[...PGlite.defaultStartParams, ...PGLITE_START_PARAM_OVERRIDES]`, defaults
+ * first so the overrides win). PGLite is one
  * backend with no worker processes, yet a CREATE INDEX still plans parallel
  * workers from max_parallel_maintenance_workers, and pgvector's HNSW build
  * then reserves maintenance_work_mem as a shared area up front inside the
@@ -176,8 +178,7 @@ export interface EmbeddedPgliteOptions {
  * (vector-index.ts PGLITE_HNSW_GRAPH_BUDGET_BYTES); the guard still
  * checkpoints at 256 MB between statements.
  */
-export const PGLITE_START_PARAMS = [
-  ...PGlite.defaultStartParams,
+export const PGLITE_START_PARAM_OVERRIDES = [
   '-c', 'max_parallel_maintenance_workers=0',
   '-c', 'max_wal_size=8GB',
 ];
@@ -231,7 +232,15 @@ async function build(): Promise<EmbeddedPgliteOptions> {
     setup: async () => ({ bundlePath: pgTrgmBundle }),
   };
 
-  return { pgliteWasmModule, initdbWasmModule, fsBundle, extensions: { vector, pg_trgm }, startParams: PGLITE_START_PARAMS };
+  // The package import stays lazy and after resolvePgliteAssetPaths(): a top-level runtime import fails at module
+  // load with the raw "Cannot find module" when the package is missing, before the tier-3 reinstall sentence above
+  // can run (#6512; the module's contract since #4116 is "never fail at load"). The literal specifier keeps the
+  // bundler embedding intact (scripts/check-pglite-embedded.sh).
+  const { PGlite } = await import('@electric-sql/pglite'); // engine-dynamic-import-ok (module must load without the package, #6512)
+  return {
+    pgliteWasmModule, initdbWasmModule, fsBundle, extensions: { vector, pg_trgm },
+    startParams: [...PGlite.defaultStartParams, ...PGLITE_START_PARAM_OVERRIDES],
+  };
 }
 
 /**
