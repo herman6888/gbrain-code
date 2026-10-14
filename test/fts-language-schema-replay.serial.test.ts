@@ -41,6 +41,12 @@ const originalLang = process.env[ENV_KEY];
 const TSVECTOR_EN = /to_tsvector\('english',/g;
 const TSVECTOR_SIMPLE = /to_tsvector\('simple',/g;
 
+// Fork (CJK bigram FTS patch, migration v243): schema.sql's trigger adds four
+// extra to_tsvector('simple', ...) terms on top of the upstream template.
+// The upstream pins assume a pure-upstream baseline; the fork baseline offsets
+// by this constant (same forkBody adaptation as test/fts-cjk-boundary.test.ts).
+const FORK_CJK_SIMPLE_TERMS = 4;
+
 function count(haystack: string, re: RegExp): number {
   return (haystack.match(re) ?? []).length;
 }
@@ -83,7 +89,7 @@ describe('schema templates carry the configured FTS language', () => {
   test('postgres: default leaves english in place', () => {
     const sql = getPostgresSchema();
     expect(count(sql, TSVECTOR_EN)).toBeGreaterThan(0);
-    expect(count(sql, TSVECTOR_SIMPLE)).toBe(0);
+    expect(count(sql, TSVECTOR_SIMPLE)).toBe(FORK_CJK_SIMPLE_TERMS);
   });
 
   test('postgres: configured language replaces every english tsvector', () => {
@@ -92,7 +98,7 @@ describe('schema templates carry the configured FTS language', () => {
     process.env[ENV_KEY] = 'simple';
     const sql = getPostgresSchema();
     expect(count(sql, TSVECTOR_EN)).toBe(0);
-    expect(count(sql, TSVECTOR_SIMPLE)).toBe(before);
+    expect(count(sql, TSVECTOR_SIMPLE)).toBe(before + FORK_CJK_SIMPLE_TERMS);
   });
 
   test('pglite: default leaves english in place', () => {
