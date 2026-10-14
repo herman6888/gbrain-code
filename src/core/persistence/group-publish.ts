@@ -39,10 +39,11 @@ import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwners
 import { isLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, lanePolicy, stepDownLanes, type LaneState } from './sync-lanes.ts';
 import { cancelRows, laneFaultBlockedReason, laneFaultCancelMessage, windowPredecessor } from './sync-window.ts';
+import { BULK_GROUP_CANCEL_MESSAGE, knockOnDetail } from './sync-knock-on.ts';
 import { clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markDispatched, markRecovering, prepareRecoveries,
   foregroundPriority, independentGroup, publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
 import { principalKey, requestPrincipal, type FileRecoveryRecord, type WriteRequest } from './model.ts';
-import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
+import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, holdClaimForPublication, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
 import { claimPhaseStamp, enterClaimPhase, startClaimPhase, type ClaimPhaseClock } from './claim-phase.ts';
 import { DEFAULT_PREPARATION_POLICY, preparationBudgetMs, startPreparation, type PreparationPolicy, type PreparationRun } from './preparation-budget.ts';
 import { setMemberAttribution, withCoordinatedWrite } from './context.ts';
@@ -51,7 +52,7 @@ import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects, queuesMentionLinks, reconcileFinishedBatch } from './effect-journal.ts';
 import { assertUnboundPublication, classifyUnboundPage } from './unbound-source.ts';
 import { declareDurablePersistence } from './protocol.ts';
-import { bindPublicationTimeouts, boundPublication, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
+import { bindPublicationTimeouts, boundPublication, publicationLeaseMs, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
@@ -185,6 +186,8 @@ export function preparationReads(engine: BrainEngine, imports?: ImportGroupReads
 
 /** Test seams around a group's commit and its rollback. */
 export interface GroupHooks {
+  /** Inside the group transaction, once BEGIN has run (a lane prefix marks its original group begun here). */
+  began?(): void;
   beforeCommit?(rows: WriteRequest[]): Promise<void>;
   /** After a failed group transaction and the restoration of any file it published. */
   rolledBack?(rows: WriteRequest[]): Promise<void>;
@@ -260,8 +263,10 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       for (const [i, member] of files) recorded.set(i, member);
       for (const member of files.values()) await seam('prepared', member.row);
     }
-    if (lane) await awaitLaneBegin(lane, rows);
+    const markBegun = lane ? await awaitLaneBegin(lane, rows) : null;
     const done = await transaction(async opened => {
+      markBegun?.();
+      hooks.began?.();
       timed.apply?.end(rows.length);
       if (lane) timed.apply = laneApplyBegin(lane);
       const tx = groupReads(opened);
@@ -451,7 +456,8 @@ async function laneFallback(engine: BrainEngine, rows: WriteRequest[], reason: G
   // claimed again as a lane head; publishing its members one at a time would hold the lanes back.
   if (prior === 'committed' && reason !== 'busy') return null;
   if (prior !== null && ['failed', 'conflict', 'cancelled'].includes(prior)) {
-    for (const done of await cancelRows(engine, rows, laneFault ? laneFaultCancelMessage(laneFault) : undefined)) run.settled(done);
+    for (const done of await cancelRows(engine, rows, laneFault ? laneFaultCancelMessage(laneFault) : undefined,
+      knockOnDetail(laneFault ? 'lane_fault' : 'window_predecessor', after))) run.settled(done);
     return true;
   }
   for (const row of rows) await releaseUnpublishedClaim(engine, row, laneFault ? laneFaultBlockedReason(laneFault) : 'group_member_waiting');
@@ -659,11 +665,14 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
     const live = rows.map((row, i) => ({ row, i })).filter(({ row }) => !released.has(row.id));
     if (!live.length) return progressed;
     const liveRows = live.map(({ row }) => row);
+    if (run.publication) await holdClaimForPublication(lease, () => renewGroupClaims(engine, liveRows, publicationLeaseMs(run.publication!.ceilingMs), undefined,
+      live.map(({ i }) => stampOf(i))));
     let requeued = new Set<string>();
     if (live.every(({ i }) => 'ok' in prepared[i]!)) {
       // #6278 lanes: a prefix publishes under the original group's order key, then drops its own begun mark.
-      if (run.lane && liveRows.length < rows.length) await awaitLaneBegin(run.lane, rows);
-      const result = await bounded(() => publishGroup(engine, liveRows, live.map(({ i }) => (prepared[i] as { ok: PreparedMutation }).ok), run.hostId, run.hooks, run.lane ?? null));
+      const markOriginal = run.lane && liveRows.length < rows.length ? await awaitLaneBegin(run.lane, rows) : null;
+      const hooks = markOriginal ? { ...run.hooks, began: () => { markOriginal(); run.hooks?.began?.(); } } : run.hooks;
+      const result = await bounded(() => publishGroup(engine, liveRows, live.map(({ i }) => (prepared[i] as { ok: PreparedMutation }).ok), run.hostId, hooks, run.lane ?? null));
       if (run.lane && liveRows.length < rows.length) run.lane.begun.delete(liveRows.at(-1)!.request_id);
       if (result.done) { for (const row of result.done) run.settled(row); return true; }
       requeued = new Set(result.requeued);
@@ -673,6 +682,8 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
       if (settled !== null) return settled || progressed;
     }
     let stop: 'cancel' | 'release' | null = null;
+    /** #6643: the member whose non-commit cancels the rest of the group (the cancel's knock-on root). */
+    let stopRoot: string | null = null;
     for (const { row: member, i } of live) {
       let row = member;
       let current = await getWriteRequestById(engine, row.id);
@@ -682,14 +693,14 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
         if (reclaimed) { row = reclaimed; current = reclaimed; }
       }
       if (!current || current.execution_token !== row.execution_token || current.state !== 'running') {
-        if (current && ['committed', 'conflict', 'failed', 'cancelled'].includes(current.state)) { run.settled(current); progressed = true; if (current.state !== 'committed' && !independent) stop ??= 'cancel'; }
+        if (current && ['committed', 'conflict', 'failed', 'cancelled'].includes(current.state)) { run.settled(current); progressed = true; if (current.state !== 'committed' && !independent && stop === null) { stop = 'cancel'; stopRoot = current.request_id; } }
         else if (independent) stop ??= 'release';
         continue;
       }
       if (stop === 'release') { await releaseUnpublishedClaim(engine, row, 'group_member_waiting'); continue; }
       if (stop === 'cancel') {
         const cancelled = await engine.transaction(tx => completeWrite(tx, current, 'cancelled', {}, { code: 'cancelled',
-          message: 'An earlier page of the same bulk sync group failed; this page was not published and is re-frozen after that failure is resolved.' }));
+          message: BULK_GROUP_CANCEL_MESSAGE, detail: knockOnDetail('bulk_group', stopRoot) }));
         run.settled(cancelled); progressed = true; continue;
       }
       const p = prepared[i]!;
@@ -698,7 +709,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
       const done = 'ok' in p ? await bounded(() => publishMutation(engine, row, p.ok, run.hostId)) : await finishUnpublishedFailure(engine, current, p.error, 'preparation');
       run.settled(done);
       if (done.state === 'committed') { progressed = true; continue; }
-      if (['conflict', 'failed', 'cancelled'].includes(done.state)) { progressed = true; if (!independent) stop = 'cancel'; } else stop = 'release';
+      if (['conflict', 'failed', 'cancelled'].includes(done.state)) { progressed = true; if (!independent) { stop = 'cancel'; stopRoot ??= done.request_id; } } else stop = 'release';
     }
     return progressed;
   } finally {

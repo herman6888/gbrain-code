@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 231878,
-    "stdoutSha256": "483f72a8533acf46fd7ff62602c053a1d78c6b77b872d60e56b3982d63df1ed9",
+    "stdoutBytes": 232698,
+    "stdoutSha256": "efcd4e38b964afc730f5c34369c4f9f3d8cec4ad1e885a6df5186b69830924e8",
     "toolNames": [
       "remember",
       "entity",
@@ -21,6 +21,7 @@
       "put_pages",
       "get_write_request",
       "list_write_requests",
+      "list_write_conflicts",
       "cancel_write_request",
       "search",
       "query",
@@ -1086,6 +1087,39 @@
           "type": "object"
         },
         "scope": "write"
+      },
+      {
+        "description": "Pages whose writes keep ending in a source_changed conflict, grouped by slug.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "list_write_conflicts",
+        "parameters": {
+          "cursor": "string?",
+          "limit": "number?",
+          "source_id": "string?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "cursor": {
+              "description": "Previous page's next.",
+              "type": "string"
+            },
+            "limit": {
+              "default": 25,
+              "description": "1-100 slugs (default 25).",
+              "type": "number"
+            },
+            "source_id": {
+              "description": "Default: yours.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "scope": "read"
       },
       {
         "description": "Cancel your accepted write before it publishes; returns the receipt.",

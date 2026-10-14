@@ -1709,6 +1709,16 @@ More: [docs/guides/company-brain-ingestion.md#resume-and-verify](../../docs/guid
 
 More: [docs/guides/multi-language-fts.md#cjk-keyword-budget](../../docs/guides/multi-language-fts.md#cjk-keyword-budget)
 
+### knock_on_exhausted
+
+<a id="knock_on_exhausted"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A managed sync kept re-freezing a page that only waited on another page of the same sync, and stopped at its limit because that earlier page still did not commit. | A page cancelled or refused only because an earlier page of its sync did not commit published nothing, so the sync re-freezes it under a fresh request by itself; the limit stops a loop when the earlier page keeps failing. | Read gbrain sync status --source <id> --json: last_error.root_cause names the request that keeps failing. Fix that request, or raise sync.knock_on_refreeze_limit / sync.knock_on_run_limit, then rerun the same sync. Run: gbrain sync status --source '{source_id}' --json | agent | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/sync-unblock-runbook.md#decision-table](../../docs/guides/sync-unblock-runbook.md#decision-table)
+
 ### legacy_job_selection_invalid
 
 <a id="legacy_job_selection_invalid"></a>
@@ -3115,7 +3125,7 @@ More: [docs/guides/write-refusals.md#unclosed_ambiguous_tail](../../docs/guides/
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A canonical skill file mode changed outside publication. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
+| A canonical file a write was publishing (or its file mode) matches neither its recorded prior nor its published bytes, so recovery left it untouched and its worktree stays blocked. | Something outside gbrain edited, split or restored the file while its write was publishing or recovering; gbrain never overwrites bytes it cannot account for. | Do not delete the file to unblock it. Inspect the owner (gbrain sources writer status --json shows the request and its blocked reason) and ask the user which version to keep: the bytes on disk, or the request's recorded prior or published bytes. Run: gbrain sources writer status --json | user | `gbrain doctor --json` | 1 | no |
 
 ### unexpected_staging_bytes
 
