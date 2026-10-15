@@ -100,6 +100,23 @@ for (const backend of backends) {
       }
     });
 
+    test('a CJK count equals its rows, with type and source filters renumbering the placeholders', async () => {
+      const e = arm().engine;
+      await seedPage(e, 'notes/cjk-glucose-a', '오늘 혈당 기록을 정리했다.');
+      await seedPage(e, 'meetings/cjk-glucose-b', '회의에서 혈당 관리 방안을 논의했다.', { type: 'meeting' });
+      try {
+        expect(await e.countKeywordPages('혈당', { types: ['meeting'], sourceId: 'default' })).toBe(1);
+        const hybrid = await callSearch(e, { query: '혈당', source_id: 'default' });
+        expect(hybrid.retrieval.keyword_total).toBe(2);
+        expect(hybrid.retrieval.degraded ?? []).not.toContainEqual(expect.objectContaining({ stage: 'keyword_count_unavailable' }));
+        const typed = await walkKeyword(e, { query: '혈당', types: ['meeting'], limit: 5 });
+        expect(typed.pages[0].retrieval.total).toBe(1);
+        expect(typed.slugs).toEqual(['meetings/cjk-glucose-b']);
+      } finally {
+        await e.executeRaw(`DELETE FROM pages WHERE slug LIKE '%/cjk-glucose-%'`);
+      }
+    });
+
     test('private fence text is not counted for remote callers', async () => {
       const e = arm().engine;
       await seedPage(e, 'notes/fenced', 'Public body.\n<!--- gbrain:takes:begin -->\nThe marmoset deal is risky.\n<!--- gbrain:takes:end -->');

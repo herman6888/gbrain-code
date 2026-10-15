@@ -57,18 +57,25 @@ bun install -g github:garrytan/gbrain
 Verify: `gbrain --version` should print a version number. If `gbrain` is not found,
 restart the shell or add the PATH export to the shell profile.
 
+Next, on Claude Code or Codex: `gbrain setup claude-code` (or `gbrain setup codex`), which needs no API
+key ([Step 3](#step-3-create-the-brain)). On any other harness, `gbrain init --pglite --no-embedding` (Step 3).
+
 > **If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`** (Bun
 > occasionally blocks the top-level postinstall hook on global installs, so schema
 > migrations don't run automatically), the CLI prints a recovery hint pointing at
 > [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain apply-migrations --yes --no-autopilot-install`
 > to recover. It exits 0 only when the schema is at head. Exit 1 with `migrations_pending` means the schema
 > is still behind: another `--yes` repeats the failure, so run `gbrain doctor --json`, tell the user what it
-> reports, and fall back to the deterministic install path:
+> reports, and fall back to the deterministic install path (exit 1 with reason `wedged` instead means one migration
+> failed three or more times in a row: relay its `fix` to the user, who fixes the cause and clears it with
+> `gbrain apply-migrations --force-retry <version>`; reinstalling does not help):
 >
 > ```bash
 > git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
 > bun install && bun link
 > ```
+
+Bun blocks gbrain's postinstall on `bun install -g` (`Blocked 1 postinstall`); a new install can skip it: the script only repeats the refusal every gbrain command prints on a Bun below the floor and runs `gbrain apply-migrations --yes --non-interactive`, which has nothing to migrate before a brain exists, and `gbrain setup` creates the brain and applies its setup migrations.
 
 ## Step 2: API Keys
 
@@ -79,7 +86,7 @@ GBrain is keyless. Explain these boundaries before enabling a capability; see
 [memory boundaries](docs/guides/memory-boundaries.md#where-text-goes).
 
 Skip API-key setup for the initial keyless memory path. If the user enables semantic retrieval or paid enrichment, configure the selected provider explicitly. GBrain defaults to the Voyage embedding + reranker stack
-(`voyage:voyage-4` @ 1024d + `voyage:rerank-2.5` — one key covers both); OpenAI is the
+(`voyage:voyage-4` @ 1024d + `voyage:rerank-3-lite` — one key covers both); OpenAI is the
 main alternative, chosen at init via `--embedding-model <provider:model>`.
 **Need to switch an existing brain's embedding or reranker model?** Follow
 the explicit-consent playbook at `skills/migrations/v0.46.3.0.md`. Preview the
@@ -287,7 +294,8 @@ Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 >
 > Expansion follows the mode for `gbrain query` only: on in `tokenmax`, off in
 > `balanced` and `conservative`; `--expand` (`expand: true` over MCP) forces it
-> and `--no-expand` (`expand: false`) skips it. `gbrain search` and the memory
+> and `--no-expand` (`expand: false`) skips it. `gbrain config set search.expansion false`
+> turns the default off for the brain in any mode. `gbrain search` and the memory
 > verbs never expand. See [search modes](docs/guides/search-modes.md) for the
 > current contract.
 >

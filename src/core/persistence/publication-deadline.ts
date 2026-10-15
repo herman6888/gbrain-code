@@ -46,6 +46,9 @@ export async function readPublicationCeilingMs(engine: Pick<BrainEngine, 'getCon
   return ceiling.value;
 }
 
+/** Test seam: the next readPublicationCeilingMs reads the config again. */
+export function _resetPublicationCeilingForTest(): void { ceiling = { ...ceiling, at: 0 }; }
+
 /** The idle-in-transaction bound a publish transaction gets: the ceiling, never above the pool's own session value. */
 export function publicationIdleTimeoutMs(ceilingMs = ceiling.value): number {
   const session = gucMilliseconds(resolveSessionTimeouts().idle_in_transaction_session_timeout);

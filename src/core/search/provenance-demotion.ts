@@ -22,6 +22,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
 import { parseFactsFence } from '../facts-fence.ts';
+import { rankingLinkSql } from '../link-ranking-policy.ts';
 import { resolveQueryEntity } from './alias-fanout.ts';
 
 export const GENERATED_FACTOR = 0.5;
@@ -60,7 +61,7 @@ export async function applyGeneratedDemotion(engine: BrainEngine, list: SearchRe
     const targetIds = targets.map(t => Number(t.id));
     if (!targetIds.length) return;
     const linking = new Set((await engine.executeRaw<{ id: number }>(
-      `SELECT DISTINCT from_page_id AS id FROM links WHERE from_page_id = ANY($1::int[]) AND to_page_id = ANY($2::int[])`,
+      `SELECT DISTINCT l.from_page_id AS id FROM links l WHERE l.from_page_id = ANY($1::int[]) AND l.to_page_id = ANY($2::int[]) AND ${rankingLinkSql('l')}`,
       [ids, targetIds])).map(r => Number(r.id)));
     const primaryPresent = list.some(r => !generatedIds.has(r.page_id) && (targetIds.includes(r.page_id) || linking.has(r.page_id)));
     if (!primaryPresent) return;

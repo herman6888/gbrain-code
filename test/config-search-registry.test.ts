@@ -48,6 +48,8 @@ const DIRECTLY_READ_SINGLETONS = [
   'search.return_budget_conversation',
   'search.return_budget_max_remote',
   'search.auto_packing',                     // search/evidence-delivery.ts (explicit-budget cap)
+  'search.long_page_unit',                   // search/evidence-delivery.ts (long non-conversation pages under implied auto)
+  'search.long_page_min_chars',              // search/evidence-delivery.ts (rendered-body threshold for a long page)
   'search.evidence_date_header',             // search/evidence-delivery.ts (C1)
   'search.entity_anchoring',                 // search/entity-anchor.ts (ops/search.ts)
   'search.query_facts_arm',                  // search/facts-arm.ts (search/query-arms.ts)

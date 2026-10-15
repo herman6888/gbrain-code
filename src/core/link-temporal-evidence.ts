@@ -276,16 +276,21 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   }
 
   // 3. Frontmatter since/until on relationship objects ({name, since, until}).
+  //    A name matches its target exactly or as a slug prefix ("Acme" for
+  //    acme-example); when several objects in the field match one target, only
+  //    the exact matches date it, so "MSA" never dates msa-renewal beside "MSA Renewal".
   const fm = page.frontmatter ?? {};
   for (const r of temporalRows) {
     if (r.link_source !== 'frontmatter' || !r.origin_field) continue;
     const field = fm[r.origin_field];
-    const items = Array.isArray(field) ? field : [field];
-    for (const item of items) {
-      if (!item || typeof item !== 'object') continue;
+    const named = (Array.isArray(field) ? field : [field]).flatMap(item => {
+      if (!item || typeof item !== 'object') return [];
       const obj = item as Record<string, unknown>;
       const name = typeof obj.name === 'string' ? obj.name : typeof obj.slug === 'string' ? obj.slug : null;
-      if (!name || !nameMatches(name, other(r))) continue;
+      const match = name ? nameMatch(name, other(r)) : null;
+      return name && match ? [{ obj, name, exact: match === 'exact' }] : [];
+    });
+    for (const { obj, name } of named.length > 1 ? named.filter(n => n.exact) : named) {
       for (const [key, kind] of [['since', 'start'], ['until', 'end']] as const) {
         const d = normalizePartialDate(stringish(obj[key]));
         if (!d) continue;
@@ -325,8 +330,9 @@ function stringish(v: unknown): string | null {
   return /^\d{4}-\d{2}-\d{2}T00:00:00(?:\.0+)?Z$/.test(v) ? v.slice(0, 10) : v;
 }
 
-function nameMatches(name: string, slug: string): boolean {
+function nameMatch(name: string, slug: string): 'exact' | 'prefix' | null {
   const base = slug.split('/').pop()!.toLowerCase();
   const norm = name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  return norm === base || base.startsWith(`${norm}-`) || normalizeLinkTarget(name).toLowerCase() === slug.toLowerCase();
+  if (norm === base || normalizeLinkTarget(name).toLowerCase() === slug.toLowerCase()) return 'exact';
+  return base.startsWith(`${norm}-`) ? 'prefix' : null;
 }

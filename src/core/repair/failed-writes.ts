@@ -53,6 +53,7 @@ import { initializeLocalPersistence, requestPrincipalForContext, submitPageMutat
 import { submitRememberMutation } from '../persistence/memory-mutations.ts';
 import { getWorktreeBinding } from '../persistence/ownership.ts';
 import { prepareFileTarget } from '../persistence/page-prepare.ts';
+import { PENDING_IMPORT, SYNC_HELD } from '../persistence/pending-import.ts';
 import { clearApprovedSet, loadApprovedSet, previewChangedError, previewHash, saveApprovedSet } from '../persistence/preview-approval.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { dispositionOf, PAGE_REMOVAL_OPERATIONS, supersessionOrderSql, supersessionSql } from '../persistence/terminal-classify.ts';
@@ -70,6 +71,8 @@ const DRIFT_REFUSAL = `(r.state='conflict' AND r.error_code='source_changed')`;
 interface FailedWrite {
   id: string; request_id: string; sequence: string; operation: string; source_id: string; slug: string; digest: string; state: string;
   intent: Record<string, unknown>; authority: WriteAuthority; created_at: string; producer: string | null;
+  /** #6693: the refusal's recorded origin (`pending_import`, `sync_held`), when the receipt carries one. */
+  origin?: string | null;
 }
 type Disposition = 'replay' | 'already_written' | 'duplicate' | 'superseded' | 'unpinned_target' | 'file_database_drift';
 /** A replay bound to the page revision the preview saw (null: no live page). */
@@ -93,7 +96,7 @@ function producerCommand(producer: string, sourceId: string): string {
 
 async function failedWrites(engine: BrainEngine, sourceIds: string[], id?: string): Promise<FailedWrite[]> {
   const rows = await engine.executeRaw<FailedWrite>(`SELECT r.id::text, r.request_id::text, r.sequence::text, r.operation, r.source_id, r.slug, r.digest, r.state, r.intent, r.authority,
-      to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+      to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at, r.error_detail->>'origin' AS origin,
       CASE WHEN r.operation = ANY($2::text[]) AND NOT (r.operation='put_page' AND r.intent ? 'kind') THEN NULL
         ELSE r.operation || COALESCE(':' || (r.intent->>'kind'), '') END AS producer
     FROM persistence_requests r
@@ -363,6 +366,10 @@ async function replayParams(ctx: OperationContext, write: ApprovedWrite, request
       return { refused: { applied: false, outcome: 'changed_since_preview', reason: `the fact's subject ${target} no longer resolves to itself` } };
     }
     params.entity = target;
+    // #6693: the fact keeps the dates its first admission gave it (valid_from defaults to the admission time, a ttl to an absolute expiry).
+    if (typeof write.intent.valid_from === 'string') params.valid_from = write.intent.valid_from;
+    if (typeof write.intent.valid_until === 'string') params.ttl = write.intent.valid_until;
+    else delete params.ttl;
     return { params };
   }
   if (write.operation === 'put_page') {
@@ -413,4 +420,56 @@ async function replay(ctx: OperationContext, failed: ApprovedWrite): Promise<Rep
     throw error;
   }
   return { applied: true, outcome: 'replayed' };
+}
+
+/** #6693: the most caller remembers one sync run replays, and the time it may spend on them. */
+export const IMPORT_REPLAY_LIMIT = 50;
+export const IMPORT_REPLAY_BUDGET_MS = 30_000;
+
+/** #6693: what one post-sync replay pass did; counts only, never a slug or claim. */
+export interface ImportReplayReport {
+  /** Refused remembers of the source whose page awaited import or was held by sync, not yet written. */
+  examined: number;
+  replayed: number;
+  /** Their page still differs from its file (not imported yet, or still held): kept for a later sync. */
+  waiting: number;
+  /** Not replayed: written or superseded since, unpinned, or the replay was refused (authority, conflict); `gbrain repair failed-writes` lists each. */
+  skipped: number;
+  /** Left for the next sync by the per-run limit or time budget. */
+  remaining: number;
+}
+
+/**
+ * #6693 (D7): after a managed sync, replay once each caller `remember` that was
+ * refused because its page's file held a committed change sync had not imported
+ * (`pending_import`) or was held by sync (`sync_held`), now that the page matches
+ * its file again. Same path as `gbrain repair failed-writes --apply`: the
+ * disposition rules, the original trust lane, a live authority re-check and a
+ * request id derived from the refused request, so two passes (or a pass and a
+ * manual apply) admit one request. A page still drifted is skipped before any
+ * admission, so a pass adds no receipt for it. `put_page` is never replayed here:
+ * its full body would replace the change the sync just imported.
+ */
+export async function replayImportedRemembers(ctx: OperationContext, sourceId: string,
+  opts: { limit?: number; budgetMs?: number; now?: () => number } = {}): Promise<ImportReplayReport> {
+  const now = opts.now ?? Date.now;
+  const deadline = now() + (opts.budgetMs ?? IMPORT_REPLAY_BUDGET_MS);
+  const limit = opts.limit ?? IMPORT_REPLAY_LIMIT;
+  const candidates = (await failedWrites(ctx.engine, [sourceId])).filter(write => write.operation === 'remember' && write.producer === null
+    && (write.origin === PENDING_IMPORT || write.origin === SYNC_HELD));
+  const report: ImportReplayReport = { examined: 0, replayed: 0, waiting: 0, skipped: 0, remaining: 0 };
+  for (const [index, write] of candidates.entries()) {
+    if (report.replayed >= limit || now() >= deadline) { report.remaining = candidates.length - index; break; }
+    const verdict = await disposition(ctx.engine, write);
+    // A replay that committed (or a later write of the same fact) settles the receipt; it stays as history only.
+    if (verdict.class === 'already_written') continue;
+    report.examined++;
+    if (verdict.class !== 'replay') { report.skipped++; continue; }
+    if (await stillDrifted(ctx.engine, write)) { report.waiting++; continue; }
+    const outcome = await replay(ctx, { ...write, revision: await pageRevision(ctx.engine, write.source_id, write.slug), selection: [sourceId] });
+    if (outcome.applied) report.replayed++;
+    else if (outcome.outcome === 'file_database_drift') report.waiting++;
+    else report.skipped++;
+  }
+  return report;
 }

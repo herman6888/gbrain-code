@@ -24,6 +24,7 @@ import { ALIAS_ORIGIN_RANK, declarationsIn, titleName, type AliasOrigin } from '
 import { readIdentitySiblings, SIBLING_GROUP_CAP } from '../mentions/siblings.ts';
 import type { MentionPolicy, PackTypes } from '../mentions/policy.ts';
 import type { Notice } from '../agent-output.ts';
+import type { RecordGroupView } from './entity-references.ts';
 
 export const EXCERPT_PAGE_CHARS = 600;
 export const EXCERPT_CARD_CHARS = 1200;
@@ -98,7 +99,8 @@ export function excerptLines(body: string, title: string, budget = EXCERPT_PAGE_
 
 export interface CardIdentity {
   aka_sources: Array<{ origin: string; slug: string }>;
-  identity_siblings?: { pages: Array<{ slug: string; title: string; type: string | null; aka: string[] }>; capped: boolean };
+  /** Each sibling page; `records` (the full card's record view for that sibling) only when record types are enrolled. */
+  identity_siblings?: { pages: Array<{ slug: string; title: string; type: string | null; aka: string[]; records?: RecordGroupView[] }>; capped: boolean };
   identity_excerpt?: IdentityExcerptLine[];
   identity_excerpt_omitted?: string[];
   alias_guidance?: { text: string; requires_surface?: 'starter' };

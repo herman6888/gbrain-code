@@ -1,4 +1,5 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
+import { recordFunnelEvent, recordRecallOutcome } from '../funnel.ts';
 import { parseRelationalPlan } from '../search/relational-plan.ts';
 import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
@@ -570,7 +571,7 @@ const recall: Operation = {
 
     const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery));
 
-    return {
+    const out = {
       facts: await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
         id: r.id,
         fact: r.fact,
@@ -635,6 +636,8 @@ const recall: Operation = {
       ...(budgetPacking ? { budget_packing: budgetPacking } : {}),
       ...(delivery ? { delivery } : {}),
     };
+    recordRecallOutcome(out);
+    return out;
   },
 };
 
@@ -681,6 +684,9 @@ async function withProvenance<T extends { id: number }>(engine: BrainEngine, sou
   return facts.map((f) => ({ ...f, provenance: byId.get(f.id) ?? null }));
 }
 
+/** context_pack `intent` values; pinned equal to proactive-brief.ts BRIEF_INTENTS by test (kept literal so this module stays import-light). */
+export const BRIEF_INTENTS = ['meeting', 'reply'] as const;
+
 const context_pack: Operation = {
   name: 'context_pack',
   mutating: false,
@@ -695,6 +701,8 @@ const context_pack: Operation = {
     include_private: { type: 'boolean', description: 'Local trusted callers only.' },
     min_trust: MIN_TRUST_PARAM,
     include_quarantined: { type: 'boolean', description: 'Admin or memory_confirm: quarantined cards.', fullSurfaceOnly: true },
+    counterparty: { type: 'string', description: 'Person or company (name or slug): adds a pulled brief of dated items about them.', fullSurfaceOnly: true },
+    intent: { type: 'string', enum: [...BRIEF_INTENTS], description: 'With counterparty: the task the brief is for.', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
@@ -728,6 +736,12 @@ const context_pack: Operation = {
         : null;
     // #5575 (CEO-20, CEO-18): a proactive surface under the connection's floor.
     const eligibility = await proactiveEligibility(ctx, 'context_pack', { minTrust: p.min_trust });
+    const includeQuarantined = p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE));
+    // Wave 5 D5 pull brief: only when the caller names a counterparty (the
+    // push switch is not read; nothing changes for a caller that does not
+    // pass it). Open loops are trusted-local only; the change arm is
+    // world-only unless a trusted caller widened with include_private.
+    const pullBrief = await contextPackBrief(ctx, p, { sourceId, includePrivate, eligibility });
     const res = entities.length === 0
       ? { cards: [], facts: [], text: '', pointers: [], factsCount: 0 } as unknown as Awaited<ReturnType<typeof assembleContextPack>>
       : await assembleContextPack(ctx.engine, {
@@ -739,7 +753,7 @@ const context_pack: Operation = {
         maxEntities: PACK_DEFAULT_MAX_ENTITIES,
         eligibility,
         // #5575 ENG-15: same rule as get_page: quarantined cards only on an authorized explicit ask.
-        includeQuarantined: p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE)),
+        includeQuarantined,
       });
     // Always-loaded core tier (core-memory.ts): owner-designated pages of
     // `default` plus this source, inside the caller's grant; it packs first.
@@ -756,7 +770,28 @@ const context_pack: Operation = {
     // Pack, price and render the redacted presentation sets (one echo
     // dictionary); local callers get the delivered facts back raw below.
     const rawFacts = await withProvenance(ctx.engine, sourceId, res.facts ?? []);
-    const view = redactRetrievalOutput([{ cards: res.cards ?? [], facts: rawFacts }], {}).results[0];
+    // F1 records (pull verb only; the ambient push path never reads them): the count and enrolled-type records of each card.
+    const { readPackReferences, renderRecordLines, RECORDS_HEADER } = await import('../verbs/entity-references.ts');
+    type PackRefs = Awaited<ReturnType<typeof readPackReferences>>;
+    const packRefs: PackRefs = await readPackReferences(ctx.engine, sourceId, res.cards ?? [], { remote: !includePrivate, eligibility, surfaceCeiling: ctx.surfaceCeiling,
+      emitNotice: (n) => ctx.emitNotice?.(n) })
+      .catch((): PackRefs => ({ bySlug: new Map(), notice: null }));
+    if (packRefs.notice) ctx.emitNotice?.(packRefs.notice);
+    // F3 (`entity.row_page_status`, default on): each card and newer-mentions row carries its page's frontmatter `status` (pull verb only).
+    const { readRowPageStatus } = await import('../entity-references-config.ts');
+    const { readPageStatusByRef } = await import('../mentions/referrers.ts');
+    const statusRefs = (res.cards ?? []).flatMap((c) => [c.entity.slug, ...(c.newer_mentions?.rows ?? []).map((r) => r.slug)]).map((slug) => ({ source_id: sourceId, slug }));
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const pageStatus = statusRefs.length && await readRowPageStatus(ctx.engine)
+      ? await readPageStatusByRef(ctx.engine, statusRefs, { excludePrivate: await resolveExcludePrivatePages(ctx.engine, includePrivate ? false : undefined), includeQuarantined })
+        .catch(() => new Map<string, string>())
+      : new Map<string, string>();
+    const statusOf = (slug: string) => { const value = pageStatus.get(`${sourceId}:${slug}`); return value ? { page_status: value } : {}; };
+    const withRefs = (res.cards ?? []).map((c) => ({
+      ...c, ...packRefs.bySlug.get(c.entity.slug), ...statusOf(c.entity.slug),
+      ...(c.newer_mentions ? { newer_mentions: { ...c.newer_mentions, rows: c.newer_mentions.rows.map((r) => ({ ...r, ...statusOf(r.slug) })) } } : {}),
+    }));
+    const view = redactRetrievalOutput([{ cards: withRefs, facts: rawFacts }], {}).results[0];
     let cards = view.cards;
     let facts = view.facts;
     // The SAME since filter the assembler applied (pre-landing review: the raw
@@ -769,7 +804,7 @@ const context_pack: Operation = {
     if (budgetTokens !== null) {
       // #4761: reserve the envelope + headers, then price each card as its
       // rendered line plus its rendered (since-filtered) thread lines.
-      const itemBudget = budgetTokens - packHeaderCost() - coreTokens;
+      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0);
       const cardCost = (c: (typeof cards)[number]) =>
         lineCost(renderCardLine(c)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
@@ -785,6 +820,14 @@ const context_pack: Operation = {
         : dropAll(withMentions);
       const keptMentions = new Set(mentionPack.items);
       cards = cards.map((c) => (c.newer_mentions && !keptMentions.has(c) ? { ...c, newer_mentions: undefined } : c));
+      // Records pack last, into what everything else left; a card whose records do not fit keeps its count.
+      const recordBudget = mentionBudget - mentionPack.meta.used - lineCost('') - lineCost(RECORDS_HEADER);
+      const withRecords = cards.filter((c) => renderRecordLines(c).length);
+      const recordPack = recordBudget > 0
+        ? packToBudget(withRecords, (c) => renderRecordLines(c).reduce((n, l) => n + lineCost(l), 0), recordBudget)
+        : dropAll(withRecords);
+      const keptRecords = new Set(recordPack.items);
+      cards = cards.map((c) => (renderRecordLines(c).length && !keptRecords.has(c) ? { ...c, records: undefined, sibling_records: undefined } : c));
       droppedCount = cardPack.meta.dropped + factPack.meta.dropped;
     }
     const open_threads = cards.flatMap(threadsOf);
@@ -792,8 +835,10 @@ const context_pack: Operation = {
     // `text` is what harnesses inject, so it must honor the same budget the
     // structured arrays report — the assembler's pre-budget rendering would
     // overrun the declared budget_tokens. budget_used reports that text.
-    const packText = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
-    const text = [coreText, packText].filter(Boolean).join('\n\n');
+    const recordLines = cards.flatMap(renderRecordLines);
+    const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
+    const packText = recordLines.length ? [basePack, ['', RECORDS_HEADER, ...recordLines].join('\n')].filter(Boolean).join('\n') : basePack;
+    const text = [coreText, pullBrief?.text ?? '', packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -803,6 +848,7 @@ const context_pack: Operation = {
         slug: c.entity.slug,
         title: c.entity.title,
         type: c.entity.type,
+        ...(c.page_status ? { page_status: c.page_status } : {}),
         summary: c.quarantined && c.summary ? renderTrustedText(c.summary, { trust_tier: 'external_untrusted', origin: 'quarantined' }) : c.summary,
         open_threads: c.open_threads,
         edges: c.edges,
@@ -812,6 +858,10 @@ const context_pack: Operation = {
         ...(c.quarantined ? { quarantined: true } : {}),
         ...(c.unconfirmed ? { unconfirmed: true } : {}),
         ...(c.newer_mentions ? { newer_mentions: c.newer_mentions } : {}),
+        ...(c.referenced_by_count !== undefined ? { referenced_by_count: c.referenced_by_count } : {}),
+        ...(c.records ? { records: c.records } : {}),
+        ...(c.sibling_records ? { sibling_records: c.sibling_records } : {}),
+        ...(c.references_unavailable ? { references_unavailable: c.references_unavailable } : {}),
       })),
       open_threads,
       facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
@@ -828,6 +878,7 @@ const context_pack: Operation = {
         ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
       text,
+      ...(pullBrief ? { brief: pullBrief.view } : {}),
       ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
       ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
         truncated: core.truncated, revision: core.revision } } : {}),
@@ -841,6 +892,52 @@ const context_pack: Operation = {
     };
   },
 };
+
+/**
+ * context_pack's pull brief (wave 5 D5): null unless `counterparty` is given.
+ * An unresolved counterparty is a labelled empty brief, not an error; an
+ * invalid `intent` is invalid_params.
+ */
+async function contextPackBrief(
+  ctx: OperationContext,
+  p: Record<string, unknown>,
+  opts: { sourceId: string; includePrivate: boolean; eligibility: import('../eligibility/policy.ts').ReadEligibility },
+): Promise<{ text: string; view: Record<string, unknown> } | null> {
+  if (typeof p.counterparty !== 'string' || !p.counterparty.trim()) return null;
+  if (p.intent !== undefined && !(BRIEF_INTENTS as readonly unknown[]).includes(p.intent)) {
+    throw verbError(
+      'invalid_params',
+      `context_pack: intent must be one of ${BRIEF_INTENTS.join(', ')}`,
+      `Pass ${paramUse(ctx, 'intent', 'meeting')} or omit it.`,
+    );
+  }
+  const { resolvePullCounterparty, assembleBrief, briefView } = await import('../context/proactive-brief.ts');
+  const local = ctx.remote === false;
+  const label = {
+    delivery: 'pull' as const,
+    intent: (p.intent as string | undefined) ?? null,
+    ...(local ? {} : { withheld_arms: ['loops'] }),
+  };
+  const cp = await resolvePullCounterparty(ctx.engine, opts.sourceId, p.counterparty.slice(0, 200), {
+    excludePrivate: !opts.includePrivate, eligibility: opts.eligibility,
+  });
+  if (!cp) return { text: '', view: { ...label, counterparty: null, items: [], reason: 'counterparty_unresolved' } };
+  const now = Date.now();
+  const brief = await assembleBrief(ctx.engine, {
+    trigger: 'pull',
+    counterparties: [cp],
+    local,
+    includePrivate: opts.includePrivate,
+    eligibility: opts.eligibility,
+    clock: { now, stopAt: now + CONTEXT_PACK_BRIEF_BUDGET_MS },
+  });
+  const counterparty = { slug: cp.slug, display: cp.display };
+  if (!brief) return { text: '', view: { ...label, counterparty, items: [], reason: 'no_items' } };
+  return { text: brief.text, view: { ...label, counterparty, items: briefView(brief).items } };
+}
+
+/** Wall-clock cap on the pull brief's queries. */
+const CONTEXT_PACK_BRIEF_BUDGET_MS = 1000;
 
 const delta: Operation = {
   name: 'delta',
@@ -1244,7 +1341,9 @@ const forget_fact: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'forget_fact', id: p.id };
     const { submitForgetMutation } = await import('../persistence/memory-mutations.ts');
-    return submitForgetMutation(ctx, 'forget_fact', p);
+    const out = await submitForgetMutation(ctx, 'forget_fact', p);
+    recordFunnelEvent('withdrawal');
+    return out;
   },
 };
 

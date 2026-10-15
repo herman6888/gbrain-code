@@ -9,10 +9,12 @@ import { join } from 'node:path';
 import type { BrainEngine, PageSnapshot } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { prepareManagedSyncMutation, type SyncIntent } from './sync-prepare.ts';
+import { recordSyncImportProvenances, syncDiskProvenance, type SyncImportProvenance, type SyncImportProvenanceBase } from './sync-holds.ts';
+import { sha256 } from './digest.ts';
 import { startClaimPhase } from './claim-phase.ts';
 import { inspectUnchanged, screeningRequest, type NoopKernelWaiver } from './noop-kernel.ts';
 import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
-import { readSyncFile, syncRawHash } from './sync-discovery.ts';
+import { readSyncFile } from './sync-discovery.ts';
 import { isImageFilePath } from '../sync.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { assertSyncPageOrigin, syncOriginScope } from './sync-origin.ts';
@@ -26,7 +28,8 @@ import { withBoundedReadSession } from './bounded-reads.ts';
 export interface WaiverCursor { sourceId: string; incarnation: string; root: string; gitRoot: string; slugMode: 'git-root' | 'source-root';
   binding: { worktree_id: string }; authority: SyncAuthority; runId: string; index: number }
 export interface WaiverEntry { requestId: string; slug: string; pageId: number | null; intent: SyncIntent }
-export interface NoopWaiver { kind: 'import' | 'delete'; kernel: NoopKernelWaiver[] }
+/** `provenance` (a Markdown import): what the waiver records as the page's import provenance, as its publication would have. */
+export interface NoopWaiver { kind: 'import' | 'delete'; kernel: NoopKernelWaiver[]; provenance?: SyncImportProvenanceBase }
 
 /** `persistence.sync_preparation_ms` (preparation-budget.ts validates it): the budget a managed sync member's preparation gets; default 120 s. */
 export const SYNC_PREPARATION_MS_KEY = 'persistence.sync_preparation_ms';
@@ -122,6 +125,9 @@ export async function waiveNoopEntry<C extends WaiverCursor>(engine: BrainEngine
     } else if (snapshot?.page.id !== pending.pageId || snapshot.page.deleted_at != null || snapshot.revision !== intent.expected_revision) return null;
     const unfinished = await tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, unfinishedPageRequestParams(cursor, pending));
     if (unfinished.length) return null;
+    const provenance = waivedProvenance(cursor, pending, waived, snapshot!.revision);
+    if (provenance === false) return null;
+    await recordSyncImportProvenances(tx, provenance ? [provenance] : []);
     return advance(tx, waived);
   });
 }
@@ -151,10 +157,10 @@ async function screenWaiverEntry(engine: BrainEngine, cursor: WaiverCursor, pend
     if (!frozen) await validateSyncAuthority(engine, cursor.authority, pending.slug);
     return { kind: 'delete', kernel: [] };
   }
-  const kernel = await unchangedSyncImport(engine, cursor, pending, config, signal, frozen?.snapshot);
-  if (!kernel) return null;
+  const unchanged = await unchangedSyncImport(engine, cursor, pending, config, signal, frozen?.snapshot);
+  if (!unchanged) return null;
   if (!frozen) await validateSyncAuthority(engine, cursor.authority, pending.slug);
-  return { kind: 'import', kernel };
+  return { kind: 'import', ...unchanged };
 }
 
 /** #5984: `GBRAIN_SYNC_WAIVE_BATCH=0` (or `sync.waive_batch=false`) waives one entry per transaction, as before. */
@@ -199,6 +205,7 @@ export async function waiveNoopRun<C extends WaiverCursor>(engine: BrainEngine, 
       // #6423: the per-entry checks go out in pipelined chunks of at most WAIVER_PIPELINE_MAX calls, and a chunk is sent only
       // while every entry before it validated (the prefix stops at the first entry that does not).
       let valid = 0;
+      const provenances: Array<Omit<SyncImportProvenance, 'recorded_at' | 'validated'>> = [];
       chunks: for (let from = 0; from < run.length; from += WAIVER_PIPELINE_MAX / 2) {
         const chunk = run.slice(from, from + WAIVER_PIPELINE_MAX / 2);
         noteDrainSql(UNFINISHED_PAGE_REQUEST_SQL);
@@ -214,11 +221,14 @@ export async function waiveNoopRun<C extends WaiverCursor>(engine: BrainEngine, 
           if (!page || Number(page.id) !== pending.pageId || revision !== pending.intent.expected_revision) break chunks;
           if (waived.kind === 'delete' ? !page.deleted || readSyncFile(cursor.root, pending.intent.path!) !== null : page.deleted) break chunks;
           if ((checks[2 * i] as unknown[]).length || checks[2 * i + 1] !== true) break chunks;
-          if (waived.kind === 'import' && syncRawHash(cursor.root, pending.intent.path!) !== pending.intent.rawHash) break chunks;
+          const provenance = waivedProvenance(cursor, pending, waived, revision!);
+          if (provenance === false) break chunks;
+          if (provenance) provenances.push(provenance);
           valid++;
         }
       }
       if (!valid) return null;
+      await recordSyncImportProvenances(tx, provenances);
       return { cursor: await advance(tx, run.slice(0, valid)), waived: valid, ...(valid < run.length ? { next: run[valid]!.pending } : {}) };
     });
   } catch (error) {
@@ -239,6 +249,19 @@ export async function wouldWaiveEntry(engine: BrainEngine, cursor: WaiverCursor,
   return (await unchangedSyncImport(engine, cursor, pending, config, signal)) !== null;
 }
 
+/**
+ * #6712: the import provenance a waived import records in its waiver transaction, from the file read there: false when
+ * the file no longer has the frozen raw hash (the entry is not waived), null for a waiver that records none (a delete,
+ * or an import whose preparation carried no provenance, such as a code file).
+ */
+function waivedProvenance(cursor: WaiverCursor, pending: WaiverEntry, waived: NoopWaiver, revision: string): Omit<SyncImportProvenance, 'recorded_at' | 'validated'> | false | null {
+  if (waived.kind !== 'import') return null;
+  const bytes = readSyncFile(cursor.root, pending.intent.path!);
+  if ((bytes === null ? null : sha256(bytes)) !== pending.intent.rawHash) return false;
+  if (!waived.provenance) return null;
+  return { ...waived.provenance, page_id: pending.pageId!, revision, ...syncDiskProvenance(bytes, pending.intent.target) };
+}
+
 function softDeletedAt(snapshot: Awaited<ReturnType<BrainEngine['readPageSnapshot']>>, pending: WaiverEntry): boolean {
   return snapshot?.page.id === pending.pageId && snapshot.page.deleted_at != null && snapshot.revision === pending.intent.expected_revision;
 }
@@ -246,7 +269,7 @@ function softDeletedAt(snapshot: Awaited<ReturnType<BrainEngine['readPageSnapsho
 /**
  * #5470 no-op screen for working-tree and company-profile sync: runs the sync
  * preparer on the frozen, unadmitted entry. A rename or a canonical overlay is
- * always admitted. Returns null to admit, or the kernel waivers the skip used.
+ * always admitted. Returns null to admit, or the kernel waivers the skip used and the provenance its waiver records.
  * #5751: a managed working-tree entry waives the two admit reasons its no-op
  * publication can never resolve (a pending contextual-mode stamp, and file
  * bytes that differ from the prepared content yet parse to the same page), so
@@ -255,7 +278,7 @@ function softDeletedAt(snapshot: Awaited<ReturnType<BrainEngine['readPageSnapsho
  * nothing is waived, and a cancelled run propagates.
  */
 export async function unchangedSyncImport(engine: BrainEngine, cursor: WaiverCursor, pending: WaiverEntry, config: GBrainConfig, signal?: AbortSignal,
-  frozenSnapshot?: PageSnapshot | null): Promise<NoopKernelWaiver[] | null> {
+  frozenSnapshot?: PageSnapshot | null): Promise<Pick<NoopWaiver, 'kernel' | 'provenance'> | null> {
   const intent = pending.intent;
   if (intent.kind !== 'managed_sync_import' || intent.renameFrom || pending.pageId === null || typeof intent.path !== 'string' || typeof intent.content !== 'string') return null;
   // #6529: an image's preparation is provider work; its hash no-op is decided under the admitted request instead.
@@ -276,7 +299,7 @@ export async function unchangedSyncImport(engine: BrainEngine, cursor: WaiverCur
       waive: intent.working === true ? ['contextual_mode', 'canonical_file_differs'] : undefined });
     if (inspected.admitReason) return null;
     await prepared.validate?.(engine);
-    return inspected.waived ?? [];
+    return { kernel: inspected.waived ?? [], ...(prepared.importProvenance ? { provenance: prepared.importProvenance } : {}) };
   } catch (error) {
     rethrowAbort(error, signal);
     return null;

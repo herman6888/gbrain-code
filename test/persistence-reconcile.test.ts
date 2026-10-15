@@ -12,7 +12,7 @@ import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts'
 import { acceptWriterTransfer, acquireWorktree, claimWorktree, getWorktreeBinding, prepareWriterTransfer } from '../src/core/persistence/ownership.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration, type LocalRegistration } from '../src/core/persistence/identity.ts';
 import { runReconcileApply, runReconcileBackups, runReconcilePreview, assertReconcileOutputPath } from '../src/core/persistence/reconcile.ts';
-import { fileClaimCandidatesSql } from '../src/core/persistence/reconcile-state.ts';
+import { fileClaimCandidatesQuery } from '../src/core/persistence/reconcile-state.ts';
 import { prepareFileTarget } from '../src/core/persistence/page-prepare.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { admitWrite, claimNextWrite, compactWriteReceipts, getWriteRequest } from '../src/core/persistence/journal.ts';
@@ -697,12 +697,26 @@ test('the file-claim census is served by the v219 name indexes on Postgres', asy
   await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw(`INSERT INTO pages(source_id,slug,type,title,compiled_truth,frontmatter,source_path)
     SELECT $1,'bulk/p'||n,'note','Bulk '||n,'Bulk '||n,'{}'::jsonb,'bulk/p'||n||'.md' FROM generate_series(1,3000) n`, [f.id]), TEST_WRITE_ATTRIBUTION));
   await engine.executeRaw('ANALYZE pages');
-  const plan = (await engine.executeRaw<{ 'QUERY PLAN': string }>(`EXPLAIN ${fileClaimCandidatesSql('linux')}`,
-    [f.id, 0, 0, 2147483647, 'example.md', 'example.md', ['example.md']]))
+  const census = fileClaimCandidatesQuery({ sourceId: f.id, pageId: 0, afterId: 0, maxId: 2147483647, fileName: 'example.md', uriNames: ['example.md'] }, 'linux');
+  const plan = (await engine.executeRaw<{ 'QUERY PLAN': string }>(`EXPLAIN ${census.sql}`, census.params))
     .map(row => row['QUERY PLAN']).join('\n');
   expect(plan).toContain('pages_source_path_name_idx');
   expect(plan).toContain('pages_file_uri_name_idx');
 }), 120_000);
+
+// #6659: the Windows census bound a POSIX-only name it never referenced; Postgres and PGLite refuse an untyped
+// unreferenced bind with 42P18, which failed every coordinated delete_page on a Windows host.
+test.each(['win32', 'linux'] as const)('the %s file-claim census runs with its own binds and finds same-name pages', platform =>
+  isolated(async engine => {
+    const f = await fixture(engine);
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw(`INSERT INTO pages(source_id,slug,type,title,compiled_truth,frontmatter,source_path,source_uri)
+      VALUES ($1,'twins/by-path','note','Path twin','x','{}'::jsonb,'other/claimed.md',NULL),
+             ($1,'twins/by-uri','note','URI twin','x','{}'::jsonb,NULL,'file:///repo/other/claimed.md'),
+             ($1,'twins/unrelated','note','Unrelated','x','{}'::jsonb,'other/unrelated.md',NULL)`, [f.id]), TEST_WRITE_ATTRIBUTION));
+    const census = fileClaimCandidatesQuery({ sourceId: f.id, pageId: 0, afterId: 0, maxId: 2147483647, fileName: 'claimed.md', uriNames: ['claimed.md'] }, platform);
+    const rows = await engine.executeRaw<{ slug: string }>(census.sql, census.params);
+    expect(rows.map(row => row.slug).sort()).toEqual(['twins/by-path', 'twins/by-uri']);
+  }), 120_000);
 
 // The parser must not normalize an already-resolved identity a second time.
 // Existing reconcile cases only covered extension-free page keys.

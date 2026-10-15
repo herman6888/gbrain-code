@@ -76,7 +76,7 @@ import {
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { fenceUnfencedFacts, planUnfencedFacts } from '../facts/unfenced-facts.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { factsFenceSection, factsFenceSections, parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
 import {
   duplicateActiveFenceRows,
   extractFactsFromFenceText,
@@ -371,11 +371,15 @@ interface FenceReconcilePlan {
 /**
  * One page's reconcile plan against its stored rows. Null when the fence is
  * not authoritative (warnings are appended): a warning-bearing parse or a
- * fence below the timeline sentinel preserves the page's existing index.
+ * fence in each section of the page (#6686: a split fence) preserves the page's existing index.
  */
 async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: string | null; timeline: string | null; effective_date?: Date | string | null },
   slug: string, sourceId: string, warnings: string[]): Promise<FenceReconcilePlan | null> {
-  const parsed = parseFactsFence(page.compiled_truth ?? '');
+  // #6686: a lone fence below the timeline sentinel that parses cleanly is the page's fence, read where the writers
+  // edit it; one that does not parse keeps the #3625 guard below.
+  const below = factsFenceSection(page) === 'timeline' ? parseFactsFence(page.timeline ?? '') : null;
+  const lone = below !== null && below.warnings.length === 0;
+  const parsed = lone ? below : parseFactsFence(page.compiled_truth ?? '');
   if (parsed.warnings.length > 0) {
     // The parser deliberately skips malformed rows and returns any rows it
     // could still recover. That partial result is not authoritative: using
@@ -386,7 +390,14 @@ async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: strin
   // #3625: a fence below the timeline sentinel lands in page.timeline, where
   // parseFactsFence cannot see it; reading compiled_truth alone would treat
   // its rows as deleted. timelineHasGenuineFactsFenceMarker explains the scan.
-  if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
+  if (!lone && timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
+    // #6686: a fence in each section (a writer added one above the sentinel) is merged by an explicit repair.
+    if (factsFenceSections(page).body) {
+      warnings.push(`${slug}: FACTS_FENCE_BELOW_SENTINEL: the page holds a ## Facts fence above the <!-- timeline --> sentinel and another below it `
+        + `(a split fence), so extract_facts leaves its indexed facts as they are. Preview merging them into one with gbrain repair split-facts --source ${sourceId}, `
+        + 'then apply the hash it prints.');
+      return null;
+    }
     warnings.push(
       `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
       `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +

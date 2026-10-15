@@ -45,6 +45,8 @@ import { STRUCTURED_WRITE_ADVICE, type FencesNormalized } from '../fence-repair/
 import type { SyncRename } from './sync-discovery.ts';
 import { isMultimodalEnabled } from '../sync.ts';
 import { VERSION } from '../../version.ts';
+import { MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
+import { gitBlobOid, sha256 } from './digest.ts';
 
 export const GIT_HOLD_OP = 'sync-hold';
 export const GIT_HOLD_SUMMARY_OP = 'sync-hold-summary';
@@ -517,7 +519,7 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
     }
     case 'file_too_large':
       return { argv: ['gbrain', 'config', 'get', 'sync.exclude'], consent: [], actor: 'agent', requires_exclusive: false,
-        why: `The size limit is fixed. Split ${record.path} into smaller files and commit, or leave it out of the source: read the current sync.exclude list, then run gbrain config set sync.exclude '<current list>,${record.path}'. The next gbrain sync --source ${source} --no-pull clears the hold.`,
+        why: `${record.path} is over the page size limit. The size limit is fixed, and every page under it syncs and is searchable. Leave the file out of the source: read the current sync.exclude list, then run gbrain config set sync.exclude '<current list>,${record.path}'; or, if it must be in the brain, split it into files under the limit and commit. The next gbrain sync --source ${source} --no-pull clears the hold.`,
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'purged_content':
       return { argv: ['gbrain', 'pages', 'purges', 'list', '--source', source], consent: [], actor: 'user', requires_exclusive: false,
@@ -679,6 +681,39 @@ export interface SyncImportProvenance {
   validated: true;
   recovery?: Array<{ kind: string; key: string; line: number; recovery_version: number }>;
   recorded_at: string;
+  /**
+   * #6712 PR 0 (write-only until a reader lands): the bytes the publish left on disk, the canonical writeback when it
+   * wrote one, else the file as admitted; null when no file was on disk. `disk_blob_oid` is their Git blob id, comparable
+   * with `git ls-tree` without reading the file. Absent on records written before the stamp, and on records a repair wrote.
+   */
+  disk_sha256?: string | null;
+  disk_blob_oid?: string | null;
+  /** The page revision the publish produced. Absent on older records. */
+  revision?: string;
+  /** What parsed the bytes: the import parser version, the Markdown chunker and the schema pack in effect (null for none). Absent on older records. */
+  parser?: SyncImportParser;
+}
+
+/**
+ * The version of the Markdown import's reading of a file: the frontmatter recovery rules and the fence screen, plus a
+ * leading import counter to bump when the import's own parsing or canonical form changes. It deliberately leaves out the
+ * release, so a parser fingerprint holds across releases that change no parsing.
+ */
+export const SYNC_IMPORT_PARSER_VERSION = `import=1;frontmatter=${RECOVERY_VERSION};fence=${FENCE_VERSION}`;
+
+/** The provenance a preparation knows before its page is written; page id, revision and disk bytes come from the publication or the waiver that settles it. */
+export type SyncImportProvenanceBase = Omit<SyncImportProvenance, 'page_id' | 'revision' | 'disk_sha256' | 'disk_blob_oid' | 'recorded_at' | 'validated'>;
+
+export interface SyncImportParser { parser_version: string; markdown_chunker: number; schema_pack: string | null }
+
+/** The disk half of an import provenance record for `bytes` (null: no file on disk), in the object format of `target`'s commit id. */
+export function syncDiskProvenance(bytes: Uint8Array | null, target: string | null): Pick<SyncImportProvenance, 'disk_sha256' | 'disk_blob_oid'> {
+  if (!bytes) return { disk_sha256: null, disk_blob_oid: null };
+  return { disk_sha256: sha256(bytes), disk_blob_oid: gitBlobOid(bytes, target?.length === 64 ? 'sha256' : 'sha1') };
+}
+
+export function syncImportParser(schemaPack: string | null): SyncImportParser {
+  return { parser_version: SYNC_IMPORT_PARSER_VERSION, markdown_chunker: MARKDOWN_CHUNKER_VERSION, schema_pack: schemaPack };
 }
 
 const provenanceFingerprint = (sourceId: string, incarnation: string, pageId: number) => `${sourceId}:${incarnation}:${pageId}`;
@@ -688,6 +723,17 @@ export async function recordSyncImportProvenance(tx: Exec, value: Omit<SyncImpor
   await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)
     ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()`,
   [SYNC_IMPORT_PROVENANCE_OP, provenanceFingerprint(value.source_id, value.incarnation, value.page_id), JSON.stringify([record])]);
+}
+
+/** Several pages' provenance in one statement (a waiver run); the last value for a page wins. */
+export async function recordSyncImportProvenances(tx: Exec, values: ReadonlyArray<Omit<SyncImportProvenance, 'recorded_at' | 'validated'>>): Promise<void> {
+  if (!values.length) return;
+  const recorded_at = new Date().toISOString();
+  const rows = new Map(values.map(value => [provenanceFingerprint(value.source_id, value.incarnation, value.page_id), { ...value, validated: true, recorded_at }]));
+  await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys)
+    SELECT $1, entry->>'fingerprint', jsonb_build_array(entry->'record') FROM jsonb_array_elements($2::text::jsonb) AS entry
+    ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()`,
+  [SYNC_IMPORT_PROVENANCE_OP, JSON.stringify([...rows].map(([fingerprint, record]) => ({ fingerprint, record })))]);
 }
 
 /** The provenance of several pages in one statement, keyed by page id; pages without a record are absent. */

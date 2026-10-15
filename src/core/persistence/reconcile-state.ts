@@ -12,7 +12,7 @@ import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
 import { findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
 import { sharedOriginExit } from './sync-origin.ts';
-export { fileClaimCandidatesSql } from './file-claims.ts';
+export { fileClaimCandidatesQuery } from './file-claims.ts';
 import { localHostId } from './identity.ts';
 import { isDatabaseOnlyPage, slugDerivedOrigin } from './unbound-pages.ts';
 import { isUnboundSourcePage } from './unbound-source.ts';

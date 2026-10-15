@@ -14,6 +14,7 @@ a page needs my decision."*
 ## The loop
 
 ```bash
+gbrain doctor --only serve_build_drift --json    # first: on a warning, restart serve and workers and stop here
 gbrain sync status --source <id> --json          # every N minutes (read-only)
 gbrain sync unblock --source <id> --apply --json # when committed_last_10m is 0 and needs_human is false
 gbrain sync <next.argv...>                       # the sync unblock (or status) names: the cursor's own options
@@ -22,6 +23,10 @@ gbrain sync <next.argv...>                       # the sync unblock (or status) 
 **Say to your agent:** *"Repair the files sync held and get the catch-up
 moving again; ask me only about the ones gbrain will not decide by itself."*
 
+0. Check the build. `serve_build_drift` warns when serve or a worker on this
+   host runs an older gbrain build than this checkout; restart them with the
+   command it prints before anything else, and stop until it reads ok
+   ([serve build drift](troubleshooting.md#serve-build-drift)).
 1. Read `status`. `cursor` is where the run stands (`index/total`, the
    `pinned_target` commit, `last_advance_at`); `committed_last_10m` is the
    signal that data is moving (a live process with a flat cursor is not
@@ -106,6 +111,8 @@ Every hold and error has three fields, from one table
 | `connection_lost` | connection | retry | no | three reruns in a row end connection_lost (the database is unreachable from this host) |
 | `database_contention` | connection | retry | no | three reruns in a row stop on it |
 | `write_capacity` | connection | retry | no | writer status shows the cap held by requests that never settle |
+| `write_capacity_backpressure` | connection | retry | no | reason lifetime_ids (request ids never free, so only the host raise lifts it), or the pause outlasts a day |
+| `capacity_paused` | connection | retry | no | reason lifetime_ids (only the host raise resumes it), or the same pause after the raise |
 | `storage_error` | connection | retry | no | the same error after a rerun (then it is not a dropped connection) |
 | `graduation_in_progress` | connection | retry | no | gbrain migrate --status --json reports no running move and the fence still refuses |
 | `preparation_systemic` | systemic | upgrade, retry | yes | always |
@@ -114,7 +121,10 @@ Every hold and error has three fields, from one table
 | `owner_unavailable` | systemic | none | yes | always |
 | `writer_coordinator_required` | systemic | none | yes | always |
 | `permission_denied` | systemic | none | yes | always |
+| `write_quota_exhausted` | systemic | none | yes | always |
+| `write_quota_insufficient` | systemic | none | yes | always |
 | `plan_stale` | systemic | none | yes | always |
+| `slug_root_mode_mismatch` | systemic | none | yes | always: the two modes give different slugs |
 | `invalid_params` | systemic | none | yes | always |
 | `cursor_incarnation_retired` | systemic | repair | no | the repair preview lists nothing to retire, or the same code returns after the apply |
 <!-- sync-fault-table:end -->
@@ -198,6 +208,18 @@ A retry alone changes nothing: the write owner is wedged
 (`preparation_systemic`, `drain_stalled`), the source binding changed, a
 company-brain approval drifted (`plan_stale`), or the principal may not sync.
 Page a person with `human_reason`; the fix is on the brain host.
+
+`slug_root_mode_mismatch` is the one systemic code that is a choice, not a
+repair: a source in a subdirectory of its repository pins one
+`slug_root_mode`, the run used the other, and the two give different slugs.
+Ask the user which mode the source keeps. Restoring the pin to the run's mode
+lets the next plain `gbrain sync --no-pull --source <id>` finish (the refused
+checkpoint is retried by itself); keeping the new pin takes
+`gbrain sync --no-pull --source <id> --retry-failed`, and the pages the refused
+run wrote keep their old slugs beside the new ones. A source rooted at its
+repository root never gets this code: both modes give it the same slugs, and
+a checkpoint an older release refused there as `revision_conflict` finishes on
+the next plain sync.
 
 ## Why the manifest is not re-frozen any more
 

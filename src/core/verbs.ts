@@ -23,6 +23,7 @@
  * evaluates second.
  */
 
+import { recordFunnelEvent, recordRememberOutcome } from './funnel.ts';
 import type { Operation } from './operations.ts';
 import { WRITE_RECEIPT_SCHEMA, WRITE_REQUEST_PARAM, AGENT_CONTENT_PARAMS, CONTENT_ORIGIN_PARAM } from './persistence/params.ts';
 import { WRITE_ERROR_CODES } from './persistence/types.ts';
@@ -203,6 +204,7 @@ const remember: Operation = {
       const { privateFactNotice } = await import('./interop-notices.ts');
       ctx.emitNotice?.(privateFactNotice((result as { id?: string | number } | null)?.id));
     }
+    recordRememberOutcome(result);
     return result;
   },
   cliHints: { name: 'remember', positional: ['fact'] },
@@ -233,7 +235,8 @@ const entity: Operation = {
           `Pass either name: "Alice Example" for one full card, or names: ["Alice Example", "WGCO"] (up to ${ENTITY_NAMES_MAX}) for compact rows.`);
       }
       const t0 = Date.now();
-      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false });
+      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false, surfaceCeiling: ctx.surfaceCeiling,
+        emitNotice: n => ctx.emitNotice?.(n) });
       return { protocol_version: 1, latency_ms: Date.now() - t0, ...out };
     }
     const name = typeof p.name === 'string' ? p.name.trim() : '';
@@ -249,6 +252,7 @@ const entity: Operation = {
     const result = await buildEntityCard(ctx.engine, ctx.sourceId ?? 'default', name, {
       remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling,
       omitQuarantined: ctx.remote !== false, // #5575: like get_page, a remote reader never gets a quarantined page's card
+      emitNotice: n => ctx.emitNotice?.(n),
     });
     const coverage = result.card?.coverage ?? result.coverage;
     if (coverage) {
@@ -456,7 +460,9 @@ const forget: Operation = {
 
     const { submitForgetMutation } = await import('./persistence/memory-mutations.ts');
     const { runMemoryWrite } = await import('./persistence/verb-errors.ts');
-    return runMemoryWrite(() => submitForgetMutation(ctx, 'forget', { ...p, id: rawId, ...(reason ? { reason } : {}) }));
+    const out = await runMemoryWrite(() => submitForgetMutation(ctx, 'forget', { ...p, id: rawId, ...(reason ? { reason } : {}) }));
+    recordFunnelEvent('withdrawal');
+    return out;
   },
   // NO cliHints: `gbrain forget` is a CLI_ONLY command (recall.ts runForget)
   // that dispatches BEFORE cliOps — a cliHint here would be silently
@@ -508,6 +514,27 @@ const REFERENCE_ROW_SCHEMA = {
     trust_tier: { type: 'string' }, origin: { type: 'string' }, unconfirmed: { type: 'boolean', const: true },
   },
 } as const;
+
+/** One record group (verbs/entity-references.ts): referring pages of an enrolled record type, newest page date first. */
+const RECORD_GROUP_SCHEMA = {
+  type: 'object',
+  required: ['canonical_type', 'total', 'rows'],
+  properties: {
+    canonical_type: { type: 'string' },
+    total: { type: 'integer' },
+    rows: { type: 'array', items: { type: 'object', required: ['slug', 'title', 'date', 'date_source'], properties: {
+      slug: { type: 'string' }, title: { type: 'string' }, date: { type: ['string', 'null'] }, date_source: { type: 'string' },
+      page_status: { type: 'string' },
+      amends: { type: 'array', items: { type: 'object', required: ['slug'], properties: { slug: { type: 'string' }, since: { type: 'string' } } } },
+      supersedes: { type: 'array', items: { type: 'object', required: ['slug'], properties: { slug: { type: 'string' } } } },
+    } } },
+    capped: { type: 'string', enum: ['per_page', 'per_call'] },
+    next: { type: 'object', required: ['tool', 'arguments'], properties: {
+      tool: { type: 'string', const: 'get_backlinks' }, arguments: { type: 'object' }, requires_surface: { type: 'string', enum: ['starter'] } } },
+  },
+} as const;
+
+const REFERENCES_UNAVAILABLE_SCHEMA = { type: 'string', enum: ['deadline', 'read_failed'] } as const;
 
 const RECALL_BUDGET_ARM_SCHEMA = {
   type: 'object',
@@ -693,6 +720,9 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             },
           },
           coverage: COVERAGE_SCHEMA,
+          // F1 record view — ADDITIVE OPTIONAL (frozen-v1 legal): only when record types are enrolled.
+          records: { type: 'array', items: RECORD_GROUP_SCHEMA },
+          references_unavailable: REFERENCES_UNAVAILABLE_SCHEMA,
         },
       },
       coverage: COVERAGE_SCHEMA,
@@ -831,6 +861,15 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             },
             backlink_count: { type: 'integer' },
             relationship_note: { type: 'string' },
+            // F3 — ADDITIVE OPTIONAL: the card page's own frontmatter `status`, only when set (entity.row_page_status).
+            page_status: { type: 'string', maxLength: 40 },
+            // F1 record view — ADDITIVE OPTIONAL: only when record types are enrolled (pull verb only).
+            referenced_by_count: { type: 'integer' },
+            records: { type: 'array', items: RECORD_GROUP_SCHEMA },
+            sibling_records: { type: 'array', items: { type: 'object', required: ['slug', 'title'], properties: {
+              slug: { type: 'string' }, title: { type: 'string' }, referenced_by_count: { type: 'integer' },
+              records: { type: 'array', items: RECORD_GROUP_SCHEMA }, references_unavailable: REFERENCES_UNAVAILABLE_SCHEMA } } },
+            references_unavailable: REFERENCES_UNAVAILABLE_SCHEMA,
           },
         },
       },

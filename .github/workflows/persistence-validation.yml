@@ -2,6 +2,12 @@ name: Durable persistence validation
 
 on:
   workflow_call:
+    inputs:
+      # test.yml `changes` (scripts/ci-convergence-scope.sh): `skip` only for a
+      # pull request whose diff cannot change managed-sync convergence.
+      convergence:
+        type: string
+        default: run
   workflow_dispatch:
 
 permissions:
@@ -443,3 +449,84 @@ jobs:
           name: reconciliation-${{ matrix.engine }}-bun-${{ matrix.bun }}
           path: .context/reconcile-crashes/*.json
           if-no-files-found: error
+
+  # Managed-sync convergence gate, PR cell (#6712 PR 0, test/sync-convergence.serial.test.ts,
+  # scripts/persistence/README.md#managed-sync-convergence-gate): real serve and
+  # sync processes against Postgres behind transaction-mode PgBouncer, through
+  # the harness's latency proxy, a seeded kill -9 loop at sync fault points under
+  # concurrent writers, then at most two plain syncs and the convergence oracle.
+  # 200 notes at 10 ms, 6 kills, fixed seed 6650 on every event. The nightly
+  # cell (2,000 notes, 50 ms, 20 kills, rotating seed) is convergence-nightly.yml,
+  # outside test-status.
+  # Named exception (docs/TESTING.md#event-parity): a pull request runs it only
+  # when scripts/ci-convergence-scope.sh selects its diff (test.yml `changes`);
+  # every merge-queue run, every push to master and the nightly Test schedule
+  # run it.
+  convergence:
+    name: Managed-sync convergence / Bun ${{ matrix.bun }}
+    if: ${{ inputs.convergence != 'skip' }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.4.0', '1.4.3']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      pgbouncer:
+        image: edoburu/pgbouncer:latest
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: gbrain_test
+          DB_PASSWORD: gbrain_test
+          POOL_MODE: transaction
+          AUTH_TYPE: plain
+          MAX_CLIENT_CONN: '200'
+          DEFAULT_POOL_SIZE: '10'
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
+        ports: ['55433:5432']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      # The step timeout sits inside the job's, so the evidence and cleanup steps below still run after it.
+      - name: Converge a managed sync after the seeded kill loop under concurrent writers
+        timeout-minutes: 30
+        env:
+          GBRAIN_TEST_CONVERGENCE: '1'
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:55433/gbrain_test
+          GBRAIN_PGBOUNCER_DIRECT_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_CONVERGENCE_NOTES: '200'
+          GBRAIN_TEST_CONVERGENCE_LATENCY_MS: '10'
+          GBRAIN_TEST_CONVERGENCE_KILLS: '6'
+          GBRAIN_TEST_CONVERGENCE_SEED: '6650'
+          GBRAIN_TEST_CONVERGENCE_SYNC_TIMEOUT_MS: '900000'
+          GBRAIN_TEST_CONVERGENCE_SCENARIO_TIMEOUT_MS: '1620000'
+          GBRAIN_TEST_CONVERGENCE_LOG_DIR: ${{ runner.temp }}/convergence
+        run: bun --no-env-file test --timeout="$GBRAIN_TEST_CONVERGENCE_SCENARIO_TIMEOUT_MS" test/sync-convergence.serial.test.ts
+      - name: Stop harness processes a timed-out run left behind
+        if: always()
+        run: pkill -9 -f 'src/cli\.ts (serve|sync|put|call|extract)' || true
+      - name: Upload the convergence fault evidence (plan, fired faults, every client, serve and writer log)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: convergence-bun-${{ matrix.bun }}
+          path: ${{ runner.temp }}/convergence
+          if-no-files-found: warn

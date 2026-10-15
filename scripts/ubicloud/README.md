@@ -85,7 +85,9 @@ the VM running the machine-level items below counts only once it joins the
 pool.
 The first VM to finish setup runs the
 machine-level work first: gitleaks, `verify`, then the serial lane's
-machine-exclusive files one at a time with nothing else on that VM. After that
+machine-exclusive files and the slow lane's latency contracts
+(`run-slow-tests.sh --dry-run-list-exclusive`, the files GitHub CI runs on a
+dedicated perf runner) one at a time with nothing else on that VM. After that
 it joins the pool. Before `verify`, it uploads the incremental typecheck state
 (`node_modules/.cache/gbrain-typecheck.tsbuildinfo`, which the checkout
 tarball never carries). The orchestrator builds that state with
@@ -93,8 +95,13 @@ tarball never carries). The orchestrator builds that state with
 (`scripts/ubicloud/typecheck-state.ts`). Cold, verify's typecheck took 81-84 s
 on a 16-vCPU VM and crossed the 120 s per-check cap on a loaded host; warm, it
 takes 16-19 s. tsc revalidates every file by content hash, so the state never
-changes the result. The run log says whether verify's typecheck ran warm or
-cold, and the local build's output is in `logs/local-typecheck.log`. Items run through the `ci:local` wrappers
+changes the result. When the local checkout's `node_modules` is a symlink (a
+worktree sharing another checkout's install), tsc records node_modules files by
+their real path outside the checkout; the uploaded copy
+(`<run>/typecheck.tsbuildinfo`) re-roots them under the checkout's own
+`node_modules`, or the state would not apply on the VM and its typecheck would run
+cold. The run log says whether verify's typecheck ran warm or cold, and the local
+build's output is in `logs/local-typecheck.log`. Items run through the `ci:local` wrappers
 (`scripts/ubicloud/ci-item.sh`): `run-unit-shard.sh`, `run-serial-tests.sh` and
 `run-slow-tests.sh` accept explicit file arguments for this purpose, and
 `run-e2e.sh` runs each E2E file against its slot's own server and pooler. The

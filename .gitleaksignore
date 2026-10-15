@@ -26,3 +26,7 @@ ee280a34288d697285fd41c35d423e49b61fe54d:CHANGELOG.md:sourcegraph-access-token:1
 # the tree renamed the constant. These history-only fingerprints are not secrets.
 ac6e0868219439a6594d9fce0e016da203c6c4fc:test/content-repair-judgment.test.ts:generic-api-key:21
 ac6e0868219439a6594d9fce0e016da203c6c4fc:test/repair-slug-conflicts.test.ts:generic-api-key:58
+
+# Large pages #6722: the synthetic placeholder OPENAI_API_KEY in test/size-state-receipts-6722.test.ts (commit e3ebcc4f) read as
+# generic-api-key; the tree now uses the allowlisted sk-test-fake. This history-only fingerprint is not a secret.
+e3ebcc4f7e15051ae6354c8e4313ef91fc06d9f2:test/size-state-receipts-6722.test.ts:generic-api-key:49

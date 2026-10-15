@@ -38,32 +38,49 @@ export function recordedReconcilePath(root: string, page: { slug: string; source
   const recorded = recordedPathFromFileUri(page.source_uri, root);
   return recorded ? join(root, recorded) : null;
 }
+export interface FileClaimCandidatesWindow {
+  sourceId: string; pageId: number; afterId: number; maxId: number;
+  /** The target file's name. */
+  fileName: string;
+  /** Names a `file:` URI may end with. */
+  uriNames: string[];
+}
 /**
- * The paged census query: $1 source, $2 the page itself, $3/$4 the id window, $5 the file name, $6 its
- * name after the last backslash (POSIX) or the name (Windows), $7 the file-URI names. Exported so the
- * Postgres plan test runs the exact text.
+ * The paged census query and its binds: $1 source, $2 the page itself, $3/$4 the id window, then the name
+ * predicates. The path index normalizes backslashes, so on POSIX the indexed name is the file name after its
+ * last backslash and the slash-only basename is rechecked against the file name; on Windows both separators
+ * are path separators and the indexed name is the whole check. Every placeholder is referenced on every
+ * platform (#6659: an unreferenced untyped bind fails with 42P18). Exported so the Postgres plan test runs
+ * the exact text.
  */
-export function fileClaimCandidatesSql(platform: NodeJS.Platform = process.platform): string {
+export function fileClaimCandidatesQuery(window: FileClaimCandidatesWindow, platform: NodeJS.Platform = process.platform): { sql: string; params: unknown[] } {
+  const { sourceId, pageId, afterId, maxId, fileName, uriNames } = window;
+  const params: unknown[] = [sourceId, pageId, afterId, maxId];
+  const bind = (value: unknown) => { params.push(value); return `$${params.length}`; };
+  const indexedName = `regexp_replace(replace(btrim(source_path), chr(92), '/'), '^.*/', '')`;
   const pathMatch = platform === 'win32'
-    ? `source_path IS NOT NULL AND regexp_replace(replace(btrim(source_path), chr(92), '/'), '^.*/', '')=$6`
-    : `source_path IS NOT NULL AND regexp_replace(replace(btrim(source_path), chr(92), '/'), '^.*/', '')=$6 AND regexp_replace(btrim(source_path),'^.*/','')=$5`;
-  return `SELECT id,slug,source_path,source_uri FROM pages WHERE source_id=$1 AND id<>$2 AND id>$3 AND id<=$4 AND deleted_at IS NULL AND (
-    (${pathMatch}) OR (source_uri LIKE 'file:%' AND regexp_replace(source_uri, '^.*/', '')=ANY($7::text[])))
-    ORDER BY id LIMIT 100`;
+    ? `source_path IS NOT NULL AND ${indexedName}=${bind(fileName)}`
+    : `source_path IS NOT NULL AND ${indexedName}=${bind(fileName.replace(/^.*\\/s, ''))} AND regexp_replace(btrim(source_path),'^.*/','')=${bind(fileName)}`;
+  const uriMatch = `source_uri LIKE 'file:%' AND regexp_replace(source_uri, '^.*/', '')=ANY(${bind(uriNames)}::text[])`;
+  return {
+    sql: `SELECT id,slug,source_path,source_uri FROM pages WHERE source_id=$1 AND id<>$2 AND id>$3 AND id<=$4 AND deleted_at IS NULL AND (
+    (${pathMatch}) OR (${uriMatch}))
+    ORDER BY id LIMIT 100`,
+    params,
+  };
 }
 /** Every other live page of the source whose recorded origin resolves to the target's canonical file, in id order. */
 export async function findLiveFileClaimants(engine: BrainEngine, target: FileClaimTarget): Promise<FileClaimant[]> {
   const { sourceId, slug, root, mode, canonicalPath } = target;
   const fileName = basename(target.path), uriName = pathToFileURL(target.path).pathname.split('/').pop()!;
-  const indexedName = fileName.replace(/^.*\\/s, '');
   const uriNames = [...new Set([fileName, uriName, ...(target.recordedUri ? [target.recordedUri.replace(/^.*\//s, '')] : [])])];
   const [ceiling] = await engine.executeRaw<{ id: number | string | null }>('SELECT max(id) AS id FROM pages WHERE source_id=$1', [sourceId]);
   const maxId = Number(ceiling?.id ?? 0);
   const claimants: FileClaimant[] = [];
   for (let afterId = 0; ;) {
+    const query = fileClaimCandidatesQuery({ sourceId, pageId: target.pageId, afterId, maxId, fileName, uriNames });
     const candidates = await engine.executeRaw<{ id: number | string; slug: string; source_path: string | null; source_uri: string | null }>(
-      fileClaimCandidatesSql(),
-      [sourceId, target.pageId, afterId, maxId, fileName, process.platform === 'win32' ? fileName : indexedName, uriNames]);
+      query.sql, query.params);
     for (const candidate of candidates) {
       const candidatePath = recordedReconcilePath(root, candidate, mode);
       if (!candidatePath || !isWriteTargetContained(candidatePath, root)) continue;

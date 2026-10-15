@@ -206,6 +206,7 @@ test/jobs-gateway-refresh-set.test.ts	#3387 — GATEWAY_REFRESH_JOB_NAMES ⇔ re
 test/jobs-list-get-json.serial.test.ts	help advertises --json on list/get/stats (#3685)	2	source-surface-helper
 test/jobs-thin-client-date-rehydration.test.ts	thin-client unpack sites route through rehydrateJobDates (source audit)	2	source-surface-helper
 test/jobs-worker-startup-recovery.test.ts	work-handler recovery placement (structural)	1	source-surface-helper
+test/large-pages-skill-guidance.test.ts	large-page guidance in shipped skills	3	readFileSync
 test/link-source-check-repair.test.ts	regex literal drift guard (#4613)	1	readFileSync
 test/longmemeval-embed-cache.test.ts	EmbeddingCache — canonical hash	4	readFileSync
 test/loops-extract-wiring.test.ts	jobs.ts wiring	2	source-surface-helper
@@ -289,9 +290,10 @@ test/scripts/ci-local-rendering.test.ts	ci-local execution coverage	5	readFileSy
 test/scripts/ci-local-rendering.test.ts	local test configuration through run-e2e	2	readFileSync
 test/scripts/ci-local-rendering.test.ts	required PgBouncer execution through run-e2e	1	readFileSync
 test/scripts/ci-manifest-diff.test.ts	test.yml dependency-audit scope	2	readFileSync
-test/scripts/ci-pr-scope.test.ts	pull-request CI scope	11	readFileSync
+test/scripts/ci-pr-scope.test.ts	pull-request CI scope	14	readFileSync
 test/scripts/ci-runner-routing.test.ts	CI runner routing	7	readFileSync
 test/scripts/classify-tests.test.ts	classify-tests detectors	23	bun-file,doctor-source-helper,exec-scan,readFileSync,source-surface-helper
+test/scripts/classify-tests.test.ts	structural-suites manifest	1	readFileSync
 test/scripts/coverage-diff-gate.test.ts	exemptions	3	readFileSync
 test/scripts/data-safety-native-workflow.test.ts	data-safety native CI coverage	13	readFileSync
 test/scripts/e2e-backend-matrix.test.ts	scripts/e2e-backend-matrix.txt	3	readFileSync
@@ -303,6 +305,7 @@ test/scripts/e2e-wiring.test.ts	(file-level)	12	readFileSync
 test/scripts/fix-wave-gate.test.ts	fix-wave gate workflow	3	readFileSync
 test/scripts/heavy-door-workflow.test.ts	heavy door supply chain and coverage gates	8	readFileSync
 test/scripts/native-lock-prebuilds.test.ts	native lock distribution integrity	2	readFileSync
+test/scripts/native-setup-toolchain.test.ts	scripts/native/setup-toolchain.ts download budget	4	readFileSync
 test/scripts/nightly-e2e.test.ts	full E2E shard classification (#6040)	2	readFileSync
 test/scripts/nightly-e2e.test.ts	nightly E2E scheduling	4	readFileSync
 test/scripts/nightly-issue.test.ts	.github/nightly-known-red.tsv	2	readFileSync
@@ -322,7 +325,7 @@ test/scripts/stress-plan.test.ts	execution profiles	3	readFileSync
 test/scripts/test-env-opt-ins-guard.test.ts	check-test-env-opt-ins	5	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — LPT balance contract	5	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — exclusion contract	7	readFileSync
-test/scripts/ubicloud-typecheck-state.test.ts	(file-level)	2	readFileSync
+test/scripts/ubicloud-typecheck-state.test.ts	(file-level)	3	readFileSync
 test/search/graph-signals-wire-integration.test.ts	v0.40.4 — source-grep regression guard	1	source-surface-helper
 test/serve-behavior-notice-6543.test.ts	(file-level)	3	readFileSync
 test/serve-http-admin-route-guard.test.ts	(file-level)	6	readFileSync

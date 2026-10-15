@@ -4,7 +4,7 @@
  * recovery path must finish: publication boundaries, after an effect's side
  * effect but before its completion is recorded, before a recovery record is
  * cleared, between sync checkpoints, after the consumer prepared a
- * claimed request, (`lane:applied`) when a lane group has applied its pages and waits for its commit turn, and (`stuck_recovery:*`) between the steps of a stuck-recovery resolution. Production never installs a hook, so every call is a
+ * claimed request, (`sync:after_freeze`) after a managed sync import entry is frozen and before it is admitted, (`lane:applied`) when a lane group has applied its pages and waits for its commit turn, and (`stuck_recovery:*`) between the steps of a stuck-recovery resolution. Production never installs a hook, so every call is a
  * no-op there; the gate's workers install one that SIGKILLs or stalls the
  * process at a chosen point.
  */
@@ -16,6 +16,8 @@ export type PublicationBoundary = Parameters<NonNullable<PublicationHooks['bound
 export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${EffectKind}:mid` | 'effect:embedding:settle'
   | 'effect_recovery:before_clear' | 'publication_recovery:before_clear' | 'sync:mid_checkpoint' | 'sync:before_group_admission' | 'sync:mid_waiver_run' | 'consumer:prepared'
   | 'consumer:preparing' | 'lane:applied'
+  // #6712 PR 0: after `freezeEntry` froze an import entry (its bytes are read) and before the request is admitted or published.
+  | 'sync:after_freeze'
   // #6511: the page purge's in-transaction journal lookups (page-purge.ts `journalLookup`); a hook that throws a 57014 models a statement timeout there.
   | 'purge:slug_lookup' | 'purge:tail_recheck' | 'purge:pending_recheck' | 'purge:redaction_read'
   // #6511: before each keyset chunk of the preparation-time journal sweep (a stalling hook models a slow chunk), and the fact purge's planning read.
@@ -28,7 +30,7 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
  * a stalling hook can model both the reporter's cases: a preparer that honours
  * cancellation (settle on abort) and one that ignores it (hang on).
  */
-export interface FaultDetail { requestId?: string; effectId?: string | number; sourceId?: string; operation?: string | null; signal?: AbortSignal }
+export interface FaultDetail { requestId?: string; effectId?: string | number; sourceId?: string; operation?: string | null; signal?: AbortSignal; slug?: string; path?: string }
 type FaultHook = (point: FaultPoint, detail: FaultDetail) => Promise<void> | void;
 
 /** The mid-effect seam of every effect kind; a new kind without one fails typecheck. */

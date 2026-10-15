@@ -1,5 +1,5 @@
 import { coordinatedManualLinkWrite } from '../persistence/manual-links.ts';
-import { filterBacklinkRows, readBacklinkPage, wantsPagedBacklinks } from './backlinks-paged.ts';
+import { filterBacklinkRows, readBacklinkPage, wantsPagedBacklinks, withLinkPageStatus } from './backlinks-paged.ts';
 /**
  * Links + graph operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). MANAGED_LINK_SOURCES stays exported (test suite + operations.ts
@@ -410,10 +410,10 @@ const get_backlinks: Operation = {
     cursor: { type: 'string', description: 'Paging.' },
   },
   handler: async (ctx, p) => {
-    if (!wantsPagedBacklinks(p)) return readLinkEdges(ctx, p, 'get_backlinks', 'in');
     if (p.group !== undefined) return readBacklinkPage(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy);
     const links = await readLinkEdges(ctx, p, 'get_backlinks', 'in');
-    return filterBacklinkRows(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy, links);
+    const policy = async () => (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy;
+    return withLinkPageStatus(ctx, policy, wantsPagedBacklinks(p) ? await filterBacklinkRows(ctx, p, await policy(), links) : links);
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },

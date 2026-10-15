@@ -82,12 +82,14 @@ jobs:
       pull-requests: read
     outputs:
       native-scope: ${{ steps.scope.outputs.native }}
+      convergence: ${{ steps.convergence.outputs.convergence }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           sparse-checkout: |
             scripts/ci-native-scope.sh
             scripts/ci-manifest-diff.sh
+            scripts/ci-convergence-scope.sh
           sparse-checkout-cone-mode: false
       - id: scope
         env:
@@ -128,6 +130,29 @@ jobs:
           fi
           echo "native scope: $scope"
           echo "native=$scope" >> "$GITHUB_OUTPUT"
+      # Named exception (docs/TESTING.md#event-parity): a pull request runs the
+      # managed-sync convergence gate only when scripts/ci-convergence-scope.sh
+      # selects its diff (persistence, sync, projections, storage, the harness
+      # and its workflow; never package.json alone). Merge-queue runs, every push
+      # to master and the nightly Test schedule always run it; an unknown or
+      # unreadable diff runs it too.
+      - id: convergence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          convergence=run
+          if [ "$EVENT" = pull_request ] && [[ "$CHANGED_FILES" =~ ^[0-9]{1,4}$ ]] && [ "$CHANGED_FILES" -lt 3000 ] \
+            && files=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename') \
+            && [ "$(printf '%s\n' "$files" | awk 'NF { count++ } END { print count+0 }')" -eq "$CHANGED_FILES" ]; then
+            convergence=$(printf '%s' "$files" | bash scripts/ci-convergence-scope.sh) || convergence=run
+          fi
+          echo "convergence gate: $convergence"
+          echo "convergence=$convergence" >> "$GITHUB_OUTPUT"
 
   # Re-run checks for every event. Only dependencies and PGLite snapshots are cached.
   gitleaks:
@@ -871,8 +896,11 @@ jobs:
       scope: ${{ needs.changes.outputs.native-scope }}
 
   persistence-validation:
+    needs: [changes]
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
     uses: ./.github/workflows/persistence-validation.yml
+    with:
+      convergence: ${{ needs.changes.outputs.convergence || 'run' }}
 
   # PR stress gate (docs/TESTING.md#stress-gate): every added or modified test
   # file, plus direct importers of changed test/helpers/ files by the fan-in

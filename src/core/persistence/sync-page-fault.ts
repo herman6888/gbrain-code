@@ -28,10 +28,9 @@
  * `needs_human` for a page that keeps moving. Only a systemic failure (the
  * preparation breaker, authority or binding loss) still ends a run.
  */
-import { createHash } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import { RECOVERY_VERSION } from '../markdown.ts';
-import { sha256 } from './digest.ts';
+import { gitBlobOid, sha256 } from './digest.ts';
 import type { WriteRequest } from './model.ts';
 import { readSyncFile, syncGitPath, type SyncDiscovery, type SyncEntry, type SyncRename } from './sync-discovery.ts';
 import { readTreeBlobs } from './sync-blobs.ts';
@@ -43,11 +42,6 @@ import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-wri
 export { HOLD_ATTEMPTS_NEEDS_HUMAN } from './sync-fault-class.ts';
 
 type HoldEntry = Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld' | 'action'>;
-
-/** Git's blob id of `bytes` in the object format HEAD uses (sha1, or sha256 when HEAD's ids are 64 hex digits). */
-function blobOid(bytes: Buffer, format: 'sha1' | 'sha256'): string {
-  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-}
 
 /**
  * The working-tree bytes of `path` when they are exactly what HEAD commits for it (their blob id equals
@@ -62,7 +56,7 @@ export function headCommittedBytes(context: Pick<SyncDiscovery, 'root' | 'gitRoo
   let head: { oid: string } | undefined;
   try { head = readTreeBlobs(context.gitRoot, 'HEAD', [gitPath]).get(gitPath); } catch { return null; }
   if (!head) return null;
-  const oid = blobOid(bytes, head.oid.length === 64 ? 'sha256' : 'sha1');
+  const oid = gitBlobOid(bytes, head.oid.length === 64 ? 'sha256' : 'sha1');
   return oid === head.oid ? { content: bytes.toString('utf8'), oid, rawHash: sha256(bytes) } : null;
 }
 

@@ -246,6 +246,26 @@ Stored rows and cache maintenance remain available. Stored contradiction reports
 are temporarily available only to trusted local callers without a source filter;
 other callers receive an empty list and an availability note.
 
+## Served instruction settings
+
+Three brain config keys change the text of the initialize instructions. Every
+transport reads them when a client initializes (a read error serves the
+defaults); the static contract, bootstrap's GBRAIN-INSTRUCTIONS.md and the SDK
+constructor fallback are always the defaults rendering.
+
+| Key | Default | Effect on the instructions |
+|---|---|---|
+| `entity.names_references` | `true` | Found `entity names` rows (and siblings) carry `referenced_by_count` and a row-level `next` to the full card; the brief clause says "a `names` row's `next` opens the card". `false` drops both. |
+| `entity.record_types` | empty | Comma-separated canonical page types whose referring pages a `names` row lists as `records`; when set, the brief clause says a `names` row lists `records` by type. |
+| `mcp.instructions_governing_rule` | `in_effect` | Instruction 7: the record whose terms are in effect on the date asked about governs, and a page's `date`/`effective_date` is when it was written. `newest` serves the earlier "prefer the newest governing source" sentence, for measuring the rule. |
+
+```bash
+gbrain config set entity.record_types contract,amendment
+gbrain config set mcp.instructions_governing_rule newest   # measurement arm only
+```
+
+Clients read the new text at their next initialize (reconnect the harness).
+
 ## Incident levers
 
 - **`GBRAIN_REMOTE_PRIVATE_PAGES=1`** — operator escape hatch for the

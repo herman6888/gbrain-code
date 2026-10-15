@@ -51,7 +51,7 @@ import { operations, type Operation } from '../src/core/operations.ts';
 import { filterOpsForSurface, STARTER_OPS } from '../src/mcp/surface.ts';
 import { buildToolDefs } from '../src/mcp/tool-defs.ts';
 import { stdioVisibleTools } from '../src/mcp/server.ts';
-import { GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
+import { buildMcpInstructions, GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
 import { cl100kAvailable, estimateTokens } from '../src/core/chunkers/token-estimate.ts';
 
 const SERVED_STARTER_MAX_CHARS = 25_000;
@@ -61,7 +61,7 @@ const SERVED_STARTER_MAX_TOKENS = 5_700;
 /** The whole tools/list JSON, annotations included (25,735 measured at v0.60.46.0; traverse_graph's `hops` is full-surface-only, 25,941 measured; 26,402 once mute_notice, the dismissal for the coaching notices starter sessions receive, joined starter; 26,671 with #6007's put_page wait_ms param and write guidance, which carry the put_pages hint and the receipt poll rule starter agents need; 26,679 with delta's opaque `cursor` param, paid for by trimming delta's own descriptions, model-visible 24,985; 26,692 with recall's `question` param, paid for by trimming recall's own parameter text, model-visible 24,998; 24,996 after the #6446 merge, recall's grep text trimmed again). */
 const SERVED_STARTER_MAX_JSON_CHARS = 26_700;
 /** 4,042 at the cost wave + 586 for the operator contract's error protocol, notice prefix and memory loop (F1); no schema guidance moved here. */
-const INSTRUCTIONS_MAX_CHARS = 4_975; // #6007: +240 for the issue-required write guidance (put_pages, wait_ms); Cat 40 Hard round 4: +107 for batching lists of names (entity names, keyword OR) and sending independent calls together
+const INSTRUCTIONS_MAX_CHARS = 5_108; // #6007: +240 for the issue-required write guidance (put_pages, wait_ms); Cat 40 Hard round 4: +107 for batching lists of names (entity names, keyword OR) and sending independent calls together; d5b: +70 for the brief naming the fields compact `entity names` rows carry (the maximal rendering, record types enrolled; +39 at the default) instead of a `referenced_by` walk batch mode cannot do; F4: +63 for instruction 7's governing rule (the record whose terms are in effect on the date asked about governs; page dates are named as page dates), 74 characters longer than the "prefer the newest governing source" sentence it replaces, 11 paid by cutting "the best-ranked excerpts" to "top excerpts" in the same clause
 const DESCRIPTION_HARD_CAP = 1_200;
 const PARAM_DESCRIPTION_HARD_CAP = 200;
 
@@ -175,6 +175,22 @@ describe('served starter tool list (Cat 40 configuration)', () => {
 
   test('initialize instructions stay at or below their recorded size', () => {
     expect(GBRAIN_MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX_CHARS);
+  });
+
+  // Per-arm renderings: all off (names-row off, no records, `newest`), names-row on / records off, F4 only
+  // (`in_effect`, names-row off, no records), and the maximal one (records enrolled, names-row on, `in_effect`) at 5,108.
+  test('every per-arm rendering stays at or below the recorded size; the maximal one is the recorded size', () => {
+    let max = 0;
+    for (const governingRule of ['newest', 'in_effect'] as const) {
+      for (const namesRow of [false, true]) {
+        for (const records of [false, true]) {
+          const size = buildMcpInstructions({ references: { namesRow, records }, governingRule }).length;
+          max = Math.max(max, size);
+          expect({ governingRule, namesRow, records, fits: size <= INSTRUCTIONS_MAX_CHARS }).toEqual({ governingRule, namesRow, records, fits: true });
+        }
+      }
+    }
+    expect(buildMcpInstructions({ references: { namesRow: true, records: true }, governingRule: 'in_effect' }).length).toBe(max);
   });
 });
 

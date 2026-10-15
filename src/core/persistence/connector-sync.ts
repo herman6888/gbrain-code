@@ -32,7 +32,7 @@ import { assertPhysicalRoot } from './physical-root.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { LockStolenError, syncLockId, withRefreshingLock, type DbLockHandle } from '../db-lock.ts';
 import { ownedGoogleReceipts, prepareGoogleReceiptPatch, type GoogleReceipts } from './connector-google-receipts.ts';
-import { connectorCheckpointKey, connectorIdentity, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
+import { connectorCheckpointKeys, connectorIdentity, connectorIdentityMatches, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
 import { readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
 import { connectorAccountChanged, connectorFenceHint, docsAnchor, receiptDeliveredHint, CONNECTOR_INTENT_OUTDATED_OLD_HOST, CONNECTOR_INTENT_OUTDATED_PRE_UPGRADE } from './connector-errors.ts';
 import { inspectUnchanged, screeningRequest } from './noop-kernel.ts';
@@ -44,6 +44,7 @@ import { withCoordinatedWrite } from './context.ts';
 import { maintenanceAttribution } from './attribution.ts';
 import { readConnectorV2Cutoff } from './connector-checkpoint-migration.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
+import { PERSISTENCE_IPC_MAX_BYTES } from './ipc.ts';
 import type { GoogleSourceConfig } from '../google/types.ts';
 
 interface ConnectorLease { handle: DbLockHandle; signal: AbortSignal; }
@@ -67,6 +68,28 @@ const ITEM_WAIT_MS = 5_000;
  * set recorded. A `write_pending` error, so direct session callers and
  * `rethrowConnectorWriteError` treat it like any accepted, unfinished write.
  */
+interface StoredCheckpoint { fingerprint: string; completed_keys: unknown[]; at: number | string }
+type GoogleCursorEntry = { generation?: number; state?: { gmail_backfill_done?: boolean; gmail_newest_ms?: number | null } | null };
+
+/**
+ * #6561: the cursor a run resumes from. Releases that hashed Google's default `contactsDir` saved it under what
+ * is now an alias key; nothing rewrites those rows on upgrade. The stable row is used unless an alias row was
+ * written after it and either the stable key has no row, or the alias cursor finished its Gmail backfill and the
+ * stable one did not or reached older mail. Once this release saves the stable row it is the newer one, so a
+ * reset or a reopened backfill never falls back. A resumed alias cursor takes a generation at or above the
+ * stable row's, so the next save still rises.
+ */
+export function resumeCheckpoint(stable: StoredCheckpoint | null, aliases: StoredCheckpoint[]): unknown[] {
+  const entry = (row: StoredCheckpoint) => (row.completed_keys[0] ?? {}) as GoogleCursorEntry;
+  const done = (row: StoredCheckpoint) => entry(row).state?.gmail_backfill_done === true;
+  const newest = (row: StoredCheckpoint) => Number(entry(row).state?.gmail_newest_ms ?? 0);
+  const newer = aliases.filter(alias => !stable || (Number(alias.at) > Number(stable.at) && done(alias) && (!done(stable) || newest(alias) > newest(stable))))
+    .sort((a, b) => Number(b.at) - Number(a.at))[0];
+  if (!newer) return stable?.completed_keys ?? [];
+  const generation = Math.max(Number(entry(newer).generation ?? 0), stable ? Number(entry(stable).generation ?? 0) : 0);
+  return [{ ...entry(newer), generation }, ...newer.completed_keys.slice(1)];
+}
+
 export class ConnectorWaitBudgetStop extends OperationError {
   constructor(row?: WriteRequest) {
     super('write_pending', 'The connector wait budget is spent with accepted writes still pending.',
@@ -305,7 +328,10 @@ export function pendingConnectorResult(result: SyncResult | null, session: Manag
 }
 
 export class ManagedConnectorSync {
+  /** The cursor this run resumes from and advances (the stable row, or a #6561 alias row the loader chose). */
   private checkpoint: unknown[] = [];
+  /** What the stable key holds: every checkpoint and page write compares against it, and writes go only there. */
+  private checkpointRow: unknown[] = [];
   private receipts: string[] = [];
   private retryApprovals = new Map<string, string>();
   /** Failed receipts a previous run ended with: retried automatically, without --retry-failed. */
@@ -330,13 +356,16 @@ export class ManagedConnectorSync {
   readonly counts: Omit<ConnectorRunCounts, 'finished_at' | 'pending' | 'stopped_on_wait_budget'> & { created: number; updated: number; deleted: number } = {
     page_admissions: 0, skipped_unchanged: 0, checkpoint_admissions: 0, dropped_upstream: 0, created: 0, updated: 0, deleted: 0 };
   readonly checkpointKey: string;
+  /** The stable key plus its #6561 alias keys: retry approvals recorded under an alias still apply. */
+  private readonly checkpointKeys: string[];
   private readonly connector: ConnectorKind;
   constructor(private engine: BrainEngine, readonly sourceId: string, private identity: ConnectorIdentity,
     private source: ConnectorSource, private authority: SyncAuthority, private binding: WorktreeBinding | null,
     private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean, private retryFailed = false,
     private lease?: ConnectorLease, private resetRequested = false, private targeted = false, private fullSweep = false) {
     this.connector = identity.kind;
-    this.checkpointKey = connectorCheckpointKey(sourceId, source.incarnation, identity);
+    this.checkpointKeys = connectorCheckpointKeys(sourceId, source.incarnation, identity);
+    this.checkpointKey = this.checkpointKeys[0]!;
   }
   async assertLease(engine: BrainEngine): Promise<void> {
     if (!this.lease) return;
@@ -363,15 +392,18 @@ export class ManagedConnectorSync {
     }
     const limits = await readJournalLimits(this.engine);
     this.outstandingCap = Math.max(1, Math.min(90, limits.principalOutstanding - 10));
-    this.intentByteCap = Math.max(1024 ** 2, Math.floor(limits.principalIntentBytes / 2));
+    this.intentByteCap = Math.max(1024 ** 2, Math.floor(Math.min(limits.principalIntentBytes, PERSISTENCE_IPC_MAX_BYTES) / 2));
     this.connectorState = await readManagedConnectorState(this.engine, this.sourceId, this.source.incarnation);
     await this.resolvePendingSet();
-    const [row] = await this.engine.executeRaw<{ completed_keys: unknown[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1", [this.checkpointKey]);
-    this.checkpoint = row?.completed_keys ?? [];
+    const rows = await this.engine.executeRaw<StoredCheckpoint>(`SELECT fingerprint,completed_keys,extract(epoch from updated_at)::float8 AS at
+      FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=ANY($1::text[])`, [this.checkpointKeys]);
+    const stable = rows.find(row => row.fingerprint === this.checkpointKey) ?? null;
+    this.checkpointRow = stable?.completed_keys ?? [];
+    this.checkpoint = resumeCheckpoint(stable, rows.filter(row => row.fingerprint !== this.checkpointKey));
     const pointers = await this.engine.executeRaw<{ completed_keys: ConnectorRetry[] }>(`SELECT completed_keys FROM op_checkpoints
-      WHERE op='managed-connector-retry' AND completed_keys->0->>'checkpointKey'=$1
+      WHERE op='managed-connector-retry' AND completed_keys->0->>'checkpointKey'=ANY($1::text[])
       AND completed_keys->0->>'principalId'=$2 AND completed_keys->0->>'principalKind'=$3`,
-    [this.checkpointKey, this.authority.writer.principal.id, this.authority.writer.principal.kind]);
+    [this.checkpointKeys, this.authority.writer.principal.id, this.authority.writer.principal.kind]);
     this.retryApprovals = new Map(pointers.map(row => [row.completed_keys[0].baseRequestId, row.completed_keys[0].requestId]));
   }
   /**
@@ -433,7 +465,7 @@ export class ManagedConnectorSync {
       // The empty cursor keeps a rising generation, so the next save can never replay an older committed checkpoint receipt.
       const next = [{ generation: Number((this.checkpoint[0] as { generation?: number }).generation ?? 0) + 1, state: null }];
       await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null, { checkpointAfter: next, receipts: [], fresh: false });
-      this.checkpoint = next;
+      this.checkpoint = this.checkpointRow = next;
       this.receipts = [];
     }
     this.connectorState = { ...this.connectorState, upgrade_recovery: 'none', resumed_from: null };
@@ -570,7 +602,8 @@ export class ManagedConnectorSync {
     // A targeted refresh must not move the cursor past a carried failure it did not revisit.
     const blocked = this.targeted && this.unreachedCarried().some(entry => entry.itemRef !== CHECKPOINT_SLUG);
     if (this.pendingRows.size || this.failedPending.length || blocked) { this.deferred = true; this.lastSaveCommitted = false; return; }
-    if (this.checkpoint.length && digest((this.checkpoint[0] as { state?: unknown }).state ?? null) === digest(state ?? null)) {
+    // A cursor resumed from an alias key is always saved once, so it moves to the stable key.
+    if (digest(this.checkpoint) === digest(this.checkpointRow) && this.checkpoint.length && digest((this.checkpoint[0] as { state?: unknown }).state ?? null) === digest(state ?? null)) {
       if (fresh) await this.stampFreshness(newestContentAt);
       this.receipts = [];
       this.lastSaveCommitted = true;
@@ -579,7 +612,7 @@ export class ManagedConnectorSync {
     const next = [{ generation: Number((this.checkpoint[0] as { generation?: number } | undefined)?.generation ?? 0) + 1, state: structuredClone(state) }];
     await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null,
       { checkpointAfter: next, receipts: [...this.receipts], fresh, ...(newestContentAt ? { newestContentAt } : {}) });
-    this.checkpoint = next;
+    this.checkpoint = this.checkpointRow = next;
     this.receipts = [];
     this.lastSaveCommitted = true;
   }
@@ -729,7 +762,7 @@ export class ManagedConnectorSync {
     const next = [{ generation: Number((this.checkpoint[0] as { generation?: number } | undefined)?.generation ?? 0) + 1, state }];
     try {
       await this.submit('connector_v2_checkpoint', CHECKPOINT_SLUG, null, { checkpointAfter: next, receipts: [], fresh: false });
-      this.checkpoint = next;
+      this.checkpoint = this.checkpointRow = next;
       return true;
     } catch {
       return false;
@@ -796,7 +829,7 @@ export class ManagedConnectorSync {
     const intent: ConnectorIntent = { kind, connector: this.connector, sourceRoot: this.source.local_path,
       configHash: this.identity.digest, syncAuthority: this.authority, expected_revision: snapshot?.revision ?? null,
       sourcePath, noEmbed: this.noEmbed, noSchemaPack: this.noSchemaPack, checkpointKey: this.checkpointKey,
-      checkpointBefore: kind === 'connector_v2_checkpoint' ? this.checkpoint : cursorOnly(this.checkpoint),
+      checkpointBefore: kind === 'connector_v2_checkpoint' ? this.checkpointRow : cursorOnly(this.checkpointRow),
       ownerEpoch: this.binding ? String(this.binding.owner_epoch) : null, canonicalRoot: this.canonicalRoot,
       filePath: file?.path ?? null, fileBeforeHash: file?.expectedBeforeHash ?? null, ...extra };
     const callerIntent = { ...intent, syncAuthority: undefined, newestContentAt: undefined,
@@ -857,7 +890,7 @@ export class ManagedConnectorSync {
           await this.refuseRetryBlocker(tx);
           const [checkpoint] = await tx.executeRaw<{ completed_keys: unknown[] }>(
             "SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1 FOR UPDATE", [this.checkpointKey]);
-          if (digest(checkpoint?.completed_keys ?? []) !== digest(this.checkpoint)) throw opError('revision_conflict', 'The connector cursor changed before retry approval.',
+          if (digest(checkpoint?.completed_keys ?? []) !== digest(this.checkpointRow)) throw opError('revision_conflict', 'The connector cursor changed before retry approval.',
             `Another run moved the connector cursor of ${this.sourceId} while this one re-approved ${slug}; nothing was admitted. Run gbrain sync --source ${this.sourceId} to continue from the new cursor.`,
             { fix: connectorSyncFix(this.sourceId, 'A new run reads the current cursor and resolves the recorded pending set first.') });
           const attempt = (current.retry?.attempt ?? 0) + 1;
@@ -947,7 +980,7 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     await validateSyncAuthority(tx, p.syncAuthority, row.slug);
     const [source] = await tx.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [row.source_id]);
     if (!source || source.archived || source.incarnation !== row.source_incarnation || source.config.kind !== p.connector ||
-        connectorIdentity(p.connector, source.config, source.local_path).digest !== p.configHash || source.local_path !== p.sourceRoot) {
+        !connectorIdentityMatches(connectorIdentity(p.connector, source.config, source.local_path), p.configHash) || source.local_path !== p.sourceRoot) {
       throw connectorPublicationRefusal('source_changed', 'The connector configuration changed after admission.', row,
         `The connector configuration, path or incarnation of ${row.source_id} changed after this write was admitted.`);
     }

@@ -101,13 +101,24 @@ export type KeywordCount = { total: number; capped: boolean } | { unavailable: '
 const isTimeout = (e: unknown) => /statement timeout|canceling statement/i.test(e instanceof Error ? e.message : String(e))
   || (e as { code?: unknown } | null)?.code === '57014';
 
+/** A non-timeout count failure is a bug, not load: its SQLSTATE is logged once per process. */
+let countErrorLogged = false;
+
 /** The strict keyword count under a deadline; a late or failed count is unavailable, never a number. */
 export async function countKeywordMatches(engine: BrainEngine, query: string, opts: SearchOpts, timeoutMs = KEYWORD_COUNT_TIMEOUT_MS): Promise<KeywordCount> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<KeywordCount>(resolve => { timer = setTimeout(() => resolve({ unavailable: 'timeout' }), timeoutMs); });
   const count = engine.countKeywordPages(query, { ...opts, timeoutMs })
     .then((n): KeywordCount => ({ total: Math.min(n, KEYWORD_COUNT_CAP), capped: n > KEYWORD_COUNT_CAP }))
-    .catch((e): KeywordCount => ({ unavailable: isTimeout(e) ? 'timeout' : 'error' }));
+    .catch((e): KeywordCount => {
+      if (isTimeout(e)) return { unavailable: 'timeout' };
+      if (!countErrorLogged) {
+        countErrorLogged = true;
+        const code = (e as { code?: unknown } | null)?.code;
+        console.warn(`[search] Keyword match count failed (SQLSTATE ${typeof code === 'string' ? code : 'unknown'}); search reports keyword_count_unavailable instead of a total. This is a bug: report it with the SQLSTATE.`);
+      }
+      return { unavailable: 'error' };
+    });
   try {
     return await Promise.race([count, deadline]);
   } finally {

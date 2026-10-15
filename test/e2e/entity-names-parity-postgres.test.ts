@@ -3,7 +3,9 @@
  * returns byte-identical rows to the old full-card resolver over the
  * adversarial fixtures in test/helpers/entity-names-parity.ts, for remote and
  * local callers and from a second source. The PGLite twin is
- * test/entity-names-parity.test.ts. Runs only when DATABASE_URL is set.
+ * test/entity-names-parity.test.ts. Runs only when DATABASE_URL is set. The
+ * parity cases run with `entity.names_references` off (the reference fields
+ * are pinned against the full card by test/e2e/entity-records-postgres.test.ts).
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { BrainEngine } from '../../src/core/engine.ts';
@@ -20,6 +22,7 @@ import { getEngine, hasDatabase, setupDB, teardownDB } from './helpers.ts';
     engine = await getEngine();
     await engine.setConfig('schema_pack', 'gbrain-base-v2');
     await seedParityBrain(engine);
+    await engine.setConfig('entity.names_references', 'false');
   }, 120_000);
   afterAll(async () => { await teardownDB(); });
 

@@ -4,6 +4,9 @@
  * it used to throw away, and returns byte-identical rows to the old resolver
  * over adversarial names (helpers/entity-names-parity.ts), for remote and
  * local callers. The Postgres twin is test/e2e/entity-names-parity-postgres.test.ts.
+ * The parity cases run with `entity.names_references` off: the reference
+ * fields come from one batched read after the lookup and are pinned against
+ * the full card by test/entity-records.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -16,6 +19,8 @@ beforeAll(async () => { engine = await mentionBrain(); await seedParityBrain(eng
 afterAll(async () => { await engine.disconnect(); });
 
 describe('entity names[] parity with the full-card resolver', () => {
+  beforeAll(async () => { await engine.setConfig('entity.names_references', 'false'); });
+  afterAll(async () => { await engine.unsetConfig('entity.names_references'); });
   for (const remote of [true, false]) {
     test(`${remote ? 'remote' : 'local'} rows are byte-identical, per name and as one batch`, async () => {
       const batch = await lookupEntityNames(engine, 'default', PARITY_NAMES, { remote });

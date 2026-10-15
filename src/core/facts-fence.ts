@@ -659,6 +659,38 @@ export function upsertFactRow(
  * An unclosed code block before that point would swallow the fence (it would
  * render as code), so the fence goes above the block's opener instead.
  */
+/** #6686: which sections of a page hold a facts fence outside markdown code (the reader `replaceOrInsertFactsFence` uses). */
+export function factsFenceSections(page: { compiled_truth: string | null; timeline?: string | null }): { body: boolean; timeline: boolean } {
+  const holds = (text: string | null | undefined) => locateOutsideCode(text ?? '', FACTS_FENCE_BEGIN, FACTS_FENCE_END).beginIdx !== -1;
+  return { body: holds(page.compiled_truth), timeline: holds(page.timeline) };
+}
+
+/**
+ * #6686: the section a writer edits a page's facts fence in. A fence that lives
+ * below the timeline sentinel (in `timeline`) is edited there when the body has
+ * none, so the writer neither adds a second fence above the sentinel nor
+ * rewrites the page's layout; every other page (no fence, a body fence, or
+ * fences in both sections) is edited in the body, as before.
+ */
+export function factsFenceSection(page: { compiled_truth: string | null; timeline?: string | null }): 'compiled_truth' | 'timeline' {
+  const held = factsFenceSections(page);
+  return !held.body && held.timeline ? 'timeline' : 'compiled_truth';
+}
+
+/**
+ * #6686: strike fence row `rowNum` as superseded by row `by` in whichever section's fence holds it (a split page can
+ * hold the old row in the other section than the one the new row went to); a page without the row is returned as is.
+ */
+export function strikeFactRowInPage<T extends { compiled_truth: string; timeline: string }>(page: T, rowNum: number, by: number): T {
+  for (const key of ['compiled_truth', 'timeline'] as const) {
+    const rows = parseFactsFence(page[key]).facts;
+    if (!rows.some(f => f.rowNum === rowNum)) continue;
+    return { ...page, [key]: replaceOrInsertFactsFence(page[key], renderFactsTable(rows.map(f => f.rowNum === rowNum
+      ? { ...f, active: false, supersededBy: by, context: `superseded by #${by}` } : f))) };
+  }
+  return page;
+}
+
 export function replaceOrInsertFactsFence(body: string, fenceBlock: string): string {
   const { beginIdx, endIdx } = locateOutsideCode(body, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
   if (beginIdx !== -1 && endIdx !== -1) {

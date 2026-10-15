@@ -30,6 +30,7 @@ const siblingCanonical: typeof import('../mentions/siblings.ts').siblingCanonica
   (await import('../mentions/siblings.ts')).siblingCanonical(...args);
 import { isUndefinedTableError } from '../utils.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { rankingLinkSql } from '../link-ranking-policy.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -505,8 +506,8 @@ export async function findPrefixCandidates(
       connection_count: number;
     }>(
       `SELECT p.slug,
-              ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
-               + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
+              ((SELECT COUNT(*)::int FROM links l WHERE l.to_page_id = p.id AND ${rankingLinkSql('l')})
+               + (SELECT COUNT(*)::int FROM links l WHERE l.from_page_id = p.id AND ${rankingLinkSql('l')})
                + (SELECT COUNT(*)::int FROM content_chunks WHERE page_id = p.id))
                 AS connection_count
        FROM pages p
@@ -604,8 +605,8 @@ async function tryPrefixExpansion(
         // directly. Even on a pathological prefix matching 1000+ pages,
         // work is bounded per-candidate, not whole-table.
         `SELECT p.slug,
-                ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
-                 + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
+                ((SELECT COUNT(*)::int FROM links l WHERE l.to_page_id = p.id AND ${rankingLinkSql('l')})
+                 + (SELECT COUNT(*)::int FROM links l WHERE l.from_page_id = p.id AND ${rankingLinkSql('l')})
                  + (SELECT COUNT(*)::int FROM content_chunks WHERE page_id = p.id))
                   AS connection_count
          FROM pages p

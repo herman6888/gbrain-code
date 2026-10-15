@@ -74,6 +74,8 @@ export interface SyncStatus {
   cursor: { index: number; total: number; pinned_target: string | null; last_advance_at: string | null; done: boolean } | null;
   /** Managed sync page requests of the source committed in the last ten minutes (waived entries are not requests). */
   committed_last_10m: number;
+  /** #6706: the active `sync` Minions job draining this cursor (its `next` watches it), or null. */
+  live_job_id: number | null;
   rate_pages_per_min: number | null;
   eta_seconds: number | null;
   holds: SyncStatusHold[];
@@ -83,8 +85,12 @@ export interface SyncStatus {
   human_reason?: string;
   /** The resume arguments after `gbrain sync` for this source's cursor (its stored options when one exists). */
   resume_argv: string[];
-  /** #6643: for a cursor whose checkpoint has not committed, every receipt that would block it now (empty: the next sync commits it). */
-  checkpoint_blockers?: Array<{ request_id: string; slug: string; state: string; code: string | null; index: number | null; recovery: boolean; knock_on: boolean }>;
+  /**
+   * #6643: for a cursor whose checkpoint has not committed, every receipt that would block it now (empty: the next sync
+   * commits it). #6712 PR 0: always present; empty when no checkpoint is pending (no cursor, a finished one, or one
+   * still before its checkpoint step).
+   */
+  checkpoint_blockers: Array<{ request_id: string; slug: string; state: string; code: string | null; index: number | null; recovery: boolean; knock_on: boolean }>;
   /** #6643: every managed-sync cursor of the source under its current incarnation, newest first (at most 20). */
   cursors: SyncStatusCursor[];
   /** #6650: the source's terminal write receipts that did not commit, summarized (`terminal-failures.ts`); `unknown` when the bounded read timed out. */
@@ -206,7 +212,12 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string): Pro
   const selfHealing = lastError?.detail === 'knock_on' || lastError?.detail === 'run_replaced';
   const actionable = holds.filter(hold => !hold.needs_human && hold.safe_actions[0] !== 'none');
   const verify = { argv: ['gbrain', 'sync', 'status', '--source', sourceId, '--json'] };
-  const next: Action | null = human
+  // #6706: a live sync job already drains this cursor; the agent watches it instead of starting a second drainer beside it.
+  const liveJob = unfinished && !human ? await (await import('./sync-movement.ts')).liveSyncJob(engine, sourceId) : null;
+  const next: Action | null = liveJob !== null
+    ? { argv: ['gbrain', 'jobs', 'get', String(liveJob), '--json'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+      why: `Sync job #${liveJob} is draining this cursor (${header!.index}/${header!.total}); it resumes the frozen manifest on its own, so watch it rather than running a second sync beside it.` }
+    : human
     ? { ...('fix' in human ? human.fix : { argv: ['gbrain', 'sources', 'status', sourceId, '--json'], consent: [], actor: 'host_admin' as const, requires_exclusive: false, why: human.human_reason ?? '' }),
       user_message: `Sync of source ${sourceId} needs a decision: ${'slug' in human && human.slug ? `page ${human.slug} (${('path' in human ? human.path : undefined) ?? ''})` : `code ${human.code}`}: ${human.human_reason ?? 'see the hold'}` }
     : actionable.length
@@ -226,7 +237,7 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string): Pro
   const { recovery_next, ...terminal } = await terminalSummary(engine, sourceId, blockers.checkpoint_blockers);
   return { source_id: sourceId, run_id: header?.runId ?? null,
     cursor: header ? { index: Number(header.index), total: Number(header.total), pinned_target: header.target ?? null, last_advance_at: p ? new Date(p.lastAt).toISOString() : null, done: !!header.done } : null,
-    committed_last_10m: Number(committed?.n ?? 0), ...estimate, holds, last_error: lastError, needs_human: !!human, ...(human ? { human_reason: human.human_reason } : {}),
+    committed_last_10m: Number(committed?.n ?? 0), ...estimate, live_job_id: liveJob, holds, last_error: lastError, needs_human: !!human, ...(human ? { human_reason: human.human_reason } : {}),
     resume_argv: resume, ...blockers, cursors: await liveCursors(engine, sourceId, source.incarnation, selected?.key ?? null, failures),
     terminal_failures: terminal, next: next ?? recovery_next ?? null };
 }
@@ -240,16 +251,16 @@ export async function readCheckpointBlockers(engine: BrainEngine, sourceId: stri
   if (!source) return [];
   const failures = (await readManagedSyncFailures(engine, [sourceId])).filter(failure => failure.code !== 'sync_incomplete');
   const selected = await cursorHeader(engine, sourceId, source.incarnation, failures[0]?.cursor_key ?? null);
-  return (await checkpointBlockers(engine, selected?.header ?? null)).checkpoint_blockers ?? [];
+  return (await checkpointBlockers(engine, selected?.header ?? null)).checkpoint_blockers;
 }
 
 /**
  * #6643: a cursor at its end whose checkpoint has not committed lists every receipt that would block that checkpoint now
  * (the checkpoint's own refusal names only the first), each marked when it is a knock-on; empty means the next sync commits it.
  */
-async function checkpointBlockers(engine: BrainEngine, header: CursorHeader | null): Promise<{ checkpoint_blockers?: Array<Awaited<ReturnType<typeof listIncompleteSyncReceipts>>[number] & { knock_on: boolean }> }> {
+async function checkpointBlockers(engine: BrainEngine, header: CursorHeader | null): Promise<{ checkpoint_blockers: Array<Awaited<ReturnType<typeof listIncompleteSyncReceipts>>[number] & { knock_on: boolean }> }> {
   const intent = header?.pending?.intent;
-  if (!header || header.done || intent?.kind !== 'managed_sync_checkpoint' || !header.binding?.worktree_id) return {};
+  if (!header || header.done || intent?.kind !== 'managed_sync_checkpoint' || !header.binding?.worktree_id) return { checkpoint_blockers: [] };
   const rows = await listIncompleteSyncReceipts(engine, header.binding.worktree_id, header.runId, intent.supersededRequests ?? [], intent.settled ?? null, Number(header.total));
   const knockOns = new Set(rows.length ? (await engine.executeRaw<{ request_id: string }>(`SELECT request_id::text AS request_id FROM persistence_requests r
     WHERE r.request_id::text = ANY($1::text[]) AND ${syncKnockOnSql('r')}`, [rows.map(row => row.request_id)])).map(row => row.request_id) : []);

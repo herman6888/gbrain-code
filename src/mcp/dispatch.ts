@@ -6,6 +6,7 @@
  * + missing-context bugs; this module exists to prevent that recurring.
  */
 
+import { writeReceiptCapacityNotices } from '../core/persistence/capacity-snapshot.ts';
 import { affectsRecall } from '../core/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, enforceBoundClientOpAllowList, opError } from '../core/operations.ts';
@@ -19,7 +20,7 @@ import { cliRenderContext, orderNotices, redactForTransport, renderNotice, toAge
 import { cliOnlyRefusal, isCallable } from '../core/ops/callable.ts';
 import { hostFix, scopeDeniedError } from '../core/ops/op-fix.ts';
 import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTests, type NoticeLedger, type NoticeAudience } from '../core/notice-ledger.ts';
-import { logVerbUsage } from '../core/verbs/usage-log.ts';
+import { logVerbUsage, recordsFiring, type RecordsFiring } from '../core/verbs/usage-log.ts';
 import { searchCountLine } from '../core/search/keyword-paging.ts';
 import { dateLabelLine } from '../core/search/date-labels.ts';
 import { hiddenTakesNotice, localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
@@ -47,6 +48,7 @@ import { enforceReadTrustFloor } from '../core/eligibility/registry.ts';
 import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
 import { admittedPendingReceipt, type WriteReceipt } from '../core/persistence/types.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
+import { frameOverCap, resultTooLargeError } from '../core/egress-budget.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
@@ -158,6 +160,8 @@ export interface ToolResult {
 }
 
 export interface DispatchOpts {
+  /** #6696 (A5): set by the trusted transport for the user's own agent calls; never from wire params. */
+  admissionOrigin?: OperationContext['admissionOrigin'];
   /** Configuration selected by the resident transport, never populated from wire params. */
   config?: OperationContext['config'];
   /** Defaults to true (remote/untrusted). Local CLI callers (`gbrain call`) pass false. */
@@ -279,6 +283,8 @@ export interface DispatchOpts {
   isListed?: (op: OperationMeta) => Promise<boolean>;
   /** #5232: commit wait for coordinated writes (OperationContext.writeWaitMs); unset = agent default. */
   writeWaitMs?: number;
+  /** Large pages: the caller sent X-Gbrain-Client (OperationContext.thinClient). Shape only, never authority. */
+  thinClient?: boolean;
   /** C1: search/query row shape chosen by the transport (OperationContext.resultRows); unset = lean for remote callers. */
   resultRows?: OperationContext['resultRows'];
 }
@@ -840,7 +846,9 @@ export function buildOperationContext(
     ...(opts.stdioSurface ? { stdioSurface: opts.stdioSurface } : {}),
     ...(opts.revealTools ? { revealTools: opts.revealTools } : {}),
     ...(opts.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
+    ...(opts.admissionOrigin ? { admissionOrigin: opts.admissionOrigin } : {}),
     ...(opts.resultRows ? { resultRows: opts.resultRows } : {}),
+    ...(opts.thinClient ? { thinClient: true } : {}),
     isCallable: (opName: string) => (render ??= dispatchRenderContext(opts)).isCallable(opName),
     auth: opts.auth,
   };
@@ -862,7 +870,7 @@ export async function dispatchToolCall(
   const isVerb = VERB_NAME_SET.has(name);
   // [c11] dispatch-layer usage sidecar for the five verbs — counts validation
   // failures too. Fire-and-forget; never awaited, never throws.
-  const logVerb = (ok: boolean, extra?: { budget_dropped?: number; entity_found?: boolean; remember_status?: string }) => {
+  const logVerb = (ok: boolean, extra?: { budget_dropped?: number; entity_found?: boolean; remember_status?: string; records_firing?: RecordsFiring }) => {
     if (!isVerb) return;
     logVerbUsage({
       verb: name,
@@ -1055,18 +1063,19 @@ export async function dispatchToolCall(
         return op.handler(ctx, safeParams);
       })
       : await op.handler(ctx, safeParams);
-    // Hot memory built before a write (forget, remember, …) is never served after it, on every transport.
-    if (op.mutating) invalidateHotMemoryForEngine(engine);
+    // Hot memory built before a write (forget, remember, …) is never served after it, on every transport;
+    // #6696 (A4): the write's receipt carries the capacity notices (60 s snapshot, at most hourly per scope).
+    if (op.mutating) { invalidateHotMemoryForEngine(engine); notices.push(...await writeReceiptCapacityNotices(engine, ctx)); }
     // [E4] verb success metrics: budget drops + entity hit/miss when present.
     {
       const r = result as { dropped_count?: number; found?: boolean; status?: string } | null;
       logVerb(true, {
         ...(typeof r?.dropped_count === 'number' ? { budget_dropped: r.dropped_count } : {}),
         ...(name === 'entity' && typeof r?.found === 'boolean' ? { entity_found: r.found } : {}),
-        // remember's frozen status enum (inserted|duplicate|superseded) —
-        // the memory_writeback doctor counters read this (all-MCP-callers
-        // semantics, labeled honestly there; OV-A11).
+        // remember's frozen status enum (inserted|duplicate|superseded) — the memory_writeback
+        // doctor counters read this (all-MCP-callers semantics, labeled honestly there; OV-A11).
         ...(name === 'remember' && typeof r?.status === 'string' ? { remember_status: r.status } : {}),
+        ...((name === 'entity' || name === 'context_pack') && recordsFiring(result) ? { records_firing: recordsFiring(result)! } : {}),
       });
     }
     // D8: model-visible loudness for empty retrievals. The body stays a bare
@@ -1135,6 +1144,9 @@ export async function dispatchToolCall(
         ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${msg}; degrading to no hook keys`);
       }
     }
+    // Large pages: the egress backstop measures the final frame; a read over the connection's cap is refused whole, never cut.
+    const over = op.mutating ? null : await frameOverCap(out, { remote: ctx.remote, transport: ctx.transport, engine, config: ctx.config });
+    if (over) return errorResult(resultTooLargeError(name, safeParams, over), opts, { op: name, mutating: false, idempotent: op.idempotent === true });
     return out;
   } catch (e: unknown) {
     logVerb(false);

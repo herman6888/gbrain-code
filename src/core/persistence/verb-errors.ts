@@ -16,6 +16,9 @@ export function frontmatterSlugConflictMessage(path: string, found: string, expe
 /** #5988: the page's canonical file is held by sync; the code says why gbrain cannot import it. Location-free, so receipts may keep it. */
 const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \(([a-z_]+)\) (and differs from the page|occupies the canonical page path); the page is read-only for put_page until the file is repaired\.$/;
 
+/** #6693: the refusal of a page write whose file holds a committed Git change sync has not imported yet (pending-import.ts). */
+export const PENDING_IMPORT_MESSAGE = 'The canonical file holds a committed Git change that sync has not imported yet.';
+
 export function heldFileMessage(kind: 'drift' | 'occupied', code: string): string {
   return kind === 'drift'
     ? `The canonical file is held by sync (${code}) and differs from the page; the page is read-only for put_page until the file is repaired.`
@@ -29,7 +32,7 @@ export function heldFileDiagnostic(message: string | null | undefined, sourceId 
   // #6188 (D6): a fence hold routes to the fence repair, never to frontmatter repair.
   const repair = held[1] === 'invalid_fence'
     ? `the maintenance run repairs most fence holds by itself; to repair it now, preview with gbrain repair fences --source ${sourceId} (read-only: it names the planned repair or the exact edit) and run the apply command it prints`
-    : `frontmatter holds: preview the fix with gbrain repair frontmatter --source ${sourceId} and apply it; file_too_large: split the file`;
+    : `frontmatter holds: preview the fix with gbrain repair frontmatter --source ${sourceId} and apply it; file_too_large: the file is over the page size limit, so exclude it with sync.exclude or split it into files under the limit`;
   return { reason: held[2] === 'and differs from the page' ? 'file_database_drift' : 'canonical_path_occupied', message: message!,
     suggestion: `Sync holds this page's file because gbrain cannot import it; gbrain sources status ${sourceId} names the file${held[1] === 'invalid_fence' ? ', fence and reason' : ', line and key'}. `
       + 'The page keeps its last good revision and refuses put_page until the file is repaired, so retrying this write refuses the same way. '
@@ -47,6 +50,10 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
     if (message === 'The canonical file contains an uncoordinated local edit.') return {
       reason: 'file_database_drift', message: 'The canonical file and database disagree. Neither copy was overwritten.',
       suggestion: 'On the source host, run gbrain sources reconcile <source> <slug> --brain <brain> --preview. Review and apply the resolved preview before retrying the original write with a new request_id. This is data repair, not an ownership or permission change.',
+    };
+    if (message === PENDING_IMPORT_MESSAGE) return {
+      reason: 'pending_import', message: 'A committed Git change to the page\'s file has not been imported yet; neither copy was overwritten.',
+      suggestion: 'A refused remember is replayed once by the first managed sync that imports the file; do not save it again. Any other write: after the next gbrain sync --source <source> --no-pull, read the page again and resubmit with a new request_id.',
     };
     if (['Newer working-tree bytes and the current page disagree with this pinned Git import.',
       'Newer code file bytes disagree with the pinned import.', 'Canonical sanitization cannot overwrite newer working-tree bytes.'].includes(message ?? '')) return {

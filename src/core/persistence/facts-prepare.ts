@@ -5,7 +5,7 @@ import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
-import { parseFactsFence, upsertFactRow, formatFenceDate, renderFactsTable, replaceOrInsertFactsFence } from '../facts-fence.ts';
+import { factsFenceSection, parseFactsFence, strikeFactRowInPage, upsertFactRow, formatFenceDate } from '../facts-fence.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { assertFactNotWithdrawn, decideSingleFact, factWithdrawnRefusal, type FactCandidate } from '../facts/single-prepare.ts';
 import { assertFactNotPurged, isFactWithdrawn } from '../facts/withdrawal.ts';
@@ -147,10 +147,12 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
   }
   // #6188 (D20): the entity's stored fence is normalized in this same write; a residual refuses typed `target_fence_malformed`.
   const target = snapshot ? await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page }) : null;
-  let body = target?.page.compiled_truth ?? '';
-  const parsed = parseFactsFence(body);
+  // #6686: the fence is edited in the section it lives in (a lone timeline fence stays below the sentinel); the other section is kept byte for byte.
+  const fenced = { compiled_truth: target?.page.compiled_truth ?? '', timeline: target?.page.timeline ?? '' };
+  const section = factsFenceSection(fenced);
+  let next = { ...fenced };
   const [maximum] = await engine.executeRaw<{ n: number }>('SELECT COALESCE(MAX(row_num),0)::int AS n FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [row.source_id, row.slug]);
-  let nextRow = Math.max(maximum?.n ?? 0, ...parsed.facts.map(fact => fact.rowNum)) + 1;
+  let nextRow = Math.max(maximum?.n ?? 0, ...[fenced.compiled_truth, fenced.timeline].flatMap(text => parseFactsFence(text).facts.map(fact => fact.rowNum))) + 1;
   const entries: Array<{ fact: typeof facts[number]; duplicateId: number | null; rowNum?: number; duplicateOf?: number; supersedes?: FactCandidate; gate?: GatedRowDecision }> = [];
   const seen = new Map<string, number[]>();
   // #5575 B3: a new row passes the write gate at the extraction's declared tier (ENG-18) before it reaches the fence;
@@ -183,21 +185,20 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
     if (gate && gate.action !== 'insert') { blocked.push(gate); continue; }
     const rowNum = fact.entity_slug !== null && !fallback(fact) ? nextRow++ : undefined;
     // #6385 R12: an entity fence that does not parse cleanly refuses typed instead of losing the rows it skipped.
-    if (rowNum !== undefined) body = refuseUnparsedRewrite({ compiled_truth: body, timeline: target!.page.timeline }, row.slug, row.source_id, () => upsertFactRow(body, {
+    if (rowNum !== undefined) next = { ...next, [section]: refuseUnparsedRewrite(next, row.slug, row.source_id, () => upsertFactRow(next[section], {
       rowNum, claim: fact.fact, kind: fact.kind, visibility: fact.visibility,
       confidence: fact.confidence ?? 1, notability: fact.notability ?? 'medium', source: fact.source, context: fact.context ?? undefined,
       validFrom: formatFenceDate(fact.valid_from!), validUntil: fact.valid_until ? formatFenceDate(fact.valid_until) : undefined,
       claimMetric: fact.claim_metric ?? undefined, claimValue: fact.claim_value ?? undefined,
       claimUnit: fact.claim_unit ?? undefined, claimPeriod: fact.claim_period ?? undefined,
-      ...(fact.attributed_to ? { attributedTo: fact.attributed_to } : {}) }).body);
-    // Strike the superseded row in this page's fence, as the remember mutation does.
+      ...(fact.attributed_to ? { attributedTo: fact.attributed_to } : {}) }).body) };
+    // Strike the superseded row in this page's fence, as the remember mutation does (#6686: in the section that holds it).
     if (supersedes && rowNum !== undefined && supersedes.source_markdown_slug === row.slug && supersedes.row_num != null) {
-      body = replaceOrInsertFactsFence(body, renderFactsTable(parseFactsFence(body).facts.map(f => f.rowNum === Number(supersedes.row_num)
-        ? { ...f, active: false, supersededBy: rowNum, context: `superseded by #${rowNum}` } : f)));
+      next = strikeFactRowInPage(next, Number(supersedes.row_num), rowNum);
     }
     entries.push({ fact, duplicateId: null, rowNum, supersedes, gate });
   }
-  const canonicalFacts = extractFactsFromFenceText(parseFactsFence(body).facts, row.slug, row.source_id);
+  const canonicalFacts = extractFactsFromFenceText(parseFactsFence(next[section]).facts, row.slug, row.source_id);
   for (const entry of entries) {
     if (entry.rowNum === undefined) continue;
     const canonical = canonicalFacts.find(fact => fact.row_num === entry.rowNum);
@@ -213,7 +214,7 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
     const rowNums = entries.flatMap(entry => entry.rowNum === undefined ? [] : [entry.rowNum]);
     page = await withPendingFenceRows({ sourceId: row.source_id, slug: row.slug, rowNums, tier: fenceAppendPendingTier(taint?.trust.tier) },
       () => preparePageMutation(engine, { ...row, intent: { ...p,
-        content: serializePageToMarkdown({ ...snapshot.page, compiled_truth: body, timeline: target!.page.timeline }, snapshot.tags) } }, config));
+        content: serializePageToMarkdown({ ...snapshot.page, ...next }, snapshot.tags) } }, config));
     if (page.observedRevision !== snapshot.revision) throw factsRefusal('revision_conflict', 'The fact entity changed during preparation.', row,
       `Entity page ${row.slug} changed while its ## Facts table was being prepared, so none of these facts were published.`);
   }

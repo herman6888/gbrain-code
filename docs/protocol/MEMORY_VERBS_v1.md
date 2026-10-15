@@ -435,13 +435,75 @@ row is `{ name, found: true, slug, title, type, aka[], lead, siblings? }` or
 `{ name, found: false, suggestions? }` (up to 3 `{slug, title}`). `lead` is the
 page's opening prose, up to 200 characters (headings, table rows, private
 fences and secrets removed); `siblings` lists the identity siblings with their
-own `slug`, `title`, `type`, `aka` and `lead`. Rows carry no references, facts
-or open threads: call `entity` with `name` for the full card.
+own `slug`, `title`, `type`, `aka` and `lead`. Rows carry no facts or open
+threads: call `entity` with `name` for the full card.
+
+#### entity names reference fields and records (additive)
+
+Every found row and each of its `siblings` carries `referenced_by_count` (the
+full card's count, every link source) and a row-level `next`, `{ tool: "entity",
+arguments: { name: <slug> } }`, the call that returns that page's full card,
+under `entity.names_references` (default on; `false` drops both). When
+`entity.record_types` names page types (empty by default, so records are off),
+each found row and sibling also carries `records[]` (below). The found page and
+each sibling get their own count and records, side by side, never merged. When
+a row carries either field, the source's `mention_index` coverage notice rides
+the response as on the full card.
+
+#### entity records: record types enrolled by config (additive)
+
+`entity.record_types` is a comma-separated list of canonical page types that
+count as records (a stored alias is read as its pack type). When it names
+types, `entity` names rows and siblings, the full card (`card.records`, and
+`records` on each `identity_siblings.pages[]` entry) and `context_pack` cards
+list the referring pages of those types:
+
+- `records[]`: one group per type with at least one record, `{ canonical_type,
+  total, rows[], capped?, next? }`, groups ordered by their newest row. An
+  enrolled entity with no records has `records: []`.
+- A row is exactly `{ slug, title, date, date_source, page_status?, amends?,
+  supersedes? }`. `date` is the page's own date (`COALESCE(effective_date,
+  updated_at)`, `date_source` says which), not when its terms take effect.
+  `page_status` is the page's own frontmatter `status` when it is a string of
+  at most 40 characters (search rows carry the same value as raw `status`; link
+  rows' temporal relationship `status` is a different field). `amends[]` is
+  `{ slug, since? }` per page this one amends through an `amends` link, `since`
+  only when the link records a terms-start date (frontmatter `amends: [{ name,
+  since }]`); `supersedes[]` is `{ slug }` per page this one replaces as a
+  whole. Each list holds at most 5 entries; absent fields mean nothing is
+  recorded.
+- Rows are newest page date first. The order never says which record governs:
+  compare `amends[].since` and the documents themselves with the date asked
+  about. No validity status is computed.
+- Bounded: 5 rows per page (all of them when it has 5 or fewer), 24 per call,
+  allotted in input order, a page repeated in the call counted once. A group
+  with `rows.length < total` carries `capped` (`per_page`, or `per_call` when
+  earlier entities took the call's rows, including a group with no rows) and
+  `next`, `{ tool: "get_backlinks", arguments: { slug, source_id, type, group:
+  "page", limit, cursor? } }`, which returns exactly the remaining records of
+  that type (with the same `page_status` / `amends` / `supersedes` fields);
+  on a verbs-only connection it carries `requires_surface: "starter"`.
+- Records use the referrer read's visibility: an untrusted caller never sees a
+  private, derived-private or quarantined referrer, a link whose origin page is
+  private, an `amends` target it cannot read, or a `since` whose only evidence
+  is private.
+- Unavailable is not empty: when the count or records read fails or misses its
+  2-second deadline, the row carries `references_unavailable: "deadline" |
+  "read_failed"` instead of the fields, and one `[gbrain notice
+  references_unavailable]` (degraded) block rides the response. The full
+  card's `referenced_by` follows the same rule. An enrolled type that neither
+  the schema pack declares nor any page uses adds a `record_types_undeclared`
+  info notice.
+
+Check which pages count as records without calling an agent: `gbrain config
+get entity.record_types`, then `get_backlinks {slug, type: <record type>,
+group: "page"}` or `list_pages {type: <record type>}`.
 
 #### entity references and coverage (additive)
 
 The `entity` verb adds three optional card fields (ambient callers,
-`context_pack` and `delta`, do not compute them):
+`context_pack` and `delta`, do not compute them; `context_pack` adds only the
+record view, below):
 
 - `referenced_by_count` — distinct pages with any inbound link to the entity,
   every link source included (`backlink_count` keeps excluding mentions).
@@ -765,6 +827,9 @@ semantics: removing a materialized timeline bullet removes its timeline row.
 
 Success returns the committed receipt with the new `revision` and `diff`, a
 unified diff of your view capped at 8 KB (`diff_truncated: true` when cut).
+On a large page only the changed region is diffed; when that region is over
+4 million old-by-new line pairs the diff is one hunk replacing it whole and
+the receipt says `diff_coarse: true`.
 Refusals name the edit and never include protected text:
 
 | Error | `detail` | Fix |
@@ -790,7 +855,7 @@ Refusals name the edit and never include protected text:
 
 From the CLI: `gbrain call edit_page '{"slug":"projects/example","expected_revision":"…","edits":[{"old_text":"…","new_text":"…"}]}'`.
 
-### context_pack(entities, budget_tokens?, since?, session_id?, include_private?) — read, zero LLM
+### context_pack(entities, budget_tokens?, since?, session_id?, include_private?, counterparty?, intent?) — read, zero LLM
 
 One deterministic, budget-packed bundle for a set of standing
 entities — entity cards + open threads + hot facts. Built for **session
@@ -808,13 +873,54 @@ lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
-degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld? }`. `text` is the
+degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld?, brief? }`. `text` is the
 envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
 
 `entities` scopes cards and threads, not the hot facts (the session's recent
 memory), so other facts can appear; `recall` with `entity` reads one entity
 strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
 and `provenance` (the stored source), never rendered into `text`.
+
+#### context_pack records (additive)
+
+When `entity.record_types` names page types, each card of the `context_pack`
+pull verb (never the ambient push hook, which stays unchanged) carries
+`referenced_by_count`, `records[]` (the entity records view, same row shape,
+caps, continuations and visibility) and `sibling_records[]` (`{ slug, title,
+referenced_by_count, records[] }` per identity sibling, side by side), or
+`references_unavailable` with its degraded notice. `text` renders them last,
+after newer mentions, under `## Records that reference these entities (page
+date = when the page was written, newest first; …)`, one line per record:
+`- <entity>: <type> <slug> "<title>" — page date <YYYY-MM-DD> (<date_source>);
+status: <page_status>; amends <slug> (terms start <since>); supersedes <slug>`.
+Under `budget_tokens` records pack into what cards, facts and newer mentions
+left; a card whose records do not fit keeps its count. With nothing enrolled,
+cards carry none of these fields, so `context_pack` still computes no
+references by default. `backlink_count` keeps excluding mentions;
+`referenced_by_count` counts every link source.
+
+#### page_status on context_pack and get_backlinks rows (additive)
+
+Under `entity.row_page_status` (default `true`), each `context_pack` card
+carries `page_status` for its own page, and each `newer_mentions.rows[]` entry
+for the referring page; `get_backlinks` adds it to every link row (the
+referring page's status) and every `group: "page"` row. Absent when the page
+has no status. A private page (for an untrusted caller) or a quarantined page
+(unless the caller may read quarantined pages) shows none. `text` is unchanged:
+the field rides the structured rows only. `false` removes it from these rows;
+record rows (`records[]`, and a record type's `get_backlinks` continuation)
+keep their `page_status` either way.
+
+`page_status` is the page's own frontmatter `status`, copied only when it is set
+to a string: trimmed, at most 40 characters (longer or non-string values are not
+shown). It is never inferred from a title, subject or text, and it does not make
+a page lesser evidence. The documented convention for a record that is not in
+force yet is `status: draft` or `status: unsigned`; any other string is passed
+through as written. Search rows carry the same frontmatter value as raw
+`status` (`frontmatter->>'status'`, unbounded and untrimmed), so a search row's
+`status` and a pack or backlink row's `page_status` agree whenever the value is
+a string of 40 characters or fewer. A link row's `status` is the relationship's
+temporal state, a different field, and the `status` input filter is unchanged.
 
 #### context_pack core memory (additive)
 
@@ -823,6 +929,32 @@ always-loaded core block (owner-designated pages loaded in every session,
 [core memory](../guides/core-memory.md)) when core memory is on and not empty.
 `text` starts with the core block, and core tokens count inside
 `budget_tokens`. `entities` may be omitted to fetch core alone.
+
+#### context_pack brief: `counterparty`, `intent` (additive)
+
+`counterparty` (a person or company name, or an exact page slug) asks for a
+pulled brief of at most three dated items about them; `intent` (`meeting` |
+`reply`, optional) labels the task. Without `counterparty` the response is
+unchanged. The brief is pull, not push, and says so: `text` gains a
+`## Before you start (pulled on request)` block after the core block, counted
+inside `budget_tokens`, and the response gains
+`brief: { delivery: "pull", intent, counterparty: { slug, display } | null,
+items: [{ id, kind, date, due?, slug, source_id, text, counterparty,
+confidence }], withheld_arms?, reason? }`.
+
+A name resolves only on the alias or title arm at ≥ 0.8, to a person or company
+page, never through a common word. An unresolved name returns
+`reason: "counterparty_unresolved"` and no items; an invalid `intent` is
+`invalid_params`. Items are open loops (`L<id>`, trusted-local callers only;
+remote callers get `withheld_arms: ["loops"]`), the newest dated fact
+(`F<id>`), and the counterparty page's newest dated edit (`kind: "edit"`: the
+lines a revision added, `Ev<page version id>`, or a timeline entry,
+`Et<timeline entry id>`), dropped when it repeats a fact or loop of the same
+brief. Visibility follows the `include_private` rule above, with
+private-provenance facts excluded unless widened; an edit's page (and a
+timeline entry's event page) follows the same page rule, and facts and takes
+fence rows never count as an edit. The same assembler serves
+the off-by-default hook push ([push context](../guides/push-context.md)).
 
 ### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
 

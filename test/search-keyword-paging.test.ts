@@ -21,7 +21,7 @@
  * keyword counts or keyword-mode paging (new surface); (4) no new seam: the
  * unavailable-count tests wrap the real engine.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { dispatchToolCall, type ToolResult } from '../src/mcp/dispatch.ts';
@@ -74,6 +74,24 @@ describe('engine: strict keyword pages', () => {
     expect(relaxed.length).toBe(2);
     expect(await engine.countKeywordPages('zephyrine obsidianite')).toBe(0);
     expect(await engine.searchKeywordPages('zephyrine obsidianite', undefined, { limit: 10 })).toEqual([]);
+  });
+
+  test('a CJK count binds only the parameters its WHERE reads and equals the rows, under filters', async () => {
+    await seedPage(engine, 'notes/cjk-glucose-a', '오늘 혈당 기록을 정리했다.');
+    await seedPage(engine, 'meetings/cjk-glucose-b', '회의에서 혈당 관리 방안을 논의했다.', { type: 'meeting' });
+    await seedPage(engine, 'notes/cjk-other', '오늘 날씨가 맑았다.');
+    try {
+      expect(await engine.countKeywordPages('혈당')).toBe(2);
+      expect(await engine.countKeywordPages('혈당', { types: ['meeting'], sourceId: 'default' })).toBe(1);
+      expect(await countKeywordMatches(engine, '혈당', {})).toEqual({ total: 2, capped: false });
+      const rows = await engine.searchKeywordPages('혈당', undefined, { limit: 10 });
+      expect(rows.map(r => r.slug).sort()).toEqual(['meetings/cjk-glucose-b', 'notes/cjk-glucose-a']);
+      const hybrid = await callSearch(engine, { query: '혈당' });
+      expect(hybrid.retrieval.keyword_total).toBe(2);
+      expect(hybrid.retrieval.degraded ?? []).not.toContainEqual(expect.objectContaining({ stage: 'keyword_count_unavailable' }));
+    } finally {
+      await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE '%/cjk-%'`);
+    }
   });
 });
 
@@ -302,6 +320,26 @@ describe('count unavailable: a degraded stage, never a number', () => {
     const keyword = await withEnv({ GBRAIN_BACKUP_CHECK: '0' }, () => dispatchToolCall(e, 'search', { query: TERM, match: 'keyword', limit: 3 }, REMOTE));
     expect(countLine(keyword)).toStartWith('[gbrain search] Keyword match count unavailable (timed out; not a count of zero); showing 1-3');
     expect(nextFromLine(countLine(keyword))).toBeDefined();
+  });
+
+  test('a failed (non-timeout) count is unavailable with its SQLSTATE logged once per process', async () => {
+    const failing = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'countKeywordPages') return async () => { throw Object.assign(new Error('bind message supplies 2 parameters'), { code: '08P01' }); };
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    }) as BrainEngine;
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(await countKeywordMatches(failing, TERM, {}, 1000)).toEqual({ unavailable: 'error' });
+      expect(await countKeywordMatches(failing, TERM, {}, 1000)).toEqual({ unavailable: 'error' });
+      const logged = warn.mock.calls.map(c => String(c[0])).filter(l => l.includes('Keyword match count failed'));
+      expect(logged).toEqual([expect.stringContaining('SQLSTATE 08P01')]);
+      expect(logged[0]).not.toContain(TERM);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test('the line renderer never invents a number', () => {

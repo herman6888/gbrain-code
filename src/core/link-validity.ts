@@ -57,6 +57,17 @@ export function setPackRelationSemantics(semantics: ReadonlyMap<string, 'state' 
   packSemantics = semantics;
 }
 
+/**
+ * Relation types that record when something takes effect rather than a
+ * relationship that starts and ends: their edges are never hidden for not
+ * having started (or for falling outside a `during` window). Status reads
+ * still report `not_started` and the stints; only filtering treats them like
+ * reference edges (never part of an `ended` read). docs/guides/temporal-edges.md.
+ */
+export const LIVENESS_EXEMPT_LINK_TYPES: readonly string[] = Object.freeze(['amends']);
+
+const livenessExemptSql = `lr.link_type <> ALL(ARRAY[${LIVENESS_EXEMPT_LINK_TYPES.map(t => `'${t}'`).join(', ')}]::text[])`;
+
 export function relationSemantics(linkType: string | null | undefined): RelationSemantics {
   if (!linkType) return 'reference';
   return packSemantics.get(linkType) ?? RELATION_SEMANTICS[linkType] ?? 'reference';
@@ -363,7 +374,8 @@ function dateLiteral(date: string): string {
  * fragment composes into statements with any parameter numbering.
  *
  * A row passes when its relationship has no state row (reference type, or not
- * yet refreshed) or its state row matches the requested status.
+ * yet refreshed), its type is liveness-exempt (outside `ended` reads), or its
+ * state row matches the requested status.
  */
 export function relationshipFilterSql(linkAlias: string, opts: EdgeTemporalOpts = {}): string {
   const status = opts.status ?? 'live';
@@ -374,14 +386,14 @@ export function relationshipFilterSql(linkAlias: string, opts: EdgeTemporalOpts 
       AND lr.link_type = ${linkAlias}.link_type AND lr.scope = '${scope}'`;
   if (opts.during) {
     const range = `daterange(${dateLiteral(opts.during.from)}, ${dateLiteral(opts.during.until)})`;
-    return `NOT EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND NOT (lr.valid_ranges && ${range}))`;
+    return `NOT EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND ${livenessExemptSql} AND NOT (lr.valid_ranges && ${range}))`;
   }
   if (status === 'ended') {
     return `EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND lr.semantics = 'state'
       AND NOT (lr.valid_ranges @> ${day}) AND (lr.first_start IS NULL OR lr.first_start <= ${day}))`;
   }
   const disputedClause = opts.asOf ? ' OR lr.disputed' : '';
-  return `NOT EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND (NOT (lr.valid_ranges @> ${day})${disputedClause}))`;
+  return `NOT EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND ${livenessExemptSql} AND (NOT (lr.valid_ranges @> ${day})${disputedClause}))`;
 }
 
 /** Validate op-level temporal params; returns normalized opts or an error message. */
@@ -484,10 +496,11 @@ export function annotateTemporalRow<T extends { link_type: string }>(row: T, asO
  * Used where the read is bounded (one page's edges) so callers can also count
  * what they hid.
  */
-export function edgeMatchesTemporal(row: TemporalAnnotation & { first_start?: string | null }, opts: EdgeTemporalOpts = {}): boolean {
+export function edgeMatchesTemporal(row: TemporalAnnotation & { first_start?: string | null; link_type?: string }, opts: EdgeTemporalOpts = {}): boolean {
   const status = opts.status ?? 'live';
   if (opts.disabled) return true;
   if (row.status === 'reference') return status !== 'ended';
+  if (row.link_type && LIVENESS_EXEMPT_LINK_TYPES.includes(row.link_type) && status !== 'ended') return true;
   if (opts.during) {
     if (!row.stints) return true;
     return row.stints.some(s => (s.from === null || s.from < opts.during!.until) && (s.until === null || s.until > opts.during!.from));

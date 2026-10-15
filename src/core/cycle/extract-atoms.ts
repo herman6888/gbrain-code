@@ -71,7 +71,8 @@ import { derivedWriteThrough } from './derived-write-through.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8, safeSplitIndex } from '../text-safe.ts';
 import { corpusTextForExtraction } from '../context/corpus-segments.ts';
-import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone } from './extract-atoms-input.ts';
+import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
+import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
 import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
 import type { MaintenanceWriteWait } from '../persistence/maintenance-wait.ts';
@@ -1069,6 +1070,10 @@ export async function runPhaseExtractAtoms(
   async function stampAtomsScanHash(item: AtomPageInput): Promise<void> {
     await writeAtomPageState(engine, sourceId, item, 'complete');
   }
+  /** Large pages A7: a page's watermark moves past the text this item read once its writes committed (a pending batch keeps the old one). */
+  async function commitAtomsWatermark(item: ExtractAtomsItem, input: ExtractAtomsInput, published: readonly { state: string }[]): Promise<void> {
+    if (item.kind === 'page' && item.identity && input.plan && published.every(receipt => receipt.state === 'committed')) await commitExtractionPlan(engine, item.identity.pageId, input.plan);
+  }
 
   /**
    * Durable per-item failure count, keyed to the CURRENT content hash so a
@@ -1152,7 +1157,7 @@ export async function runPhaseExtractAtoms(
     // item, so a quote can only verify against text the model actually saw.
     // #6503: a cut item is extracted once from its head and gets a partial
     // disposition instead of a completion stamp (extract-atoms-input.ts).
-    const input = extractAtomsInput(item, maxInputChars);
+    const input = extractAtomsInput(item, maxInputChars, item.kind === 'page' ? (await readPageWatermark(engine, sourceId, item.slug, 'extract_atoms')).stored : null);
     const { promptContent } = input;
     // Local fork patch (#6503): oversized items are windowed with overlap
     // instead of truncated at the cap; a one-window item keeps the old path
@@ -1173,7 +1178,8 @@ export async function runPhaseExtractAtoms(
       const resumed = !opts.dryRun && managed && origin ? await resumeManagedAtoms(engine, managed, origin) : 'run';
       if (resumed === 'done') { duplicatesSkipped++; continue; }
       if (resumed === 'held') { heldFailed++; continue; } // #6325: settled after repeated failures; doctor lists it
-      if (truncated) { inputTruncated++; console.error(inputTruncatedLine(originLabel, input, maxInputChars)); } // counted only for a model call
+      const cutLine = truncated ? inputTruncatedLine(originLabel, input, maxInputChars) : null; // A7: a complete appended-tail read prints nothing
+      if (cutLine) { inputTruncated++; console.error(cutLine); } // counted only for a model call
 
       // One chat call per window (#6503). Atoms accumulate across windows;
       // per-window provenance is resolved NOW (#4706 holds per window: the
@@ -1274,10 +1280,12 @@ export async function runPhaseExtractAtoms(
         // row is (source_id, file_path, content_hash)-keyed, so editing the
         // file re-eligibilizes it — which is what makes the permanence safe.
         if (!opts.dryRun) {
-          if (managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, []));
-          else if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
-          else if (item.kind === 'page') await stampAtomsScanHash(item);
-          else await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
+          const published = managed && origin ? await publishManagedAtoms(engine, managed, origin, []) : [];
+          writeRequests.push(...published);
+          if (!origin && truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
+          else if (!origin && item.kind === 'page') await stampAtomsScanHash(item);
+          else if (!origin && item.kind === 'transcript') await stampTranscriptTombstone(engine, sourceId, item.filePath, item.contentHash);
+          await commitAtomsWatermark(item, input, published);
         }
         if (item.kind === 'transcript') transcriptsProcessed++;
         else pagesProcessed++;
@@ -1410,6 +1418,7 @@ export async function runPhaseExtractAtoms(
           writeRequests.push(...published);
           if (published.some(receipt => receipt.state !== 'committed')) writesPending++;
           totalAtomsExtracted += managedAtoms.length;
+          await commitAtomsWatermark(item, input, published);
         } else {
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
@@ -1425,6 +1434,7 @@ export async function runPhaseExtractAtoms(
         await atomFiles?.(importedSlugs, retired);
         if (truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
         else if (item.kind === 'page') await stampAtomsScanHash(item);
+        await commitAtomsWatermark(item, input, []);
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting

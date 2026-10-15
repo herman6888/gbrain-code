@@ -49,6 +49,7 @@ on:
       - E2E Tests
       - Heavy Tests
       - Scale tier
+      - Convergence nightly
       - macOS 26 validation
       - Semgrep
       - OSV-Scanner

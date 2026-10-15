@@ -834,12 +834,19 @@ test('healthy renewals during a long preparation keep the claim: one attempt, co
   const sources = await fixtures(engine, config);
   const row = await admitWrite(engine, admission(config, sources[0], 'claim-lease/healthy', 'healthy body'));
   const renewed: string[] = [];
-  const restore = interceptRenewals(id => { renewed.push(id); return undefined; });
+  const threeRenewals = Promise.withResolvers<void>();
+  const restore = interceptRenewals(id => {
+    renewed.push(id);
+    if (renewed.filter(seen => seen === row.id).length >= 3) threeRenewals.resolve();
+    return undefined;
+  });
   let attempts = 0;
   const errors: unknown[] = [];
   const consumer = new PersistenceConsumer(engine, { engine: 'pglite' }, async (_engine, current) => {
     attempts++;
-    await Bun.sleep(120);
+    // A long preparation: at least 120 ms and until the lease has renewed three times (at most 3 s). Only one renewal is
+    // in flight at a time, so a fixed 120 ms saw two when each renewal took over 40 ms on a loaded host.
+    await Promise.all([Bun.sleep(120), Promise.race([threeRenewals.promise, Bun.sleep(3_000)])]);
     return prepared(current, sources);
   }, { hostId: config.hostId, pollMs: 60_000, renewalIntervalMs: 10, phaseMs: 2_000, onError: error => errors.push(error) });
   try {
