@@ -40,7 +40,7 @@ export interface RuntimeArtefactSweep {
 const GBRAIN_SOCKET_KINDS = ['resolve', 'persistence'] as const;
 
 /** What the runtime reports for a stale Windows AF_UNIX reparse point (EACCES on Bun; the others are its neighbours). */
-const UNREADABLE_CODES = new Set(['EACCES', 'EPERM', 'EINVAL', 'UNKNOWN']);
+export const UNREADABLE_CODES: ReadonlySet<string> = new Set(['EACCES', 'EPERM', 'EINVAL', 'UNKNOWN']);
 
 function entryStat(path: string): fs.Stats | 'missing' | 'unreadable' {
   try { return fs.lstatSync(path); }

@@ -40,6 +40,7 @@ import {
   connectionEntry,
   connectionGateEntry,
 } from './checks/db-connection.ts';
+import { ipcSocketPathEntry } from './checks/local-ipc.ts';
 import {
   pgvectorEntry,
   rlsEntry,
@@ -48,6 +49,7 @@ import {
   embeddingsEntry,
 } from './checks/schema-health.ts';
 import { embeddingStateEntry } from './checks/embedding-state.ts';
+import { embeddingIdentityEntry } from './checks/embedding-identity.ts';
 import {
   embeddingProviderEntry,
   alternativeProvidersEntry,
@@ -82,6 +84,8 @@ import {
 import { queueHealthEntry, indexAuditEntry, imageAssetsEntry } from './checks/queue-assets.ts';
 import { imageEmbeddingCoverageEntry } from './checks/image-embedding-coverage.ts';
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
+import { embedBackfillStalledEntry } from './checks/embed-backfill-stalled.ts';
+import { connectorAccountMismatchEntry } from './checks/connector-account-mismatch.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
 import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
@@ -95,11 +99,13 @@ import { factsDrainEntry } from './checks/facts-drain.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
 import { supersessionCalibrationEntry } from './checks/supersession-calibration.ts';
+import { factAdmissionFloorsEntry } from './checks/fact-admission-floors.ts';
 import { unlinkedFactsEntry } from './checks/unlinked-facts.ts';
 import { edgeValidityEntry } from './checks/edge-validity.ts';
 import { coreMemoryEntry } from './checks/core-memory.ts';
 import { plannerStatsEntry } from './checks/planner-stats.ts';
 import { revisionBackfillEntry } from './checks/revision-backfill.ts';
+import { beliefLedgerEntry } from './checks/belief-ledger.ts';
 import { trustTiersEntry } from './checks/trust-tiers.ts';
 import { trustScanEntry } from './checks/trust-scan.ts';
 import { trustSourcesUnclaimedEntry } from './checks/trust-sources-unclaimed.ts';
@@ -110,6 +116,7 @@ import { providerConsentEntry } from './checks/provider-consent.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
 import { ghostPagesEntry } from './checks/ghost-pages.ts';
+import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
 import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
 import { atomHeldFailedEntry } from './checks/atom-holds.ts';
 import { extractionInputTruncatedEntry } from './checks/extraction-input.ts';
@@ -146,6 +153,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   harnessWiringDoctorEntry,
   agentContractEntry,
   pgliteDataDirEntry,
+  ipcSocketPathEntry,
   projectionResidentEntry,
   offlineConnectionEntry,
   dbChecksGateEntry,
@@ -169,7 +177,9 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   embeddingQueryPrefixEntry,
   embeddingColumnRegistryEntry,
   embeddingEnvOverrideEntry,
+  embeddingIdentityEntry,
   supersessionCalibrationEntry,
+  factAdmissionFloorsEntry,
   chatFallbackChainEntry,
   behaviorChangesEntry,
   graphCoverageEntry,
@@ -192,6 +202,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   salienceEntry,
   queueHealthEntry,
   globalMaintenanceTimeoutsEntry,
+  embedBackfillStalledEntry,
+  connectorAccountMismatchEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
   grantNewOpsEntry,
@@ -210,6 +222,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   retrievalFeedbackEntry,
   transcriptSecretExposureEntry,
   revisionBackfillEntry,
+  beliefLedgerEntry,
   trustTiersEntry,
   trustScanEntry,
   trustSourcesUnclaimedEntry,
@@ -218,6 +231,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   atomHeldFailedEntry,
   extractionInputTruncatedEntry,
   ghostPagesEntry,
+  missingRecordedFilesEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];

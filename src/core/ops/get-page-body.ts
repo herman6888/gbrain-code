@@ -33,6 +33,7 @@ import type { OperationContext, ParamDef } from './contract.ts';
 import { opError, OperationError } from './contract.ts';
 import { invalidParam, readFix } from './op-fix.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { deepResearchPageUrl, encodeDeepResearchId } from '../deep-research-id.ts';
 import { encodedFrameBytes, EGRESS_CAP_CONFIG_KEYS, egressTransport, FRAME_RESERVE_BYTES, resultByteCap } from '../egress-budget.ts';
 import { DEFAULT_INLINE_BODY_BYTES, chunkDocumentSpan, readPageDocument, spanHoldsChunk, type PageDocument } from '../page-window/document.ts';
@@ -43,6 +44,7 @@ import {
 } from '../page-window/window.ts';
 import { renderTrustedText, type TrustFields } from '../eligibility/labels.ts';
 import type { QuarantinedView } from './get-page-projection.ts';
+import { chunkGenerationProbe } from '../search/safe-chunks.ts';
 
 export const BODY_MODES = ['auto', 'full', 'none', 'outline', 'window'] as const;
 export type BodyMode = typeof BODY_MODES[number];
@@ -235,7 +237,7 @@ async function aroundChunk(ctx: OperationContext, page: Page, doc: PageDocument,
   Promise<{ window: WindowSlice | null; chunkText: string; anchor: 'stored_span' | 'located' | 'chunk_only'; span?: { byte_start: number; byte_end: number } }> {
   const rows = await ctx.engine.executeRaw<{ chunk_text: string; chunk_source: string; projected_byte_start: unknown; projected_byte_end: unknown }>(
     `SELECT chunk_text, chunk_source, projected_byte_start, projected_byte_end FROM content_chunks
-      WHERE id = $1 AND page_id = $2 AND COALESCE(modality, 'text') = 'text'`, [chunkId, page.id]);
+      WHERE id = $1 AND page_id = $2 AND COALESCE(modality, 'text') = 'text' AND ${chunkGenerationProbe('content_chunks')}`, [chunkId, page.id]);
   const row = rows[0];
   if (!row) {
     throw opError('revision_changed', `Chunk ${chunkId} is not part of page ${page.slug} at its current revision.`,
@@ -268,6 +270,16 @@ function setNext(out: Record<string, unknown>, page: Page, cursor: string, markd
   out.next = { tool: 'get_page', arguments: { slug: page.slug, source_id: page.source_id, cursor, ...(markdown ? { view: 'markdown' } : {}) } };
 }
 
+/** The `body: 'none'` response: `out` plus chunk and embedding counts, no text. */
+async function noneResult(ctx: OperationContext, page: Page, out: Record<string, unknown>, truncated: boolean): Promise<Record<string, unknown>> {
+  const [counts] = await ctx.engine.executeRaw<{ total: unknown; embedded: unknown }>(
+    `SELECT count(*) AS total, count(*) FILTER (WHERE embedded_at IS NOT NULL) AS embedded FROM content_chunks
+      WHERE page_id = $1 AND ${chunkGenerationProbe('content_chunks')}`, [page.id]);
+  const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
+  return { ...out, chunks: { total: Number(counts?.total ?? 0), embedded: Number(counts?.embedded ?? 0) },
+    ...(fm.embed_skip ? { embed_skip: true } : {}), truncated };
+}
+
 /**
  * The partial (none / outline / window / auto-above-threshold) response. Never
  * carries compiled_truth, timeline or content.
@@ -282,6 +294,10 @@ export async function readPartialBody(ctx: OperationContext, input: PartialReadI
   const omitted = quarantined?.body_omitted === true;
   const mode = req.mode === 'auto' ? 'outline' : req.mode;
   if (omitted) return { ...base, body: mode, truncated: true, body_omitted: true };
+  // Wave B PR 1: a segmented body is never loaded; `none` reports its stored size (windows arrive with the segment reader).
+  if (mode === 'none' && isSegmentedPage(page)) {
+    return noneResult(ctx, page, { ...base, body: mode, view: req.view, body_storage: 'segmented', size: { body_bytes: Number(page.body_bytes ?? 0) } }, true);
+  }
 
   const markdown = req.view === 'markdown';
   const doc: PageDocument = markdown
@@ -294,13 +310,7 @@ export async function readPartialBody(ctx: OperationContext, input: PartialReadI
   };
   const out: Record<string, unknown> = { ...base, body: mode, view: req.view, size };
 
-  if (mode === 'none') {
-    const [counts] = await ctx.engine.executeRaw<{ total: unknown; embedded: unknown }>(
-      `SELECT count(*) AS total, count(*) FILTER (WHERE embedded_at IS NOT NULL) AS embedded FROM content_chunks WHERE page_id = $1`, [page.id]);
-    const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
-    return { ...out, chunks: { total: Number(counts?.total ?? 0), embedded: Number(counts?.embedded ?? 0) },
-      ...(fm.embed_skip ? { embed_skip: true } : {}), truncated: doc.bytes.length > 0 };
-  }
+  if (mode === 'none') return noneResult(ctx, page, out, doc.bytes.length > 0);
 
   if (mode === 'outline') {
     const limit = Math.min(MAX_OUTLINE_LIMIT, DEFAULT_OUTLINE_LIMIT);

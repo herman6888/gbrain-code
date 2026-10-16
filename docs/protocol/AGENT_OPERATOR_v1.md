@@ -994,6 +994,7 @@ that work in this conversation.
 | 3 | `confirmation_required`, nothing ran | stop, relay `user_message`, run `fix.command` only after the user agrees |
 | 10 | write accepted, still pending | poll the receipt (`gbrain write-request -- <id>`) |
 | 11 | partial, resumable budget stop | run `resume_command` |
+| 13 | `pending_verify`: a harness wired, verification waits for the serve | start the serve, then run `fix.command` |
 | 75 | another runner holds the migration lock | wait, then retry |
 | 124 | the command's deadline elapsed | inspect what is still running |
 | 130 | interrupted | ask the user whether to re-run |

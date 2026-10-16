@@ -15,6 +15,9 @@
  *   replaced a higher-tier page): accept = the owner endorses the edited page
  *   (confirm it); reject = dismiss, the page stays lowered; revert
  *   (`revertLoweredPage`) = restore the prior owner version's content and tier.
+ * - #6550 marker repair (`repairPageMarker`, local CLI only): rewrite a page's
+ *   `trust_tier: unknown` marker to its stored tier (removed at owner tiers);
+ *   the row keeps its tier. trust/marker-repair.ts decides which pages.
  *
  * Every function here runs after the caller established the owner's
  * confirmation (trust/confirm.ts); each re-checks the page revision it was
@@ -42,7 +45,10 @@ import {
   decisionResult, registerTrustProposalHandler, transitionTrustProposal, type TrustProposalAction,
   type TrustDecisionContext, type TrustDecisionResult, type TrustProposalRow,
 } from './proposals.ts';
-import { effectiveWriteTrust, storedTrustTier, type TrustTier, type WriteTrust } from './tier.ts';
+import { OWNER_TIER_FLOOR, compareTrust, effectiveWriteTrust, storedTrustTier, type TrustTier, type WriteTrust } from './tier.ts';
+import { propagateTierLowering } from './propagation.ts';
+import { beliefStreamSlugs, lockedBeliefBatch } from '../belief/writers.ts';
+import { markBeliefCommits } from '../belief/append.ts';
 
 /** The journaled operation that publishes an owner page action on a managed brain. */
 export const TRUST_OWNER_PAGE_OPERATION = 'trust_owner_page';
@@ -75,9 +81,10 @@ function changedSincePreview(ref: string, what: string): Error {
     'Run the command again: it shows the page as it is now and asks for a new confirmation.');
 }
 
-/** The page with the CEO-21 marker removed, as canonical markdown. */
-function markdownWithoutMarker(snapshot: PageSnapshot): string {
-  const { trust_tier: _marker, ...frontmatter } = (snapshot.page.frontmatter ?? {}) as Record<string, unknown>;
+/** The page with the CEO-21 marker removed (or set to `marker`), as canonical markdown. */
+function markdownWithoutMarker(snapshot: PageSnapshot, marker: TrustTier | null = null): string {
+  const { trust_tier: _marker, ...rest } = (snapshot.page.frontmatter ?? {}) as Record<string, unknown>;
+  const frontmatter = marker ? { ...rest, trust_tier: marker } : rest;
   return serializeMarkdown(frontmatter, snapshot.page.compiled_truth ?? '', snapshot.page.timeline ?? '', {
     type: (snapshot.page.type as PageType) ?? 'note', title: snapshot.page.title ?? '', tags: snapshot.tags,
   });
@@ -123,25 +130,36 @@ async function attributionFor(engine: BrainEngine, by: Principal | null | undefi
 export async function setRowTier(engine: BrainEngine, input: {
   table: 'facts' | 'takes' | 'pages'; id: number; sourceId: string; tier: TrustTier; ceiling?: TrustTier;
   expect?: (tx: BrainEngine) => Promise<boolean>; by?: Principal | null; note?: Record<string, unknown>;
-  also?: (tx: BrainEngine) => Promise<void>;
+  also?: (tx: BrainEngine, publicationId: string) => Promise<void>;
 }): Promise<boolean> {
   const attribution = await attributionFor(engine, input.by);
   const enabled = await managed(engine);
-  return engine.transaction(async tx => {
+  const publicationId = randomUUID();
+  const report = { appended: 0 };
+  const changed = await engine.transaction(async tx => {
     const run = async () => {
       if (input.expect && !(await input.expect(tx))) return false;
+      const [prior] = await tx.executeRaw<{ trust_tier: string }>(`SELECT trust_tier FROM ${input.table} WHERE id = $1`, [input.id]);
       const update = () => tx.executeRaw<{ id: number }>(
         `UPDATE ${input.table} SET trust_tier = $2,
             write_origin = COALESCE(write_origin, '{}'::jsonb) || jsonb_build_object('owner_decision', $3::text::jsonb)
-          WHERE id = $1 RETURNING id`, [input.id, input.tier, JSON.stringify({ tier: input.tier, at: new Date().toISOString(), ...input.note })]);
+          WHERE id = $1 RETURNING id`, [input.id, input.tier, JSON.stringify({ tier: input.tier, at: new Date().toISOString(), publication_id: publicationId, ...input.note })]);
       const rows = input.ceiling ? await withTrustPromotion(tx, input.ceiling, update) : await update();
       if (rows.length !== 1) return false;
       await queueTierProjection(tx, input.table, input.id);
-      await input.also?.(tx);
+      // W1 #6783 §12 (b): a lowering reaches what was derived from the row; a raise never does.
+      if (prior && compareTrust(input.tier, storedTrustTier(prior.trust_tier)) < 0) await propagateTierLowering(tx, [{ table: input.table, id: input.id }]);
+      await input.also?.(tx, publicationId);
       return true;
     };
-    return enabled ? withCoordinatedWrite(tx, [input.sourceId], run, attribution) : withWriteAttribution(tx, attribution, run);
+    // W1 #6783 §6.4: the tier change is recorded as trust.retiered in the row's stream, under its page key.
+    const slugs = await beliefStreamSlugs(tx, input.table, [input.id]);
+    const recorded = () => lockedBeliefBatch(tx, { sourceId: input.sourceId, slugs, publicationId, op: 'trust_set_tier', report,
+      cause: { owner_decision: { tier: input.tier, ...input.note } } }, run);
+    return enabled ? withCoordinatedWrite(tx, [input.sourceId], recorded, attribution) : withWriteAttribution(tx, attribution, recorded);
   });
+  if (report.appended) await markBeliefCommits(engine, [publicationId]).catch(() => undefined);
+  return changed;
 }
 
 export interface PageActionInput {
@@ -159,7 +177,7 @@ export interface PageActionInput {
 }
 
 export interface PageActionResult {
-  status: 'confirmed' | 'reverted' | 'unchanged';
+  status: 'confirmed' | 'reverted' | 'repaired' | 'unchanged';
   ref: string;
   tier: TrustTier;
   prior_tier: TrustTier;
@@ -168,7 +186,7 @@ export interface PageActionResult {
 }
 
 type OwnerPageIntent = {
-  mode: 'confirm' | 'revert';
+  mode: 'confirm' | 'revert' | 'repair_marker';
   expected_revision: string;
   version_id?: number;
   via: OwnerConfirmation['via'];
@@ -209,6 +227,23 @@ export async function confirmPage(engine: BrainEngine, input: PageActionInput): 
   return { status: 'confirmed', ref, tier: 'user_confirmed', prior_tier: state.tier, marker_removed: true };
 }
 
+/** #6550: the marker a repaired page carries: its stored tier, none at owner tiers (CEO-21 stamps none there). */
+export const repairedMarker = (tier: TrustTier): TrustTier | null => compareTrust(tier, OWNER_TIER_FLOOR) >= 0 ? null : tier;
+
+const ACTION_NAMES: Record<OwnerPageIntent['mode'], string> = { confirm: 'its confirmation', revert: 'the revert', repair_marker: 'the marker repair' };
+
+/** #6550: rewrites the page's marker to `repairedMarker(stored tier)`, bound to the previewed revision; the row keeps its tier. */
+export async function repairPageMarker(engine: BrainEngine, input: PageActionInput): Promise<PageActionResult & { marker: TrustTier | null }> {
+  const ref = pageRef(input.sourceId, input.slug);
+  const state = await readPageTrustState(engine, input.sourceId, input.slug);
+  if (!state) throw opError('page_not_found', `No live page ${ref}.`, 'Run gbrain trust backfill --repair-unknown-markers again to see the current candidates.');
+  if (state.revision !== input.expectedRevision) throw changedSincePreview(ref, ACTION_NAMES.repair_marker);
+  const marker = repairedMarker(state.tier);
+  await publishOwnerPage(engine, input, { mode: 'repair_marker', expected_revision: input.expectedRevision, via: input.confirmation.via },
+    markdownWithoutMarker(state.snapshot, marker), state.tier);
+  return { status: 'repaired', ref, tier: state.tier, prior_tier: state.tier, marker };
+}
+
 /** The tier a version restores: its snapshot tier, `unknown` for legacy versions. */
 export const versionTier = (version: { trust_tier?: string | null }): TrustTier => storedTrustTier(version.trust_tier);
 
@@ -242,10 +277,10 @@ async function publishOwnerPage(engine: BrainEngine, input: PageActionInput, int
   await engine.transaction(tx => withWriteAttribution(tx, { ...attribution, trust }, () => withTrustPromotion(tx, tier, () =>
     withTrustKeep(tx, FENCE_TABLES, async () => {
       if ((await tx.readPageSnapshot(input.slug, { sourceId: input.sourceId }))?.revision !== input.expectedRevision) {
-        throw changedSincePreview(pageRef(input.sourceId, input.slug), intent.mode === 'confirm' ? 'its confirmation' : 'the revert');
+        throw changedSincePreview(pageRef(input.sourceId, input.slug), ACTION_NAMES[intent.mode]);
       }
       // forceRechunk: the trust_tier marker is hash-ephemeral, so removing it alone would read as unchanged content.
-      await importFromContent(tx, input.slug, markdown, { sourceId: input.sourceId, noEmbed: true, preserveGateMarkers: intent.mode === 'confirm', forceRechunk: true, allowEmptyOverwrite: intent.mode === 'revert' });
+      await importFromContent(tx, input.slug, markdown, { sourceId: input.sourceId, noEmbed: true, preserveGateMarkers: intent.mode !== 'revert', forceRechunk: true, allowEmptyOverwrite: intent.mode === 'revert' });
       await closeProposal(tx, intent.proposal, input.by);
     }))));
 }
@@ -284,14 +319,14 @@ async function submitOwnerPage(engine: BrainEngine, input: PageActionInput, inte
  */
 export async function prepareTrustOwnerPageMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const intent = row.intent as unknown as OwnerPageIntent | null;
-  if (row.operation !== TRUST_OWNER_PAGE_OPERATION || !intent || (intent.mode !== 'confirm' && intent.mode !== 'revert') || typeof intent.expected_revision !== 'string'
-    || (row.authority.remote && !(row.authority.scopes ?? []).includes(MEMORY_CONFIRM_SCOPE))) {
+  if (row.operation !== TRUST_OWNER_PAGE_OPERATION || !intent || !Object.hasOwn(ACTION_NAMES, intent.mode) || typeof intent.expected_revision !== 'string'
+    || (row.authority.remote && (intent.mode === 'repair_marker' || !(row.authority.scopes ?? []).includes(MEMORY_CONFIRM_SCOPE)))) {
     throw opError('confirmation_required', 'This owner page action is not confirmed by the owner; nothing was changed.',
       'Run the gbrain trust command on the brain host in an interactive terminal.');
   }
   const ref = pageRef(row.source_id, row.slug);
   const state = await readPageTrustState(engine, row.source_id, row.slug);
-  if (!state || state.revision !== intent.expected_revision) throw changedSincePreview(ref, intent.mode === 'confirm' ? 'its confirmation' : 'the revert');
+  if (!state || state.revision !== intent.expected_revision) throw changedSincePreview(ref, ACTION_NAMES[intent.mode]);
   let content: string;
   let tags: string[] | undefined;
   let tier: TrustTier = 'user_confirmed';
@@ -301,6 +336,9 @@ export async function prepareTrustOwnerPageMutation(engine: BrainEngine, row: Wr
     content = versionMarkdown(state.snapshot, version);
     tags = version.tags ?? undefined;
     tier = versionTier(version);
+  } else if (intent.mode === 'repair_marker') {
+    tier = state.tier;
+    content = markdownWithoutMarker(state.snapshot, repairedMarker(tier));
   } else content = markdownWithoutMarker(state.snapshot);
   // The request keeps its own operation, so page-prepare stamps no CEO-21 marker and files no lower_page item for it.
   const { preparePageMutation } = await import('../persistence/page-prepare.ts');

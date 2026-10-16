@@ -94,6 +94,7 @@ export const ERROR_CATALOGUE = {
   sync_drain_connection_lost: { code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' },
   sync_drain_capacity_paused: { code: 'capacity_paused', docs: 'docs/guides/write-refusals.md#drain-capacity-paused' },
   sync_drain_head_blocked: { code: 'drain_stalled', docs: 'docs/guides/write-refusals.md#head-blocked' },
+  sync_drain_lease_held: { code: 'sync_drain_lease_held', docs: 'docs/guides/write-refusals.md#sync_drain_lease_held' },
   // D8 `gbrain setup <harness>` (src/commands/setup.ts).
   setup_harness_unsupported: { code: 'setup_harness_unsupported', docs: 'docs/guides/repair.md#setup-harness-unsupported' },
   setup_owner_conflict: { code: 'setup_owner_conflict', docs: 'docs/guides/repair.md#setup-owner-conflict' },

@@ -125,6 +125,78 @@ async function startServer(opts: {
 
 // ── Dispatch + kill switch ──────────────────────────────────────────────────
 
+describe('user-prompt source routing (#5941)', () => {
+  // Adapted from PR #6409 (@benswinney). Codex hooks.json is machine-global, so its context hooks bake no
+  // GBRAIN_SOURCE; the hook resolves the source the way capture does (the session's frozen record, then the cwd walk).
+  function repoWithDotfile(source: string): string {
+    const repo = join(tmp, 'repo');
+    mkdirSync(join(repo, 'sub'), { recursive: true });
+    writeFileSync(join(repo, '.gbrain-source'), `${source}\n`);
+    return join(repo, 'sub');
+  }
+
+  test('no GBRAIN_SOURCE: the .gbrain-source walk from the payload cwd sets sourceId', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    const out = collectStdout();
+    await runHook(['user-prompt', '--harness', 'codex'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'hello Acme', cwd: repoWithDotfile('wiki') }),
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].sourceId).toBe('wiki');
+  });
+
+  test('GBRAIN_SOURCE still wins over the dotfile', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    process.env.GBRAIN_SOURCE = 'pinned';
+    const out = collectStdout();
+    await runHook(['user-prompt'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'hello Acme', session_id: 'sess-env', cwd: repoWithDotfile('wiki') }),
+    });
+    expect(seen[0].sourceId).toBe('pinned');
+  });
+
+  test('with a session id, the source capture froze for the session wins over a later dotfile change', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    const cwd = repoWithDotfile('wiki');
+    await runHook(['user-prompt', '--harness', 'codex'], { ...collectStdout().io, stdin: JSON.stringify({ prompt: 'hi', session_id: 'sess-frz', cwd }) });
+    writeFileSync(join(tmp, 'repo', '.gbrain-source'), 'notes\n');
+    await runHook(['user-prompt', '--harness', 'codex'], { ...collectStdout().io, stdin: JSON.stringify({ prompt: 'hi again', session_id: 'sess-frz', cwd }) });
+    expect(seen.map(r => r.sourceId)).toEqual(['wiki', 'wiki']);
+  });
+
+  test('no GBRAIN_SOURCE and no dotfile: no sourceId (the serve binding), as before', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    const bare = join(tmp, 'bare');
+    mkdirSync(bare, { recursive: true });
+    await runHook(['user-prompt', '--harness', 'codex'], { ...collectStdout().io, stdin: JSON.stringify({ prompt: 'hi', session_id: 'sess-bare', cwd: bare }) });
+    expect(seen[0].sourceId).toBeUndefined();
+  });
+
+  test('a dotfile naming a source the bound serve does not serve degrades with source_mismatch, no other-source context', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'OTHER-SOURCE-CONTEXT', boundSourceId: 'other-source' });
+    const out = collectStdout();
+    await runHook(['user-prompt', '--harness', 'codex'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi', cwd: repoWithDotfile('wiki') }) });
+    expect(out.get()).not.toContain('OTHER-SOURCE-CONTEXT');
+    expect((await lastHeartbeat())?.reason).toBe('source_mismatch');
+  });
+});
+
 describe('dispatch', () => {
   test('GBRAIN_HOOKS=0 short-circuits every event: exit 0, no output, no heartbeat', async () => {
     process.env.GBRAIN_HOOKS = '0';

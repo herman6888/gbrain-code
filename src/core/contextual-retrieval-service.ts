@@ -65,6 +65,7 @@ import { installPageEmbeddings, readProjectionSnapshot, type ProjectionSnapshot 
 import { reconcileContextualEmbeddingInputs } from './page-state/contextual-proof.ts';
 import { digest } from './persistence/digest.ts';
 import { isLargePageBytes } from './page-size-policy.ts';
+import { pageBodyBytes } from './page-body/page-shape.ts';
 
 /**
  * v3 = chunks embed with optional contextual retrieval wrapper. The
@@ -394,7 +395,7 @@ export async function reembedPageWithContextualRetrieval(
     args.synopsisMaxTokens ?? (await resolveSynopsisMaxTokens(args.engine));
   // Large pages: the title tier until per-chunk synopses are metered per page
   // (plan B8), and no re-embed while the per-page cap holds or capped the page.
-  const large = isLargePageBytes(Buffer.byteLength(page.compiled_truth ?? '', 'utf-8') + Buffer.byteLength(page.timeline ?? '', 'utf-8'));
+  const large = isLargePageBytes(pageBodyBytes(page));
   if (large && (await args.engine.executeRaw(`SELECT 1 FROM page_embedding_budget WHERE page_id = $1 AND state <> 'open'`, [page.id])).length) {
     return { kind: 'skipped', reason: 'budget_limited' };
   }

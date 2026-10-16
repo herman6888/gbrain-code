@@ -438,9 +438,10 @@ ${subtypes}`);
     fs.writeFileSync(file, content);
     await putPage.handler(makeCtx({ remote: true }), { slug, content: content.replace('Existing body', 'Edited body'), force: true });
     const after = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
-    // The edit is a remote agent write over an unknown-tier page, so it also carries the lower-only trust marker (#5575 CEO-21).
+    // The edit is a remote agent write over an unclassified legacy row (stored tier unknown, no marker in the file):
+    // the marker names the writer's tier, never a permanent `unknown` cap (#6550; #5575 CEO-21 keeps the marker).
     expect(after.page.frontmatter).toEqual({ source_kind: 'mcp:put_page', ingested_via: 'mcp:put_page',
-      ingested_at: before.page.ingested_at!.toISOString(), trust_tier: 'unknown' });
+      ingested_at: before.page.ingested_at!.toISOString(), trust_tier: 'agent_written' });
     expect(after.page.source_kind).toBe('mcp:put_page');
     expect(after.page.ingested_at).toEqual(before.page.ingested_at);
     expect(parseMarkdown(fs.readFileSync(file, 'utf8'), slug).frontmatter).toEqual(after.page.frontmatter);

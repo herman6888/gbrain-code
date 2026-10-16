@@ -13,7 +13,7 @@
  *
  * The same entry emits `tracked_ownership_marker` (#5186) for the same roots.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../../../core/spawn.ts';
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../../core/engine.ts';

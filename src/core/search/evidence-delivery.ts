@@ -27,7 +27,7 @@ import { estimateTokens as heuristicTokens } from './token-budget.ts';
 import { redactRetrievalOutput } from './output-redaction.ts';
 import { buildSnippetMarker } from './snippet-cap.ts';
 import { pageReadFilter } from './read-policy-sql.ts';
-import { currentTextProjectionFilter, safeChunksFilter, requiresSafeChunks } from './safe-chunks.ts';
+import { chunkGenerationFilter, currentTextProjectionFilter, safeChunksFilter, requiresSafeChunks } from './safe-chunks.ts';
 import { resolveExcludePrivatePages } from './private-visibility.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { loadFenceChunkOverlay, type FenceChunkOverlay } from '../eligibility/fence-overlay.ts';
@@ -1571,7 +1571,7 @@ export async function resolveFrozenHits(
             cc.id AS chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source
        FROM unnest($1::text[], $2::text[], $3::int[], $4::int[]) AS h(source_id, slug, chunk_id, ord)
        JOIN pages p ON p.source_id = h.source_id AND p.slug = h.slug
-       LEFT JOIN content_chunks cc ON cc.page_id = p.id
+       LEFT JOIN content_chunks cc ON cc.page_id = p.id AND ${chunkGenerationFilter('p', 'cc')}
             AND CASE WHEN h.chunk_id > 0 THEN cc.id = h.chunk_id ELSE cc.chunk_index = 0 END
       WHERE ${filter} AND ${currentTextProjectionFilter('p')} ${safe}`,
     params,

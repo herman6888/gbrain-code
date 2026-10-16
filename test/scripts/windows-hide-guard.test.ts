@@ -90,12 +90,13 @@ describe('check-windows-hide.ts', () => {
   });
 
   test('the ratchet: a listed file may still launch directly, and fails as stale once it stops', () => {
-    const listed = run({ 'src/core/tailscale.ts': "export const p = Bun.spawn(['tailscale', 'status']);\n" });
+    // Any file still on the real NOT_YET_MIGRATED list serves as the fixture.
+    const listed = run({ 'src/core/persistence/topology-filesystem.ts': "export const p = Bun.spawn(['tailscale', 'status']);\n" });
     expect(listed.out).toContain('check-windows-hide: ok');
     expect(listed.code).toBe(0);
-    const migrated = run({ 'src/core/tailscale.ts': "import { bunSpawn } from './spawn.ts';\nexport const p = bunSpawn(['tailscale', 'status']);\n" });
+    const migrated = run({ 'src/core/persistence/topology-filesystem.ts': "import { bunSpawn } from '../spawn.ts';\nexport const p = bunSpawn(['tailscale', 'status']);\n" });
     expect(migrated.code).toBe(1);
-    expect(migrated.out).toContain('FAIL [windows_hide_stale_migration_entry]: src/core/tailscale.ts no longer launches subprocesses directly');
+    expect(migrated.out).toContain('FAIL [windows_hide_stale_migration_entry]: src/core/persistence/topology-filesystem.ts no longer launches subprocesses directly');
     expect(migrated.out).toContain('Fix: delete its NOT_YET_MIGRATED entry');
   });
 

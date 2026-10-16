@@ -7,6 +7,7 @@ import { pageIdentityError } from './page-identity.ts';
 import { assertPageRevision } from '../page-state/types.ts';
 import { factsFenceSection, parseFactsFence, strikeFactRowInPage, upsertFactRow, formatFenceDate } from '../facts-fence.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { assertFactNotWithdrawn, decideReplacement, decideSingleFact, prepareFactEmbedding, type SingleFactIntent } from '../facts/single-prepare.ts';
 import { factEmbeddingDisabled } from '../embedding-disabled.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
@@ -27,6 +28,7 @@ import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { fenceAppendPendingTier, withPendingFenceRows } from '../eligibility/fence-overlay.ts';
 import { withPageTierKept } from '../trust/fence-append.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { noteBelief } from '../belief/ledger.ts';
 
 function receiptFix(row: WriteRequest): Action {
   return row.principal_kind === 'local_cli'
@@ -144,6 +146,7 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   let rowNum: number | undefined;
   let fencesNormalized: Record<string, unknown> = {};
   if (p.fence === true && snapshot) {
+    assertInlineBody(snapshot.page, 'remember facts fence write');
     // #6188 (D20): the stored fence is normalized in this same write; a residual refuses typed `target_fence_malformed`.
     const target = await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page });
     if (target.fixes.length) fencesNormalized = { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: target.fixes,
@@ -170,7 +173,10 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
       () => preparePageMutation(engine, { ...row, intent: { ...p, content, expected_revision: observedRevision, force: false } }, config, undefined, signal));
     if (page.observedRevision !== observedRevision) conflict(row);
   }
-  return { observedRevision, file: page?.file, ...(page?.exclusiveSources ? { exclusiveSources: page.exclusiveSources } : {}), validate: async tx => { await validate(tx); await page?.validate?.(tx); }, apply: async tx => {
+  // The belief ledger records the superseded fact in its own stream, so that stream's page key is held too.
+  const supersededStream = status === 'superseded' ? decision.candidate!.source_markdown_slug ?? decision.candidate!.entity_slug ?? null : null;
+  const additionalPageKeys = supersededStream && supersededStream !== row.slug ? [{ sourceId: row.source_id, slug: supersededStream }] : undefined;
+  return { observedRevision, file: page?.file, ...(page?.exclusiveSources ? { exclusiveSources: page.exclusiveSources } : {}), ...(additionalPageKeys ? { additionalPageKeys } : {}), validate: async tx => { await validate(tx); await page?.validate?.(tx); }, apply: async tx => {
     const pageReceipt = page ? await withPageTierKept(tx, { sourceId: row.source_id, slug: row.slug }, () => page!.apply(tx)) as { size_state?: unknown } | undefined : undefined;
     let id: number;
     if (rowNum !== undefined) {
@@ -188,8 +194,11 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
       const inserted = await tx.insertFact(fact, { source_id: row.source_id }); // gbrain-allow-direct-insert: journaled source-scoped semantic publication for subjectless or unresolved entity memory
       id = inserted.id;
     }
-    if (status === 'superseded') await tx.executeRaw(`UPDATE facts SET expired_at=now(),superseded_by=$3
+    if (status === 'superseded') {
+      await tx.executeRaw(`UPDATE facts SET expired_at=now(),superseded_by=$3
       WHERE id=$1 AND source_id=$2 AND expired_at IS NULL`, [decision.candidate!.id, row.source_id, id]);
+      noteBelief({ kind: 'superseded', oldId: Number(decision.candidate!.id), newId: id });
+    }
     const contestedBy = contestedOld ? await recordContestedFact(tx, { sourceId: row.source_id, oldId: contestedOld.id,
       oldTier: storedTrustTier(contestedOld.trust_tier), newId: id, newTier: writerTier,
       guard: replaces !== null ? 'remember.replaces' : contested ? 'conflict_slot' : 'conflict_slot_lexical' }) : null;

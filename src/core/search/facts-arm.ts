@@ -20,7 +20,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { PageReadScope, SearchResult } from '../types.ts';
 import { resolveExcludePrivatePages } from './private-visibility.ts';
-import { admitted, collectFactCandidates, queryTerms, scoreFactCandidates, type FactCandidate as PoolCandidate, type FactPoolScope } from './fact-relevance.ts';
+import { admitted, collectFactCandidates, FACTS_ARM_COSINE_MIN, queryTerms, scoreFactCandidates, type FactCandidate as PoolCandidate, type FactPoolScope } from './fact-relevance.ts';
 import { pageReadFilter } from './read-policy-sql.ts';
 import { enforceTokenBudget, resultTokens } from './token-budget.ts';
 import { factDateHeader } from './evidence-date.ts';
@@ -32,7 +32,7 @@ export const QUERY_FACTS_ARM_KEY = 'search.query_facts_arm';
 /** Fact rows added per query at most. */
 export const MAX_FACT_ROWS = 3;
 /** Cosine similarity a fact needs against the query embedding to count as a match on its own. */
-export const FACT_COSINE_MIN = 0.6;
+export const FACT_COSINE_MIN = FACTS_ARM_COSINE_MIN;
 /** Share of the query's content terms a fact's text and entity must hold to match by keyword. */
 const TERM_SHARE_MIN = 0.5;
 

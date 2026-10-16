@@ -7,6 +7,7 @@ import type { Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { factsFenceSection, parseFactsFence, strikeFactRowInPage, upsertFactRow, formatFenceDate } from '../facts-fence.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { assertFactNotWithdrawn, decideSingleFact, factWithdrawnRefusal, type FactCandidate } from '../facts/single-prepare.ts';
 import { assertFactNotPurged, isFactWithdrawn } from '../facts/withdrawal.ts';
 import { samePageRewording, warnSamePageShadow } from '../facts/same-page-shadow.ts';
@@ -16,6 +17,7 @@ import { authorizePageVisibility } from './page-visibility.ts';
 import { authorizeFactsBackstop } from './effect-facts.ts';
 import { getWriteRequestById } from './journal.ts';
 import { preparePageMutation } from './page-prepare.ts';
+import { FACTS_BATCH_INCOMPLETE_MESSAGE } from './verb-errors.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
 import type { ManagedFactIntent, FrozenExtractedFact } from './facts-maintenance.ts';
@@ -120,7 +122,7 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
     const children = p.children ?? [];
     const done = await tx.executeRaw<{ outcome: { inserted?: number; duplicate?: number; fact_ids?: number[]; withdrawn_skipped?: number; would_dedup_same_page?: number } }>(`SELECT outcome FROM persistence_requests WHERE id=ANY($1::uuid[]) AND source_incarnation=$2::uuid
       AND state='committed' AND COALESCE(intent->>'batchKey',outcome->>'batch_key')=$3 AND operation='extract_facts'`, [children, row.source_incarnation, p.batchKey]);
-    if (done.length !== children.length) throw factsRefusal('revision_conflict', 'Some extracted facts have not committed.', row,
+    if (done.length !== children.length) throw factsRefusal('revision_conflict', FACTS_BATCH_INCOMPLETE_MESSAGE, row,
       `${children.length - done.length} of the batch's ${children.length} per-entity fact requests have not committed, so the extraction cannot be recorded as complete.`,
       'once the entity requests are final, run extract_facts again for the same turn with a new request_id only if facts are still missing.');
     const withdrawnSkipped = done.reduce((sum, item) => sum + Number(item.outcome.withdrawn_skipped ?? 0), 0);
@@ -146,6 +148,7 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
       `The request holds no facts, or facts attributed to a page other than ${row.slug}, so none were published.`);
   }
   // #6188 (D20): the entity's stored fence is normalized in this same write; a residual refuses typed `target_fence_malformed`.
+  if (snapshot) assertInlineBody(snapshot.page, 'facts fence write');
   const target = snapshot ? await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page }) : null;
   // #6686: the fence is edited in the section it lives in (a lone timeline fence stays below the sentinel); the other section is kept byte for byte.
   const fenced = { compiled_truth: target?.page.compiled_truth ?? '', timeline: target?.page.timeline ?? '' };

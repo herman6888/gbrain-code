@@ -40,11 +40,12 @@ describe('validateDelegatedSyncOptions', () => {
     expect(v.options).not.toBe(raw as never);
   });
 
-  test('#6317: the managed catch-up fields validate by shape (lanes 1..16, explicitProcessing from the three processing keys)', () => {
-    const ok = validateDelegatedSyncOptions({ noBulk: true, lanes: 4, explicitProcessing: ['noEmbed', 'noExtract'], timeoutSeconds: 60 });
+  // #6712 PR 1: explicitProcessing is still validated by shape (an older CLI sends it) but dropped: the cursor's opt-outs are inherited.
+  test('#6317: the managed catch-up fields validate by shape (lanes 1..16, explicitProcessing from the three processing keys, accepted and ignored)', () => {
+    const ok = validateDelegatedSyncOptions({ noBulk: true, lanes: 4, explicitProcessing: ['noEmbed', 'noExtract'], timeoutSeconds: 60 } as never);
     expect(ok.ok).toBe(true);
     if (!ok.ok) throw new Error('unreachable');
-    expect(ok.options).toEqual({ noBulk: true, lanes: 4, explicitProcessing: ['noEmbed', 'noExtract'], timeoutSeconds: 60 });
+    expect(ok.options).toEqual({ noBulk: true, lanes: 4, timeoutSeconds: 60 });
     for (const lanes of [0, 17, 1.5, '4']) expect(validateDelegatedSyncOptions({ lanes, timeoutSeconds: 60 })).toEqual({ ok: false, error: 'invalid_options:lanes' });
     for (const explicitProcessing of ['noEmbed', ['repoPath'], [1], ['noEmbed', 'noEmbed', 'noExtract', 'noSchemaPack']]) {
       expect(validateDelegatedSyncOptions({ explicitProcessing, timeoutSeconds: 60 })).toEqual({ ok: false, error: 'invalid_options:explicitProcessing' });

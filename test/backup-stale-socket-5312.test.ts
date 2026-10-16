@@ -32,6 +32,7 @@ import { createPgliteBackup } from '../src/core/backup/snapshot.ts';
 import { sweepStaleRuntimeArtefacts } from '../src/core/backup/runtime-artefacts.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resolveSocketPathForConfig } from '../src/core/context/resolve-ipc.ts';
+import { UNIX_SOCKET_PATH_MAX_BYTES } from '../src/core/context/ipc-path.ts';
 
 const posix = process.platform !== 'win32';
 const windows = process.platform === 'win32';
@@ -102,19 +103,21 @@ async function backupFailure(): Promise<{ code: string; message: string }> {
   throw new Error('backup unexpectedly succeeded');
 }
 
-// sockaddr_un.sun_path is 108 bytes on Linux and Windows (afunix.sys) and 104 on Darwin. On Windows the socket is
-// bound at the data-dir path itself (no shortened fallback), and the runner's TEMP (`C:\Users\RUNNER~1\AppData\Local\Temp`)
-// plus the old 19-character prefix put `<dataDir>\.gbrain-persistence.sock` at 114 bytes, so every listen failed
-// before the sweep ran. The prefix is short and the fixture refuses up front when the path would not fit.
-const SUN_PATH_LIMIT = process.platform === 'darwin' ? 104 : 108;
+// On Windows the socket is bound at the data-dir path itself (no shortened fallback) and afunix.sys's sun_path is 108
+// bytes; the runner's TEMP (`C:\Users\RUNNER~1\AppData\Local\Temp`) plus the old 19-character prefix put
+// `<dataDir>\.gbrain-persistence.sock` at 114 bytes, so every listen failed before the sweep ran. On POSIX gbrain keeps
+// the data-dir socket only up to UNIX_SOCKET_PATH_MAX_BYTES and otherwise binds a shortened /tmp path the sweep never
+// sees (#6573: macOS's TMPDIR always crossed it, so the planted sockets sat where nothing looked). So the POSIX fixture
+// root is under /tmp (realpath'd: /private/tmp on macOS), and the fixture refuses up front when the path would not fit.
+const SOCKET_PATH_LIMIT = windows ? 107 : UNIX_SOCKET_PATH_MAX_BYTES;
 
 beforeAll(async () => {
-  temporary = realpathSync(mkdtempSync(join(tmpdir(), 'g5312-')));
+  temporary = realpathSync(mkdtempSync(join(windows ? tmpdir() : '/tmp', 'g5312-')));
   root = join(temporary, 'brain');
   mkdirSync(join(root, '.gbrain'), { recursive: true, mode: 0o700 });
   dataDir = join(root, '.gbrain', 'brain.pglite');
   const longest = join(dataDir, '.gbrain-persistence.sock');
-  if (Buffer.byteLength(longest) >= SUN_PATH_LIMIT) throw new Error(`fixture socket path is ${Buffer.byteLength(longest)} bytes, at or over the ${SUN_PATH_LIMIT}-byte AF_UNIX limit: ${longest}`);
+  if (Buffer.byteLength(longest) > SOCKET_PATH_LIMIT) throw new Error(`fixture socket path is ${Buffer.byteLength(longest)} bytes, over the ${SOCKET_PATH_LIMIT}-byte data-dir socket limit: ${longest}`);
   privateWrite(join(root, '.gbrain', 'config.json'), JSON.stringify({ engine: 'pglite', database_path: dataDir, embedding_disabled: true }));
   const engine = new PGLiteEngine();
   await engine.connect({ engine: 'pglite', database_path: dataDir });

@@ -5,6 +5,9 @@ import type { OperationContext } from '../ops/contract.ts';
 import { requireConsent, type ConsentRequest } from '../consent.ts';
 import { managedPersistenceEnabled } from './ownership.ts';
 import { submitPageMutation } from './page-mutations.ts';
+import { withBeliefBatch } from '../belief/ledger.ts';
+import { markBeliefCommits } from '../belief/append.ts';
+import { linkStreamSlugs } from './page-purge.ts';
 
 /** A tombstone that moved under a concurrent writer; the next run retries it. */
 const DEFERRAL_CODES = new Set(['revision_conflict', 'page_not_found', 'page_identity_changed']);
@@ -52,6 +55,33 @@ export async function consentedPurgeDeletedPages(engine: BrainEngine, olderThanH
 }
 
 /**
+ * W1 (BELIEF_LEDGER.md 6.5): on an unmanaged brain, each expired tombstone of a source the belief ledger records is
+ * removed under its page key inside a belief batch, which appends `page.expired` (retention, never a purge: no
+ * tombstone, nothing redacted) and a `link.retracted` for each link the delete cascades away, in its own stream. The bulk delete then takes the rest.
+ */
+async function expireRecordedTombstones(engine: BrainEngine, olderThanHours: number): Promise<string[]> {
+  const hours = String(Math.max(0, Math.floor(olderThanHours)));
+  const rows = await engine.executeRaw<{ id: number; source_id: string; slug: string }>(`SELECT p.id, p.source_id, p.slug FROM pages p
+    WHERE p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($1 || ' hours')::interval
+      AND EXISTS (SELECT 1 FROM belief_events e WHERE e.source_id = p.source_id AND e.subject_kind = 'coverage')
+    ORDER BY p.deleted_at ASC, p.source_id ASC, p.slug ASC`, [hours]);
+  const slugs: string[] = [];
+  for (const row of rows) {
+    const publicationId = randomUUID(), report = { appended: 0 };
+    const deleted = await engine.transaction(async tx => {
+      const slugs = [...new Set([row.slug, ...await linkStreamSlugs(tx, row.source_id, row.id)])].sort();
+      await tx.lockPageKeys(slugs.map(slug => ({ sourceId: row.source_id, slug })));
+      return withBeliefBatch(tx, { sourceId: row.source_id, slugs, publicationId, op: 'purge_deleted_pages', hardDeleteEvent: 'page.expired', report },
+        async () => (await tx.executeRaw(`DELETE FROM pages WHERE id = $1 AND deleted_at IS NOT NULL AND deleted_at < now() - ($2 || ' hours')::interval RETURNING id`,
+          [row.id, hours])).length > 0);
+    });
+    if (report.appended) await markBeliefCommits(engine, [publicationId]).catch(() => undefined);
+    if (deleted) slugs.push(row.slug);
+  }
+  return slugs;
+}
+
+/**
  * #5405: hard-delete tombstones older than the recovery window. An unmanaged
  * brain keeps the engine's bulk delete. A managed brain refuses that bulk
  * delete, so each expired tombstone is purged through the coordinator with the
@@ -61,8 +91,9 @@ export async function consentedPurgeDeletedPages(engine: BrainEngine, olderThanH
  */
 export async function purgeDeletedPagesCoordinated(engine: BrainEngine, olderThanHours: number): Promise<DeletedPagePurge> {
   if (!await managedPersistenceEnabled(engine)) {
+    const recorded = await expireRecordedTombstones(engine, olderThanHours);
     const result = await engine.purgeDeletedPages(olderThanHours);
-    return { slugs: result.slugs, count: result.count, blocked: [], deferred: 0, failed: 0 };
+    return { slugs: [...recorded, ...result.slugs], count: recorded.length + result.count, blocked: [], deferred: 0, failed: 0 };
   }
   const hours = Math.max(0, Math.floor(olderThanHours));
   const rows = await engine.executeRaw<{ source_id: string; slug: string; cutoff: string }>(
@@ -82,7 +113,7 @@ export async function purgeDeletedPagesCoordinated(engine: BrainEngine, olderTha
       const ctx: OperationContext = { engine, config, remote: false, sourceId: row.source_id, dryRun: false,
         logger: { info() {}, warn() {}, error() {} } };
       await submitPageMutation(ctx, { operation: 'delete_page', params: { slug: row.slug, source_id: row.source_id,
-        purge: true, expected_revision: snapshot.revision, request_id: randomUUID() } });
+        purge: true, retention: true, expected_revision: snapshot.revision, request_id: randomUUID() } });
       slugs.push(row.slug);
     } catch (error) {
       const code = typeof (error as { code?: unknown })?.code === 'string' ? (error as { code: string }).code : null;

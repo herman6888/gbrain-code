@@ -8,6 +8,7 @@ import { publicationHold } from '../persistence/accepted-pending.ts';
 import { authorizeStoredRequest } from '../persistence/authority.ts';
 import { digest } from '../persistence/digest.ts';
 import { getWriteRequest } from '../persistence/journal.ts';
+import { parseWriteRequestId } from '../persistence/preconditions.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 import { publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { writeResponse } from '../persistence/service.ts';
@@ -19,7 +20,7 @@ import { emptyQuoteVerifyStats, groundSource, isDreamOwnedPage, resolveVerifyPri
 import { attributionChecksEnabled } from './attribution-checks.ts';
 
 interface OutputRef { slug: string; source_id: string; raw_source?: string; seat?: string; first_write_at?: Date; }
-interface RetainedOutput { job_id: number | bigint; job_key: string; request: WriteRequest; }
+export interface RetainedOutput { job_id: number | bigint; job_key: string; input_slug: string; request: WriteRequest; }
 /** #6360: a retained output a later non-maintenance write moved; it is left alone and reported once. */
 export interface PostprocessConflict { slug: string; source_id: string; request_id: string; message: string; fix: Action; }
 
@@ -45,6 +46,43 @@ const localMaintenance = (r: WriteRequest) => r.operation === 'submit_job' && r.
 
 const writerStatusFix = (sourceId: string, why: string): Action => readFix(why, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] });
 
+/** The slug submitPageMutation journals for a client slug: it lowercases it (page-mutations.ts). */
+export const journaledPageSlug = (slug: string): string => slug.toLowerCase();
+
+/**
+ * #6616: each child's completed `brain_put_page` call joined to the committed
+ * journal row it produced. The retained tool input holds what the child sent;
+ * the journal holds the canonical forms (`parseWriteRequestId`: a printable
+ * client id becomes its UUIDv5, a UUID is lowercased; the slug is lowercased),
+ * so both are canonicalized here before matching on request id, source,
+ * incarnation, committed put_page, slug and revision. Newest first. Shared by
+ * slug discovery and postprocessing so the two cannot disagree.
+ */
+export async function loadCommittedSynthesisOutputs(engine: BrainEngine, authority: MaintenanceAuthority, childIds: number[]): Promise<RetainedOutput[]> {
+  if (!childIds.length) return [];
+  const tools = await engine.executeRaw<{ job_id: number | bigint; job_key: string; input: Record<string, unknown> | null; output: Record<string, unknown> | null }>(
+    `SELECT t.job_id,j.idempotency_key AS job_key,t.input,t.output
+       FROM subagent_tool_executions t JOIN minion_jobs j ON j.id=t.job_id
+      WHERE t.job_id=ANY($1::int[]) AND t.tool_name='brain_put_page' AND t.status='complete' AND t.output->>'state'='committed'`, [childIds]);
+  const calls = tools.flatMap(t => {
+    const inputSlug = t.input?.slug;
+    const revision = t.output?.revision;
+    let requestId: string | undefined;
+    try { requestId = parseWriteRequestId(t.input?.request_id); } catch { return []; }
+    return requestId && typeof inputSlug === 'string' && typeof revision === 'string'
+      ? [{ job_id: t.job_id, job_key: t.job_key, input_slug: inputSlug, slug: journaledPageSlug(inputSlug), requestId, revision }] : [];
+  });
+  if (!calls.length) return [];
+  const requests = await engine.executeRaw<{ request: WriteRequest }>(
+    `SELECT row_to_json(p) AS request FROM persistence_requests p
+      WHERE p.request_id::text=ANY($1::text[]) AND p.source_id=$2 AND p.source_incarnation=$3
+        AND p.operation='put_page' AND p.state='committed'
+      ORDER BY p.sequence DESC`, [[...new Set(calls.map(c => c.requestId))], authority.writer.sourceId, authority.writer.sourceIncarnation]);
+  return requests.flatMap(({ request }) => calls
+    .filter(c => c.requestId === String(request.request_id) && c.slug === request.slug && c.revision === request.outcome?.revision)
+    .map(c => ({ job_id: c.job_id, job_key: c.job_key, input_slug: c.input_slug, request })));
+}
+
 export async function postprocessManagedSynthesis(
   engine: BrainEngine,
   authority: MaintenanceAuthority,
@@ -53,6 +91,8 @@ export async function postprocessManagedSynthesis(
   jobRawSource: Map<number, string>,
   transcripts: DiscoveredTranscript[],
   opts: { cycleDate: string; quoteVerify: boolean; sinceByTranscript: Map<string, Date>; signal?: AbortSignal; grounding?: GroundingPass;
+    /** The child outputs slug discovery already loaded (loadCommittedSynthesisOutputs). */
+    committedOutputs?: RetainedOutput[];
     /** #5575 I2: files under it are third-party speech; their outputs publish external_untrusted. */
     meetingTranscriptsDir?: string | null },
 ) {
@@ -64,15 +104,7 @@ export async function postprocessManagedSynthesis(
   if (!refs.length) return { writtenRefs, finalizedRefs, stats, pending, conflicts };
   const reported = await readReportedConflicts(engine);
   const supersession = opts.quoteVerify ? await attributionChecksEnabled(engine) : false; // #5425 [UC4], default off
-  const outputs = await engine.executeRaw<RetainedOutput>(
-    `SELECT t.job_id,j.idempotency_key AS job_key,row_to_json(p) AS request
-       FROM subagent_tool_executions t JOIN minion_jobs j ON j.id=t.job_id
-       JOIN persistence_requests p ON p.request_id::text=t.input->>'request_id'
-         AND p.source_id=$2 AND p.source_incarnation=$3 AND p.slug=t.input->>'slug'
-         AND p.operation='put_page' AND p.state='committed'
-         AND p.outcome->>'revision'=t.output->>'revision' AND t.output->>'state'='committed'
-      WHERE t.job_id=ANY($1::int[]) AND t.tool_name='brain_put_page' AND t.status='complete'
-      ORDER BY p.sequence DESC`, [childIds, authority.writer.sourceId, authority.writer.sourceIncarnation]);
+  const outputs = opts.committedOutputs ?? await loadCommittedSynthesisOutputs(engine, authority, childIds);
   const byPath = new Map(transcripts.map(t => [t.filePath, t]));
   let grounded: GroundedSource | undefined;
   for (const ref of [...refs].sort((a, b) => (a.raw_source ?? '').localeCompare(b.raw_source ?? ''))) {

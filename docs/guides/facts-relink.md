@@ -31,6 +31,21 @@ not. Pass `infer_entity: false` to skip inference for one call.
 Page imports work the same way, and a fact extracted from an entity page with
 no other name in it belongs to that page.
 
+### CJK subjects need a literal slug or a delimiter
+
+Chinese, Japanese and Korean text has no spaces between words, so write-time
+inference and relink's free tiers cannot tell where an unspaced name ends.
+They link a CJK subject only from its literal page slug followed by a space or
+punctuation. Unspaced natural-name inference is unsupported: name the page
+with `--entity` (or `entity`) instead. Relink's model tier also needs the name
+set off by a space or punctuation.
+
+| Fact text | Free inference |
+|---|---|
+| `people/王小明 负责项目。` | links `people/王小明` |
+| `people/王小明负责项目。` | no link |
+| `王小明负责项目。` | no link |
+
 Turn write-time inference off with `gbrain config set facts.entity_inference
 off`. That does not undo earlier links, and it does not affect `gbrain facts
 relink`.

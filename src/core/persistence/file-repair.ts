@@ -69,7 +69,7 @@ import { getWorktreeBinding } from './ownership.ts';
 import { checkOwner, ownerUnavailableError } from './owner-refusal.ts';
 import { loadRepairBusySet, repairBusy, repairBusyError } from './repair-busy.ts';
 import { submitPageMutation } from './page-mutations.ts';
-import { clearGitHold, recordSyncImportProvenance } from './sync-holds.ts';
+import { clearGitHold, recordSyncImportProvenance, syncDiskProvenance, syncImportParserFor } from './sync-holds.ts';
 import { screenSyncImport } from './sync-prepare.ts';
 import type { SyncRename } from './sync-discovery.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
@@ -237,9 +237,9 @@ export async function prepareRepairPublication(engine: BrainEngine, input: Repai
 }
 
 /** The schema pack and content-sanity settings a repair preview and its publication both read, so their results agree. */
-export async function repairScreenConfig(engine: BrainEngine, sourceId: string): Promise<Pick<RepairPublicationInput, 'activePack' | 'sanity'>> {
-  const activePack = (await loadActivePackForEngine(engine, { remote: false, sourceId }).catch(() => null))?.manifest;
-  return { ...(activePack ? { activePack } : {}), sanity: await loadImportSanityConfig(engine) };
+export async function repairScreenConfig(engine: BrainEngine, sourceId: string): Promise<Pick<RepairPublicationInput, 'activePack' | 'sanity'> & { packIdentity: string | null }> {
+  const pack = await loadActivePackForEngine(engine, { remote: false, sourceId }).catch(() => null);
+  return { ...(pack?.manifest ? { activePack: pack.manifest } : {}), sanity: await loadImportSanityConfig(engine), packIdentity: pack?.identity ?? null };
 }
 
 function assertTrustedRepairCaller(ctx: Pick<OperationContext, 'remote'>): void {
@@ -381,9 +381,10 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
       await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
       if (!applied.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
       const holdCleared = await clearGitHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: p.path, observedAt: p.holdObservedAt ?? new Date().toISOString() });
-      const [page] = await tx.executeRaw<{ id: number }>('SELECT id FROM pages WHERE source_id=$1 AND slug=$2', [row.source_id, row.slug]);
-      if (page) await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(page.id), origin: p.sourcePath,
-        raw_sha256: sha256(importContent), gbrain_version: VERSION });
+      // #6712 PR 1: the record names what is on disk now (the approved bytes), the page revision they produced and the parser, so the next discovery prescreens the file.
+      const page = await tx.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
+      if (page && page.page.deleted_at == null) await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(page.page.id), origin: p.sourcePath,
+        raw_sha256: sha256(importContent), gbrain_version: VERSION, revision: page.revision, parser: syncImportParserFor(p.sourcePath, screenConfig.packIdentity), ...syncDiskProvenance(bytes, null) });
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: applied.result.chunks, imported_file: true, file_repaired: fileChanges, hold_cleared: holdCleared, ...(moved ? { renamed_from: moved.slug } : {}),
         ...(fenceRepair ? { fence_repair: fenceRepair } : {}), ...(contentRepair ? { content_repair: contentRepair } : {}) };

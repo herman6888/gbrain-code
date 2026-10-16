@@ -69,7 +69,13 @@ export async function auditCanonicalSource(engine: BrainEngine, sourceId: string
   for (const candidate of rows.slice(0, limit)) {
     report.inspected++;
     if (isDatabaseOnlyPage(candidate)) {
-      const origin = slugDerivedOrigin(root, candidate.slug, mode);
+      let origin: ReturnType<typeof slugDerivedOrigin>;
+      try { origin = slugDerivedOrigin(root, candidate.slug, mode); } catch (error) {
+        if (!(error instanceof OperationError)) throw error;
+        report.errors++;
+        report.findings.push({ slug: candidate.slug, reason: error.detail ?? error.code, suggestion: error.suggestion ?? error.message });
+        continue;
+      }
       if (!origin || !existsSync(origin.path)) {
         report.database_only++;
         report.findings.push({ slug: candidate.slug, reason: 'database_only',

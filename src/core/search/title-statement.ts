@@ -9,7 +9,7 @@ import type { SearchOpts } from '../types.ts';
 import { clampSearchLimit } from '../engine.ts';
 import { searchLimitCap } from './eval-pool-depth.ts';
 import { getFtsLanguage } from '../fts-language.ts';
-import { requiresSafeChunks } from './safe-chunks.ts';
+import { chunkGenerationFilter, requiresSafeChunks } from './safe-chunks.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import {
@@ -107,7 +107,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
   const sql = `
     WITH top_pages AS (
       SELECT p.slug, p.id AS page_id, p.title, p.type, p.source_id,
-        p.effective_date, p.effective_date_source, p.updated_at,
+        p.effective_date, p.effective_date_source, p.updated_at, p.body_generation,
         (lower(btrim(p.title, ' "''' || chr(160))) = $2) AS exact_title,
         ${rankSql} * ${sourceFactorCase} AS score
       FROM pages p
@@ -131,7 +131,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     LEFT JOIN LATERAL (
       SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
       FROM content_chunks cc
-      WHERE cc.page_id = tp.page_id
+      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc')}
         AND cc.modality = 'text'
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
       ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC

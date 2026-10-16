@@ -6,6 +6,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { opError, OperationError } from '../ops/contract.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { pageIdentityError } from './page-identity.ts';
 import { renderTimelineEntry, spliceTimelineBlock } from '../timeline-write-through.ts';
 import { extractTimelineFromContent } from '../timeline-extract.ts';
@@ -45,6 +46,7 @@ export function regeneratedByWriter(sourceKind: string | null | undefined, page:
 export async function prepareSemanticPageMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
   if (!snapshot || snapshot.page.id !== row.page_id) throw pageIdentityError(snapshot != null, 'The accepted page was replaced by another page.');
+  assertInlineBody(snapshot.page, row.operation);
   const p = row.intent!;
   if (p.expected_revision !== undefined) assertPageRevision(snapshot,engineMutationPrecondition(parseMutationPrecondition(p)));
   if (row.operation === 'add_tag' || row.operation === 'remove_tag') {

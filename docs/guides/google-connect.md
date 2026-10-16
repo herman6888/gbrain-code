@@ -180,6 +180,40 @@ for. Re-pointing an existing source at a different calendar (its
 re-lists the new calendar from a fresh window instead of replaying the old
 calendar's delta. Pages already imported from the previous calendar stay in
 the brain until you remove them — they are not reconciled automatically.
+`gbrain sources set-calendar <source> <calendar-id>` makes that change in one
+step and prints the sync to run. On a managed brain the source's sync cursor
+is keyed by its configuration, so when the source also syncs Gmail or
+Contacts the change makes their next sync re-read history from the start; the
+command then refuses with `confirmation_required` (exit 3) until you re-run
+it with `--yes`.
+
+### Unreadable calendar
+
+When Google answers the sweep's calendar read with HTTP 403 or 404, the
+account cannot read the calendar the source names (a calendar id from another
+account, a calendar that was unshared or deleted). Before #5012 that sweep
+looked like an empty calendar. Now:
+
+- the sync records `calendar_unreadable` (with the calendar id and HTTP
+  status) in the source's state and logs
+  `[google] calendar_unreadable: <account> cannot read calendar "<id>"`
+  with both fix commands. The run itself does not fail, so Gmail and Contacts
+  keep syncing; a readable list clears the record;
+- `gbrain google status` probes each linked calendar live (one `events.list`
+  read; `--no-probe` reports what the last sync recorded instead), names the
+  unreadable one with the fix, and reports `ok: false` and exits 1;
+- `gbrain doctor` warns `google_calendar_readable` from the recorded state,
+  with no network call.
+
+The fix: list the calendars the account can read, then point the source at
+one.
+
+```bash
+gbrain google calendars --account you@example.com
+gbrain sources set-calendar <source> <calendar-id>   # e.g. primary
+gbrain sync --source <source>
+gbrain doctor --only google_calendar_readable --json # verify
+```
 
 ## Calendar window
 
@@ -409,6 +443,7 @@ attached. The catalog (also emitted as structured JSON with `--json`):
 | `scope_missing` | Connected with narrower `--scopes` than needed | `gbrain google connect --reauth <email>` |
 | `relay_unreachable` / `relay_session_expired` / `claim_already_used` / `relay_disabled` | Hosted fast-path (gbrain.io relay) issues | BYO connect always works: `gbrain google connect` |
 | `not_connected` | No vault entry for the account | `gbrain google connect` |
+| `calendar_unreadable` | Google answered the source's calendar read with HTTP 403 or 404: the account cannot read that calendar | `gbrain google calendars --account <email>`, then `gbrain sources set-calendar <source> <calendar-id>`; see [Unreadable calendar](#unreadable-calendar) |
 | `upstream` | Google returned an unexpected error | Retry; if it persists, run `gbrain google status --json` and file the output |
 | `access_command_failed` | The `--access command` token command exited non-zero, timed out, or printed nothing token-shaped | Run it by hand; it must print a bare token or JSON with `token`/`access_token` |
 | `access_env_missing` | The `--access env` variable is unset/blank in this process | Export a live token into it (refresh externally), or switch back to the vault flow |

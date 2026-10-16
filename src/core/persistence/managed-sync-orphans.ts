@@ -21,6 +21,11 @@
  *   incarnation-joined reader (`readManagedSyncFailures`, the two passes above,
  *   the clear paths) drops it; only the local ledger mirror still shows it.
  *   Archived sources are excluded; a live pending request still retains it.
+ * - `checkpoint_moved` (#6834): an unfinished cursor whose every page committed and whose checkpoint was refused
+ *   because `sources.last_commit` moved to a commit that is neither the cursor's start nor its target (another run,
+ *   or an older binary, checkpointed the source elsewhere). The checkpoint can never publish and no resume clears it;
+ *   retiring the cursor lets the next sync discover from the commit the source now records. A cursor whose source
+ *   already stands at its target is not one: the next sync finishes it (sync-slug-mode.ts `checkpointMovedToTarget`).
  * - `mirror_only` (#6518): a row of the local compatibility ledger
  *   (`~/.gbrain/sync-failures.jsonl`) carrying a `managed_cursor_key` with no
  *   durable `managed-sync-failure` row under that key in any incarnation. The
@@ -37,8 +42,12 @@
 import type { BrainEngine } from '../engine.ts';
 import type { SqlEngine } from './model.ts';
 import { clearManagedSyncFailure, loadSyncFailures } from '../sync-failure-ledger.ts';
+import { CHECKPOINT_MOVED_MESSAGE } from './sync-slug-mode.ts';
+import { clearSyncSlice } from './sync-slices.ts';
+import type { SyncCursorOptions } from './sync-prepare.ts';
 
-export type ManagedSyncOrphanReason = 'no_cursor' | 'principal_unadoptable' | 'superseded' | 'incarnation_retired' | 'mirror_only';
+/** `superseded_by_adoption` (#6712 PR 1): an unfinished cursor of the incarnation that the drain's fan-in did not adopt (sync-cursor-key.ts). */
+export type ManagedSyncOrphanReason = 'no_cursor' | 'principal_unadoptable' | 'superseded' | 'incarnation_retired' | 'mirror_only' | 'superseded_by_adoption' | 'checkpoint_moved';
 export type ManagedSyncOrphanRetained = 'pending_request_live' | 'resumable';
 
 export interface ManagedSyncOrphan {
@@ -68,8 +77,24 @@ interface CursorRow {
   cursor_key: string; source_id: string; source_incarnation: string; run_id: string | null;
   principal_kind: string | null; principal_id: string | null; has_sync_options: boolean;
   pending_request_id: string | null; pending_state: string | null;
-  principal_live: boolean; superseded: boolean; updated_at: string;
+  principal_live: boolean; superseded: boolean; checkpoint_moved: boolean; updated_at: string;
 }
+
+/**
+ * #6834: the cursor `c` (of source `s`) stands at its checkpoint, which ended refused because `last_commit` moved, and the
+ * source now records a commit other than the cursor's start and other than where the checkpoint would put it: the
+ * target, or, for a path slice short of its target's end (#6349), the start again. A company-brain cursor records its
+ * approval and is never one. Shared by the classification and the retirement's re-check, so both read the same rule.
+ * `$msg` is the moved-checkpoint message parameter.
+ */
+const checkpointMovedSql = (msg: string) => `(c.completed_keys->0->'pending'->'intent'->>'kind'='managed_sync_checkpoint' AND c.completed_keys->0->>'companyReceiptId' IS NULL
+  AND (c.completed_keys->0->>'index')::int>=(c.completed_keys->0->>'total')::int
+  AND s.last_commit IS DISTINCT FROM c.completed_keys->0->>'from'
+  AND (c.completed_keys->0->'pending'->'intent'->'slice'->>'done'='false' OR s.last_commit IS DISTINCT FROM c.completed_keys->0->>'target')
+  AND EXISTS(SELECT 1 FROM persistence_requests m WHERE m.source_id=s.id AND m.request_id=(c.completed_keys->0->'pending'->>'requestId')::uuid
+    AND m.state IN ('failed','conflict') AND m.recovery IS NULL AND m.error_code='revision_conflict' AND m.error_message=${msg})
+  AND NOT EXISTS(SELECT 1 FROM persistence_requests o WHERE o.source_id=s.id AND o.intent->>'cursorKey'=c.fingerprint
+    AND (o.state IN ('queued','running','recovering') OR o.recovery IS NOT NULL)))`;
 
 /** Read-only. `sourceIds` narrows to those sources; null reads every active source. */
 export async function classifyManagedSyncOrphans(engine: SqlEngine, sourceIds: string[] | null = null): Promise<ManagedSyncOrphanClassification> {
@@ -85,6 +110,7 @@ export async function classifyManagedSyncOrphans(engine: SqlEngine, sourceIds: s
       EXISTS(SELECT 1 FROM op_checkpoints n WHERE n.op='managed-sync' AND n.fingerprint<>c.fingerprint
         AND n.completed_keys->0->>'sourceId'=s.id AND n.completed_keys->0->>'incarnation'=s.incarnation::text
         AND COALESCE(n.completed_keys->0->>'done','false')='true' AND n.updated_at>c.updated_at) AS superseded,
+      ${checkpointMovedSql('$2')} AS checkpoint_moved,
       to_char(c.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
     FROM op_checkpoints c
     JOIN sources s ON s.id=c.completed_keys->0->>'sourceId' AND s.incarnation::text=c.completed_keys->0->>'incarnation' AND NOT COALESCE(s.archived,false)
@@ -94,13 +120,14 @@ export async function classifyManagedSyncOrphans(engine: SqlEngine, sourceIds: s
       AND r.principal_kind=c.completed_keys->0->'authority'->'writer'->'principal'->>'kind'
     WHERE c.op='managed-sync' AND COALESCE(c.completed_keys->0->>'done','false')<>'true'
       AND ($1::text[] IS NULL OR s.id=ANY($1::text[]))
-    ORDER BY s.id,c.updated_at,c.fingerprint`, [sourceIds]);
+    ORDER BY s.id,c.updated_at,c.fingerprint`, [sourceIds, CHECKPOINT_MOVED_MESSAGE]);
   const orphans: ManagedSyncOrphan[] = [];
   const retained: ManagedSyncOrphanClassification['retained'] = [];
   for (const row of cursors) {
     const principal = row.principal_kind && row.principal_id ? { kind: row.principal_kind, id: row.principal_id } : null;
     if (row.pending_request_id && row.pending_state && !TERMINAL.includes(row.pending_state)) { retained.push({ cursor_key: row.cursor_key, source_id: row.source_id, why: 'pending_request_live' }); continue; }
-    const reason: ManagedSyncOrphanReason | null = !row.principal_live ? 'principal_unadoptable' : !row.has_sync_options && row.superseded ? 'superseded' : null;
+    const reason: ManagedSyncOrphanReason | null = !row.principal_live ? 'principal_unadoptable' : !row.has_sync_options && row.superseded ? 'superseded'
+      : row.checkpoint_moved ? 'checkpoint_moved' : null;
     if (!reason) { retained.push({ cursor_key: row.cursor_key, source_id: row.source_id, why: 'resumable' }); continue; }
     orphans.push({ kind: 'unfinished_cursor', cursor_key: row.cursor_key, source_id: row.source_id, source_incarnation: row.source_incarnation, run_id: row.run_id,
       principal, pending_request_id: row.pending_request_id, pending_state: row.pending_state, reason, updated_at: row.updated_at });
@@ -201,9 +228,21 @@ export async function pruneMirrorOnlyManagedFailures(engine: SqlEngine, sourceId
  * still active under a different incarnation at apply time; the live-writer
  * veto below is for a cursor the live writer could still resume, which no
  * retired key can be, so it does not apply. The live pending-request guard does.
+ *
+ * #6712 PR 1: a `superseded_by_adoption` cursor is one the drain's fan-in passed over for the incarnation's adopted
+ * cursor; it is deleted only while no request admitted under its key is still open or carries recovery, and `inTx`
+ * (the drain lease's fence) runs first in the same transaction.
+ *
+ * #6834: a `checkpoint_moved` cursor is deleted only while the classification's rule still holds (`checkpointMovedSql`):
+ * its checkpoint is still the refused one, the source still records a commit other than its start and target, and no
+ * request under its key is open or carries recovery. It is bound to the previewed run and checkpoint request, so a run
+ * that replaced the cursor under the same key since the preview is kept, and a path slice's record is cleared with it.
  */
-export async function retireManagedSyncOrphan(engine: BrainEngine, orphan: Pick<ManagedSyncOrphan, 'kind' | 'cursor_key' | 'run_id' | 'source_id' | 'source_incarnation' | 'reason'>): Promise<{ cursor: boolean; failure: boolean; manifest: boolean; mirror: boolean }> {
+export async function retireManagedSyncOrphan(engine: BrainEngine, orphan: Pick<ManagedSyncOrphan, 'kind' | 'cursor_key' | 'run_id' | 'source_id' | 'source_incarnation' | 'reason'>
+  & { pending_request_id?: string | null },
+  inTx?: (tx: BrainEngine) => Promise<void>): Promise<{ cursor: boolean; failure: boolean; manifest: boolean; mirror: boolean }> {
   const retired = orphan.reason === 'incarnation_retired';
+  const mode = retired ? 'retired' : orphan.reason === 'superseded_by_adoption' ? 'adoption' : orphan.reason === 'checkpoint_moved' ? 'checkpoint_moved' : 'orphan';
   if (orphan.kind === 'mirror_row') {
     const durable = await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1", [orphan.cursor_key]);
     if (durable.length) return { cursor: false, failure: false, manifest: false, mirror: false };
@@ -211,6 +250,7 @@ export async function retireManagedSyncOrphan(engine: BrainEngine, orphan: Pick<
   }
   const removed = await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','2000ms',true)");
+    await inTx?.(tx);
     let cursor = false;
     if (orphan.kind === 'unfinished_cursor') {
       const rows = await tx.executeRaw(`
@@ -219,14 +259,23 @@ export async function retireManagedSyncOrphan(engine: BrainEngine, orphan: Pick<
           AND c.completed_keys->0->>'sourceId'=$2 AND c.completed_keys->0->>'incarnation'=$3
           AND NOT EXISTS(SELECT 1 FROM persistence_requests r WHERE r.request_id=(c.completed_keys->0->'pending'->>'requestId')::uuid
             AND r.source_id=$2 AND r.state NOT IN ('committed','failed','conflict','cancelled'))
-          AND ($4::boolean AND EXISTS(SELECT 1 FROM sources s WHERE s.id=$2 AND NOT COALESCE(s.archived,false) AND s.incarnation::text<>$3)
-            OR NOT $4::boolean AND NOT EXISTS(SELECT 1 FROM persistence_local_writers w WHERE w.revoked_at IS NULL
+          AND ($4::text='retired' AND EXISTS(SELECT 1 FROM sources s WHERE s.id=$2 AND NOT COALESCE(s.archived,false) AND s.incarnation::text<>$3)
+            OR $4::text='adoption' AND NOT EXISTS(SELECT 1 FROM persistence_requests r WHERE r.source_id=$2 AND r.intent->>'cursorKey'=$1
+              AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL))
+            OR $4::text='checkpoint_moved' AND c.completed_keys->0->>'runId' IS NOT DISTINCT FROM $6::text
+              AND c.completed_keys->0->'pending'->>'requestId' IS NOT DISTINCT FROM $7::text
+              AND EXISTS(SELECT 1 FROM sources s WHERE s.id=$2 AND s.incarnation::text=$3 AND NOT COALESCE(s.archived,false) AND ${checkpointMovedSql('$5')})
+            OR $4::text='orphan' AND NOT EXISTS(SELECT 1 FROM persistence_local_writers w WHERE w.revoked_at IS NULL
               AND w.id::text=c.completed_keys->0->'authority'->'writer'->'principal'->>'id'
               AND c.completed_keys->0->'authority'->'writer'->'principal'->>'kind' IN ('local_cli','local_stdio')
               AND (c.completed_keys->0 ? 'syncOptions')))
-        RETURNING fingerprint`, [orphan.cursor_key, orphan.source_id, orphan.source_incarnation, retired]);
+        RETURNING fingerprint,c.completed_keys->0->'pending'->'intent' AS intent`,
+        [orphan.cursor_key, orphan.source_id, orphan.source_incarnation, mode, CHECKPOINT_MOVED_MESSAGE, orphan.run_id, orphan.pending_request_id ?? null]);
       cursor = rows.length > 0;
       if (!cursor) return { cursor: false, failure: false, manifest: false, mirror: false };
+      // #6834: a retired path slice's record goes with it, so the next discovery starts from the recorded commit instead of resuming that slice.
+      const intent = (rows[0] as { intent?: { slice?: { target?: string }; syncOptions?: SyncCursorOptions } | null }).intent;
+      if (mode === 'checkpoint_moved' && intent?.slice?.target && intent.syncOptions) await clearSyncSlice(tx, orphan.source_id, orphan.source_incarnation!, intent.syncOptions, intent.slice.target);
     }
     const failure = (await tx.executeRaw(`DELETE FROM op_checkpoints f WHERE f.op='managed-sync-failure' AND f.fingerprint=$1
       AND NOT EXISTS(SELECT 1 FROM op_checkpoints c WHERE c.op='managed-sync' AND c.fingerprint=$1

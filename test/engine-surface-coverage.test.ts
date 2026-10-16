@@ -114,6 +114,9 @@ const INTERFACE_METHODS: readonly string[] = [
   // Salience + anomaly + enrich
   'batchLoadEmotionalInputs', 'setEmotionalWeightBatch', 'getRecentSalience', 'listEnrichCandidates',
   'findAnomalies',
+  // Wave B segmented page bodies (src/core/engine-sql/page-body.ts; covered by test/large-pages/ and test/engine-sql-page-body.test.ts)
+  'allocateBodyOccurrenceIds', 'stageSegmentTexts', 'readSegmentTexts', 'stageManifestRows', 'readManifest', 'stageSegmentChunks',
+  'createSegmentedPageShell', 'flipBodyGeneration', 'openBodyStaging', 'setBodyStagingState', 'sweepSegments',
 ];
 
 /**

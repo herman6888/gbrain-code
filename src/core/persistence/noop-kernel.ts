@@ -32,7 +32,7 @@ import type { PreparedMutation } from './coordinator.ts';
 import { persistenceFileHash } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
-import { belowSafeChunkFence } from '../search/safe-chunks.ts';
+import { belowSafeChunkFence, chunkGenerationFilter } from '../search/safe-chunks.ts';
 import { sha256 } from './digest.ts';
 
 export interface NoopKernelResult {
@@ -55,6 +55,26 @@ export function screeningRequest(fields: Pick<WriteRequest, 'source_id' | 'sourc
     updated_at: new Date().toISOString(), protocol_version: 1, target_kind: 'page', ...fields } as unknown as WriteRequest;
 }
 
+/** What the kernel reads about a live page: its projection state, revision and recorded origin. */
+export interface KernelPage { id: number | string; slug: string; chunker_version: number | null; text_projection_revision: string | null; knowledge_revision: string;
+  mode_pending: boolean; unembedded: boolean; source_path: string | null }
+/** The kernel's page read; callers append the `WHERE` (one page by id, or #6712 PR 1 a prescreened run by slug). */
+export const KERNEL_PAGE_SQL = `SELECT p.id,p.slug,p.chunker_version,p.text_projection_revision::text,p.knowledge_revision::text,p.source_path,
+      (p.contextual_retrieval_mode IS NULL AND EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND c.embedding IS NOT NULL AND ${chunkGenerationFilter('p', 'c')})) AS mode_pending,
+      EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND c.embedding IS NULL AND ${chunkGenerationFilter('p', 'c')}) AS unembedded
+    FROM pages p`;
+
+/**
+ * The projection and metadata work a no-op would leave undone on `page` (null: none): a safe-chunk re-seal, a text
+ * projection behind the knowledge revision, a contextual-mode stamp (unless `waived` lists it), unembedded chunks when
+ * the publication would queue embedding, or a stored source path that differs.
+ */
+export function kernelPageWork(page: KernelPage, input: { sourcePath: string | null; embeddingRequested?: boolean; waived?: readonly NoopKernelWaiver[] }): 'projection_work' | 'metadata_work' | null {
+  if (belowSafeChunkFence(page.chunker_version === null ? null : Number(page.chunker_version)) || page.text_projection_revision !== page.knowledge_revision
+    || page.mode_pending === true && !input.waived?.includes('contextual_mode') || input.embeddingRequested === true && page.unembedded === true) return 'projection_work';
+  return input.sourcePath !== null && page.source_path !== input.sourcePath ? 'metadata_work' : null;
+}
+
 export async function inspectUnchanged(engine: Pick<BrainEngine, 'executeRaw'>, input: {
   prepared: PreparedMutation; snapshot: PageSnapshot | null; sourcePath: string | null; databaseOnly: boolean;
   /** The publication would queue an embedding effect: a page with unembedded chunks is then not skipped. */
@@ -71,23 +91,15 @@ export async function inspectUnchanged(engine: Pick<BrainEngine, 'executeRaw'>, 
   if (snapshot.page.deleted_at != null) return result('page_deleted');
   if (!unchanged) return result('content_changed');
   if (observedRevision !== snapshot.revision) return result('revision_moved');
-  const [page] = await engine.executeRaw<{ chunker_version: number | null; text_projection_revision: string | null; knowledge_revision: string;
-    mode_pending: boolean; unembedded: boolean; source_path: string | null }>(`SELECT p.chunker_version,p.text_projection_revision::text,p.knowledge_revision::text,p.source_path,
-      (p.contextual_retrieval_mode IS NULL AND EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND c.embedding IS NOT NULL)) AS mode_pending,
-      EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND c.embedding IS NULL) AS unembedded
-    FROM pages p WHERE p.id=$1 AND p.deleted_at IS NULL`, [snapshot.page.id]);
+  const [page] = await engine.executeRaw<KernelPage>(`${KERNEL_PAGE_SQL} WHERE p.id=$1 AND p.deleted_at IS NULL`, [snapshot.page.id]);
   if (!page) return result('page_missing');
   // The page's current revision, read after the preparer ran: a write that landed since the snapshot was read is admitted.
   if (page.knowledge_revision != null && page.knowledge_revision !== snapshot.revision) return result('revision_moved');
   const waived: NoopKernelWaiver[] = [];
-  const modePending = page.mode_pending === true;
-  if (modePending && input.waive?.includes('contextual_mode')) waived.push('contextual_mode');
-  const projectionWorkRequired = belowSafeChunkFence(page.chunker_version === null ? null : Number(page.chunker_version))
-    || page.text_projection_revision !== page.knowledge_revision || modePending && !waived.includes('contextual_mode')
-    || input.embeddingRequested === true && page.unembedded === true;
-  if (projectionWorkRequired) return result('projection_work', { projectionWorkRequired });
-  const metadataWorkRequired = input.sourcePath !== null && page.source_path !== input.sourcePath;
-  if (metadataWorkRequired) return result('metadata_work', { metadataWorkRequired });
+  if (page.mode_pending === true && input.waive?.includes('contextual_mode')) waived.push('contextual_mode');
+  const pending = kernelPageWork(page, { sourcePath: input.sourcePath, embeddingRequested: input.embeddingRequested, waived });
+  if (pending === 'projection_work') return result(pending, { projectionWorkRequired: true });
+  if (pending === 'metadata_work') return result(pending, { metadataWorkRequired: true });
   if (!input.databaseOnly) {
     const file = prepared.file;
     const onDisk = file && file.content !== null ? persistenceFileHash(file.path) : null;

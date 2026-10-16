@@ -85,7 +85,7 @@ test('the delegation ladder refuses before it looks for the serve\'s socket', as
   const id = await fixture();
   let socketLookups = 0;
   const error = await quiet(() => maybeDelegateManagedSyncToServe(engine, ['--source', id, '--no-pull', '--include-gitignored'],
-    { sourceId: id, noPull: true, includeGitignored: true, explicitProcessing: [], drain: true } as SyncOpts, {
+    { sourceId: id, noPull: true, includeGitignored: true, drain: true } as SyncOpts, {
       config: { engine: 'postgres', database_url: 'postgresql://example.invalid/brain' },
       probe: async () => ({ host_id: 'host', pid: 4242, nonce: 'n1', pid_ns: null, kind: 'serve', mode: 'full', started_at: new Date().toISOString(),
         renewed_at: new Date().toISOString(), restart_required: false, root_barrier_age_ms: null, pool: null, host_json_path: '/tmp/host.json',

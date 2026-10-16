@@ -88,8 +88,6 @@ export interface DelegatedSyncOptions {
   lanes?: number;
   /** #6696 (A5): who the run's writes are for; the operator's CLI sends `interactive`, absent is `background`. */
   origin?: 'interactive' | 'background';
-  /** #6317: the processing options the caller set itself; the managed cursor supplies the rest. #6696: a missing list (an older CLI) means none. */
-  explicitProcessing?: Array<typeof DELEGATED_SYNC_PROCESSING_KEYS[number]>;
   /** #6696: the client's cost gate deferred this run's embedding; cursor adoption never lifts it. Sent only when true. */
   embedDeferred?: boolean;
   /**
@@ -142,6 +140,8 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
     if (keys.length > DELEGATED_SYNC_PROCESSING_KEYS.length || keys.some(key => !(DELEGATED_SYNC_PROCESSING_KEYS as readonly string[]).includes(key))) {
       return { ok: false, error: 'invalid_options:explicitProcessing' };
     }
+    // #6712 PR 1: accepted from an older CLI and ignored (WIRE_SKEW_WINDOWS.explicitProcessing); the cursor's opt-outs are inherited.
+    delete out.explicitProcessing;
   }
   if (out.origin !== undefined && out.origin !== 'interactive' && out.origin !== 'background') {
     return { ok: false, error: 'invalid_options:origin' };

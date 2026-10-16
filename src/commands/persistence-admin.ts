@@ -19,7 +19,7 @@ export const WRITER_HELP = `Usage:
   gbrain sources writer failures <source> [--state all] [--group-by category] [--since 7d] [--limit 20] [--before <cursor>]
     [--category <c>] [--code <c>] [--origin <o>|none] [--json]
   gbrain sources writer movement [<source>] [--wait <dur>] [--warn-only] [--json]
-  gbrain sources writer retry-effects <source> --request-id <uuid> [--dry-run] [--json]
+  gbrain sources writer retry-effects <source> --request-id <uuid> [--admin-intent writer_retry_effects --expected-state <admin_state>] [--dry-run] [--json]
   gbrain sources writer git-durability <source> --enable|--disable [--pat-file <path>] [administration options] [--dry-run] [--json]
   gbrain sources writer claim <source> --path <directory> [administration options] [--dry-run] [--json]
   gbrain sources writer activate --confirm-quiesced [--cleanup-dead-local-locks] [--shared-skills] [administration options] [--dry-run] [--json]
@@ -82,7 +82,13 @@ previews parked targets with --dry-run and otherwise authorizes one more attempt
 per parked target (a target that fails again parks again). For embeddings it
 reconciles existing complete vectors or authorizes one additional bounded retry
 cycle per request; repeating it never renews that allowance. --dry-run never queues work.
-It never changes ownership or activation and needs no topology admin-intent.
+It never changes ownership or activation and needs no topology admin-intent, except
+when the original writer was revoked: --dry-run then reports action owner_revoked,
+and --admin-intent writer_retry_effects with the reviewed --expected-state lets the
+owner host retry the parked Git effect once under its own authority (recorded as
+retried_under: owner_host); a withdrawal effect is never retried that way.
+git-durability --pat-file retries every parked push of the worktree; requests refused
+on their own are listed in parked_pushes.refused, the result is status partial, and it exits 1.
 lock sets an opt-in, brain-level writer admin lock (config key persistence.writer_admin_lock)
 and unlock clears it; both are local-only, idempotent and print the resulting state.
 While locked, writer claim, activate and transfer (prepare and accept) are refused with
@@ -243,7 +249,13 @@ export async function runPersistenceAdminCli(group: Group, args: string[], conne
       await writeStdoutFinal(renderWriterFailures(result as Parameters<typeof renderWriterFailures>[0], parsed.json));
       return;
     }
+    // #5182: activation proceeds, but a source whose Git effects it leaves skipped is named for a person on stderr too.
+    if (parsed.operation === 'writer_activate' && !parsed.json) {
+      for (const warning of (result as { warnings?: Array<{ message: string }> }).warnings ?? []) process.stderr.write(`warning: ${warning.message}\n`);
+    }
     await writeStdoutFinal(JSON.stringify(result, bigintToStringReplacer, 2) + '\n');
+    // #6678: a credential repair that refused some parked pushes on their own is partial and exits 1.
+    if (parsed.operation === 'writer_git_durability' && (result as { status?: unknown }).status === 'partial') setCliExitVerdict(1);
   } catch (error) {
     if (!await reportPersistenceCliError(error, args.includes('--json'))) {
       console.error(error instanceof Error ? error.message : String(error));

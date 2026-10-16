@@ -19,7 +19,7 @@ import {
   enforceClientSlugFence,
   validatePageSlug,
 } from './context.ts';
-import { embedQuery } from '../embedding.ts';
+import { embedQueryWithPrefix } from '../search/query-prefix.ts';
 import { ALL_SOURCES } from '../source-id.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 
@@ -283,7 +283,7 @@ const think: Operation = {
     const result = await runThink(ctx.engine, {
       question: String(p.question),
       // #3734: MCP think must populate the question vector for takes retrieval.
-      embedQuestion: (q) => embedQuery(q),
+      embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
       anchor: p.anchor ? String(p.anchor) : undefined,
       rounds: typeof p.rounds === 'number' ? (p.rounds as number) : undefined,
       save: safeSave,

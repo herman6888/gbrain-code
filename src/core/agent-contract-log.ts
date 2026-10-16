@@ -27,6 +27,12 @@ export interface AgentContractEvent {
   outcome?: string;
   /** Internal normaliser fault class (never a message). */
   fault?: string;
+  /** #6629: the gbrain release that wrote the event. */
+  version?: string;
+  /** #6629: the `--json` guard mode the event concerns. */
+  guard?: 'document' | 'ndjson';
+  /** #6629: the process exit code the event was recorded at. */
+  exit_code?: number;
 }
 
 export function agentContractLogPath(): string {

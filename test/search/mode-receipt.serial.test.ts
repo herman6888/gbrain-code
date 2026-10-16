@@ -3,8 +3,8 @@
  * the provider calls one `put_page`, one `search` and one `query` make in
  * each mode, with every provider stubbed (embedding, rerank, expansion). It
  * pins what choosing a mode at init actually changes on the agent read and
- * write paths: `query` expands by default only in tokenmax, `search` never
- * does, conservative never reranks, and `put_page` makes no provider call in
+ * write paths: `query` does not expand by default in any mode (GBRA-94),
+ * `search` never does, conservative never reranks, and `put_page` makes no provider call in
  * any mode (it queues the page's embedding; per-chunk synopses come only from
  * the separate contextual-retrieval backfill).
  *
@@ -90,11 +90,11 @@ const RECEIPTS: Record<SearchMode, {
     query: { embed: 1, rerank: 1, expand: 0, chat: 0 },
   },
   tokenmax: {
-    settings: { searchLimit: 50, tokenBudget: null, reranker_enabled: true, reranker_top_n_in: 50, expansion: true, contextual_retrieval: 'per_chunk_synopsis' },
+    settings: { searchLimit: 50, tokenBudget: null, reranker_enabled: true, reranker_top_n_in: 50, expansion: false, contextual_retrieval: 'per_chunk_synopsis' },
     put_page: { embed: 0, rerank: 0, expand: 0, chat: 0 },
     search: { embed: 1, rerank: 1, expand: 0, chat: 0 },
-    // The original question plus the expander's two variants.
-    query: { embed: 3, rerank: 1, expand: 1, chat: 0 },
+    // No expansion call and no variant embeds since GBRA-94 (was embed 3, expand 1).
+    query: { embed: 1, rerank: 1, expand: 0, chat: 0 },
   },
 };
 

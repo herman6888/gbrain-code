@@ -1,11 +1,12 @@
 /**
- * #6643: managed sync recovers from its own knock-ons.
+ * #6643: managed sync recovers from its own knock-ons; #6712 (one page, one fate) retired every producer.
  *
- * Protects: a page cancelled or refused only because another page of the same sync did not commit is re-frozen under a
- * fresh request by the run itself, even under `sync.holds=fail` and without `--retry-failed`; an operator's cancel is
- * never re-frozen; the re-freeze is bounded (`sync.knock_on_refreeze_limit`, `sync.knock_on_run_limit`) and an
- * exhausted run names its root request in its result and in a fresh `sync status`; the pre-#6643 producer messages are
- * recognised, nothing else is; and the checkpoint does not wait on a knock-on receipt.
+ * Protects: a legacy knock-on receipt an older build wrote (a page cancelled or refused only because another page of
+ * the same sync did not commit) is re-frozen in place under a fresh request by the run itself, even under
+ * `sync.holds=fail` and without `--retry-failed`; an operator's cancel is never re-frozen; the re-freeze is bounded per
+ * entry (`STOPS_PER_ENTRY`, no config key) and past it the failure is recorded as a retryable page fault; the retired
+ * `knock_on_exhausted` code renders superseded; the pre-#6643 producer messages are recognised, nothing else is; and
+ * the checkpoint waits on every receipt the cursor did not settle (no knock-on exemption).
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -16,7 +17,8 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { performManagedSync, STOPS_PER_ENTRY } from '../src/core/persistence/sync-run.ts';
+import { __setManagedCursorKeyForTests } from '../src/core/persistence/sync-cursor-key.ts';
 import { readSyncStatus } from '../src/core/persistence/sync-status.ts';
 import { classifySyncFault } from '../src/core/persistence/sync-fault-class.ts';
 import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
@@ -73,7 +75,7 @@ async function asKnockOn(requestId: string, message: string, detail: unknown, st
   await engine.executeRaw(`UPDATE persistence_requests SET state=$2, error_code=$3, error_message=$4, error_detail=$5::jsonb, recovery=NULL, publication_started=false
     WHERE request_id=$1::uuid`, [requestId, state, code, message, detail == null ? null : JSON.stringify(detail)]);
 }
-const clearConfig = () => engine.executeRaw("DELETE FROM config WHERE key IN ('sync.holds','sync.knock_on_refreeze_limit','sync.knock_on_run_limit')");
+const clearConfig = () => engine.executeRaw("DELETE FROM config WHERE key='sync.holds'");
 
 beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 60_000);
 afterAll(async () => { await disposePersistenceConsumer(engine); await engine.disconnect(); rmSync(home, { recursive: true, force: true }); });
@@ -95,8 +97,9 @@ test('the pre-#6643 producer messages are the only untyped knock-ons; an operato
   expect(isSyncKnockOn({ ...base, state: 'cancelled', error_code: 'cancelled', error_message: WINDOW_CANCEL_MESSAGE, intent: page('put_page') } as never)).toBe(false);
   // The typed marker survives compaction (no intent, no message).
   expect(isSyncKnockOn({ ...base, intent: null, state: 'cancelled', error_code: 'cancelled', error_message: null, error_detail: knockOnDetail('bulk_group', null) } as never)).toBe(true);
-  expect(classifySyncFault({ code: 'knock_on_exhausted' })).toMatchObject({ class: 'systemic', needs_human: true });
-  expect(CODES.knock_on_exhausted).toBeDefined();
+  // #6712: the retired stop renders superseded: a retryable page fault a plain sync resumes, never a human page.
+  expect(classifySyncFault({ code: 'knock_on_exhausted' })).toEqual({ class: 'page', safe_actions: ['retry'], needs_human: false });
+  expect(CODES.knock_on_exhausted).toMatchObject({ retired_in: '0.60.255.0' });
 });
 
 test('the SQL predicate agrees with isSyncKnockOn row by row', async () => {
@@ -122,7 +125,6 @@ test('a knock-on is re-frozen by the plain sync under sync.holds=fail, and the r
     await asKnockOn(f.stopped, WINDOW_CANCEL_MESSAGE, knockOnDetail('window_predecessor', f.rootRequest));
     const resumed = await performManagedSync(engine, f.opts);
     expect(resumed.status).not.toBe('blocked_by_failures');
-    expect(resumed.knockOns).toEqual({ refrozen: 1 });
     const status = await readSyncStatus(engine, f.id);
     expect(status.cursor?.done).toBe(true);
     // The stopped receipt is immutable; the page committed under a fresh request.
@@ -139,7 +141,7 @@ test('a pre-#6643 untyped knock-on is recovered the same way', async () => withE
     await asKnockOn(f.stopped, EARLIER_PAGE_REFUSAL_MESSAGE, null, 'conflict', 'revision_conflict');
     const resumed = await performManagedSync(engine, f.opts);
     expect(resumed.status).not.toBe('blocked_by_failures');
-    expect(resumed.knockOns).toEqual({ refrozen: 1 });
+    expect((await readSyncStatus(engine, f.id)).cursor?.done).toBe(true);
   } finally { await clearConfig(); }
 }), 120_000);
 
@@ -149,55 +151,43 @@ test('an operator cancel is never re-frozen', async () => withEnv({ GBRAIN_HOME:
     await asKnockOn(f.stopped, 'Cancelled before publication.', null);
     const resumed = await performManagedSync(engine, f.opts);
     expect(resumed.status).toBe('blocked_by_failures');
-    expect(resumed.knockOns).toBeUndefined();
     expect(resumed.failureCodes).toEqual([{ code: 'cancelled', count: 1 }]);
   } finally { await clearConfig(); }
 }), 120_000);
 
-test('sync.knock_on_refreeze_limit=0 turns the re-freeze off', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+test('a legacy knock-on is re-frozen at most STOPS_PER_ENTRY times in a row; past that the failure is recorded as a retryable page fault', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   try {
     const f = await stoppedRun();
     await asKnockOn(f.stopped, WINDOW_CANCEL_MESSAGE, knockOnDetail('window_predecessor', f.rootRequest));
-    await engine.setConfig('sync.knock_on_refreeze_limit', '0');
+    // The entry was already re-frozen STOPS_PER_ENTRY times in a row.
+    await engine.executeRaw(`UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,pending,stops}',to_jsonb($2::int))
+      WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1`, [f.id, STOPS_PER_ENTRY]);
     const resumed = await performManagedSync(engine, f.opts);
     expect(resumed.status).toBe('blocked_by_failures');
-    expect(resumed.knockOns).toBeUndefined();
-  } finally { await clearConfig(); }
-}), 120_000);
-
-test('an exhausted re-freeze stops with knock_on_exhausted naming the root, in the result and in a fresh sync status', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
-  try {
-    const f = await stoppedRun();
-    await asKnockOn(f.stopped, WINDOW_CANCEL_MESSAGE, knockOnDetail('window_predecessor', f.rootRequest));
-    await engine.setConfig('sync.knock_on_run_limit', '0');
-    const resumed = await performManagedSync(engine, f.opts);
-    expect(resumed.status).toBe('blocked_by_failures');
-    expect(resumed.failureCodes).toEqual([{ code: 'knock_on_exhausted', count: 1 }]);
-    expect(resumed.failures?.[0]).toMatchObject({ code: 'knock_on_exhausted', root_cause: { request_id: f.rootRequest, slug: 'a', state: 'committed' } });
+    expect(resumed.failureCodes).toEqual([{ code: 'cancelled', count: 1 }]);
     const status = await readSyncStatus(engine, f.id);
-    expect(status.last_error).toMatchObject({ code: 'knock_on_exhausted', class: 'systemic', needs_human: true, root_cause: { request_id: f.rootRequest } });
-    expect(status.needs_human).toBe(true);
-    // Raising the limit again lets the same sync re-freeze and finish.
-    await engine.executeRaw("DELETE FROM config WHERE key='sync.knock_on_run_limit'");
+    expect(status.last_error).toMatchObject({ code: 'cancelled', class: 'page', safe_actions: ['retry'], needs_human: false });
+    expect(status.needs_human).toBe(false);
+    // The printed retry finishes the sync.
     const again = await performManagedSync(engine, { ...f.opts, retryFailed: true });
     expect(again.status).not.toBe('blocked_by_failures');
     expect((await readSyncStatus(engine, f.id)).cursor?.done).toBe(true);
   } finally { await clearConfig(); }
 }), 180_000);
 
-test('the checkpoint waits on a real failed receipt, never on a knock-on of a pre-#6643 cursor, and skips the indexes a cursor settled', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+test('the checkpoint waits on every receipt the cursor did not settle, a legacy knock-on included (#6712), and skips the indexes a cursor settled', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   try {
     const f = await stoppedRun();
     const [row] = await engine.executeRaw<{ worktree_id: string; run_id: string; idx: number }>(
       "SELECT worktree_id::text AS worktree_id, intent->>'runId' AS run_id, (intent->>'index')::int AS idx FROM persistence_requests WHERE request_id=$1::uuid", [f.stopped]);
-    const check = (settled: Parameters<typeof findIncompleteSyncReceipt>[4]) => findIncompleteSyncReceipt(engine, row!.worktree_id, row!.run_id, [], settled, 2);
+    const check = (settled: Parameters<typeof findIncompleteSyncReceipt>[4]) => findIncompleteSyncReceipt(engine, row!.worktree_id, row!.run_id, [], settled);
     // A real failure (no knock-on marker, no matching message) blocks under every cursor shape.
     expect(await check(null)).toBe(f.stopped);
     expect(await check({ from: 0, ranges: [] })).toBe(f.stopped);
     await asKnockOn(f.stopped, WINDOW_CANCEL_MESSAGE, knockOnDetail('window_predecessor', f.rootRequest));
-    // A cursor from before #6643 recorded no settled ranges: a knock-on below its end does not block.
-    expect(await check(null)).toBeNull();
-    // A #6643 cursor names what it settled: an unsettled knock-on index still blocks, a settled one does not.
+    // #6712: no knock-on exemption: a legacy knock-on blocks unless the cursor settled its index or converted it.
+    expect(await check(null)).toBe(f.stopped);
+    expect(await findIncompleteSyncReceipt(engine, row!.worktree_id, row!.run_id, [f.stopped], null)).toBeNull();
     expect(await check({ from: 0, ranges: [] })).toBe(f.stopped);
     expect(await check({ from: 0, ranges: [[row!.idx, row!.idx]] })).toBeNull();
     expect(addSettledRange(addSettledRange({ from: 0, ranges: [] }, 1, 2), 3, 4)).toEqual({ from: 0, ranges: [[1, 4]] });
@@ -205,7 +195,7 @@ test('the checkpoint waits on a real failed receipt, never on a knock-on of a pr
   } finally { await clearConfig(); }
 }), 120_000);
 
-for (const retryFailed of [false, true]) test(`a checkpoint refused by a receipt that turns out to be a knock-on revives under ${retryFailed ? 'the --retry-failed repro command' : 'the plain sync'}, without rediscovery`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+for (const retryFailed of [false, true]) test(`#6712: a checkpoint a legacy knock-on still blocks ${retryFailed ? 'is rediscovered by the --retry-failed repro command and finishes' : 'stays blocked under the plain sync, naming the knock-on'}`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   try {
     const f = await stoppedRun();
     // The pre-#6643 shape: the cursor passed the stopped page (no settled ranges recorded) and froze its checkpoint.
@@ -215,16 +205,18 @@ for (const retryFailed of [false, true]) test(`a checkpoint refused by a receipt
     const refused = await performManagedSync(engine, f.opts);
     expect(refused.status).toBe('blocked_by_failures');
     expect(refused.failures?.[0]).toMatchObject({ code: 'recovery_required', phase: 'checkpoint', root_cause: { request_id: f.stopped } });
-    const before = await readSyncStatus(engine, f.id);
-    const runId = before.run_id;
-    expect(before.checkpoint_blockers).toEqual([expect.objectContaining({ request_id: f.stopped, slug: 'b', knock_on: false })]);
-    // The receipt that refused it was a knock-on all along (a pre-#6643 producer's message): status previews that nothing blocks now.
+    expect((await readSyncStatus(engine, f.id)).checkpoint_blockers).toEqual([expect.objectContaining({ request_id: f.stopped, slug: 'b', knock_on: false })]);
+    // The receipt that refused it was a knock-on (a pre-#6643 producer's message): it still blocks, and status says what it is.
     await asKnockOn(f.stopped, WINDOW_CANCEL_MESSAGE, null);
-    expect((await readSyncStatus(engine, f.id)).checkpoint_blockers).toEqual([]);
-    const revived = await performManagedSync(engine, { ...f.opts, retryFailed });
-    expect(revived.status).not.toBe('blocked_by_failures');
-    const status = await readSyncStatus(engine, f.id);
-    expect(status).toMatchObject({ run_id: runId, cursor: { done: true } });
+    expect((await readSyncStatus(engine, f.id)).checkpoint_blockers).toEqual([expect.objectContaining({ request_id: f.stopped, slug: 'b', knock_on: true })]);
+    const resumed = await performManagedSync(engine, { ...f.opts, retryFailed });
+    if (!retryFailed) {
+      expect(resumed.status).toBe('blocked_by_failures');
+      expect((await readSyncStatus(engine, f.id)).cursor?.done).not.toBe(true);
+      return;
+    }
+    expect(resumed.status).not.toBe('blocked_by_failures');
+    expect((await readSyncStatus(engine, f.id)).cursor).toMatchObject({ done: true });
     const [source] = await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]);
     expect(source!.last_commit).toBe(git(f.root, 'rev-parse', 'HEAD'));
   } finally { await clearConfig(); }
@@ -246,17 +238,14 @@ test('a stop on an outside_fence refusal is a root that needs a person in sync s
   } finally { await clearConfig(); }
 }), 120_000);
 
-test('the cursor fence names window_dropped only for a member the cursor recorded dropping, with the root recorded then', () => {
-  const run = randomUUID(), root = randomUUID(), member = randomUUID(), stray = randomUUID(), now = randomUUID();
+test('#6712: the cursor fence has two causes; a request the cursor does not hold is outside_fence, even one an older cursor recorded dropping', () => {
+  const run = randomUUID(), root = randomUUID(), member = randomUUID(), now = randomUUID();
   const row = (id: string) => ({ request_id: id, source_id: 'default' }) as never;
   const intent = { kind: 'managed_sync_import', runId: run, index: 7 } as never;
   const fence = { run_id: run, request_id: now, group: null, index: 3, dropped: [{ requestId: member, root }] };
   const detail = (id: string, f: typeof fence) => cursorFenceRefusal(row(id), intent, f).syncRefusal as Record<string, unknown>;
-  // A dropped member is a knock-on of the request whose failure dropped it, not of whatever the cursor holds now.
-  expect(detail(member, fence)).toMatchObject({ cause: 'window_dropped', origin: 'sync_knock_on', root_request_id: root });
-  // A request ahead of the cursor that it never dropped is a coordination fault, not a knock-on.
-  expect(detail(stray, fence)).toMatchObject({ cause: 'outside_fence', origin: 'sync_cursor_fence' });
-  expect(detail(member, { ...fence, dropped: undefined as never })).toMatchObject({ cause: 'outside_fence' });
+  expect(detail(member, fence)).toMatchObject({ cause: 'outside_fence', origin: 'sync_cursor_fence' });
+  expect(detail(member, fence)).not.toHaveProperty('root_request_id');
   expect(detail(member, { ...fence, run_id: randomUUID() })).toMatchObject({ cause: 'run_replaced' });
 });
 
@@ -265,8 +254,17 @@ test('with two cursors, sync status shows the one its recorded failure belongs t
     const f = await stoppedRun();
     const blockedRun = (await readSyncStatus(engine, f.id)).run_id!;
     await clearConfig();
-    // A newer cursor of the same source, selected by different options, runs to the end.
-    const other = await performManagedSync(engine, { ...f.opts, exclude: ['nothing-matches/**'] });
+    // A newer cursor of the same source, selected by different options, runs to the end. #6712 PR 1: one key per source,
+    // so a second cursor is one an older gbrain left under its own key; it ran while the blocked cursor did not exist for it.
+    const blockedKey = (await engine.executeRaw<{ fingerprint: string }>("SELECT fingerprint FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [f.id]))[0]!.fingerprint;
+    await engine.executeRaw("UPDATE op_checkpoints SET op='managed-sync-parked' WHERE op='managed-sync' AND fingerprint=$1", [blockedKey]);
+    __setManagedCursorKeyForTests(() => `${f.id}-older-key`);
+    let other: Awaited<ReturnType<typeof performManagedSync>>;
+    try { other = await performManagedSync(engine, { ...f.opts, exclude: ['nothing-matches/**'] }); }
+    finally {
+      __setManagedCursorKeyForTests(null);
+      await engine.executeRaw("UPDATE op_checkpoints SET op='managed-sync' WHERE op='managed-sync-parked' AND fingerprint=$1", [blockedKey]);
+    }
     expect(other.status).not.toBe('blocked_by_failures');
     const status = await readSyncStatus(engine, f.id);
     expect(status.run_id).toBe(blockedRun);

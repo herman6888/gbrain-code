@@ -247,7 +247,15 @@ codex mcp remove gbrain
   `UserPromptSubmit`, `SessionEnd` in `$CODEX_HOME/hooks.json`, each trusted by
   a `[hooks.state]` entry in config.toml); `gbrain setup codex` wires the two
   read-context hooks so brain pages named in a prompt arrive as context without
-  a tool call. Without those hooks (the plugin, `connect` or `--no-hooks`), use
+  a tool call. `hooks.json` is machine-wide, so those hooks name no source:
+  each session reads context from the source its capture uses, `GBRAIN_SOURCE`
+  first, else the `.gbrain-source` file found walking up from the session's
+  working directory (fixed for the session at its first hook). A repository's
+  committed `.gbrain-source` therefore picks which source Codex reads there,
+  the same as every `gbrain` command run in it. When that source has no serve
+  of its own, the shared serve refuses with `source_mismatch` (the hook
+  heartbeat's reason) and the session gets no context rather than another
+  source's (#5941). Without those hooks (the plugin, `connect` or `--no-hooks`), use
   the pull path: at the start of a topical thread and after a compaction, call
   `context_pack(entities, budget_tokens)` to warm the standing entities; on a
   periodic wake call `delta(session_id, budget_tokens)` for "what changed since

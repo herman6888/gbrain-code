@@ -41,7 +41,9 @@ export type DrainStopReason = 'deadline' | 'drain_stalled' | 'database_contentio
   /** #6340: the database connection dropped `CONNECTION_STRIKES` times in a row with no page committed between the drops; the cursor stands, the same command resumes it. */
   | 'connection_lost'
   /** #6696 (A7): a cumulative write cap (or the background pause line) refused the next admission after the preflight passed; resumable once capacity returns. */
-  | 'capacity_paused';
+  | 'capacity_paused'
+  /** #6712 PR 1: another drainer holds the source's drain lease (or took it from this run); resumable, the next run follows it. */
+  | 'drain_lease_held';
 /** #6696 (A7): the refusal that paused the drain (`capacity_paused`); `fix` is the host's config raise. */
 export interface DrainCapacityPause { code: string; reason: string | null; detail: string | null; message: string; fix?: Action }
 /** A capacity refusal raised by an admission after the run's preflight (the preflight's own refusal stops the command up front). */
@@ -114,6 +116,8 @@ export interface DrainStall {
   owner_kind?: string | null;
   owner_nonce?: string | null;
   last_sql?: ClaimLastSql | null;
+  /** #6712 PR 1: the drain-lease holder a following run waited on (`no_progress`: it heartbeats but commits nothing). */
+  lease_holder?: import('./sync-lease.ts').DrainHolder;
   /** #6317: the owner's heartbeat row, when the stop read one (`owner_wedged_here`). */
   owner_row?: DrainOwnerRow | null;
   /** #6317: whether the stop came at the ceiling (true) or on the owner's own wedged verdict before it (false), and the ceiling judged against. */
@@ -576,6 +580,8 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
       }
       if (!continues(result)) {
         if (TERMINAL_STATUSES.has(result.status)) return finish(result, 'synced');
+        if (result.leaseHeld) return result.drain?.stop_reason === 'drain_stalled' ? finish(result, 'blocked', 'drain_stalled', { stall: result.drain.stall })
+          : finish(result, 'resumable', 'drain_lease_held', { retry_after_ms: result.leaseHeld.retry_after_ms });
         // #6278: the breaker's systemic stop is one diagnostic, not a failed page.
         if (result.breaker) return finish(result, 'blocked', 'preparation_systemic');
         if (result.status === 'blocked_by_failures') return finish(result, 'blocked', 'blocked_by_failures');
@@ -808,9 +814,6 @@ export async function drainManagedSync(engine: BrainEngine, opts: SyncOpts, anno
       const left = opts.deadlineAtMs === undefined ? null : Math.max(0, opts.deadlineAtMs - Date.now());
       const stats = left === null ? await closeLaneRun(laneRun)
         : await Promise.race([closeLaneRun(laneRun), new Promise<undefined>(resolve => { const t: ReturnType<typeof setTimeout> = setTimeout(() => resolve(undefined), left); t.unref?.(); })]);
-      const { cancelOrphanedLaneRows } = await import('./sync-window.ts');
-      const settleMs = opts.deadlineAtMs === undefined ? 10_000 : Math.max(0, Math.min(10_000, opts.deadlineAtMs - Date.now()));
-      await cancelOrphanedLaneRows(engine, laneRun, result?.drain?.outcome === 'blocked' ? settleMs : 0).catch(() => undefined);
       const lanes = result?.drain?.bulk?.lanes;
       if (lanes && stats) Object.assign(lanes, { busy: stats.busy, apply_ms_per_page: stats.applyMsPerPage, turn_wait_share: stats.turnWaitShare });
     }
@@ -901,7 +904,7 @@ const STOP_DOCS: Record<DrainStopReason, CatalogueName> = {
   recovery_required: 'sync_drain_writer_blocked', owner_unavailable: 'sync_drain_writer_blocked', unexpected_file_bytes: 'sync_drain_writer_blocked',
   unexpected_staging_bytes: 'sync_drain_writer_blocked', blocked_by_failures: 'sync_drain_blocked_by_failures',
   preparation_abandoned: 'sync_drain_preparation_abandoned', preparation_systemic: 'sync_drain_preparation_systemic', write_capacity: 'sync_drain_write_capacity',
-  connection_lost: 'sync_drain_connection_lost', capacity_paused: 'sync_drain_capacity_paused',
+  connection_lost: 'sync_drain_connection_lost', capacity_paused: 'sync_drain_capacity_paused', drain_lease_held: 'sync_drain_lease_held',
 };
 
 /** What the agent runs next, or null when the sync is done (DX-A2). */
@@ -918,6 +921,26 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
       why: `The sync paused: ${pause?.message ?? 'a cumulative write cap refused its next admission'} Nothing failed; the cursor and every accepted write are intact. `
         + `${pause?.reason === 'lifetime_ids' ? 'Request ids never free, so ' : ''}${raise ? `the brain host runs ${raise} (reversible)` : 'the brain host raises the cap gbrain doctor --only persistence_capacity --json names'}`
         + `${pause?.reason === 'terminal_bytes' ? ', or receipts compact over time' : ''}; then rerun: ${resumeCommand}`, ...(docs ? { docs } : {}) };
+  }
+  if (outcome === 'resumable' && (d?.stop_reason === 'drain_lease_held' || result.leaseHeld)) {
+    const held = result.leaseHeld;
+    return { command: resumeCommand, safe_to_loop: true, retry_after_ms: held?.retry_after_ms ?? d?.retry_after_ms ?? 0, ...estimate, code: 'sync_drain_lease_held',
+      why: held?.fix.why ?? 'Another drainer holds this source\'s drain lease and resumes the same cursor; rerun after retry_after_ms.',
+      ...(held ? { fix: renderAction({ ...held.fix, argv: resumeCommand.split(' ') }, cliRenderContext()) } : {}), docs: ERROR_CATALOGUE.sync_drain_lease_held.docs };
+  }
+  // #6712 PR 1: the drain-lease holder this run followed heartbeats but has committed nothing (and saved no cursor) for the
+  // stall window. Waiting again would read as a clean exit on every tick, so this stops blocked with the holder named.
+  if (d?.stop_reason === 'drain_stalled' && d.stall?.lease_holder) {
+    const holder = d.stall.lease_holder, who = `the ${holder.kind} drainer${holder.pid ? ` (pid ${holder.pid}${holder.host ? ` on ${holder.host}` : ''})` : ''}`;
+    const breakLock = `gbrain sync --source ${sourceId} --no-pull --break-lock`;
+    return { command: `gbrain sources writer status --source ${sourceId} --json`, safe_to_loop: false, retry_after_ms: 0, ...estimate, code: 'drain_stalled', cause: 'no_progress',
+      why: `Source ${sourceId}'s drain lease is held by ${who}${holder.version ? `, gbrain ${holder.version}` : ''}, which still heartbeats but has committed no page and saved no cursor for ${d.stall.stalled_seconds}s, `
+        + `so this run stopped following it. Inspect the writer (read-only), then stop that process (or wait for it if it is a long discovery) and rerun: ${resumeCommand}. `
+        + `Once it has exited, ${breakLock} releases a lease it left behind; it never breaks a live holder.`,
+      fix: renderAction({ argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'], consent: [], actor: 'host_admin', requires_exclusive: false,
+        why: 'Status names the source\'s writer, its step and the requests it holds, read-only.',
+        user_message: `Source ${sourceId} is held by ${who}, which has made no progress for ${d.stall.stalled_seconds}s. Stop that process, then run: ${breakLock} and ${resumeCommand}`,
+        verify: { argv: ['gbrain', 'sync', 'status', '--source', sourceId, '--json'] } }, cliRenderContext()), docs: ERROR_CATALOGUE.sync_drain_stalled.docs };
   }
   if (outcome === 'resumable') {
     const abandoned = d?.stop_reason === 'preparation_abandoned';

@@ -56,7 +56,7 @@
 
 import { isAdmissionOrigin, withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
-import { typedSyncProcessing, withLegacySyncDelegation } from './persistence/sync-authority.ts';
+import { withLegacySyncDelegation } from './persistence/sync-authority.ts';
 import { verifyLocalWriter, withVerifiedLocalRegistration } from './persistence/identity.ts';
 import { readManagedMode } from './persistence/managed-mode.ts';
 import { OperationError } from './ops/contract.ts';
@@ -353,8 +353,8 @@ async function startVerifiedDelegatedSync(
           // flags ride through; the classic path keeps the always-deferred embed rule of the legacy lane.
           ...(managed
             ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, embedDeferred: options.embedDeferred,
-              // #6696: an older CLI omits the list but still sends true for each processing flag its user typed.
-              explicitProcessing: options.explicitProcessing ?? typedSyncProcessing(options) }
+              // #6712 PR 1: the CLI's run follows a live drain-lease holder inside the serve, as it would in its own process.
+              followDrainLease: true, drainHolder: { kind: 'serve' as const, id: String(job.id) } }
             : { noEmbed: true }),
           signal: job.controller.signal,
           onProgress: (p) => {

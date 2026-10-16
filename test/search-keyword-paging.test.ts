@@ -27,6 +27,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { dispatchToolCall, type ToolResult } from '../src/mcp/dispatch.ts';
 import { errorCodeRow } from '../src/core/error-docs.ts';
 import { countKeywordMatches, searchCountLine } from '../src/core/search/keyword-paging.ts';
+import { safeChunksFilter } from '../src/core/search/safe-chunks.ts';
 import { withEnv } from './helpers/with-env.ts';
 import {
   DOMINANT_CHUNKS, DOMINANT_SLUG, MANY_PAGES, MIXED_TYPES, TERM, callSearch, seedKeywordCorpus, seedPage, walkKeyword,
@@ -310,6 +311,44 @@ describe('count unavailable: a degraded stage, never a number', () => {
   test('a count past its deadline is unavailable', async () => {
     expect(await countKeywordMatches(stalled(engine, 'hang'), TERM, {}, 50)).toEqual({ unavailable: 'timeout' });
     expect(await countKeywordMatches(stalled(engine, 'timeout'), TERM, {}, 1000)).toEqual({ unavailable: 'timeout' });
+  });
+
+  const delayed = (base: BrainEngine, ms: number, seen: Array<Record<string, unknown> | undefined>): BrainEngine => new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === 'countKeywordPages') {
+        return async (q: string, o?: Record<string, unknown>) => { seen.push(o); await new Promise(r => setTimeout(r, ms)); return target.countKeywordPages(q, o as never); };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const after = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+  test('#6632: a count past the floor still lands while the search is running', async () => {
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    const count = await countKeywordMatches(delayed(engine, 150, seen), TERM, {}, 50, after(400));
+    expect('total' in count ? count.total : -1).toBeGreaterThan(0);
+  });
+
+  test('#6632: a count still running after the search and its grace is given up, not waited on', async () => {
+    const started = Date.now();
+    expect(await countKeywordMatches(stalled(engine, 'hang'), TERM, {}, 50, after(150))).toEqual({ unavailable: 'timeout' });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('#6632: the count statement runs under the operator bound, not a narrower fixed deadline', async () => {
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    await countKeywordMatches(delayed(engine, 0, seen), TERM, {}, 50);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.timeoutMs).toBeUndefined();
+  });
+
+  test('#6632: the safe-chunk predicate compares the bare NOT NULL column, so the planner keeps its statistics', async () => {
+    expect(await engine.executeRaw(`SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = 'pages' AND column_name = 'chunker_version'`))
+      .toEqual([{ data_type: 'smallint', is_nullable: 'NO' }]);
+    expect(safeChunksFilter('p')).toBe('p.chunker_version >= 4');
   });
 
   test('over MCP: the line says unavailable, the stage is recorded, keyword paging still works', async () => {

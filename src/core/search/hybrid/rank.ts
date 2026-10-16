@@ -156,7 +156,7 @@ export async function fuseArms(
     fused = await cosineReScore(
       engine, fused, queryEmbedding, unifiedDone ? 'embedding_multimodal' : resolvedCol.name,
       imageQueryEmbedding && !unifiedDone ? { queryEmbedding: imageQueryEmbedding, column: 'embedding_image' } : undefined,
-      attribute,
+      attribute, () => { req.cosineRescore = 'js_fallback'; },
     );
   }
 
@@ -511,6 +511,7 @@ export async function finalizeHybridResults(
     ...(keywordArmConfidence ? { keyword_arm_confidence: keywordArmConfidence } : {}),
     metadata_boost_gate: metadataBoostGate,
     ...(rerankGate ? { rerank_gate: rerankGate } : {}),
+    ...(req.cosineRescore ? { cosine_rescore: req.cosineRescore } : {}),
   });
   return budgeted;
 }

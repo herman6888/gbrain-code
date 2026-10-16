@@ -25,6 +25,7 @@ import { opError } from '../ops/contract.ts';
 import type { Principal } from '../persistence/model.ts';
 import type { OwnerConfirmation } from './confirm.ts';
 import { tierRaiseFix } from './confirm.ts';
+import { releaseSuppressedFields, suppressedFields } from '../belief/purge.ts';
 import { decideTrustProposal } from './decide.ts';
 import { resolveContestedFactOnConfirm } from './supersede-handlers.ts';
 import { getTrustProposal, pendingTrustProposalsFor, trustProposalRef, type TrustDecisionResult, type TrustProposalRow } from './proposals.ts';
@@ -39,6 +40,7 @@ import { getWriteGateHold, releaseWriteGateHold, type WriteGateHold } from '../w
 import { withCoordinatedWrite, withTrustPromotion, withWriteAttribution, withWriteTrust } from '../persistence/context.ts';
 import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { lockedBeliefBatch } from '../belief/writers.ts';
 import {
   addTrustAllowRule, getTrustAllowRule, normalizeTrustAllowRule, parseAllowRuleRef, principalLabel, removeTrustAllowRule, type TrustAllowRule,
 } from './allow-rules.ts';
@@ -190,12 +192,14 @@ async function publishReleasedFact(tx: BrainEngine, hold: WriteGateHold): Promis
   const p = hold.payload;
   const str = (v: unknown) => (typeof v === 'string' && v ? v : null);
   const trust = { tier: 'user_confirmed' as const, origin: { channel: 'trust_release', request_id: hold.request_id ?? undefined } };
-  const write = () => withTrustPromotion(tx, 'user_confirmed', () => withWriteTrust(tx, trust, () => tx.insertFact({ // gbrain-allow-direct-insert: owner release of a held fact (CEO-9), inside the owner's coordinated transaction
+  // W1 #6783 §5.1: the released fact is recorded in its subject's stream, under that slug's page key.
+  const write = () => withTrustPromotion(tx, 'user_confirmed', () => withWriteTrust(tx, trust, () => lockedBeliefBatch(tx, { sourceId: hold.source_id,
+    slugs: str(p.entity_slug) ? [String(p.entity_slug)] : [], op: 'trust_release', remote: false, cause: { hold: `wh${hold.id}` } }, () => tx.insertFact({ // gbrain-allow-direct-insert: owner release of a held fact (CEO-9), inside the owner's coordinated transaction
     fact: String(p.fact ?? ''), kind: (str(p.kind) ?? 'fact') as never, entity_slug: str(p.entity_slug), visibility: (p.visibility === 'world' ? 'world' : 'private'),
     source: str(p.source) ?? `trust release h${hold.id}`, context: str(p.context), source_session: str(p.source_session), confidence: 1,
     valid_from: str(p.valid_from) ? new Date(String(p.valid_from)) : new Date(), valid_until: str(p.valid_until) ? new Date(String(p.valid_until)) : null,
     embedding: null, embedding_model: null,
-  }, { source_id: hold.source_id })));
+  }, { source_id: hold.source_id }))));
   if (await managedPersistenceEnabled(tx)) await withCoordinatedWrite(tx, [hold.source_id], write, await maintenanceAttribution(tx));
   else await withWriteAttribution(tx, await maintenanceAttribution(tx), write);
 }
@@ -258,9 +262,11 @@ function proposalSummary(p: TrustProposalRow, verb: 'Accept' | 'Dismiss' | 'Reve
     if (verb === 'Revert') return `Revert the agent edit of ${page}: restore version ${s.version_id ?? '?'} and its tier "${trustLabel(s.prior_tier)}"`;
     return `Dismiss ${trustProposalRef(p.id)}: ${page} stays "${trustLabel(s.edited_tier)}"`;
   }
-  const target = `${p.target_table === 'facts' ? 'f' : p.target_table === 'takes' ? 't' : ''}${p.target_id}`;
+  const target = `${p.target_table === 'facts' ? 'f' : p.target_table === 'takes' ? 't' : p.target_table === 'timeline_entries' ? 'timeline row ' : ''}${p.target_id}`;
   const related = p.related_id === null ? '' : ` with ${p.related_table === 'facts' ? 'f' : p.related_table === 'takes' ? 't' : ''}${p.related_id}`;
-  const what = p.action === 'forget' ? `forget ${target}` : p.action.startsWith('supersede') ? `supersede ${target}${related}` : `${p.action.replace('_', ' ')} ${target}${related}`;
+  // W1 #6783 §12 (a): a held take or timeline row names what the lower-tier write asked for.
+  const held = p.action === 'forget' && p.target_table !== 'facts' ? ({ removed: 'remove', replaced: 'replace', deactivated: 'deactivate', detail_changed: 'rewrite' } as Record<string, string>)[String(p.before_state.change)] : undefined;
+  const what = held ? `${held} ${target} as the page now says` : p.action === 'forget' ? `forget ${target}` : p.action.startsWith('supersede') ? `supersede ${target}${related}` : `${p.action.replace('_', ' ')} ${target}${related}`;
   return verb === 'Accept' ? `Accept ${trustProposalRef(p.id)}: ${what} (raises trust over "${trustLabel(storedTrustTier(p.before_state.prior_tier ?? p.before_state.tier))}")`
     : `Dismiss ${trustProposalRef(p.id)}: do not ${what}`;
 }
@@ -276,8 +282,10 @@ async function previewConfirm(engine: BrainEngine, ref: TrustRef, input: OwnerAc
     const row = ref.kind === 'fact' ? await readFactTarget(engine, ref.id) : await readTakeTarget(engine, ref.id);
     if (!row) throw notFound(label, ref.kind);
     if (!row.live) throw opError('invalid_params', `${label} is no longer active (expired, superseded or forgotten); there is nothing to confirm.`, 'Confirm the row that replaced it instead; gbrain trust explain shows its history.');
-    return { action: 'confirm', ref: label, token: label, command: trustCommand('confirm', label), raises: row.tier !== 'user_confirmed', binding: row.binding,
-      tier: row.tier, target_tier: 'user_confirmed', summary: `Raise ${ref.kind} ${label} ("${snippet(row.text)}") from "${trustLabel(row.tier)}" to "confirmed by you"` };
+    const release = await suppressedFields(engine, row.table, row.id);
+    return { action: 'confirm', ref: label, token: label, command: trustCommand('confirm', label), raises: row.tier !== 'user_confirmed' || release.length > 0, binding: row.binding,
+      tier: row.tier, target_tier: 'user_confirmed', summary: `Raise ${ref.kind} ${label} ("${snippet(row.text)}") from "${trustLabel(row.tier)}" to "confirmed by you"`
+        + (release.length ? ` and release its purge-redacted ${release.join(', ')} in recorded history` : '') };
   }
   if (ref.kind === 'page') {
     const { sourceId, slug } = await resolvePageRef(engine, ref, input.source);
@@ -439,11 +447,14 @@ export async function applyOwnerAction(engine: BrainEngine, input: OwnerActionIn
         const resolved = ref.kind === 'fact' && row.binding === opts.binding ? await resolveContestedFactOnConfirm(engine, ref.id, decision) : null;
         if (resolved?.status === 'accepted') return { action: input.action, ref: preview.ref, status: 'confirmed', tier: 'user_confirmed', prior_tier: row.tier, detail: { resolved_proposal: resolved.ref } };
         if (!preview.raises) return { action: input.action, ref: preview.ref, status: 'unchanged', tier: 'user_confirmed', prior_tier: 'user_confirmed' };
+        // BELIEF_LEDGER.md 6.5: the release is part of the confirm's publication, which released_by names.
+        let released: string[] = [];
         const ok = await setRowTier(engine, { table: row.table, id: row.id, sourceId: row.sourceId, tier: 'user_confirmed', ceiling: 'user_confirmed', by,
           note: { via: confirmation.via, action: 'confirm', by: principalLabel(by) },
-          expect: async tx => (await read(tx, ref.id))?.binding === opts.binding });
+          expect: async tx => (await read(tx, ref.id))?.binding === opts.binding,
+          also: async (tx, publicationId) => { released = await releaseSuppressedFields(tx, row.table, row.id, publicationId); } });
         if (!ok) throw opError('preview_changed', `${preview.ref} changed after you approved it; nothing was changed.`, 'Run the command again.');
-        return { action: input.action, ref: preview.ref, status: 'confirmed', tier: 'user_confirmed', prior_tier: row.tier };
+        return { action: input.action, ref: preview.ref, status: 'confirmed', tier: 'user_confirmed', prior_tier: row.tier, ...(released.length ? { detail: { released_redactions: released } } : {}) };
       }
       if (ref?.kind === 'page') {
         const { sourceId, slug } = await resolvePageRef(engine, ref, input.source);

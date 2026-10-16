@@ -22,7 +22,7 @@ import type { BrainEngine } from '../engine.ts';
 import { entityLookupScope, readAka, selectEntityCandidates, type EntityLookupScope } from './entity-card.ts';
 import { readSiblingIdentity } from './entity-card-identity.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
-import { boundedPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
+import { boundedBodyPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
 import { redactFindings } from '../secret-scan.ts';
 import type { Notice } from '../agent-output.ts';
 import { readRowReferences, type RowReferences } from './entity-references.ts';
@@ -91,7 +91,7 @@ async function lookupOne(engine: BrainEngine, sourceId: string, name: string, sc
   const bodies = new Map<string, string | null>([[row.slug, row.compiled_truth]]);
   if (siblingPages.length) {
     const sib = await engine.executeRaw<{ slug: string; source_id: string; compiled_truth: string | null }>(
-      `SELECT slug, source_id, ${boundedPrefixSql('compiled_truth')} AS compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`,
+      `SELECT slug, source_id, ${boundedBodyPrefixSql('pages')} AS compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`,
       [sourceId, siblingPages.map(p => p.slug)]).catch(() => []);
     for (const s of await overlaidBoundedRows(engine, sib)) bodies.set(s.slug, s.compiled_truth);
   }

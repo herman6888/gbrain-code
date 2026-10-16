@@ -107,8 +107,8 @@ export const MODES_REPORT_PER_CALL_NOTE =
   'Resolved from config overrides + the active mode bundle. Per-call SearchOpts ' +
   'overrides on individual searches are not shown — a call that passes its own ' +
   'knobs (e.g. expand, autocut, relational) wins for that call only. The `query` ' +
-  'op expands when the resolved `expansion` row below is on (the tokenmax ' +
-  'default; `search.expansion` overrides it) unless the call passes `expand` ' +
+  'op expands when the resolved `expansion` row below is on (off in every ' +
+  'mode by default; `search.expansion` overrides it) unless the call passes `expand` ' +
   '(`--expand` / `expand: true` forces it, `--no-expand` / `expand: false` ' +
   'skips it), while `search` never expands. Expansion needs configured embedding and expansion ' +
   'providers; requested expansion is not proof a provider ran. A configured ' +

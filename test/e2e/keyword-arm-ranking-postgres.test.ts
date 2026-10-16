@@ -64,7 +64,7 @@ describe('keyword arm plan (postgres)', () => {
     test(`\`${query}\` with excludePrivate runs the full-text match inside the OFFSET 0 subquery`, async () => {
       const { sql, params, rows } = await capturedKeywordStatement(query, true);
       expect(rows).toBeGreaterThan(0);
-      expect(sql).toMatch(/FROM \(\s*SELECT id, page_id, chunk_index, chunk_text, chunk_source, search_vector, language, symbol_type\s+FROM content_chunks\s+WHERE search_vector @@ websearch_to_tsquery\('[a-z_]+', \$1\) AND modality = 'text'\s+OFFSET 0\s*\) cc\s+JOIN pages p/);
+      expect(sql).toMatch(/FROM \(\s*SELECT id, page_id, chunk_index, chunk_text, chunk_source, search_vector, language, symbol_type, body_generation, retired_generation\s+FROM content_chunks\s+WHERE search_vector @@ websearch_to_tsquery\('[a-z_]+', \$1\) AND modality = 'text'\s+OFFSET 0\s*\) cc\s+JOIN pages p/);
       expect(sql).not.toMatch(/cc\.search_vector @@/);
       const plan = (await engine.executeRaw<{ 'QUERY PLAN': string }>(`EXPLAIN ${sql}`, params)).map((r) => r['QUERY PLAN']).join('\n');
       expect(plan).toContain('content_chunks');

@@ -215,9 +215,9 @@ describe('cost matrix: newest models, priced from model-pricing', () => {
 
   test('the menu states the query expansion rule and no cache refill', () => {
     const flat = MODE_PICKER_MENU.replace(/\s+/g, ' ');
-    expect(flat).toContain('`gbrain query` expands only when the mode says so');
+    expect(flat).toContain('`gbrain query` does not expand by default in any mode');
     expect(flat).toContain('`gbrain search` never expands');
-    expect(flat).toContain('`gbrain config set search.expansion false` turns the default off for the brain');
+    expect(flat).toContain('`gbrain config set search.expansion true` turns the default on for the brain');
     expect(flat).not.toMatch(/in every mode/);
     expect(MODE_PICKER_MENU).toContain('semantic result caching is temporarily disabled');
     expect(MODE_PICKER_MENU).toContain('gbrain search tune');

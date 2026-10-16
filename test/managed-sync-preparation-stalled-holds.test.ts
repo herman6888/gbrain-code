@@ -1,13 +1,15 @@
 /**
  * #6278 (B1): a managed sync member whose owner gave up preparing it
- * (`preparation_stalled`) is held, never re-entered: an import by its bytes, a
+ * (`preparation_stalled`) is held: an import by its bytes, a
  * delete as a delete hold, a rename with its endpoints; the checkpoint never
  * holds; `sync.holds=fail` keeps blocking. The hold lands behind the narrowed
  * gate: an unrelated maintenance write on the same source no longer blocks
  * it, a write on the same page still does, and a run killed before the cursor
  * consumed the failure holds the entry at the start of the next run. Every
  * surface routes the hold to writer status, then `sources retry-held` and the
- * same sync with its options, never to frontmatter repair. The forced probe
+ * same sync with its options, never to frontmatter repair. #6712: the hold is
+ * transient, so every sync retries it until it has been held
+ * `HOLD_ATTEMPTS_NEEDS_HUMAN` times; then it waits for `sources retry-held`. The forced probe
  * throws the terminal code from the consumer's `consumer:prepared` seam (the
  * single path) or the `publication:before_commit` seam inside the group transaction, so
  * the receipt is exactly what Lane A's consumer writes. Synthetic content only.
@@ -28,6 +30,7 @@ import { installFaultHook, type FaultPoint } from '../src/core/persistence/fault
 import { readGitSourceHolds, holdRescreenDue, readGitHoldRetryPaths, GIT_HOLD_SUMMARY_OP } from '../src/core/persistence/sync-holds.ts';
 import { drainManagedSync, readManagedSyncBacklog } from '../src/core/persistence/sync-drain.ts';
 import { preparationStallMeta } from '../src/core/persistence/sync-screen.ts';
+import { HOLD_ATTEMPTS_NEEDS_HUMAN } from '../src/core/persistence/sync-fault-class.ts';
 import { readHeldCoverage, coverageRoute } from '../src/core/persistence/held-reads.ts';
 import { retryHeld } from '../src/commands/sources-retry-held.ts';
 import { gitHeldFilesCheck } from '../src/commands/doctor/checks/git-holds.ts';
@@ -147,12 +150,21 @@ test('an import whose preparation stalls is held in the same run, the run finish
   expect(record!.meta.deleted).toBeUndefined();
   expect(await s.summary()).toMatchObject({ count: 1, stalled: 1, fences: 0 });
   expect(coverageRoute((await readHeldCoverage(engine, { sourceId: s.id }))[0]!)).toEqual({ fences: 0, others: 0, stalled: 1 });
-  // It waits: the next run neither re-screens the held bytes nor mints another receipt...
-  expect(holdRescreenDue(record!, false)).toBe(false);
+  // #6712: a transient hold (the owner stalled, not the file) is retried by every sync until it has been held
+  // HOLD_ATTEMPTS_NEEDS_HUMAN times; a retry that stalls again re-holds it under its new receipt...
+  expect(holdRescreenDue(record!, false)).toBe(true);
+  for (let attempt = 2; attempt <= HOLD_ATTEMPTS_NEEDS_HUMAN; attempt++) {
+    expect(await s.sync()).toMatchObject({ holds_outstanding: 1 });
+    expect(await s.failedRequests()).toHaveLength(attempt);
+    expect((await s.holds())[0]!.meta.attempts).toBe(attempt);
+  }
+  // ...then it waits: the next run neither re-screens the held bytes nor mints another receipt...
+  const waiting = (await s.holds())[0]!;
+  expect(holdRescreenDue(waiting, false)).toBe(false);
   expect(await s.sync()).toMatchObject({ status: 'up_to_date', holds_outstanding: 1 });
-  expect(await s.failedRequests()).toHaveLength(1);
+  expect(await s.failedRequests()).toHaveLength(HOLD_ATTEMPTS_NEEDS_HUMAN);
   // ...a different gbrain version would re-screen it...
-  expect(holdRescreenDue({ code: 'preparation_stalled', meta: { ...record!.meta, stall: { ...record!.meta.stall!, gbrain_version: '0.0.1' } } }, false)).toBe(true);
+  expect(holdRescreenDue({ code: 'preparation_stalled', meta: { ...waiting.meta, stall: { ...waiting.meta.stall!, gbrain_version: '0.0.1' } } }, false)).toBe(true);
   // ...doctor and retry-held route it the same way, and the retry's sync keeps the run's options.
   const check = await gitHeldFilesCheck(engine, [s.id]);
   expect(check.status).toBe('warn');
@@ -184,9 +196,12 @@ test('a stalled delete becomes a delete hold (no bytes); the page stays until re
   expect(record).toMatchObject({ path: 'notes/gone.md', code: 'preparation_stalled', upstream_version: null, page_id: expect.any(Number), meta: { deleted: true } });
   expect(result.held![0]!.fix.why).toContain('its deletion could not finish preparing');
   expectRoutedToWriter(result.held![0]!.fix, s.id);
-  // The absent file is not "a change": the hold waits instead of re-admitting the delete every run.
+  // #6712: the transient hold is retried by the next syncs (the absent file is not what re-admits it) until its attempt
+  // bound, then it waits instead of re-admitting the delete every run.
+  for (let attempt = 2; attempt <= HOLD_ATTEMPTS_NEEDS_HUMAN; attempt++) expect(await s.sync()).toMatchObject({ holds_outstanding: 1 });
+  expect(await s.failedRequests()).toHaveLength(HOLD_ATTEMPTS_NEEDS_HUMAN);
   expect(await s.sync()).toMatchObject({ status: 'up_to_date', holds_outstanding: 1 });
-  expect(await s.failedRequests()).toHaveLength(1);
+  expect(await s.failedRequests()).toHaveLength(HOLD_ATTEMPTS_NEEDS_HUMAN);
   installFaultHook(undefined);
   await retryHeld(engine, s.id);
   expect(await s.sync()).toMatchObject({ status: 'synced', deleted: 1 });
@@ -217,7 +232,9 @@ test('a stalled rename holds the destination with its origin; the hold gate lock
   const blocked = await s.sync();
   expect(blocked).toMatchObject({ status: 'blocked_by_failures', failureCodes: [{ code: 'preparation_stalled', count: 1 }] });
   expect(blocked.managedWrite).toMatchObject({ write_error: 'preparation_stalled' });
-  expect(await s.holds()).toHaveLength(1);
+  // #6712: the same sync retried the transient rename hold (its stall is gone) and imported it; the checkpoint's stall held nothing.
+  expect(await s.holds()).toEqual([]);
+  expect(await engine.getPage('notes/new', { sourceId: s.id })).not.toBeNull();
 }), 180_000);
 
 test('sync.holds=fail keeps blocking with the typed receipt; the next run after holds are on converts it at its start (a kill before the cursor consumed the failure)', () => each(async engine => {
@@ -367,9 +384,11 @@ test('retry-held while the stall persists: the file is re-held once under the ne
   expect(await s.summary()).toMatchObject({ count: 1, stalled: 1 });
   expect(await readGitHoldRetryPaths(engine, s.id, await s.incarnation())).toEqual([]);
   expect(await engine.getPage('notes/stuck', { sourceId: s.id })).toBeNull();
-  // It waits again: no third receipt without another retry.
+  // #6712: the automatic retries stop at HOLD_ATTEMPTS_NEEDS_HUMAN holds; past that no receipt without another retry-held.
+  for (let attempt = 3; attempt <= HOLD_ATTEMPTS_NEEDS_HUMAN; attempt++) expect(await s.sync()).toMatchObject({ holds_outstanding: 1 });
   expect(await s.sync()).toMatchObject({ status: 'up_to_date', holds_outstanding: 1 });
-  expect(await s.failedRequests()).toHaveLength(2);
+  expect(await s.failedRequests()).toHaveLength(HOLD_ATTEMPTS_NEEDS_HUMAN);
+  expect(await s.holds()).toHaveLength(1);
 }), 180_000);
 
 test('a scheduled re-screen survives a run killed before it reached the file; a run killed after freezing it carries it in its manifest and leaves no stale schedule', () => each(async engine => {

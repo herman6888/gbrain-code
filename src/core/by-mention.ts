@@ -32,7 +32,7 @@
 
 import { createHash } from 'crypto';
 import type { BrainEngine } from './engine.ts';
-import { isUndefinedTableError } from './utils.ts';
+import { isMissingSchemaObject } from './utils.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import { stripCodeBlocks, isCrossSourceLinksEnabled } from './link-extraction.ts';
 // #4222: shared generic-token reject list — same list gates enrichEntity
@@ -593,7 +593,7 @@ export async function buildGazetteer(
     // (mention-pass) build throws instead, so nothing is reconciled against
     // a partial gazetteer.
     if (opts.strict) throw err;
-    if (!isUndefinedTableError(err) && !aliasGazetteerWarned) {
+    if (!isMissingSchemaObject(err, 'table', 'page_aliases') && !aliasGazetteerWarned) {
       aliasGazetteerWarned = true;
       console.error(`[gbrain] gazetteer alias load degraded (titles-only): ${err instanceof Error ? err.message : String(err)}`);
     }

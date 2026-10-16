@@ -30,6 +30,12 @@ const rootGone = (relativePath: string) => opError('git_target_unsafe', 'The can
   `The canonical checkout was moved or deleted while ${relativePath} was being committed, so nothing was committed for it; the page write itself is committed. Inspect the owner and tell the user: Git effects resume only once the checkout is back, and how to restore it is their decision.`,
   { fix: effectStatusFix });
 
+/** #6665: Git for Windows' cached directory listing can still show a delete-pending file; a removal is probed and committed without it. */
+const NO_FSCACHE = ['-c', 'core.fscache=false'];
+const targetPending = (path: string) => opError('git_target_pending', `Git still lists ${path} in the index although it is absent on disk.`,
+  `The removal of ${path} could not be staged, so nothing was committed for it; the page write itself is committed. The effect worker retries it and parks it after repeated failures. On Windows another program (a sync watcher, an indexer or antivirus) may still hold the file open: close it, check with git -c core.fscache=false status on the brain host, then retry the parked effect.`,
+  { fix: effectStatusFix });
+
 const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never', GIT_GLOB_PATHSPECS: '0', GIT_NOGLOB_PATHSPECS: '0',
   GIT_ICASE_PATHSPECS: '0', LC_ALL: 'C' };
 
@@ -165,7 +171,11 @@ export async function commitGitTargets(root: string, relativePaths: string[], si
     const dirty = new Set((await list(['status', '--porcelain', '-z', '--no-renames', '--untracked-files=all'])).split('\0').filter(Boolean).map(entry => entry.slice(3)));
     const changed: { requested: string; path: string }[] = [];
     const staged: string[] = [];
+    // #6665: a tracked path absent on disk is staged as a removal without trusting status, which can
+    // still list a delete-pending file on Windows (core.fscache), so status said clean and nothing was committed.
+    const removed = new Set(paths.filter(path => tracked.has(path) && !existsSync(join(root, path))));
     for (const [requested, path] of normalized) {
+      if (removed.has(path)) continue;
       if (!tracked.has(path) && !(existsSync(join(root, path)) && dirty.has(path))) {
         try {
           const target = await stageTarget(root, hooks, requested, signal);
@@ -188,6 +198,22 @@ export async function commitGitTargets(root: string, relativePaths: string[], si
         else results.set(requested, { git: 'unchanged' });
       }
     }
+    if (removed.size) {
+      const removals = [...removed];
+      const rm = await git(root, hooks, [...NO_FSCACHE, 'rm', '--cached', '--quiet', '--ignore-unmatch', '--', ...removals], signal);
+      if (rm.code !== 0) throw gitFailure('Cannot stage the canonical Git target removal.', `git rm --cached failed for this group of ${removals.length} removed file(s).`);
+      const kept = await git(root, hooks, [...NO_FSCACHE, 'ls-files', '-z', '--', ...removals], signal);
+      const diff = await git(root, hooks, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--', ...removals], signal);
+      if (kept.code !== 0 || diff.code !== 0) throw gitFailure('Cannot compare the canonical Git target removal.', `git ls-files or git diff --cached failed for this group of ${removals.length} removed file(s).`);
+      const still = new Set(kept.stdout.split('\0').filter(Boolean));
+      const indexed = new Set(diff.stdout.split('\0').filter(Boolean));
+      for (const [requested, path] of normalized) {
+        if (!removed.has(path)) continue;
+        if (still.has(path)) results.set(requested, targetPending(path));
+        else if (indexed.has(path)) changed.push({ requested, path });
+        else results.set(requested, { git: 'unchanged' });
+      }
+    }
     if (!changed.length) return;
     // --only keeps unrelated staged paths out of this commit. After a lost
     // database acknowledgment the same HEAD/file state is an exact no-op.
@@ -198,7 +224,7 @@ export async function commitGitTargets(root: string, relativePaths: string[], si
       : commitText(noted.get(commitPaths[0]!)?.subject ?? '') || 'gbrain: persist canonical memory update';
     const body = commitPaths.length > 1 ? [...new Set([...noted.keys()].sort().map(path => commitText(noted.get(path)!.line)).filter(Boolean))] : [];
     const trailers = [...new Set([...noted.keys()].sort().map(path => commitText(noted.get(path)!.trailer ?? '')).filter(Boolean))];
-    const result = await git(root, hooks, ['commit', '--only', '-m', subject, ...(body.length ? ['-m', body.join('\n')] : []), ...(trailers.length ? ['-m', trailers.join('\n')] : []), '--', ...commitPaths], signal);
+    const result = await git(root, hooks, [...(commitPaths.some(path => removed.has(path)) ? NO_FSCACHE : []), 'commit', '--only', '-m', subject, ...(body.length ? ['-m', body.join('\n')] : []), ...(trailers.length ? ['-m', trailers.join('\n')] : []), '--', ...commitPaths], signal);
     const outcome = result.code === 0 ? { git: 'committed' } : gitFailure('Cannot commit the canonical Git target.',
       `git commit failed for ${commitPaths.length} file(s); a missing Git identity (user.name, user.email) in that checkout is one cause to check.`);
     for (const c of changed) results.set(c.requested, outcome);

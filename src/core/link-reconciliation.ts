@@ -8,6 +8,7 @@ import { buildSourceLocalReferenceIndex } from './source-local-reference-index.t
 import { collectWantedLinks, isWantedPagesEnabled } from './wanted-links.ts';
 import { readLineGrammarSettings } from './line-grammar.ts';
 import { DerivedLinkSettingsChangedError } from './derived-links.ts';
+import { isSegmentedPage } from './page-body/page-shape.ts';
 
 export interface LinkPageMetadata {
   slug: string;
@@ -92,6 +93,11 @@ export async function reconcileSourceLinks(
         return result;
       }
       const page = snapshot.page;
+      if (isSegmentedPage(page)) {
+        result.failures.push({ originSlug, code: 'page_body_segmented' });
+        result.nextAfterSlug = page.slug;
+        continue;
+      }
       const sourcesOf = makeLinkSourceResolver(page.slug, sourceId, endpoints, policy);
       const extracted = await extractPageLinks(page.slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter,
         page.type, resolver, { pack: opts.pack, globalBasename: opts.globalBasename, lineGrammar,

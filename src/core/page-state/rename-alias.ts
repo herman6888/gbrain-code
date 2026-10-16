@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { isUndefinedTableError } from '../utils.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 import { MOVE_WITHDRAWAL_SUBJECT_SQL } from '../facts/withdrawal-schema.ts';
 
 /**
@@ -28,7 +28,7 @@ export async function recordRenameAlias(
       [sourceId, oldSlug, newSlug]);
     });
   } catch (error) {
-    if (!isUndefinedTableError(error)) throw error;
+    if (!isMissingSchemaObject(error, 'table', 'slug_aliases')) throw error;
   }
 }
 
@@ -63,7 +63,7 @@ export async function moveSlugBindings(
     try {
       await tx.transaction(savepoint => savepoint.executeRaw(sql, [sourceId, oldSlug, newSlug]));
     } catch (error) {
-      if (!isUndefinedTableError(error)) throw error;
+      if (!isMissingSchemaObject(error, 'table', ['facts', 'page_aliases'])) throw error;
     }
   }
 }

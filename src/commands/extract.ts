@@ -43,7 +43,7 @@ import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { ATTENDANCE_REPAIR_HELP, isAttendanceRepairRequest } from './extract-attendance-repair.ts';
 import { join, relative, dirname } from 'path';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from '../core/engine.ts';
-import { isUndefinedTableError } from '../core/utils.ts';
+import { isMissingSchemaObject } from '../core/utils.ts';
 import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { resolveCandidateSources, resolveLinkFallbackDefault, loadLinkPageMetadata, capturedLinkEndpoints, fileLinkOwnership, replaceFileLinks, replacePageFileLinks, type LinkPageMetadata } from '../core/link-reconciliation.ts';
@@ -60,7 +60,7 @@ import {
   attendanceEvidenceRanges, hasAttendanceEvidence, resolvedLinkCandidate, orientCanonicalAttendance, extractMarkdownLinks,
   extractFrontmatterLinks, isGlobalBasenameEnabled, isCrossSourceLinksEnabled,
   WIKILINK_BASENAME_LINK_TYPE,
-  buildBasenameIndex, queryBasenameIndex, stripCodeBlocks, normalizeBasename,
+  buildBasenameIndex, queryBasenameIndex, stripCodeBlocks, normalizeBasename, exactSlugCandidates,
   parseInlineCitationTimelineEntries,
   type UnresolvedFrontmatterRef, type LinkCandidate, type LinkExtractionPack,
 } from '../core/link-extraction.ts';
@@ -509,7 +509,7 @@ async function loadSlugAliasTargets(engine: BrainEngine, sourceId: string, allSl
   try {
     rows = await engine.executeRaw('SELECT alias_slug, canonical_slug FROM slug_aliases WHERE source_id = $1', [sourceId]);
   } catch (error) {
-    if (!isUndefinedTableError(error)) throw error;
+    if (!isMissingSchemaObject(error, 'table', 'slug_aliases')) throw error;
   }
   const aliases = new Map(rows.filter(row => !allSlugs.has(row.alias_slug) && allSlugs.has(row.canonical_slug))
     .map(row => [row.alias_slug, row.canonical_slug]));
@@ -621,12 +621,11 @@ export async function extractLinksFromFile(
       async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
         if (!name) return null;
         const trimmed = name.trim();
-        // Same broadened slug-shape as makeResolver step 1: accepts
-        // digit-leading folders (`90-people/nicolai`) and nested paths.
-        // Exact Set membership guards it — no false positives.
-        if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed) && allSlugs.has(trimmed)) {
-          return canonical(trimmed);
-        }
+        // Same exact candidates as makeResolver step 1 (slug-shaped value,
+        // then the slug sync mints for the path). Exact Set membership
+        // guards it, so no false positives.
+        const exact = exactSlugCandidates(trimmed).find(candidate => allSlugs.has(candidate));
+        if (exact) return canonical(exact);
         const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
         // Both slug grammars, as in makeResolver step 2 (#4855): the folded
         // basename form and the unfolded page-slug form sync mints.

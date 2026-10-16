@@ -13,6 +13,8 @@ import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
 import { derivedExtractionSkip } from './derived-extraction-gate.ts';
+import { bodyStorageOf, stringWriteStorage } from './segmented-apply.ts';
+import { isSegmentedPage, pageBodyBytes } from '../page-body/page-shape.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
@@ -94,6 +96,7 @@ export async function prepareFactsBackstop(engine: BrainEngine, row: WriteReques
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };
+  if ((await stringWriteStorage(engine, pageBodyBytes(page), bodyStorageOf(before?.page))).storage === 'segmented') return { skipped: 'page_body_segmented' };
   if (await bodyAlreadyOffered(engine, row.slug, page, before)) return { skipped: 'body_unchanged' };
   return { queued: true };
 }
@@ -117,6 +120,7 @@ export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record
       throw error;
     }
   }
+  if (isSegmentedPage(snapshot.page)) return { skipped: 'page_body_segmented' } as const;
   return { page: snapshot.page };
 }
 
@@ -145,7 +149,8 @@ export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: P
     // #6231: the page-write filter in force when the effect dispatches; the job keeps it across retries.
     const notabilityFilter = await resolvePageWriteNotabilityFilter(tx);
     const job = await new MinionQueue(tx).add('facts-absorb', {
-      slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', notabilityFilter,
+      // #6333: a stable per-page session (mirrors sync's `sync:<slug>`) so a re-extraction feeds the same-page shadow counter.
+      slug: effect.data.slug, sourceId: effect.source_id, source: 'mcp:put_page', sessionId: `put_page:${effect.data.slug}`, notabilityFilter,
       visibility: effect.data.visibility === 'world' ? 'world' : 'private',
       persistence_request_id: effect.request_id, page_id: effect.data.page_id, revision: effect.revision,
     }, { queue: 'default', idempotency_key: `facts-absorb:write:${effect.request_id}`, max_attempts: 5, backoff_delay: 60_000 });

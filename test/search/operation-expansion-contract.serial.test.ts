@@ -1,11 +1,12 @@
 /**
  * The `query` expansion contract: the search mode decides the default
- * (`expansion` off in conservative and balanced, on in tokenmax, overridden
- * by `search.expansion`), an explicit `expand` wins in either direction, the
- * expander stays wired whenever expansion can resolve on (so tokenmax still
- * expands), and `search` never expands. Rewritten from the earlier pin
- * ("query requests expansion in every mode") when the default moved to the
- * mode (GBRA-81 item 1b).
+ * (`expansion` off in all three bundles since GBRA-94, overridden by
+ * `search.expansion`), an explicit `expand` wins in either direction, the
+ * expander stays wired whenever expansion can resolve on (so
+ * `search.expansion true` still expands), and `search` never expands.
+ * Rewritten from the earlier pin ("query requests expansion in every mode")
+ * when the default moved to the mode (GBRA-81 item 1b); tokenmax's default
+ * turned off on the 2026-10-14 expansion-latency eval (GBRA-94).
  *
  * Serial: configures the process-global gateway with a stub embedder so the
  * vector path (where expansion runs) is reached without a provider call.
@@ -86,7 +87,7 @@ async function resetSearchConfig(mode: string, expansionOverride: string | undef
 describe('query expansion follows the search mode', () => {
   for (const mode of ['conservative', 'balanced', 'tokenmax'] as const) {
     for (const override of [undefined, 'true', 'false'] as const) {
-      const modeDefault = override === undefined ? mode === 'tokenmax' : override === 'true';
+      const modeDefault = override === 'true';
       test(`${mode}, search.expansion=${override ?? 'unset'}: default ${modeDefault ? 'expands' : 'does not expand'}, explicit expand wins, search never expands`, async () => {
         await resetSearchConfig(mode, override);
         const probe = spyHybrid(q => [q, `${q} alternate phrasing`]);
@@ -129,30 +130,36 @@ describe('query expansion follows the search mode', () => {
   }
 });
 
-describe('per-brain off switch: `gbrain config set search.expansion false`', () => {
+describe('per-brain switch: `gbrain config set search.expansion true|false`', () => {
   async function runQueryCli(argv: string[], probe: ReturnType<typeof spyHybrid>): Promise<number> {
     const before = probe.expanderCalls.length;
     await operationsByName.query.handler(makeCtx({}), parseOpArgs(operationsByName.query, argv));
     return probe.expanderCalls.length - before;
   }
 
-  test('unset expands in tokenmax, false stops it, an explicit --expand still wins, unset again restores it', async () => {
+  test('unset does not expand in tokenmax, true turns it on, false pins it off, explicit flags still win, unset restores the default', async () => {
     await resetSearchConfig('tokenmax', undefined);
     const probe = spyHybrid(q => [q, `${q} alternate phrasing`]);
     const log = spyOn(console, 'log').mockImplementation(() => {});
     try {
       expect(parseOpArgs(operationsByName.query, ['Zirconiumneedle retrieval'])).not.toHaveProperty('expand');
+      expect((await buildModesReport(engine)).resolved.expansion).toMatchObject({ value: false });
+      expect(await runQueryCli(['Zirconiumneedle retrieval'], probe)).toBe(0);
+      expect(await runQueryCli(['Zirconiumneedle retrieval', '--expand'], probe)).toBe(1);
+
+      await runConfig(engine, ['set', 'search.expansion', 'true']);
+      expect(await engine.getConfig('search.expansion')).toBe('true');
+      expect((await buildModesReport(engine)).resolved.expansion).toMatchObject({ value: true, source: 'override' });
       expect(await runQueryCli(['Zirconiumneedle retrieval'], probe)).toBe(1);
+      expect(await runQueryCli(['Zirconiumneedle retrieval', '--no-expand'], probe)).toBe(0);
 
       await runConfig(engine, ['set', 'search.expansion', 'false']);
-      expect(await engine.getConfig('search.expansion')).toBe('false');
       expect((await buildModesReport(engine)).resolved.expansion).toMatchObject({ value: false, source: 'override' });
       expect(await runQueryCli(['Zirconiumneedle retrieval'], probe)).toBe(0);
       expect(await runQueryCli(['Zirconiumneedle retrieval', '--expand'], probe)).toBe(1);
-      expect(await runQueryCli(['Zirconiumneedle retrieval', '--no-expand'], probe)).toBe(0);
 
       await runConfig(engine, ['unset', 'search.expansion']);
-      expect(await runQueryCli(['Zirconiumneedle retrieval'], probe)).toBe(1);
+      expect(await runQueryCli(['Zirconiumneedle retrieval'], probe)).toBe(0);
     } finally {
       log.mockRestore();
       probe.restore();
@@ -206,7 +213,7 @@ describe('CRAG escalation reads what the first pass did', () => {
 });
 
 describe('tuning advice', () => {
-  test('tokenmax with a Haiku subagent: balanced also turns off the expansion default', async () => {
+  test('tokenmax with a Haiku subagent: balanced caps the payload (no expansion claim: neither mode expands by default)', async () => {
     await engine.executeRaw(`DELETE FROM config WHERE key LIKE 'search.%'`);
     await engine.setConfig('search.mode', 'tokenmax');
     await engine.setConfig('models.tier.subagent', 'haiku');
@@ -220,7 +227,7 @@ describe('tuning advice', () => {
     expect(report.recommendations.some(row => row.knob.startsWith('search.cache.'))).toBe(false);
     const mode = report.recommendations.find(row => row.knob === 'search.mode');
     expect(mode?.suggested).toBe('balanced');
-    expect(mode?.reason).toContain('turns off query expansion by default');
+    expect(mode?.reason).not.toContain('expansion');
     expect(mode?.reason).toContain('12K tokens');
   });
 });

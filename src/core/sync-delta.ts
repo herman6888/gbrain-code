@@ -31,7 +31,7 @@
  * require A to be an ancestor of B (unlike a rev-walk or `A...B` merge-base).
  * That is the #1970 property this module preserves.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from './spawn.ts';
 import { buildSyncManifest, type SyncManifest } from './sync.ts';
 import { gitChildEnv } from './git-env.ts';
 

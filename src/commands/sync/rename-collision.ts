@@ -15,6 +15,9 @@
 import type { BrainEngine } from '../../core/engine.ts';
 import { moveSlugBindings } from '../../core/page-state/rename-alias.ts';
 import { maintenanceTransaction } from '../../core/persistence/attribution.ts';
+import { randomUUID } from 'node:crypto';
+import { lockedBeliefBatch } from '../../core/belief/writers.ts';
+import { markBeliefCommits } from '../../core/belief/append.ts';
 
 export type RenameOutcome = 'renamed' | 'noop' | 'live_destination';
 
@@ -31,13 +34,20 @@ export function purgedSlug(slug: string, pageId: number): string {
 
 export async function renamePageOntoSlug(engine: BrainEngine, input: { sourceId: string; oldSlug: string; newSlug: string; to: string }): Promise<RenameOutcome> {
   const { sourceId, oldSlug, newSlug, to } = input;
-  const move = async (tx: BrainEngine) => {
+  const publicationId = randomUUID();
+  const report = { appended: 0 };
+  // W1 #6783 §3: the moved row keeps its id, so its batch pairs both sides into one page.renamed on the same lifetime.
+  const move = (tx: BrainEngine) => lockedBeliefBatch(tx, { sourceId, slugs: [oldSlug, newSlug], publicationId, op: 'sync_rename', remote: false, report }, async () => {
     const moved = await tx.updateSlug(oldSlug, newSlug, { sourceId });
     if (moved > 0) await tx.executeRaw('UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3', [to, sourceId, newSlug]);
     return moved;
+  });
+  const recorded = async <T>(outcome: T) => {
+    if (report.appended) await markBeliefCommits(engine, [publicationId]).catch(() => undefined);
+    return outcome;
   };
   try {
-    return (await maintenanceTransaction(engine, move)) > 0 ? 'renamed' : 'noop';
+    return recorded((await maintenanceTransaction(engine, move)) > 0 ? 'renamed' : 'noop');
   } catch (error) {
     if (!isUniqueViolation(error)) throw error;
     const [destination] = await engine.executeRaw<{ id: number | string; tombstone: boolean }>(
@@ -47,14 +57,15 @@ export async function renamePageOntoSlug(engine: BrainEngine, input: { sourceId:
     const tombstoneId = Number(destination.id);
     const nothingToMove = Symbol('nothing to move');
     try {
-      return await maintenanceTransaction(engine, async tx => {
+      return await recorded(await maintenanceTransaction(engine, async tx => {
+        await tx.lockPageKeys([{ sourceId, slug: oldSlug }, { sourceId, slug: newSlug }]);
         const rekeyed = await tx.executeRaw<{ id: number }>(
           'UPDATE pages SET slug = $1 WHERE id = $2 AND source_id = $3 AND deleted_at IS NOT NULL RETURNING id', [purgedSlug(newSlug, tombstoneId), tombstoneId, sourceId]);
         if (!rekeyed.length) return 'live_destination' as const;
         await moveSlugBindings(tx, sourceId, newSlug, purgedSlug(newSlug, tombstoneId));
         if (await move(tx) === 0) throw nothingToMove;
         return 'renamed' as const;
-      });
+      }));
     } catch (merge) {
       if (merge === nothingToMove) return 'noop';
       throw merge;

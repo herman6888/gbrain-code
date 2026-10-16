@@ -13,6 +13,7 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
     return;
   }
   const json = args.includes('--json');
+  const dryRun = args.includes('--dry-run');
   const { OperationError } = await import('../../core/ops/contract.ts');
   const { reportPersistenceCliError } = await import('../../commands/persistence-delegate.ts');
   const refuse = async (error: InstanceType<typeof OperationError>) => {
@@ -21,7 +22,7 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
   };
   const limitAt = args.indexOf('--limit');
   const limitValue = limitAt === -1 ? undefined : args[limitAt + 1];
-  const known = new Set(['drain', '--json', '--limit', ...(limitValue === undefined ? [] : [limitValue])]);
+  const known = new Set(['drain', '--json', '--dry-run', '--limit', ...(limitValue === undefined ? [] : [limitValue])]);
   const unknown = args.find(arg => !known.has(arg));
   if (args[0] !== 'drain' || unknown !== undefined) {
     await refuse(new OperationError('invalid_params', `Unknown projections argument '${unknown ?? args[0]}'.`,
@@ -51,6 +52,19 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
   const { createProgress } = await import('../../core/progress.ts');
   const { cliOptsToProgressOptions } = await import('../../core/cli-options.ts');
   const engine = await ctx.connectEngine();
+  if (dryRun) {
+    // #6803: the preview reads the queue and rebuilds nothing.
+    try {
+      const preview = await projections.previewProjectionDrain(engine, limit ?? 50);
+      if (json) { await writeStdoutFinal(JSON.stringify(preview) + '\n'); return; }
+      const lines = preview.rows.map(row => `  ${row.reason === 'rebuild_failed' ? 'last failed' : 'queued'}: ${row.source_id}/${row.slug} (${row.reason}, since ${row.updated_at})`);
+      await writeStdoutFinal([`projections drain --dry-run: ${preview.pending} queued, ${preview.failed} last failed; nothing was rebuilt.`, ...lines,
+        preview.pending ? 'Run `gbrain projections drain` to rebuild them; a page that fails again is printed with its next step.' : 'The projection backlog is empty.'].join('\n') + '\n');
+    } finally {
+      await finishCliTeardown({ engine });
+    }
+    return;
+  }
   try {
     const result = await projections.drainProjections(engine, { limit, progress: createProgress(cliOptsToProgressOptions(getCliOptions())) });
     if (json) {

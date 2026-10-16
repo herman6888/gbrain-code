@@ -138,6 +138,7 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, true | (() => Promise<(engine: ne
     (await import('../commands/compile-context.ts')).runCompileContext as never,
   // runLoops / runWaiting answer --help before touching the engine.
   loops: async () => (await import('../commands/loops.ts')).runLoops as never,
+  beliefs: async () => (await import('../commands/beliefs.ts')).runBeliefs as never,
   'edge-proposals': async () => (await import('../commands/edge-proposals.ts')).runEdgeProposals as never,
   questions: async () => (await import('../commands/questions.ts')).runQuestions as never, // --help before the engine
   waiting: async () => (await import('../commands/loops.ts')).runWaiting as never,
@@ -2448,7 +2449,7 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
         const { syncWatchdogPlan } = await import('../core/sync-reconcile.ts');
         const plan = syncWatchdogPlan(args, res);
         syncWatchdog = installProcessWatchdog(plan.watchdog);
-        (await import('../core/forward-progress.ts')).registerRunDeadline({ atMs: Date.now() + res.deadlineMs, strict: !res.progressWindowMs });
+        (await import('../core/forward-progress.ts')).registerRunDeadline({ atMs: Date.now() + res.deadlineMs, strict: !res.progressWindowMs, ...(res.progressWindowMs ? { progressWindowMs: res.progressWindowMs } : {}) });
         process.stderr.write(plan.armedLine);
       }
     } catch (e) {

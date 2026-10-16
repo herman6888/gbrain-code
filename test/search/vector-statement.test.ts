@@ -7,9 +7,10 @@
  * timeline `stale` column.
  */
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { buildVectorSearchStatement, INDEX_WALK_MIN_SCOPE_SHARE, indexWalkOverfetch, SCOPE_SCAN_FIRST_MAX_CHUNKS, SCOPE_SCAN_MAX_CHUNKS, SCOPE_SCAN_MAX_SHARE, sourceScope, sourceScopeShare, vectorScopeLoader, type PageSourceStats, type VectorSearchStatementInput } from '../../src/core/search/vector-statement.ts';
+import { buildVectorSearchStatement, INDEX_WALK_MIN_SCOPE_SHARE, INDEX_WALK_PAGE_COLUMNS, indexWalkOverfetch, SCOPE_SCAN_FIRST_MAX_CHUNKS, SCOPE_SCAN_MAX_CHUNKS, SCOPE_SCAN_MAX_SHARE, sourceScope, sourceScopeShare, vectorScopeLoader, type PageSourceStats, type VectorSearchStatementInput } from '../../src/core/search/vector-statement.ts';
 import { _resetVectorLegacyGuardForTests, readVectorLegacyGuard, resolveVectorLegacyGuard } from '../../src/core/search/vector-legacy-guard.ts';
 import { withEnv } from '../helpers/with-env.ts';
+import { TRUST_TIERS } from '../../src/core/trust/tier.ts';
 
 const MD5 = 'md5(cc.chunk_text)';
 const indexedColumn = { name: 'embedding', type: 'vector' as const, dimensions: 1536, embeddingModel: 'openai:text-embedding-3-large' };
@@ -114,14 +115,29 @@ describe('vector index walk statement', () => {
     expect(ann).not.toContain(MD5);
     expect(ann).toContain(`LIMIT $${stmt.innerLimitIdx + 1}::int * 2`);
     const candidates = walk.slice(walk.indexOf('hnsw_candidates AS ('), walk.indexOf('scored AS ('));
-    expect(candidates).toContain('JOIN content_chunks cc ON cc.id = ann.id');
-    expect(candidates).toContain('JOIN pages p ON p.id = cc.page_id');
+    expect(candidates).toContain('CROSS JOIN LATERAL (SELECT * FROM content_chunks c WHERE c.id = ann.id OFFSET 0) cc');
+    expect(candidates).toContain(`CROSS JOIN LATERAL (SELECT ${INDEX_WALK_PAGE_COLUMNS.map(c => `pg.${c}`).join(', ')} FROM pages pg WHERE pg.id = cc.page_id OFFSET 0) p`);
     expect(candidates).toContain('AND p.slug != ALL($2::text[])');
     expect(candidates).toContain('AND p.source_id = ANY($4::text[])');
     expect(candidates).toContain(`COALESCE(p.frontmatter->>'visibility'`);
     expect(candidates).toContain('ORDER BY ann.distance, ann.id');
     expect(candidates).toContain(`LIMIT $${stmt.innerLimitIdx + 1}::int`);
     expect(scoredCte(walk)).toContain('WHERE $5::text IS NULL OR hash_current');
+  });
+
+  test('the page probe projects every page column the candidates read, and no body column', () => {
+    const variants = [{}, { excludePrivate: true }, { sourceIds: ['a', 'b'] }, { exclude_slugs: ['x'] },
+      { exclude_slug_prefixes: ['x/'] }, { include_slug_prefixes: ['y/'] }, { detail: 'low' as const }, { language: 'typescript', symbolKind: 'function' }, { minTrust: TRUST_TIERS[TRUST_TIERS.length - 1] }, { suppressFlagged: true },
+      { excludePrivate: true, sourceIds: ['a', 'b'], exclude_slug_prefixes: ['x/'], detail: 'low' as const }];
+    const read = new Set<string>();
+    for (const dialect of ['postgres', 'pglite'] as const) for (const v of variants) {
+      const walk = build(v, dialect).indexWalkSql!;
+      const candidates = walk.slice(walk.indexOf('hnsw_candidates AS ('), walk.indexOf('ORDER BY ann.distance'));
+      for (const m of candidates.matchAll(/\bp\.(\w+)/g)) read.add(m[1]!);
+    }
+    expect([...read].filter(c => !(INDEX_WALK_PAGE_COLUMNS as readonly string[]).includes(c))).toEqual([]);
+    expect(INDEX_WALK_PAGE_COLUMNS).not.toContain('compiled_truth');
+    expect(INDEX_WALK_PAGE_COLUMNS).not.toContain('timeline');
   });
 
   test('exists only for the relaxed variant without a type or date filter, and binds the same parameters', () => {

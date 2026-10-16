@@ -41,7 +41,8 @@ import type { MinionQueue } from '../core/minions/queue.ts';
 import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
 import { CONNECTOR_SOURCE_PHASES } from '../core/cycle/phase-scope.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
-import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
+import { attemptedConnectorSourceIds, type ConnectorAccountMismatch } from '../core/persistence/connector-state.ts';
+import { connectorAccountMismatches, connectorAccountMismatchSkipWarning } from '../core/persistence/connector-account-mismatch.ts';
 import { parseSourceConfig, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
 import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
 import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip } from '../core/sync-policy.ts';
@@ -368,6 +369,7 @@ export function selectSourcesForDispatch(
   cooldownOpts: CooldownOpts = { baseMin: FAILURE_COOLDOWN_BASE_MIN, capMin: FAILURE_COOLDOWN_CAP_MIN },
   pathExists: (path: string) => boolean = () => true,
   connectorIds: ReadonlySet<string> = new Set(),
+  accountMismatches: ReadonlyMap<string, ConnectorAccountMismatch> = new Map(),
 ): {
   dispatch: SourceRow[];
   skippedFresh: SourceRow[];
@@ -382,7 +384,9 @@ export function selectSourcesForDispatch(
   const cooldown: SourceRow[] = [];
   const unavailablePath: Array<SourceRow & { skip_warning: string }> = [];
   for (const s of sources) {
-    const skipWarning = s.local_path && !connectorIds.has(s.id) ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
+    const mismatch = connectorIds.has(s.id) ? accountMismatches.get(s.id) : undefined;
+    const skipWarning = mismatch ? connectorAccountMismatchSkipWarning(s.id, mismatch)
+      : s.local_path && !connectorIds.has(s.id) ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
     if (skipWarning) {
       unavailablePath.push({ ...s, skip_warning: skipWarning });
       continue;
@@ -542,6 +546,8 @@ export async function dispatchPerSource(
   }
 
   const pathExists = opts.pathExists ?? existsSync;
+  // #6803: a connector whose credential resolves to another account is unavailable until the operator repins it.
+  const accountMismatches = connectorIds.size ? await connectorAccountMismatches(engine).catch(() => new Map<string, ConnectorAccountMismatch>()) : new Map<string, ConnectorAccountMismatch>();
   const { dispatch, skippedFresh, skippedCap, skippedCooldown, skippedUnavailablePath } =
     selectSourcesForDispatch(
       sources,
@@ -552,6 +558,7 @@ export async function dispatchPerSource(
       cooldownOpts,
       pathExists,
       connectorIds,
+      accountMismatches,
     );
 
   for (const src of skippedUnavailablePath) {

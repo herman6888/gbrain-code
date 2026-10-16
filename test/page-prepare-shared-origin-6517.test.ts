@@ -43,6 +43,8 @@ import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { repairRunner } from '../src/core/repair/registry.ts';
+import { resolveRepairScope } from '../src/core/repair/core.ts';
 
 const op = (name: string) => operations.find(o => o.name === name)!;
 const git = (root: string, ...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -128,25 +130,44 @@ for (const backend of testBackends()) describe(`[${backend}] #6517 delete of a s
     expect((await page(f.id, 'alpha-twin'))!.deleted_at).not.toBeNull();
   }, 120_000);
 
-  test('[R8] deleting the page the file was synced into keeps the file for the twin, which the next sync imports the file into', async () => {
+  test('[R8] deleting the page the file was synced into keeps the file for the twin; sync holds the twin file_drift and repair file-drift --prefer file imports the file', async () => {
     const f = await twins('path');
     const result = await (await del(f.id, 'alpha'))();
     expect(result).toMatchObject({ state: 'committed', status: 'soft_deleted', write_through: { written: false, skipped: 'shared_origin' } });
     expect(result.write_through.warning).toContain('alpha-twin');
-    expect(result.write_through.warning).toContain(`gbrain sync --source ${f.id} --no-pull --full`);
+    // #6712 PR 1: the receipt names the repair that imports the file into the survivor, never a --full sync (which holds it).
+    const repair = ['gbrain', 'repair', 'file-drift', '--source', f.id, '--slug', 'alpha-twin', '--prefer', 'file'];
+    expect(result.write_through.warning).toContain(repair.join(' '));
+    expect(result.write_through.warning).not.toContain('--full');
     expect(readFileSync(f.file)).toEqual(Buffer.from(f.bytes));
-    // The kept file still holds the deleted page's text and is unchanged in git, so an incremental sync has nothing to import;
-    // the full sync the receipt names imports it into the survivor.
+    // The kept file still holds the deleted page's text and is unchanged in git, so an incremental sync has nothing to import.
     expect((await withEnv(env, () => performManagedSync(engine, f.opts))).status).toBe('up_to_date');
     expect((await page(f.id, 'alpha-twin'))!.compiled_truth).toBe('A twin recording alpha.');
-    const synced = await withEnv(env, () => performManagedSync(engine, { ...f.opts, full: true }));
-    expect(synced.managedWrite).toBeUndefined();
+    // #6712 PR 1 (eng-review finding): the twin has no import record and differs from the file, so a tree walk holds it
+    // file_drift instead of overwriting it; the hold's fix leads with the same repair as the receipt.
+    const held = await withEnv(env, () => performManagedSync(engine, { ...f.opts, full: true }));
+    expect(held.managedWrite).toBeUndefined();
+    expect((held.held ?? []).map(item => [item.path, item.code, item.slug])).toEqual([['alpha.md', 'file_drift', 'alpha-twin']]);
+    const fix = held.held![0]!.fix;
+    expect(fix.argv).toEqual(repair);
+    // No fix text the run returns (the hold's fix, its follow-up steps, the run's next steps) tells the survivor to run --full.
+    expect(JSON.stringify(held)).not.toContain('--full');
+    expect((await page(f.id, 'alpha-twin'))!.compiled_truth).toBe('A twin recording alpha.');
+    const logger = { info() {}, warn() {}, error() {} };
+    await withEnv(env, async () => {
+      const scope = await resolveRepairScope(engine, f.id);
+      const preview = await (await repairRunner(engine, { apply: false, logger })).run('file-drift', scope, { explicit: true, sourceFlag: f.id, slugs: ['alpha-twin'], prefer: 'file' });
+      expect(preview).toMatchObject({ mode: 'dry_run', affected: 1 });
+      const applied = await (await repairRunner(engine, { apply: true, logger })).run('file-drift', scope,
+        { explicit: true, sourceFlag: f.id, slugs: ['alpha-twin'], prefer: 'file', expect: preview.preview_hash });
+      expect(applied.outcomes).toEqual({ repaired: 1 });
+    });
+    const synced = await withEnv(env, () => performManagedSync(engine, f.opts));
     expect(synced.held_count ?? 0).toBe(0);
     const survivor = (await page(f.id, 'alpha-twin'))!;
     expect(survivor.deleted_at).toBeNull();
     expect(survivor.compiled_truth).toContain('Observation of alpha, version one.');
     expect((await page(f.id, 'alpha'))!.deleted_at).not.toBeNull();
-    // The import's write-back normalizes the file's frontmatter; its body is the observation, and the checkout is committed.
     expect(readFileSync(f.file, 'utf8')).toContain('Observation of alpha, version one.');
   }, 120_000);
 

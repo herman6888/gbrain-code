@@ -78,6 +78,8 @@ export interface HybridRequest {
   vectorPoolUnderfill: HybridSearchMeta['vector_pool_underfilled'];
   /** #5989: the last bounded CJK keyword arm outcome. */
   keywordCandidates?: HybridSearchMeta['keyword_candidates'];
+  /** Set when the cosine re-score fell back from SQL to JavaScript (search/cosine-rescore.ts). */
+  cosineRescore?: HybridSearchMeta['cosine_rescore'];
   /** v0.25.0: whether query expansion actually produced variants (onMeta). */
   expansionApplied: boolean;
   /** Telemetry counters set at each return path before emitHybridMeta. */

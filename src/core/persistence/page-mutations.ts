@@ -27,19 +27,20 @@ import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequ
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
 import type { BrainEngine } from '../engine.ts';
-import { claimWorktree, getWorktreeBinding, managedPersistenceEnabled } from './ownership.ts';
+import { claimWorktree, getWorktreeBinding } from './ownership.ts';
 import { clientRequestIdOf, parseMutationPrecondition } from './preconditions.ts';
 import { assertPurgeParams } from './purge-params.ts';
 import type { Principal, WriteRequest } from './model.ts';
 import { normalizeSubagentPageInput, undeclaredPageTypeWarning, type PageTypeWarning } from './page-input.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
-import { isUnboundSourcePage, readDatabaseOnlyActivatedSources, readUnboundWritePolicy, unboundSourceError } from './unbound-source.ts';
+import { decideUnboundWrite, isUnboundSourcePage } from './unbound-source.ts';
+import { assertRestoreOrigin } from './detached-pages.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
 import { publishesDatabaseOnly } from './page-prepare.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 import { cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { isConnectorSourceKind } from './connector-identity.ts';
 
 export async function requestPrincipalForContext(ctx: OperationContext): Promise<Principal> {
   // #5994: a failed-writes replay is admitted under the original writer.
@@ -349,7 +350,7 @@ export async function preparePageAdmission(ctx: OperationContext,
     const { applyPageEdits, assertEditRevision, parsePageEdits } = await import('./page-edit.ts');
     if (!snapshot || snapshot.page.deleted_at) throw new OperationError('page_not_found', `Page not found: ${slug}`, 'edit_page changes an existing page; create it with put_page.');
     assertEditRevision(snapshot.revision, p.expected_revision);
-    applyPageEdits(snapshot.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
+    applyPageEdits((await materializedSnapshot(ctx.engine, snapshot))!.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
   }
   let binding = boundAtStart;
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
@@ -371,26 +372,18 @@ export async function preparePageAdmission(ctx: OperationContext,
     if (!matches) throw new OperationError('invalid_params', 'The CLI directory must match the selected source canonical root.',
       'Register the source canonical path, then omit --dir or use that same path.');
   }
-  // A connector source without a canonical owner is database-only by design
-  // (connector_database): a page write never claims it or refuses as unbound.
-  if (writeThrough && root && !binding && isConnectorSourceKind(source.kind)) authority.databaseOnlyReason = 'connector_database';
-  else if (writeThrough && root && !binding) {
-    // #6449: a source activation listed database-only (sync.write_through was off) is never claimed by a flip of that
-    // setting: the write refuses with the claim named (or stays database-only under persistence.unbound_write), as on Postgres.
-    const databaseOnlyActivated = ctx.engine.kind === 'pglite' && (await readDatabaseOnlyActivatedSources(ctx.engine)).includes(sourceId);
-    if (ctx.engine.kind === 'pglite' && !databaseOnlyActivated) binding = await claimWorktree(ctx.engine, sourceId, root, undefined, undefined, { automatic: true });
-    else {
-      // #5393: the opt-in covers every page mutation whose target has no
-      // recorded canonical file; a revert is also judged on the version it writes.
-      const fileBacked = Boolean(snapshot?.page.source_path) || (input.operation === 'revert_version' && snapshot
-        && (await ctx.engine.executeRaw<{ source_path: string | null }>('SELECT source_path FROM page_versions WHERE id=$1 AND page_id=$2',
-          [p.version_id, snapshot.page.id]))[0]?.source_path);
-      if (fileBacked || await readUnboundWritePolicy(ctx.engine) !== 'database_only') {
-        throw unboundSourceError(sourceId, ctx.remote === false ? root : null, fileBacked ? 'file_backed' : 'database_only_eligible', !await managedPersistenceEnabled(ctx.engine));
-      }
-      authority.databaseOnlyReason = 'unbound_source';
-    }
+  if (writeThrough && root && !binding) {
+    // #5393: a revert is also judged on the version it writes.
+    const fileBacked = Boolean(snapshot?.page.source_path) || Boolean(input.operation === 'revert_version' && snapshot
+      && (await ctx.engine.executeRaw<{ source_path: string | null }>('SELECT source_path FROM page_versions WHERE id=$1 AND page_id=$2',
+        [p.version_id, snapshot.page.id]))[0]?.source_path);
+    const decision = await decideUnboundWrite(ctx.engine, { sourceId, sourceKind: source.kind, fileBacked, path: ctx.remote === false ? root : null });
+    if (decision.kind === 'claim') binding = await claimWorktree(ctx.engine, sourceId, root, undefined, undefined, { automatic: true });
+    else authority.databaseOnlyReason = decision.reason;
   }
+  // #6609 (D5): a restore that writes no file refuses a page whose recorded file is gone, unless detach.
+  if (input.operation === 'restore_page') await assertRestoreOrigin(ctx.engine, { sourceId, slug, snapshot,
+    publishesFile: writeThrough && binding !== null, detach: p.detach === true, remote: ctx.remote !== false });
   // #5032: this host publishes the canonical file, and on Windows a ':' in its
   // name cannot be stored; refuse before admission. Database-only writes pass,
   // including read-only mirror sources and pages created while one (#5409).

@@ -20,7 +20,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
-import { isUndefinedTableError } from '../utils.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 
 export interface ResolvedCounterparty {
   slug: string;
@@ -42,7 +42,7 @@ async function canonicalTwin(engine: BrainEngine, sourceId: string, slug: string
     );
     return rows.length === 1 ? { slug: rows[0]!.slug, sourceId: rows[0]!.source_id } : null;
   } catch (err) {
-    if (isUndefinedTableError(err)) return null;
+    if (isMissingSchemaObject(err, 'table', 'entity_identities')) return null;
     throw err;
   }
 }
@@ -62,7 +62,7 @@ async function emailAliasElsewhere(engine: BrainEngine, sourceId: string, email:
     );
     return rows.length === 1 ? { slug: rows[0]!.slug, sourceId: rows[0]!.source_id } : null;
   } catch (err) {
-    if (isUndefinedTableError(err)) return null;
+    if (isMissingSchemaObject(err, 'table', 'page_aliases')) return null;
     throw err;
   }
 }

@@ -89,7 +89,7 @@ export interface ConversationFactsBackfillPhaseResult {
 
 const CFG_PREFIX = 'cycle.conversation_facts_backfill';
 
-interface ResolvedConfig {
+export interface ResolvedConfig {
   enabled: boolean;
   maxCostUsd: number;          // per source per cycle
   maxTotalCostUsd: number;     // brain-wide per cycle
@@ -106,7 +106,8 @@ interface ResolvedConfig {
   workers: number;
 }
 
-async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
+/** The backfill's resolved config (switch, caps, types); doctor reads the same values. */
+export async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
   const get = (k: string) => engine.getConfig(`${CFG_PREFIX}.${k}`);
   const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw] =
     await Promise.all([

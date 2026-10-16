@@ -191,14 +191,34 @@ export class PgliteStatementCache {
 }
 
 /**
- * PGlite copies `db.parsers` into a fresh object for every query result. Its
+ * Codec setup after connect. PGlite copies `db.parsers` into a fresh object for every query result. Its
  * array-type init registers one parser per composite (table row) array type,
  * most of the map in a gbrain schema, and gbrain never selects those arrays;
  * the per-query copy then dominated short statements. Their values would only
- * have been split into unparsed strings, so drop them after connect.
+ * have been split into unparsed strings, so drop them. Then install the
+ * Buffer bytea codec below.
  */
-export async function dropRowTypeArrayParsers(db: PGlite): Promise<void> {
+export async function configurePgliteCodecs(db: PGlite): Promise<void> {
   const { rows } = await db.query<{ oid: number }>(`SELECT a.oid::int AS oid FROM pg_type a
     JOIN pg_type e ON e.oid=a.typelem WHERE a.typcategory='A' AND e.typtype='c'`);
   for (const { oid } of rows) delete db.parsers[oid];
+  useBufferByteaCodec(db);
+}
+
+/**
+ * PGlite's bytea codec walks every byte through a JS array of two-character
+ * strings (serialize) or a substring per byte (parse): a 4 MiB segment-text
+ * batch allocated ~250 MB of garbage per statement. Buffer's hex codec writes
+ * the same hex text in one pass. A parsed value is a Uint8Array over its own
+ * buffer, as before.
+ */
+function useBufferByteaCodec(db: PGlite): void {
+  db.serializers[types.BYTEA] = (value: unknown) => {
+    if (!(value instanceof Uint8Array)) throw new Error('Invalid input for bytea type');
+    return `\\x${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex')}`;
+  };
+  (db.parsers as unknown as Record<number, Parser>)[types.BYTEA] = (value: string) => {
+    const bytes = Buffer.from(value.slice(2), 'hex');
+    return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? new Uint8Array(bytes.buffer) : new Uint8Array(bytes);
+  };
 }

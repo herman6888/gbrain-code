@@ -45,7 +45,7 @@
  * at apply and again at the write (file-repair.ts). Messages carry paths,
  * slugs, codes and amounts only.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';

@@ -5,7 +5,8 @@
  * Agent operator contract v1 table (docs/guides/exit-codes.md):
  *   0 ok · 1 failed (class/retryable in JSON) · 2 usage / invalid input ·
  *   3 confirmation_required (its ONLY meaning) · 10 write pending ·
- *   11 resumable budget stop · 69 serve exited unhealthy · 75 migration
+ *   11 resumable budget stop · 13 harness wired, verification pending ·
+ *   69 serve exited unhealthy · 75 migration
  *   lock held · 124 timeout · 130 interrupted. `test/exit-codes.test.ts` enumerates every literal
  *   exit 3 in src/ so a new one cannot reuse it.
  */
@@ -43,6 +44,14 @@ export const PENDING_WRITE_EXIT_CODE = 10;
  * from 3, which agent-facing commands reserve for "ask the user first".
  */
 export const BUDGET_STOP_EXIT_CODE = 11;
+
+/**
+ * #6661: `gbrain bootstrap harness --token` on a PGLite brain wired every
+ * target while no serve answered (`pending_verify`): nothing failed, nothing
+ * verified yet. The JSON `fix` names the re-run that completes it once
+ * `gbrain serve --http` runs; `--status` stays partial until then.
+ */
+export const HARNESS_PENDING_VERIFY_EXIT_CODE = 13;
 
 /**
  * #6543: `gbrain serve` exited on its own because its persistence consumer

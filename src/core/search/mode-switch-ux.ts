@@ -135,8 +135,7 @@ export function summarizeTransition(
   }
 
   // Narrowing: dropping a feature (e.g. balanced → conservative drops the
-  // reranker; tokenmax → balanced drops default expansion and synopsis
-  // context). Semantic result caching is off, so nothing refills; no backfill.
+  // reranker; tokenmax → balanced drops synopsis context). Semantic result caching is off, so nothing refills; no backfill.
   if (oldMode && narrowness(newMode) < narrowness(oldMode)) {
     return {
       kind: 'narrowing',

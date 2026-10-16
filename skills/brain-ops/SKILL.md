@@ -125,7 +125,7 @@ Before using ANY external API to research a person, company, or topic:
 
 1. `gbrain entity "<name>"` (v0.43+) — ONE known person/company/project → full card (description, aliases, open threads, recent events, edges, backlink/fact counts). Zero LLM calls, sub-100ms. This one call replaces steps 2–6 for known-entity lookups; near-misses return suggestions.
 2. `gbrain search "name"` — exact-token lookup for existing pages (cheap hybrid, no expansion)
-3. `gbrain query "natural question about name"` — concept/landscape questions go here FIRST (expansion recovers synonym phrasings; a nonzero `search` count is not proof of completeness)
+3. `gbrain query "natural question about name"` — concept/landscape questions go here FIRST (meaning-match plus reranking recovers synonym phrasings; `--expand` adds LLM rewrites when results look thin; a nonzero `search` count is not proof of completeness)
 4. `gbrain get <slug>` — if you know the slug, read the full page
 5. Check backlinks: who references this entity?
 6. Check timeline: recent events involving this entity
@@ -273,7 +273,7 @@ Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) 
 ## Tools Used
 
 - `search` — cheap hybrid search (vector + keyword, no expansion)
-- `query` — hybrid search + LLM multi-query expansion (concept/landscape questions)
+- `query` — hybrid search for concept/landscape questions (`--expand` adds LLM multi-query expansion)
 - `get_page` — read a brain page
 - `put_page` — create/update brain pages
 - `add_link` — cross-reference entities

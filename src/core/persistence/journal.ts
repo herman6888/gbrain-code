@@ -25,6 +25,9 @@ import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
 import { CAPACITY_VERIFY } from './capacity-verify.ts';
+import { readManagedMode } from './managed-mode.ts';
+import { localHostId } from './identity.ts';
+import { segmentWriteScope } from '../page-body/ingest.ts';
 import {
   isTerminal, principalKey, requestPrincipal, recoveryFiles,
   type JournalLimits, type Principal, type RecoveryRecord, type RequestState,
@@ -405,6 +408,10 @@ export function publicationGroupKey(row: Pick<WriteRequest, 'operation' | 'inten
 /** Groups whose members are independent page writes: one member's failure never cancels the others. */
 export function independentGroup(key: string | null): boolean {
   return key !== null && (key.startsWith('batch:') || key.startsWith('import:'));
+}
+/** #6712: a bulk managed-sync group key; such a group claims up to its admitted size (63 followers) and prepares four members at a time. */
+export function syncGroup(key: string | null): boolean {
+  return key !== null && key.startsWith('sync:');
 }
 const GROUP_KEY_SQL = `CASE WHEN intent ? 'group' THEN 'sync:'||(intent->>'group')
   WHEN operation='put_page' AND intent->>'kind'='managed_file_import' AND jsonb_typeof(intent->'import_batch')='string' THEN 'import:'||(intent->>'import_batch')
@@ -939,6 +946,28 @@ export async function vacuumPersistenceQueues(engine: BrainEngine): Promise<numb
   if (tables.length) await engine.executeRaw(`VACUUM (ANALYZE) ${tables.join(', ')}`);
   const [requests] = await engine.executeRaw<{ rows: number }>("SELECT GREATEST(reltuples,0)::float8 AS rows FROM pg_class WHERE oid='persistence_requests'::regclass");
   return Number(requests?.rows ?? 0);
+}
+
+/**
+ * Wave B segment GC (spec 3.5), run by the resident owner next to the queue
+ * vacuum: expires body stagings past their deadlines (their staged manifest
+ * and chunk rows go with them), deletes retired chunk rows and manifest rows
+ * no retained generation needs, and unreferenced segment texts past the grace
+ * window. On a managed brain it collects only the sources this host owns, each
+ * in a coordinated write. A brain that never staged a segment pays one
+ * existence probe.
+ */
+export async function sweepSegmentStorage(engine: BrainEngine): Promise<void> {
+  const [row] = await engine.executeRaw<{ present: boolean }>(
+    'SELECT EXISTS (SELECT 1 FROM page_body_stagings) OR EXISTS (SELECT 1 FROM page_segment_texts) AS present');
+  if (!row?.present) return;
+  if (!await readManagedMode(engine)) { await engine.sweepSegments({ expireStagings: true }); return; }
+  const owned = await engine.executeRaw<{ source_id: string }>(`SELECT s.source_id FROM persistence_source_bindings s
+    JOIN persistence_worktrees w ON w.id=s.worktree_id WHERE w.owner_host_id=$1::uuid AND w.state='active'`, [localHostId()]);
+  for (const { source_id: sourceId } of owned) {
+    const writes = await segmentWriteScope(engine, sourceId);
+    await writes(exec => exec.sweepSegments({ sourceId, expireStagings: true }));
+  }
 }
 
 /**

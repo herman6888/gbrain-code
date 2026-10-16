@@ -23,7 +23,7 @@ import { stripFactsFence } from '../src/core/facts-fence.ts';
 import { redactFindings } from '../src/core/secret-scan.ts';
 import { sanitizeRemoteBody } from '../src/core/remote-body.ts';
 import { BOUNDED_PREFIX_BYTES } from '../src/core/page-window/document.ts';
-import { boundedPrefixSql, boundedRawPrefix, overlaidBoundedRows, prefixNeedsOverlay, projectedLead } from '../src/core/page-window/bounded-lead.ts';
+import { boundedBodyPrefixSql, boundedRawPrefix, overlaidBoundedRows, prefixNeedsOverlay, projectedLead } from '../src/core/page-window/bounded-lead.ts';
 import { structuralExactLookup } from '../src/core/search/exact-lookup.ts';
 import { applyAliasHop } from '../src/core/search/alias-hop.ts';
 import { normalizeAlias } from '../src/core/search/alias-normalize.ts';
@@ -115,13 +115,13 @@ afterAll(async () => { await engine.disconnect(); });
 const pageBody = async (slug: string) => (await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth;
 
 describe('bounded-lead building blocks', () => {
-  test('boundedRawPrefix cuts on a code point within the byte budget; boundedPrefixSql bounds the column', () => {
+  test('boundedRawPrefix cuts on a code point within the byte budget; boundedBodyPrefixSql bounds the column or its lead', () => {
     const body = 'é'.repeat(BOUNDED_PREFIX_BYTES);
     const prefix = boundedRawPrefix(body);
     expect(Buffer.byteLength(prefix, 'utf8')).toBeLessThanOrEqual(BOUNDED_PREFIX_BYTES);
     expect(prefix).toBe('é'.repeat(prefix.length));
     expect(boundedRawPrefix('short')).toBe('short');
-    expect(boundedPrefixSql('p.compiled_truth')).toBe(`left(p.compiled_truth, ${BOUNDED_PREFIX_BYTES})`);
+    expect(boundedBodyPrefixSql('p')).toBe(`left(coalesce(p.compiled_truth, p.truth_lead), ${BOUNDED_PREFIX_BYTES})`);
     expect(prefixNeedsOverlay('x <!--- gbrain:facts:begin -->')).toBe(true);
     expect(prefixNeedsOverlay(small('x').replace(FACTS, ''))).toBe(false);
   });

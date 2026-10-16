@@ -234,6 +234,23 @@ for (const backend of testBackends()) {
     } });
   }, 120_000);
 
+  // #6685: fenced rows left in the index after their page was deleted.
+  test.each([
+    ['all expired: skipped, not drift', [true, true], { status: 'complete', detail: 'pages_checked=0 skipped_expired_no_page=1' }],
+    ['one live row: still drift', [true, false], { status: 'failed', detail: '1 pages drifted: projects/gone-example (page missing)' }],
+  ])(`${backend}: verify on a deleted page's fenced rows, %s (#6685)`, async (_case, expired, expected) => {
+    await managedBrain(async ({ engine }) => {
+      expect(await __testing.phaseCVerify(engine, OPTS)).toMatchObject(expected);
+    }, { databaseUrl, setup: async ({ engine }) => {
+      for (const [index, isExpired] of expired.entries()) {
+        await engine.executeRaw(`INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
+            row_num, source_markdown_slug, expired_at)
+          VALUES ('default', 'projects/gone-example', $1, 'fact', 'private', 'medium', now(), 'manual', 1.0, $2, 'projects/gone-example',
+            CASE WHEN $3::boolean THEN now() ELSE NULL END)`, [`Claim ${index + 1}`, index + 1, isExpired]);
+      }
+    } });
+  }, 120_000);
+
   test(`${backend}: a duplicate active fence row reads in sync whichever writer indexed the page last (#5814)`, async () => {
     await managedBrain(async ({ ctx, engine }) => {
       const slug = 'people/dana-example';

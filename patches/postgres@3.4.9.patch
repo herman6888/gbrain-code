@@ -606,7 +606,7 @@ index 07f6716..a15e780 100644
    seconds = typeof seconds === 'function' ? seconds() : seconds
    if (!seconds)
 diff --git a/cjs/src/index.js b/vendor/postgres/cjs/src/index.js
-index f09c61c..93eb66d 100644
+index f09c61c..b25e0b6 100644
 --- a/cjs/src/index.js
 +++ b/vendor/postgres/cjs/src/index.js
 @@ -62,10 +62,36 @@ function Postgres(a, b) {
@@ -647,7 +647,7 @@ index f09c61c..93eb66d 100644
    Object.assign(sql, {
      get parameters() { return options.parameters },
      largeObject: largeObject.bind(null, sql),
-@@ -200,40 +226,134 @@ function Postgres(a, b) {
+@@ -200,40 +226,181 @@ function Postgres(a, b) {
      return await sql`select pg_notify(${ channel }, ${ '' + payload })`
    }
  
@@ -656,7 +656,7 @@ index f09c61c..93eb66d 100644
      const queue = Queue()
 -    const c = open.length
 -      ? open.shift()
-+    let busy = false, fence = null, holding = null, releasing = false
++    let busy = false, fence = null, holding = null, releasing = false, discarding = false, discardPromise = null
 +    const reservation = c.reserved = (ended = false) => {
 +      if (c.reserved !== reservation)
 +        return
@@ -680,7 +680,7 @@ index f09c61c..93eb66d 100644
 +      }
 +    }
 +    reservation.enqueue = q => {
-+      if (c.reserved !== reservation || releasing)
++      if (c.reserved !== reservation || releasing || discarding)
 +        return q.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is no longer owned'))
 +      queue.push(q)
 +      pump()
@@ -696,6 +696,52 @@ index f09c61c..93eb66d 100644
 +      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection was discarded'))
 +      c.terminate()
 +    }
++    // A Terminate message on the busy socket cannot interrupt its current
++    // statement. Preserve the fenced Query/canceller until CancelRequest and
++    // the query's backend response settle; never let a later query use it.
++    // The bounded fallback still discards, but rejects as unconfirmed.
++    reservation.cancelAndDiscard = ({ timeout = 2000 } = {}) => {
++      if (discardPromise)
++        return discardPromise
++      if (c.reserved !== reservation)
++        return Promise.resolve()
++      discarding = true
++      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is being discarded'))
++      const q = fence || holding
++      if (!q) {
++        // A busy, unfenced query has no retained canceller/settlement proof.
++        // Retire the socket but never report that as confirmed server stop.
++        const unconfirmed = busy
++        reservation.discard()
++        return discardPromise = unconfirmed
++          ? Promise.reject(Errors.generic('CANCEL_UNCONFIRMED', 'Busy unfenced query cancellation cannot be confirmed'))
++          : Promise.resolve()
++      }
++      let timer
++      let cancelling
++      try {
++        cancelling = q.cancel()
++      } catch (error) {
++        reservation.discard()
++        return discardPromise = Promise.reject(error)
++      }
++      discardPromise = Promise.race([
++        Promise.all([
++          cancelling,
++          Promise.prototype.then.call(q, () => {}, error => {
++            if (!error || error.code !== '57014')
++              throw error
++          })
++        ]),
++        new Promise((_, reject) => {
++          timer = setTimeout(() => reject(Errors.generic('CANCEL_UNCONFIRMED', 'Query cancellation did not settle before discard')), timeout)
++        })
++      ]).then(() => {}).finally(() => {
++        clearTimeout(timer)
++        reservation.discard()
++      })
++      return discardPromise
++    }
 +    reservation.releaseConnection = () => {
 +      if (c.reserved !== reservation)
 +        return
@@ -705,7 +751,7 @@ index f09c61c..93eb66d 100644
 +    return reservation
 +
 +    function pump() {
-+      if (c.reserved !== reservation || holding || fence)
++      if (c.reserved !== reservation || discarding || holding || fence)
 +        return
 +      while (queue.length) {
 +        const q = queue.peek()
@@ -791,6 +837,7 @@ index f09c61c..93eb66d 100644
 +      const sql = Sql(reservation.enqueue)
 +      sql.release = reservation.releaseConnection
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
 +      return sql
      }
    }
@@ -801,7 +848,7 @@ index f09c61c..93eb66d 100644
      let savepoints = 0
        , connection
        , prepare = null
-@@ -249,9 +369,13 @@ function Postgres(a, b) {
+@@ -249,9 +416,14 @@ function Postgres(a, b) {
      }
  
      async function scope(c, fn, name) {
@@ -812,10 +859,11 @@ index f09c61c..93eb66d 100644
        sql.savepoint = savepoint
        sql.prepare = x => prepare = x.replace(/[^a-z0-9$-_. ]/gi)
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
        let uncaughtError
          , result
  
-@@ -281,6 +405,8 @@ function Postgres(a, b) {
+@@ -281,6 +453,8 @@ function Postgres(a, b) {
        return result
  
        function savepoint(name, fn) {
@@ -824,7 +872,7 @@ index f09c61c..93eb66d 100644
          if (name && Array.isArray(name.raw))
            return savepoint(sql => sql.apply(sql, arguments))
  
-@@ -290,18 +416,16 @@ function Postgres(a, b) {
+@@ -290,18 +464,16 @@ function Postgres(a, b) {
  
        function handler(q) {
          q.catch(e => uncaughtError || (uncaughtError = e))
@@ -847,7 +895,7 @@ index f09c61c..93eb66d 100644
      }
    }
  
-@@ -351,7 +475,7 @@ function Postgres(a, b) {
+@@ -351,7 +523,7 @@ function Postgres(a, b) {
      return new Promise((resolve, reject) => {
        query.state
          ? query.active
@@ -856,7 +904,7 @@ index f09c61c..93eb66d 100644
            : query.cancelled = { resolve, reject }
          : (
            queries.remove(query),
-@@ -362,6 +486,25 @@ function Postgres(a, b) {
+@@ -362,6 +534,25 @@ function Postgres(a, b) {
      })
    }
  
@@ -882,7 +930,7 @@ index f09c61c..93eb66d 100644
    async function end({ timeout = null } = {}) {
      if (ending)
        return ending
-@@ -398,7 +541,14 @@ function Postgres(a, b) {
+@@ -398,7 +589,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -898,7 +946,7 @@ index f09c61c..93eb66d 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +568,50 @@ function Postgres(a, b) {
+@@ -418,12 +616,50 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -950,7 +998,7 @@ index f09c61c..93eb66d 100644
    }
  }
  
-@@ -444,7 +632,7 @@ function parseOptions(a, b) {
+@@ -444,7 +680,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -959,7 +1007,7 @@ index f09c61c..93eb66d 100644
    const defaults = {
      max             : globalThis.Cloudflare ? 3 : 10,
      ssl             : false,
-@@ -453,6 +641,9 @@ function parseOptions(a, b) {
+@@ -453,6 +689,9 @@ function parseOptions(a, b) {
      connect_timeout : 30,
      max_lifetime    : max_lifetime,
      max_pipeline    : 100,
@@ -969,7 +1017,7 @@ index f09c61c..93eb66d 100644
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-@@ -491,11 +682,18 @@ function parseOptions(a, b) {
+@@ -491,11 +730,18 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
@@ -1666,7 +1714,7 @@ index 1b1cccd..7b6372c 100644
    seconds = typeof seconds === 'function' ? seconds() : seconds
    if (!seconds)
 diff --git a/src/index.js b/vendor/postgres/src/index.js
-index c7fba3d..5bfd92f 100644
+index c7fba3d..5458638 100644
 --- a/src/index.js
 +++ b/vendor/postgres/src/index.js
 @@ -62,10 +62,36 @@ function Postgres(a, b) {
@@ -1707,7 +1755,7 @@ index c7fba3d..5bfd92f 100644
    Object.assign(sql, {
      get parameters() { return options.parameters },
      largeObject: largeObject.bind(null, sql),
-@@ -200,40 +226,134 @@ function Postgres(a, b) {
+@@ -200,40 +226,181 @@ function Postgres(a, b) {
      return await sql`select pg_notify(${ channel }, ${ '' + payload })`
    }
  
@@ -1716,7 +1764,7 @@ index c7fba3d..5bfd92f 100644
      const queue = Queue()
 -    const c = open.length
 -      ? open.shift()
-+    let busy = false, fence = null, holding = null, releasing = false
++    let busy = false, fence = null, holding = null, releasing = false, discarding = false, discardPromise = null
 +    const reservation = c.reserved = (ended = false) => {
 +      if (c.reserved !== reservation)
 +        return
@@ -1740,7 +1788,7 @@ index c7fba3d..5bfd92f 100644
 +      }
 +    }
 +    reservation.enqueue = q => {
-+      if (c.reserved !== reservation || releasing)
++      if (c.reserved !== reservation || releasing || discarding)
 +        return q.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is no longer owned'))
 +      queue.push(q)
 +      pump()
@@ -1756,6 +1804,52 @@ index c7fba3d..5bfd92f 100644
 +      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection was discarded'))
 +      c.terminate()
 +    }
++    // A Terminate message on the busy socket cannot interrupt its current
++    // statement. Preserve the fenced Query/canceller until CancelRequest and
++    // the query's backend response settle; never let a later query use it.
++    // The bounded fallback still discards, but rejects as unconfirmed.
++    reservation.cancelAndDiscard = ({ timeout = 2000 } = {}) => {
++      if (discardPromise)
++        return discardPromise
++      if (c.reserved !== reservation)
++        return Promise.resolve()
++      discarding = true
++      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is being discarded'))
++      const q = fence || holding
++      if (!q) {
++        // A busy, unfenced query has no retained canceller/settlement proof.
++        // Retire the socket but never report that as confirmed server stop.
++        const unconfirmed = busy
++        reservation.discard()
++        return discardPromise = unconfirmed
++          ? Promise.reject(Errors.generic('CANCEL_UNCONFIRMED', 'Busy unfenced query cancellation cannot be confirmed'))
++          : Promise.resolve()
++      }
++      let timer
++      let cancelling
++      try {
++        cancelling = q.cancel()
++      } catch (error) {
++        reservation.discard()
++        return discardPromise = Promise.reject(error)
++      }
++      discardPromise = Promise.race([
++        Promise.all([
++          cancelling,
++          Promise.prototype.then.call(q, () => {}, error => {
++            if (!error || error.code !== '57014')
++              throw error
++          })
++        ]),
++        new Promise((_, reject) => {
++          timer = setTimeout(() => reject(Errors.generic('CANCEL_UNCONFIRMED', 'Query cancellation did not settle before discard')), timeout)
++        })
++      ]).then(() => {}).finally(() => {
++        clearTimeout(timer)
++        reservation.discard()
++      })
++      return discardPromise
++    }
 +    reservation.releaseConnection = () => {
 +      if (c.reserved !== reservation)
 +        return
@@ -1765,7 +1859,7 @@ index c7fba3d..5bfd92f 100644
 +    return reservation
 +
 +    function pump() {
-+      if (c.reserved !== reservation || holding || fence)
++      if (c.reserved !== reservation || discarding || holding || fence)
 +        return
 +      while (queue.length) {
 +        const q = queue.peek()
@@ -1851,6 +1945,7 @@ index c7fba3d..5bfd92f 100644
 +      const sql = Sql(reservation.enqueue)
 +      sql.release = reservation.releaseConnection
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
 +      return sql
      }
    }
@@ -1861,7 +1956,7 @@ index c7fba3d..5bfd92f 100644
      let savepoints = 0
        , connection
        , prepare = null
-@@ -249,9 +369,13 @@ function Postgres(a, b) {
+@@ -249,9 +416,14 @@ function Postgres(a, b) {
      }
  
      async function scope(c, fn, name) {
@@ -1872,10 +1967,11 @@ index c7fba3d..5bfd92f 100644
        sql.savepoint = savepoint
        sql.prepare = x => prepare = x.replace(/[^a-z0-9$-_. ]/gi)
 +      sql.discard = reservation.discard
++      sql.cancelAndDiscard = reservation.cancelAndDiscard
        let uncaughtError
          , result
  
-@@ -281,6 +405,8 @@ function Postgres(a, b) {
+@@ -281,6 +453,8 @@ function Postgres(a, b) {
        return result
  
        function savepoint(name, fn) {
@@ -1884,7 +1980,7 @@ index c7fba3d..5bfd92f 100644
          if (name && Array.isArray(name.raw))
            return savepoint(sql => sql.apply(sql, arguments))
  
-@@ -290,18 +416,16 @@ function Postgres(a, b) {
+@@ -290,18 +464,16 @@ function Postgres(a, b) {
  
        function handler(q) {
          q.catch(e => uncaughtError || (uncaughtError = e))
@@ -1907,7 +2003,7 @@ index c7fba3d..5bfd92f 100644
      }
    }
  
-@@ -351,7 +475,7 @@ function Postgres(a, b) {
+@@ -351,7 +523,7 @@ function Postgres(a, b) {
      return new Promise((resolve, reject) => {
        query.state
          ? query.active
@@ -1916,7 +2012,7 @@ index c7fba3d..5bfd92f 100644
            : query.cancelled = { resolve, reject }
          : (
            queries.remove(query),
-@@ -362,6 +486,25 @@ function Postgres(a, b) {
+@@ -362,6 +534,25 @@ function Postgres(a, b) {
      })
    }
  
@@ -1942,7 +2038,7 @@ index c7fba3d..5bfd92f 100644
    async function end({ timeout = null } = {}) {
      if (ending)
        return ending
-@@ -398,7 +541,14 @@ function Postgres(a, b) {
+@@ -398,7 +589,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -1958,7 +2054,7 @@ index c7fba3d..5bfd92f 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +568,50 @@ function Postgres(a, b) {
+@@ -418,12 +616,50 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -2010,7 +2106,7 @@ index c7fba3d..5bfd92f 100644
    }
  }
  
-@@ -444,7 +632,7 @@ function parseOptions(a, b) {
+@@ -444,7 +680,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -2019,7 +2115,7 @@ index c7fba3d..5bfd92f 100644
    const defaults = {
      max             : globalThis.Cloudflare ? 3 : 10,
      ssl             : false,
-@@ -453,6 +641,9 @@ function parseOptions(a, b) {
+@@ -453,6 +689,9 @@ function parseOptions(a, b) {
      connect_timeout : 30,
      max_lifetime    : max_lifetime,
      max_pipeline    : 100,
@@ -2029,7 +2125,7 @@ index c7fba3d..5bfd92f 100644
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-@@ -491,11 +682,18 @@ function parseOptions(a, b) {
+@@ -491,11 +730,18 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
@@ -2119,7 +2215,7 @@ index 7c7c2b9..d462498 100644
  
    return '$' + (types.push(
 diff --git a/types/index.d.ts b/vendor/postgres/types/index.d.ts
-index 13c3432..0d48716 100644
+index 13c3432..49c8e53 100644
 --- a/types/index.d.ts
 +++ b/vendor/postgres/types/index.d.ts
 @@ -119,6 +119,51 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
@@ -2200,7 +2296,7 @@ index 13c3432..0d48716 100644
  
      end(options?: { timeout?: number | undefined } | undefined): Promise<void>;
  
-@@ -717,10 +765,11 @@ declare namespace postgres {
+@@ -717,10 +765,12 @@ declare namespace postgres {
      begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
@@ -2210,14 +2306,16 @@ index 13c3432..0d48716 100644
  
    interface TransactionSql<TTypes extends Record<string, unknown> = {}> extends ISql<TTypes>  {
 +    discard(): void;
++    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
      savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
-@@ -728,6 +777,7 @@ declare namespace postgres {
+@@ -728,6 +778,8 @@ declare namespace postgres {
    }
  
    interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
 +    discard(): void;
++    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
      release(): void;
    }
  }

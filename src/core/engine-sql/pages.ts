@@ -19,11 +19,13 @@ import type { GetVersionsOpts, PageVersionRows } from '../page-state/version-typ
 import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
+import { segmentedRevertRefusal } from '../page-state/versions.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment } from '../search/private-visibility.ts';
 import { quarantineFilterFragment } from '../quarantine.ts';
-import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
+import { rederiveHiddenSql } from '../eligibility/sql.ts';
+import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
@@ -102,16 +104,18 @@ export async function putPage(
     // over real content (ON CONFLICT sets compiled_truth = EXCLUDED.* flat).
     // Only fires when the incoming body is itself blank, so the common
     // non-empty write pays no extra query. Deletes use deletePage; a deliberate
-    // clear passes allowEmptyOverwrite. See isBlankBody.
+    // clear passes allowEmptyOverwrite. See isBlankBody. A segmented page's
+    // body columns are NULL, so its size is body_bytes.
     if (isBlankBody(page.compiled_truth) && !opts?.allowEmptyOverwrite) {
-      const { rows: prior } = await exec.run<{ compiled_truth: string | null }>(sqlFragment`
-        SELECT compiled_truth FROM pages
+      const { rows: prior } = await exec.run<{ compiled_truth: string | null; body_storage: string | null; body_bytes: unknown }>(sqlFragment`
+        SELECT compiled_truth, body_storage, body_bytes FROM pages
         WHERE source_id = ${sourceId} AND slug = ${slug} AND deleted_at IS NULL
         LIMIT 1`);
-      if (prior[0] && !isBlankBody(prior[0].compiled_truth)) {
+      const segmented = prior[0]?.body_storage === 'segmented';
+      if (prior[0] && (segmented || !isBlankBody(prior[0].compiled_truth))) {
         throw new Error(
           `putPage: refusing to overwrite non-empty page '${slug}' ` +
-            `(${prior[0].compiled_truth!.length} chars) with an empty body — ` +
+            `(${segmented ? `${Number(prior[0].body_bytes)} bytes, segmented` : `${prior[0].compiled_truth!.length} chars`}) with an empty body — ` +
             `likely a read-modify-write that read empty. Pass ` +
             `{ allowEmptyOverwrite: true } to force, or deletePage to remove it.`,
         );
@@ -169,6 +173,7 @@ export async function putPage(
         import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
         chunker_version       = ${trustedSql(bodyWriteChunkVersion('EXCLUDED.compiled_truth', 'EXCLUDED.timeline'))},
         source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
+        database_only_reason  = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason = 'detached' THEN NULL ELSE pages.database_only_reason END,
         source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
@@ -454,7 +459,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
 
     const columns = filters?.listColumnsOnly === true
       ? sqlFragment`p.id, p.source_id, p.slug, p.type, p.page_kind, p.title, p.created_at, p.updated_at, p.deleted_at,
-          p.effective_date, p.effective_date_source, ''::text AS compiled_truth, ''::text AS timeline, '{}'::jsonb AS frontmatter`
+          p.effective_date, p.effective_date_source, p.body_storage, p.body_bytes, ''::text AS compiled_truth, ''::text AS timeline, '{}'::jsonb AS frontmatter`
       : sqlFragment`p.*`;
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
@@ -514,7 +519,8 @@ const toDomainBankRow = ((normalize) => (raw: Record<string, unknown>): DomainBa
 //
 // `listPrefixSampledPages`: one page per prefix, tiebroken by inbound-link
 // count (connection_count via LEFT JOIN to page_links). Stale-bias optional
-// for LSD mode (D5). Source-scoped (D5). Excludes close-set slugs.
+// for LSD mode (D5). Source-scoped (D5). Excludes close-set slugs, and (like
+// listCorpusSample) segmented pages, whose body column is NULL.
 //
 // Ranking inside each prefix partition:
 //   1. stale_score DESC (when staleBias) — never-retrieved beats >90d-stale beats fresh
@@ -543,7 +549,7 @@ export async function listPrefixSampledPages(scoped: ScopedReadRunner, opts: Dom
         FROM pages p
         LEFT JOIN page_retrievals r ON r.page_id = p.id
         LEFT JOIN page_links pl ON pl.to_page_id = p.id
-        WHERE p.deleted_at IS NULL
+        WHERE p.deleted_at IS NULL AND p.body_storage = 'inline'
           AND substring(p.slug from '^[^/]+/[^/]+') = ANY(${opts.prefixes}::text[])
           AND (cardinality(${exclude}::text[]) = 0 OR NOT (p.slug = ANY(${exclude}::text[])))
           AND (
@@ -629,7 +635,7 @@ export async function listCorpusSample(scoped: ScopedReadRunner, opts: CorpusSam
           (SELECT COUNT(*) FROM page_links pl WHERE pl.to_page_id = p.id) AS connection_count
         FROM pages p
         LEFT JOIN page_retrievals r ON r.page_id = p.id
-        WHERE p.deleted_at IS NULL
+        WHERE p.deleted_at IS NULL AND p.body_storage = 'inline'
           AND (cardinality(${exclude}::text[]) = 0 OR NOT (p.slug = ANY(${exclude}::text[])))
           AND (
             (${sourceIds}::text[] IS NOT NULL AND p.source_id = ANY(${sourceIds}::text[]))
@@ -736,10 +742,13 @@ export async function listStalePagesForExtraction(exec: ScopedRead, opts: {
     // #1768: project a deterministic full-µs UTC string alongside updated_at.
     // to_char (not ::text — DateStyle-fragile) so extractStaleFromDB can stamp
     // links_extracted_at = the exact updated_at and the staleness predicate clears.
+    // A segmented page is not listed (its body columns are NULL: extracting ''
+    // would delete its derived links) but stays counted as stale until the
+    // per-segment extraction reads it.
     const { text, params } = renderFragment(sqlFragment`SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso
            FROM pages
-           WHERE ${stalePagesWhere(opts)}${afterClause}
+           WHERE ${stalePagesWhere(opts)} AND body_storage = 'inline'${afterClause}
            ORDER BY id
            LIMIT ${opts.batchSize}`);
     const { rows } = await exec.unsafe(text, params);
@@ -896,11 +905,14 @@ const PAGE_VERSION_COLUMNS = trustedSql('pv.id, pv.page_id, pv.compiled_truth, p
   + 'pv.timeline, pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
 const PAGE_VERSION_METADATA_COLUMNS = trustedSql('pv.id, pv.page_id, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
   + 'pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
+/** Wave B: the reference columns of a segmented version, kept only on segmented rows so inline rows stay as they were. */
+const PAGE_VERSION_SEGMENTED_COLUMNS = trustedSql('pv.body_storage, pv.body_generation, pv.body_bytes, pv.content_hash');
 
 /**
- * Newest first (`pv.id` breaks snapshot_at ties). Scope and privacy
- * predicates sit in WHERE, so `limit` bounds only rows the caller may read;
- * `includeBody: false` never selects the body columns.
+ * Newest first (`pv.id` breaks snapshot_at ties). Scope, privacy and
+ * re-derivation (a page a purge hid) predicates sit in WHERE, so `limit`
+ * bounds only rows the caller may read; `includeBody: false` never selects
+ * the body columns.
  */
 export async function getVersions<B extends boolean = true>(
   exec: LegacyUnscopedRead,
@@ -915,14 +927,19 @@ export async function getVersions<B extends boolean = true>(
     const columns = opts?.includeBody === false ? PAGE_VERSION_METADATA_COLUMNS : PAGE_VERSION_COLUMNS;
     const limit = opts?.limit !== undefined ? sqlFragment`LIMIT ${opts.limit}` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`
-      SELECT ${columns} FROM page_versions pv
+      SELECT ${columns}, ${PAGE_VERSION_SEGMENTED_COLUMNS} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
       WHERE p.slug = ${slug} ${scope}
-        ${privacy}
+        ${privacy} AND ${trustedSql(rederiveHiddenSql('pages', 'p'))}
       ORDER BY pv.snapshot_at DESC, pv.id DESC
       ${limit}
     `);
-    return rows as PageVersionRows<B>;
+    return rows.map(row => {
+      const { body_storage, body_generation, body_bytes, content_hash, ...version } = row as Record<string, unknown>;
+      return body_storage === 'segmented'
+        ? { ...version, body_storage, body_generation: Number(body_generation), body_bytes: Number(body_bytes), content_hash }
+        : version;
+    }) as PageVersionRows<B>;
   }
 
 export async function revertToVersion(
@@ -931,6 +948,14 @@ export async function revertToVersion(
   versionId: number,
   opts?: { sourceId?: string },
 ): Promise<void> {
+    // Wave B: a segmented page or version is refused before anything is written (segment writer: PR 3).
+    const scope = opts?.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
+    const { rows: segmented } = await exec.run(sqlFragment`
+      SELECT 1 FROM pages p JOIN page_versions pv ON pv.page_id = p.id
+      WHERE p.slug = ${slug} ${scope} AND pv.id = ${versionId}
+        AND (p.body_storage = 'segmented' OR pv.body_storage = 'segmented')
+    `);
+    if (segmented.length > 0) throw segmentedRevertRefusal(slug, versionId);
     // v0.31.8 (D12): two-branch. With opts.sourceId, scope BOTH the page lookup
     // AND the version reference. Without it, multi-source brains can revert
     // the wrong same-slug page.
@@ -1026,7 +1051,7 @@ export async function resolveSlugWithAliasDetailed(
     } catch (e) {
       // Pre-v105 brain: slug_aliases table doesn't exist yet. Defense-in-depth
       // per the engine interface contract.
-      if (isUndefinedTableError(e)) return null;
+      if (isMissingSchemaObject(e, 'table', 'slug_aliases')) return null;
       throw e;
     }
   }

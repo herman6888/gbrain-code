@@ -32,6 +32,8 @@ import {
 import { OwnerProcessingState, readAutopilotProcessingStatus } from '../core/minions/processing-state.ts';
 import { VERSION } from '../version.ts';
 import {
+  AUTO_CHECK_INTERVAL_MS,
+  CRASH_ON_LAUNCH_REASON_PREFIX,
   canSelfUpdate,
   decideSelfUpgrade,
   gateOnTargetRuntime,
@@ -40,9 +42,12 @@ import {
   reconcileBreadcrumb,
   resolveQuietHoursWindow,
   resolveSelfUpgradeMode,
+  SWAP_RECEIPT_ENV,
+  SWAPPED_REASON,
 } from '../core/self-upgrade.ts';
+import { prepareSwapReceipt, settleAutopilotSwap } from '../core/self-upgrade-swap.ts';
 import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
-import { BUN_FLOOR_EXIT_CODE, BUN_FLOOR_FIX, readHostBun } from '../core/bun-floor.ts';
+import { readHostBun } from '../core/bun-floor.ts';
 import { detectInstallMethod, readInstallTargetFloor } from './upgrade.ts';
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
@@ -355,7 +360,7 @@ export function reconcileSelfUpgradeAtBoot(): void {
       reason:
         transition === 'applied'
           ? 'running version is at or past the attempted version'
-          : 'crash-on-launch: running version is not at or past the attempted version (recorded known-bad)',
+          : `${CRASH_ON_LAUNCH_REASON_PREFIX} running version is not at or past the attempted version (recorded known-bad)`,
     });
     if (transition === 'applied') {
       console.log(`[autopilot] self-upgrade confirmed: attempted ${attempted}, now running ${VERSION}.`);
@@ -456,11 +461,14 @@ export async function attemptAutopilotSelfUpgrade(
       idle,
       inQuietHours: verdict !== 'allow',
       canSelfUpdate: canSelfUpdate(installMethod),
-      throttledByInterval: false, // cache TTL is the fetch throttle
+      // The cache TTL throttles the fetch; last_check_ts (written when a swap
+      // installed nothing, #6828) keeps a no-op swap to one attempt a day.
+      throttledByInterval: typeof cfg.self_upgrade?.last_check_ts === 'number'
+        && Date.now() - cfg.self_upgrade.last_check_ts < AUTO_CHECK_INTERVAL_MS,
     });
     // #5855: never swap in a release the host's Bun cannot start (a binary carries its own Bun).
     if (decision.action === 'apply' && installMethod !== 'binary') {
-      decision = gateOnTargetRuntime(decision, await readInstallTargetFloor(installMethod), readHostBun());
+      decision = gateOnTargetRuntime(decision, await readInstallTargetFloor(installMethod), readHostBun(), cfg.self_upgrade?.failed_versions);
     }
 
     if (decision.action !== 'apply') {
@@ -484,29 +492,20 @@ export async function attemptAutopilotSelfUpgrade(
     logSelfUpgrade({ channel: 'autopilot', action: 'apply', current: VERSION, latest: latestVersion, reason: decision.reason });
     console.log(`[autopilot] self-upgrade: applying ${VERSION} -> ${latestVersion} (idle, quiet hours).`);
 
+    // #6828: the swap writes what it installed to the receipt; exit 0 alone cannot tell a swap from a no-op.
+    const receiptPath = prepareSwapReceipt();
+    let swapError: unknown = null;
     try {
       execSync('gbrain upgrade --swap-only', {
         stdio: 'inherit',
         timeout: 300_000,
-        env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },
+        env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1', [SWAP_RECEIPT_ENV]: receiptPath },
       });
     } catch (e) {
-      const fresh = loadConfig();
-      // #5855: the swap's own floor re-check refused; hold, never known-bad.
-      const held = (e as { status?: number }).status === BUN_FLOOR_EXIT_CODE;
-      if (fresh) {
-        const failed = new Set(fresh.self_upgrade?.failed_versions ?? []);
-        if (!held) failed.add(latestVersion);
-        fresh.self_upgrade = { ...(fresh.self_upgrade ?? {}), failed_versions: [...failed] };
-        delete fresh.self_upgrade.attempting_version;
-        saveConfig(fresh);
-      }
-      logSelfUpgrade(held
-        ? { channel: 'autopilot', action: 'unsupported_runtime', current: VERSION, latest: latestVersion, outcome: 'skipped', reason: `gbrain upgrade refused the swap: the Bun floor of ${latestVersion} is not met or unreadable. ${BUN_FLOOR_FIX}` }
-        : { channel: 'autopilot', action: 'apply', current: VERSION, latest: latestVersion, outcome: 'failed', error: e instanceof Error ? e.message : String(e) });
-      console.error(`[autopilot] self-upgrade swap failed; staying on ${VERSION}.`);
-      return;
+      swapError = e;
     }
+    const swap = settleAutopilotSwap(VERSION, latestVersion, swapError, receiptPath);
+    if (!swap.relaunch) return;
 
     if (!mayContinue()) return;
     // Swap done + smoke-verified by `upgrade --swap-only`. Exit cleanly so the
@@ -515,9 +514,9 @@ export async function attemptAutopilotSelfUpgrade(
       channel: 'autopilot',
       action: 'apply',
       current: VERSION,
-      latest: latestVersion,
+      latest: swap.installed,
       outcome: 'applied',
-      reason: 'swapped; exiting for supervisor relaunch',
+      reason: SWAPPED_REASON,
     });
     console.log('[autopilot] self-upgrade swapped; exiting for relaunch.');
     try {

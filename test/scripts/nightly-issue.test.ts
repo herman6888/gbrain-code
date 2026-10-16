@@ -14,7 +14,7 @@ import { load as loadYaml } from 'js-yaml';
 import { loadReceiptDir } from '../../scripts/ci-executed-counts.ts';
 import { buildManifest, checkManifest, failureSignature, junitMessages, MANIFEST_ARTIFACT, MANIFEST_SCHEMA, type CiManifest } from '../../scripts/ci-manifest.ts';
 import { failureSignature as gateSignature, parseExemptionBlocks } from '../fixtures/nightly-watch/stress-exemption-contract.ts';
-import { inert, jsonBlock, labelNames, readJsonBlock, readZipEntry, type GitHubClient, type Issue } from '../../scripts/lib/gh-issue.ts';
+import { GET_RETRY_DELAYS_MS, inert, jsonBlock, labelNames, readJsonBlock, readZipEntry, restClient, type GitHubClient, type Issue } from '../../scripts/lib/gh-issue.ts';
 import { FLAKE_MARKER, MR_MARKER, PUSH_ALLOWLIST, type FlakeRecord, type MasterRedState } from '../../scripts/lib/master-red.ts';
 import {
   JSON_MARKER, parseKnownRed, resolveTarget, routeRun, validateKnownRed, watch, watchRun, type IncidentRecord, type JobInfo, type KnownRow, type RunInfo,
@@ -613,6 +613,64 @@ describe('master-red: push-to-master runs', () => {
     await expect(go(blind, T.g8352)).rejects.toThrow('HTTP 502');
     expect(writes()).toBe(before);
     expect(masterIssue(blind)!.state).toBe('open');
+  });
+
+  test('a historic run whose jobs list keeps returning 502 is skipped with a warning; the watch evaluates the newer runs and the triggering run still fails loudly', async () => {
+    const w = testWorld(T.g8315, T.r8320);
+    await go(w, T.r8320);
+    for (const r of [T.c8331, T.r8336, T.r8343, T.g8352]) w.addRun(r, existsSync(join(MR, `jobs-${r.id}.json`)) ? `jobs-${r.id}.json` : undefined);
+    const poison = `/actions/runs/${T.r8336.id}/attempts/${T.r8336.run_attempt}/jobs`;
+    w.failGet = p => p.includes(poison);
+    const logs: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(' ')); };
+    let r: Awaited<ReturnType<typeof go>>;
+    try { r = await go(w, T.g8352); } finally { console.log = log; }
+    expect(r.masterRed!.evaluated).toEqual([T.r8343.id, T.g8352.id]);
+    expect(mrState(masterIssue(w)!).evaluated).toMatchObject({ run_id: T.g8352.id });
+    expect(logs.filter(l => l.startsWith('::warning::'))).toEqual([expect.stringContaining(`run ${T.r8336.id} attempt ${T.r8336.run_attempt}`)]);
+
+    const own = testWorld(T.g8315, T.r8320);
+    own.failGet = p => p.includes(`/actions/runs/${T.r8320.id}/attempts/`);
+    await expect(go(own, T.r8320)).rejects.toThrow('HTTP 502');
+  });
+
+  test('restClient retries a GET that returns 5xx and succeeds on a later 200; a persistent 502 throws after the bounded retries; writes are never retried', async () => {
+    const real = globalThis.fetch;
+    const calls: string[] = [];
+    let script: number[] = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`);
+      const status = script.shift() ?? 200;
+      return new Response(status === 200 ? JSON.stringify({ jobs: [], total_count: 0 }) : 'bad gateway', { status });
+    }) as typeof fetch;
+    const slept: number[] = [];
+    const client = restClient('o/r', 'token', async ms => { slept.push(ms); });
+    const statusOf = (p: Promise<unknown>) => p.then(() => 0, e => (e as { status?: number }).status);
+    try {
+      script = [502, 200];
+      expect(await client.request<unknown>('GET', 'repos/{repo}/actions/runs/1/attempts/2/jobs')).toEqual({ jobs: [], total_count: 0 });
+      expect(calls).toEqual(['GET https://api.github.com/repos/o/r/actions/runs/1/attempts/2/jobs', 'GET https://api.github.com/repos/o/r/actions/runs/1/attempts/2/jobs']);
+      expect(slept).toEqual([GET_RETRY_DELAYS_MS[0]!]);
+
+      calls.length = 0; slept.length = 0;
+      script = [502, 502, 502, 502];
+      expect(await statusOf(client.request('GET', 'repos/{repo}/actions/runs/1/attempts/2/jobs'))).toBe(502);
+      expect(calls).toHaveLength(GET_RETRY_DELAYS_MS.length + 1);
+      expect(slept).toEqual(GET_RETRY_DELAYS_MS);
+
+      calls.length = 0;
+      script = [404];
+      expect(await statusOf(client.request('GET', 'repos/{repo}/actions/runs/9'))).toBe(404);
+      expect(calls).toHaveLength(1);
+
+      calls.length = 0;
+      script = [502];
+      expect(await statusOf(client.request('POST', 'repos/{repo}/issues', { title: 't' }))).toBe(502);
+      expect(calls).toHaveLength(1);
+    } finally {
+      globalThis.fetch = real;
+    }
   });
 
   test('more than three failures are all listed; a database URL in run text is redacted and never reaches a reproduce command', async () => {

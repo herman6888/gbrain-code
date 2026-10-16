@@ -35,6 +35,7 @@ describe('exit code table', () => {
     expect(exitCodes.CONFIRMATION_REQUIRED_EXIT_CODE).toBe(3);
     expect(exitCodes.PENDING_WRITE_EXIT_CODE).toBe(10);
     expect(exitCodes.BUDGET_STOP_EXIT_CODE).toBe(11);
+    expect(exitCodes.HARNESS_PENDING_VERIFY_EXIT_CODE).toBe(13);
     expect(exitCodes.SERVE_UNHEALTHY_EXIT_CODE).toBe(69);
     expect(exitCodes.MIGRATIONS_RUNNING_EXIT_CODE).toBe(75);
     expect(exitCodes.TIMEOUT_EXIT_CODE).toBe(124);
@@ -51,6 +52,7 @@ describe('exit code table', () => {
     expect(exitCodeForCode('invalid_params')).toBe(2);
     expect(exitCodeForCode('unknown_flag')).toBe(2);
     expect(exitCodeForCode('write_pending')).toBe(10);
+    expect(exitCodeForCode('pending_verify')).toBe(13);
     expect(exitCodeForCode('serve_unhealthy_exit')).toBe(69);
     expect(exitCodeForCode('timeout')).toBe(124);
     expect(exitCodeForCode('interrupted')).toBe(130);

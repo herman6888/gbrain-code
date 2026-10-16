@@ -16,6 +16,9 @@
       "backfill": [
         "./commands/backfill.ts"
       ],
+      "beliefs": [
+        "./commands/beliefs.ts"
+      ],
       "book-mirror": [
         "./commands/book-mirror.ts"
       ],

@@ -6,6 +6,7 @@ import { TOKEN_TTL_MAX_SECONDS, TOKEN_TTL_MIN_SECONDS, normalizeGrantBrain, vali
 import { shellQuote } from '../mcp-registration.ts';
 import type { CatalogProvenance } from '../grants/profiles.ts';
 import type { Action, Notice } from '../agent-output.ts';
+import { EXECUTION_PREREQUISITES, requiresExplicitApproval } from '../ops/execution-prerequisites.ts';
 
 type GrantSurface = 'verbs' | 'starter' | 'full';
 
@@ -82,10 +83,20 @@ export interface GrantGapInput {
 export interface GrantGaps {
   missingScopes: string[];
   snapshotExcluded: string[];
+  /** #6663: operations that need explicit snapshot approval, which a grant with no snapshot never gives. */
+  approvalExcluded: string[];
   pinExcluded: string[];
   serverExcluded: string[];
   unreachable: string[];
+  /**
+   * #6621/#6663: eligible operations whose execution needs something no snapshot or surface change gives
+   * (ops/execution-prerequisites.ts), each with what lifts it. Not counted in `unreachable` unless a blocker
+   * above also applies; named because every one is within the grant's own scopes.
+   */
+  prerequisites: GrantPrerequisite[];
 }
+
+export interface GrantPrerequisite { operation: string; prerequisite: string; fix: string }
 
 export async function grantOperationGaps(input: GrantGapInput): Promise<GrantGaps> {
   const [{ operations, opAllowedForBoundClient }, { filterOpsForSurface }] = await Promise.all([
@@ -101,13 +112,25 @@ export async function grantOperationGaps(input: GrantGapInput): Promise<GrantGap
   };
   const snapshot = input.allowedOperations ? new Set(input.allowedOperations) : null;
   const snapshotExcluded = snapshot ? eligible.filter(op => !snapshot.has(op.name)).map(op => op.name) : [];
+  const approvalExcluded = snapshot ? [] : eligible.filter(op => requiresExplicitApproval(op.name)).map(op => op.name);
   const pinExcluded = outside(input.clientSurface);
   const serverExcluded = outside(input.serverSurface);
-  const blocked = new Set([...snapshotExcluded, ...pinExcluded, ...serverExcluded]);
+  const blocked = new Set([...snapshotExcluded, ...approvalExcluded, ...pinExcluded, ...serverExcluded]);
+  const prerequisites: GrantPrerequisite[] = [];
+  for (const op of eligible) {
+    const need = EXECUTION_PREREQUISITES[op.name];
+    if (!need) continue;
+    if (need.kind === 'owner_granted_scope' && need.scope && !hasScope([...input.scopes], need.scope)) {
+      prerequisites.push({ operation: op.name, prerequisite: `scope:${need.scope}`, fix: need.fix });
+    } else if (need.kind === 'explicit_operation_approval' && !snapshot?.has(op.name)) {
+      prerequisites.push({ operation: op.name, prerequisite: 'explicit_operation_approval', fix: need.fix });
+    }
+  }
   return {
     missingScopes: ['read', 'write'].filter(scope => !hasScope([...input.scopes], scope)),
-    snapshotExcluded, pinExcluded, serverExcluded,
+    snapshotExcluded, approvalExcluded, pinExcluded, serverExcluded,
     unreachable: eligible.filter(op => blocked.has(op.name)).map(op => op.name),
+    prerequisites,
   };
 }
 
@@ -152,7 +175,7 @@ export type RescopeTarget = { kind: 'oauth_client'; id: string } | { kind: 'lega
  * leaves the `<OPERATIONS>` placeholder for the owner to choose. `all` is the
  * disclosed no-snapshot choice, never the default repair.
  */
-export function grantRescopeArgvs(target: RescopeTarget, gaps: Pick<GrantGaps, 'snapshotExcluded' | 'pinExcluded'>, operations: string | null) {
+export function grantRescopeArgvs(target: RescopeTarget, gaps: Pick<GrantGaps, 'snapshotExcluded' | 'pinExcluded'> & Partial<Pick<GrantGaps, 'approvalExcluded'>>, operations: string | null) {
   const value = operations ?? '<OPERATIONS>';
   if (target.kind === 'legacy_token') {
     const base = ['gbrain', 'auth', 'rescope', ...target.flag];
@@ -161,7 +184,7 @@ export function grantRescopeArgvs(target: RescopeTarget, gaps: Pick<GrantGaps, '
   }
   const base = ['gbrain', 'auth', 'rescope', '--client', target.id];
   const surface = gaps.pinExcluded.length ? ['--surface', 'full'] : [];
-  const apply = [...base, ...(gaps.snapshotExcluded.length ? ['--operations', value] : []), ...surface];
+  const apply = [...base, ...(gaps.snapshotExcluded.length || gaps.approvalExcluded?.length ? ['--operations', value] : []), ...surface];
   return { preview: [...apply, '--dry-run'], apply, all_operations: [...base, '--operations', 'all', ...surface, '--dry-run'] };
 }
 
@@ -170,6 +193,7 @@ export function grantBlockers(gaps: GrantGaps, surfaces: { clientSurface: GrantS
   const blockers: Array<Record<string, unknown>> = [];
   if (gaps.missingScopes.length) blockers.push({ blocker: 'scope', missing_scopes: gaps.missingScopes });
   if (gaps.snapshotExcluded.length) blockers.push({ blocker: 'operation_snapshot', excluded_count: gaps.snapshotExcluded.length });
+  if (gaps.approvalExcluded?.length) blockers.push({ blocker: 'explicit_approval', excluded_count: gaps.approvalExcluded.length });
   if (gaps.pinExcluded.length) blockers.push({ blocker: 'client_pin', surface: surfaces.clientSurface, set_by: surfaces.clientSurfaceSetBy, excluded_count: gaps.pinExcluded.length });
   if (gaps.serverExcluded.length) blockers.push({ blocker: 'server_ceiling', surface: surfaces.serverSurface, excluded_count: gaps.serverExcluded.length });
   return blockers;
@@ -187,11 +211,16 @@ export function describeGrantDiagnosis(gaps: GrantGaps, opts: {
   serverSurface: GrantSurface | null; target: RescopeTarget | null;
 }) {
   const blockers = grantBlockers(gaps, opts);
-  const repairable = opts.target && (gaps.snapshotExcluded.length || gaps.pinExcluded.length);
+  const repairable = opts.target && (gaps.snapshotExcluded.length || gaps.approvalExcluded?.length || gaps.pinExcluded.length);
   const argvs = repairable ? grantRescopeArgvs(opts.target!, gaps, null) : null;
+  const prerequisites = gaps.prerequisites ?? [];
+  const prerequisiteNote = prerequisites.length
+    ? ` Some operations need more than this change: ${prerequisites.map(p => `${p.operation} (${p.fix})`).join('; ')}`
+    : '';
   return {
     blockers,
     unreachable_count: gaps.unreachable.length,
+    prerequisites,
     grant_age: grantAge(gaps.snapshotExcluded, opts.hasSnapshot, opts.provenance),
     fix: argvs ? {
       next: 'tell_user_to_run' as const, actor: 'host_admin' as const,
@@ -199,7 +228,7 @@ export function describeGrantDiagnosis(gaps: GrantGaps, opts: {
       then_argv: argvs.apply,
       ...(argvs.apply.includes('<OPERATIONS>') ? { inputs: [{ name: 'OPERATIONS', how: 'The brain owner chooses: the current operation snapshot plus each operation they approve, comma-separated.' }] } : {}),
       why: 'This grant cannot call operations its scopes allow until the brain owner changes it; nothing widens automatically.',
-      user_message: `This gbrain connection cannot call ${gaps.unreachable.length} operation(s) its scopes allow. Ask the brain owner to preview the change on the brain host with the command shown, then apply it.`,
+      user_message: `This gbrain connection cannot call ${gaps.unreachable.length} operation(s) its scopes allow. Ask the brain owner to preview the change on the brain host with the command shown, then apply it.${prerequisiteNote}`,
       all_operations: { argv: argvs.all_operations, label: ALL_OPERATIONS_CHOICE },
     } : null,
   };
@@ -236,6 +265,7 @@ export function grantRepairAction(d: GrantDiagnosis): Action | null {
 
 function blockerPhrase(b: Record<string, unknown>): string {
   if (b.blocker === 'operation_snapshot') return `its operation snapshot (${b.excluded_count})`;
+  if (b.blocker === 'explicit_approval') return `missing explicit approval of membership operations, which a grant with no operation snapshot never gives (${b.excluded_count})`;
   if (b.blocker === 'client_pin') return `its stored ${b.surface} tool surface${b.set_by === 'operator' ? ', which the brain owner pinned' : ''} (${b.excluded_count})`;
   return `the server's ${b.surface} tool surface (${b.excluded_count})`;
 }

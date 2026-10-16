@@ -24,7 +24,7 @@
 import type { SearchResult, PageReadPolicy } from '../types.ts';
 import type { Action } from '../agent-output.ts';
 import { pageReadFilter } from './read-policy-sql.ts';
-import { belowSafeChunkFence } from './safe-chunks.ts';
+import { belowSafeChunkFence, chunkGenerationFilter } from './safe-chunks.ts';
 
 export interface ExplainTargetRef {
   slug: string;
@@ -180,7 +180,7 @@ export async function probeTarget(query: ReadQuery, slug: string, policy: PageRe
   const filter = pageReadFilter('p', policy, params, true);
   const rows = await query<{ source_id: string; chunks: number; current: boolean; chunker_version: number | null }>(
     `SELECT p.source_id,
-       (SELECT COUNT(*)::int FROM content_chunks cc WHERE cc.page_id = p.id) AS chunks,
+       (SELECT COUNT(*)::int FROM content_chunks cc WHERE cc.page_id = p.id AND ${chunkGenerationFilter('p', 'cc')}) AS chunks,
        ((p.text_projection_revision = p.knowledge_revision) IS TRUE) AS current,
        p.chunker_version
      FROM pages p WHERE p.slug = $1 AND ${filter} ORDER BY p.source_id`, params);

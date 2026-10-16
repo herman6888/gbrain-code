@@ -89,6 +89,7 @@ Every hold and error has three fields, from one table
 |---|---|---|---|---|
 | `worktree_dirty` | page | retry_when_clean | no | held 3 times: the file keeps changing without being committed |
 | `concurrent_write` | page | reconcile | yes | always: the file and the database page diverge |
+| `file_drift` | page | reconcile | yes | always: the page changed in the database since its file was last imported |
 | `preparation_stalled` | page | retry, upgrade | no | held 3 times, or writer status names a step that never finishes |
 | `invalid_fence` | page | repair | no | the fence repair preview offers no plan (a manual reason) |
 | `invalid_frontmatter` | page | repair | no | the repair preview needs an interpretation (--include-ambiguous) |
@@ -103,16 +104,17 @@ Every hold and error has three fields, from one table
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
 | `source_changed` | page | retry | no | the same path fails again after a rerun |
 | `cancelled` | page | retry | no | the same group is cancelled again after a rerun |
-| `knock_on` | page | retry | no | the same root request is named again after a rerun |
+| `knock_on` | page | retry | no | never: superseded; an older gbrain cancelled this page for another page's failure and a plain sync re-freezes it |
 | `run_replaced` | page | retry | no | never: another run of the source superseded this one and covers its pages |
 | `outside_fence` | systemic | none | yes | always: a request published outside the cursor that admitted it |
-| `knock_on_exhausted` | systemic | none | yes | always: re-freezing did not get past the failing page |
+| `knock_on_exhausted` | page | retry | no | never: superseded; a plain sync resumes the entry an older gbrain stopped on |
 | `sync_incomplete` | page | retry | no | never: an unfinished cursor resumes with the same command |
 | `connection_lost` | connection | retry | no | three reruns in a row end connection_lost (the database is unreachable from this host) |
 | `database_contention` | connection | retry | no | three reruns in a row stop on it |
 | `write_capacity` | connection | retry | no | writer status shows the cap held by requests that never settle |
 | `write_capacity_backpressure` | connection | retry | no | reason lifetime_ids (request ids never free, so only the host raise lifts it), or the pause outlasts a day |
 | `capacity_paused` | connection | retry | no | reason lifetime_ids (only the host raise resumes it), or the same pause after the raise |
+| `sync_drain_lease_held` | connection | retry | no | never: a holder that stops committing ends the run drain_stalled instead |
 | `storage_error` | connection | retry | no | the same error after a rerun (then it is not a dropped connection) |
 | `graduation_in_progress` | connection | retry | no | gbrain migrate --status --json reports no running move and the fence still refuses |
 | `preparation_systemic` | systemic | upgrade, retry | yes | always |
@@ -136,23 +138,30 @@ or `statement_timeout` on a parallel publish lane) also carries that fault as
 The verdict is the same retry; the detail says the database, not the page,
 ended the group.
 
-A page that only waited on another page of the same sync (a knock-on: its
-group, window or lane predecessor did not commit) is re-frozen by the sync
-itself under a fresh request on the next pass; `--retry-failed` is not
-needed for it. Its error carries `last_error.detail: knock_on` and
-`last_error.root_cause` (the request, page and error it waited on); act on
-the root. A cursor refusal is classified by its recorded cause:
-`run_replaced` (another run of the source took over; nothing to do),
-`window_dropped` (a knock-on), or `outside_fence` (a request was not the
-entry its cursor held: a person stops the extra drain and reports it).
-After `sync.knock_on_refreeze_limit` re-freezes at one index (default 3;
-0 turns automatic re-freeze off), or after `sync.knock_on_run_limit`
-re-freezes in one sync invocation (default 25), the run stops with
-`knock_on_exhausted` and names the root. The per-index count resets when
-the page commits; the per-invocation count resets on the next sync. A
-checkpoint refused by a receipt that turns out to be a knock-on, or at an
-index the cursor passed without a commit, is re-assessed on every resume and
-commits without rediscovering the manifest.
+Each page of a sync has its own fate (#6712): a page that does not commit is
+held, retried or stops the run on its own, and the pages admitted after it
+still publish and are counted from their own receipts. No page is cancelled
+for another page's failure, and two changes of one page (a delete and an
+import of one slug, say) are never published in the same group: the later
+one waits for the earlier one, and is held behind it (`blocked_on`) when the
+earlier one is held. A file that changed after its request was admitted
+(`source_changed`) is retried after the manifest's last entry, at most three
+times, then held `worktree_dirty`. A transport fault re-freezes the entry in
+place; a systemic stop is re-frozen in place by the next plain sync, at most
+three times in a row before the failure stays recorded for `--retry-failed`.
+
+A `knock_on` or `knock_on_exhausted` error was written by an older gbrain
+(a page cancelled only because another page of its sync did not commit, or
+the stop that bounded re-freezing them). Both are superseded: the next plain
+sync re-freezes the entry under a fresh request; act on `root_cause` if it
+fails again. A cursor refusal is classified by its recorded cause:
+`run_replaced` (another run of the source took over; nothing to do) or
+`outside_fence` (a request was not the entry its cursor held: a person stops
+the extra drain and reports it); an older build's `window_dropped` reads as
+a knock-on. A checkpoint refused by a receipt at an index the cursor passed
+without a commit is re-assessed on every resume and commits without
+rediscovering the manifest; one a receipt still blocks is rediscovered by
+`--retry-failed`.
 
 An unknown code is systemic and human: `gbrain errors <code>` explains it
 offline, `gbrain doctor --json` says what the brain thinks.

@@ -150,15 +150,15 @@ export async function recordPartialDisposition(engine: SqlEngine, sourceId: stri
   if (!item.identity) throw new AtomPageStateError('unpinned');
   const rows = await engine.executeRaw(
     `INSERT INTO extract_atoms_page_state (source_incarnation, page_id, content_hash, fail_count, tombstoned, partial_input_chars)
-      SELECT s.incarnation, p.id, p.content_hash, 0, false, $8::integer
+      SELECT s.incarnation, p.id, p.content_hash, 0, false, $7::integer
       FROM pages p JOIN sources s ON s.id=p.source_id
       WHERE p.id=$1 AND s.incarnation=$2::uuid AND p.source_id=$3 AND p.slug=$4
-        AND p.content_hash=$5 AND p.knowledge_revision=$6::uuid AND p.compiled_truth=$7 AND p.deleted_at IS NULL
+        AND p.content_hash=$5 AND p.knowledge_revision=$6::uuid AND p.deleted_at IS NULL
       FOR SHARE OF p, s
       ON CONFLICT (source_incarnation, page_id, content_hash) DO UPDATE
         SET partial_input_chars=EXCLUDED.partial_input_chars, updated_at=now()
       RETURNING page_id`,
-    [item.identity.pageId, item.identity.sourceIncarnation, sourceId, item.slug, item.contentHash, item.identity.revision, item.content, maxInputChars])
+    [item.identity.pageId, item.identity.sourceIncarnation, sourceId, item.slug, item.contentHash, item.identity.revision, maxInputChars])
     .catch((error: unknown) => {
       const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
       throw new AtomPageStateError(code === '42P01' ? 'schema' : code === '42501' ? 'denied' : 'storage');

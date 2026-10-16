@@ -60,7 +60,7 @@ import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/p
 import { acquireLeaseSet, maintenanceLockBusySkip, MAINTENANCE_LEASE_ID } from './cycle/lock-set.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts'; import { embedBackfillFix } from './embed-consent.ts';
 import { anyAbortSignal } from './abort-signals.ts';
-import { maybeRefreshPlannerStats } from './planner-stats.ts';
+import { maybeRefreshPlannerStats } from './planner-stats.ts'; import { listSourceChangedPages, sourceCycleWindowStamp, unionSlugSets, type SourceCycleWindow } from './cycle/source-window.ts';
 
 export { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 export { anyAbortSignal } from './abort-signals.ts';
@@ -580,6 +580,8 @@ export interface CycleOpts {
    * Validated via `assertValidSourceId` in `cycleLockIdFor` (defense-in-depth).
    */
   sourceId?: string;
+  /** #6803: a connector source's cycle (no sync phase) works on its pages changed after this (null: all); see cycle/source-window.ts. */
+  sourceChangedSince?: string | null;
   /**
    * #4700 — bare `gbrain dream` may opt the brain's default-like source
    * (sources.default / sole-non-default routing) into the full implicit
@@ -601,13 +603,15 @@ export interface CycleOpts {
    * Never reads or writes config — the phase still evaluates its config
    * gate every call; this only overrides the boolean OUTCOME for that one
    * call. Applies to: patterns, synthesize, conversation_facts_backfill,
-   * enrich_thin, skillopt, lint (the phases that gate on a `.enabled` config
+   * enrich_thin, skillopt, lint, consolidate (the phases that gate on a `.enabled` config
    * key read inside the phase's own module). Does NOT apply to
    * extract_atoms / synthesize_concepts — those are pack-gated via
    * `packDeclaresPhase`, a different mechanism with its own existing
    * one-shot escape hatch (`--drain` for extract_atoms).
    */
   onceForPhase?: CyclePhase;
+  /** #6297: the operator named the phases (`gbrain dream --phase`); patterns then skips its in-cycle cadence. */
+  directPhases?: boolean;
   /**
    * Absolute wall-clock deadline (epoch ms) of the enclosing minion job,
    * from `MinionJobContext.deadlineAtMs` (the claim-time `timeout_at`
@@ -1286,7 +1290,7 @@ async function runPhaseSync(
       noExtract: willRunExtractPhase,      // dedupe ONLY when cycle's extract phase will also run.
                                            // If extract isn't scheduled (e.g. `gbrain dream --phase sync`),
                                            // sync's inline extract still runs to preserve prior behavior.
-      explicitProcessing: [],              // unattended: an unfinished managed cursor keeps its own options (#5632)
+      drainHolder: { kind: 'cycle', id: null }, // #6712 PR 1: a busy drain lease skips like a busy sync lock
     });
     const syncedCount = result.added + result.modified;
     // #3068: a pull_failed partial means the internal git pull failed and the
@@ -1439,6 +1443,7 @@ async function runPhaseExtract(
     }
     const { sweepStaleRelationships } = await import('./link-relationships.ts');
     staleDetails = { ...staleDetails, ...(await sweepStaleRelationships(engine)) };
+    staleDetails = { ...staleDetails, ...(await (await import('./belief/coverage-report.ts')).cycleBeliefReconcile(engine, sourceId)) };
     return {
       phase: 'extract',
       status: 'ok',
@@ -1961,6 +1966,7 @@ async function runCycleUnscoped(
     ? (opts.sourceId ?? (await resolveSourceForDir(engine, brainDir)))
     : opts.sourceId;
   const orphansSourceId = opts.forceGlobalOrphans ? undefined : cycleSourceId;
+  let sourceWindow: SourceCycleWindow | undefined;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
@@ -2248,6 +2254,8 @@ async function runCycleUnscoped(
     // legitimate full reconcile — only a sync that ran and failed suppresses it.
     let syncAttempted = false;
     let synthesizeWrittenSlugs: string[] | undefined;
+    sourceWindow = engine && cycleSourceId && opts.sourceChangedSince !== undefined
+      ? await listSourceChangedPages(engine, cycleSourceId, opts.sourceChangedSince) : undefined;
     if (phases.includes('sync')) {
       checkAborted(cycleSignal);
       if (!engine) {
@@ -2404,7 +2412,7 @@ async function runCycleUnscoped(
         // (#1928, codex: keying off phases.includes('sync') wrongly suppressed
         // the skipped-sync full reconcile).
         const syncRanButFailed = syncAttempted && syncPagesAffected === undefined;
-        const xfSlugs = syncRanButFailed ? [] : syncPagesAffected;
+        const xfSlugs = syncRanButFailed ? [] : (sourceWindow?.slugs ?? syncPagesAffected);
         const { result, duration_ms } = await timePhase(() =>
           runPhaseExtractFacts(engine, brainDir, xfSourceId, dryRun, xfSlugs, cycleSignal), 'extract_facts');
         result.duration_ms = duration_ms;
@@ -2536,7 +2544,7 @@ async function runCycleUnscoped(
           // the cycle lock (pre-fix these sites passed the raw — in production
           // always-undefined — hook, so long phases never refreshed).
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
-          once: opts.onceForPhase === 'patterns',
+          once: opts.onceForPhase === 'patterns', direct: opts.directPhases === true,
           cycleDate,
           deadlineAtMs: opts.deadlineAtMs ?? null,
           privateQueueOwnerJobId: opts.privateQueueOwnerJobId ?? null,
@@ -2621,13 +2629,7 @@ async function runCycleUnscoped(
         // Determine incremental vs full mode. If sync OR synthesize ran in this
         // cycle, do incremental over their union. If neither phase ran (e.g.,
         // user passed `--phase recompute_emotional_weight`), do full walk.
-        const incremental: string[] | undefined =
-          (syncPagesAffected || synthesizeWrittenSlugs)
-            ? Array.from(new Set([
-                ...(syncPagesAffected ?? []),
-                ...(synthesizeWrittenSlugs ?? []),
-              ]))
-            : undefined;
+        const incremental = unionSlugSets(syncPagesAffected, synthesizeWrittenSlugs, sourceWindow?.slugs);
         // #4797: raced + signal + lock-refresh + progress, like consolidate —
         // the full-brain write is sliced inside the phase; these hooks fire
         // between slices so a long first run stays observable and abortable.
@@ -2665,7 +2667,7 @@ async function runCycleUnscoped(
         progress.start('cycle.consolidate');
         const { runPhaseConsolidate } = await import('./cycle/phases/consolidate.ts');
         const { result, duration_ms } = await racedTimePhase(() => runPhaseConsolidate(engine, {
-          dryRun,
+          dryRun, once: opts.onceForPhase === 'consolidate',
           remote: opts.remote,
           sourceId: cycleSourceId,
           // W0 (Tier-1 #1): wrap the caller hook so this phase ALSO refreshes
@@ -3152,6 +3154,7 @@ async function runCycleUnscoped(
       await engine.updateSourceConfig(opts.sourceId, {
         last_source_cycle_at: nowIso,
         last_full_cycle_at: nowIso,
+        ...sourceCycleWindowStamp(phaseResults, opts.sourceChangedSince, sourceWindow),
       });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);

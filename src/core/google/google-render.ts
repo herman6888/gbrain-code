@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto';
 import { renderAttachmentInspection, threadAttachmentReceipts } from './attachment-receipts.ts';
 
 import { emailCitation } from '../output/scaffold.ts';
-import { DEFAULT_CONTACTS_DIR, type CalendarEventData, type ContactData, type GmailThreadData } from './types.ts';
+import { DEFAULT_CONTACTS_DIR, type CalendarEventData, type ContactData, type GmailMessageMeta, type GmailThreadData } from './types.ts';
 
 // ── Noise + signature rules (recipes/email-to-brain.md, now code) ───────────
 
@@ -40,6 +40,19 @@ const GOOGLE_SYSTEM_SENDERS: ReadonlySet<string> = new Set(['gemini-notes@google
 export function isNoiseSender(fromAddress: string): boolean {
   const f = fromAddress.toLowerCase();
   return GOOGLE_SYSTEM_SENDERS.has(f) || NOISE_SENDER_SUBSTRINGS.some((p) => f.includes(p));
+}
+
+const BULK_PRECEDENCE = new Set(['bulk', 'list', 'junk']);
+
+/**
+ * #5012: mail that positively declares itself automated: `Precedence:
+ * bulk|list|junk`, a `List-Id` header, or a no-reply `From` or `Reply-To`.
+ * Category labels and sender guesses are deliberately not signals, so a cold
+ * introduction from a real person still owes a reply.
+ */
+export function isPositivelyAutomated(m: GmailMessageMeta): boolean {
+  return BULK_PRECEDENCE.has(m.precedence ?? '') || m.listId === true || isNoiseSender(m.fromAddress)
+    || (m.replyTo ?? []).some((a) => isNoiseSender(a));
 }
 
 /**

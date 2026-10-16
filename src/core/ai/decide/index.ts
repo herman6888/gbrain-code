@@ -132,6 +132,14 @@ function deadlineSignal(deadlineAt: number, now: () => number, caller?: AbortSig
   return { signal: ctrl.signal, done: () => { clearTimeout(t); caller?.removeEventListener('abort', onAbort); } };
 }
 
+/** Attach the settled batches' answers to a failed decision (#6519); a policy error passes through bare. */
+function withPartial(err: unknown, answers: Record<string, DecideAnswer>, models: Set<string>): unknown {
+  if (err instanceof DecideError && Object.keys(answers).length > 0) {
+    err.partial = { answers: { ...answers }, model_resolved: models.size === 1 ? [...models][0]! : null };
+  }
+  return err;
+}
+
 function asDecideError(err: unknown, signal: AbortSignal, caller?: AbortSignal): unknown {
   if (err instanceof DecideError || isAIInvocationPolicyError(err)) return err;
   if (signal.aborted) return caller?.aborted ? new DecideError('provider_error', 'decide: caller aborted') : new DecideError('timeout', 'decide: deadline exceeded');
@@ -224,12 +232,12 @@ async function runTypesafe(req: DecideRequest, ctx: DecideContext, cfg: DecideCo
       }
     }, { concurrency: a.lane === 'hot' ? cfg.maxConcurrency : cfg.backgroundConcurrency, deadlineAt: a.deadlineAt, signal, lane: a.lane, now: a.now });
   } catch (err) {
-    throw asDecideError(err, signal, req.signal);
+    throw withPartial(asDecideError(err, signal, req.signal), answers, models);
   } finally {
     done();
     recordOnTracker(tracker, { modelId: a.provider, reservation, inputTokens, outputTokens: 0, kind: budgetKind, label: 'gateway.decide' });
   }
-  if (models.size > 1) throw new DecideError('mixed_model', `decide: batches answered by ${models.size} different models`);
+  if (models.size > 1) throw withPartial(new DecideError('mixed_model', `decide: batches answered by ${models.size} different models`), answers, models);
   const modelResolved = [...models][0] ?? modelId;
   return {
     decision_id: randomUUID(), provider: a.provider, model_alias: modelId, model_resolved: modelResolved, answers, refused: {},
@@ -269,11 +277,11 @@ async function runLlm(req: DecideRequest, cfg: DecideConfig, a: RunArgs): Promis
       Object.assign(answers, parseLlmReply(reply.text, questions));
     }, { concurrency: a.lane === 'hot' ? cfg.maxConcurrency : cfg.backgroundConcurrency, deadlineAt: a.deadlineAt, signal, lane: a.lane, now: a.now });
   } catch (err) {
-    throw asDecideError(err, signal, req.signal);
+    throw withPartial(asDecideError(err, signal, req.signal), answers, models);
   } finally {
     done();
   }
-  if (models.size > 1) throw new DecideError('mixed_model', 'decide: batches answered by different models');
+  if (models.size > 1) throw withPartial(new DecideError('mixed_model', 'decide: batches answered by different models'), answers, models);
   return {
     decision_id: randomUUID(), provider: a.provider, model_alias: model, model_resolved: [...models][0] ?? model, answers, refused: {},
     usage: { input_tokens: inputTokens, output_tokens: outputTokens }, cost_usd: 0, latency_ms: 0, batches: plan.length, lane: a.lane,

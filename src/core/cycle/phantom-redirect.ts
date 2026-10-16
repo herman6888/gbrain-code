@@ -38,6 +38,7 @@ import * as path from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
 import { contentHash } from '../utils.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import type { Page } from '../types.ts';
 import {
   resolvePhantomCanonical,
@@ -575,6 +576,8 @@ export async function tryRedirectPhantom(
     return { outcome: 'drift', canonical };
   }
   const canonicalPath = writeTarget.ok ? writeTarget.filePath : path.join(brainDir, `${canonical}.md`);
+  const target = await engine.getPage(canonical, { sourceId });
+  if (target) assertInlineBody(target, 'phantom redirect');
   await materializeCanonicalToDisk(engine, canonical, sourceId, canonicalPath);
 
   // Disk-side first: parse phantom's fence and append to canonical's

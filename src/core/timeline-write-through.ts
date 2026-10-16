@@ -1,4 +1,5 @@
 import { bodyWriteChunkVersion } from './search/safe-chunks.ts';
+import { assertInlineBody } from './page-body/page-shape.ts';
 /**
  * #1856 — write-through for manual timeline entries.
  *
@@ -323,6 +324,7 @@ export async function writeTimelineEntryThrough(
       // error instead of inventing a second error shape here.
       return { handled: false, skipped: 'page_not_found' };
     }
+    assertInlineBody(page, 'timeline write-through');
 
     const rendered = renderTimelineEntry(entry, slug);
     if (!rendered) {

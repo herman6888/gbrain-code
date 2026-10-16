@@ -43,6 +43,7 @@ import { connectorCheckpointsRepair } from './connector-checkpoints.ts';
 import { requestIndexesRepair } from './request-indexes.ts';
 import { connectorFencesRepair } from './connector-fences.ts';
 import { takeSupersessionRepair } from './take-supersession.ts';
+import { acceptedTakesRepair } from './accepted-takes.ts';
 import { orphanBindingsRepair } from './orphan-bindings.ts';
 import { managedSyncOrphansRepair } from './managed-sync-orphans.ts';
 import { embeddingEffectsRepair } from './embedding-effects.ts';
@@ -66,6 +67,7 @@ import { fileDriftRepair } from './file-drift.ts';
 import { stuckRecoveryRepair } from './stuck-recovery.ts';
 import { ghostPagesRepair, GHOST_CONSENT_TEXT, GHOST_CONSEQUENCES, GHOST_PURGE_FUSE_HOURS } from './ghost-pages.ts';
 import { receiptCompactionRepair } from './receipt-compaction.ts';
+import { aliasesRepair } from './aliases.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
 
@@ -88,6 +90,12 @@ export interface RepairKindSpec {
   consentText?: { what: string; why: string; risk: string; user_message: string };
   /** `llm`: the kind may call a paid chat model; its spend is metered by the daily USD ledger and reported in `cost.llm_usd`. */
   spends?: 'llm';
+  /**
+   * `unbound`: the remediation approval (`--expect <plan_hash>`) leaves this kind out. Its plan follows live server
+   * statistics that autovacuum changes between preview and run, and its apply changes no stored record; the run
+   * still applies what is pending then.
+   */
+  approval?: 'unbound';
 }
 
 const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
@@ -132,6 +140,14 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '`superseded by #<own row>` pointer with exactly one possible predecessor. The pointer is written onto the old row and stale self-pointers are '
       + 'dropped through a revision-bound put_page; a page whose fence is right but whose stored pointers differ is reprojected. Ambiguous pages are '
       + 'listed with the manual edit and never changed.',
+  },
+  'accepted-takes': {
+    handler: acceptedTakesRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true,
+    summary: 'Restore takes that accepting a held strike-through or kind change removed on v0.60.253.0 (gbrain trust confirm tp<id> ran a takes_remove '
+      + 'instead of applying the change). Only what the records prove: the accepted proposal, the takes_remove receipt bound to it, the page version that '
+      + 'receipt archived (the fence row the accept should have applied) and the reservation row still holding its number. --apply --expect <hash> '
+      + 'republishes each page with that row (a revision-bound put_page) at the tier of the write the owner accepted. A grade or resolution only the '
+      + 'database held is not in any record and is not restored. Runs only when named.',
   },
   'orphan-bindings': {
     handler: orphanBindingsRepair, embeds: 'none', checks: ['orphan_persistence_bindings'],
@@ -261,7 +277,7 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'Preview-bound: --apply --expect <hash> applies exactly the previewed set. gbrain repair content runs fences, then this kind.',
   },
   'planner-stats': {
-    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'],
+    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'], approval: 'unbound',
     summary: 'ANALYZE the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale (F4b), '
       + 'so search and graph reads stop planning as slow nested loops. PGLite also resets each table\'s pending row count; Postgres runs each '
       + 'ANALYZE with a 60 s statement and 2 s lock timeout. No journal admission and no user data changes. Brain-wide.',
@@ -328,6 +344,13 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '(persistence.receipt_retention_days) unless --force; committed receipts only unless --include-failures. Receipts of a run whose sync cursor is '
       + 'open, and the newest sync receipt per worktree, are kept. Preview-bound and destructive: --apply --expect <hash> --yes compacts only the '
       + 'previewed set. No admission, so it runs at a full cap. Brain-wide. Runs only when named.',
+  },
+  aliases: {
+    handler: aliasesRepair, embeds: 'none', checks: ['dangling_aliases'], explicit_only: true,
+    summary: 'Delete free-text page aliases and slug redirects whose target page has no row at all (purged or hard-deleted, #6619), which doctor '
+      + 'dangling_aliases reports as orphaned. Aliases of a soft-deleted page are kept for gbrain restore and counted; a redirect from an old name '
+      + 'of a page that still exists is never touched. Each target slug is rechecked under its page lock; coordinated maintenance write on a managed '
+      + 'brain, no journal admission. Runs only when named.',
   },
 };
 

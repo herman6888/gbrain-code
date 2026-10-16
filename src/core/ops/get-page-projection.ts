@@ -9,6 +9,7 @@ import { renderTrustedText, type TrustFields } from '../eligibility/labels.ts';
 import { loadPageTrust } from '../eligibility/stamp.ts';
 import { resolveReadEligibility, type ReadEligibility } from '../eligibility/policy.ts';
 import { admitsTrust } from '../trust/tier.ts';
+import { rederiveHiddenSql } from '../eligibility/sql.ts';
 
 /**
  * #6259: how a get_page reader sees a page the content-quality gate hid as junk.
@@ -121,8 +122,9 @@ export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
 /**
  * #5575 (A6, CEO-18, ENG-14): get_page and fetch read one page's trust once.
  * Returns its label fields and the read eligibility (for the page's timeline
- * rows), or null when the page sits below the effective read floor, which the
- * caller answers exactly like a missing page (no existence oracle).
+ * rows), or null when the page sits below the effective read floor or a purge
+ * hid it for re-derivation (even with include_deleted), which the caller
+ * answers exactly like a missing page (no existence oracle).
  */
 export async function pageTrustForRead(ctx: Pick<OperationContext, 'engine' | 'auth'>, page: Pick<Page, 'id'>, minTrust: unknown):
   Promise<{ trust: TrustFields; eligibility: ReadEligibility } | null> {
@@ -130,6 +132,9 @@ export async function pageTrustForRead(ctx: Pick<OperationContext, 'engine' | 'a
   const trust = (await loadPageTrust(ctx.engine, [{ page_id: page.id, slug: '' }]).catch(() => null))?.byId.get(page.id)
     ?? { trust_tier: 'unknown' as const, origin: 'unrecorded' };
   if (eligibility.floor && !admitsTrust(trust.trust_tier, eligibility.floor)) return null;
+  const [hidden] = await ctx.engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM pages p WHERE p.id = $1 AND NOT ${rederiveHiddenSql('pages', 'p')}`, [page.id]);
+  if (Number(hidden?.n) > 0) return null;
   return { trust, eligibility };
 }
 

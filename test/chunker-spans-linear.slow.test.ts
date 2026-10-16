@@ -3,19 +3,17 @@
  *
  * Span tracking carries offset segments through merge and overlap; copying a
  * run's segments on every merge made the merge quadratic in pieces per chunk.
- * Doubling the input must roughly double the time with spans on, for chat-log
- * text and for a page of one-word paragraphs (the most pieces per chunk). The
- * bound is generous (linear is 2x, quadratic 4x) and each size takes its best
- * of three runs, so a busy machine does not fail it. Each run is timed in
- * process CPU time, which measures the work rather than how long the
- * scheduler made it wait. The 2 MB and 4 MB runs alternate: CPU time still
- * grows when a co-tenant slows the core (a 2-vCPU CI runner read 3.8x with
- * the three 4 MB runs after the three 2 MB runs), so a slow spell has to cover
- * both sizes to move the ratio.
+ * That cost is per chunk, so doubling the input only doubles it: a time ratio
+ * between 2 MB and 4 MB read 2.0x on the quadratic merge too (3.2x slower in
+ * absolute terms), and on shared CI runners thread CPU time itself grows
+ * when a co-tenant slows the core (a 2 MB / 4 MB ratio of 3.04 on linear
+ * code; GC is under 2% of the run). So this test counts the bookkeeping's
+ * work instead (`spanWork`: seg entries visited or copied, steps the
+ * UTF-8 offset walk takes) and bounds it per chunk and per input code unit.
+ * Counts are deterministic: no machine can move them.
  */
 import { describe, test, expect } from 'bun:test';
-import { chunkText } from '../src/core/chunkers/recursive.ts';
-import { cpuMs } from './helpers/cpu-time.ts';
+import { chunkText, spanWork } from '../src/core/chunkers/recursive.ts';
 
 function chatLog(chars: number): string {
   let a = 0x9e3779b9;
@@ -41,34 +39,37 @@ function chatLog(chars: number): string {
   return parts.join('');
 }
 
-function runMs(text: string): number {
-  let chunks: ReturnType<typeof chunkText> = [];
-  const ms = cpuMs(() => { chunks = chunkText(text, { spans: true }); });
+/** Span bookkeeping work for one chunkText call. */
+function work(text: string): { chunks: number; segs: number; units: number } {
+  spanWork.segs = 0;
+  spanWork.units = 0;
+  const chunks = chunkText(text, { spans: true });
   expect(chunks.every(c => c.byte_start !== undefined)).toBe(true);
-  return ms;
-}
-
-/** Best of three runs per size, the sizes alternating. */
-function bestPair(small: string, large: string): [number, number] {
-  let s = Infinity;
-  let l = Infinity;
-  for (let k = 0; k < 3; k++) {
-    s = Math.min(s, runMs(small));
-    l = Math.min(l, runMs(large));
-  }
-  return [s, l];
+  return { chunks: chunks.length, segs: spanWork.segs, units: spanWork.units };
 }
 
 const MB = 1024 * 1024;
+/** Seg entries per chunk: about 10 with in-place merging; the per-merge copy read 470 (chat) and 103,000 (one-word). */
+const SEGS_PER_CHUNK = 32;
 
 describe('chunkText(spans: true) scales linearly', () => {
   for (const [name, make] of [
     ['chat log', chatLog],
     ['one-word paragraphs', (chars: number) => 'x\n\n'.repeat(Math.floor(chars / 3))],
   ] as const) {
-    test(`${name}: 4 MB takes under 3x the time of 2 MB`, () => {
-      const [small, large] = bestPair(make(2 * MB), make(4 * MB));
-      expect(large / small).toBeLessThan(3);
+    test(`${name}: span work per chunk is bounded and doubles with the input`, () => {
+      const smallText = make(2 * MB);
+      const largeText = make(4 * MB);
+      const small = work(smallText);
+      const large = work(largeText);
+      for (const [w, text] of [[small, smallText], [large, largeText]] as const) {
+        expect(w.segs / w.chunks).toBeLessThan(SEGS_PER_CHUNK);
+        // One pass over the projected text, never a walk per offset.
+        expect(w.units).toBeLessThanOrEqual(text.length);
+      }
+      expect(large.chunks / small.chunks).toBeLessThan(2.1);
+      expect(large.segs / small.segs).toBeLessThan(2.1);
+      expect(large.units / small.units).toBeLessThan(2.1);
     }, 120_000);
   }
 });

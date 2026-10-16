@@ -30,7 +30,7 @@ import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import { embedStaleTakes } from '../core/embed-takes.ts';
 import { assertBrainEmbeddingEnabled } from '../core/embedding-dim-check.ts';
 import { loadConfig } from '../core/config.ts';
-import { embedQuery } from '../core/embedding.ts';
+import { embedQueryWithPrefix } from '../core/search/query-prefix.ts';
 import {
   listPendingProposals,
   acceptProposal,
@@ -184,7 +184,7 @@ async function cmdSearch(engine: BrainEngine, args: string[]): Promise<void> {
     await assertBrainEmbeddingEnabled(engine, loadConfig());
     const { validateEmbeddingCreds } = await import('../core/embed-preflight.ts');
     validateEmbeddingCreds();
-    const queryEmbedding = await embedQuery(query);
+    const queryEmbedding = await embedQueryWithPrefix(engine, query);
     hits = await engine.searchTakesVector(queryEmbedding, { limit });
   } else {
     hits = await engine.searchTakes(query, { limit });

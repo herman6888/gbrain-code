@@ -54,12 +54,12 @@ link it here rather than raising the cap.
 | [Managed sync bookkeeping](key-files/managed-sync-bookkeeping.md) | `sync-failures.ts`, `managed-sync-orphans.ts`, `sync-checkpoint-replaced.ts` |
 | [Core Search (1/2)](key-files/core-search-1.md) | `src/core/search/` through `src/core/search/read-policy-sql.ts` |
 | [Core Search (2/2)](key-files/core-search-2.md) | `search/rerank.ts` through `search/vector-pool.ts`, the relational arm and multi-hop chain modules, `hub-dampening.ts`, `crag.ts` |
-| [Core Services (1/3)](key-files/core-services-1.md) | `src/core/advisor/{types,run,render,recommended-set,history,apply,collect-*}.ts` through `src/core/connectors/` |
+| [Core Services (1/3)](key-files/core-services-1.md) | `src/core/advisor/*.ts` through `src/core/connectors/` |
 | [Core Services (1/3, continued)](key-files/core-services-1-continued.md) | `src/core/context/` through `src/core/context/ipc-path.ts` |
 | [Core Services (2/3)](key-files/core-services-2.md) | `src/core/conversation-parser/` through `src/core/ops/sources.ts`, except `src/core/persistence/` |
-| [Core Services (2/3, continued)](key-files/core-services-2-continued.md) | `src/core/page-state/` and `src/core/progressive-batch/` |
+| [Core Services (2/3, continued)](key-files/core-services-2-continued.md) | `page-state/`, `page-body/page-shape.ts`, `progressive-batch/` |
 | [Core Services (3/3)](key-files/core-services-3.md) | `src/core/think/index.ts` through `src/core/verbs/usage-log.ts` |
-| [Core Utilities (1/2)](key-files/core-utilities-1.md) | `src/core/archive-crawler-config.ts` through `src/core/remediation-checkpoint.ts`; [`cycle.ts`](key-files/core-cycle-primitive.md) |
+| [Core Utilities (1/2)](key-files/core-utilities-1.md) | `archive-crawler-config.ts` through `remediation-checkpoint.ts`; [`cycle.ts`](key-files/core-cycle-primitive.md) |
 | [Core Utilities (2/2)](key-files/core-utilities-2.md) | `src/core/repair/` through `src/core/verbs.ts` |
 | [Engines (1/2)](key-files/engines-1.md) | `src/core/connection-manager.ts` through `src/core/pglite-repair.ts` |
 | [Engines (2/2)](key-files/engines-2.md) | `src/core/pglite-resetwal.ts` through `src/core/worker-pool.ts` |
@@ -76,7 +76,7 @@ link it here rather than raising the cap.
 | [Shared brain skills](key-files/shared-skills.md) | Canonical catalog, enrollment, migration, publication and harness integration |
 | [Skills](key-files/skills.md) | `src/core/audit-skill-brain-first.ts` through `src/core/skills-integrity.ts` |
 | [Tooling And Tests](key-files/tooling-and-tests.md) | `.github/workflows/test.yml` through `test/remote-privacy-sweep.test.ts` |
-| [CI Health And Test Guards](key-files/ci-health-and-test-guards.md) | `.github/workflows/nightly-watch.yml` through `scripts/check-image-decoders-embedded.sh`, plus contributor audit, fix-wave gate |
+| [CI Health And Test Guards](key-files/ci-health-and-test-guards.md) | `nightly-watch.yml` through `check-image-decoders-embedded.sh`, contributor audit, fix-wave gate |
 | [BrainBench — in a sibling repo](key-files/brainbench.md) | Cross-file subsystem contract |
 | [Hindsight calibration](key-files/hindsight.md) | Cross-file subsystem contract |
 | [Schema packs: mutation surface](key-files/schema-mutation.md) | Cross-file subsystem contract |
@@ -89,4 +89,5 @@ link it here rather than raising the cap.
 | [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts |
 | [Secret and sensitivity scanning](key-files/secret-scan.md) | `secret-scan*.ts`: detection, allowlist, scan counters |
 | [Ambient capture consent gate](key-files/ambient-capture.md) | `memory.auto_writeback` capture lanes |
+| [Belief ledger](key-files/belief-ledger.md) | `src/core/belief/`, `gbrain beliefs`, doctor coverage |
 | [Quarantine](key-files/quarantine.md) | Gate-marker strip; quarantined pages in facts, reads, writes |

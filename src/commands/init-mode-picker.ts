@@ -139,8 +139,7 @@ retrieval or downstream generation.
   2) balanced       12K-token cap, 25 results by default, reranked.
                     Best for: mixed workloads, a reranker without a chat key.
 
-  3) tokenmax       no token cap, 50 results by default, reranked,
-                    query expansion on by default.
+  3) tokenmax       no token cap, 50 results by default, reranked.
                     Best for: the widest retrieval, low-volume high-stakes work.
 
 ${QUERY_EXPANSION_LINE}

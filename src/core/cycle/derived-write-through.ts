@@ -14,7 +14,7 @@
  * generated pages that have no file yet, a bounded batch per run. A page the
  * phase retires has its file removed, so sync cannot bring it back.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { relative } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { isDbOnly, loadStorageConfig } from '../storage-config.ts';

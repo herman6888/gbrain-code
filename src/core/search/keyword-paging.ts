@@ -32,8 +32,16 @@ import { KEYWORD_COUNT_CAP, type KeywordPageAfter } from './keyword-statement.ts
 export type SearchMatch = 'hybrid' | 'keyword';
 
 export const SEARCH_OFFSET_CAP = 10_000;
-/** The count's deadline: it runs beside the search and never holds the response longer. */
+/**
+ * The count's deadline floor. The count runs beside the search and is given
+ * up at whichever is later: this floor, or the search finishing plus
+ * KEYWORD_COUNT_GRACE_MS (#6632), so a slow search no longer drops a count
+ * that would have landed before the response. The statement itself runs
+ * under the operator bound `search.keyword_statement_timeout_ms`.
+ */
 export const KEYWORD_COUNT_TIMEOUT_MS = 2_000;
+/** How long the response waits for the count after the search is done (when that is past the floor). */
+export const KEYWORD_COUNT_GRACE_MS = 250;
 
 /** Params a keyword `next` carries over unchanged. */
 const CARRIED_PARAMS = ['limit', 'types', 'source_id', 'snippet_chars', 'return_unit', 'return_window', 'token_budget', 'fields'] as const;
@@ -104,11 +112,17 @@ const isTimeout = (e: unknown) => /statement timeout|canceling statement/i.test(
 /** A non-timeout count failure is a bug, not load: its SQLSTATE is logged once per process. */
 let countErrorLogged = false;
 
-/** The strict keyword count under a deadline; a late or failed count is unavailable, never a number. */
-export async function countKeywordMatches(engine: BrainEngine, query: string, opts: SearchOpts, timeoutMs = KEYWORD_COUNT_TIMEOUT_MS): Promise<KeywordCount> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<KeywordCount>(resolve => { timer = setTimeout(() => resolve({ unavailable: 'timeout' }), timeoutMs); });
-  const count = engine.countKeywordPages(query, { ...opts, timeoutMs })
+/**
+ * The strict keyword count under a deadline; a late or failed count is
+ * unavailable, never a number. The deadline is `floorMs`, or `searchDone`
+ * settling plus KEYWORD_COUNT_GRACE_MS when that is later.
+ */
+export async function countKeywordMatches(engine: BrainEngine, query: string, opts: SearchOpts, floorMs = KEYWORD_COUNT_TIMEOUT_MS, searchDone?: Promise<unknown>): Promise<KeywordCount> {
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  const sleep = (ms: number) => new Promise<void>(resolve => { timers.push(setTimeout(resolve, ms)); });
+  const searchGrace = searchDone ? searchDone.then(() => {}, () => {}).then(() => sleep(KEYWORD_COUNT_GRACE_MS)) : undefined;
+  const deadline = Promise.all([sleep(floorMs), searchGrace]).then((): KeywordCount => ({ unavailable: 'timeout' }));
+  const count = engine.countKeywordPages(query, opts)
     .then((n): KeywordCount => ({ total: Math.min(n, KEYWORD_COUNT_CAP), capped: n > KEYWORD_COUNT_CAP }))
     .catch((e): KeywordCount => {
       if (isTimeout(e)) return { unavailable: 'timeout' };
@@ -122,7 +136,7 @@ export async function countKeywordMatches(engine: BrainEngine, query: string, op
   try {
     return await Promise.race([count, deadline]);
   } finally {
-    clearTimeout(timer);
+    for (const t of timers) clearTimeout(t);
   }
 }
 
@@ -131,11 +145,11 @@ export async function countKeywordMatches(engine: BrainEngine, query: string, op
  * Types expand the way hybridSearch expands them; a filter that expands to
  * nothing matches nothing.
  */
-export function startKeywordCount(engine: BrainEngine, query: string, types: string[] | undefined, opts: SearchOpts): Promise<KeywordCount> {
+export function startKeywordCount(engine: BrainEngine, query: string, types: string[] | undefined, opts: SearchOpts, searchDone?: Promise<unknown>): Promise<KeywordCount> {
   return (async (): Promise<KeywordCount> => {
     const expanded = types ? (await expandEngineTypeFilters(engine, { types, ...opts })).types : undefined;
     if (expanded?.length === 0) return { total: 0, capped: false };
-    return countKeywordMatches(engine, query, { ...opts, ...(expanded ? { types: expanded } : {}) });
+    return countKeywordMatches(engine, query, { ...opts, ...(expanded ? { types: expanded } : {}) }, KEYWORD_COUNT_TIMEOUT_MS, searchDone);
   })().catch((): KeywordCount => ({ unavailable: 'error' }));
 }
 

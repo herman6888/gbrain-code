@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
 import type { SqlEngine } from './model.ts';
-import { readPersistenceBrain } from './managed-mode.ts';
+import { readManagedMode, readPersistenceBrain } from './managed-mode.ts';
 import { canonicalFilesystemPath, managedRootMarkerFor, recordManagedRoots, registeredManagedRootRecords, type ManagedRootRecord } from './root-registry.ts';
 
 interface FileCapability { roots: string[]; active: boolean; }
@@ -75,4 +75,15 @@ export async function withFilesystemPublication<T>(roots: string[], fn: () => Pr
 export async function assertLegacyFilesystemWriter(engine: SqlEngine, path: string): Promise<void> {
   await refreshManagedFilesystemRoots(engine);
   assertManagedFilesystemWrite(path);
+}
+/**
+ * #5362/#6785: the legacy fence writer's refusal for a source's checkout,
+ * checked before a lane pays for extraction (a claimed but not activated
+ * canonical worktree refuses every fence write with writer_coordinator_required).
+ * A managed brain writes through the coordinator and is never refused here.
+ */
+export async function assertSourceLegacyWriter(engine: SqlEngine, sourceId: string): Promise<void> {
+  if (await readManagedMode(engine)) return;
+  const [source] = await engine.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1', [sourceId]);
+  if (source?.local_path) await assertLegacyFilesystemWriter(engine, source.local_path);
 }

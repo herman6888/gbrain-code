@@ -16,7 +16,7 @@ import { connectedEngine, type DoctorContext, type DoctorEntry } from '../contex
 import { readTrustBackfillState, readTrustTierCounts } from '../../../core/trust/backfill.ts';
 import { TRUST_TIERS } from '../../../core/trust/tier.ts';
 import { readDerivedTaintShare } from '../../../core/trust/taint.ts';
-import { isUndefinedColumnError } from '../../../core/utils.ts';
+import { isMissingSchemaObject } from '../../../core/utils.ts';
 
 
 async function runTrustTiers(ctx: DoctorContext): Promise<Check[]> {
@@ -46,7 +46,7 @@ async function runTrustTiers(ctx: DoctorContext): Promise<Check[]> {
       fix: agentFix(argv, 'Classifies legacy rows from deterministic signals in resumable batches; it never raises a row to confirmed and changes no content.', 'trust_tiers',
         { preview_argv: ['gbrain', 'trust', 'backfill', '--dry-run', '--json'] }) });
   } catch (err) {
-    if (isUndefinedColumnError(err, 'trust_tier')) {
+    if (isMissingSchemaObject(err, 'column', 'trust_tier')) {
       checks.push({ name: 'trust_tiers', status: 'ok', details: { schema: 'pre_trust' }, message: 'This schema predates trust tiers; they arrive with the migration that adds them.' });
     } else {
       checks.push(checkError('trust_tiers', 'read trust tier counts', err));

@@ -52,6 +52,8 @@ interface MsgSpec {
   dateMs?: number;
   /** Extra Gmail label ids (categories) beside SENT/INBOX. */
   labels?: string[];
+  /** #5012 automated-mail headers (fields a master mapper did not capture). */
+  headers?: { precedence?: string; listId?: boolean; replyTo?: string[] };
 }
 
 function msg(spec: MsgSpec): GmailMessageMeta {
@@ -73,6 +75,7 @@ function msg(spec: MsgSpec): GmailMessageMeta {
     labelIds: [spec.sent ? 'SENT' : 'INBOX', ...(spec.labels ?? [])],
     listUnsubscribe: spec.listUnsub ?? false,
     bodyText: spec.body ?? 'Can you review the plan?',
+    ...(spec.headers ?? {}),
   };
 }
 
@@ -923,5 +926,67 @@ describe('#5103: Google system senders and bulk categories in the deterministic 
       msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 48, subject: 'Re: planning', body: 'Can you send the budget sheet?' }),
     ]);
     expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'bob@example.com']]);
+  });
+});
+
+describe('#5012 positively automated mail and the opt-in Updates reciprocity rule', () => {
+  const alert = (headers: MsgSpec['headers'], labels: string[] = []) =>
+    msg({ from: 'alerts@notify.bank-example.test', to: ['me@example.com'], ageHours: 48, labels, headers,
+      subject: 'Your balance alert', body: 'Your available balance is below the threshold you set. Review it?' });
+
+  const automatedHeaders: Array<[string, NonNullable<MsgSpec['headers']>]> = [
+    ['Precedence: bulk', { precedence: 'bulk' }],
+    ['Precedence: list', { precedence: 'list' }],
+    ['Precedence: junk', { precedence: 'junk' }],
+    ['a List-Id header', { listId: true }],
+    ['a no-reply Reply-To', { replyTo: ['no-reply@bank-example.test'] }],
+  ];
+  for (const [name, headers] of automatedHeaders) {
+    test(`a bank alert with ${name} opens no reply-owed loop and records why`, () => {
+      const v = detectThreadLoop(thread([alert(headers)]), MY, NOW, sup());
+      expect(v.open).toEqual([]);
+      expect(v.held).toBeUndefined();
+      expect(v.withheld).toEqual({ reason: 'automated_mail', counterpartyEmail: 'alerts@notify.bank-example.test' });
+    });
+  }
+
+  test('withholding never fabricates a close: my earlier outbound ask is still closed by their reply', () => {
+    const v = detectThreadLoop(thread([
+      msg({ from: 'me@example.com', to: ['alerts@notify.bank-example.test'], ageHours: 100, sent: true, body: 'Can you raise my limit?' }),
+      alert({ precedence: 'bulk' }),
+    ]), MY, NOW, sup());
+    expect(v.close).toEqual(['unanswered_outbound']);
+    expect(v.open).toEqual([]);
+  });
+
+  test('a cold founder intro in Primary still opens a loop', () => {
+    const v = detectThreadLoop(thread([msg({ from: 'founder@startup-example.test', to: ['me@example.com'], ageHours: 48,
+      labels: ['CATEGORY_PERSONAL'], subject: 'Intro: seed round', body: 'Would you have 20 minutes next week to hear about what we are building?' })]), MY, NOW, sup());
+    expect(v.open.map((o) => [o.loopType, o.counterpartyEmail])).toEqual([['unanswered_inbound', 'founder@startup-example.test']]);
+    expect(v.withheld).toBeUndefined();
+  });
+
+  const updatesIntro = () => thread([msg({ from: 'founder@startup-example.test', to: ['me@example.com'], ageHours: 48,
+    labels: ['CATEGORY_UPDATES'], subject: 'Intro: seed round', body: 'Would you have 20 minutes next week?' })]);
+
+  test('a cold founder intro in Updates opens a loop by default (the category alone never withholds)', () => {
+    const v = detectThreadLoop(updatesIntro(), MY, NOW, sup());
+    expect(v.open.map((o) => o.counterpartyEmail)).toEqual(['founder@startup-example.test']);
+  });
+
+  test('with the reciprocity rule on, Updates mail opens only for a sender the owner wrote to', () => {
+    const off = detectThreadLoop(updatesIntro(), MY, NOW, sup(), { ownerWroteTo: new Set() });
+    expect(off.open).toEqual([]);
+    expect(off.withheld).toEqual({ reason: 'updates_without_reciprocity', counterpartyEmail: 'founder@startup-example.test' });
+    const known = detectThreadLoop(updatesIntro(), MY, NOW, sup(), { ownerWroteTo: new Set(['founder@startup-example.test']) });
+    expect(known.open.map((o) => o.counterpartyEmail)).toEqual(['founder@startup-example.test']);
+  });
+
+  test('with the reciprocity rule on, an Updates thread the owner already wrote in still opens', () => {
+    const v = detectThreadLoop(thread([
+      msg({ from: 'me@example.com', to: ['billing@vendor-example.test'], ageHours: 100, sent: true, labels: ['CATEGORY_UPDATES'], body: 'Please resend the invoice.' }),
+      msg({ from: 'billing@vendor-example.test', to: ['me@example.com'], ageHours: 48, labels: ['CATEGORY_UPDATES'], body: 'Attached. Can you approve it?' }),
+    ]), MY, NOW, sup(), { ownerWroteTo: new Set() });
+    expect(v.open.map((o) => o.counterpartyEmail)).toEqual(['billing@vendor-example.test']);
   });
 });

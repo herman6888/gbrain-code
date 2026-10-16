@@ -36,6 +36,15 @@ the `onpoisoned(status)` option (#5730). Cancellation
 must settle or retire the connection before another query can own it. This
 is necessary for worker admission, query timeout and lease-release safety.
 See issues #5466 and #5560 and `test/e2e/persistence-chaos.test.ts`.
+Reserved and transaction owners also expose `cancelAndDiscard({ timeout })`
+(#6598): a Terminate cannot interrupt the statement already running on a busy
+socket, so it sends the fenced statement's CancelRequest first, refuses new and
+queued statements while it waits for that statement to settle, then discards.
+It rejects `CANCEL_UNCONFIRMED` when the statement does not settle within
+`timeout` (default 2000 ms) or was not fenced, so a socket close is never
+reported as a confirmed server stop
+(`test/postgres-transaction-cancel-order.test.ts`,
+`test/e2e/transaction-cancel-held-lock.test.ts`).
 
 A statement that fails to build is answered in its place in the pipeline
 (#6383; the approach of upstream PR porsager/postgres#1236, which fixes

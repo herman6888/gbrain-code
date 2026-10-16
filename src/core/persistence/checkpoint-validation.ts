@@ -23,7 +23,6 @@ import { PERSISTENCE_REQUEST_ONLINE_INDEXES, PERSISTENCE_SYNC_RUN_INDEXES } from
 import { docsAnchor } from './connector-errors.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
 import type { SyncCursorOptions } from './sync-prepare.ts';
-import { syncKnockOnSql } from './sync-knock-on.ts';
 
 export const CHECKPOINT_VALIDATION_TIMEOUT = 'checkpoint_validation_timeout';
 export const CHECKPOINT_VALIDATION_TIMEOUT_MESSAGE = 'The sync checkpoint validation timed out on a large request table; the checkpoint did not commit.';
@@ -32,9 +31,9 @@ export const REQUEST_INDEXES_REPAIR_COMMAND = 'gbrain repair request-indexes --a
 const SYNC_PAGE_KINDS = "r.intent->>'kind' IN ('managed_sync_import','managed_sync_delete')";
 /**
  * #6643: clause 3 skips a terminal, recovery-free receipt the cursor settled another way: one the run converted in place
- * ($3, #5988), one at an index the cursor passed without a commit (waived or held: the settled ranges $4..$5), and, only
- * below $6 (the index from which the cursor recorded its settled ranges, i.e. a cursor that began before #6643), a
- * knock-on (sync-knock-on.ts), which never published and whose entry the cursor re-froze when it reached it.
+ * ($3, #5988) and one at an index the cursor passed without a commit (waived or held: the settled ranges $4..$5).
+ * #6712 retired the knock-on exemption ($6): no page is cancelled for another page's failure any more, and the cursor
+ * converts a legacy knock-on it meets in place (sync-run.ts `refreezeInPlace`).
  */
 export const INCOMPLETE_SYNC_RECEIPT_SQL = `(SELECT r.request_id::text AS request_id FROM persistence_requests r
     WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL LIMIT 1)
@@ -48,8 +47,7 @@ export const INCOMPLETE_SYNC_RECEIPT_SQL = `(SELECT r.request_id::text AS reques
         AND committed.state='committed' AND committed.intent ? 'runId')
       AND NOT (r.request_id::text=ANY($3::text[]))
       AND NOT (r.state IN ('failed','cancelled','conflict') AND r.recovery IS NULL
-        AND EXISTS (SELECT 1 FROM unnest($4::int[], $5::int[]) AS settled(lo, hi) WHERE (r.intent->>'index')::int BETWEEN settled.lo AND settled.hi))
-      AND NOT ((r.intent->>'index')::int < $6::int AND ${syncKnockOnSql('r')}) LIMIT 1)
+        AND EXISTS (SELECT 1 FROM unnest($4::int[], $5::int[]) AS settled(lo, hi) WHERE (r.intent->>'index')::int BETWEEN settled.lo AND settled.hi)) LIMIT 1)
   LIMIT 1`;
 
 /** #6643: the index ranges a cursor passed without a commit, and the index it began recording them at. */
@@ -63,11 +61,11 @@ export interface SyncSettledIndexes { from: number; ranges: Array<[number, numbe
  * commit; null for a checkpoint frozen before #6643, whose whole run predates it.
  */
 export async function findIncompleteSyncReceipt(tx: Pick<BrainEngine, 'executeRaw'>, worktreeId: string, runId: string, superseded: string[] = [],
-  settled: SyncSettledIndexes | null = null, total = 0): Promise<string | null> {
+  settled: SyncSettledIndexes | null = null): Promise<string | null> {
   try {
     const ranges = settled?.ranges ?? [];
     const [row] = await tx.executeRaw<{ request_id: string }>(INCOMPLETE_SYNC_RECEIPT_SQL,
-      [worktreeId, runId, superseded, ranges.map(range => range[0]), ranges.map(range => range[1]), settled ? settled.from : total]);
+      [worktreeId, runId, superseded, ranges.map(range => range[0]), ranges.map(range => range[1])]);
     return row?.request_id ?? null;
   } catch (error) {
     const failure = error as { code?: string; message?: string };
@@ -83,11 +81,11 @@ export async function findIncompleteSyncReceipt(tx: Pick<BrainEngine, 'executeRa
  * knock-on from a root; read-only. The checkpoint itself names only the first (`findIncompleteSyncReceipt`).
  */
 export async function listIncompleteSyncReceipts(engine: Pick<BrainEngine, 'executeRaw'>, worktreeId: string, runId: string, superseded: string[] = [],
-  settled: SyncSettledIndexes | null = null, total = 0): Promise<Array<{ request_id: string; slug: string; state: string; code: string | null; index: number | null; recovery: boolean }>> {
+  settled: SyncSettledIndexes | null = null): Promise<Array<{ request_id: string; slug: string; state: string; code: string | null; index: number | null; recovery: boolean }>> {
   const ranges = settled?.ranges ?? [];
   return engine.executeRaw(`SELECT r.request_id::text AS request_id, r.slug, r.state, r.error_code AS code, (r.intent->>'index')::int AS index, r.recovery IS NOT NULL AS recovery
       FROM persistence_requests r WHERE r.request_id::text IN (SELECT request_id FROM (${INCOMPLETE_SYNC_RECEIPT_SQL.replaceAll('LIMIT 1', 'LIMIT 20')}) blockers) ORDER BY r.sequence LIMIT 20`,
-    [worktreeId, runId, superseded, ranges.map(range => range[0]), ranges.map(range => range[1]), settled ? settled.from : total]);
+    [worktreeId, runId, superseded, ranges.map(range => range[0]), ranges.map(range => range[1])]);
 }
 
 /** #6643: `settled` with `[from, to]` added, merged into the last range when contiguous. */

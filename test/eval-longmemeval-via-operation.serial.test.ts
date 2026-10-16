@@ -175,13 +175,13 @@ describe('eval longmemeval --via-operation', () => {
     expect(via.summary.run_config.via_operation_summary.model_calls_per_query.expansion).toBe(1);
   }, 120_000);
 
-  test('query under tokenmax with no --op-expand: the mode turns expansion on', async () => {
+  test('query under tokenmax with no --op-expand: the mode default no longer expands (GBRA-94)', async () => {
     expansionTransport('variants');
     const via = await run(['--via-operation', 'query', '--mode', 'tokenmax', ...NO_SYNOPSIS]);
     expect(via.failed).toBe(false);
-    expect(expansionCalls).toBe(QUESTIONS);
-    expect(via.summary.run_config.expansion).toBe(true);
-    expect(via.rows.every(r => r.via_operation.expansion.outcome === 'applied')).toBe(true);
+    expect(expansionCalls).toBe(0);
+    expect(via.summary.run_config.expansion).toBe(false);
+    expect(via.rows.every(r => r.via_operation.expansion.outcome === 'not_expected')).toBe(true);
   }, 120_000);
 
   test('a throwing expansion provider invalidates the arm: every row says failed and the run fails', async () => {

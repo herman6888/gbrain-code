@@ -316,7 +316,7 @@ const synthesize: Operation = {
     }
     const scope = sourceScopeOpts(ctx);
     const { runThink } = await import('./think/index.ts');
-    const { embedQuery } = await import('./embedding.ts');
+    const { embedQueryWithPrefix } = await import('./search/query-prefix.ts');
     // Remote-safe delegation: save/take are NEVER offered through this verb,
     // for any caller — the verb is a pure read.
     const result = await runThink(ctx.engine, {
@@ -329,7 +329,7 @@ const synthesize: Operation = {
       // Fail-closed: only a context that explicitly says local gets local.
       remote: ctx.remote !== false,
       // #3734: activate takes' vector retrieval arm for the synthesize verb.
-      embedQuestion: (q) => embedQuery(q),
+      embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
     });
 
     // [c10] runThink degrades gracefully to a no-LLM stub RESULT; the protocol
@@ -579,6 +579,15 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
         properties: {
           reason: { type: 'string', description: 'Why the cosine arm did not run: keyword_only_no_embedding_provider, keyword_only_embedding_disabled, embed_timeout, embed_unavailable, no_query_terms or facts_embedding_column_missing.' },
           unembedded: { type: 'integer', description: 'Facts in scope without a comparable embedding (ranked by word overlap only).' },
+        },
+      },
+      facts_calibration: {
+        type: 'object',
+        description: 'Informational, present when question ranking used semantic matching on an embedding model whose fact admission floors were never measured: a short facts list is weaker evidence of "nothing matched". Never replaces facts_degraded.',
+        required: ['status', 'model_key'],
+        properties: {
+          status: { type: 'string', enum: ['unmeasured'] },
+          model_key: { type: 'string', description: 'provider:model@dims, the key doctor fact_admission_floors reports.' },
         },
       },
       results: {

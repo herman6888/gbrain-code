@@ -64,6 +64,7 @@ const EXEMPT: Record<string, string> = {
   'src/core/takes-write.ts': 'shared fence helpers; the takes_* verbs gate in takes-prepare.ts',
   'src/core/timeline-dedup-repair.ts': 'owner repair deduplicating existing timeline rows',
   'src/core/timeline-write-through.ts': 'rendering helpers for add_timeline_entry, which gates the row in semantic-pages.ts',
+  'src/core/trust/held-removals.ts': 'owner accept (W1) of a held take or timeline removal: deletes the row, or re-projects it from the stored page text like sweep.ts; a fence-carried take reruns as takes_remove, which gates in takes-prepare.ts',
   'src/core/trust/owner-actions.ts': 'owner release publishes a held row the owner confirmed (CEO-9); the gate already held it',
   'src/core/trust/supersede-handlers.ts': 'owner accept/undo re-tiers existing rows inside the checked supersede',
   'src/core/repair/conversation-labels.ts': 'owner repair of existing conversation labels',

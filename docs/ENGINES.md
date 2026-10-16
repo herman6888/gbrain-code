@@ -173,14 +173,14 @@ describes bounded candidate recovery and incomplete-result metadata.
 
 On Postgres the same refresh also analyzes the page columns every search
 filter reads (`deleted_at`, `source_id`, `type`, `slug`) and
-`content_chunks(model, modality, page_id)`, and an embed drain that embedded
+`content_chunks(model, modality, page_id, body_generation, retired_generation)`, and an embed drain that embedded
 anything analyzes those chunk columns once at its end (each ANALYZE bounded by
 a 30 s statement and 2 s lock timeout). Without those statistics the vector
 candidate statement sorts every eligible chunk instead of walking the HNSW
 index, and at 1M chunks and above that sort runs past the 8 s vector budget,
 so hybrid search falls back to keyword-only results until autovacuum
 analyzes the tables. If a refresh is skipped (a lock, or a role that does not
-own the tables), run `ANALYZE content_chunks(model, modality, page_id)` and
+own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation, retired_generation)` and
 `ANALYZE pages` as the table owner.
 
 ### Vector index sizing
@@ -344,11 +344,13 @@ and the fix is the read-only `gbrain migrate --to postgres --plan --json`.
 | Concurrency | Single process | Connection pooling |
 | Backups | Manual (file copy) | Managed by Supabase |
 
+**The belief ledger lives only in the database.** `belief_events` and its side tables record what the brain had recorded, and when (`gbrain beliefs status`). Markdown carries only current state, so a rebuild from Markdown, `gbrain reinit-pglite` or a dropped database starts an empty history; back up the database itself. After restoring a Postgres (or PGLite) backup, replay the purges made after the backup was taken: until then content purged later is readable again, and `gbrain doctor --only belief_ledger_coverage` reports a restore whose purge replay was partial, unavailable or unverified. Graduation copies the ledger verbatim (equal event keys and digests); the legacy copier refuses a brain that has one.
+
 **Migration:** on a PGLite brain, `gbrain migrate --to postgres` (alias `--to supabase`) graduates the brain to Postgres. Without `--yes` it prints the plan and exits 3; `--yes --expect <plan_hash>` runs it. Graduation drains pending writes, copies every table verbatim with its primary keys (pages, facts, takes, versions, links, timeline, embeddings, transcripts and paid caches, request history and withdrawals, token and OAuth rows) into a fenced target, verifies row counts and digests, runs `gbrain doctor` on the target, and only then flips routing. It works for brains with write history and for managed brains. The PGLite data dir is retained as `<path>.graduated-<run_id>` and a tombstone file takes its place. Walkthrough, recovery by error code, rollback and what stays on this computer: [Move a PGLite brain to Postgres](guides/move-to-postgres.md).
 
 **Say to your agent:** *"Upgrade my brain to Postgres. Show me the plan first."*
 
-The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It forwards the full page row (origin path, kind, provenance, `ingested_at`, aliases, chunk code metadata). Pages the source had sealed are rebuilt on the target before the config flip, without an embedding key, keeping chunk ids and vectors whose input matches. A failed rebuild blocks the flip: the run exits 1 with no error code, prints `The active engine was NOT switched` and the failing pages, and leaves the source engine active; fix them (`gbrain projections drain` on the target) and re-run `gbrain migrate` to resume. Pages the source had not sealed arrive queued, with their verbatim chunks. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`).
+The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It forwards the full page row (origin path, kind, provenance, `ingested_at`, aliases, chunk code metadata). Pages the source had sealed are rebuilt on the target before the config flip, without an embedding key, keeping chunk ids and vectors whose input matches. A failed rebuild blocks the flip: the run exits 1 with no error code, prints `The active engine was NOT switched` and the failing pages, and leaves the source engine active; fix them (`gbrain projections drain` on the target) and re-run `gbrain migrate` to resume. Pages the source had not sealed arrive queued, with their verbatim chunks. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`), and a brain with a belief ledger (rows in `belief_events`), which it names.
 
 <a id="engine-migration-refused"></a>**Engine migration refused (`writer_coordinator_required`).** The legacy copier's refusal is an agent-contract envelope whose `fix` names the refusing side; every branch verifies with the read-only `gbrain doctor --no-migrate --json`, and nothing has changed in either datastore:
 

@@ -12,7 +12,8 @@ import { computeEffectiveDate } from '../../../core/effective-date.ts';
 import { zeroTotalContradictionsCheck } from '../../../core/eval-contradictions/run-health.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { checkError, doctorVerify } from '../check-fix.ts';
+import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
+import { isMissingSchemaObject } from '../../../core/utils.ts';
 
 async function runEvalCapture(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -275,9 +276,16 @@ async function runFactsExtraction(ctx: DoctorContext): Promise<Check[]> {
           : `Facts:absorb activity in last 24h (under threshold ${threshold}): ${summary}.`,
       });
     }
+    const note = await conversationPipelineNote(engine);
+    const check = checks[checks.length - 1];
+    if (note && check) {
+      check.message = `${check.message} ${note.message}`;
+      check.details = { ...(check.details ?? {}), conversation_pipeline: note.details };
+      if (!check.fix) check.fix = note.fix;
+    }
   } catch (err) {
     const code = (err as { code?: string } | null)?.code;
-    if (code === '42P01' || code === '42703') {
+    if (isMissingSchemaObject(err, 'table', 'ingest_log') || isMissingSchemaObject(err, 'column', 'source_id')) {
       // ingest_log missing entirely (extreme legacy) or source_id column
       // missing (pre-v50 brain that hasn't run apply-migrations yet).
       checks.push({
@@ -296,6 +304,39 @@ async function runFactsExtraction(ctx: DoctorContext): Promise<Check[]> {
     }
   }
   return checks;
+}
+
+/**
+ * #6557: conversation-shaped pages skip the page-write backstop
+ * (`conversation_pipeline`); their facts come from the opt-in conversation
+ * facts backfill. When such pages exist and the backfill is off, name the
+ * opt-in and its spend caps; enabling it is the user's call.
+ */
+async function conversationPipelineNote(engine: ReturnType<typeof connectedEngine>) {
+  const { CONVERSATION_PIPELINE_TYPES, CONVERSATION_PIPELINE_ENABLE_KEY, BACKSTOP_RESCUE_SLUG_PREFIXES } =
+    await import('../../../core/facts/eligibility.ts');
+  const { loadCfg } = await import('../../../core/cycle/conversation-facts-backfill.ts');
+  const cfg = await loadCfg(engine);
+  if (cfg.enabled) return null;
+  const [row] = await engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM pages
+      WHERE deleted_at IS NULL AND type = ANY($1::text[]) AND NOT (slug LIKE ANY($2::text[]))`,
+    [CONVERSATION_PIPELINE_TYPES, BACKSTOP_RESCUE_SLUG_PREFIXES.map(p => `${p}%`)]);
+  const pages = Number(row?.n ?? 0);
+  if (pages === 0) return null;
+  const caps = `$${cfg.maxCostUsd.toFixed(2)} per source and $${cfg.maxTotalCostUsd.toFixed(2)} per cycle, ` +
+    `${cfg.maxWalltimeMin} min per source and ${cfg.maxTotalWalltimeMin} min per cycle`;
+  return {
+    message: `${pages} conversation page(s) are not read by the page-write facts backstop (conversation_pipeline); ` +
+      `their facts come from the conversation facts backfill, which is off. Enabling it makes paid model calls, capped at ${caps}: ` +
+      `gbrain config set ${CONVERSATION_PIPELINE_ENABLE_KEY} true.`,
+    details: { reason: 'conversation_pipeline', pages, enable_key: CONVERSATION_PIPELINE_ENABLE_KEY,
+      caps: { max_cost_usd: cfg.maxCostUsd, max_total_cost_usd: cfg.maxTotalCostUsd,
+        max_walltime_min: cfg.maxWalltimeMin, max_total_walltime_min: cfg.maxTotalWalltimeMin } },
+    fix: agentFix(['gbrain', 'config', 'set', CONVERSATION_PIPELINE_ENABLE_KEY, 'true'],
+      `Turns on the conversation facts backfill, which extracts facts from imported conversation pages with paid model calls capped at ${caps}; the spend is the user's call.`,
+      'facts_extraction_health', { ask_user: true, consent: ['paid'] }),
+  };
 }
 
 export const factsExtractionEntry: DoctorEntry = {
@@ -419,8 +460,7 @@ async function runEffectiveDate(ctx: DoctorContext): Promise<Check[]> {
       });
     }
   } catch (err) {
-    const code = (err as { code?: string } | null)?.code;
-    if (code === '42703') {
+    if (isMissingSchemaObject(err, 'column', ['effective_date', 'effective_date_source'])) {
       // column doesn't exist — pre-v0.29.1 brain
       checks.push({ name: 'effective_date_health', status: 'ok', message: 'Skipped (effective_date column unavailable — run gbrain apply-migrations)' });
     } else {
@@ -479,8 +519,7 @@ async function runSalience(ctx: DoctorContext): Promise<Check[]> {
       });
     }
   } catch (err) {
-    const code = (err as { code?: string } | null)?.code;
-    if (code === '42703' || code === '42P01') {
+    if (isMissingSchemaObject(err, 'column', 'emotional_weight') || isMissingSchemaObject(err, 'table', 'takes')) {
       checks.push({ name: 'salience_health', status: 'ok', message: 'Skipped (emotional_weight or takes table unavailable — pre-v0.29 brain)' });
     } else {
       checks.push(checkError('salience_health', 'read pages', err));

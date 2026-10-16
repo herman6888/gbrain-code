@@ -84,7 +84,7 @@ export async function buildTuneRecommendations(engine: BrainEngine): Promise<Tun
       knob: 'search.mode',
       current: 'tokenmax',
       suggested: 'balanced',
-      reason: 'Subagent tier is Haiku but mode is tokenmax. Balanced caps the result payload at 12K tokens by default, reducing downstream input volume, and turns off query expansion by default (query --expand still requests it). Semantic result caching is temporarily disabled.',
+      reason: 'Subagent tier is Haiku but mode is tokenmax. Balanced caps the result payload at 12K tokens by default, reducing downstream input volume. Semantic result caching is temporarily disabled.',
       apply_command: 'gbrain config set search.mode balanced',
     });
   }

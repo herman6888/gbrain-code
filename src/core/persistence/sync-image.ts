@@ -46,6 +46,8 @@ export interface ManagedSyncImageContext {
   validate: (tx: BrainEngine) => Promise<void>;
   /** Clears the path's hold (if any) when the import commits. */
   releaseHold: (tx: BrainEngine) => Promise<void>;
+  /** #6712 PR 1: records the page's import provenance (revision, disk bytes, parser) in the publishing transaction. */
+  recordProvenance: (tx: BrainEngine) => Promise<void>;
   /** The caller's publication refusal, so the image branch names requests, retries and codes the way the text branch does. */
   refuse: (code: RegistryCode, message: string, cause: string) => OperationError;
   clock?: ClaimPhaseClock;
@@ -94,6 +96,7 @@ export async function prepareManagedSyncImage(engine: BrainEngine, row: WriteReq
       await ready.apply(tx);
       await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
       await ctx.releaseHold(tx);
+      await ctx.recordProvenance(tx);
       mutation.postimage = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
       return { status: ctx.renamedFrom ? 'renamed' : ready.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: ready.result.chunks, noop: ready.noop && !ctx.renamedFrom, imported_file: true, ...(ctx.renamedFrom ? { renamed_from: ctx.renamedFrom.slug } : {}) };

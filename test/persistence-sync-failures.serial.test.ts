@@ -198,7 +198,10 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
     expect(await engine.executeRaw('SELECT id,state,intent,error_code FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [f.id])).toEqual(receipts);
     writeFileSync(join(f.root, 'bad.md'), 'Repaired valid source observation.\n');
     const fullTarget = commit(f.root);
-    expect(await performManagedSync(engine, { ...options, full: true })).toMatchObject({ status: 'synced', toCommit: fullTarget });
+    // #6712 PR 1: one cursor per source, so `--full` resumes the failed cursor instead of starting its own: it stays
+    // blocked on the same failure and moves nothing (before, a full run synced under a separate key beside it).
+    expect(fullTarget).not.toBe(target);
+    expect(await performManagedSync(engine, { ...options, full: true })).toMatchObject({ status: 'blocked_by_failures', runId: blocked.runId, toCommit: target });
     const [source] = await engine.executeRaw('SELECT last_commit,last_sync_at FROM sources WHERE id=$1', [f.id]);
     expect(await performManagedSync(engine, options)).toEqual(blocked);
     expect(await engine.executeRaw('SELECT last_commit,last_sync_at FROM sources WHERE id=$1', [f.id])).toEqual([source]);
@@ -279,7 +282,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
   }
 }), 120_000);
 
-test('--retry-failed counts only the failures of the cursor its own options select and names the others', async () => withEnv({ ...env, GBRAIN_BACKUP_CHECK: 'off', GBRAIN_SYNC_NO_EXTRACT_NUDGE: '1' }, async () => {
+test('--retry-failed counts every managed failure of the source, whatever options the failed run used (#6712 PR 1: one cursor key)', async () => withEnv({ ...env, GBRAIN_BACKUP_CHECK: 'off', GBRAIN_SYNC_NO_EXTRACT_NUDGE: '1' }, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'bad.md': '---\ntitle: [broken\n---\nRetry count fixture.\n' });
     await engine.executeRaw("UPDATE sources SET config=jsonb_set(config,'{syncEnabled}','false'::jsonb) WHERE id<>$1", [f.id]);
@@ -288,12 +291,8 @@ test('--retry-failed counts only the failures of the cursor its own options sele
     expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(1);
 
     const other = await captureCli(() => runSync(engine, [...flags, '--retry-failed']));
-    expect(other).toContain('1 previously-failed file(s) of this source belong to a run with different sync options and are not retried by this invocation.');
-    expect(other).toContain(`gbrain sync --source ${f.id} --no-pull --retry-failed --no-embed --no-extract --no-schema-pack --exclude 'it'\\''s a dir/**'`);
-    expect(other).not.toContain('Retrying 1 previously-failed file(s)');
-
-    const same = await captureCli(() => runSync(engine, [...flags, '--exclude', QUOTED_EXCLUDE, '--retry-failed']));
-    expect(same).toContain('Retrying 1 previously-failed file(s)...');
+    expect(other).toContain('Retrying 1 previously-failed file(s)...');
+    expect(other).not.toContain('belong to a run with different sync options');
   }
 }), 120_000);
 
@@ -302,7 +301,9 @@ test('checkpoint, discovery, and freeze failures remain diagnosable without a fi
     const f = await fixture(engine, { 'note.md': 'A stable observation before checkpoint.\n' });
     const options = { sourceId: f.id, noPull: true };
     expect((await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 })).status).toBe('partial');
-    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, f.head]), TEST_WRITE_ATTRIBUTION));
+    // #6834: the checkpoint moves to a commit outside the run (the fixture's empty initial commit); one moved to the run's own target is finished by the next sync.
+    const outside = execFileSync('git', ['-C', f.root, 'rev-parse', 'HEAD~1'], { encoding: 'utf8' }).trim();
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [f.id, outside]), TEST_WRITE_ATTRIBUTION));
     const blocked = await performManagedSync(engine, options);
     expect(blocked).toEqual(expect.objectContaining({ status: 'blocked_by_failures', failures: [expect.objectContaining({ path: '<checkpoint>', phase: 'checkpoint', code: 'revision_conflict' })] }));
     expect(await performManagedSync(engine, options)).toEqual(blocked);
@@ -464,18 +465,19 @@ test('remote pending sync keeps its private receipt off the response while resum
   }
 }), 120_000);
 
-test('missing manifest is a durable nonfile blocker and only explicit idle retry rediscovers it', async () => withEnv(env, async () => {
+// #6712 PR 1 (L1): a lost manifest no longer blocks until an explicit idle retry. The next plain sync re-discovers against
+// HEAD and finishes under a new run; the page the lost run already imported is prescreened (the old cursor is a skip-ahead).
+test('missing manifest re-discovers against HEAD on the next sync; the page the lost run imported is prescreened', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'a.md': 'First committed observation.\n', 'b.md': 'Second committed observation.\n' });
     const options = { sourceId: f.id, noPull: true };
     const partial = await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 });
     await engine.executeRaw("DELETE FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [partial.runId]);
-    await expect(performManagedSync(engine, options)).rejects.toMatchObject({ code: 'storage_error' });
-    expect(await readManagedSyncFailures(engine, [f.id])).toEqual([expect.objectContaining({ phase: 'resume', path: '<resume>', run_id: partial.runId, target: f.head })]);
-    expect((await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBeNull();
-    const repaired = await performManagedSync(engine, { ...options, retryFailed: true });
-    expect(repaired.status).toBe('first_sync'); expect(repaired.runId).not.toBe(partial.runId);
+    const resumed = await performManagedSync(engine, options);
+    expect(resumed.status).toBe('first_sync'); expect(resumed.runId).not.toBe(partial.runId);
+    expect(resumed.prescreened).toBe(1);
     expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(0);
+    expect((await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
   }
 }), 120_000);
 

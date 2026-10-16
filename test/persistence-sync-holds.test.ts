@@ -291,7 +291,7 @@ test('a flagless sync converts a --no-embed cursor with its stored options, and 
   await engine.unsetConfig('sync.holds');
   s.write('notes/broken.md', note('Fixed in the working tree only'));
   // Pinned bytes still refuse, so the entry is held; the stored --no-embed survives the flagless run.
-  const converted = await performManagedSync(engine, { sourceId: s.id, noPull: true, explicitProcessing: [] });
+  const converted = await performManagedSync(engine, { sourceId: s.id, noPull: true });
   expect(converted.held_count).toBe(1);
   const [cursor] = await engine.executeRaw<{ completed_keys: Array<{ processingOptions: { noEmbed: boolean } }> }>(
     "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [s.id]);

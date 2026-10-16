@@ -91,8 +91,10 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
 
   test('unavailable-path skips in the daemon loops are NDJSON events under --json, and sources-load is a static import (wave review)', () => {
     // Bare prose on stderr breaks the --json NDJSON stream every other daemon
-    // line keeps; the two skip sites now emit an event in jsonMode.
-    expect(AUTOPILOT_SRC.match(/event: 'freshness_source_path_skipped'/g)?.length).toBe(2);
+    // line keeps; the two path-skip sites and the #6803 account-mismatch
+    // skip emit an event in jsonMode.
+    expect(AUTOPILOT_SRC.match(/event: 'freshness_source_path_skipped'/g)?.length).toBe(3);
+    expect(AUTOPILOT_SRC).toContain("event: 'freshness_source_path_skipped', source_id: src.id, code: 'connector_account_changed'");
     expect(AUTOPILOT_SRC).not.toContain("await import('../core/sources-load.ts')");
     // The stale "#3696 RELATIVE path" narration is gone: the skip covers any
     // unavailable path (relative OR missing on this machine).

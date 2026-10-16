@@ -31,6 +31,7 @@ import { performSync } from '../src/commands/sync/perform.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { __setPinnedWindowForTests } from '../src/core/persistence/sync-blobs.ts';
 import { syncGitTopLevel } from '../src/core/persistence/sync-prepare.ts';
+import { pinnedBlob } from '../src/core/persistence/sync-screen.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
@@ -289,6 +290,63 @@ for (const [backend, open] of backends) {
     expect(count(windowed[0]!.calls!, / rev-parse --show-toplevel$/)).toBeLessThan(imports / 2);
   }, 600_000);
 }
+
+/**
+ * #6712 PR 1 (the forced probes for the windowed bound): the discovery prescreen's `ls-tree` seeds the run's first
+ * pinned window, so a delta round over existing pages lists its pinned tree once; and the entries of one aligned block
+ * share a window whichever of them reaches its pinned read first (concurrent follower freezes finish in any order).
+ * Before: the prescreen listed the tree and the first freeze listed it again (2), and a follower whose freeze read first
+ * started the window at its own index, so the head missed it and listed it again (2).
+ */
+for (const [backend, open] of backends) {
+  test(`${backend}: a delta round over existing pages lists its pinned tree once (the prescreen seeds the window)`, async () => {
+    if (backend === 'postgres' && !process.env.DATABASE_URL) return;
+    const dir = join(home, `${backend}-seeded`), root = join(dir, 'repo');
+    mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
+    const note = (i: number, body: string) => `---\ntitle: Seeded ${i}\ntype: note\n---\n${body}\n`;
+    write(root, { ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`vault/notes/s${pad(i)}.md`, note(i, `A synthetic note ${i}.`)])), 'outside/readme.md': '# Not in the source\n' }); commit(root);
+    const sourceRoot = join(root, 'vault');
+    const { engine, close } = await open();
+    const counter = gitCounter(dir);
+    const restore = __setPinnedWindowForTests(null);
+    try {
+      await withEnv({ GBRAIN_HOME: join(dir, 'home'), PATH: counter.path }, async () => {
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+        await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,\'{}\')', [SOURCE, sourceRoot]);
+        await claimWorktree(engine, SOURCE, sourceRoot);
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        expect((await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true })).status).toBe('first_sync');
+        write(root, { ...Object.fromEntries([1, 2, 3].map(i => [`vault/notes/s${pad(i)}.md`, note(i, `An edited synthetic note ${i}.`)])), 'vault/notes/s006.md': note(6, 'A new synthetic note.') });
+        commit(root);
+        const before = counter.calls().length;
+        const delta = await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true });
+        expect(delta).toMatchObject({ status: 'synced', added: 1, modified: 3 });
+        expect(counter.calls().slice(before).filter(call => / ls-tree -l /.test(call))).toHaveLength(1);
+        await disposePersistenceConsumer(engine);
+      });
+    } finally { restore(); await close(); }
+  }, 120_000);
+}
+
+test('the entries of one aligned block share a pinned window whichever of them reads first', async () => {
+  if (process.platform === 'win32') return;
+  const dir = join(home, 'block'), root = join(dir, 'repo');
+  mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
+  write(root, { ...Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`vault/notes/b${pad(i)}.md`, `---\ntitle: Block ${i}\n---\nBody ${i}.\n`])), 'outside/readme.md': '# Not in the source\n' }); commit(root);
+  const entries = Array.from({ length: 5 }, (_, i) => ({ path: `notes/b${pad(i)}.md`, sourcePath: `notes/b${pad(i)}.md`, action: 'import' as const, working: false }));
+  const cursor = { root: join(root, 'vault'), gitRoot: root, target: git(root, 'rev-parse', 'HEAD'), entries };
+  const counter = gitCounter(dir);
+  const restore = __setPinnedWindowForTests(null);
+  try {
+    await withEnv({ PATH: counter.path }, async () => {
+      // A follower (index 1) reaches its pinned read before the head (index 0), as concurrent follower freezes may.
+      expect(pinnedBlob({ ...cursor, index: 1 }, entries[1]!.path)).not.toBeNull();
+      expect(pinnedBlob({ ...cursor, index: 0 }, entries[0]!.path)).not.toBeNull();
+      expect(pinnedBlob({ ...cursor, index: 4 }, entries[4]!.path)).not.toBeNull();
+    });
+    expect(counter.calls().filter(call => / ls-tree -l /.test(call))).toHaveLength(1);
+  } finally { restore(); }
+});
 
 test('the Git top level is read once per root and run, and again when the checkout\'s .git changes', async () => {
   mkdirSync(join(home, 'top-level', 'a', 'b'), { recursive: true });

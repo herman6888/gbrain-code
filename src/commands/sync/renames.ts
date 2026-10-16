@@ -33,6 +33,8 @@ import type { TrackedSlugIndex } from './rename-reconcile.ts';
 import { clearLegacyHold, holdRefusedImport, holdRenameDestination, noteScreenedImport } from './holds.ts';
 import { partial, noteTypeWarning, markCompleted } from './sync-run.ts';
 import type { SyncPlan, SyncRun, SyncProgress } from './sync-run.ts';
+import { recordFallbackRename } from '../../core/belief/identity.ts';
+import { markBeliefCommits } from '../../core/belief/append.ts';
 
 type RenamePlan = Pick<SyncPlan, 'opts' | 'filtered' | 'manifest' | 'lastCommit' | 'pin' | 'gitContextRoot' | 'modePath' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
 
@@ -352,16 +354,20 @@ async function applyRename(
  * aliases) move, and page-id-keyed rows (edges, timeline, versions) move with
  * duplicates on their unique keys dropped from the stale side.
  */
-async function carryRenameIdentity(engine: BrainEngine, sourceId: string, staleSlug: string, newSlug: string): Promise<void> {
+export async function carryRenameIdentity(engine: BrainEngine, sourceId: string, staleSlug: string, newSlug: string): Promise<void> {
   const rows = await engine.executeRaw<{ slug: string; id: number | string }>(
     'SELECT slug, id FROM pages WHERE source_id = $1 AND slug = ANY($2::text[])', [sourceId, [staleSlug, newSlug]]);
   const from = rows.find(r => r.slug === staleSlug), to = rows.find(r => r.slug === newSlug);
   if (!from || !to || from.id === to.id) return;
-  await maintenanceTransaction(engine, async tx => {
-    await recordRenameAlias(tx, sourceId, staleSlug, newSlug);
-    await moveSlugBindings(tx, sourceId, staleSlug, newSlug);
-    await movePageIdReferences(tx, Number(from.id), Number(to.id));
+  const publication = await maintenanceTransaction(engine, async tx => {
+    await tx.lockPageKeys([{ sourceId, slug: staleSlug }, { sourceId, slug: newSlug }]);
+    return recordFallbackRename(tx, { sourceId, staleSlug, newSlug, fromPageId: Number(from.id), toPageId: Number(to.id) }, async () => {
+      await recordRenameAlias(tx, sourceId, staleSlug, newSlug);
+      await moveSlugBindings(tx, sourceId, staleSlug, newSlug);
+      await movePageIdReferences(tx, Number(from.id), Number(to.id));
+    });
   });
+  if (publication) await markBeliefCommits(engine, [publication]).catch(() => undefined);
 }
 
 /**

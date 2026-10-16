@@ -1,4 +1,5 @@
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import { unmanagedBeliefPoint } from '../belief/projection-point.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { OperationError } from '../ops/contract.ts';
 import { matchesSlugAllowList, slugUnderBoundPrefixes } from '../ops/context.ts';
@@ -10,6 +11,7 @@ import { REMOTE_AUTO_LINKS_KEY, REMOTE_MENTION_LINK_SOURCE, type PersistenceEffe
 import { guardEffectSource } from './effect-recovery.ts';
 import type { SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
 import { excludesPrivateWrites } from './page-visibility.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { isRemoteWantedPagesEnabled, replaceWantedLinks } from '../wanted-links.ts';
 
 /** `mcp.remote_auto_links`: unset is on; false/0/no/off (any case) turns the remote `links` effect off. */
@@ -67,8 +69,9 @@ async function targetGrant(tx: SqlEngine, a: WriteAuthority): Promise<(slug: str
  * mention edges (link_source `mcp-remote-mention`, origin = the page) against
  * the targets that exist at execution time, in the page's source, visible to
  * the writer and inside its slug grant. Only this producer's edges are added
- * or removed. A changed or deleted page, a revoked grant or a disabled config
- * finishes the effect as skipped with its reason. The links table carries no
+ * or removed. A changed or deleted page, a revoked grant, a disabled config or
+ * a segmented page (its body is not read; its edges are kept) finishes the
+ * effect as skipped with its reason. The links table carries no
  * writer guard or row attribution, so the source guard and the page keys of
  * the page and its targets are what serialize this with publications.
  */
@@ -80,7 +83,9 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
   const snapshot = await engine.readPageSnapshot(effect.data.slug, { sourceId });
   if (!snapshot || snapshot.page.id !== effect.data.page_id || snapshot.revision !== effect.revision) return skip(engine, 'superseded');
   if (!await isAutoLinkEnabled(engine) || !await isRemoteAutoLinksEnabled(engine)) return skip(engine, 'disabled');
+  if (isSegmentedPage(snapshot.page)) return skip(engine, 'page_body_segmented');
   const { targets, skipped } = await mentionTargets(engine, snapshot, sourceId);
+  const beliefs = unmanagedBeliefPoint(sourceId, [snapshot.page.slug], 'remote_auto_links');
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)");
     await guardEffectSource(tx, effect, hostId);
@@ -112,8 +117,10 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
     const additions: LinkBatchInput[] = [...wanted].filter(([slug]) => !kept.has(slug)).map(([slug, context]) => ({
       from_slug: live.page.slug, to_slug: slug, from_source_id: sourceId, to_source_id: sourceId, link_type: 'mentions', context,
       link_source: REMOTE_MENTION_LINK_SOURCE, link_kind: 'plain', origin_slug: live.page.slug, origin_source_id: sourceId }));
-    if (obsolete.length) await tx.executeRaw('DELETE FROM links WHERE id=ANY($1::bigint[])', [obsolete]);
-    const added = additions.length ? await tx.addLinksBatch(additions, { auditSite: 'addLinksBatch' }) : 0;
+    const added = await beliefs.run(tx, async () => {
+      if (obsolete.length) await tx.executeRaw('DELETE FROM links WHERE id=ANY($1::bigint[])', [obsolete]);
+      return additions.length ? await tx.addLinksBatch(additions, { auditSite: 'addLinksBatch' }) : 0;
+    });
     // Wanted pages: a missing mention target is recorded so the edge appears once that page is written (core/wanted-links.ts).
     if (await isRemoteWantedPagesEnabled(tx)) {
       await replaceWantedLinks(tx, { pageId: Number(live.page.id), sourceId }, { producers: ['body'], rows: skipped
@@ -124,4 +131,5 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
     await completeEffect(tx, effect, { links: 'committed', added, removed: obsolete.length, skipped_targets: skipped.slice(0, SKIPPED_TARGET_LIMIT),
       ...(skipped.length > SKIPPED_TARGET_LIMIT ? { skipped_target_count: skipped.length } : {}) });
   });
+  await beliefs.commit(engine);
 }

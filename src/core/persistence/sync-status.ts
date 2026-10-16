@@ -95,6 +95,11 @@ export interface SyncStatus {
   cursors: SyncStatusCursor[];
   /** #6650: the source's terminal write receipts that did not commit, summarized (`terminal-failures.ts`); `unknown` when the bounded read timed out. */
   terminal_failures: SyncTerminalSummary;
+  /**
+   * #6831: for a Google or GitHub connector source, the error its connector runs keep ending on (null once a run
+   * finishes). Connector runs keep no managed-sync cursor, so this never sets `last_error`, the cursor's `next` or `needs_human`.
+   */
+  connector_last_error: import('./connector-status.ts').ConnectorLastError | null;
   next: Action | null;
 }
 
@@ -235,11 +240,12 @@ export async function readSyncStatus(engine: BrainEngine, sourceId: string): Pro
   const blockers = await checkpointBlockers(engine, header);
   // #6650: a receipt still holding a recovery record holds its root, so a source with nothing else to do names it as `next`.
   const { recovery_next, ...terminal } = await terminalSummary(engine, sourceId, blockers.checkpoint_blockers);
+  const connectorLastError = await (await import('./connector-status.ts')).readConnectorLastError(engine, sourceId);
   return { source_id: sourceId, run_id: header?.runId ?? null,
     cursor: header ? { index: Number(header.index), total: Number(header.total), pinned_target: header.target ?? null, last_advance_at: p ? new Date(p.lastAt).toISOString() : null, done: !!header.done } : null,
     committed_last_10m: Number(committed?.n ?? 0), ...estimate, live_job_id: liveJob, holds, last_error: lastError, needs_human: !!human, ...(human ? { human_reason: human.human_reason } : {}),
     resume_argv: resume, ...blockers, cursors: await liveCursors(engine, sourceId, source.incarnation, selected?.key ?? null, failures),
-    terminal_failures: terminal, next: next ?? recovery_next ?? null };
+    terminal_failures: terminal, connector_last_error: connectorLastError, next: next ?? recovery_next ?? null };
 }
 
 /**
@@ -261,7 +267,7 @@ export async function readCheckpointBlockers(engine: BrainEngine, sourceId: stri
 async function checkpointBlockers(engine: BrainEngine, header: CursorHeader | null): Promise<{ checkpoint_blockers: Array<Awaited<ReturnType<typeof listIncompleteSyncReceipts>>[number] & { knock_on: boolean }> }> {
   const intent = header?.pending?.intent;
   if (!header || header.done || intent?.kind !== 'managed_sync_checkpoint' || !header.binding?.worktree_id) return { checkpoint_blockers: [] };
-  const rows = await listIncompleteSyncReceipts(engine, header.binding.worktree_id, header.runId, intent.supersededRequests ?? [], intent.settled ?? null, Number(header.total));
+  const rows = await listIncompleteSyncReceipts(engine, header.binding.worktree_id, header.runId, intent.supersededRequests ?? [], intent.settled ?? null);
   const knockOns = new Set(rows.length ? (await engine.executeRaw<{ request_id: string }>(`SELECT request_id::text AS request_id FROM persistence_requests r
     WHERE r.request_id::text = ANY($1::text[]) AND ${syncKnockOnSql('r')}`, [rows.map(row => row.request_id)])).map(row => row.request_id) : []);
   return { checkpoint_blockers: rows.map(row => ({ ...row, recovery: row.recovery === true, knock_on: knockOns.has(row.request_id) })) };

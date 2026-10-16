@@ -2,12 +2,12 @@
  * #6643: a managed-sync page request that ended without committing only because another request of the same sync did
  * not commit (a knock-on), told apart from a page that really failed.
  *
- * A knock-on never published anything: it was cancelled before its claim published (`cancelRows`, the bulk group's
- * member cancel) or refused by a dependency validation before any write ("An earlier page of this sync did not
- * commit."). It is therefore never a reason to block a sync: the run re-freezes its entry under a fresh request
- * (sync-run.ts `recoverKnockOn`), and the checkpoint does not wait for it (`checkpoint-validation.ts`).
+ * #6712 (one page, one fate) retired every producer: no page is cancelled or refused for another page's failure any
+ * more. What stays is the legacy predicate over receipts older builds wrote: such a receipt published nothing, so the
+ * terminal classifier renders it superseded and a resumed cursor that meets one re-freezes its entry in place
+ * (sync-run.ts `refreezeInPlace`).
  *
- * The canceller records why and which request it depended on in the receipt's `error_detail` (`origin:
+ * Older cancellers recorded why and which request they depended on in the receipt's `error_detail` (`origin:
  * 'sync_knock_on'`), which outlives receipt compaction. Receipts written before #6643 carry no marker; they are matched
  * by the exact messages their producers wrote, and nothing else: an operator's cancel ("Cancelled before
  * publication."), an authority or restore cancel, and a compacted receipt with no message are never knock-ons.
@@ -19,6 +19,7 @@ export type KnockOnReason = 'group_member' | 'window_predecessor' | 'predecessor
   | 'suffix_cancelled' | 'bulk_group' | 'window_dropped';
 export interface KnockOnDetail { origin: typeof SYNC_KNOCK_ON_ORIGIN; reason: KnockOnReason; root_request_id: string | null }
 
+/** The marker older cancellers stamped (no producer since #6712); legacy fixtures build it. */
 export const knockOnDetail = (reason: KnockOnReason, rootRequestId: string | null | undefined): KnockOnDetail =>
   ({ origin: SYNC_KNOCK_ON_ORIGIN, reason, root_request_id: rootRequestId ?? null });
 

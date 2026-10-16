@@ -26,7 +26,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { assertAllowedScopes } from '../core/scope.ts';
 import { isTrustTier, TRUST_TIERS, type TrustTier } from '../core/trust/tier.ts';
 import { setMinTrust, setTokenMinTrust } from '../core/trust/min-trust.ts';
-import { generateToken, isUndefinedColumnError, isUndefinedTableError } from '../core/utils.ts';
+import { generateToken, isMissingSchemaObject } from '../core/utils.ts';
 import { TOKEN_ID_RE, insertUnifiedToken } from '../core/token-mint.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { sqlQueryForEngine, type SqlQuery } from '../core/sql-query.ts';
@@ -888,13 +888,17 @@ function printTokenRescope(result: RescopeTokenResult, json: boolean) {
   }
   if (result.migrated) console.log('  Migrated to the unified grant columns; the permissions JSON is kept as a mirror for older gbrain binaries.');
   if (result.refresh) {
-    const { available, added, unregistered } = result.refresh;
-    console.log(`  New operations available: ${available.length ? available.join(', ') : 'none'}`);
+    const { available, added, unregistered, materialized } = result.refresh;
+    if (materialized) {
+      console.log('  This token has no operation snapshot: it reaches every operation its scopes allow except membership operations, which need explicit approval.');
+      console.log('  Adding one writes a snapshot of every operation its scopes allow today plus the ones you add; operations later upgrades add then need --refresh-operations.');
+    }
+    console.log(`  ${materialized ? 'Operations that need approval' : 'New operations available'}: ${available.length ? available.join(', ') : 'none'}`);
     if (unregistered.length) console.log(`  Granted but no longer registered: ${unregistered.join(', ')}`);
     if (added.length) console.log(`  Added: ${added.join(', ')}`);
     else if (available.length) {
       const add = available.length <= 8 ? `--add ${available.join(',')}` : '--add <op,...>';
-      console.log(`  Nothing widened. Grant them with: gbrain auth rescope --token ${result.name} --refresh-operations ${add} (or --all-new)`);
+      console.log(`  Nothing widened. Grant them with: gbrain auth rescope --token ${result.name} --refresh-operations ${add}${materialized ? '' : ' (or --all-new)'}`);
     }
   }
   if (result.changed && !result.dryRun) console.log('Grants apply on the next request; the token secret is unchanged.');
@@ -1022,12 +1026,10 @@ export function clientOperationsLines(row: ClientRow): string[] {
  * for the unit suite.
  */
 export async function listClientRows(engine: BrainEngine): Promise<ClientRow[]> {
-  // The columns each degrade tier drops. isUndefinedColumnError matches any
-  // 42703 by code; the column list covers message-only (code-less) variants.
+  // The columns each degrade tier drops; any other missing object rethrows.
   const isSchemaShapeError = (e: unknown): boolean =>
-    isUndefinedTableError(e) ||
-    ['allowed_operations', 'deleted_at', 'surface', 'surface_set_by', 'source_id', 'federated_read']
-      .some(col => isUndefinedColumnError(e, col));
+    isMissingSchemaObject(e, 'table', 'oauth_clients') ||
+    isMissingSchemaObject(e, 'column', ['allowed_operations', 'deleted_at', 'surface', 'surface_set_by', 'source_id', 'federated_read']);
   try {
     return await engine.executeRaw<ClientRow>(
       `SELECT client_id, client_name, scope, surface, surface_set_by, source_id, federated_read, allowed_operations, deleted_at
@@ -1070,7 +1072,7 @@ export async function tokenLifetimeClampedClients(engine: BrainEngine): Promise<
     );
     return new Set(rows.map(r => r.client_id));
   } catch (e) {
-    if (isUndefinedTableError(e)) return new Set();
+    if (isMissingSchemaObject(e, 'table', 'oauth_grant_audit')) return new Set();
     throw e;
   }
 }

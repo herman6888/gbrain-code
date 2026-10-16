@@ -5,8 +5,6 @@ import { slog, withSourcePrefix } from '../../core/console-prefix.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { msysToNativePath } from '../../core/path-confine.ts';
 import { syncFailureJsonFields, readManagedSyncFailures } from '../../core/persistence/sync-failures.ts';
-import { formatManagedRetryAction, managedRetryActions } from '../../core/persistence/managed-retry-actions.ts';
-import { managedSyncCursorKey } from '../../core/persistence/sync-run.ts';
 import { syncHoldJsonFields } from '../../core/persistence/sync-holds.ts';
 import { printHoldNotes } from '../sync-diagnostics.ts';
 import { getDefaultSourcePath } from '../../core/source-resolver.ts';
@@ -335,7 +333,7 @@ async function runSyncAll(
   input: { noEmbed: boolean; embeddingCredentialError: Error | undefined; resumeCommand: string },
 ): Promise<void> {
   const {
-    dryRun, full, noPull, noBulk, lanes, noExtract, skipFailed, retryFailed, noSchemaPack, explicitProcessing, includeGitignored,
+    dryRun, full, noPull, noBulk, lanes, noExtract, skipFailed, retryFailed, noSchemaPack, includeGitignored,
     workingTree, missingPathMode, jsonOut, yesFlag, serialFlag, noAutoEmbed, maxSources, concurrency, timeoutSeconds,
   } = flags;
   const { noEmbed, embeddingCredentialError, resumeCommand } = input;
@@ -509,14 +507,14 @@ async function runSyncAll(
       // #6696: a planned or cost-gate deferral (not the user's --no-embed) survives cursor adoption.
       embedDeferred: effectiveNoEmbed && !noEmbed,
       noExtract,
-      skipFailed, retryFailed, noSchemaPack, explicitProcessing,
+      skipFailed, retryFailed, noSchemaPack,
       includeGitignored,
       workingTree,
       sourceId: src.id,
       strategy: cfg.strategy,
       concurrency,
       signal: composeAbortSignals(allInterrupt.signal, controller?.signal),
-      drain: true, noBulk, lanes,
+      drain: true, noBulk, lanes, followDrainLease: true, drainHolder: { kind: 'cli', id: null },
     };
     // v0.40.6.0 (D6): wrap performSync in withSourcePrefix so every slog /
     // serr line emitted from inside the sync code path gets prefixed with
@@ -772,7 +770,7 @@ async function runSingleSourceSync(
 ): Promise<void> {
   const {
     repoPath, watch, interval, dryRun, full, noPull, noBulk, lanes, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack,
-    explicitProcessing, includeGitignored, workingTree, jsonOut, yesFlag, noAutoEmbed, strategyArg, srcSubpath,
+    includeGitignored, workingTree, jsonOut, yesFlag, noAutoEmbed, strategyArg, srcSubpath,
     excludePatterns, includeHiddenPatterns, concurrency, timeoutSeconds,
   } = flags;
   const { sourceId, companyPolicy, noEmbed, resumeCommand, args } = input;
@@ -792,13 +790,13 @@ async function runSingleSourceSync(
   const singleSourceInterrupt = new AbortController();
   const onSingleSourceSigint = () => { try { singleSourceInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
   const opts: SyncOpts = {
-    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, explicitProcessing, includeGitignored, workingTree, sourceId,
+    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, includeGitignored, workingTree, sourceId,
     strategy: strategyArg, concurrency,
     srcSubpath,
     exclude: excludePatterns.length > 0 ? excludePatterns : undefined,
     includeHidden: includeHiddenPatterns.length > 0 ? includeHiddenPatterns : undefined,
     signal: composeAbortSignals(singleSourceInterrupt.signal, singleSourceController?.signal),
-    drain: true, noBulk, lanes,
+    drain: true, noBulk, lanes, followDrainLease: true, drainHolder: { kind: 'cli', id: null },
   };
 
   // v0.42.42.0 (#2139, Step 4b): single-source `gbrain sync` gets the SAME
@@ -844,25 +842,21 @@ async function runSingleSourceSync(
     // v0.42.42.0 (#2139, D13C): scope the retry count to THIS source — rows
     // carry source_id (#1939), so a single-source retry shouldn't report
     // another source's failures.
-    // A managed retry resumes only the cursor its own options select; failures under other options are named, not counted.
+    // #6712 PR 1: a managed source has one cursor, whatever options a run passes, so every recorded failure is this retry's.
     const managedBrain = await readManagedMode(engine);
     let failures: Array<{ source_id: string }> = unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
-    if (managedBrain) {
-      const managed = await readManagedSyncFailures(engine, [sourceId]);
-      const key = await managedSyncCursorKey(engine, opts).catch(() => null);
-      const other = key ? managed.filter(f => f.cursor_key !== key) : [];
-      failures = key ? managed.filter(f => f.cursor_key === key) : managed;
-      if (other.length) {
-        slog(`${other.length} previously-failed file(s) of this source belong to a run with different sync options and are not retried by this invocation. Each, with the action that settles it:`);
-        for (const action of await managedRetryActions(engine, opts, other)) slog(`  ${formatManagedRetryAction(action)}`);
-      }
-    }
+    if (managedBrain) failures = await readManagedSyncFailures(engine, [sourceId]);
     const legacyRows = managedBrain ? legacyLedgerRows(sourceId).length : 0;
     if (legacyRows) slog(`${legacyRows} legacy ledger row(s) of this source were recorded by the pre-managed sync and are not retried by a managed sync; this run settles every one whose file it imports.`);
     if (failures.length === 0) {
       slog(legacyRows ? 'No managed sync failures recorded; checking the durable sync cursor for unfinished or failed writes.' : 'No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
     } else {
       slog(`Retrying ${failures.length} previously-failed file(s)...`);
+      // #6712 PR 1: a failure whose run no cursor holds any more (an older gbrain's, under its own key) is not settled by
+      // a sync; the orphan repair retires it.
+      const orphaned = managedBrain ? (await (await import('../../core/persistence/managed-sync-orphans.ts')).classifyManagedSyncOrphans(engine, [sourceId]))
+        .orphans.filter(orphan => orphan.kind === 'failure_row').length : 0;
+      if (orphaned) slog(`${orphaned} of them belong to no sync run any more (an older gbrain's run under another cursor key); no sync settles them: preview and retire them with gbrain repair managed-sync-orphans --source ${sourceId}.`);
     }
   }
 

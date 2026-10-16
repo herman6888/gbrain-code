@@ -44,7 +44,8 @@ import type { McpSurface } from '../mcp/surface.ts';
 import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
 import { createPersistenceIpcProvider, residentPersistenceConfig } from '../core/persistence/provider.ts';
 import { resolveMcpStdioSourceScope } from '../mcp/server.ts';
-import { loadConfig, type GBrainConfig } from '../core/config.ts';
+import { type GBrainConfig } from '../core/config.ts';
+import { loadServeConfigs } from '../mcp/serve-config.ts';
 import { buildError } from '../core/errors.ts';
 import * as db from '../core/db.ts';
 import { sqlQueryForEngine, type SqlQuery } from '../core/sql-query.ts';
@@ -614,7 +615,7 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   // a misconfiguration; we WARN to stderr at startup in that case rather
   // than silently binding loopback only.
   const bind = options.bind ?? '127.0.0.1';
-  const config = loadConfig() || { engine: 'pglite' as const };
+  const config = (await loadServeConfigs(engine)).operationConfig || { engine: 'pglite' as const }; // #6589: CLI parity, read once
 
   const skillStatus = await logServeHttpStartup(engine, options, config);
 

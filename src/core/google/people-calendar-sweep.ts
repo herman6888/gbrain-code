@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { CALENDAR_HORIZON_DAYS, CalendarSyncWindow, planCalendarPage, staleCalendarPages } from './calendar-window.ts';
-import { CalendarClient, CONTACT_PERSON_FIELDS, GoogleCursorExpiredError, GoogleSyncTokenRejectedError, PeopleClient } from './google-clients.ts';
+import { CalendarClient, calendarUnreadableStatus, CONTACT_PERSON_FIELDS, GoogleCursorExpiredError, GoogleSyncTokenRejectedError, PeopleClient } from './google-clients.ts';
 import { calendarRelPath, contactIdSlug, personSlugFromContact, renderCalendarEventPage, renderPersonPage } from './google-render.ts';
 import { DEFAULT_CALENDAR_ID, type CalendarEventData, type ContactData, type GoogleSourceState } from './types.ts';
 import { deletePageByRelPath, importRendered, type ActivePack, type GoogleSyncDeps, type GoogleSyncSummary } from './sweep-shared.ts';
@@ -212,12 +212,21 @@ export async function sweepCalendar(
   try {
     result = await list(deltaToken === null ? range.listBounds() : { syncToken: deltaToken });
   } catch (e) {
-    if (!(e instanceof GoogleCursorExpiredError)) throw e;
+    if (deltaToken === null || !(e instanceof GoogleCursorExpiredError)) {
+      if (recordCalendarUnreadable(deps, state, e)) return;
+      throw e;
+    }
     deps.log('[google] calendar syncToken expired; windowed re-list');
     state.calendar_sync_token = null;
     wholeWindow = true;
-    result = await list(range.listBounds());
+    try {
+      result = await list(range.listBounds());
+    } catch (relist) {
+      if (recordCalendarUnreadable(deps, state, relist)) return;
+      throw relist;
+    }
   }
+  state.calendar_unreadable = null;
   const tally = { outside: 0 };
   const sweepCtx = { activePack, summary, countedSlugs };
   if (!await applyCalendarList(deps, result.events, range, sweepCtx, tally)) return;
@@ -239,6 +248,25 @@ export async function sweepCalendar(
     deps.log(`[google] calendar: ${tally.outside} listed event(s) outside the sync window (${deps.cfg.historyDays} days back, ${range.futureDays} ahead) were not imported`);
   }
   if (deps.opts.full) await reconcileCalendarWindow(deps, new Set(result.events.map(ev => ev.id)), range, summary);
+}
+
+/**
+ * #5012 item 9: a 403 or 404 from `events.list` on the configured calendar
+ * means this account cannot read it. Instead of a sweep that looks like an
+ * empty calendar, the typed result is recorded in source state (doctor's
+ * `google_calendar_readable` reads it with no network call) and the log line
+ * names the fix. The run is not failed: the calendar stays unreadable until
+ * the user changes the source, and a failed run would also hold back Gmail's
+ * freshness on every sync.
+ */
+function recordCalendarUnreadable(deps: GoogleSyncDeps, state: GoogleSourceState, e: unknown): boolean {
+  const httpStatus = calendarUnreadableStatus(e);
+  if (httpStatus === null) return false;
+  state.calendar_unreadable = { code: 'calendar_unreadable', calendar_id: deps.cfg.calendarId, http_status: httpStatus, at: new Date().toISOString() };
+  deps.log(`[google] calendar_unreadable: ${deps.cfg.account} cannot read calendar "${deps.cfg.calendarId}" (HTTP ${httpStatus}); no events were synced. `
+    + `List the calendars it can read: gbrain google calendars --account ${deps.cfg.account}; `
+    + `then point the source at one: gbrain sources set-calendar ${deps.sourceId} <calendar-id>`);
+  return true;
 }
 
 /**

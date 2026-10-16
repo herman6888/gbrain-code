@@ -4,7 +4,7 @@
  * recovery path must finish: publication boundaries, after an effect's side
  * effect but before its completion is recorded, before a recovery record is
  * cleared, between sync checkpoints, after the consumer prepared a
- * claimed request, (`sync:after_freeze`) after a managed sync import entry is frozen and before it is admitted, (`lane:applied`) when a lane group has applied its pages and waits for its commit turn, and (`stuck_recovery:*`) between the steps of a stuck-recovery resolution. Production never installs a hook, so every call is a
+ * claimed request, (`sync:after_freeze`) after a managed sync import entry is frozen and before it is admitted, (`lane:applied`) when a lane group has applied its pages and waits for its commit turn, (`stuck_recovery:*`) between the steps of a stuck-recovery resolution, and (`segmented:*`) between the stages of a segmented write. Production never installs a hook, so every call is a
  * no-op there; the gate's workers install one that SIGKILLs or stalls the
  * process at a chosen point.
  */
@@ -14,23 +14,36 @@ import type { WriteRequest } from './model.ts';
 
 export type PublicationBoundary = Parameters<NonNullable<PublicationHooks['boundary']>>[0];
 export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${EffectKind}:mid` | 'effect:embedding:settle'
-  | 'effect_recovery:before_clear' | 'publication_recovery:before_clear' | 'sync:mid_checkpoint' | 'sync:before_group_admission' | 'sync:mid_waiver_run' | 'consumer:prepared'
+  | 'effect_recovery:before_clear' | 'publication_recovery:before_clear' | 'sync:mid_checkpoint' | 'sync:before_group_admission' | 'sync:mid_waiver_run' | 'sync:prescreened' | 'consumer:prepared'
   | 'consumer:preparing' | 'lane:applied'
   // #6712 PR 0: after `freezeEntry` froze an import entry (its bytes are read) and before the request is admitted or published.
   | 'sync:after_freeze'
+  // #6712 PR 1 (L2): after the cursor step that holds a failed entry and settles its index commits (`holdUnderGate`), and after
+  // the cursor step that defers an entry whose file changed after admission past the manifest end (`deferChangedEntry`).
+  | 'sync:held_settled' | 'sync:retry_deferred'
+  // #6712 PR 1: after a pass took the source's drain lease (before it reads the cursor); after each cursor the fan-in
+  // superseded is retired (before the next one), and after a pass stamped its authority on a cursor another writer started.
+  | 'sync:lease_acquired' | 'sync:cursor_adopted'
   // #6511: the page purge's in-transaction journal lookups (page-purge.ts `journalLookup`); a hook that throws a 57014 models a statement timeout there.
   | 'purge:slug_lookup' | 'purge:tail_recheck' | 'purge:pending_recheck' | 'purge:redaction_read'
   // #6511: before each keyset chunk of the preparation-time journal sweep (a stalling hook models a slow chunk), and the fact purge's planning read.
   | 'purge:sweep_chunk' | 'purge:carrying_lookup'
+  // W1: before each keyset batch of the belief ledger's purge redaction (belief/purge.ts); a 57014 from the hook models its statement timeout.
+  | 'purge:ledger_redaction'
   // #6650: `gbrain repair stuck-recovery` (recovery-resolve.ts): after the backup is durable (before its journal step), after the prior
   // bytes are written (before their journal step), after a --keep disk write is abandoned (its journal step written), and after recoverPublication returns.
-  | 'stuck_recovery:backed_up' | 'stuck_recovery:written' | 'stuck_recovery:abandoned' | 'stuck_recovery:recovered';
+  | 'stuck_recovery:backed_up' | 'stuck_recovery:written' | 'stuck_recovery:abandoned' | 'stuck_recovery:recovered'
+  // Wave B segmented writes (spec 3.4 crash windows): after the texts, the staged manifest rows and the staged chunks of a
+  // preparation, after the generation flip (inside the publication transaction), and after a projection staged its chunks (before its seal).
+  | 'segmented:texts_staged' | 'segmented:manifest_staged' | 'segmented:chunks_staged' | 'segmented:flipped' | 'segmented:projection_staged';
 /**
  * `signal` (#6278, `consumer:preparing` only): the preparation's abort signal, so
  * a stalling hook can model both the reporter's cases: a preparer that honours
  * cancellation (settle on abort) and one that ignores it (hang on).
  */
-export interface FaultDetail { requestId?: string; effectId?: string | number; sourceId?: string; operation?: string | null; signal?: AbortSignal; slug?: string; path?: string }
+export interface FaultDetail { requestId?: string; effectId?: string; sourceId?: string; operation?: string | null; signal?: AbortSignal; slug?: string; path?: string }
+/** Postgres returns `persistence_effects.id` (bigserial) as a BigInt; `faultPoint` hands hooks its decimal string (#6584). */
+export type FaultDetailInput = Omit<FaultDetail, 'effectId'> & { effectId?: string | number | bigint };
 type FaultHook = (point: FaultPoint, detail: FaultDetail) => Promise<void> | void;
 
 /** The mid-effect seam of every effect kind; a new kind without one fails typecheck. */
@@ -45,8 +58,10 @@ export const EFFECT_FAULT_POINTS: Record<EffectKind, FaultPoint> = {
 let installed: FaultHook | undefined;
 /** Gate workers only. */
 export function installFaultHook(hook: FaultHook | undefined): void { installed = hook; }
-export async function faultPoint(point: FaultPoint, detail: FaultDetail = {}): Promise<void> {
-  if (installed) await installed(point, detail);
+export async function faultPoint(point: FaultPoint, detail: FaultDetailInput = {}): Promise<void> {
+  if (!installed) return;
+  const { effectId, ...rest } = detail;
+  await installed(point, effectId === undefined ? rest : { ...rest, effectId: String(effectId) });
 }
 /** Publication hooks that also reach the installed seam; returns the caller's hooks unchanged when none is installed. */
 export function withFaultPoints(hooks: PublicationHooks): PublicationHooks {

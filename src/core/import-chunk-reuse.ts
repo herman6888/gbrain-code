@@ -8,6 +8,10 @@ import { embeddingWriteTarget, embeddingInputContext } from './page-state/projec
 import { canReuseMarkdownVector, planEmbeddingReuse } from './embed-reuse.ts';
 import { modeRequiresSynopsis } from './embedding-context.ts';
 import type { Chunk, ChunkInput, CRMode } from './types.ts';
+import type { SegmentChunkInput } from './page-body/types.ts';
+import { quoteIdentifier } from './search/embedding-column.ts';
+import { chunkGenerationFilter } from './search/safe-chunks.ts';
+import { parseEmbedding } from './utils.ts';
 
 /**
  * A13 reuse for one page import: copies each stored vector the reuse gate
@@ -69,4 +73,43 @@ export async function reuseStoredChunkVectors(
     }
   }
   return reused;
+}
+
+/**
+ * Wave B: vector reuse for a segmented write, scoped to the live chunk rows of
+ * the occurrences the write retires (never the whole page): one statement
+ * reads those rows with their vectors, the same gate as
+ * `reuseStoredChunkVectors` admits each (recorded input hash for the write's
+ * tier, nothing from a page stored under per-chunk synopsis), and each admitted
+ * vector is copied, with its recorded input, onto the new chunk with the same
+ * source and text (`chunk_source\0chunk_text`, FIFO for duplicates). So an
+ * unchanged chunk inside a rewritten tail keeps its vector and only new text
+ * reaches the provider. Returns how many chunks got one.
+ */
+export async function reuseSegmentChunkVectors(exec: BrainEngine, { pageId, retiredOccurrences, chunks, title, corpusGeneration, tier }: {
+  pageId: number; retiredOccurrences: readonly number[]; chunks: SegmentChunkInput[]; title: string; corpusGeneration: string | null; tier: 'title' | 'none' }): Promise<number> {
+  if (retiredOccurrences.length === 0 || chunks.length === 0) return 0;
+  const target = await embeddingWriteTarget(exec);
+  const provenance = embeddingInputContext(target, title, corpusGeneration, []);
+  const col = quoteIdentifier(target.column.name);
+  const rows = await exec.executeRaw<{ chunk_text: string; chunk_source: string; embedding: unknown; token_count: number | null; model: string | null;
+    embedding_input_hash: string | null; contextual_retrieval_mode: string | null }>(
+    `SELECT c.chunk_text, c.chunk_source, c.${col} AS embedding, c.token_count, c.model, c.embedding_input_hash, p.contextual_retrieval_mode
+       FROM content_chunks c JOIN pages p ON p.id = c.page_id
+      WHERE c.page_id = $1 AND c.occurrence_id = ANY($2::bigint[]) AND c.${col} IS NOT NULL AND ${chunkGenerationFilter('p', 'c')}
+      ORDER BY c.chunk_index`, [pageId, [...retiredOccurrences]]);
+  const mode = rows[0]?.contextual_retrieval_mode ?? null;
+  if (rows.length === 0 || (mode && modeRequiresSynopsis(mode as CRMode))) return 0;
+  const stored = rows.map(row => ({ chunk_text: row.chunk_text, chunk_source: row.chunk_source, embedding: parseEmbedding(row.embedding),
+    token_count: row.token_count, model: row.model, embedding_input_hash: row.embedding_input_hash }))
+    .filter(chunk => canReuseMarkdownVector(chunk.embedding_input_hash, mode, tier, provenance, chunk));
+  const { reuse } = planEmbeddingReuse(stored, chunks, c => `${c.chunk_source}\0${c.chunk_text}`);
+  for (const [i, matched] of reuse) {
+    const row = matched as typeof stored[number];
+    chunks[i]!.embedding = row.embedding as Float32Array;
+    chunks[i]!.token_count = row.token_count ?? undefined;
+    if (row.model) chunks[i]!.model = row.model;
+    if (row.embedding_input_hash) chunks[i]!.embedding_input_hash = row.embedding_input_hash;
+  }
+  return reuse.size;
 }

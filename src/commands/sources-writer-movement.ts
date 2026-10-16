@@ -55,8 +55,7 @@ normally), held (advanced only by holds; the hold kind's repair route is printed
 Exit 1 with code managed_sync_not_moving for not_moving and parked; 0 otherwise.
 Run it after restarting serve and the workers: gbrain sources writer movement`;
 
-/** The bare command `gbrain upgrade` and `gbrain post-upgrade` print for the supervisor's step (no flags, so it inherits the default window). */
-export const MOVEMENT_SUPERVISOR_STEP = 'after restarting serve and the workers, run: gbrain sources writer movement';
+export { MOVEMENT_SUPERVISOR_STEP } from './movement-step.ts';
 
 export const MOVEMENT_DEFAULT_MIN_MS = 300_000;
 export const MOVEMENT_BUDGET_GRACE_MS = 60_000;

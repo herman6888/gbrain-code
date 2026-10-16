@@ -1,6 +1,19 @@
 import { isAbsolute, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { graduationVerifyInheritsPersistence } from '../persistence/ownership.ts';
+import { isMissingSchemaObject } from '../utils.ts';
+
+/** Objects ownedContentFreshness reads that an older schema may lack; any other SQL error surfaces (#6599). */
+const OWNED_CONTENT_TABLES = [
+  'persistence_brain', 'persistence_source_bindings', 'persistence_worktrees', 'persistence_host_bindings',
+  'persistence_requests', 'persistence_effects', 'source_ingestion_receipts',
+] as const;
+const OWNED_CONTENT_COLUMNS = ['incarnation', 'source_incarnation', 'recovery', 'owner_host_id'] as const;
+
+/** True only when the error names a table or column ownedContentFreshness reads and the schema predates it. */
+export function isOwnedContentSchemaMissing(error: unknown): boolean {
+  return isMissingSchemaObject(error, 'table', OWNED_CONTENT_TABLES) || isMissingSchemaObject(error, 'column', OWNED_CONTENT_COLUMNS);
+}
 
 export interface OwnedContentFreshness {
   sourceId: string;

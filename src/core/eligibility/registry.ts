@@ -37,7 +37,7 @@ export const OP_READ_TRUST: Readonly<Record<string, ReadTrustHandling>> = {
   wanted_pages: 'labeled', get_tags: 'labeled', get_ingest_log: 'labeled',
   chronicle_day: 'labeled', chronicle_on_this_day: 'labeled', chronicle_since: 'labeled', chronicle_last_seen: 'labeled',
   ontology_get: 'labeled', ontology_dimensions: 'labeled', ontology_conflicts: 'labeled', volunteer_chronicle: 'labeled',
-  extraction_pending: 'labeled', entity_identity_list: 'labeled', find_contradictions: 'labeled',
+  extraction_pending: 'labeled', entity_identity_list: 'labeled', find_contradictions: 'filtered',
   find_experts: 'labeled', find_trajectory: 'labeled', takes_scorecard: 'labeled', takes_calibration: 'labeled',
   open_loops: 'labeled', schema_review_orphans: 'labeled',
   questions_list: 'labeled', questions_status: 'labeled',

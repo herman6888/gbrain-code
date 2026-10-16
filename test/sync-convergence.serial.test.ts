@@ -58,7 +58,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -109,11 +109,14 @@ const MODES = {
   c: { title: 'concurrent writers: put, remember and a managed maintenance job', skip: null },
   'c-db': { title: 'a DB-only competitor', skip: null },
   d: { title: 'out-of-band git mv/git rm of committed files and deletion of uncommitted files', skip: null },
-  e: { title: 'a deterministic mid-run edit after freezeEntry', skip: PR1 },
+  e: { title: 'a deterministic mid-run edit after freezeEntry', skip: null },
+  // #6712 lane C: the page that loses its pooled connection mid-publication keeps its live owner's publication claim until
+  // that lease lapses (~366 s, "claim lapsed: owner missing"); one page's fate converges, the stall is the owner's (the drain lease).
   f: { title: 'a pooler drop mid-bulk', skip: PR1 },
   g: { title: 'two concurrent drainers: a --all run beside a serve', skip: null },
-  'knock-on': { title: 'one page failure inside a bulk group', skip: PR1 },
-  systemic: { title: 'a systemic database refusal: an unknown P0001 or a 55000 from a trigger on every page write', skip: PR1 },
+  lease: { title: 'the drain-lease holder killed with two followers queued behind it', skip: null },
+  'knock-on': { title: 'one page failure inside a bulk group', skip: null },
+  systemic: { title: 'a systemic database refusal: an unknown P0001 or a 55000 from a trigger on every page write', skip: null },
 } as const satisfies Record<string, { title: string; skip: string | null }>;
 type Mode = keyof typeof MODES;
 const requestedModes = process.env.GBRAIN_TEST_CONVERGENCE_MODES?.split(',').map(mode => mode.trim()).filter(Boolean);
@@ -128,13 +131,19 @@ const ENTITY = 'people/alice-example';
  * file-publication pair (`before_publication`/`after_publication`) never fires for it. Per-page seams are counted
  * per submit_job request (nth inside the first 60% of a round); `lane:applied` and `sync:before_group_admission`
  * fire once per bulk group, and a small round may form one group, so they kill at the first; `sync:mid_checkpoint`
- * fires on every cursor save (the first or second).
+ * fires on every cursor save (the first or second). #6712's `sync:retry_deferred` and `sync:held_settled` need a file
+ * that changes after its freeze: their round primes one with an uncommitted edit at `sync:after_freeze`, which is
+ * deferred once (the first) and, when its retry finds the same newer bytes, held `worktree_dirty` (the hold); the
+ * harness commits the edit after the round.
  */
 const KILL_POINTS = [
   { point: 'publication:before_commit', per: 'page' }, { point: 'publication:after_commit', per: 'page' },
   { point: 'consumer:preparing', per: 'page' }, { point: 'lane:applied', per: 'group' },
   { point: 'sync:before_group_admission', per: 'group' }, { point: 'sync:mid_checkpoint', per: 'save' },
-] as const satisfies ReadonlyArray<{ point: FaultPoint; per: 'page' | 'group' | 'save' }>;
+  { point: 'sync:held_settled', per: 'held' }, { point: 'sync:retry_deferred', per: 'deferred' },
+  // #6712 PR 1: inside the guarded kernel run of prescreened entries (its round also commits mode-only changes, so it has some).
+  { point: 'sync:prescreened', per: 'group' },
+] as const satisfies ReadonlyArray<{ point: FaultPoint; per: 'page' | 'group' | 'save' | 'held' | 'deferred' }>;
 const MAX_RECOVERY_RUNS = 2;
 /** Oracle tests are named by the persistence gate's violation class (scripts/persistence/model.ts) they would report. */
 const as = (violation: ViolationClass, title: string): string => `[${violation}] ${title}`;
@@ -306,7 +315,8 @@ class LatencyProxy {
 // ---------------------------------------------------------------- one brain
 
 interface Fault { point: FaultPoint; nth: number; marker: string; operation?: string; path?: string; action?: 'kill' | 'edit' | 'stall' | 'throw';
-  edit?: { file: string; content: string }; release?: string; ms?: number; sqlstate?: string }
+  edit?: { file: string; content: string }; release?: string; ms?: number; sqlstate?: string;
+  prime?: { point: FaultPoint; nth: number; path?: string; edit: { file: string; content: string } } }
 interface Run { code: number; out: string; err: string; ms: number }
 interface SyncRun { proc: ReturnType<typeof Bun.spawn>; result: Promise<Run> }
 
@@ -386,6 +396,12 @@ class Brain {
     this.git('add', '--', ...paths); this.git('commit', '-qm', message, '--', ...paths);
     const ack = performance.now();
     for (const f of files) this.ledger.record({ kind: 'commit', slug: f.slug, marker: f.marker, touches: ['db', 'file'], start, ack });
+  }
+  /** #6712 PR 1: a mode-only commit of these notes (same blobs), which the discovery prescreen passes without an import. */
+  chmodNotes(indexes: number[], message: string): void {
+    const paths = indexes.map(i => `${noteSlug(i)}.md`);
+    for (const path of paths) chmodSync(join(this.repo, path), 0o755);
+    this.git('add', '--', ...paths); this.git('commit', '-qm', message, '--', ...paths);
   }
   writeNotes(indexes: number[], version: string, message: string, extra: Array<{ slug: string; content: string; marker: string }> = []): void {
     this.commit(message, [...indexes.map(i => ({ slug: noteSlug(i), content: noteText(i, version), marker: noteMarker(i, version) })), ...extra]);
@@ -805,8 +821,8 @@ describe('convergence harness calibration (#6650 L0, #6712 PR 0)', () => {
     } finally { rmSync(b.repo, { recursive: true, force: true }); }
   });
   test('modes master fails stay written and name the PR that turns them on', () => {
-    for (const mode of ['e', 'f', 'knock-on', 'systemic'] as const) expect(MODES[mode].skip).toContain('PR 1 of #6712');
-    for (const mode of ['a', 'b', 'c', 'c-db', 'd', 'g'] as const) expect(MODES[mode].skip).toBeNull();
+    expect(MODES.f.skip).toContain('PR 1 of #6712');
+    for (const mode of ['a', 'b', 'c', 'c-db', 'd', 'e', 'g', 'lease', 'knock-on', 'systemic'] as const) expect(MODES[mode].skip).toBeNull();
   });
 });
 
@@ -825,13 +841,13 @@ scenario(['a', 'b', 'c'], 'managed sync converges after a seeded kill loop of cl
     // The fault plan, drawn from the seed before anything runs: one kill per round.
     const kinds = [runs('a') && 'client', runs('b') && 'serve', runs('a') && runs('b') && 'serve+client'].filter(Boolean) as Array<'client' | 'serve' | 'serve+client'>;
     const perRound = Math.min(100, Math.max(10, Math.round(NOTES * 0.1)));
-    // Victims and fault points cycle from seeded offsets, so six kills reach every point and each victim kind twice.
+    // Victims and fault points cycle from seeded offsets, so six kills reach each victim kind twice and KILL_POINTS.length kills reach every point.
     const offset = b.between(0, 2), pointOffset = b.between(0, KILL_POINTS.length - 1);
     const plan = Array.from({ length: kinds.length ? KILLS : 0 }, (_, k) => {
       const kind = kinds[(k + offset) % kinds.length];
       const { point, per } = KILL_POINTS[(k + pointOffset) % KILL_POINTS.length];
-      const nth = per === 'page' ? b.between(2, Math.floor(perRound * 0.6)) : per === 'group' ? 1 : b.between(1, 2);
-      return { round: k + 1, kind, point, nth, operation: per === 'page' || point === 'lane:applied' ? 'submit_job' : undefined };
+      const nth = per === 'page' ? b.between(2, Math.floor(perRound * 0.6)) : per === 'group' || per === 'held' || per === 'deferred' ? 1 : b.between(1, 2);
+      return { round: k + 1, kind, point, nth, operation: per === 'page' || point === 'lane:applied' ? 'submit_job' : undefined, primed: per === 'held' || per === 'deferred' };
     });
     b.plan = plan.map(p => `round ${p.round} ${p.kind} ${p.point} #${p.nth}`);
     const putTargets = runs('c') ? [...new Set(Array.from({ length: 40 }, () => b.between(0, NOTES - 1)))].slice(0, Math.round(NOTES * 0.05)).map(noteSlug) : [];
@@ -842,9 +858,13 @@ scenario(['a', 'b', 'c'], 'managed sync converges after a seeded kill loop of cl
     for (const p of plan) {
       const started = performance.now();
       const tag = `round-${p.round}`;
-      const fault: Fault = { point: p.point, nth: p.nth, marker: b.marker(tag), operation: p.operation };
       const first = (p.round * perRound) % NOTES;
       const indexes = Array.from({ length: perRound }, (_, i) => (first + i) % NOTES);
+      if (p.point === 'sync:prescreened') b.chmodNotes(Array.from({ length: 3 }, (_, i) => (first + perRound + 1 + 2 * i) % NOTES), `round ${p.round} modes`);
+      const edited = p.primed ? indexes[Math.floor(perRound / 2)]! : null;
+      const fault: Fault = { point: p.point, nth: p.nth, marker: b.marker(tag), operation: p.operation,
+        ...(edited !== null ? { prime: { point: 'sync:after_freeze', nth: 1, path: `${noteSlug(edited)}.md`,
+          edit: { file: join(b.repo, `${noteSlug(edited)}.md`), content: noteText(edited, `Round ${p.round} edit`) } } } : {}) };
       b.writeNotes(indexes, `Round ${p.round}`, `round ${p.round}`, p.round % 3 === 1 ? [b.bigFile(120 + 20 * p.round, 400 + 40 * p.round, `v${p.round}`)] : []);
       let line: string;
       if (p.kind === 'client') {
@@ -863,6 +883,11 @@ scenario(['a', 'b', 'c'], 'managed sync converges after a seeded kill loop of cl
         line = `serve ${serve.alive ? 'survived' : 'killed'}; client exit ${r.code}${client.proc.signalCode ? ` (${client.proc.signalCode})` : ''} in ${(r.ms / 1000).toFixed(1)}s, worst stall ${worstStall(r.err)}s`;
         if (plan[p.round - 2]?.kind === 'client') afterClientKill.push(tag);
         await serve.stop();
+      }
+      if (edited !== null) {
+        const editStart = performance.now();
+        b.git('add', '--', `${noteSlug(edited)}.md`); b.git('commit', '-qm', `round ${p.round}: the editor commits`, '--', `${noteSlug(edited)}.md`);
+        b.ledger.record({ kind: 'commit', slug: noteSlug(edited), marker: noteMarker(edited, `Round ${p.round} edit`), touches: ['db', 'file'], start: editStart, ack: performance.now() });
       }
       const fired = b.recordFault(tag, `round ${p.round} ${p.kind} ${p.point} #${p.nth}`);
       b.note(`round ${p.round} (${p.kind}): ${fired ? `fault fired ${fired}` : 'no fault fired'}; ${line}`);
@@ -1076,6 +1101,43 @@ scenario(['g'], 'a --all run beside a serve draining the same source converges',
     await b.recover();
   }, SCENARIO_TIMEOUT_MS);
   afterAll(() => b.teardown(), 120_000);
+  oracleTests(b, () => ({ bigPage: false }));
+});
+
+// ---------------------------------------------------------------- (lease): the drain-lease holder dies with followers queued
+
+scenario(['lease'], 'a killed drain-lease holder is taken over by a queued follower and the source converges', () => {
+  const b = new Brain('lease-takeover', ['lease']);
+  const notes = Math.min(NOTES, 200);
+  const followers: Array<{ code: number; envelope: Record<string, unknown> | null; followed: boolean }> = [];
+  beforeAll(async () => {
+    await b.setup(brain => brain.writeNotes(Array.from({ length: notes }, (_, i) => i), 'Initial', 'fixture'));
+    b.writeNotes(Array.from({ length: Math.min(notes, 120) }, (_, i) => i), 'Round one', 'round one');
+    const tag = 'leader', release = join(b.home, 'release-leader');
+    b.plan = ['leader stalls at sync:lease_acquired #1; two --no-delegate followers queue behind it; the leader is SIGKILLed'];
+    const leader = b.sync(['--no-pull', '--no-delegate', '--json'], { point: 'sync:lease_acquired', nth: 1, marker: b.marker(tag), action: 'stall', release });
+    await until(() => existsSync(b.marker(tag)), 'the leader to take the drain lease', SYNC_TIMEOUT_MS);
+    const queued = [0, 1].map(() => b.sync(['--no-pull', '--no-delegate', '--json', '--timeout', '10m']));
+    // Both followers must be following the live leader before it dies (they print the holder once they see it).
+    await Bun.sleep(5_000);
+    leader.proc.kill('SIGKILL'); b.killedPids.add(leader.proc.pid);
+    const killed = await leader.result;
+    b.keepLog('leader.log', `${killed.out}\n${killed.err}`);
+    b.recordFault(tag, b.plan[0]);
+    for (const [i, run] of queued.entries()) {
+      const r = await run.result;
+      b.keepLog(`follower-${i + 1}.log`, `${r.out}\n${r.err}`);
+      followers.push({ code: r.code, envelope: lastJson(r.out), followed: r.err.includes('following it until it finishes') });
+      b.note(`follower ${i + 1}: exit ${r.code} in ${(r.ms / 1000).toFixed(1)}s outcome=${String(lastJson(r.out)?.outcome ?? 'none')}`);
+    }
+    await b.recover();
+  }, SCENARIO_TIMEOUT_MS);
+  afterAll(() => b.teardown(), 120_000);
+  test(as('wedge', 'a follower takes over the dead holder inside the lease TTL; no follower ends blocked'), () => b.verdict([
+    ...(followers.some(f => f.followed) ? [] : ['no follower reported following the live leader']),
+    ...(followers.some(f => f.code === 0 && f.envelope?.outcome === 'synced') ? [] : [`no follower finished the source: ${JSON.stringify(followers.map(f => [f.code, f.envelope?.outcome]))}`]),
+    ...followers.filter(f => f.envelope?.outcome === 'blocked').map(f => `a follower ended blocked: ${JSON.stringify(f.envelope?.next ?? f.envelope).slice(0, 400)}`),
+  ]));
   oracleTests(b, () => ({ bigPage: false }));
 });
 

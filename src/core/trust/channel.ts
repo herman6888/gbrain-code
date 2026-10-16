@@ -105,6 +105,12 @@ export function requestChannelTrust(row: Pick<WriteRequest, 'id' | 'operation' |
 
 const str = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
 
+/**
+ * #6533: the `extracted_by` prefix extract_atoms stamps on every atom it writes. Legacy atoms
+ * (before `dream_generated`) carry only this, so it is an agent_written signal on its own.
+ */
+export const EXTRACT_ATOMS_EXTRACTOR_PREFIX = 'extract_atoms';
+
 /** The tier a single channel stamp names (`source_kind`, `ingested_via`, `captured_via`), or undefined. */
 function stampTier(value: unknown): TrustTier | undefined {
   const v = str(value);
@@ -135,7 +141,8 @@ export function frontmatterTrustCaps(frontmatter: Record<string, unknown> | null
   if (str(fm.source_url) && (str(fm.clipped_at) || str(fm.clipper) || str(fm.captured_via) === 'clipper' || str(fm.type) === 'clipping')) {
     caps.push('external_untrusted');
   }
-  if (str(fm.provenance) === 'auto-extracted' || fm.dream_generated === true || str(fm.dream_generated) === 'true') caps.push('agent_written');
+  if (str(fm.provenance) === 'auto-extracted' || fm.dream_generated === true || str(fm.dream_generated) === 'true'
+    || str(fm.extracted_by).startsWith(EXTRACT_ATOMS_EXTRACTOR_PREFIX)) caps.push('agent_written');
   return caps;
 }
 
@@ -160,7 +167,7 @@ export function frontmatterTrustCapsSql(fm: string): string[] {
     `CASE WHEN ${text('source_url')} IS NOT NULL AND (${text('clipped_at')} IS NOT NULL OR ${text('clipper')} IS NOT NULL
       OR ${text('captured_via')} = 'clipper' OR ${text('type')} = 'clipping') THEN ${TRUST_TIER_RANK.external_untrusted} END`,
     `CASE WHEN ${text('provenance')} = 'auto-extracted' OR ${fm}->'dream_generated' = 'true'::jsonb OR ${text('dream_generated')} = 'true'
-      THEN ${TRUST_TIER_RANK.agent_written} END`,
+      OR ${text('extracted_by')} LIKE '${EXTRACT_ATOMS_EXTRACTOR_PREFIX.replace(/_/g, '\\_')}%' THEN ${TRUST_TIER_RANK.agent_written} END`,
   ];
 }
 

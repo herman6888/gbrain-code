@@ -59,11 +59,24 @@ export const fenceParseTimeoutMs = () => positiveEnv('GBRAIN_FENCE_PARSE_TIMEOUT
 export const fenceParseBudgetMs = () => positiveEnv('GBRAIN_FENCE_PARSE_BUDGET_MS', 5_000);
 
 /** Sanitize the complete body before scanning any fenced code. */
-async function extractFencedChunks(
-  markdown: string,
-  startChunkIndex: number,
-): Promise<ChunkInput[]> {
-  markdown = credentialSafeProjection(sanitizeRemoteBody(markdown));
+function extractFencedChunks(markdown: string, startChunkIndex: number): Promise<ChunkInput[]> {
+  return fencedCodeChunks(credentialSafeProjection(sanitizeRemoteBody(markdown)), startChunkIndex);
+}
+
+/**
+ * The fence cap (MAX_FENCES_PER_PAGE) and parse budget one page shares. A
+ * segmented page passes one budget to every segment's fencedCodeChunks call,
+ * so the caps stay per page.
+ */
+export interface FenceChunkBudget { fences: number; spentMs: number }
+
+export function newFenceChunkBudget(): FenceChunkBudget {
+  return { fences: MAX_FENCES_PER_PAGE, spentMs: 0 };
+}
+
+/** Recognized code-fence chunks of an already projected (sanitized, credential-safe) text. */
+export async function fencedCodeChunks(markdown: string, startChunkIndex: number,
+  budget: FenceChunkBudget = newFenceChunkBudget()): Promise<ChunkInput[]> {
   const out: ChunkInput[] = [];
   // Fast path: most pages (prose, tables, converted docs) contain no code
   // fence at all, so there is nothing for this function to extract — skip
@@ -72,7 +85,8 @@ async function extractFencedChunks(
   // line splitting, so CR/CRLF-only documents don't lose a real fence.
   if (!/(^|[\r\n])[ \t]{0,3}(```|~~~)/.test(markdown)) return out;
 
-  const { fences, capped } = scanFencedBlocks(markdown);
+  const { fences, capped } = scanFencedBlocks(markdown, budget.fences);
+  budget.fences -= fences.length;
   if (capped) {
     console.warn(
       `[gbrain] markdown fence cap hit (${MAX_FENCES_PER_PAGE} fences/page); skipping additional fences. ` +
@@ -81,7 +95,7 @@ async function extractFencedChunks(
   }
 
   let indexOffset = 0;
-  const started = performance.now();
+  const started = performance.now() - budget.spentMs;
   for (const fence of fences) {
     const text = fence.text.trim();
     if (!text) continue;
@@ -119,6 +133,7 @@ async function extractFencedChunks(
       );
     }
   }
+  budget.spentMs = performance.now() - started;
   return out;
 }
 

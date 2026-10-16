@@ -463,25 +463,9 @@ async function prepareFactFenceAdoption(unbounded: BrainEngine, row: WriteReques
     if (adopted.length !== facts.length) throw opError('revision_conflict', 'A legacy fact was adopted by another run.',
       `Another run adopted a legacy fact on ${row.slug} in ${row.source_id} while request ${row.request_id} was publishing, so its transaction rolled back. Read the receipt with gbrain write-request -- ${row.request_id} for the final state before planning any new adoption.`,
       { fix: receiptFix(row) });
-    const outcome = await applyPreservingTakeResolutions(tx, row.page_id, prepared);
+    const outcome = await prepared.apply(tx);
     return { ...outcome, facts_adopted: facts.length };
   } };
-}
-
-/**
- * Apply a page publication that republishes the page's takes fence unchanged.
- * Its projection would clear take resolutions recorded only in the database,
- * so they are restored afterwards in the same transaction.
- */
-export async function applyPreservingTakeResolutions(tx: BrainEngine, pageId: number | null, prepared: PreparedMutation): Promise<Record<string, unknown>> {
-  const resolved = await tx.executeRaw<Record<string, unknown>>(`SELECT row_num,resolved_at,resolved_quality,resolved_outcome,
-    resolved_source,resolved_value,resolved_unit,resolved_by FROM takes WHERE page_id=$1 AND resolved_at IS NOT NULL`, [pageId]);
-  const outcome = await prepared.apply(tx);
-  for (const take of resolved) await tx.executeRaw(`UPDATE takes SET resolved_at=$3,resolved_quality=$4,resolved_outcome=$5,
-    resolved_source=$6,resolved_value=$7,resolved_unit=$8,resolved_by=$9 WHERE page_id=$1 AND row_num=$2 AND resolved_at IS NULL`,
-  [pageId, take.row_num, take.resolved_at, take.resolved_quality, take.resolved_outcome, take.resolved_source,
-    take.resolved_value, take.resolved_unit, take.resolved_by]);
-  return outcome;
 }
 
 /**

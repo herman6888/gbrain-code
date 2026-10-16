@@ -12,6 +12,8 @@ import { OperationError } from '../src/core/ops/contract.ts';
 import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
+import { clientRequestUuid } from '../src/core/persistence/preconditions.ts';
+import { journaledPageSlug } from '../src/core/cycle/synthesize-postprocess.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests, __setDecideTransportForTests } from '../src/core/ai/gateway.ts';
 import { flushDecideWrites } from '../src/core/ai/decide/store.ts';
@@ -269,6 +271,92 @@ test('interrupted synthesis postprocessing resumes once without rerunning either
     expect(replay.details.pages_written).toBe(0);
     expect((await engine.readPageSnapshot(slug, { sourceId }))!.revision).toBe(snapshot.revision);
     expect(calls()).toBe(spent);
+  });
+}, 120_000);
+
+/**
+ * #6616: the retained tool input holds what the child sent; the journal holds the
+ * canonical forms. Each alias below rewrites only the retained input (and, for a
+ * printable client id, the journal row to that id's UUIDv5, as the write path
+ * would have stored it); postprocessing must still find the committed output and
+ * resume without another provider call.
+ */
+const RETAINED_ALIASES: Array<[string, (engine: BrainEngine, sourceId: string) => Promise<void>]> = [
+  ['an uppercase UUID request_id', async (engine, sourceId) => {
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=jsonb_set(input,'{request_id}',to_jsonb(upper(input->>'request_id')))
+      WHERE tool_name='brain_put_page' AND job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)`, [sourceId]);
+  }],
+  ['a printable client request_id', async (engine, sourceId) => {
+    const [tool] = await engine.executeRaw<{ request_id: string }>(`SELECT input->>'request_id' AS request_id FROM subagent_tool_executions
+      WHERE tool_name='brain_put_page' AND job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)`, [sourceId]);
+    await engine.executeRaw('UPDATE persistence_requests SET request_id=$2::uuid WHERE source_id=$1 AND request_id::text=$3',
+      [sourceId, clientRequestUuid('synth-output-test-1'), tool.request_id]);
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=jsonb_set(input,'{request_id}','"synth-output-test-1"')
+      WHERE tool_name='brain_put_page' AND job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)`, [sourceId]);
+  }],
+  ['a mixed-case slug', async (engine, sourceId) => {
+    await engine.executeRaw(`UPDATE subagent_tool_executions SET input=jsonb_set(input,'{slug}',to_jsonb(replace(input->>'slug','session','SESSION')))
+      WHERE tool_name='brain_put_page' AND job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)`, [sourceId]);
+  }],
+];
+
+for (const [alias, rewrite] of RETAINED_ALIASES) {
+  test(`#6616: interrupted postprocessing resumes a child output retained with ${alias}, without a provider call`, async () => {
+    await fixture(async ({ engine, sourceId, root, opts, calls }) => {
+      await interruptAfterChild(engine, sourceId, opts);
+      const slug = await outputSlug(engine, sourceId);
+      await rewrite(engine, sourceId);
+      const spent = calls();
+      const recovered = await runPhaseSynthesize(engine, opts);
+      expect(recovered.status, JSON.stringify(recovered.error ?? recovered.summary)).toBe('ok');
+      expect(calls()).toBe(spent);
+      expect(recovered.details.pages_written).toBe(1);
+      const snapshot = (await engine.readPageSnapshot(slug, { sourceId }))!;
+      expect(snapshot.page.frontmatter.dream_generated).toBe(true);
+      expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('dream_generated: true');
+    });
+  }, 120_000);
+}
+
+test('#6616: a committed output that does not match source, incarnation, revision, slug or state still refuses', async () => {
+  const { loadCommittedSynthesisOutputs } = await import('../src/core/cycle/synthesize-postprocess.ts');
+  const { maintenancePreflight } = await import('../src/core/persistence/prepared-maintenance.ts');
+  await fixture(async ({ engine, sourceId, root, opts, calls }) => {
+    await interruptAfterChild(engine, sourceId, opts);
+    const authority = (await maintenancePreflight(engine, sourceId, root))!;
+    const [tool] = await engine.executeRaw<{ job_id: number | bigint; input: Record<string, unknown>; output: Record<string, unknown> }>(
+      `SELECT t.job_id,t.input,t.output FROM subagent_tool_executions t JOIN minion_jobs j ON j.id=t.job_id
+       WHERE j.data->>'source_id'=$1 AND t.tool_name='brain_put_page' AND t.status='complete'`, [sourceId]);
+    const ids = [Number(tool.job_id)];
+    expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toHaveLength(1);
+    for (const writer of [{ ...authority.writer, sourceId: 'unrelated-source' }, { ...authority.writer, sourceIncarnation: randomUUID() }]) {
+      expect(await loadCommittedSynthesisOutputs(engine, { ...authority, writer }, ids)).toEqual([]);
+    }
+    const spent = calls();
+    for (const [input, output] of [
+      [{ ...tool.input, slug: 'wiki/personal/reflections/unrelated' }, tool.output],
+      [tool.input, { ...tool.output, revision: randomUUID() }],
+      [tool.input, { ...tool.output, state: 'queued' }],
+    ]) {
+      await engine.executeRaw(`UPDATE subagent_tool_executions SET input=$2::text::jsonb,output=$3::text::jsonb WHERE job_id=$1 AND tool_name='brain_put_page'`,
+        [ids[0], JSON.stringify(input), JSON.stringify(output)]);
+      expect(await loadCommittedSynthesisOutputs(engine, authority, ids)).toEqual([]);
+      const refused = await runPhaseSynthesize(engine, opts);
+      expect(refused.status).toBe('fail');
+      expect(refused.error?.code).toBe('SYNTH_PHASE_FAIL');
+      expect(calls()).toBe(spent);
+    }
+  });
+}, 120_000);
+
+test('#6616: journaledPageSlug is the slug submitPageMutation journals', async () => {
+  await fixture(async ({ engine, sourceId }) => {
+    const requestId = randomUUID();
+    await submitPageMutation({ engine, sourceId, remote: false, config: { engine: engine.kind, embedding_disabled: true }, dryRun: false,
+      logger: { info() {}, warn() {}, error() {} } } as never,
+    { operation: 'put_page', params: { slug: 'Notes/Mixed-Case-Example', content: '---\ntitle: Mixed\ntype: note\n---\nBody.', request_id: requestId } });
+    const [row] = await engine.executeRaw<{ slug: string }>('SELECT slug FROM persistence_requests WHERE request_id=$1::uuid', [requestId]);
+    expect(row.slug).toBe(journaledPageSlug('Notes/Mixed-Case-Example'));
   });
 }, 120_000);
 

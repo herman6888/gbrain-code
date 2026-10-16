@@ -406,6 +406,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
   if (key.startsWith('persistence.')) await (await import('./config/preparation-keys.ts')).refuseInvalidPreparationValue(engine, key, value);
   if (key.startsWith('facts.')) await (await import('./config/facts-values.ts')).refuseInvalidFactsConfigValue(key, value);
   await engine.setConfig(key, value);
+  if (key === 'search.contextual_retrieval') console.log((await import('./config/contextual-mode-hint.ts')).contextualModeHint());
   if (key === 'auto_chronicle') await acknowledgeAutoChronicle(engine, value);
   if (!key.startsWith('decide.slots.')) return;
   try {

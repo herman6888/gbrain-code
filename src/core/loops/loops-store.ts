@@ -152,8 +152,11 @@ export async function upsertOpenLoop(
        closed_at = NULL,
        closed_by = NULL,
        updated_at = now()
-     WHERE open_loops.status = 'open'
-        OR EXCLUDED.last_activity_at > open_loops.last_activity_at
+     WHERE (open_loops.status = 'open'
+            OR EXCLUDED.last_activity_at > open_loops.last_activity_at
+            OR open_loops.closed_by = '${MUTE_RECHECK}')
+       AND (open_loops.closed_by IS DISTINCT FROM '${MUTED}'
+            OR open_loops.counterparty_email IS DISTINCT FROM EXCLUDED.counterparty_email)
      RETURNING id, (xmax = 0) AS created`,
     [
       loop.sourceId,
@@ -177,7 +180,9 @@ export async function upsertOpenLoop(
   // The DO UPDATE's WHERE is the manual-close guard: a closed (done/dropped/
   // stale) row only reopens on GENUINELY newer activity. Without it, any
   // re-render of an unchanged thread (label-only history touch, re-extraction
-  // of the same content) would silently revert `gbrain loops done`.
+  // of the same content) would silently revert `gbrain loops done`. #5012: a
+  // loop a mute closed never reopens for the same counterparty while muted,
+  // and one an unmute queued for re-check reopens on the re-check's verdict.
   if (rows.length > 0) {
     return { id: Number(rows[0].id), created: Boolean(rows[0].created), applied: true };
   }
@@ -206,7 +211,11 @@ export async function closeOpenLoop(
   return rows.length > 0 ? normalizeRow(rows[0]) : null;
 }
 
-/** Close every open thread-detector loop for a thread (reply auto-close). */
+/**
+ * Close every open thread-detector loop for a thread (reply auto-close). A
+ * loop an unmute queued for re-check closes the same way: the thread's turn
+ * flipped, so the owner answered it.
+ */
 export async function closeThreadLoops(
   engine: BrainEngine,
   sourceId: string,
@@ -217,7 +226,7 @@ export async function closeThreadLoops(
   const rows = await engine.executeRaw<{ id: number }>(
     `UPDATE open_loops
        SET status = 'done', closed_at = now(), closed_by = $1, updated_at = now()
-     WHERE source_id = $2 AND thread_id = $3 AND status = 'open'
+     WHERE source_id = $2 AND thread_id = $3 AND (status = 'open' OR closed_by = '${MUTE_RECHECK}')
        AND detector = 'deterministic_thread'
        AND ($4::text IS NULL OR loop_type = ANY(string_to_array($4, ',')))
      RETURNING id`,
@@ -298,6 +307,106 @@ export async function markStaleLoops(engine: BrainEngine, sourceId: string): Pro
 
 // ── Suppressions (`gbrain loops mute`) ───────────────────────────────────────
 
+/** #5012: `closed_by` of a reply-owed loop a mute closed (status `dropped`). */
+export const MUTED = 'muted';
+/** #5012: `closed_by` of a muted loop an unmute queued for re-check on the next Gmail sweep. */
+export const MUTE_RECHECK = 'mute_recheck';
+/** #5012: `closed_by` of a muted loop whose re-check found nothing owed, or that has no thread to re-check. */
+export const UNMUTED = 'unmuted';
+
+function suppressionMatch(kind: 'sender' | 'thread', param: string, alias = ''): string {
+  return kind === 'sender' ? `${alias}counterparty_email = ${param}` : `lower(${alias}thread_id) = ${param}`;
+}
+
+/**
+ * #5012: the reply-owed loops a sender or thread mute covers: open
+ * `unanswered_inbound` loops (and ones still queued from an earlier unmute).
+ * `apply` closes them as `dropped` / `muted`; otherwise they are only listed.
+ */
+export async function closeMutedLoops(
+  engine: BrainEngine,
+  sourceId: string,
+  kind: 'sender' | 'thread',
+  value: string,
+  apply: boolean,
+): Promise<number[]> {
+  const where = `source_id = $1 AND loop_type = 'unanswered_inbound' AND ${suppressionMatch(kind, '$2')}
+       AND (status = 'open' OR closed_by = '${MUTE_RECHECK}')`;
+  const rows = apply
+    ? await engine.executeRaw<{ id: number }>(
+      `UPDATE open_loops SET status = 'dropped', closed_at = now(), closed_by = '${MUTED}', updated_at = now()
+        WHERE ${where} RETURNING id`, [sourceId, value.toLowerCase()])
+    : await engine.executeRaw<{ id: number }>(`SELECT id FROM open_loops WHERE ${where} ORDER BY id`, [sourceId, value.toLowerCase()]);
+  return rows.map((r) => Number(r.id)).sort((a, b) => a - b);
+}
+
+/**
+ * #5012: the loops an unmute hands back to detection: those this mute closed
+ * that no remaining suppression still covers. Loops on a thread are queued
+ * for re-check (`mute_recheck`): the next Gmail sweep re-fetches the thread
+ * and reopens a loop only when nothing answered it since. A loop without a
+ * thread cannot be re-checked and stays closed (`unmuted`). Manual closes are
+ * never touched. Without `apply` the loops are only listed.
+ */
+export async function requeueMutedLoops(
+  engine: BrainEngine,
+  sourceId: string,
+  kind: 'sender' | 'thread',
+  value: string,
+  apply: boolean,
+): Promise<{ requeued: number[]; unverifiable: number[] }> {
+  const rows = await engine.executeRaw<{ id: number; thread_id: string | null }>(
+    `${apply ? `UPDATE open_loops l SET closed_by = CASE WHEN l.thread_id IS NULL THEN '${UNMUTED}' ELSE '${MUTE_RECHECK}' END, updated_at = now()`
+      : 'SELECT l.id, l.thread_id FROM open_loops l'}
+      WHERE l.source_id = $1 AND l.closed_by = '${MUTED}' AND ${suppressionMatch(kind, '$3', 'l.')}
+        AND NOT EXISTS (SELECT 1 FROM loop_suppressions s
+                         WHERE s.source_id = l.source_id AND NOT (s.kind = $2 AND s.value = $3)
+                           AND ((s.kind = 'thread' AND s.value = lower(l.thread_id))
+                             OR (s.kind = 'sender' AND s.value = l.counterparty_email)))
+      ${apply ? 'RETURNING l.id, l.thread_id' : ''}`,
+    [sourceId, kind, value.toLowerCase()],
+  );
+  const ids = (pick: (r: { thread_id: string | null }) => boolean) =>
+    rows.filter(pick).map((r) => Number(r.id)).sort((a, b) => a - b);
+  return { requeued: ids((r) => r.thread_id !== null), unverifiable: ids((r) => r.thread_id === null) };
+}
+
+/** #5012: every open reply-owed loop from one sender (`gbrain loops drop sender`), oldest id first. */
+export async function listSenderInboundLoops(
+  engine: BrainEngine,
+  email: string,
+  sourceIds: string[] | null,
+): Promise<Array<{ id: number; source_id: string }>> {
+  const rows = await engine.executeRaw<{ id: number; source_id: string }>(
+    `SELECT id, source_id FROM open_loops
+      WHERE status = 'open' AND loop_type = 'unanswered_inbound' AND counterparty_email = $1
+        AND ($2::text IS NULL OR source_id = ANY(string_to_array($2, ',')))
+      ORDER BY id`,
+    [email.toLowerCase(), sourceIds && sourceIds.length > 0 ? sourceIds.join(',') : null],
+  );
+  return rows.map((r) => ({ id: Number(r.id), source_id: r.source_id }));
+}
+
+/** #5012: a re-checked thread whose verdict neither reopened nor answered its queued loops: they stay closed. */
+export async function settleMuteRecheck(engine: BrainEngine, sourceId: string, threadId: string): Promise<number> {
+  const rows = await engine.executeRaw<{ id: number }>(
+    `UPDATE open_loops SET closed_by = '${UNMUTED}', updated_at = now()
+      WHERE source_id = $1 AND thread_id = $2 AND closed_by = '${MUTE_RECHECK}' RETURNING id`,
+    [sourceId, threadId],
+  );
+  return rows.length;
+}
+
+/** #5012: threads with loops an unmute queued for re-check (the sweep re-fetches each). */
+export async function muteRecheckThreads(engine: BrainEngine, sourceId: string): Promise<Array<{ thread_id: string; page_slug: string | null }>> {
+  return engine.executeRaw<{ thread_id: string; page_slug: string | null }>(
+    `SELECT thread_id, max(page_slug) AS page_slug FROM open_loops
+      WHERE source_id = $1 AND closed_by = '${MUTE_RECHECK}' AND thread_id IS NOT NULL
+      GROUP BY thread_id ORDER BY thread_id`,
+    [sourceId],
+  );
+}
+
 export async function addSuppression(
   engine: BrainEngine,
   sourceId: string,
@@ -343,6 +452,8 @@ export async function removeSuppression(
 export interface SuppressionSet {
   senders: Set<string>;
   threads: Set<string>;
+  /** #5012: threads with loops an unmute queued for re-check. */
+  recheckThreads?: Set<string>;
 }
 
 export async function loadSuppressions(
@@ -359,5 +470,6 @@ export async function loadSuppressions(
     if (r.kind === 'sender') senders.add(r.value);
     else threads.add(r.value);
   }
-  return { senders, threads };
+  const recheckThreads = new Set((await muteRecheckThreads(engine, sourceId)).map((r) => r.thread_id));
+  return { senders, threads, recheckThreads };
 }

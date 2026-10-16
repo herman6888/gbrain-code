@@ -56,7 +56,12 @@ canonical-owner binding.
 The source must have no Git sync commit, external repository, connector, or
 company-ingestion policy. Existing external roots and incomplete or mismatched
 receipts retain the ordinary never-synced/stale checks; managed persistence alone
-does not exempt a source. No `last_sync_at` timestamp is fabricated. The separate
+does not exempt a source. No `last_sync_at` timestamp is fabricated. A dedicated
+skills source is the other exemption: a source holding an adopted skill pack
+(live heads on its current incarnation) whose content is a read-only catalog, with
+no Git commit recorded and, when doctor may read the checkout, no `.git` under
+its root, counts as `read_only_pack_count` in `sync_freshness`. A git-backed pack
+is still judged stale. The separate
 `canonical_content_writes` check reports queued publication and required recovery
 for these roots. Both checks classify ownership from database records; remote
 doctor does not inspect or execute commands against stored filesystem paths.

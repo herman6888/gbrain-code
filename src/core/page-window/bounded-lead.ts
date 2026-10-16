@@ -14,16 +14,26 @@
  * snapshot read (the same overlay readPageSnapshot applies), so a withdrawn
  * world fact never shows in a lead. A page the snapshot read no longer
  * returns, or a snapshot read that fails, gets an empty lead (fail closed:
- * a lead is decoration, so the row stays and only its text is withheld).
+ * a lead is decoration, so the row stays and only its text is withheld). So
+ * does a segmented page whose lead holds a facts fence: its overlay applies
+ * per window (segment reader), not to a snapshot body.
  */
 import type { BrainEngine } from '../engine.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { pageSnapshotKey } from '../page-snapshot-batch.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { BOUNDED_PREFIX_BYTES, boundedProjectedPrefix } from './document.ts';
 
-/** SQL for the bounded raw prefix a fan-out query selects instead of the whole column (fixed column names only). */
-export function boundedPrefixSql(column: string): string {
-  return `left(${column}, ${BOUNDED_PREFIX_BYTES})`;
+/**
+ * SQL for the bounded raw prefix of a page's compiled truth that a fan-out
+ * query selects instead of the whole column (fixed table aliases only). A
+ * segmented page has no `compiled_truth`; its `truth_lead` holds the same raw
+ * prefix, so the sanitize path downstream is unchanged. This is the one
+ * sanctioned COALESCE of the body column (scripts/check-page-body-readers.ts
+ * allows it by name).
+ */
+export function boundedBodyPrefixSql(alias: string): string {
+  return `left(coalesce(${alias}.compiled_truth, ${alias}.truth_lead), ${BOUNDED_PREFIX_BYTES})`;
 }
 
 /** The first `maxBytes` UTF-8 bytes of a raw body, cut on a code point; nothing is sanitized. */
@@ -59,7 +69,9 @@ export async function overlaidBoundedRows<T extends { slug: string; source_id: s
   try {
     for (let rest = pending; rest.length > 0;) {
       const batch = await engine.readPageSnapshotsBatch(rest);
-      for (const [key, snapshot] of batch.snapshots) overlaid.set(key, boundedRawPrefix(snapshot.page.compiled_truth));
+      for (const [key, snapshot] of batch.snapshots) {
+        if (!isSegmentedPage(snapshot.page)) overlaid.set(key, boundedRawPrefix(snapshot.page.compiled_truth));
+      }
       rest = rest.slice(Math.max(1, batch.covered));
     }
   } catch {

@@ -15,6 +15,8 @@ import { quarantineRestoredExecution, rebaseRestorePath, relativeBackupPath, typ
 import { quarantineSharedSkillRestore, validateSharedSkillRestoreMode, type SharedSkillRestore, type SharedSkillRestoreOptions } from '../shared-skills/restore.ts';
 import { isPhysicalRootMetadata } from '../persistence/physical-root-record.ts';
 import { protectNewBackupPath } from './private-path.ts';
+import { PURGE_MIRROR_FILE, readPurgeMirror, replayPurgesInRestore, type PurgeReplayResult } from '../belief/purge-mirror.ts';
+import { pgliteBackupPreflight } from './preflight.ts';
 
 interface SourceInventory { id: string; local_path: string | null; managed_relative_path: string | null }
 interface BackupMetadata {
@@ -137,9 +139,13 @@ export async function createPgliteBackup(options: { output: string; root?: strin
     throw new AgentInstallError('pglite_required', 'Full local snapshots require an existing file-configured PGLite brain.');
   }
   const dbPath = state.config.database_path;
-  if (typeof dbPath !== 'string' || resolve(dbPath) !== join(root, '.gbrain', 'brain.pglite') || !existsSync(dbPath)) {
+  if (typeof dbPath !== 'string' || !existsSync(dbPath)) {
     throw new AgentInstallError('unmanaged_database_path', 'This recovery format requires .gbrain/brain.pglite within the selected root.');
   }
+  // #6649: refuse a layout or a size this format cannot hold before the lock, the dump and the archive write.
+  const refusal = pgliteBackupPreflight(root, dbPath, () => checkedManagedPaths(root, readInstallReceipt(root)?.managed_paths ?? [])
+    .flatMap(path => walkFiles(root, path)).reduce((sum, path) => sum + lstatSync(confinedPath(root, path)).size, 0));
+  if (refusal) throw refusal;
   confinedPath(root, '.gbrain/brain.pglite');
   const lock = await acquireBootstrapLock(root);
   let work: string | undefined;
@@ -222,7 +228,12 @@ function metadataOf(manifest: ArchiveManifest): BackupMetadata {
   return value;
 }
 
-export async function restorePgliteBackup(options: { archive: string; into: string } & SharedSkillRestoreOptions): Promise<{ root: string; quarantined_jobs: number; reconnect_required: string[]; shared_skills: SharedSkillRestore | null }> {
+/**
+ * `purgeMirror` names a copy of the original brain's purge mirror when its root is gone (default:
+ * `<original_root>/.gbrain/purge-events.jsonl`); the restore replays the purges recorded there after the archive.
+ */
+export async function restorePgliteBackup(options: { archive: string; into: string; purgeMirror?: string } & SharedSkillRestoreOptions): Promise<{ root: string; quarantined_jobs: number;
+  reconnect_required: string[]; shared_skills: SharedSkillRestore | null; purge_replay: PurgeReplayResult }> {
   const mode = validateSharedSkillRestoreMode(options);
   const root = checkedRoot(options.into);
   if (!existsSync(dirname(root))) throw new AgentInstallError('parent_missing', 'Restore parent directory must already exist.');
@@ -266,12 +277,16 @@ export async function restorePgliteBackup(options: { archive: string; into: stri
     let quarantined = 0;
     let execution: RestoreQuarantine;
     let sharedSkills: SharedSkillRestore | null = null;
+    let purgeReplay: PurgeReplayResult = { state: 'none', replays: [] };
     await engine.transaction(async tx => {
       sharedSkills = await quarantineSharedSkillRestore(tx, restoreId, options);
       await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
       execution = await quarantineRestoredExecution(tx, { sources: metadata.sources, originalRoot: metadata.original_root, root, managedPaths: metadata.managed_paths, restoreId });
       const jobs = await tx.executeRaw<{ id: number }>(`UPDATE minion_jobs SET status = 'cancelled', lock_token = NULL, lock_until = NULL, finished_at = NOW(), updated_at = NOW(), error_text = 'quarantined by backup restore; inspect and explicitly resubmit', data = data || jsonb_build_object('__restore_previous_status', status, '__restore_id', $1::text) WHERE status NOT IN ('completed', 'failed', 'dead', 'cancelled') RETURNING id`, [restoreId]);
       quarantined = jobs.length;
+      // W1 (BELIEF_LEDGER.md 8): purges made after the archive are replayed before the root is published; coverage.restored names the archive time.
+      purgeReplay = await replayPurgesInRestore(tx, { lines: readPurgeMirror(options.purgeMirror ?? join(metadata.original_root, '.gbrain', PURGE_MIRROR_FILE)),
+        archivedAt: metadata.created_at, restoreId });
     });
     // #6696 (A1): the restore failed every pending effect; their requests give back their unused reservations.
     await trueUpRequests(engine, (await engine.executeRaw<{ request_id: string }>(
@@ -325,11 +340,14 @@ export async function restorePgliteBackup(options: { archive: string; into: stri
       if (existsSync(join(root, name))) throw new AgentInstallError('restore_collision', 'New content appeared in the reserved restore root.');
       renameSync(join(restored, name), join(root, name));
     }
-    const reconnect = [...new Set([...metadata.credential_references.map(key => `Configure credential: ${key}`), ...metadata.omitted, ...detachedConfig, ...execution!.reconnect, 'Autopilot is paused; review .gbrain/restore-detached.json before explicitly resuming automation.'])];
-    privateWrite(receiptPath, JSON.stringify({ format_version: 1, restore_id: restoreId, state: 'ready', original_root: metadata.original_root, shared_skills: sharedSkills, quarantined_jobs: quarantined, reconnect_required: reconnect, launcher_ready: false, setup_required: true, native_automation_started: false }, null, 2) + '\n');
+    const replayWarning = purgeReplay.state === 'none' || purgeReplay.state === 'complete' ? [] : [purgeReplay.state === 'unavailable'
+      ? `Purges made after the archive (${metadata.created_at}) were not replayed: no purge mirror could be read under ${metadata.original_root}. Restore again into a new root with the original brain's .gbrain/${PURGE_MIRROR_FILE} in place, or name a copy of it with gbrain backup restore --purge-mirror <absolute path>; otherwise purge the content again.`
+      : `Purge replay is ${purgeReplay.state} for request(s) ${purgeReplay.replays.filter(r => r.outcome !== 'complete').map(r => `${r.request_id} (${r.outcome})`).join(', ')}: review them and run those purges again if the content is still present.`];
+    const reconnect = [...new Set([...metadata.credential_references.map(key => `Configure credential: ${key}`), ...metadata.omitted, ...detachedConfig, ...execution!.reconnect, ...replayWarning, 'Autopilot is paused; review .gbrain/restore-detached.json before explicitly resuming automation.'])];
+    privateWrite(receiptPath, JSON.stringify({ format_version: 1, restore_id: restoreId, state: 'ready', original_root: metadata.original_root, shared_skills: sharedSkills, quarantined_jobs: quarantined, reconnect_required: reconnect, purge_replay: purgeReplay, launcher_ready: false, setup_required: true, native_automation_started: false }, null, 2) + '\n');
     syncDirectory(root);
     published = true;
-    return { root, quarantined_jobs: quarantined, reconnect_required: reconnect, shared_skills: sharedSkills };
+    return { root, quarantined_jobs: quarantined, reconnect_required: reconnect, shared_skills: sharedSkills, purge_replay: purgeReplay };
   } catch (error) {
     privateWrite(receiptPath, JSON.stringify({ format_version: 1, restore_id: restoreId, state: 'failed', mode, reason: error instanceof AgentInstallError ? error.code : 'restore_failed', original_preserved: true }) + '\n');
     throw error;

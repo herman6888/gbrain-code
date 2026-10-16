@@ -58,7 +58,7 @@ test('the verifying target of this run inherits the source flag; every other com
       { GBRAIN_GRADUATION_RUN: undefined, GBRAIN_GRADUATION_SOURCE_PERSISTENCE: 'enabled' }]) {
       const check = await freshness(env);
       expect(check.status).toBe('fail');
-      expect(check.message).toContain(`'${sourceId}' has never been synced`);
+      expect(check.message).toContain(`'${sourceId}': no successful sync recorded`);
     }
     for (const row of ["state='verified'", "role='source'"]) {
       await engine.executeRaw(`UPDATE persistence_graduation SET ${row}`);

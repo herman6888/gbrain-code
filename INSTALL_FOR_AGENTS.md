@@ -289,13 +289,13 @@ Estimated downstream input cost of the retrieved payload @ 10K queries/mo:
 >
 >   2) balanced — 12K budget, 25 chunks, reranked.
 >
->   3) tokenmax (recommended with a chat key) — no budget, 50 chunks, reranked,
->      `gbrain query` expands by default. The widest retrieval.
+>   3) tokenmax (recommended with a chat key) — no budget, 50 chunks, reranked.
+>      The widest retrieval.
 >
-> Expansion follows the mode for `gbrain query` only: on in `tokenmax`, off in
-> `balanced` and `conservative`; `--expand` (`expand: true` over MCP) forces it
-> and `--no-expand` (`expand: false`) skips it. `gbrain config set search.expansion false`
-> turns the default off for the brain in any mode. `gbrain search` and the memory
+> `gbrain query` does not expand by default in any mode; `--expand`
+> (`expand: true` over MCP) forces it and `--no-expand` (`expand: false`) skips
+> it. `gbrain config set search.expansion true` turns the default on for the
+> brain in any mode. `gbrain search` and the memory
 > verbs never expand. See [search modes](docs/guides/search-modes.md) for the
 > current contract.
 >

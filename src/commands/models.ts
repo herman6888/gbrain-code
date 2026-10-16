@@ -83,7 +83,7 @@ interface PerTaskModelRoute {
    * chain visible rather than implying full resolveModel() coverage — can
    * never disagree with the resolved value.
    */
-  narrowResolver?: (engine: BrainEngine) => Promise<{ model: string; source: 'config' | 'tier_default' | 'measured'; label?: string }>;
+  narrowResolver?: (engine: BrainEngine) => Promise<{ model: string; source: 'config' | 'tier_config' | 'tier_default' | 'measured'; label?: string }>;
 }
 
 const PER_TASK_KEYS: PerTaskModelRoute[] = [

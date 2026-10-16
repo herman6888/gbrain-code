@@ -2,6 +2,7 @@ import { isAbsolute } from 'node:path';
 import type { SyncOpts } from '../../commands/sync.ts';
 import { opError } from '../ops/contract.ts';
 import { SYNC_PROCESSING_KEYS } from './sync-authority.ts';
+import { WIRE_SKEW_WINDOWS } from '../wire-skew.ts';
 
 export const SYNC_BOOLEAN_FLAGS = {
   '--full':'full','--dry-run':'dryRun','--no-pull':'noPull','--no-embed':'noEmbed','--no-extract':'noExtract',
@@ -25,11 +26,12 @@ export function validateSyncWireParams(value: Record<string,unknown>): SyncWireP
     else if(stringFields.has(key)) { if(typeof item!=='string'||!item||item.length>32768||item.includes('\0'))throw invalid(); }
     else if(['exclude','includeHidden'].includes(key)) {
       if(!Array.isArray(item)||item.length>256||item.some(v=>typeof v!=='string'||!v||v.length>4096||v.includes('\0')))throw invalid();
-    } else if(key==='explicitProcessing') {
+    } else if(key===WIRE_SKEW_WINDOWS.explicitProcessing.field) {
+      // #6712 PR 1: accepted from an older client and ignored until the window in wire-skew.ts closes.
       if(!Array.isArray(item)||new Set(item).size!==item.length||item.some(v=>!(SYNC_PROCESSING_KEYS as readonly unknown[]).includes(v)))throw invalid();
     } else throw invalid();
   }
-  const options=value.options as SyncOpts;
+  const { [WIRE_SKEW_WINDOWS.explicitProcessing.field]: _ignored, ...options } = value.options as SyncOpts & Record<string, unknown>;
   if(options.strategy&&!['markdown','code','auto'].includes(options.strategy))throw invalid();
   return {options:{...options},cwd:value.cwd,timeoutSeconds:value.timeoutSeconds};
 }

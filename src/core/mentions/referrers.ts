@@ -22,6 +22,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { boundedBodyPrefixSql } from '../page-window/bounded-lead.ts';
 import { privateLinkOriginFilterFragment, privatePagesFilterFragment, privatePagesFilterFragmentFast } from '../search/private-visibility.ts';
 import { isIdentityUnionEnabled, listEntityIdentities } from '../entity-identity.ts';
 import { stripTakesFence } from '../takes-fence.ts';
@@ -140,7 +141,7 @@ async function hydrate(engine: BrainEngine, rows: RawRow[], keep: ('private' | '
   if (!rows.length) return [];
   const pages = new Map((await engine.executeRaw<{ id: number; title: string | null; body: string | null; date_source: string;
     trust_tier: string; write_origin: unknown; flagged: boolean; frontmatter: Record<string, unknown> | null }>(
-    `SELECT id, title, left(compiled_truth, 4000) AS body,
+    `SELECT id, title, left(${boundedBodyPrefixSql('pages')}, 4000) AS body,
             CASE WHEN effective_date IS NULL THEN 'updated_at' ELSE COALESCE(effective_date_source, 'effective_date') END AS date_source,
             trust_tier, write_origin, ${activationSuppressedSql('pages', 'pages')} AS flagged, frontmatter
        FROM pages WHERE id = ANY($1::int[])`, [rows.map(r => r.id)])).map(r => [Number(r.id), r]));

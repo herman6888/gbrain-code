@@ -114,7 +114,8 @@ async function failedWrites(engine: BrainEngine, sourceIds: string[], id?: strin
 
 /**
  * #6429: the caller writes this command would still replay, counted per source, operation and refusal reason for
- * doctor's `lost_caller_writes`, plus the refused receipts compaction already emptied (unreplayable). Distinct
+ * doctor's `lost_caller_writes`, plus the refused receipts compaction already emptied (unreplayable) and (#6527) the
+ * retained ones the preview keeps for a reason SQL can decide (`not_replayable`). Distinct
  * intents, so a caller's retry counts its write once; a refused replay attempt is the original write (its rows are
  * dropped and its attempts walked as `disposition` does); a write whose replay or retry committed or whose page was
  * later deleted (for put_page: written again) is not lost. Owner-produced writes are not counted: their producer
@@ -122,14 +123,19 @@ async function failedWrites(engine: BrainEngine, sourceIds: string[], id?: strin
  * doctor runs this on every call.
  */
 export async function lostCallerWrites(engine: BrainEngine, sourceIds: string[]):
-Promise<{ lost: { source_id: string; operation: string; reason: 'source_changed' | 'writer_guard'; count: number }[]; compacted: number }> {
-  type Lost = { id: string; request_id: string; source_id: string; slug: string; operation: string; digest: string; sequence: string; reason: 'source_changed' | 'writer_guard' };
+Promise<{ lost: { source_id: string; operation: string; reason: 'source_changed' | 'writer_guard'; count: number }[]; compacted: number;
+  not_replayable: { unpinned_target: number; revision_superseded: number } }> {
+  type Lost = { id: string; request_id: string; source_id: string; slug: string; operation: string; digest: string; sequence: string; reason: 'source_changed' | 'writer_guard';
+    unpinned: boolean; stale_revision: boolean };
   const caller = `r.operation = ANY($2::text[]) AND NOT (r.operation='put_page' AND r.intent ? 'kind')`;
   const refused = `(${GUARD_REFUSAL} OR ${DRIFT_REFUSAL})`;
   const [rows, [compacted]] = await Promise.all([
     engine.executeRaw<Lost>(
       `SELECT r.id::text, r.request_id::text, r.source_id, r.slug, r.operation, r.digest, r.sequence::text,
-        CASE WHEN r.state='conflict' THEN 'source_changed' ELSE 'writer_guard' END AS reason
+        CASE WHEN r.state='conflict' THEN 'source_changed' ELSE 'writer_guard' END AS reason,
+        (r.operation='remember' AND jsonb_typeof(r.intent->'entity_slug') IS DISTINCT FROM 'string') AS unpinned,
+        (r.operation='put_page' AND jsonb_typeof(r.intent->'expected_revision')='string' AND r.intent->>'expected_revision' IS DISTINCT FROM
+          (SELECT p.knowledge_revision::text FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug AND p.deleted_at IS NULL)) AS stale_revision
       FROM persistence_requests r
       WHERE r.source_id = ANY($1::text[]) AND NOT r.compacted AND r.intent IS NOT NULL AND ${refused} AND ${caller}
       ORDER BY r.sequence`, [sourceIds, REPLAYABLE]),
@@ -140,7 +146,7 @@ Promise<{ lost: { source_id: string; operation: string; reason: 'source_changed'
       WHERE r.source_id = ANY($1::text[]) AND r.compacted AND (${GUARD_REFUSAL} OR ${DRIFT_REFUSAL}) AND r.operation = ANY($2::text[])`,
       [sourceIds, REPLAYABLE.filter(operation => operation !== 'put_page')]),
   ]);
-  if (!rows.length) return { lost: [], compacted: Number(compacted?.count ?? 0) };
+  if (!rows.length) return { lost: [], compacted: Number(compacted?.count ?? 0), not_replayable: { unpinned_target: 0, revision_superseded: 0 } };
   // Attempt rows this command submitted belong to their original (walked below), not to the listing.
   const requestIds = new Set(rows.map(row => row.request_id));
   const replays = new Set<string>();
@@ -179,15 +185,26 @@ Promise<{ lost: { source_id: string; operation: string; reason: 'source_changed'
     }
     pending = next;
   }
+  // #6527: the two classes the preview keeps out of its replay set that SQL decides (as `disposition` does): a remember
+  // whose subject was inferred (entity_slug absent or not a string) and a put_page whose page moved past the revision
+  // the caller read. The rest (duplicate, still-drifted file) need per-row or filesystem reads; the preview decides.
+  const unpinned = new Set<string>(), stale = new Set<string>();
+  const replayable = lost.filter(row => {
+    if (row.stale_revision) stale.add(`${row.source_id}\0${row.digest}`);
+    else if (row.unpinned) unpinned.add(`${row.source_id}\0${row.digest}`);
+    else return true;
+    return false;
+  });
   const groups = new Map<string, { source_id: string; operation: string; reason: Lost['reason']; digests: Set<string> }>();
-  for (const row of lost) {
+  for (const row of replayable) {
     const key = `${row.source_id}\0${row.operation}\0${row.reason}`;
     const group = groups.get(key) ?? { source_id: row.source_id, operation: row.operation, reason: row.reason, digests: new Set<string>() };
     group.digests.add(row.digest);
     groups.set(key, group);
   }
   const sorted = [...groups.values()].sort((a, b) => a.source_id.localeCompare(b.source_id) || a.operation.localeCompare(b.operation) || a.reason.localeCompare(b.reason));
-  return { lost: sorted.map(group => ({ source_id: group.source_id, operation: group.operation, reason: group.reason, count: group.digests.size })), compacted: Number(compacted?.count ?? 0) };
+  return { lost: sorted.map(group => ({ source_id: group.source_id, operation: group.operation, reason: group.reason, count: group.digests.size })), compacted: Number(compacted?.count ?? 0),
+    not_replayable: { unpinned_target: unpinned.size, revision_superseded: stale.size } };
 }
 
 async function pageRevision(engine: BrainEngine, sourceId: string, slug: string): Promise<string | null> {
@@ -310,7 +327,8 @@ export const failedWritesRepair: RepairHandler = {
         replay: replay.map(write => ({ id: write.id, digest: write.digest, revision: write.revision })) });
       if (replay.length) await saveApprovedSet<ApprovedWrite>(engine, { command: 'failed-writes', hash }, replay);
       return { items: replay.map((write, index) => item(write, hash, index === replay.length - 1)), preview_hash: hash, residuals, listing,
-        warnings: [...producers].map(([what, run]) => `${what}: produced by gbrain itself, not replayed here; ${run}`) };
+        warnings: [...[...producers].map(([what, run]) => `${what}: produced by gbrain itself, not replayed here; ${run}`),
+          ...(replay.length ? [`This preview recorded an approval checkpoint for its replay set (preview ${hash.slice(0, 12)}), which --apply --expect reads; no page content changed.`] : [])] };
     }
     if (!opts.expect) {
       throw new OperationError('invalid_params', 'gbrain repair failed-writes --apply replays only the set a preview printed.',

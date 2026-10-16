@@ -10,6 +10,7 @@
  * A Markdown-only clone does not carry DB-only withdrawal records.
  */
 
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
@@ -20,8 +21,10 @@ import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fen
 import { parseMarkdown } from '../markdown.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { contentHash } from '../utils.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { recordFactWithdrawal } from './withdrawal.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { markBeliefCommits } from '../belief/append.ts';
 import { withdrawnFact } from './withdrawal-overlay.ts';
 
 export interface ForgetFactResult {
@@ -167,7 +170,11 @@ export async function forgetFactInFence(
     await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET valid_until = LEAST(COALESCE(valid_until, now()), now()), expired_at = now()
       WHERE id = $1 AND expired_at IS NULL`, [factId]));
   } else {
-    await maintenanceTransaction(engine, tx => recordFactWithdrawal(tx, factId, row.source_id, opts.worldOnly === true));
+    // W1 #6783 §5.1: the withdrawal's ledger publication is marked committed once its transaction commits.
+    const publicationId = randomUUID();
+    const beliefReport = { appended: 0 };
+    await maintenanceTransaction(engine, tx => recordFactWithdrawal(tx, factId, row.source_id, opts.worldOnly === true, { publicationId, beliefReport }));
+    if (beliefReport.appended) await markBeliefCommits(engine, [publicationId]).catch(() => undefined);
   }
 
   if (row.expired_at !== null) {
@@ -181,6 +188,7 @@ export async function forgetFactInFence(
     const slug = row.source_markdown_slug;
     const page = await engine.getPage(slug, { sourceId: row.source_id });
     if (!page) return;
+    assertInlineBody(page, 'forget fence strike');
     const struck = strikeFenceRow(page.compiled_truth ?? '', row.row_num, strike);
     if (struck === null) return;
     // The FILE was not rewritten on this tier, so the row must NOT keep the
@@ -290,6 +298,7 @@ export async function forgetFactInFence(
         const reparsed = parseMarkdown(tmpBody, `${slug}.md`);
         const page = await engine.getPage(slug, { sourceId: row.source_id });
         if (page) {
+          assertInlineBody(page, 'forget fence mirror');
           await maintenanceTransaction(engine, tx => tx.refreshPageBody(slug, row.source_id,
             sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
             page.content_hash || contentHash(page)));

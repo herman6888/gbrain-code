@@ -14,13 +14,15 @@
  * Seams: none (the fault hook stays uninstalled); PGLite.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { descriptor, executeOp, parseDescriptor, SessionDrops } from '../scripts/persistence/ops.ts';
 import { ReferenceModel } from '../scripts/persistence/model.ts';
 import { crossBoundarySequences, pageBody, randomSchedule } from '../scripts/persistence/generator.ts';
-import { ROBOT_TOPOLOGY, restrict } from '../scripts/persistence/robot-driver.ts';
+import { FULL_ROBOT_SECONDS, ROBOT_TOPOLOGY, restrict, runRobotPhase, type RobotRun } from '../scripts/persistence/robot-driver.ts';
+import { robotFailure, robotFullGate, runValidation, spawnWorker } from '../scripts/persistence/validate.ts';
+import { faultPoint, installFaultHook, type FaultDetail, type FaultPoint } from '../src/core/persistence/fault-points.ts';
 import { shrinkRun } from '../scripts/persistence/shrink.ts';
 import { runSchedule, runSteps } from '../scripts/persistence/crash-robot.ts';
 import { installLockOrderTrace, lockOrderReport } from '../scripts/persistence/lock-order.ts';
@@ -290,4 +292,156 @@ describe('PGLite releases claims a dead owner left behind', () => {
       expect(row).toEqual({ state: 'queued', token: null });
     });
   }, 60_000);
+});
+
+describe('requested faults are reported, never silently skipped (#6584)', () => {
+  const replayRun = (fault: { point: FaultPoint; nth: number }): RobotRun =>
+    ({ schedule: 'caller_bound_replay', seed: 5105, length: 0, fault, crashed: false, violations: [], duration_ms: 0 });
+  function fakeSpawn(script: Record<string, Record<string, unknown>>[]) {
+    const spawned: { role: string; killed: boolean }[] = [];
+    const spawn = ((_path: string, _home: string, _mode: string, [role]: string[]) => {
+      const events = script[spawned.length] ?? {}; const entry = { role, killed: false }; spawned.push(entry);
+      const event = (name: string) => name in events ? Promise.resolve({ event: name, ...events[name] }) : new Promise<never>(() => {});
+      return { child: { pid: 0 }, event, done: () => event('done'), failureDiagnostics: () => [], async kill() { entry.killed = true; } };
+    }) as unknown as typeof spawnWorker;
+    return { spawn, spawned };
+  }
+  async function phase(spawn: typeof spawnWorker, fault: { point: FaultPoint; nth: number }) {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-fake-'));
+    try {
+      return await runRobotPhase({ engine: 'pglite', seed: 0, seconds: 0, scratch, home: scratch, databases: [],
+        spawn, track: () => {}, replay: [replayRun(fault)], log: () => {} });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  }
+  const clean = { result: { violations: [], deferred: [] } };
+
+  test('faultPoint hands the hook a Postgres bigserial effect id as its decimal string', async () => {
+    const seen: FaultDetail[] = [];
+    installFaultHook((_point, detail) => { seen.push(detail); });
+    try { await faultPoint('effect:git:mid', { effectId: 9007199254740993n, requestId: 'r1' }); }
+    finally { installFaultHook(undefined); }
+    expect(seen).toEqual([{ effectId: '9007199254740993', requestId: 'r1' }]);
+  });
+
+  async function hookChild(detail: string) {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-hook-'));
+    const path = join(dir, 'hook.ts');
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+installFaultHook(robotFaultHook({ point: 'effect:git:mid', nth: 2 }));
+await faultPoint('effect:git:mid', { effectId: 41n });
+${detail}
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const lines: Record<string, unknown>[] = [];
+    try {
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (!lines.length && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      await Bun.sleep(500);
+      return { lines, alive: child.exitCode === null, stderr: child.exitCode === null ? '' : await new Response(child.stderr).text() };
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  test('the run hook freezes at the requested seam with a BigInt effect id and reports it', async () => {
+    const { lines, alive, stderr } = await hookChild(`await faultPoint('effect:git:mid', { effectId: 42n, requestId: 'r1' });`);
+    expect({ lines, alive, stderr }).toEqual({ lines: [{ event: 'fault', point: 'effect:git:mid', nth: 2, detail: { effectId: '42', requestId: 'r1' } }], alive: true, stderr: '' });
+  }, 90_000);
+
+  test('a re-run preparation of the same request does not advance nth: count and run agree', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-prep-'));
+    const path = join(dir, 'prep.ts');
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook, seamCounter } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+const counted = seamCounter(); const counts: Record<string, number> = {};
+installFaultHook((point, detail) => { if (counted(point, detail)) counts[point] = (counts[point] ?? 0) + 1; });
+for (const requestId of ['a', 'a', 'b', 'b', 'b']) await faultPoint('consumer:preparing', { requestId });
+for (const requestId of ['a', 'a']) await faultPoint('publication:after_commit', { requestId });
+process.stdout.write(JSON.stringify({ event: 'counts', counts }) + '\\n');
+installFaultHook(robotFaultHook({ point: 'consumer:preparing', nth: 2 }));
+await faultPoint('consumer:preparing', { requestId: 'a' });
+await faultPoint('consumer:preparing', { requestId: 'a' });
+await faultPoint('consumer:preparing', { requestId: 'b' });
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const lines: Record<string, unknown>[] = [];
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (lines.length < 2 && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      expect(lines).toEqual([
+        { event: 'counts', counts: { 'consumer:preparing': 2, 'publication:after_commit': 2 } },
+        { event: 'fault', point: 'consumer:preparing', nth: 2, detail: { requestId: 'b' } },
+      ]);
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }, 90_000);
+
+  test('a hook that cannot report its fault emits fault_hook_error and still freezes', async () => {
+    const { lines, alive } = await hookChild(`const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
+await faultPoint('effect:git:mid', { requestId: 'r1', signal: cyclic as never });`);
+    expect(alive).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ event: 'fault_hook_error', point: 'effect:git:mid', nth: 2 });
+    expect(String(lines[0].message)).toMatch(/cyclic|circular/i);
+  }, 90_000);
+
+  test('a worker that finishes before its requested fault fails the run and the full gate', async () => {
+    const { spawn, spawned } = fakeSpawn([{ done: clean }]);
+    const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
+    expect(spawned.map(s => s.role)).toEqual(['run']);
+    expect(robot.runs[0]).toMatchObject({ crashed: false, fault_not_reached: true });
+    expect({ crashed: robot.crashed_runs, unreached: robot.faults_not_reached.length, failing: robot.failing_runs.length })
+      .toEqual({ crashed: 0, unreached: 1, failing: 1 });
+    expect(robotFullGate(robot, FULL_ROBOT_SECONDS)).toBe(false);
+    expect(robotFailure(robot.failing_runs, { engine: 'pglite' })).toContain('fault_not_reached');
+  });
+
+  test('a fault_hook_error kills the worker and fails the run and the full gate', async () => {
+    const { spawn, spawned } = fakeSpawn([{ fault_hook_error: { point: 'effect:git:mid', nth: 1, message: 'JSON.stringify cannot serialize BigInt.' } }]);
+    const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
+    expect(spawned).toEqual([{ role: 'run', killed: true }]);
+    expect(robot.fault_hook_errors.map(r => r.hook_error)).toEqual(['JSON.stringify cannot serialize BigInt.']);
+    expect(robot.failing_runs).toHaveLength(1);
+    expect(robotFullGate(robot, FULL_ROBOT_SECONDS)).toBe(false);
+    expect(robotFailure(robot.failing_runs, { engine: 'pglite' })).toContain('fault_hook_error: JSON.stringify cannot serialize BigInt.');
+  });
+
+  test('control: a reached fault that recovers cleanly keeps the full gate', async () => {
+    const { spawn, spawned } = fakeSpawn([{ fault: { point: 'effect:git:mid', nth: 1 } }, { done: clean }]);
+    const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
+    expect(spawned).toEqual([{ role: 'run', killed: true }, { role: 'recover', killed: false }]);
+    expect({ crashed: robot.crashed_runs, failing: robot.failing_runs.length }).toEqual({ crashed: 1, failing: 0 });
+    expect(robotFullGate(robot, FULL_ROBOT_SECONDS)).toBe(true);
+  });
+
+  test('validation exits nonzero when a replayed fault is never reached by a real worker', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-unreached-'));
+    try {
+      const manifest = join(dir, 'manifest.json');
+      writeFileSync(manifest, JSON.stringify({ engine: 'pglite', robot: { runs: [replayRun({ point: 'effect:git:mid', nth: 9999 })] } }));
+      const out = join(dir, 'out.json');
+      const error = await runValidation({ engine: 'pglite', replay: manifest, manifest: out }).then(() => null, (e: Error) => e);
+      expect(error?.message).toContain('fault_not_reached');
+      expect(JSON.parse(readFileSync(out, 'utf8'))).toMatchObject({ status: 'failed', full_gate: false });
+      rmSync(JSON.parse(readFileSync(`${out}.retained.json`, 'utf8')).scratch_root, { recursive: true, force: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
 });

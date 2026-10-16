@@ -22,6 +22,8 @@ import { isValidSourceId } from './source-id.ts';
 import { isDatedTimelineLine, parseInlineCitationTimelineEntries, TIMELINE_LINE_RE, TIMELINE_LINE_RE_CN } from './timeline-citations.ts';
 import { isMaterializedMarkerLine } from './timeline-marker.ts';
 import { slugifyPath, slugifySegment } from './sync.ts';
+import { exactSlugCandidates } from './exact-slug-candidates.ts';
+export { EXACT_SLUG_SHAPE_RE, exactSlugCandidates } from './exact-slug-candidates.ts';
 import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
 import { foldNonDecomposingLatin } from './latin-fold.ts';
 import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
@@ -1774,29 +1776,23 @@ export function makeResolver(
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
-      // Step 1: already a slug? Try an exact page lookup for any slug-shaped
-      // value (contains '/', slug charset). Broadened beyond the original
-      // single-segment lowercase-leading form (`^[a-z][a-z0-9-]*\/[a-z0-9]...`)
-      // to also accept digit-leading folders (`90-people/nicolai`,
-      // `01-trading/...`) and nested paths (`a/b/c`) — common in PARA-numbered
-      // vaults. This is an EXACT getPage match only — no fuzzy — so it never
-      // produces a false positive; a non-existent slug just falls through to
-      // the steps below. Fixes frontmatter `related: [[dir/slug]]` values
-      // (unwrapped by unwrapWikilink) that name a real page the strict regex
-      // could not reach and whose full-path fuzzy score is below threshold.
-      if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
+      // Step 1: a path-shaped value names its page exactly. Try each exact
+      // candidate (the value itself when slug-shaped, then the slug sync
+      // mints for that path), then a rename alias. Exact lookups only, so a
+      // miss falls through to the steps below and never invents an edge.
+      for (const candidate of exactSlugCandidates(trimmed)) {
         // Same source scope as the basename index above (#972): a wikilink in
         // source A must not resolve to a same-slug page in source B.
-        const page = await engine.getPage(trimmed, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+        const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
         if (page) {
-          cache.set(cacheKey, trimmed);
-          return trimmed;
+          cache.set(cacheKey, candidate);
+          return candidate;
         }
         // A renamed page leaves `old -> new` in slug_aliases; links written
         // against the old slug keep resolving to the page that moved.
         if (typeof engine.resolveSlugWithAlias === 'function') {
-          const canonical = await engine.resolveSlugWithAlias(trimmed, opts.sourceId ?? 'default');
-          if (canonical !== trimmed && await engine.getPage(canonical, { sourceId: opts.sourceId ?? 'default' })) {
+          const canonical = await engine.resolveSlugWithAlias(candidate, opts.sourceId ?? 'default');
+          if (canonical !== candidate && await engine.getPage(canonical, { sourceId: opts.sourceId ?? 'default' })) {
             cache.set(cacheKey, canonical);
             return canonical;
           }
@@ -2120,7 +2116,7 @@ export function findTimelineSourceDelimiter(text: string): number {
 // pass skips the lines they read.
 
 // `### YYYY-MM-DD — summary` headings, as the FS extractor (timeline-extract.ts Format 2) accepts.
-const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
+export const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
 
 /**
  * Parse timeline entries from content. Looks at:

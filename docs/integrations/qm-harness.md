@@ -87,10 +87,10 @@ boundary, and it does not make every side effect prefix-clean:
   page content. Unreachable in the layout above (the `agents` source is
   path-less and holds no code pages); it applies only if you point employee
   writes at a code-synced source.
-- **Stored contradiction reports are temporarily local-only.**
-  `find_contradictions` returns stored findings only to trusted local callers
-  without a source filter. Harness clients receive `{ contradictions: [], note }`
-  with an availability note. Other brain-wide read ops (`get_recent_salience`,
+- **Stored contradiction findings are filtered per caller.**
+  `find_contradictions` returns a harness client only the findings whose two
+  sides it can read in its grant, re-read live with `source_id` and
+  `trust_tier`; stored report text never leaves. Other brain-wide read ops (`get_recent_salience`,
   `find_anomalies`, and `sources_list`/`sources_status`) honor the federated
   grant; `sources_status` answers `not_found` for an out-of-grant ID.
 - **Reads touch `last_retrieved_at`** (in `page_retrievals`) on the pages they return, including

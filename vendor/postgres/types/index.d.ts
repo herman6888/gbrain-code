@@ -770,6 +770,7 @@ declare namespace postgres {
 
   interface TransactionSql<TTypes extends Record<string, unknown> = {}> extends ISql<TTypes>  {
     discard(): void;
+    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
     savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
     savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
 
@@ -778,6 +779,7 @@ declare namespace postgres {
 
   interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
     discard(): void;
+    cancelAndDiscard(options?: { timeout?: number }): Promise<void>;
     release(): void;
   }
 }

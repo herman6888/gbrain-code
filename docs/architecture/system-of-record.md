@@ -96,6 +96,7 @@ also contain knowledge absent from canonical files and must be backed up.
 | `config` (some keys) | Site-local routing config (e.g. `sync.repo_path`). |
 | Withdrawal ledger and page overlays | Authoritative withdrawal decisions must survive stale imports and owner downtime. Markdown mirrors can lag. |
 | Mutation journal, receipts, outbox, ownership and local registrations | Durable replay identity, publication recovery and authorization cannot be rebuilt from Markdown. |
+| Belief ledger (`belief_events`, `belief_page_lifetimes`, `belief_commit_marks`, `belief_redactions`, `belief_retier_manifest`) | What the brain had recorded, and when. Markdown holds only the current state, so the history cannot be rebuilt from it; a rebuild from Markdown starts a new, empty history. See [BELIEF_LEDGER.md](../designs/BELIEF_LEDGER.md). |
 
 A new derived table that holds user-knowledge MUST land FS-first.
 If you're tempted to add one as "DB-only for now," the structural
@@ -197,6 +198,15 @@ start `unrecorded`; version history is not copied).
   (`local_cli`), else this host's identity (`application`, `host:<id>`), else
   `host:unregistered`: attribution never creates an identity file. No direct
   writer is left unattributed.
+- **Belief ledger on unmanaged brains:** three of these writers record their
+  belief changes as `unmanaged` events when their source has the ledger on
+  (`src/core/belief/projection-point.ts`): the legacy import, the cycle's
+  `extract_facts` fence reconcile and the takes reextract, plus the derived
+  link writers (extract, the remote auto-links effect and attendance repair)
+  on any brain. Every other writer above changes beliefs unrecorded, so an
+  unmanaged source's history is never certified; the drift check in
+  `gbrain doctor` and the cycle's extract phase find those changes and append
+  `reconcile` events.
 
 Agents: treat `NULL` attribution on an unmanaged brain as "written before
 attribution existed, or before `gbrain extract`, meeting timeline extraction
@@ -251,11 +261,12 @@ or a physical projection that leaves attribution untouched):
 - `src/core/minions/handlers/ingest-capture.ts` (1): the capture ingest tombstone soft delete runs in `maintenanceTransaction`.
 - `src/core/ops/extraction.ts` (2): extraction review promote (frontmatter) and reject (soft delete) each run in `maintenanceTransaction`.
 - `src/core/output/writer.ts` (4): `BrainWriter.transaction` is a `maintenanceTransaction`, so its pages and timeline rows carry the maintenance principal.
+- `src/core/page-body/streamed-import.ts` (1): the streamed segmented import's pre-replace version snapshot runs in its `maintenanceTransaction`.
 - `src/core/page-state/materialize.ts` (1): coordinated maintenance.
 - `src/core/page-state/rename-alias.ts` (5): the fact slug rewrite runs inside its caller's `updateSlug` transaction, and `movePageIdReferences` (#5431: page_versions, timeline_entries and links moved to the row that materialized under a fallback rename) runs inside `carryRenameIdentity`'s `maintenanceTransaction`; every caller is attributed.
-- `src/core/page-state/versions.ts` (1): `createVersion` itself; the caller's scope supplies the actor.
+- `src/core/page-state/versions.ts` (2): `createVersion` itself and its segmented-page twin; the caller's scope supplies the actor.
 - `src/core/persistence/atom-maintenance.ts` (1): request preparer.
-- `src/core/persistence/canonical-projections.ts` (7): fence projection inside the request's publication.
+- `src/core/persistence/canonical-projections.ts` (8): fence projection inside the request's publication.
 - `src/core/persistence/connector-google-receipts.ts` (2): request preparer.
 - `src/core/persistence/connector-sync.ts` (2): connector publication inside `withCoordinatedWrite`.
 - `src/core/persistence/derived-facts.ts` (1): the gated conversation fact insert (`insertDerivedFacts`) on unmanaged brains, in `writeDerivedFacts`' `maintenanceTransaction` at the page's derived tier.
@@ -267,7 +278,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/persistence/memory-mutations.ts` (1): `forget` inside its request's coordinated write.
 - `src/core/persistence/memory-prepare.ts` (3): `remember` request preparer.
 - `src/core/persistence/page-prepare.ts` (6): page request preparer.
-- `src/core/persistence/prepared-maintenance.ts` (4): managed maintenance request preparer.
+- `src/core/persistence/prepared-maintenance.ts` (3): managed maintenance request preparer.
 - `src/core/persistence/semantic-pages.ts` (1): `add_timeline_entry` request preparer.
 - `src/core/persistence/sync-image.ts` (2): managed sync image request preparer; a Git rename retires the old page inside the same publication.
 - `src/core/persistence/sync-prepare.ts` (4): managed sync request preparer.
@@ -291,6 +302,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/timeline-dedup-repair.ts` (1): runs only from schema migration v139, before migration v193 adds the attribution columns, so it has no actor to record.
 - `src/core/timeline-write-through.ts` (2): the timeline write-through's page row splice and entry insert run in one `maintenanceTransaction`.
 - `src/core/trust/fence-guard.ts` (2): the guarded fence re-projection detaches or moves higher-tier fact rows inside the page's coordinated publication.
+- `src/core/trust/held-removals.ts` (1): an owner accept of a held take or timeline removal re-projects the row as the page says in a coordinated (managed) or attributed (unmanaged) transaction under the page key.
 - `src/core/trust/owner-actions.ts` (1): an owner release inserts the held fact in a coordinated (managed) or attributed (unmanaged) transaction at user_confirmed.
 - `src/core/trust/supersede-handlers.ts` (3): owner accept/undo of a trust proposal re-tiers the new fact (or take) inside the checked supersede's (or takes publication's) transaction.
 <!-- write-attribution-covered:end -->
@@ -353,6 +365,14 @@ memory; history, source material and private backups may remain. Editing a fence
 does not erase the withdrawal ledger or promise physical erasure.
 
 ## Disaster recovery
+
+The belief ledger is DB-only (see the exceptions above). The rebuild below
+keeps it, but every fact, take and link it deletes and re-derives is recorded
+as a change by the next `gbrain doctor --fix` or cycle (`reconcile` events,
+and the slugs stay uncertified for that interval), and dropping the database
+loses the history for good. After a database backup restore, replay the
+purges made after the backup (`gbrain doctor --only belief_ledger_coverage`
+names any restore whose replay was partial, unavailable or unverified).
 
 This example is only for a database whose affected facts, takes, links and
 timeline entries have been verified to exist in canonical files. Before running

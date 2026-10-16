@@ -191,7 +191,17 @@ predate unknown-parameter warnings cannot be detected; upgrade the host first.
 
 The most-used subcommands (run `gbrain sources --help` for the full,
 always-current reference — it also covers `status`, `current`,
-`set-cr-mode`, and the `push`/`pull` durability surface):
+`set-cr-mode`, and the `push`/`pull` durability surface).
+
+Changing the contextual retrieval mode, per source with `gbrain sources
+set-cr-mode <id> <mode>` or brain-wide with `gbrain config set
+search.contextual_retrieval <mode>`, does not restamp existing pages: each
+keeps the mode recorded when it was imported, and the new mode applies to
+pages imported from then on. Both commands print this after the write, with
+`gbrain repair contextual-mode [--source <id>] --apply` for pages that have no
+recorded mode (preview it first without `--apply`; see
+[repair](repair.md)).
+
 
 ```
 gbrain sources add <id> --path <p> [--name <n>] [--federated|--no-federated] [--force]

@@ -254,6 +254,7 @@ brackets are filled in with real values on each surface.
 | `not_yet_happened` | decision | The calendar event has not ended yet; it is picked up automatically after its end time, with no edit needed. | — | — | — |
 | `too_short` | decision | The page body is under 80 characters, too short to hold events. | — | — | — |
 | `dream_generated` | decision | Dream-generated pages are never mined for events. | — | — | — |
+| `page_body_segmented` | decision | The page body is over the 24 MiB single-string ceiling and is stored in segments; extraction reads the whole body as one string, so it skips this page. | — | — | — |
 | `no_write_decision` | discovery | This revision has no recorded write decision (written by an older binary or before this release activated), so only a trusted backfill extracts it. | `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --yes` (preview: `gbrain chronicle-backfill --source <source> --since <YYYY-MM-DD> --limit 50 --dry-run`) | agent | paid |
 | `not_chronicle_shaped` | decision | The page is no longer a meeting, conversation or calendar page, so the events extracted from it were retired. | — | — | — |
 | `already_extracted` | decision | This exact content was already extracted; its events are current, so no new call is made. | — | — | — |

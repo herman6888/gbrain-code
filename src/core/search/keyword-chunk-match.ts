@@ -27,8 +27,9 @@ export function buildKeywordChunkMatch(
   const tsq = tsquery;
   if (!excludePrivate) return { from: 'content_chunks cc', match: `cc.search_vector @@ ${tsq}`, modality: `AND cc.modality = 'text'` };
   return {
+    // chunk-visibility-ok: the outer search statement applies buildVisibilityClause(..., { chunkAlias: 'cc' }) to the generation columns this subquery projects
     from: `(
-          SELECT id, page_id, chunk_index, chunk_text, chunk_source, search_vector, language, symbol_type
+          SELECT id, page_id, chunk_index, chunk_text, chunk_source, search_vector, language, symbol_type, body_generation, retired_generation
           FROM content_chunks
           WHERE search_vector @@ ${tsq} AND modality = 'text'
           OFFSET 0

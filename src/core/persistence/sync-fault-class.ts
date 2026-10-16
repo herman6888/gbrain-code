@@ -48,6 +48,8 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
     escalate: `held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times: the file keeps changing without being committed`, human_reason: 'Someone (or an agent) keeps editing the file without committing it; find out who and commit or restore it.' },
   { code: 'concurrent_write', class: 'page', safe_actions: ['reconcile'], needs_human: true, escalate: 'always: the file and the database page diverge',
     human_reason: 'The Git file and the database page both changed; a person chooses which version wins (gbrain sources reconcile <source> <slug> --preview shows both and writes nothing).' },
+  { code: 'file_drift', class: 'page', safe_actions: ['reconcile'], needs_human: true, escalate: 'always: the page changed in the database since its file was last imported',
+    human_reason: 'The database page moved since sync last imported its file, and importing would replace it; a person chooses which version wins (gbrain repair file-drift --source <source> --slug <slug> --prefer database|file previews it and writes nothing until applied).' },
   { code: 'preparation_stalled', class: 'page', safe_actions: ['retry', 'upgrade'], needs_human: false,
     escalate: `held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times, or writer status names a step that never finishes`, human_reason: 'The write owner cannot finish preparing this file; writer status names the step, fix or report it.' },
   { code: 'invalid_fence', class: 'page', safe_actions: ['repair'], needs_human: false, escalate: 'the fence repair preview offers no plan (a manual reason)', human_reason: 'Edit the facts or takes table the hold names and commit.' },
@@ -65,13 +67,12 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
   { code: 'source_changed', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
   { code: 'cancelled', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same group is cancelled again after a rerun' },
   // #6643: refinements of `cancelled` / `revision_conflict` by the receipt's recorded cause; they take precedence over the code.
-  { code: 'knock_on', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same root request is named again after a rerun',
-    human_reason: 'This page only waited on another page of the same sync; the next sync re-freezes it by itself. Fix the root request the error names.' },
+  // #6712 retired both producers (one page, one fate); the rows render what older builds wrote as superseded.
+  { code: 'knock_on', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'never: superseded; an older gbrain cancelled this page for another page\'s failure and a plain sync re-freezes it' },
   { code: 'run_replaced', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'never: another run of the source superseded this one and covers its pages' },
   { code: 'outside_fence', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always: a request published outside the cursor that admitted it',
     human_reason: 'A sync request was not the entry its cursor held (two drains of one cursor, or a writer defect). gbrain sync status --source <source> --json lists the live cursors; stop the extra drain (pause autopilot with gbrain autopilot pause) and report the fence snapshot the error carries.' },
-  { code: 'knock_on_exhausted', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always: re-freezing did not get past the failing page',
-    human_reason: 'The same page kept being cancelled because an earlier page of the sync never committed. Fix the root request the error names, or raise sync.knock_on_refreeze_limit (per page) or sync.knock_on_run_limit (per sync), then rerun the sync; the per-page count resets when the page commits.' },
+  { code: 'knock_on_exhausted', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'never: superseded; a plain sync resumes the entry an older gbrain stopped on' },
   { code: 'sync_incomplete', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'never: an unfinished cursor resumes with the same command' },
   // Connection class: transport only; the cursor and manifest stand.
   { code: 'connection_lost', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'three reruns in a row end connection_lost (the database is unreachable from this host)' },
@@ -82,6 +83,9 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
     escalate: 'reason lifetime_ids (request ids never free, so only the host raise lifts it), or the pause outlasts a day' },
   { code: 'capacity_paused', class: 'connection', safe_actions: ['retry'], needs_human: false,
     escalate: 'reason lifetime_ids (only the host raise resumes it), or the same pause after the raise' },
+  // #6712 PR 1: another process holds the source's drain lease and is committing; a stalled holder ends drain_stalled instead.
+  { code: 'sync_drain_lease_held', class: 'connection', safe_actions: ['retry'], needs_human: false,
+    escalate: 'never: a holder that stops committing ends the run drain_stalled instead' },
   { code: 'storage_error', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'the same error after a rerun (then it is not a dropped connection)' },
   // #6513: the engine-graduation fence (SQLSTATE 55000) refuses every write until the move finishes; the cursor and manifest stand.
   { code: 'graduation_in_progress', class: 'connection', safe_actions: ['retry'], needs_human: false, escalate: 'gbrain migrate --status --json reports no running move and the fence still refuses' },

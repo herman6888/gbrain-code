@@ -11,7 +11,11 @@
  * times out or already spends more than half the configured bound.
  *
  * It names the knob and its range, says that one canary term is not workload
- * coverage, and never reports a timed-out count as "no matches". Skipped on
+ * coverage, and never reports a timed-out count as "no matches". It also
+ * reads the keyword timeout counter the engine writes once per statement
+ * timeout (`search.keyword_timeout_stats`, postgres-engine/keyword-timeout-cache.ts)
+ * into `details.negative_cache` and, when timeouts were recorded, names them
+ * and the skip TTL in the message. Skipped on
  * PGLite (no statement timeout), below 10,000 chunks (`pg_class.reltuples`)
  * and when the planner has no statistics for the column.
  */
@@ -24,6 +28,13 @@ import {
   KEYWORD_STATEMENT_TIMEOUT_MIN_MS,
   resolveKeywordStatementTimeoutMs,
 } from '../../../core/postgres-engine/keyword-statement-timeout.ts';
+import {
+  KEYWORD_TIMEOUT_NEGATIVE_CACHE_DEFAULT_S,
+  KEYWORD_TIMEOUT_NEGATIVE_CACHE_KEY,
+  KEYWORD_TIMEOUT_STATS_KEY,
+  keywordTimeoutNegativeCacheSeconds,
+  parseKeywordTimeoutStats,
+} from '../../../core/postgres-engine/keyword-timeout-cache.ts';
 import { isStatementTimeoutError } from '../../../core/retry-matcher.ts';
 import { buildKeywordCountStatement } from '../../../core/search/keyword-statement.ts';
 
@@ -102,15 +113,23 @@ export async function keywordPlanCheck(engine: BrainEngine, probe: KeywordPlanPr
     const cfg = await loadConfigWithEngine(engine).catch(() => loadConfig());
     const timeoutMs = resolveKeywordStatementTimeoutMs(cfg?.search?.keyword_statement_timeout_ms, undefined);
     const knob = `${KEYWORD_STATEMENT_TIMEOUT_KEY} = ${timeoutMs} ms (range ${KEYWORD_STATEMENT_TIMEOUT_MIN_MS}-${KEYWORD_STATEMENT_TIMEOUT_MAX_MS})`;
-    const base = { timeout_ms: timeoutMs, canary_timeout_ms: KEYWORD_PLAN_CANARY_TIMEOUT_MS, docs: DOCS };
+    const read = async (key: string) => { try { return await engine.getConfig(key); } catch { return null; } };
+    const stats = parseKeywordTimeoutStats(await read(KEYWORD_TIMEOUT_STATS_KEY));
+    const ttlSeconds = keywordTimeoutNegativeCacheSeconds(await read(KEYWORD_TIMEOUT_NEGATIVE_CACHE_KEY)) ?? KEYWORD_TIMEOUT_NEGATIVE_CACHE_DEFAULT_S;
+    const negativeCache = { ttl_seconds: ttlSeconds, timeouts: stats?.timeouts ?? 0, skips: stats?.skips ?? 0, last_timeout_at: stats?.last_timeout_at ?? null };
+    const recorded = negativeCache.timeouts > 0
+      ? ` Hybrid search's keyword arm hit this bound ${negativeCache.timeouts} time(s) (last ${negativeCache.last_timeout_at ?? 'unknown'}); ${negativeCache.skips} later search(es) skipped the timed-out statement (counted at each timeout write). `
+        + (ttlSeconds > 0 ? `A serving process skips the exact statement that timed out for ${ttlSeconds} s (${KEYWORD_TIMEOUT_NEGATIVE_CACHE_KEY}; 0 turns it off), reporting keyword_arm_failed: skipped_after_timeout.` : `The skip is off (${KEYWORD_TIMEOUT_NEGATIVE_CACHE_KEY} = 0).`)
+      : '';
+    const base = { timeout_ms: timeoutMs, canary_timeout_ms: KEYWORD_PLAN_CANARY_TIMEOUT_MS, docs: DOCS, negative_cache: negativeCache };
     const chunks = await probe.chunkEstimate();
     if (chunks < KEYWORD_PLAN_MIN_CHUNKS) {
-      return { name, status: 'ok', message: `Skipped: fewer than ${KEYWORD_PLAN_MIN_CHUNKS} chunks by the planner's estimate; the keyword statements finish well inside ${knob}.`,
+      return { name, status: 'ok', message: `Skipped: fewer than ${KEYWORD_PLAN_MIN_CHUNKS} chunks by the planner's estimate; the keyword statements finish well inside ${knob}.${recorded}`,
         details: { ...base, outcome: 'skipped', reason: 'small_brain' } };
     }
     const canary = await probe.canary();
     if (!canary) {
-      return { name, status: 'ok', message: `Skipped: the planner has no statistics for content_chunks.search_vector yet (run ANALYZE content_chunks on the brain host, or let the next sync refresh them); the keyword bound is ${knob}.`,
+      return { name, status: 'ok', message: `Skipped: the planner has no statistics for content_chunks.search_vector yet (run ANALYZE content_chunks on the brain host, or let the next sync refresh them); the keyword bound is ${knob}.${recorded}`,
         details: { ...base, outcome: 'skipped', reason: 'no_statistics' } };
     }
     const percent = `${(canary.share * 100).toFixed(1)}%`;
@@ -121,15 +140,15 @@ export async function keywordPlanCheck(engine: BrainEngine, probe: KeywordPlanPr
     if (count.outcome === 'timed_out') {
       return { name, status: 'warn', details: { ...details, outcome: 'canary_timed_out' },
         message: `Keyword search's commonest term "${canary.term}" (about ${percent} of chunks) did not finish a strict page count within ${count.ms} ms, so broad keyword queries on this brain are likely to hit ${knob} and fail open to the vector arm (keyword_arm_failed). `
-          + `A timed-out count is never "no matches". Raising the knob (gbrain config set ${KEYWORD_STATEMENT_TIMEOUT_KEY} <ms>, then restart the serving process) buys time, not a cheaper statement: ranking cost grows with the number of matching chunks (#6495); narrow queries to one source (gbrain search --source-id <id>, MCP source_id). Plan: ${scans.join(', ') || 'unavailable'}. ${coverage}` };
+          + `A timed-out count is never "no matches". Raising the knob (gbrain config set ${KEYWORD_STATEMENT_TIMEOUT_KEY} <ms>, then restart the serving process) buys time, not a cheaper statement: ranking cost grows with the number of matching chunks (#6495); narrow queries to one source (gbrain search --source-id <id>, MCP source_id). Plan: ${scans.join(', ') || 'unavailable'}. ${coverage}${recorded}` };
     }
     if (count.ms > timeoutMs / 2) {
       return { name, status: 'warn', details: { ...details, outcome: 'canary_slow' },
         message: `Keyword search's commonest term "${canary.term}" (about ${percent} of chunks) took ${count.ms} ms for a strict page count, more than half of ${knob}; a slightly broader query or a busier host will hit the bound and fail open to the vector arm (keyword_arm_failed). `
-          + `A timed-out count is never "no matches". Raising the knob (gbrain config set ${KEYWORD_STATEMENT_TIMEOUT_KEY} <ms>, then restart the serving process) buys time, not a cheaper statement (#6495); narrow queries to one source (gbrain search --source-id <id>, MCP source_id). Plan: ${scans.join(', ') || 'unavailable'}. ${coverage}` };
+          + `A timed-out count is never "no matches". Raising the knob (gbrain config set ${KEYWORD_STATEMENT_TIMEOUT_KEY} <ms>, then restart the serving process) buys time, not a cheaper statement (#6495); narrow queries to one source (gbrain search --source-id <id>, MCP source_id). Plan: ${scans.join(', ') || 'unavailable'}. ${coverage}${recorded}` };
     }
     return { name, status: 'ok', details: { ...details, outcome: 'ok' },
-      message: `Keyword search's commonest term "${canary.term}" (about ${percent} of chunks) counted ${count.pages} page(s) in ${count.ms} ms, inside half of ${knob}. Plan: ${scans.join(', ') || 'unavailable'}. ${coverage}` };
+      message: `Keyword search's commonest term "${canary.term}" (about ${percent} of chunks) counted ${count.pages} page(s) in ${count.ms} ms, inside half of ${knob}. Plan: ${scans.join(', ') || 'unavailable'}. ${coverage}${recorded}` };
   } catch (error) {
     return { name, status: 'warn', message: `Keyword plan could not be inspected: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
       details: { health: 'unknown', docs: DOCS } };

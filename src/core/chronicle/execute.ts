@@ -18,6 +18,7 @@ import { recordOnTracker } from '../ai/budget-record.ts';
 import { getCurrentBudgetTracker, withBudgetTracker } from '../ai/gateway.ts';
 import type { ExtractAtomsCostGate } from '../cycle/extract-atoms-cost-gate.ts';
 import type { MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { materializedPage, segmentedOverCeiling } from '../persistence/segmented-apply.ts';
 import { CHRONICLE_DEFAULTS, CHRONICLE_EXTRACTOR_VERSION, type ChronicleLedgerRow } from './contract.ts';
 import type { ChronicleReasonCode } from './reasons.ts';
 import type { ChronicleSettings } from './config.ts';
@@ -175,12 +176,17 @@ export async function executeChronicleRow(ctx: ChronicleExecContext, row: Chroni
     await finish(engine, row, row.attempts, { state: 'skipped', reason: 'no_extract', nextAttemptAt: null });
     return done('skipped', 'no_extract');
   }
+  if (segmentedOverCeiling(snapshot.page)) {
+    await finish(engine, row, row.attempts, { state: 'skipped', reason: 'page_body_segmented', nextAttemptAt: null });
+    return done('skipped', 'page_body_segmented');
+  }
+  const page = await materializedPage(engine, snapshot.page);
   const auto = row.trigger === 'auto';
   const eligible = isChronicleEligible({
-    type: snapshot.page.type, slug: snapshot.page.slug, body: snapshot.page.compiled_truth ?? '',
-    dreamGenerated: snapshot.page.frontmatter?.dream_generated === true,
-    effectiveDate: snapshot.page.effective_date ?? null, effectiveDateSource: snapshot.page.effective_date_source ?? null,
-    frontmatter: snapshot.page.frontmatter ?? null, changedAt: row.decided_at,
+    type: page.type, slug: page.slug, body: page.compiled_truth ?? '',
+    dreamGenerated: page.frontmatter?.dream_generated === true,
+    effectiveDate: page.effective_date ?? null, effectiveDateSource: page.effective_date_source ?? null,
+    frontmatter: page.frontmatter ?? null, changedAt: row.decided_at,
   }, { now, recentDays: auto ? settings.recentDays : null, settleSeconds: auto ? settings.settleSeconds : null });
   if (!eligible.ok) {
     if ('wait' in eligible) {
@@ -193,8 +199,8 @@ export async function executeChronicleRow(ctx: ChronicleExecContext, row: Chroni
     return done('skipped', reason);
   }
 
-  const judgeCtx = chronicleJudgeContext(snapshot.page);
-  const invite = endedInviteProposal(snapshot.page, judgeCtx.attendees, now);
+  const judgeCtx = chronicleJudgeContext(page);
+  const invite = endedInviteProposal(page, judgeCtx.attendees, now);
   if (auto && !invite && !(await reserveChronicleSlot(engine, settings.dailyLimit, { sourceId: row.source_id, pageId: Number(row.page_id), contentHash: row.content_hash }))) {
     await setNextAttempt(engine, row, null);
     return { kind: 'deferred', reason: 'daily_limit' };

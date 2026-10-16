@@ -567,7 +567,7 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
 # runs each question as an agent's stdio MCP call would (remote, stdio, source
 # `default`), at the operation's own default limit and under the brain's resolved
 # search mode, so a receipt reproduces from a tagged gbrain. `query` expands by the
-# mode (on only in tokenmax) unless --op-expand on|off says otherwise. Each row's
+# mode (off by default in all three modes) unless --op-expand on|off says otherwise. Each row's
 # `via_operation` records the context, the `expand` sent, model calls per
 # touchpoint, latency, the CRAG grade and the expansion outcome;
 # run_config.via_operation_summary has the tree, p50/p95 latency and model calls
@@ -1239,7 +1239,11 @@ bun test test/nightly-quality-probe.test.ts
 score for your brain. It answers the 10 committed questions in
 `test/fixtures/longmemeval-nightly.jsonl` from an isolated in-memory
 benchmark brain, with your search mode, reranker and model routes, and has
-three judges grade the answers. A PASS says the retrieval-plus-answer
+three judges grade the answers. It uses the direct reader (`--reader-mode
+direct`, the original terse prompt and 512-token budget), because the judges
+grade directness and the default notes reader's notes and reasoning would be
+graded as the answer (#6627). Standalone `gbrain eval longmemeval` runs keep
+the notes default. A PASS says the retrieval-plus-answer
 pipeline and the judges work end to end tonight; it says nothing about the
 pages in your own brain. The fixture is embedded in the gbrain binary, so
 source checkouts and compiled installs run the same probe.

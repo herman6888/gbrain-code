@@ -234,6 +234,10 @@
         "name": "pglite_scratch_probe"
       },
       {
+        "category": "ops",
+        "name": "ipc_socket_path"
+      },
+      {
         "category": "brain",
         "name": "text_projection_readiness"
       },
@@ -363,7 +367,15 @@
       },
       {
         "category": "brain",
+        "name": "embedding_identity_unqualified"
+      },
+      {
+        "category": "brain",
         "name": "supersession_calibration"
+      },
+      {
+        "category": "brain",
+        "name": "fact_admission_floors"
       },
       {
         "category": "ops",
@@ -484,6 +496,10 @@
       {
         "category": "ops",
         "name": "google_file_modes"
+      },
+      {
+        "category": "ops",
+        "name": "google_calendar_readable"
       },
       {
         "category": "brain",
@@ -635,6 +651,14 @@
       },
       {
         "category": "ops",
+        "name": "embed_backfill_stalled"
+      },
+      {
+        "category": "ops",
+        "name": "connector_account_mismatch"
+      },
+      {
+        "category": "ops",
         "name": "legacy_job_authority"
       },
       {
@@ -771,6 +795,10 @@
       },
       {
         "category": "brain",
+        "name": "belief_ledger_coverage"
+      },
+      {
+        "category": "brain",
         "name": "trust_tiers"
       },
       {
@@ -808,6 +836,10 @@
       {
         "category": "brain",
         "name": "ghost_pages"
+      },
+      {
+        "category": "brain",
+        "name": "missing_recorded_files"
       },
       {
         "category": "brain",

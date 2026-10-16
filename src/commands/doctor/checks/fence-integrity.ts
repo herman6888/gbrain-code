@@ -25,11 +25,17 @@
  * classes, never the claim. Those rows stay active and searchable and
  * nothing is lost, so the finding has no command (`next: report`) and never
  * suggests `forget_fact`; its verify re-counts the rows.
+ *
+ * #6610: it also lists `unbound_legacy_facts`, the unfenced rows of a classic
+ * database-only page that stay unfenced because the source has a checkout but
+ * no canonical owner and `persistence.unbound_write` is not `database_only`;
+ * the fix asks the user about that opt-in.
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { agentFix, doctorVerify } from '../check-fix.ts';
-import { auditUnadoptableFacts, planUnfencedFacts, type UnadoptableFactRecord } from '../../../core/facts/unfenced-facts.ts';
+import { auditUnadoptableFacts, planUnfencedFacts, unboundRefusedSentence, type UnadoptableFactRecord, type UnfencedFactsOutcome } from '../../../core/facts/unfenced-facts.ts';
+import { UNBOUND_SOURCE_DOCS, UNBOUND_WRITE_KEY } from '../../../core/persistence/unbound-source.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { runFenceCensus, summarizeFenceCensus, type SourceCensus, type TierCounts } from '../../../core/fence-repair/census.ts';
 import { readTrend, type TrendEntry } from '../../../core/fence-repair/census-store.ts';
@@ -105,14 +111,17 @@ function modelRepairSentence(caps: { perPageUsd: number; perDayUsd: number }, to
 }
 
 interface UnrenderablePage { source_id: string; slug: string; rows: Array<{ fact_id: number; reason: UnadoptableFactRecord['reason']; class: UnadoptableFactRecord['class'] }> }
-interface UnrenderableLegacyFacts { total: number; complete: boolean; pages: UnrenderablePage[] }
+interface UnrenderableLegacyFacts { total: number; complete: boolean; pages: UnrenderablePage[]; unbound: UnfencedFactsOutcome['unbound_refused'] }
 
 /** Legacy rows the fence step would leave unadopted, planned read-only per source within `deadline`; location only. */
 async function unrenderableLegacyFacts(engine: BrainEngine, sourceIds: string[] | undefined, deadline: number): Promise<UnrenderableLegacyFacts> {
   const byPage = new Map<string, UnrenderablePage>();
   let complete = true;
+  const unbound: UnfencedFactsOutcome['unbound_refused'] = [];
   for (const sourceId of sourceIds ?? [undefined]) {
-    const audit = await auditUnadoptableFacts(engine, await planUnfencedFacts(engine, sourceId === undefined ? {} : { sourceId }), { deadline });
+    const plan = await planUnfencedFacts(engine, sourceId === undefined ? {} : { sourceId });
+    unbound.push(...plan.outcome.unbound_refused);
+    const audit = await auditUnadoptableFacts(engine, plan, { deadline });
     complete &&= audit.complete;
     for (const record of audit.records) {
       const key = `${record.source_id}\0${record.slug}`;
@@ -121,10 +130,10 @@ async function unrenderableLegacyFacts(engine: BrainEngine, sourceIds: string[] 
     }
   }
   const pages = [...byPage.values()];
-  return { total: pages.reduce((sum, page) => sum + page.rows.length, 0), complete, pages };
+  return { total: pages.reduce((sum, page) => sum + page.rows.length, 0), complete, pages, unbound };
 }
 
-function unrenderableSentence(found: UnrenderableLegacyFacts): string {
+function unrenderableSentence(found: Omit<UnrenderableLegacyFacts, 'unbound'>): string {
   const pages = found.pages.slice(0, 5).map(page => `${page.slug} (${page.source_id}): ${[...new Set(page.rows.map(row => row.class))].sort().join(', ')}`).join('; ');
   return `${found.total} legacy fact row(s) on ${found.pages.length} page(s) cannot be adopted into their facts fence: ${pages}${found.pages.length > 5 ? '; …' : ''}. `
     + 'They stay active and searchable and nothing is lost: the fence codec would change their text (or the page already carries the claim), so gbrain leaves them as legacy rows '
@@ -150,7 +159,8 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
   // T2: legacy fence repairs written and imported but not committed yet (counts for a scoped remote caller, paths locally).
   const uncommitted = await readUncommittedFenceRepairs(engine, opts.sourceIds ?? census.map(c => c.source_id)).catch(() => []);
   // The audit's deadline is on the wall clock (it bounds real work; the census's `now` is for dates).
-  const unrenderable = await unrenderableLegacyFacts(engine, opts.sourceIds, Date.now() + timeoutMs).catch((): UnrenderableLegacyFacts => ({ total: 0, complete: false, pages: [] }));
+  const { unbound, ...unrenderable } = await unrenderableLegacyFacts(engine, opts.sourceIds, Date.now() + timeoutMs)
+    .catch((): UnrenderableLegacyFacts => ({ total: 0, complete: false, pages: [], unbound: [] }));
   const details = {
     total, partial: partial.length > 0, partial_sources: partial.map(c => c.source_id), sources: census, trend, warn_at_normalized_7d: FENCE_NORMALIZATION_WARN_7D,
     model_repair: { max_usd_per_page: caps.perPageUsd, max_usd_per_day: caps.perDayUsd, spent_today_usd: today?.committedUsd ?? null, reserved_today_usd: today?.reservedUsd ?? null },
@@ -158,8 +168,9 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
     uncommitted_repairs: uncommitted.length,
     ...(uncommitted.length && !opts.sourceIds ? { uncommitted: uncommitted.map(n => ({ source_id: n.source_id, path: n.path, commit_step: n.commit_step })) } : {}),
     unrenderable_legacy_facts: unrenderable,
+    unbound_legacy_facts: { total: unbound.reduce((sum, page) => sum + page.rows, 0), pages: unbound },
   };
-  if (!total && !partial.length && !noisy.length && !uncommitted.length && !unrenderable.total && unrenderable.complete) {
+  if (!total && !partial.length && !noisy.length && !uncommitted.length && !unrenderable.total && unrenderable.complete && !unbound.length) {
     return { status: 'ok', details, message: census.length ? `No malformed facts or takes fence is held, stored or waiting in a checkout (${census.length} source(s) scanned).` : 'No sources to scan.' };
   }
   const auto = await readFenceAutoRepair(engine, now());
@@ -189,6 +200,7 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
   }
   if (unrenderable.total || !unrenderable.complete) sentences.push(unrenderable.total ? unrenderableSentence(unrenderable)
     : 'The scan for legacy fact rows the fence cannot render did not finish within its time budget; run gbrain doctor --only fence_integrity again.');
+  if (unbound.length) sentences.push(unboundRefusedSentence(unbound));
   const first = waiting[0];
   const fix = first ? sourceFix(first, auto)
     : partial.length || (!unrenderable.total && !unrenderable.complete) ? agentFix(['gbrain', 'doctor', '--only', 'fence_integrity', '--json'], 'Resumes the fence census where the last scan stopped and reports what it found.', 'fence_integrity', { docs: DOCS })
@@ -196,6 +208,10 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
         'fence_integrity', { docs: DOCS })
         : uncommitted.length ? agentFix(['gbrain', 'sources', 'status', uncommitted[0]!.source_id], 'Lists the uncommitted fence repairs of this legacy source with the exact git add and git commit step for each file.',
           'fence_integrity', { docs: DOCS })
+          : unbound.length && !unrenderable.total ? agentFix(['gbrain', 'config', 'set', UNBOUND_WRITE_KEY, 'database_only'],
+            `Allows database-only writes to sources with a checkout but no canonical owner, so the next extract_facts run fences these rows into their database pages. It is brain-wide (every database-only page of such a source stays database-only after binding), so ask the user first.`,
+            'fence_integrity', { ask_user: true, docs: UNBOUND_SOURCE_DOCS,
+              user_message: `Some saved facts sit on database-only pages of an unbound source and are not in those pages' facts tables yet. I can allow database-only writes to unbound sources (gbrain config set ${UNBOUND_WRITE_KEY} database_only) so the next maintenance run adds them; those pages then stay database-only even after the source is bound.` })
           // No command to run: the rows stay as they are, so the fix is a report; verify re-counts them.
           : { consent: [], actor: 'agent' as const, requires_exclusive: false, docs: UNRENDERABLE_DOCS, verify: doctorVerify('fence_integrity'),
             why: `Nothing to run: ${unrenderable.total} legacy fact row(s) stay active and searchable because their text cannot be written into a facts fence unchanged. Tell the user which pages are listed under unrenderable_legacy_facts and report them with the gbrain version; the verify re-counts the rows.` };

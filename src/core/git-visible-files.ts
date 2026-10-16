@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { execFileSync } from 'child_process';
+import { execFileSync } from './spawn.ts';
 import { lstatSync } from 'fs';
 import { join, resolve } from 'path';
 import { gitChildEnv } from './git-env.ts';

@@ -9,7 +9,7 @@ import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
-import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
+import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
 import { sharedOriginExit } from './sync-origin.ts';
 export { fileClaimCandidatesQuery } from './file-claims.ts';
@@ -21,7 +21,7 @@ import { digest, requireUuid, sha256, stableJson } from './digest.ts';
 import { reconcileCanonical, strictReconcileKeys, validateReconcileJson, type ReconcileConflict, type ReconcileDecision } from './reconcile-merge.ts';
 import type { ParsedPage } from '../import-file.ts';
 import type { AutoDecision } from './reconcile-additive.ts';
-import { publishesDatabaseOnly } from './page-prepare.ts';
+import { publishesDatabaseOnly, readCanonicalAsImported } from './page-prepare.ts';
 import { isMirrorOnlyPage } from './mirror-read-only.ts';
 
 export interface ReconcilePins {
@@ -39,6 +39,8 @@ export interface ReconcileArtifact {
 }
 export interface ReconcileState {
   binding: WorktreeBinding; root: string; path: string; raw: Buffer; snapshot: PageSnapshot;
+  /** The path the importer reads the file under (`scannerSourcePath`), for path inference (#6605). */
+  importPath: string;
   storedPage: Record<string, unknown>; file: ParsedPage; pins: ReconcilePins;
   /** `slug_derived`: a database-only page matched to the canonical file at its slug path. */
   origin: 'recorded' | 'slug_derived';
@@ -141,7 +143,10 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
       `Nothing changed. Fix the frontmatter of the canonical file of ${slug} in '${sourceId}' (quote values containing ': ', close the --- block), then preview the page again.`);
   }
   // Preserve a terminal .md in the page key while parsing the canonical Markdown.
-  const parsed = parseMarkdown(text, `${slug}.md`, { validate: true, expectedSlug: slug });
+  const importPath = scannerSourcePath(root, path, mode);
+  const reading = reconcileFileReading(text, importPath, snapshot.page);
+  const parsed = parseMarkdown(reading.content, `${slug}.md`, { validate: true, expectedSlug: slug });
+  if (reading.inferred) parsed.type = snapshot.page.type;
   const errors = parsed.errors?.filter(e => !['MISSING_OPEN', 'MISSING_CLOSE', 'EMPTY_FRONTMATTER'].includes(e.code)) ?? [];
   if (!errors.length && !parsed.errors?.some(e => e.code === 'MISSING_CLOSE') && parsed.slug !== slug) {
     // #5966 (W14 P1.7): a well-formed file whose path derives another slug is a legacy render of a slug the
@@ -158,7 +163,7 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     page_id: snapshot.page.id, worktree_id: binding.worktree_id, binding_digest: digest({ binding, root, path: canonicalPath }), owner_epoch: String(binding.owner_epoch),
     revision: snapshot.revision, raw_file_hash: sha256(raw), relative_path: relative(root, path),
     policy_digest: await reconcilePolicyDigest(engine, sourceId), withdrawals_digest: digest({ withdrawals: snapshot.withdrawals, global_purges: snapshot.globalPurges ?? null }), assessment_at: assessmentAt };
-  return { binding, root, path, raw, snapshot, storedPage, file: reconcileCanonical(parsed, parsed.tags), pins, origin, originSourcePath: derived?.sourcePath ?? null };
+  return { binding, root, path, importPath, raw, snapshot, storedPage, file: reconcileCanonical(parsed, parsed.tags), pins, origin, originSourcePath: derived?.sourcePath ?? null };
 }
 /** #6394: a preview made with --adopt-slug-path recorded a page with no origin; apply and publication adopt the same pinned file. */
 export function reconcilePreviewAdopts(artifact: Pick<ReconcileArtifact, 'preimages'>): boolean {
@@ -224,4 +229,18 @@ export function validateReconcileArtifact(value: unknown): ReconcileArtifact {
   for (const conflict of value.conflicts as unknown[]) strictReconcileKeys(conflict, ['path', 'file', 'database']);
   for (const withdrawal of value.preimages.database.withdrawals as unknown[]) strictReconcileKeys(withdrawal, ['visibility', 'fact_hash', 'withdrawn_at', 'purged'], ['visibility', 'fact_hash', 'withdrawn_at']);
   return JSON.parse(stableJson(value)) as ReconcileArtifact;
+}
+
+/**
+ * #6605: the file side of a reconciliation, read the way the importer stored it. A frontmatter-less file under a
+ * directory-inference rule was imported with the frontmatter its path infers, so its raw bytes would show every
+ * inferred key as a difference. The inferred reading is used when the stored row carries every key it adds (an
+ * inferring import wrote the row); a row imported without inference (`gbrain reindex` on an unmanaged brain) is
+ * compared with the raw bytes. An inferred `type:` is not one the file declared: the caller keeps the stored type.
+ */
+export function reconcileFileReading(text: string, sourcePath: string, stored: { frontmatter?: Record<string, unknown> | null }): { content: string; inferred: boolean } {
+  const reading = readCanonicalAsImported(text, sourcePath);
+  if (!reading.inferred) return reading;
+  const keys = Object.keys(parseMarkdown(reading.content, sourcePath).frontmatter);
+  return keys.every(key => Object.hasOwn(stored.frontmatter ?? {}, key)) ? reading : { content: text, inferred: false };
 }

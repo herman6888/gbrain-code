@@ -21,7 +21,7 @@ import { readContentChunksEmbeddingDim } from './embedding-dim-check.ts';
  */
 
 import type { BrainEngine } from './engine.ts';
-import type { Chunk, ChunkInput } from './types.ts';
+import type { Chunk, ChunkInput, StaleChunkRow } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from './embed-retry.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
@@ -35,6 +35,8 @@ import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { resolveStaleEmbedConcurrency } from './embed-concurrency.ts';
 import { AbortError } from './abort-check.ts';
 import { meterPageBatch, spendGrant } from './page-embedding-budget.ts';
+import { chunkGenerationFilter, chunkVisibleFilter } from './search/safe-chunks.ts';
+import { embedSegmentedPage, embedSegmentedRows, readSegmentedEmbedPage, type SegmentedEmbedOpts } from './page-body/segmented-embedding.ts';
 
 /**
  * W0 fix-wave (Tier-1 #3, CONFIRMED): the ONE carry-through field list for
@@ -195,7 +197,7 @@ export async function stampIfPageProvenanceComplete(
       `SELECT count(*) > 0
               AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)}) AS complete
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-        WHERE p.slug = $2 AND p.source_id = $3 AND p.text_projection_revision=p.knowledge_revision
+        WHERE p.slug = $2 AND p.source_id = $3 AND ${chunkVisibleFilter('p', 'cc')}
           AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)`,
       [model, slug, sourceId, dims],
     );
@@ -266,6 +268,23 @@ export async function probeEmbedder(
  * worker: stored-CR-mode wrapping, metadata carry, full-restale signature
  * stamp, title-tier restamp.
  */
+/**
+ * Wave B: when the batch's page is segmented, embed these rows by keyset
+ * (`embedSegmentedRows`, never through its body or every chunk), stamp the
+ * page's provenance when it is complete, and return true; false for an inline page.
+ */
+async function embedSegmentedStaleRows(engine: BrainEngine, stale: readonly StaleChunkRow[], result: { embedded: number; pagesProcessed: number },
+  opts: Omit<SegmentedEmbedOpts, 'beforeInstall'> & { stamp?: ProvenanceStamp; pacer: DbPacer; assertOwned?: (tx?: BrainEngine) => Promise<void>; stopped: () => boolean }): Promise<boolean> {
+  const page = await observed(opts.pacer, () => readSegmentedEmbedPage(engine, { id: stale[0]!.page_id }));
+  if (!page) return false;
+  const installed = await embedSegmentedRows(engine, page, stale, { ...opts,
+    beforeInstall: async tx => { await opts.assertOwned?.(tx); if (opts.stopped()) throw new AbortError(); } });
+  if (opts.stamp && installed) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, opts.stamp);
+  result.embedded += installed ?? 0;
+  if (installed) result.pagesProcessed += 1;
+  return true;
+}
+
 export async function embedStalePages(
   engine: BrainEngine,
   slugs: string[],
@@ -293,6 +312,15 @@ export async function embedStalePages(
       return result;
     }
     try {
+      const segmented = await readSegmentedEmbedPage(engine, { sourceId, slug });
+      if (segmented) {
+        const page = await embedSegmentedPage(engine, segmented, { embedFn, signal: opts.signal, signature: opts.embeddingSignature });
+        const stamp = page.complete ? await resolveProvenanceStamp(engine, opts.embeddingSignature) : undefined;
+        if (stamp) await stampIfPageProvenanceComplete(engine, slug, sourceId, stamp);
+        result.embedded += page.embedded;
+        if (page.embedded) result.pagesProcessed += 1;
+        continue;
+      }
       // SUP-3874: split legacy oversized rows before embedding so a single
       // pre-cap chunk cannot permanently fail the page.
       await healOversizedPageChunks(engine, slug, { sourceId });
@@ -303,7 +331,7 @@ export async function embedStalePages(
         (await engine.executeRaw<{ chunk_index: number }>(
           `SELECT cc.chunk_index
              FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-            WHERE p.slug = $1 AND p.source_id = $2 AND cc.${staleColId} IS NULL
+            WHERE p.slug = $1 AND p.source_id = $2 AND cc.${staleColId} IS NULL AND ${chunkGenerationFilter('p', 'cc')}
             ORDER BY cc.chunk_index`,
           [slug, sourceId],
         )).map(r => r.chunk_index),
@@ -528,7 +556,7 @@ export async function embedStaleForSource(
       const slug = stale[0].slug;
       try {
         await opts.assertOwned?.();
-        if (stopped()) return;
+        if (stopped() || await embedSegmentedStaleRows(engine, stale, result, { embedFn, signal, signature, stamp, pacer, assertOwned: opts.assertOwned, stopped })) return;
         // SUP-3874: split legacy oversized chunk_text before embedding.
         const healed = await observed(pacer, () => engine.transaction(async tx => {
           await opts.assertOwned?.(tx);

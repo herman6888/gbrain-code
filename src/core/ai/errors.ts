@@ -172,12 +172,28 @@ function contentPolicy400Reason(responseBody: string): string | undefined {
   return error?.message === 'Content Exists Risk' ? 'content_exists_risk' : undefined;
 }
 
+/**
+ * #6816: Claude Code reports a usage-policy refusal as an error envelope with no API status, which the claude-cli
+ * adapter surfaces as `claude-cli reported error: API Error: ...`. The wordings it has used all link the policy:
+ * "<model> can't help with this. Start a new session to continue. ... https://www.anthropic.com/legal/aup",
+ * "<model>'s safeguards flagged this message (https://www.anthropic.com/legal/aup)" and, before 2.1.219,
+ * "Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup)".
+ * Only that adapter error counts: the anchored prefix, no API status, the policy link and one of the refusal phrases.
+ */
+const CLAUDE_CLI_REFUSAL_RE = /^claude-cli reported error: API Error: (?=[\s\S]*https:\/\/www\.anthropic\.com\/legal\/aup)[\s\S]*(?:can['\u2019]t help with this|violate our Usage Policy|safeguards flagged this)/;
+
+function claudeCliRefusal(value: { name?: unknown; message?: unknown; apiErrorStatus?: unknown }): boolean {
+  return value.name === 'ClaudeCliProcessError' && value.apiErrorStatus === undefined
+    && typeof value.message === 'string' && CLAUDE_CLI_REFUSAL_RE.test(value.message);
+}
+
 /** A provider refusal tied to the prompt, even when the SDK wraps its response. */
 export function providerContentBlockReason(err: unknown): string | undefined {
   for (let depth = 0; depth < 8 && err != null; depth++) {
     try {
       if (typeof err !== 'object') break;
-      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown };
+      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown; name?: unknown; message?: unknown; apiErrorStatus?: unknown };
+      if (claudeCliRefusal(value)) return 'claude_cli_usage_policy';
       if (typeof value.responseBody === 'string' && (value.statusCode === 400 || value.status === 400)) {
         const reason = contentPolicy400Reason(value.responseBody);
         if (reason) return reason;

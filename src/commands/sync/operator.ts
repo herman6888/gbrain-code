@@ -51,6 +51,8 @@ leaves a file out, and each refusal names the file, why, and its fix.
                         at HEAD now (still dirty: refused still_dirty)
   preparation_stalled   re-screened (the writer, not the file, stalled)
   concurrent_write      refused: a person reconciles the two versions
+  file_drift            refused: a person picks the database or the file
+                        (gbrain repair file-drift --prefer database|file)
   ${CONTENT_HOLD_CODES.padEnd(22)}repaired by the content-repair lane (gbrain repair content,
                         each file bound to the bytes its plan read, under the
                         fences.repair caps), then re-screened; per
@@ -106,6 +108,8 @@ export async function runSyncStatus(engine: BrainEngine, args: string[]): Promis
     for (const b of t.active_blockers) console.log(`    BLOCKING ${b.kind}: request ${b.request_id}${b.slug ? ` (${b.slug})` : ''} [${b.category}]`);
     if (t.active_blockers.length || t.unresolved.rows) console.log(`    drill down: ${t.drill_down.join(' ')}`);
   }
+  const connector = status.connector_last_error;
+  if (connector) console.log(`  connector: ${connector.stopped ? 'STOPPED, ' : ''}the last ${connector.consecutive} run(s) ended on ${connector.code}${connector.slug ? ` at ${connector.slug}` : ''}: ${connector.message}`);
   for (const notice of notices) console.log(`  [gbrain notice ${notice.code}] ${notice.why}`);
   if (rendered.next) console.log(`  Next: ${rendered.next.command ?? rendered.next.argv?.join(' ')}\n  Why: ${rendered.next.why}`);
   else console.log('  Next: nothing; the source is synced and holds nothing.');

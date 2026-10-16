@@ -33,7 +33,8 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { LockStolenError, syncLockId, withRefreshingLock, type DbLockHandle } from '../db-lock.ts';
 import { ownedGoogleReceipts, prepareGoogleReceiptPatch, type GoogleReceipts } from './connector-google-receipts.ts';
 import { connectorCheckpointKeys, connectorIdentity, connectorIdentityMatches, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
-import { readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
+import { CONNECTOR_PURGED_LIMIT, readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorPurgedItem, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
+import { connectorConfigDigest } from './connector-account-mismatch.ts';
 import { connectorAccountChanged, connectorFenceHint, docsAnchor, receiptDeliveredHint, CONNECTOR_INTENT_OUTDATED_OLD_HOST, CONNECTOR_INTENT_OUTDATED_PRE_UPGRADE } from './connector-errors.ts';
 import { inspectUnchanged, screeningRequest } from './noop-kernel.ts';
 import { conceptPreservationHold, preserveCanonicalFences } from '../cycle/concept-publication.ts';
@@ -44,6 +45,7 @@ import { withCoordinatedWrite } from './context.ts';
 import { maintenanceAttribution } from './attribution.ts';
 import { readConnectorV2Cutoff } from './connector-checkpoint-migration.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
+import { intentCarriesPurgedContent } from './purged-intent.ts';
 import { PERSISTENCE_IPC_MAX_BYTES } from './ipc.ts';
 import type { GoogleSourceConfig } from '../google/types.ts';
 
@@ -63,6 +65,13 @@ export const connectorWaitBudget = { ms: CONNECTOR_WAIT_BUDGET_MS };
 const WAIT_RESERVE_MS = 1_000;
 const COMMIT_GRACE_MS = 1_000;
 const ITEM_WAIT_MS = 5_000;
+
+/**
+ * #6831: the pages guard refused this connector item because its content matches a page purge tombstone. That is the
+ * tombstone doing its job (the owner purged this content), so the item is skipped and recorded, never retried, and the
+ * rest of the run goes on. Every other failed receipt still fails the run or joins the retry set.
+ */
+const purgedRefusal = (row: WriteRequest) => row.state === 'failed' && row.error_code === 'purged_content';
 /**
  * Accepted-pending writes stop the sweep: the run ends partial with its pending
  * set recorded. A `write_pending` error, so direct session callers and
@@ -304,7 +313,9 @@ export async function withConnectorSync<T>(engine: BrainEngine, sourceId: string
       result = await work(session, options);
     } catch (error) {
       if (!(error instanceof ConnectorWaitBudgetStop)) {
-        if (error instanceof OperationError) await session.finish().catch(() => {});
+        // #6831: a run cut short by its caller's deadline or cancel is not a failure of the source.
+        const failure = combined.aborted ? undefined : error;
+        if (error instanceof OperationError || (failure && !(error instanceof LockStolenError))) await session.finish(failure).catch(() => {});
         throw error;
       }
       await session.finish();
@@ -318,7 +329,7 @@ export async function withConnectorSync<T>(engine: BrainEngine, sourceId: string
   });
 }
 
-interface PendingWrite { entry: ConnectorPendingEntry; row: WriteRequest; bytes: number }
+interface PendingWrite { entry: ConnectorPendingEntry; row: WriteRequest; bytes: number; counted?: 'created' | 'updated' | 'deleted' }
 
 /** A connector sweep that ended with accepted writes pending, or stopped on its wait budget, reports `partial` / `writer_pending`. */
 export function pendingConnectorResult(result: SyncResult | null, session: ManagedConnectorSync): SyncResult {
@@ -351,10 +362,16 @@ export class ManagedConnectorSync {
   private pendingCheckpoint: ConnectorPendingEntry | null = null;
   /** Page slugs of held connector items: their terminal, recovery-free failed receipts leave the automatic retry set. */
   private heldSlugs = new Set<string>();
+  /** #6831: items this run skipped because their content matches a page purge tombstone. */
+  private purged: ConnectorPurgedItem[] = [];
+  /** #6831: whether the source holds any page purge tombstone (read once per run); only then are imports screened against them. */
+  private hasPagePurges = false;
+  /** #6831: the item whose failed receipt this run last reported, so a run that ends on it can name the item. */
+  private lastFailedItem: { slug: string; requestId: string } | null = null;
   /** True when this run ended with accepted writes pending, so its checkpoint did not advance. */
   deferred = false;
-  readonly counts: Omit<ConnectorRunCounts, 'finished_at' | 'pending' | 'stopped_on_wait_budget'> & { created: number; updated: number; deleted: number } = {
-    page_admissions: 0, skipped_unchanged: 0, checkpoint_admissions: 0, dropped_upstream: 0, created: 0, updated: 0, deleted: 0 };
+  readonly counts: Omit<ConnectorRunCounts, 'finished_at' | 'pending' | 'stopped_on_wait_budget'> & { created: number; updated: number; deleted: number; purged_skipped: number } = {
+    page_admissions: 0, skipped_unchanged: 0, checkpoint_admissions: 0, dropped_upstream: 0, created: 0, updated: 0, deleted: 0, purged_skipped: 0 };
   readonly checkpointKey: string;
   /** The stable key plus its #6561 alias keys: retry approvals recorded under an alias still apply. */
   private readonly checkpointKeys: string[];
@@ -394,6 +411,7 @@ export class ManagedConnectorSync {
     this.outstandingCap = Math.max(1, Math.min(90, limits.principalOutstanding - 10));
     this.intentByteCap = Math.max(1024 ** 2, Math.floor(Math.min(limits.principalIntentBytes, PERSISTENCE_IPC_MAX_BYTES) / 2));
     this.connectorState = await readManagedConnectorState(this.engine, this.sourceId, this.source.incarnation);
+    this.hasPagePurges = (await this.engine.executeRaw('SELECT 1 FROM page_purges WHERE source_id=$1 LIMIT 1', [this.sourceId])).length > 0;
     await this.resolvePendingSet();
     const rows = await this.engine.executeRaw<StoredCheckpoint>(`SELECT fingerprint,completed_keys,extract(epoch from updated_at)::float8 AS at
       FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=ANY($1::text[])`, [this.checkpointKeys]);
@@ -423,6 +441,7 @@ export class ManagedConnectorSync {
       if (row.state === 'committed') continue;
       if (entry.itemRef === CHECKPOINT_SLUG && !isTerminal(row)) { this.pendingCheckpoint = entry; this.blockedByCheckpoint = true; continue; }
       if (!isTerminal(row)) { this.pendingRows.set(row.id, { entry, row, bytes: 0 }); continue; }
+      if (purgedRefusal(row)) { this.skipPurged(entry.itemRef, row); continue; }
       this.autoRetry.add(entry.baseRequestId);
       this.carried.push(entry);
     }
@@ -435,12 +454,16 @@ export class ManagedConnectorSync {
   async assertAccount(resolved: ConnectorAccount | null): Promise<void> {
     if (this.blockedByCheckpoint) { this.stopped = true; throw new ConnectorWaitBudgetStop(); }
     const configured = this.identity.kind === 'google' ? (this.identity.config as GoogleSourceConfig).account : null;
-    if (resolved === null) throw connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured ?? 'the pinned account', null);
+    if (resolved === null) throw await this.accountRefused(connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured ?? 'the pinned account', null));
     if (configured !== null && resolved.kind === 'google' && resolved.email !== configured) {
-      throw connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured, resolved);
+      throw await this.accountRefused(connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, this.connectorState.account ?? configured, resolved));
     }
     const pinned = this.connectorState.account;
-    if (pinned && !sameConnectorAccount(pinned, resolved)) throw connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, pinned, resolved);
+    if (pinned && !sameConnectorAccount(pinned, resolved)) throw await this.accountRefused(connectorAccountChanged(this.sourceId, this.identity.kind, this.identity.config, pinned, resolved));
+    if (this.connectorState.account_mismatch) {
+      this.connectorState = { ...this.connectorState, account_mismatch: null };
+      if (pinned) await this.writeState();
+    }
     if (!pinned) {
       const migrated = this.connectorState.upgrade_recovery === 'resumed';
       this.connectorState = { ...this.connectorState, account: resolved, pinned_at: new Date().toISOString(), continuity_unverified: migrated };
@@ -451,6 +474,17 @@ export class ManagedConnectorSync {
       }
     }
     if (this.resetRequested) await this.resetCheckpoint();
+  }
+  /**
+   * #6803: records the refusal in the connector state so autopilot stops
+   * dispatching this source until the operator repins it or changes its
+   * connector config. Best-effort: the refusal itself is what the caller sees.
+   */
+  private async accountRefused(error: OperationError): Promise<OperationError> {
+    this.connectorState = { ...this.connectorState, account_mismatch: { at: new Date().toISOString(),
+      detail: error.detail === 'account_unresolved' ? 'account_unresolved' : 'account_changed', config_digest: connectorConfigDigest(this.identity.config) } };
+    await this.writeState().catch(() => undefined);
+    return error;
   }
   /** `--reset-checkpoint`: resolve pending writes, then start from an empty cursor. Existing pages stay; the pin is kept. */
   private async resetCheckpoint(): Promise<void> {
@@ -653,7 +687,15 @@ export class ManagedConnectorSync {
     for (const [id, pending] of this.pendingRows) {
       const row = found.get(id);
       if (!row || row.state === 'committed') { this.pendingRows.delete(id); continue; }
-      if (isTerminal(row)) { this.pendingRows.delete(id); this.failedPending.push(pending.entry); continue; }
+      if (isTerminal(row)) {
+        this.pendingRows.delete(id);
+        if (!purgedRefusal(row)) this.failedPending.push(pending.entry);
+        else {
+          if (pending.counted) this.counts[pending.counted]--;
+          this.skipPurged(pending.entry.itemRef, row);
+        }
+        continue;
+      }
       pending.row = row;
     }
   }
@@ -707,8 +749,12 @@ export class ManagedConnectorSync {
       await this.refreshPending();
     }
   }
-  /** Records the run's pending set, counts and upgrade state; written only while the lease is held. */
-  async finish(): Promise<void> {
+  /**
+   * Records the run's pending set, counts and upgrade state; written only while the lease is held. `failure` is the
+   * error the run ended on (#6831): it is recorded with a count of runs in a row that ended that way. Only a complete
+   * run (its cursor saved, nothing pending or failed) clears it; a partial or wait-budget stop leaves it as it was.
+   */
+  async finish(failure?: unknown): Promise<void> {
     await this.refreshPending().catch(() => {});
     const now = new Date().toISOString();
     const outstanding = [...this.pendingRows.values()].map(pending => pending.entry);
@@ -725,10 +771,47 @@ export class ManagedConnectorSync {
       .map(entry => [entry.requestId, entry])).values()];
     if (outstanding.length || this.failedPending.length || this.pendingCheckpoint || this.stopped) this.deferred = true;
     const recovery = this.connectorState.upgrade_recovery === 'rewalking_once' && complete ? 'none' : this.connectorState.upgrade_recovery;
-    this.connectorState = { ...this.connectorState, pending, upgrade_recovery: recovery, last_run: {
+    const listed = new Set<string>();
+    const purgedItems = [...this.purged].reverse().concat(this.connectorState.purged_items ?? [])
+      .filter(entry => !listed.has(entry.slug) && !!listed.add(entry.slug)).slice(0, CONNECTOR_PURGED_LIMIT);
+    const receipt = failure instanceof OperationError ? failure.writeRequest : undefined;
+    const item = receipt && receipt.request_id === this.lastFailedItem?.requestId ? this.lastFailedItem : null;
+    const named = failure as { code?: unknown; message?: unknown } | undefined;
+    const lastFailure = failure ? { code: (failure instanceof OperationError ? failure.writeError : undefined) ?? (typeof named?.code === 'string' && named.code ? named.code : 'connector_error'),
+      message: typeof named?.message === 'string' ? named.message : String(failure), slug: item?.slug ?? null, request_id: item?.requestId ?? null,
+      at: now, consecutive: (this.connectorState.last_failure?.consecutive ?? 0) + 1 } : complete ? null : this.connectorState.last_failure ?? null;
+    this.connectorState = { ...this.connectorState, pending, upgrade_recovery: recovery, purged_items: purgedItems, last_failure: lastFailure, last_run: {
       page_admissions: this.counts.page_admissions, skipped_unchanged: this.counts.skipped_unchanged, pending: pending.length,
-      checkpoint_admissions: this.counts.checkpoint_admissions, stopped_on_wait_budget: this.stopped, dropped_upstream: this.counts.dropped_upstream, finished_at: now } };
+      checkpoint_admissions: this.counts.checkpoint_admissions, stopped_on_wait_budget: this.stopped, dropped_upstream: this.counts.dropped_upstream,
+      ...(this.counts.purged_skipped ? { purged_skipped: this.counts.purged_skipped } : {}), finished_at: now } };
     await this.writeState();
+  }
+  /**
+   * #6831: records a connector item skipped because its content matches a page purge tombstone, either screened out
+   * before admission (`row` null) or refused by the pages guard at publication. A refused receipt is not one the
+   * checkpoint waits on, and it never joins the automatic retry set. The item stays skipped on every run that lists the
+   * same content until the owner clears the tombstone (`gbrain pages unpurge <slug>`).
+   */
+  private skipPurged(slug: string, row: WriteRequest | null): void {
+    if (row) this.receipts = this.receipts.filter(id => id !== row.id);
+    this.counts.purged_skipped++;
+    this.purged.push({ slug, request_id: row?.request_id ?? null, at: new Date().toISOString() });
+    process.stderr.write(`[connector] ${this.sourceId}: skipped ${slug}: its content matches a page purge tombstone${row ? ` (request ${row.request_id})` : ''}; `
+      + `the rest of the sync continues. To let it back in: gbrain pages unpurge ${slug}\n`);
+  }
+  /**
+   * #6831: screens a page import against the source's page purge tombstones before admission, with the content hash
+   * the pages guard compares (`intentCarriesPurgedContent`), so a purged item that keeps being listed costs no refused
+   * receipt per run. A miss here (the publication renders different bytes, or a purge lands mid-run) still ends in the
+   * guard's refusal, which `submit` and the pending-set paths skip the same way.
+   */
+  private async carriesPurgedPage(slug: string, content: string | undefined): Promise<boolean> {
+    return this.hasPagePurges && this.purgedNow(slug, content);
+  }
+  /** Whether a page tombstone of the source matches this content now, read without the per-run presence shortcut. */
+  private async purgedNow(slug: string, content: string | undefined): Promise<boolean> {
+    if (!content) return false;
+    return intentCarriesPurgedContent(this.engine, { source_id: this.sourceId, slug, intent: { content } }, { facts: false, pages: true });
   }
   /**
    * Fix wave 4: marks connector items held by this run. Only their terminal,
@@ -859,11 +942,17 @@ export class ManagedConnectorSync {
         { fix: ownerStatusFix(this.sourceId, 'Shows the source\'s receipts and any retained recovery before a retry is approved again.') });
       return { retry, input, row };
     };
+    const prior = await selected(this.engine);
+    let row = prior.row;
+    // #6831: a replayed purged refusal stays skipped (even under --retry-failed) while its tombstone stands; once the
+    // owner cleared it, the item gets one automatic retry through the guarded retry path below.
+    if (kind === 'connector_v2_import' && row && purgedRefusal(row) && row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId)) {
+      if (await this.purgedNow(slug, extra.content)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      this.autoRetry.add(baseRequestId);
+    }
     const automatic = this.autoRetry.has(baseRequestId);
     const mayRetry = (row: WriteRequest | null) => (this.retryFailed || automatic) && row && ['failed', 'conflict'].includes(row.state) &&
       row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId);
-    const prior = await selected(this.engine);
-    let row = prior.row;
     let admitted = false;
     if (mayRetry(row)) {
       const failedRow = row!;
@@ -919,6 +1008,10 @@ export class ManagedConnectorSync {
         this.counts.skipped_unchanged++;
         return { row: null, pending: false, created: false };
       }
+      if (kind === 'connector_v2_import' && await this.carriesPurgedPage(slug, extra.content)) {
+        this.skipPurged(slug, null);
+        return { row: null, pending: false, created: false };
+      }
       row = await this.engine.transaction(async tx => {
         await this.assertLease(tx);
         const accepted = await admitWriteInTransaction(tx, prior.input);
@@ -950,6 +1043,8 @@ export class ManagedConnectorSync {
       return { row, pending: false, created: false };
     }
     if (isTerminal(row)) {
+      if (page && purgedRefusal(row)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      if (row.state !== 'committed') this.lastFailedItem = { slug, requestId: row.request_id };
       writeResponse(row);
       this.receipts.push(row.id);
       if (row.outcome?.noop !== true) {
@@ -958,9 +1053,10 @@ export class ManagedConnectorSync {
       return { row, pending: false, created: row.outcome?.status === 'created' };
     }
     this.receipts.push(row.id);
-    this.pendingRows.set(row.id, { row, bytes: Buffer.byteLength(JSON.stringify(intent)),
+    const counted = !snapshot ? 'created' : kind === 'connector_v2_delete' ? 'deleted' : 'updated';
+    this.pendingRows.set(row.id, { row, bytes: Buffer.byteLength(JSON.stringify(intent)), counted,
       entry: { itemRef: slug, requestId: row.request_id, baseRequestId, admittedAt: new Date(row.created_at).toISOString() } });
-    if (!snapshot) this.counts.created++; else if (kind === 'connector_v2_delete') this.counts.deleted++; else this.counts.updated++;
+    this.counts[counted]++;
     await this.makeRoom();
     return { row, pending: true, created: !snapshot };
   }

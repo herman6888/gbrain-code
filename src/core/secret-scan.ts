@@ -421,8 +421,8 @@ const PEM_LINE_MAX = 128;
 const PEM_LINE_MIN = 16;
 const PEM_INDENT_MAX = 16;
 const PEM_RFC1421_LINE_MAX = 256;
-const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
-const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/g;
+export const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
+export const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/g;
 
 type PemClaimKind = 'block' | 'forward' | 'backward';
 
@@ -488,7 +488,7 @@ function atCut(t: string, i: number): boolean {
 }
 
 /** FORWARD claim end for a BEGIN fence ending at `headerEnd` (== headerEnd when no body line follows). */
-function pemForwardEnd(t: string, headerEnd: number): number {
+export function pemForwardEnd(t: string, headerEnd: number): number {
   const n = t.length;
   const cap = headerEnd + PEM_BODY_MAX_CHARS;
   let pos = lineEndAfter(t, headerEnd);
@@ -520,7 +520,7 @@ function pemForwardEnd(t: string, headerEnd: number): number {
 }
 
 /** BACKWARD claim start for an END fence at `endStart`, never below `floor`; -1 when no body line precedes it. */
-function pemBackwardStart(t: string, endStart: number, floor: number): number {
+export function pemBackwardStart(t: string, endStart: number, floor: number): number {
   let p = endStart;
   while (endStart - p < PEM_INDENT_MAX && p > floor && isIndentCode(t.charCodeAt(p - 1))) p--;
   let le = lineEndBefore(t, p, floor);

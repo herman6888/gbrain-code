@@ -23,7 +23,7 @@
  * is done, the incremental pass caught up and the walk finished; anything
  * less is `partial`, and a partial census never reads as healthy.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';

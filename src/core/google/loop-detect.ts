@@ -17,6 +17,11 @@
  *  - list mail (List-Unsubscribe) never opens loops
  *  - auto-submitted mail (RFC 3834 Auto-Submitted other than "no": tracker
  *    notices, auto-replies) neither opens nor closes loops
+ *  - positively automated mail (#5012: `Precedence: bulk|list|junk`, a
+ *    `List-Id`, or a no-reply `Reply-To`) owes no reply; the verdict records
+ *    `withheld: 'automated_mail'`. A Gmail category alone never withholds a
+ *    reply-owed loop; with `loops.updates_require_reciprocity` on, Updates
+ *    mail opens one only when the owner has written to the sender
  *  - self-threads (all participants are my addresses) never open loops
  *  - CC-only inbound does not owe a reply (must be in To:)
  *  - outbound without a question mark is FYI, not an ask; a question mark
@@ -38,14 +43,17 @@ import type { BrainEngine } from '../engine.ts';
 import {
   closeThreadLoops,
   loadSuppressions,
+  settleMuteRecheck,
   upsertOpenLoop,
   type LoopEvidence,
   type SuppressionSet,
 } from '../loops/loops-store.ts';
 import { resolveCounterparty, type ResolvedCounterparty } from './counterparty.ts';
-import { isCalendarSystemMail, isNoiseSender } from './google-render.ts';
+import { isCalendarSystemMail, isNoiseSender, isPositivelyAutomated } from './google-render.ts';
+export { isPositivelyAutomated } from './google-render.ts';
 import { hasBulkCategory } from './gmail-categories.ts';
 import { isExcludedByLabels, NO_EXCLUSION, pageLabelIds, type LoopsExclusionPolicy } from './loops-exclusion.ts';
+import { ownerWroteToFor } from './loops-reciprocity.ts';
 import type { GmailMessageMeta, GmailThreadData } from './types.ts';
 
 export const INBOUND_GRACE_HOURS = 24;
@@ -80,7 +88,21 @@ export interface ThreadLoopVerdict {
    * hold because Gmail history never re-lists a quiet thread.
    */
   held?: { untilMs: number; spec: ThreadLoopSpec };
+  /**
+   * #5012: a reply-owed loop every other gate would have opened (or held)
+   * was withheld because the mail is positively automated, or because it is
+   * Updates mail from a sender the owner never wrote to (opt-in rule).
+   */
+  withheld?: { reason: LoopWithheldReason; counterpartyEmail: string };
 }
+
+export type LoopWithheldReason = 'automated_mail' | 'updates_without_reciprocity';
+
+/** #5012: opt-in detection policy. `ownerWroteTo` is set only when `loops.updates_require_reciprocity` is on. */
+export interface LoopDetectPolicy {
+  ownerWroteTo?: ReadonlySet<string> | null;
+}
+
 
 function isMine(m: GmailMessageMeta, myAddresses: Set<string>): boolean {
   return m.labelIds.includes('SENT') || myAddresses.has(m.fromAddress);
@@ -122,6 +144,7 @@ export function detectThreadLoop(
   myAddresses: Set<string>,
   now: Date,
   suppressions?: SuppressionSet,
+  policy: LoopDetectPolicy = {},
 ): ThreadLoopVerdict {
   const messages = thread.messages.filter((m) => m.internalDateMs > 0);
   if (messages.length === 0) return { open: [], close: [] };
@@ -206,6 +229,11 @@ export function detectThreadLoop(
     const inTo = last.to.some((a) => myAddresses.has(a));
     if (!inTo) return { open: [], close };
     if (threadSuppressed || suppressions?.senders.has(last.fromAddress)) return { open: [], close };
+    if (isPositivelyAutomated(last)) return { open: [], close, withheld: { reason: 'automated_mail', counterpartyEmail: last.fromAddress } };
+    if (policy.ownerWroteTo && last.labelIds.includes('CATEGORY_UPDATES') && !substantive.some((m) => isMine(m, myAddresses))
+      && !policy.ownerWroteTo.has(last.fromAddress)) {
+      return { open: [], close, withheld: { reason: 'updates_without_reciprocity', counterpartyEmail: last.fromAddress } };
+    }
     const owedSince = run.find((m) => m.to.some((a) => myAddresses.has(a))) ?? last;
     const spec: ThreadLoopSpec = {
       loopType: 'unanswered_inbound',
@@ -279,6 +307,11 @@ export function __clearSuppressionCacheForTests(engine?: BrainEngine): void {
   else suppressionCacheEpoch++;
 }
 
+/** #5012: a mute or unmute in this process takes effect on the next detection, not after the 60s TTL. */
+export function invalidateSuppressionCache(engine: BrainEngine): void {
+  suppressionCache.delete(engine);
+}
+
 /**
  * Apply the verdict: close thread loops that no longer hold, upsert the ones
  * that do (dedup key 'thread:<threadId>:<loop_type>' — reopen on conflict).
@@ -295,11 +328,12 @@ export async function applyThreadLoopVerdict(
   exclusion: LoopsExclusionPolicy = NO_EXCLUSION,
 ): Promise<ThreadLoopVerdict> {
   const suppressions = await suppressionsFor(engine, sourceId);
+  const policy: LoopDetectPolicy = { ownerWroteTo: await ownerWroteToFor(engine, sourceId, myAddresses) };
   // One verdict, two lanes: `close` is the turn-flip set (suppression- and
   // grace-independent — only a genuine reply closes, and only the answered
   // type); `open` is suppression-filtered. A held loop (grace window,
   // CC-only nudge, muted sender) is neither opened nor closed.
-  const verdict = withLabelExclusion(detectThreadLoop(thread, myAddresses, now, suppressions), exclusion,
+  const verdict = withLabelExclusion(detectThreadLoop(thread, myAddresses, now, suppressions, policy), exclusion,
     thread.messages.flatMap((m) => m.labelIds));
 
   const desired = new Set(verdict.open.map((s) => s.loopType));
@@ -309,6 +343,12 @@ export async function applyThreadLoopVerdict(
   }
 
   for (const spec of verdict.open) await upsertThreadLoop(engine, sourceId, thread.threadId, spec, pageSlug);
+  // #5012: an unmute's re-check that neither reopened nor answered the queued loop leaves it closed;
+  // a grace hold keeps it queued until the hold settles.
+  if (!verdict.held && suppressions.recheckThreads?.has(thread.threadId)) {
+    await settleMuteRecheck(engine, sourceId, thread.threadId);
+    suppressions.recheckThreads.delete(thread.threadId);
+  }
   return verdict;
 }
 

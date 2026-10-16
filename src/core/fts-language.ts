@@ -187,7 +187,9 @@ export function chunkSearchVectorSql(lang: string, row = ''): string {
  * after a migration leaves the catalog unchanged. #2704: compiled_truth is not
  * indexed (it overflows the 1MB tsvector cap); the timeline and the joined
  * entries are cut to their FTS caps for the same reason, the entries in id
- * order so the cut is deterministic. `SET search_path = pg_catalog,
+ * order so the cut is deterministic. A segmented page (Wave B) has a NULL
+ * timeline and indexes its stored `timeline_lead` prefix instead, read only
+ * then because the column is migration-only (v248). `SET search_path = pg_catalog,
  * public` keeps the v120/#1647 hardening, which CREATE OR REPLACE would
  * otherwise reset.
  */
@@ -195,15 +197,20 @@ export function pageSearchVectorTriggerFnSql(lang: string): string {
   return `CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $$
 DECLARE
   timeline_text TEXT;
+  timeline_lead_text TEXT;
 BEGIN
   SELECT coalesce(string_agg(summary || ' ' || detail, ' ' ORDER BY id), '')
   INTO timeline_text
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
+  IF NEW.timeline IS NULL THEN
+    timeline_lead_text := NEW.timeline_lead;
+  END IF;
+
   NEW.search_vector :=
     setweight(to_tsvector('${lang}', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
-    setweight(to_tsvector('${lang}', gbrain_fts_input(left(coalesce(NEW.timeline, ''), ${PAGE_TIMELINE_FTS_MAX_CHARS}))), 'C') ||
+    setweight(to_tsvector('${lang}', gbrain_fts_input(left(coalesce(NEW.timeline, timeline_lead_text, ''), ${PAGE_TIMELINE_FTS_MAX_CHARS}))), 'C') ||
     setweight(to_tsvector('${lang}', gbrain_fts_input(left(coalesce(timeline_text, ''), ${PAGE_TIMELINE_ENTRIES_FTS_MAX_CHARS}))), 'C');
 
   RETURN NEW;

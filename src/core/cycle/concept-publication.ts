@@ -9,6 +9,7 @@
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { preservedConceptSections, stripPreservedConceptSections } from './concept-sections.ts';
 import type { Page } from '../types.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { serializeMarkdown, parseMarkdown, type ParsedMarkdown } from '../markdown.ts';
 import { digest } from '../persistence/digest.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, replaceOrInsertFactsFence, stripFactsFence } from '../facts-fence.ts';
@@ -105,9 +106,11 @@ export function composeConceptRepublication(page: Pick<Page, 'type' | 'title' | 
  * Curated `## Facets` / `## Merged` sections (#6161: the record of a concept
  * merge) are carried the same way. Throws a hold
  * (`concept_preservation_hold`) when the original fences are ambiguous or the
- * result would not carry exactly the original rows and sections.
+ * result would not carry exactly the original rows and sections. A segmented
+ * page refuses with `page_body_segmented`: its fences live in segments.
  */
-export function preserveCanonicalFences(page: Pick<Page, 'compiled_truth' | 'timeline'>, replacement: string): string {
+export function preserveCanonicalFences(page: Pick<Page, 'compiled_truth' | 'timeline' | 'body_storage'>, replacement: string): string {
+  assertInlineBody(page, 'preserveCanonicalFences');
   const hold = conceptPreservationHold(page);
   if (hold) throw conceptHoldError(hold);
   const body = page.compiled_truth ?? '';

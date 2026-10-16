@@ -133,7 +133,7 @@ export class GoogleApiClient {
         if (reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded' || /rate/i.test(msg)) {
           // fall through to the retry-after sleep below
         } else if (!/quota/i.test(`${reason} ${msg}`)) {
-          throw new CredentialError('upstream', `: HTTP 403 ${reason || msg} on ${apiHint}`);
+          throw new GoogleForbiddenError(`: HTTP 403 ${reason || msg} on ${apiHint}`);
         }
       }
       if (res.status === 403 || res.status === 429) {
@@ -206,6 +206,26 @@ export class GoogleCursorExpiredError extends Error {
     super(`Google cursor expired (HTTP ${status}) on ${url}`);
     this.name = 'GoogleCursorExpiredError';
   }
+}
+
+/**
+ * #5012 item 9: a 403 that is neither a disabled API, a rate limit nor a
+ * quota: the token cannot read this resource. Still an upstream
+ * `CredentialError` for every caller that does not classify it; the calendar
+ * sweep and `google status` read it as an unreadable calendar.
+ */
+export class GoogleForbiddenError extends CredentialError {
+  constructor(detail: string) {
+    super('upstream', detail);
+    this.name = 'GoogleForbiddenError';
+  }
+}
+
+/** #5012 item 9: the HTTP status when `e` says the calendar cannot be read by this account (403 or 404), else null. */
+export function calendarUnreadableStatus(e: unknown): 403 | 404 | null {
+  if (e instanceof GoogleForbiddenError) return 403;
+  if (e instanceof GoogleCursorExpiredError && e.status === 404) return 404;
+  return null;
 }
 
 /**
@@ -475,6 +495,9 @@ export class GmailClient extends GoogleApiClient {
         labelIds: m.labelIds ?? [],
         listUnsubscribe: header(m, 'List-Unsubscribe') !== '',
         autoSubmitted: isAutoSubmittedHeader(header(m, 'Auto-Submitted')),
+        precedence: header(m, 'Precedence').trim().toLowerCase(),
+        listId: header(m, 'List-Id') !== '',
+        replyTo: splitAddressList(header(m, 'Reply-To')),
         calendarMethod: extractCalendarMethod(m.payload),
         bodyText,
         attachmentInspection,
@@ -573,6 +596,23 @@ export class CalendarClient extends GoogleApiClient {
    * only — the sweep still reads ONE calendar per source, so this exists to
    * find the id you pass to `sources add --calendar-id`.
    */
+  /**
+   * #5012 item 9: one cheap read of the calendar's events (`maxResults=1`).
+   * `readable: false` carries the 403/404 that says the account cannot read
+   * it; any other failure throws.
+   */
+  async probeCalendar(calendarId: string, opts: { signal?: AbortSignal } = {}): Promise<{ readable: true } | { readable: false; httpStatus: 403 | 404 }> {
+    try {
+      await this.fetchJSON(`${CALENDAR_BASE}/calendars/${encodeURIComponent(calendarId.trim() || DEFAULT_CALENDAR_ID)}/events?maxResults=1&fields=kind`,
+        'calendar-json', { ...opts, retries: 1, rateLimitRetries: 1 });
+      return { readable: true };
+    } catch (e) {
+      const httpStatus = calendarUnreadableStatus(e);
+      if (httpStatus === null) throw e;
+      return { readable: false, httpStatus };
+    }
+  }
+
   async listCalendars(opts: { signal?: AbortSignal } = {}): Promise<
     Array<{ id: string; summary: string; primary: boolean; accessRole: string }>
   > {

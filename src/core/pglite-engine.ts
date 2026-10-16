@@ -1,4 +1,5 @@
 import { registerManagedFilesystemEngine } from './persistence/filesystem-guard.ts';
+import { noteRequestConfigWrite, requestConfigRows, requestConfigValue } from './config-snapshot.ts';
 import { replaceDerivedLinks, replaceDerivedLinksBatch, type DerivedLinkBatchItem, type DerivedLinkOrigin, type DerivedLinkReplacementOptions } from './derived-links.ts';
 import { trackPgliteDatabase, PgliteClosingError, notifyPgliteOpened } from './pglite-lifecycle.ts';
 import { mutatePageTag } from './page-state/tags.ts';
@@ -11,7 +12,7 @@ import { readPageSnapshotsBatch } from './page-snapshot-batch.ts';
 import { createPageVersion } from './page-state/versions.ts';
 import { moveSlugBindings, recordRenameAlias } from './page-state/rename-alias.ts';
 import { composablePgliteTransaction, transactionMemo } from './page-state/transactions.ts';
-import { dropRowTypeArrayParsers, PgliteStatementCache } from './pglite-statements.ts';
+import { configurePgliteCodecs, PgliteStatementCache } from './pglite-statements.ts';
 import { snapshotSchemaInputs } from './snapshot-schema-inputs.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
@@ -151,6 +152,9 @@ import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './sea
 import type { KeywordPageWindow } from './search/keyword-statement.ts';
 import type { EmbeddingState, EmbeddingStateCounts, EmbeddingStateRow } from './embedding-state.ts';
 import * as chunksImpl from './engine-sql/chunks.ts';
+import * as pageBodyImpl from './engine-sql/page-body.ts';
+import type { BodyFlipInput, BodyFlipResult, BodyRegion, BodyStagingInput, BodyStagingState, ManifestRow, ManifestRowInput, SegmentChunkInput,
+  SegmentedPageMeta, SegmentSweepOptions, SegmentSweepResult, SegmentTextInput } from './page-body/types.ts';
 import { searchKeywordCJK } from './engine-sql/cjk-search.ts';
 import * as titlesImpl from './engine-sql/titles.ts';
 import * as keywordPagesImpl from './engine-sql/keyword-pages.ts';
@@ -790,7 +794,7 @@ export class PGLiteEngine implements BrainEngine {
     this.vectorIterativeScan = undefined;
     const opening = this._connectInternal(config).then(async () => {
       try {
-        await dropRowTypeArrayParsers(this.db);
+        await configurePgliteCodecs(this.db);
         if (registerRoots) await registerManagedFilesystemEngine(this, config.database_path);
       }
       catch (error) {
@@ -1411,7 +1415,7 @@ export class PGLiteEngine implements BrainEngine {
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
 
     // v0.26.5: visibility filter (soft-deleted + archived-source).
-    const visibilityClause = buildVisibilityClause('p', 's', opts);
+    const visibilityClause = buildVisibilityClause('p', 's', { ...opts, chunkAlias: 'cc' });
 
     // CJK rides the GIN-indexed bigram FTS path (v150, PMBrain port): the
     // query is tokenized through gbrain_cjk_search_tokens +
@@ -1638,7 +1642,7 @@ export class PGLiteEngine implements BrainEngine {
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
-    const visibilityClause = buildVisibilityClause('p', 's', opts);
+    const visibilityClause = buildVisibilityClause('p', 's', { ...opts, chunkAlias: 'cc' });
 
     // CJK rides the GIN-indexed bigram FTS path (v150) — same treatment
     // as searchKeyword but chunk-grain (no page-dedup), with the v0.32.7
@@ -2531,6 +2535,25 @@ export class PGLiteEngine implements BrainEngine {
     return factsImpl.getFactsHealth(unscopedExecutor(this.engineSql, 'facts: unscoped on master (EO4 inventory)'), source_id);
   }
 
+  // Segmented page storage (Wave B): SQL in ./engine-sql/page-body.ts.
+  async allocateBodyOccurrenceIds(count: number): Promise<number[]> { return pageBodyImpl.allocateBodyOccurrenceIds(this.engineSql, count); }
+  async stageSegmentTexts(sourceId: string, texts: readonly SegmentTextInput[]): Promise<{ inserted: number }> { return pageBodyImpl.stageSegmentTexts(this.engineSql, sourceId, texts); }
+  async readSegmentTexts(sourceId: string, sha256s: readonly Uint8Array[]): Promise<Map<string, Uint8Array>> {
+    return pageBodyImpl.readSegmentTexts(unscopedExecutor(this.engineSql, 'page-body: page-id keyed internal read'), sourceId, sha256s);
+  }
+  async stageManifestRows(rows: readonly ManifestRowInput[]): Promise<void> { return pageBodyImpl.stageManifestRows(this.engineSql, rows); }
+  async readManifest(pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number }): Promise<ManifestRow[]> {
+    return pageBodyImpl.readManifest(unscopedExecutor(this.engineSql, 'page-body: page-id keyed internal read'), pageId, opts);
+  }
+  async stageSegmentChunks(pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn }): Promise<number[]> {
+    return pageBodyImpl.stageSegmentChunks(this.engineSql, pageId, generation, chunks, opts);
+  }
+  async createSegmentedPageShell(slug: string, meta: SegmentedPageMeta, opts: { sourceId: string }): Promise<{ id: number }> { return pageBodyImpl.createSegmentedPageShell(this.engineSql, slug, meta, opts); }
+  async flipBodyGeneration(input: BodyFlipInput): Promise<BodyFlipResult> { return pageBodyImpl.flipBodyGeneration(this.engineSql, input); }
+  async openBodyStaging(input: BodyStagingInput): Promise<void> { return pageBodyImpl.openBodyStaging(this.engineSql, input); }
+  async setBodyStagingState(id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null }): Promise<void> { return pageBodyImpl.setBodyStagingState(this.engineSql, id, state, opts); }
+  async sweepSegments(opts?: SegmentSweepOptions): Promise<SegmentSweepResult> { return pageBodyImpl.sweepSegments(this.engineSql, opts); }
+
   // ============================================================
   // v0.28: Takes (typed/weighted/attributed claims) + synthesis_evidence
   // ============================================================
@@ -2829,6 +2852,8 @@ export class PGLiteEngine implements BrainEngine {
 
   // Config
   async getConfig(key: string): Promise<string | null> {
+    const held = await requestConfigValue(this, key);
+    if (held !== undefined) return held;
     const { rows } = await this.db.query('SELECT value FROM config WHERE key = $1', [key]);
     return rows.length > 0 ? (rows[0] as { value: string }).value : null;
   }
@@ -2839,6 +2864,7 @@ export class PGLiteEngine implements BrainEngine {
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [key, value]
     );
+    noteRequestConfigWrite(this, key, value);
   }
 
   async unsetConfig(key: string): Promise<number> {
@@ -2846,6 +2872,7 @@ export class PGLiteEngine implements BrainEngine {
       'DELETE FROM config WHERE key = $1',
       [key],
     ) as { affectedRows?: number };
+    noteRequestConfigWrite(this, key, null);
     return affectedRows ?? 0;
   }
 
@@ -2860,6 +2887,8 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async getAllConfig(): Promise<Record<string, string>> {
+    const held = await requestConfigRows(this);
+    if (held) return held;
     const { rows } = await this.db.query('SELECT key, value FROM config');
     const out: Record<string, string> = {};
     for (const row of rows as { key: string; value: string }[]) out[row.key] = row.value;

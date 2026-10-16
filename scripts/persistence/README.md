@@ -142,7 +142,12 @@ fault. Full runs crash every seam and run every fault. The manifest's `robot`
 key lists every run (schedule, seed, seam and occurrence or process fault),
 `sequences_x_crash_points`, `lease_bound_seams_skipped`,
 `lease_bound_faults_skipped` and violations with the observed trace;
-`robot_full_gate` is true for a full-budget run with no violations.
+`robot_full_gate` is true for a full-budget run with no violations, no
+`fault_hook_errors` (a fault hook that threw instead of freezing the worker)
+and no `faults_not_reached` (a worker that finished without reaching its
+requested seam, outside the per-scenario `UNREACHED_FAULT_ALLOWLIST` in
+`robot-driver.ts`); either kind of run also fails validation with a nonzero
+exit and is listed in `failing_runs` for `--replay`.
 
 A failing run prints two commands. `--replay=<manifest>` re-runs exactly the
 manifest's failing runs. `--shrink=<manifest>` removes ops from the first
@@ -563,6 +568,7 @@ The chaos modes, each named in failures and selectable with
 | (e) mid-run edit | The `sync:after_freeze` hook writes an uncommitted edit to a seeded entry after it was frozen | the run's receipt and `sync status` name `worktree_dirty`; after the editor commits, strict convergence | skipped until PR 1 of #6712: no `worktree_dirty` hold is named, and the run churns through `source_changed` conflicts and cancellations (5 of 20 entries after 150 s) |
 | (f) pooler drop | Every pooled connection drops at the proxy after 20 committed pages of a bulk run (`GBRAIN_TEST_CONVERGENCE_PGBOUNCER_CONTAINER=<name>` restarts that container instead) | no new hold; the drain resumes within the owner-kill stall bound; strict convergence | skipped until PR 1 of #6712: it converges with no hold, but publication stalls 356 s (a publication lease) after the drop |
 | (g) two drainers | `sync --all --no-delegate` beside a serve draining a delegated sync of the same source | strict convergence | runs |
+| (lease) drain-lease takeover | A `--no-delegate` leader stalls right after it takes the source's drain lease (`sync:lease_acquired`), two `--no-delegate` followers queue behind it, and the leader is SIGKILLed | a follower reports following, one takes over inside the lease TTL (2 min) and finishes `synced`, no follower ends `blocked`; strict convergence | runs (#6712 PR 1) |
 | (knock-on) | One page's publication throws P0001 once inside a bulk group, then a trigger refuses one page with P0001 for a whole run | no other page of the run is cancelled; strict convergence once the trigger is gone | skipped until PR 1 of #6712: the one-shot throw is retried and cancels nothing, but the refused page cancels the run's other 74 requests, and both plain syncs after the trigger is dropped stop `blocked_by_failures` on the frozen `storage_error` request until `--retry-failed` |
 | (systemic) | A trigger on `pages` raises an unregistered P0001 (one scenario) or 55000 (another) on every page write for one run, then is dropped | the refused run does not report success and its receipt names the SQLSTATE; strict convergence once the trigger is gone | skipped until PR 1 of #6712: the refused run stops `blocked` naming the SQLSTATE, but both plain syncs after the trigger is dropped stay `blocked_by_failures` until `--retry-failed` |
 

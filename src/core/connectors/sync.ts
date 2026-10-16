@@ -69,6 +69,7 @@ export type EmbedKickoffOutcome =
   | 'pglite_inline'
   | 'cooldown'
   | 'spend_capped'
+  | 'stalled'
   | 'no_worker_surface'
   | 'below_threshold'
   | 'none';
@@ -494,6 +495,7 @@ export async function maybeKickoffEmbed(
       if (status === 'submitted') return 'postgres_submitted';
       if (status === 'cooldown') return 'cooldown';
       if (status === 'spend_capped') return 'spend_capped';
+      if (status === 'stalled') return 'stalled';
       if (status === 'no_worker_surface') return 'no_worker_surface';
       return 'none';
     } catch (e) {

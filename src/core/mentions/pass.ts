@@ -38,6 +38,10 @@
  *
  * MENTION_EXTRACTOR_VERSION is separate from LINK_EXTRACTOR_VERSION_TS, so a
  * gazetteer change never reruns link or timeline extraction.
+ *
+ * A segmented page (body in segments, NULL body columns) is never scanned:
+ * mentions derived from its title alone would delete the ones its body holds.
+ * It stays due, and counted as pending, until the per-segment pass.
  */
 
 import { createHash } from 'node:crypto';
@@ -256,7 +260,7 @@ async function refreshAliases(engine: BrainEngine, managed: boolean, sourceId: s
     const pages = await engine.executeRaw<DuePage>(
       `SELECT p.id, p.slug, p.source_id, p.knowledge_revision::text AS revision, p.title, p.type, p.compiled_truth, p.timeline, NULL AS mention_ignore, p.frontmatter
          FROM pages p LEFT JOIN page_mention_state s ON s.page_id = p.id
-        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.type = ANY($2::text[]) AND p.id > $3
+        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.body_storage = 'inline' AND p.type = ANY($2::text[]) AND p.id > $3
           AND (s.page_id IS NULL OR s.alias_revision IS DISTINCT FROM p.knowledge_revision OR s.alias_version IS DISTINCT FROM $4)
         ORDER BY p.id LIMIT $5`, [sourceId, types, after, ALIAS_DERIVATION_VERSION, ALIAS_BATCH]);
     if (!pages.length) break;
@@ -323,7 +327,7 @@ async function pagesMatchingNames(engine: BrainEngine, sourceIds: string[], adde
     const rows = await engine.executeRaw<{ id: number; slug: string; source_id: string; body: string; mention_ignore: unknown }>(
       `SELECT id, slug, source_id, COALESCE(title, '') || E'\\n\\n' || COALESCE(compiled_truth, '') || E'\\n\\n' || COALESCE(timeline, '') AS body,
               frontmatter->'mention_ignore' AS mention_ignore
-         FROM pages WHERE deleted_at IS NULL AND source_id = ANY($1::text[]) AND id > $2
+         FROM pages WHERE deleted_at IS NULL AND body_storage = 'inline' AND source_id = ANY($1::text[]) AND id > $2
           ${ascii ? `AND lower(COALESCE(title, '') || ' ' || COALESCE(compiled_truth, '') || ' ' || COALESCE(timeline, '')) LIKE ANY($4::text[])` : ''}
         ORDER BY id LIMIT $3`,
       ascii ? [sourceIds, after, PREFILTER_BATCH, patterns] : [sourceIds, after, PREFILTER_BATCH]);
@@ -430,7 +434,7 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
       `SELECT p.id, p.slug, p.source_id, p.knowledge_revision::text AS revision, p.title, p.type, p.compiled_truth, p.timeline,
               p.frontmatter->'mention_ignore' AS mention_ignore
          FROM pages p LEFT JOIN page_mention_state s ON s.page_id = p.id
-        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.id > $3 AND ${DUE_PREDICATE}
+        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.body_storage = 'inline' AND p.id > $3 AND ${DUE_PREDICATE}
         ORDER BY p.id LIMIT $4`, [sourceId, MENTION_EXTRACTOR_VERSION, after, RECONCILE_BATCH]);
     if (!pages.length) return;
     after = pages[pages.length - 1]!.id;

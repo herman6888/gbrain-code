@@ -278,6 +278,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/google-file-modes.ts')).checkGoogleFileModes(engine, scope.sourceIds),
   },
   {
+    id: 'google_calendar_readable', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Connector state and the account address live on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A Google source is configured with a calendar its account cannot read, so it imports no events',
+    instruction: 'List the readable calendars with `gbrain google calendars --account <email>`, then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` (docs/guides/google-connect.md#unreadable-calendar).',
+    run: async (engine, scope) => (await import('./checks/google-calendar.ts')).googleCalendarReadableCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'atom_provenance_drift', resolution: 'repair', registration: 'doctor.ts',
     hostOnly: 'Retiring stale atoms is a host-side, explicit-only repair.',
     count: d => Number(d.drifted ?? 0),

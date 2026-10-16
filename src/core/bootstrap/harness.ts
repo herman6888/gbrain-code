@@ -42,7 +42,8 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { askHarnessConsent } from './harness-consent.ts';
-import { CONFIRMATION_REQUIRED_EXIT_CODE } from '../exit-codes.ts';
+import { CONFIRMATION_REQUIRED_EXIT_CODE, HARNESS_PENDING_VERIFY_EXIT_CODE } from '../exit-codes.ts';
+import { finishPendingVerify, harnessOutcomeFields, harnessVerifyPending, pendingVerifyStatusLine } from './harness-pending-verify.ts';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -781,15 +782,16 @@ async function cleanupStalePriorTargets(
   }
 }
 
-/** A live `gbrain serve` holds this PGLite brain: the two documented escape hatches. */
-function liveServeRefusal(): BootstrapError {
-  return new BootstrapError(
-    'LIVE_SERVE',
-    'a live `gbrain serve` holds this PGLite brain, so the harness cannot mint a token — either ' +
-      'pre-mint one while the serve is stopped (`gbrain auth create bootstrap-harness --scopes read,write`) ' +
-      'and re-run with --token <value>, or stop the serve, re-run this command, and restart it. ' +
-      '(Postgres brains mint fine while the serve runs.)',
-  );
+/** #6661 (D25): a live serve holds this PGLite brain (no mint) and a stopped one fails the health probe: pre-mint with the harness grant, then --token. */
+async function liveServeRefusal(opts: { tokenName: string; follow: boolean; source?: string }): Promise<BootstrapError> {
+  const scopes = opts.follow ? ['read', 'write', 'skills_member_self'] : ['read', 'write'];
+  const operations = await harnessOperationSnapshot(opts.follow);
+  const steps = ['stop the serve that holds this brain', `gbrain auth create ${opts.tokenName} --scopes ${scopes.join(',')}`,
+    `gbrain auth rescope --token ${opts.tokenName} --operations ${operations.join(',')}${opts.source ? ` --sources ${opts.source}` : ''}`,
+    'start `gbrain serve --http` again', 're-run this `gbrain bootstrap harness` command with --token <the token step 2 printed>'];
+  return new BootstrapError('LIVE_SERVE', 'a live `gbrain serve` holds this PGLite brain, so the harness cannot mint a token, and with the serve ' +
+    `stopped its health check fails. Pre-mint the token with the harness grant (scopes ${scopes.join(',')} and its operation list), then use ` +
+    `--token:\n${steps.map((step, i) => `  ${i + 1}. ${step}`).join('\n')}\n(Postgres brains mint fine while the serve runs.)`, { details: { steps, scopes, operations } });
 }
 
 /** The engine could not open because a live serve holds the PGLite brain (vs any other failure). */
@@ -945,13 +947,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     d.log('registrar mode (non-loopback url): hooks are NOT wired — they would talk to the LOCAL brain, not the registered remote serve. MCP registration only.');
   }
   const health = await probeServeHealth(url, d.fetchFn);
-  if (!health.ok) {
-    d.logError(
-      `no healthy gbrain serve at ${url} (${health.detail ?? 'unreachable'}) — ` +
-        'start `gbrain serve --http` on this box first (or pass --url/--port).',
-    );
-    return 1;
-  }
+  const verifyPending = harnessVerifyPending(health, flags, registrarMode, url, d); // #6661: logs the verdict
+  if (!health.ok && !verifyPending) return 1;
 
   // 2b. Ambient-writeback gate (WP3): resolved from the FILE plane only —
   // this lane is engine-free by design (the DB plane stays authoritative for
@@ -1086,7 +1083,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       // A live PGLite serve holds the brain. Without a token the mint below
       // would refuse anyway — refuse HERE with the same two escape hatches, so
       // the operator never sees a source-resolution error for a lock problem.
-      if (flags.token === undefined) throw liveServeRefusal();
+      if (flags.token === undefined) throw await liveServeRefusal({ tokenName: flags.tokenName, follow: skillsPolicy === 'follow' });
       // --token lane (the documented PGLite path): nothing is minted, so the
       // grant is the operator's own token. Leave the hooks UNPINNED — a hook
       // request that names no source resolves through the live serve's own
@@ -1265,7 +1262,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
         });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (isLiveServeFailure(msg, d)) throw liveServeRefusal();
+        if (isLiveServeFailure(msg, d)) throw await liveServeRefusal({ tokenName: flags.tokenName, follow: skillsPolicy === 'follow', ...(flags.source ? { source: flags.source } : {}) });
         throw e;
       }
       tokens.set(host, minted.token);
@@ -1678,7 +1675,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       'smoke test: token authenticated (initialize + tool dispatch reached); get_brain_identity ' +
         'unavailable — the serve likely runs a narrowed --surface (e.g. verbs). Counted as verified.',
     );
-  } else {
+  } else if (!verifyPending || !['unreachable', 'timeout'].includes(smoke.reason)) { // #6661: nothing answered, nothing to roll back
     d.logError(
       redactToken(
         `smoke test FAILED (${smoke.reason}): ${smoke.message}` +
@@ -2018,11 +2015,12 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     );
   }
 
+  const pendingFix = verifyPending && allConfirmed && !smokeOk ? finishPendingVerify(receipt, save, flags.raw, url, unpinnedHooks || flags.source ? null : hookSource, d) : null;
   if (flags.json) {
     emitJson(
       JSON.stringify(
         {
-          schema_version: 1,
+          schema_version: 1, ...harnessOutcomeFields(pendingFix, allConfirmed && smokeOk),
           url,
           engine: health.engine ?? null,
           serve_version: health.version ?? null,
@@ -2040,7 +2038,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       ),
     );
   }
-  return allConfirmed && smokeOk ? 0 : 1;
+  return pendingFix ? HARNESS_PENDING_VERIFY_EXIT_CODE : allConfirmed && smokeOk ? 0 : 1;
 }
 
 // ── Remove [C9/F2/C8] ───────────────────────────────────────────────────────
@@ -2515,6 +2513,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
           ...(instructionsProbes.length > 0 ? { instructions_blocks: instructionsProbes } : {}),
           ...(hookCarriers.length > 0 ? { hook_carriers: hookCarriers } : {}),
           pending_previous_tokens: receipt.token.previous_ids ?? [],
+          ...(receipt.verify_pending ? { status: 'partial', verify_pending: receipt.verify_pending } : {}),
           receipt_path: harnessReceiptPath(d.gbrainHome),
         },
         null,
@@ -2547,6 +2546,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
     if (receipt.token.previous_ids?.length) {
       d.log(`  pending: ${receipt.token.previous_ids.length} previous token(s) await revocation (re-run to converge): ${receipt.token.previous_ids.join(', ')}`);
     }
+    if (receipt.verify_pending) d.log(pendingVerifyStatusLine(receipt.verify_pending));
     if (degraded) {
       d.log('per-turn injection: needs a running gbrain serve on Postgres (MCP tools are the active seam).');
     }
@@ -2571,7 +2571,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
         'stop the serve and re-run `gbrain bootstrap harness --remove`, or revoke it with `gbrain auth revoke` and the id flag.',
     );
   }
-  return health.ok && tokenVerified !== false && allTargetsConfirmed && rotationConverged && !removalPending && instructionsOk
+  return health.ok && tokenVerified !== false && allTargetsConfirmed && rotationConverged && !removalPending && instructionsOk && !receipt.verify_pending
     ? 0
     : 1;
 }

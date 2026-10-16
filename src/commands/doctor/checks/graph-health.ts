@@ -342,6 +342,7 @@ export const timelineHistoryEntry: DoctorEntry = {
     'keyword_plan',
     'stale_embedding_effects',
     'google_file_modes',
+    'google_calendar_readable',
     'extractor_facts_expired',
     'conversation_label_facts',
     'conversation_outcomes_stale',

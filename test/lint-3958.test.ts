@@ -44,6 +44,23 @@ describe('#6133 placeholder-date skips inline code spans', () => {
   });
 });
 
+// #6538: a filename/path template (`YYYY-MM-DD-topic.md`, `notes/YYYY-MM-DD/`) names a pattern, not an
+// unfilled date. A bare prose example keeps the "backtick it" rule, and frontmatter stays strict.
+describe('#6538 placeholder-date skips filename and path templates', () => {
+  test('template tokens give no hits; bare prose examples and frontmatter still fire', () => {
+    const content = [
+      '---', 'title: Formats', 'type: note', 'file: YYYY-MM-DD-topic.md', '---', '',
+      'Dates use the ISO 8601 format: YYYY-MM-DD.',
+      'Meeting notes are named YYYY-MM-DD-topic.md.',
+      'Daily files live in journal/YYYY-MM-DD/ and exports in YYYY-MM-DD.json.',
+      'Named YYYY-MM-DD-topic.md, due YYYY-MM-DD.',
+      'Use YYYY-MM-DD here once confirmed.',
+    ].join('\n');
+    const hits = lintContent(content, 'test.md', { contentSanity: SANITY_OFF }).filter(i => i.rule === 'placeholder-date');
+    expect(hits.map(h => h.line)).toEqual([4, 7, 10, 11]);
+  });
+});
+
 describe('#3958 placeholder-date skips fenced code blocks', () => {
   test('YYYY-MM-DD inside a ``` fence is not a placeholder', () => {
     const content =

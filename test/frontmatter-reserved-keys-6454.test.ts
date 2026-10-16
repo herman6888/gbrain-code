@@ -144,10 +144,11 @@ async function staleKeysCase(engine: BrainEngine): Promise<void> {
       // The reporter's rows: stored `type`/`title` the file can never carry (and that disagree with nothing yet).
       await seedStaleReservedKeys(engine, sourceId, slug, { type: 'person', title: 'Example Person' });
       // Before the fix: source_changed / file_database_drift although the file is exactly the last publication.
-      expect(await put({ content, expected_revision: await revision() })).toMatchObject({ state: 'committed' });
-      const [row] = await engine.executeRaw<{ frontmatter: Record<string, unknown> }>('SELECT frontmatter FROM pages WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
-      expect(Object.keys(row.frontmatter)).not.toContain('type');
-      expect(Object.keys(row.frontmatter)).not.toContain('title');
+      // The stored row already matches the content (the stale keys are ignored), so the write is a committed no-op that
+      // leaves the file untouched; the stale keys are `repair frontmatter-keys`' to clean. (Before #6550 the agent's
+      // identical write restamped `trust_tier: unknown` and so rewrote the row.)
+      expect(await put({ content, expected_revision: await revision() })).toMatchObject({ state: 'committed', noop: true });
+      expect(readFileSync(file, 'utf8')).toBe(published);
 
       // Stale keys that disagree with the columns: still not drift, and the published file renders the columns ([R40]).
       await seedStaleReservedKeys(engine, sourceId, slug, { type: 'note', title: 'A Title The Columns Never Had', tags: ['stale-tag'], slug: 'people/elsewhere' });

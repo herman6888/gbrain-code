@@ -1,6 +1,6 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, independentGroup, publicationGroupKey, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
+import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, syncGroup, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues, independentGroup, sweepSegmentStorage } from './journal.ts';
 import { finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
@@ -12,6 +12,7 @@ import { isTerminal, type WriteRequest } from './model.ts';
 import { ownerExceptionLogText } from './publication-failure.ts';
 import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { PROJECTION_RETRY_READY_SQL, rebuildPendingPageProjections } from '../page-state/projections.ts';
+import { rebuildPendingSegmentedProjections } from '../page-body/projection.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { claimedHeadOrder } from './sync-window.ts';
 import { laneClaim, laneOf, laneRoots, laneTask } from './sync-lanes.ts';
@@ -104,8 +105,11 @@ export async function runResidentProjectionInvocation(engine: BrainEngine, hostI
   // Advisory and bounded by the caller's signal: a probe that cannot answer
   // (for example behind a table lock) counts as a waiting write.
   const writesWaiting = publicationConcurrency(engine) > 0 && await hasClaimableWrite(engine, hostId, excludeRoots, signal).catch(() => true);
-  return rebuildPendingPageProjections(engine, writesWaiting ? WRITE_WAITING_PROJECTION_PAGES : RESIDENT_PROJECTION_PAGES,
-    { deadlineMs: RESIDENT_PROJECTION_BUDGET_MS, now, retryCooldown: true });
+  const pages = writesWaiting ? WRITE_WAITING_PROJECTION_PAGES : RESIDENT_PROJECTION_PAGES;
+  // Wave B: queued segmented pages are rebuilt first, through their own route (one segment batch at a time).
+  const startedAt = now();
+  await rebuildPendingSegmentedProjections(engine, pages, { deadlineMs: RESIDENT_PROJECTION_BUDGET_MS, now });
+  return rebuildPendingPageProjections(engine, pages, { deadlineMs: Math.max(0, RESIDENT_PROJECTION_BUDGET_MS - (now() - startedAt)), now, retryCooldown: true });
 }
 
 const PARKED_WORKER: Promise<void> = Promise.resolve();
@@ -539,7 +543,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     if (!this.maintenanceWorker && (Date.now() >= this.nextMaintenance || this.publishedSinceMaintenance >= this.maintenanceVolume)) {
       this.nextMaintenance = Date.now() + 60_000;
       this.publishedSinceMaintenance = 0;
-      this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(() => vacuumPersistenceQueues(this.engine))
+      this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(() => sweepSegmentStorage(this.engine).catch(error => this.report(error)))
+        .then(() => vacuumPersistenceQueues(this.engine))
         .then(rows => { this.maintenanceVolume = 50 + Math.ceil(rows * 0.2); }).catch(error => this.report(error))
         .finally(() => { this.maintenanceWorker = undefined; });
     }
@@ -1030,18 +1035,15 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   }
   /** #5984: a claimed bulk sync head takes its directly following group members along; one row runs the single path. */
   private async executeOrGroup(row: WriteRequest, root: RootHold): Promise<boolean> {
-    // #5984 admit-ahead: a window group whose predecessor did not commit is cancelled, never published after it.
-    // A lane group may be claimed while its predecessor still publishes; its commit wait decides instead.
-    // A bulk-sync group member released mid-group follows the member before it, not only the previous group (#6153 class).
+    // #6712: a page publishes whatever its predecessor's fate; a lane group member released mid-group only waits while the
+    // member before it is still unfinished (#6153 class).
     const lane = laneOf(row);
-    const order = await claimedHeadOrder(this.engine, row, lane !== null);
-    if (order === 'wait') { await releaseUnpublishedClaim(this.statements, row, 'group_member_waiting'); return false; }
-    if (order) { for (const done of order) this.settled(done); return true; }
+    if (await claimedHeadOrder(this.engine, row, lane !== null) === 'wait') { await releaseUnpublishedClaim(this.statements, row, 'group_member_waiting'); return false; }
     const group = publicationGroupKey(row);
     // A managed import batch also groups on PGLite: its members share one transaction's guards there too.
     if (!group || this.engine.kind !== 'postgres' && !group.startsWith('import:')) return this.execute(row, root);
     // #6007: a put_pages or import batch publishes in groups of at most PAGE_BATCH_GROUP_MAX pages.
-    const followers = await claimGroupFollowers(this.engine, row, group, independentGroup(group) ? PAGE_BATCH_GROUP_MAX - 1 : 63);
+    const followers = await claimGroupFollowers(this.engine, row, group, syncGroup(group) ? 63 : PAGE_BATCH_GROUP_MAX - 1);
     if (!followers.length && !lane) return this.execute(row, root);
     const rows = [row, ...followers];
     for (const member of rows) this.executing.add(member.id);

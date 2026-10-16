@@ -2,6 +2,7 @@ import type { BrainEngine } from '../engine.ts';
 import { effectiveLinkExtractorWatermark } from '../link-extraction-watermark.ts';
 import { isQuarantined } from '../quarantine.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
+import { materializedSnapshot, segmentedOverCeiling } from './segmented-apply.ts';
 import { preparationConfigView } from './config-snapshot.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { maintenanceAttribution } from './attribution.ts';
@@ -11,6 +12,8 @@ import { formatMentionSummary, linkPhaseDeadline, mentionJsonFields, previewMent
 import { plannerStatsForLinkDrain } from '../planner-stats.ts';
 
 export interface ManagedLinkExtraction { pages: number; created: number; removed: number; timeline: number; skipped: number; remaining: number;
+  /** Pages skipped for a named reason (`page_body_segmented`: a segmented body over the 24 MiB single-string ceiling; it stays stale). */
+  skipped_reasons?: Record<string, number>;
   /** The mention pass (absent when the caller ran links only, as sync does). */
   mentions?: MentionPassResult; mention_due?: number; mention_last_pass_at?: string | null; }
 
@@ -83,8 +86,13 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
   const derive = async (slug: string, sourceId: string, stamp?: string) => {
     opts.signal?.throwIfAborted();
     done.add(`${sourceId}\0${slug}`);
-    const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+    const snapshot = await materializedSnapshot(engine, await engine.readPageSnapshot(slug, { sourceId }));
     if (!snapshot || isQuarantined(snapshot.page.frontmatter)) return;
+    if (segmentedOverCeiling(snapshot.page)) {
+      result.skipped++;
+      result.skipped_reasons = { ...result.skipped_reasons, page_body_segmented: (result.skipped_reasons?.page_body_segmented ?? 0) + 1 };
+      return;
+    }
     const prepared = await prepareAutomaticLinks(settings, slug, snapshot.page, sourceId);
     const outcome = await engine.transaction(async tx => withCoordinatedWrite(tx, [sourceId], async () => {
       await tx.lockPageKeys(prepared.pageKeys);
@@ -96,7 +104,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       }
       const written = await prepared.apply(tx);
       if (written.errors) return null;
-      const timeline = (await unrecordedCanonicalTimeline(tx, current.page.id, current.page, slug)).map(entry => ({ slug, date: entry.date,
+      const timeline = (await unrecordedCanonicalTimeline(tx, current.page.id, snapshot.page, slug)).map(entry => ({ slug, date: entry.date,
         source: entry.source, summary: entry.summary, detail: entry.detail || '', source_id: sourceId }));
       const added = timeline.length ? await tx.addTimelineEntriesBatch(timeline, { auditSite: 'extract.stale' }) : 0;
       const at = stamp ?? new Date().toISOString();

@@ -407,9 +407,10 @@ Options:
                       unlike toggling the flag on/off around the run, a
                       crash mid-invocation can't leave it stuck. Applies to
                       patterns, synthesize, conversation_facts_backfill,
-                      enrich_thin, skillopt, drift; no-op on phases with no such
-                      gate. Requires an EXPLICIT --phase <name> — a phase
-                      implied by --input or --drain does not count (bare
+                      enrich_thin, skillopt, drift, lint, consolidate; no-op
+                      on phases with no such gate. Requires an EXPLICIT
+                      --phase <name> — a phase implied by --input or
+                      --drain does not count (bare
                       --once, or --once with --input/--drain and no
                       explicit --phase, is a usage error).
   --eval-run          Eval harness run: honor GBRAIN_DECIDE_SLOTS (e.g. triage=on)
@@ -868,6 +869,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     dryRun: opts.dryRun,
     pull: opts.pull,
     phases,
+    directPhases: phases !== undefined,
     // Undefined for legacy unscoped runs; set for explicit source cycles,
     // path-derived cycles, and bare default-like non-default source cycles.
     sourceId: resolvedSourceId,

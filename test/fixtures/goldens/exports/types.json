@@ -62,6 +62,7 @@
           "addTakesBatch: (rows: TakeBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntriesBatch: (entries: TimelineBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntry: (slug: string, entry: TimelineInput, opts?: { skipExistenceCheck?: boolean; sourceId?: string; }) => Promise<boolean>",
+          "allocateBodyOccurrenceIds: (count: number) => Promise<number[]>",
           "batchLoadEmotionalInputs: (slugs?: string[]) => Promise<EmotionalWeightInputRow[]>",
           "connect: (config: EngineConfig) => Promise<void>",
           "consolidateFact: (id: number, takeId: number) => Promise<void>",
@@ -72,6 +73,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
+          "createSegmentedPageShell: (slug: string, meta: SegmentedPageMeta, opts: { sourceId: string; }) => Promise<{ id: number; }>",
           "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
@@ -81,7 +83,7 @@
           "deletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
           "disconnect: () => Promise<void>",
           "discoverOntologyDimensions: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<OntologyDimensionStat[]>",
-          "executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; }) => Promise<T[]>",
+          "executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; jitOff?: boolean; prepare?: boolean; }) => Promise<T[]>",
           "executeRawDirect: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; }) => Promise<T[]>",
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
@@ -92,6 +94,7 @@
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: PageReadScope & { sourceId?: string; sourceIds?: string[]; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
@@ -171,14 +174,17 @@
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
           "migrateFactsToCanonical: (phantomSlug: string, canonicalSlug: string, sourceId: string) => Promise<{ migrated: number; }>",
+          "openBodyStaging: (input: BodyStagingInput) => Promise<void>",
           "purgeDeletedPages: (olderThanHours: number, opts?: { dryRun?: boolean; }) => Promise<{ slugs: string[]; count: number; pages?: { slug: string; deleted_at: Date; }[]; }>",
           "putContradictionCacheEntry: (opts: { chunk_a_hash: string; chunk_b_hash: string; model_id: string; prompt_version: string; truncation_policy: string; verdict: Record<string, unknown>; ttl_seconds?: number; }) => Promise<void>",
           "putDreamVerdict: (filePath: string, contentHash: string, verdict: DreamVerdictInput) => Promise<void>",
           "putPage: (slug: string, page: PageInput, opts?: PageWriteOptions) => Promise<Page>",
           "putRawData: (slug: string, source: string, data: object, opts?: { sourceId?: string; }) => Promise<void>",
           "readEmbeddingStateCounts: (opts: { mode: \"ops\" | \"full\"; sourceIds?: string[]; purgeWindowHours: number; }) => Promise<EmbeddingStateCounts>",
+          "readManifest: (pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number; }) => Promise<ManifestRow[]>",
           "readPageSnapshot: (slug: string, opts?: PageSnapshotOptions) => Promise<PageSnapshot | null>",
           "readPageSnapshotsBatch: (refs: ReadonlyArray<{ slug: string; sourceId: string; }>, opts?: { maxBytes?: number; includeDeleted?: boolean; absentIsNull?: boolean; }) => Promise<PageSnapshotBatch>",
+          "readSegmentTexts: (sourceId: string, sha256s: readonly Uint8Array[]) => Promise<Map<string, Uint8Array>>",
           "readonly kind: \"postgres\" | \"pglite\"",
           "reconnect: (ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
@@ -207,17 +213,22 @@
           "searchTakesVector: (embedding: Float32Array, opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[]; eligibility?: ReadEligibility; }) => Promise<TakeHit[]>",
           "searchTitles: (query: string, opts?: SearchOpts) => Promise<SearchResult[]>",
           "searchVector: (embedding: Float32Array, opts?: SearchOpts) => Promise<SearchResult[]>",
+          "setBodyStagingState: (id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null; }) => Promise<void>",
           "setConfig: (key: string, value: string) => Promise<void>",
           "setEmotionalWeightBatch: (rows: EmotionalWeightWriteRow[]) => Promise<number>",
           "setPageAliases: (slug: string, sourceId: string, aliasNorms: string[], opts?: { inline?: boolean; }) => Promise<void>",
           "setPageEmbeddingSignature: (slug: string, opts: { sourceId?: string; signature: string; }) => Promise<void>",
           "softDeletePage: (slug: string, opts?: { sourceId?: string; }) => Promise<{ slug: string; } | null>",
           "softDeletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
+          "stageManifestRows: (rows: readonly ManifestRowInput[]) => Promise<void>",
+          "stageSegmentChunks: (pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn; }) => Promise<number[]>",
+          "stageSegmentTexts: (sourceId: string, texts: readonly SegmentTextInput[]) => Promise<{ inserted: number; }>",
           "stripStaleFrontmatterKeys: (opts: { sourceId: string; ids: number[]; }) => Promise<number>",
           "sumStaleChunkChars: (opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; }) => Promise<number>",
           "supersedeTake: (pageId: number, oldRow: number, newRow: Omit<TakeBatchInput, \"page_id\" | \"row_num\" | \"superseded_by\">) => Promise<{ oldRow: number; newRow: number; }>",
           "sweepContradictionCache: () => Promise<number>",
           "sweepDreamVerdicts: () => Promise<number>",
+          "sweepSegments: (opts?: SegmentSweepOptions) => Promise<SegmentSweepResult>",
           "transaction: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "transactionDirect: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "traverseGraph: (slug: string, depth?: number, opts?: TraverseGraphOpts) => Promise<GraphNode[]>",
@@ -367,7 +378,7 @@
         "kind": "interface",
         "members": [
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
           "doc_comment?: string | null | undefined",
           "embedded_at: Date | null",
@@ -394,7 +405,7 @@
         "kind": "interface",
         "members": [
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\" | \"image_asset\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\" | \"image_asset\"",
           "chunk_text: string",
           "doc_comment?: string | undefined",
           "embedding?: Float32Array<ArrayBufferLike> | undefined",
@@ -469,7 +480,7 @@
         "kind": "variable",
         "name": "DEGRADED_REASONS",
         "signature": [
-          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"rate_limited\", \"unreachable\", \"auth\", \"candidate_budget\", \"iterative_scan_unavailable\", \"egress_denied\", \"embedding_disabled\"]"
+          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"rate_limited\", \"unreachable\", \"auth\", \"candidate_budget\", \"iterative_scan_unavailable\", \"egress_denied\", \"embedding_disabled\", \"skipped_after_timeout\"]"
         ]
       },
       {
@@ -483,7 +494,7 @@
         "kind": "type",
         "name": "DegradedReason",
         "signature": [
-          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\""
+          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\" | \"skipped_after_timeout\""
         ]
       },
       {
@@ -496,7 +507,7 @@
       {
         "kind": "interface",
         "members": [
-          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\" | undefined",
+          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\" | \"skipped_after_timeout\" | undefined",
           "stage: \"embed_unavailable\" | \"embed_timeout\" | \"expansion_failed\" | \"expansion_partial\" | \"rescore_skipped\" | \"vector_arm_failed\" | \"keyword_arm_failed\" | \"title_arm_failed\" | \"budget_dropped_all\" | \"budget_truncated\" | \"keyword_zero\" | \"cache_prestamp\" | \"reranker_skipped\" | \"rerank_passthrough\" | \"rerank_failed\" | \"keyword_relaxed_carried\" | \"safe_index_pending\" | \"vector_candidates_incomplete\" | \"keyword_candidates_incomplete\" | \"projection_pending\" | \"projection_status_unknown\" | \"keyword_count_unavailable\""
         ],
         "name": "DegradedStageEntry"
@@ -734,6 +745,7 @@
           "answerability?: AnswerabilityVerdict | undefined",
           "autocut?: AutocutDecision | undefined",
           "cache?: { status: \"hit\" | \"miss\" | \"disabled\"; similarity?: number; age_seconds?: number; } | undefined",
+          "cosine_rescore?: \"js_fallback\" | undefined",
           "decide?: Partial<Record<\"rerank\" | \"intent\" | \"evidence\" | \"answerable\" | \"injection\" | \"recall_needed\" | \"triage\" | \"grounding\" | \"conflict\", DecideSlotMeta>> | undefined",
           "degraded?: DegradedStageEntry[] | undefined",
           "detail_resolved: \"low\" | \"medium\" | \"high\" | null",
@@ -897,6 +909,8 @@
       {
         "kind": "interface",
         "members": [
+          "body_bytes?: number | null | undefined",
+          "body_storage?: BodyStorage | undefined",
           "compiled_truth: string",
           "content_hash?: string | undefined",
           "contextual_retrieval_mode?: \"none\" | \"title\" | \"per_chunk_synopsis\" | null | undefined",
@@ -1014,7 +1028,11 @@
       {
         "kind": "interface",
         "members": [
+          "body_bytes?: number | undefined",
+          "body_generation?: number | undefined",
+          "body_storage?: \"segmented\" | undefined",
           "compiled_truth: string",
+          "content_hash?: string | null | undefined",
           "frontmatter: Record<string, unknown>",
           "id: number",
           "is_deleted?: boolean | null | undefined",
@@ -1040,6 +1058,7 @@
           "addTakesBatch: (rowsIn: TakeBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntriesBatch: (entries: TimelineBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntry: (slug: string, entry: TimelineInput, opts?: { skipExistenceCheck?: boolean; sourceId?: string; }) => Promise<boolean>",
+          "allocateBodyOccurrenceIds: (count: number) => Promise<number[]>",
           "batchLoadEmotionalInputs: (slugs?: string[]) => Promise<EmotionalWeightInputRow[]>",
           "connect: (config: EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager; }) => Promise<void>",
           "connectionManager: ConnectionManager | null",
@@ -1051,6 +1070,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
+          "createSegmentedPageShell: (slug: string, meta: SegmentedPageMeta, opts: { sourceId: string; }) => Promise<{ id: number; }>",
           "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
@@ -1060,7 +1080,7 @@
           "deletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
           "disconnect: () => Promise<void>",
           "discoverOntologyDimensions: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<OntologyDimensionStat[]>",
-          "executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; }) => Promise<T[]>",
+          "executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; jitOff?: boolean; prepare?: boolean; }) => Promise<T[]>",
           "executeRawDirect: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; }) => Promise<T[]>",
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "explainVectorSearch: (embedding: Float32Array, opts?: SearchOpts) => Promise<Record<string, unknown>>",
@@ -1072,6 +1092,7 @@
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
@@ -1153,6 +1174,7 @@
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
           "migrateFactsToCanonical: (phantomSlug: string, canonicalSlug: string, sourceId: string) => Promise<{ migrated: number; }>",
           "onCheckout: (listener: () => void) => () => void",
+          "openBodyStaging: (input: BodyStagingInput) => Promise<void>",
           "private _beforeDisconnect",
           "private _bulkRetryOptsCache",
           "private _chunkWritesInTransaction",
@@ -1179,6 +1201,7 @@
           "private jitOffRead",
           "private keywordStatementTimeout",
           "private keywordStatementTimeoutSetting",
+          "private keywordTimeouts",
           "private onPoisoned",
           "private poisonedDiscards",
           "private poolHealth",
@@ -1198,8 +1221,10 @@
           "putPage: (slug: string, page: PageInput, opts?: PageWriteOptions) => Promise<Page>",
           "putRawData: (slug: string, source: string, data: object, opts?: { sourceId?: string; }) => Promise<void>",
           "readEmbeddingStateCounts: (opts: { mode: \"ops\" | \"full\"; sourceIds?: string[]; purgeWindowHours: number; }) => Promise<EmbeddingStateCounts>",
+          "readManifest: (pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number; }) => Promise<ManifestRow[]>",
           "readPageSnapshot: (slug: string, opts?: PageSnapshotOptions) => Promise<PageSnapshot | null>",
           "readPageSnapshotsBatch: (refs: ReadonlyArray<{ slug: string; sourceId: string; }>, opts?: { maxBytes?: number; includeDeleted?: boolean; absentIsNull?: boolean; }) => Promise<PageSnapshotBatch>",
+          "readSegmentTexts: (sourceId: string, sha256s: readonly Uint8Array[]) => Promise<Map<string, Uint8Array>>",
           "readonly kind: \"postgres\"",
           "reconnect: (ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
@@ -1228,6 +1253,7 @@
           "searchTakesVector: (embedding: Float32Array, opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[]; eligibility?: ReadEligibility; }) => Promise<TakeHit[]>",
           "searchTitles: (query: string, opts?: SearchOpts) => Promise<SearchResult[]>",
           "searchVector: (embedding: Float32Array, opts?: SearchOpts) => Promise<SearchResult[]>",
+          "setBodyStagingState: (id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null; }) => Promise<void>",
           "setConfig: (key: string, value: string) => Promise<void>",
           "setEmotionalWeightBatch: (rows: EmotionalWeightWriteRow[]) => Promise<number>",
           "setPageAliases: (slug: string, sourceId: string, aliasNorms: string[], opts?: { inline?: boolean; }) => Promise<void>",
@@ -1235,11 +1261,15 @@
           "softDeletePage: (slug: string, opts?: { sourceId?: string; }) => Promise<{ slug: string; } | null>",
           "softDeletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
           "sql: postgres.Sql<{}>",
+          "stageManifestRows: (rows: readonly ManifestRowInput[]) => Promise<void>",
+          "stageSegmentChunks: (pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn; }) => Promise<number[]>",
+          "stageSegmentTexts: (sourceId: string, texts: readonly SegmentTextInput[]) => Promise<{ inserted: number; }>",
           "stripStaleFrontmatterKeys: (opts: { sourceId: string; ids: number[]; }) => Promise<number>",
           "sumStaleChunkChars: (opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; }) => Promise<number>",
           "supersedeTake: (pageId: number, oldRow: number, newRow: Omit<TakeBatchInput, \"page_id\" | \"row_num\" | \"superseded_by\">) => Promise<{ oldRow: number; newRow: number; }>",
           "sweepContradictionCache: () => Promise<number>",
           "sweepDreamVerdicts: () => Promise<number>",
+          "sweepSegments: (opts?: SegmentSweepOptions) => Promise<SegmentSweepResult>",
           "transaction: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "transactionDirect: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "traverseGraph: (slug: string, depth?: number, opts?: TraverseGraphOpts) => Promise<GraphNode[]>",
@@ -1397,6 +1427,7 @@
           "hnswIterativeScan?: \"relaxed_order\" | \"strict_order\" | \"off\" | undefined",
           "include_slug_prefixes?: string[] | undefined",
           "intentWeighting?: boolean | undefined",
+          "keywordTimeoutCache?: boolean | undefined",
           "language?: string | undefined",
           "limit?: number | undefined",
           "minTrust?: \"user_confirmed\" | \"operator_curated\" | \"tool_observed\" | \"agent_written\" | \"unknown\" | \"external_untrusted\" | undefined",
@@ -1445,7 +1476,7 @@
           "chronicle_boost?: number | undefined",
           "chunk_id: number",
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
           "content_flag?: { reason: string; detail: string; } | undefined",
           "content_hash?: string | null | undefined",
@@ -1522,7 +1553,7 @@
         "kind": "interface",
         "members": [
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
           "model: string | null",
           "page_id: number",
@@ -1920,7 +1951,7 @@
         "kind": "type",
         "name": "ToolLoopStopReason",
         "signature": [
-          "\"length\" | \"unrecoverable\" | \"end\" | \"refusal\" | \"content_filter\" | \"max_turns\" | \"aborted\" | \"empty_response\""
+          "\"aborted\" | \"length\" | \"end\" | \"unrecoverable\" | \"refusal\" | \"content_filter\" | \"max_turns\" | \"empty_response\""
         ]
       },
       {
@@ -3316,6 +3347,7 @@
           "addTakesBatch: (rows: TakeBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntriesBatch: (entries: TimelineBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntry: (slug: string, entry: TimelineInput, opts?: { skipExistenceCheck?: boolean; sourceId?: string; }) => Promise<boolean>",
+          "allocateBodyOccurrenceIds: (count: number) => Promise<number[]>",
           "batchLoadEmotionalInputs: (slugs?: string[]) => Promise<EmotionalWeightInputRow[]>",
           "connect: (config: EngineConfig) => Promise<void>",
           "consolidateFact: (id: number, takeId: number) => Promise<void>",
@@ -3326,6 +3358,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
+          "createSegmentedPageShell: (slug: string, meta: SegmentedPageMeta, opts: { sourceId: string; }) => Promise<{ id: number; }>",
           "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
           "deleteCodeEdgesForChunks: (chunkIds: number[]) => Promise<void>",
@@ -3335,7 +3368,7 @@
           "deletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
           "disconnect: () => Promise<void>",
           "discoverOntologyDimensions: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<OntologyDimensionStat[]>",
-          "executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; }) => Promise<T[]>",
+          "executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number; jitOff?: boolean; prepare?: boolean; }) => Promise<T[]>",
           "executeRawDirect: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; }) => Promise<T[]>",
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
@@ -3346,6 +3379,7 @@
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: PageReadScope & { sourceId?: string; sourceIds?: string[]; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
@@ -3425,14 +3459,17 @@
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
           "migrateFactsToCanonical: (phantomSlug: string, canonicalSlug: string, sourceId: string) => Promise<{ migrated: number; }>",
+          "openBodyStaging: (input: BodyStagingInput) => Promise<void>",
           "purgeDeletedPages: (olderThanHours: number, opts?: { dryRun?: boolean; }) => Promise<{ slugs: string[]; count: number; pages?: { slug: string; deleted_at: Date; }[]; }>",
           "putContradictionCacheEntry: (opts: { chunk_a_hash: string; chunk_b_hash: string; model_id: string; prompt_version: string; truncation_policy: string; verdict: Record<string, unknown>; ttl_seconds?: number; }) => Promise<void>",
           "putDreamVerdict: (filePath: string, contentHash: string, verdict: DreamVerdictInput) => Promise<void>",
           "putPage: (slug: string, page: PageInput, opts?: PageWriteOptions) => Promise<Page>",
           "putRawData: (slug: string, source: string, data: object, opts?: { sourceId?: string; }) => Promise<void>",
           "readEmbeddingStateCounts: (opts: { mode: \"ops\" | \"full\"; sourceIds?: string[]; purgeWindowHours: number; }) => Promise<EmbeddingStateCounts>",
+          "readManifest: (pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number; }) => Promise<ManifestRow[]>",
           "readPageSnapshot: (slug: string, opts?: PageSnapshotOptions) => Promise<PageSnapshot | null>",
           "readPageSnapshotsBatch: (refs: ReadonlyArray<{ slug: string; sourceId: string; }>, opts?: { maxBytes?: number; includeDeleted?: boolean; absentIsNull?: boolean; }) => Promise<PageSnapshotBatch>",
+          "readSegmentTexts: (sourceId: string, sha256s: readonly Uint8Array[]) => Promise<Map<string, Uint8Array>>",
           "readonly kind: \"postgres\" | \"pglite\"",
           "reconnect: (ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
@@ -3461,17 +3498,22 @@
           "searchTakesVector: (embedding: Float32Array, opts?: SearchOpts & { takesHoldersAllowList?: string[]; sourceId?: string; sourceIds?: string[]; eligibility?: ReadEligibility; }) => Promise<TakeHit[]>",
           "searchTitles: (query: string, opts?: SearchOpts) => Promise<SearchResult[]>",
           "searchVector: (embedding: Float32Array, opts?: SearchOpts) => Promise<SearchResult[]>",
+          "setBodyStagingState: (id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null; }) => Promise<void>",
           "setConfig: (key: string, value: string) => Promise<void>",
           "setEmotionalWeightBatch: (rows: EmotionalWeightWriteRow[]) => Promise<number>",
           "setPageAliases: (slug: string, sourceId: string, aliasNorms: string[], opts?: { inline?: boolean; }) => Promise<void>",
           "setPageEmbeddingSignature: (slug: string, opts: { sourceId?: string; signature: string; }) => Promise<void>",
           "softDeletePage: (slug: string, opts?: { sourceId?: string; }) => Promise<{ slug: string; } | null>",
           "softDeletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
+          "stageManifestRows: (rows: readonly ManifestRowInput[]) => Promise<void>",
+          "stageSegmentChunks: (pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn; }) => Promise<number[]>",
+          "stageSegmentTexts: (sourceId: string, texts: readonly SegmentTextInput[]) => Promise<{ inserted: number; }>",
           "stripStaleFrontmatterKeys: (opts: { sourceId: string; ids: number[]; }) => Promise<number>",
           "sumStaleChunkChars: (opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; }) => Promise<number>",
           "supersedeTake: (pageId: number, oldRow: number, newRow: Omit<TakeBatchInput, \"page_id\" | \"row_num\" | \"superseded_by\">) => Promise<{ oldRow: number; newRow: number; }>",
           "sweepContradictionCache: () => Promise<number>",
           "sweepDreamVerdicts: () => Promise<number>",
+          "sweepSegments: (opts?: SegmentSweepOptions) => Promise<SegmentSweepResult>",
           "transaction: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "transactionDirect: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "traverseGraph: (slug: string, depth?: number, opts?: TraverseGraphOpts) => Promise<GraphNode[]>",
@@ -4633,21 +4675,21 @@
         "kind": "variable",
         "name": "importFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; bodyPolicy?: PageBodyPolicy; }) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "function",
         "name": "importFromContent",
         "signature": [
-          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; coordinated?: boolean; existingSnapshot?: PageSnapshot | null; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; preserveGateMarkers?: boolean; allowEmptyOverwrite?: boolean; overrideTier?: unknown; writeGate?: WriteGateInput; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; } & ImportFenceOptions) => Promise<ImportResult>"
+          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; coordinated?: boolean; existingSnapshot?: PageSnapshot | null; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; segmentedOwner?: SegmentedStagingOwner; reuseSegments?: SegmentedImport; remote?: boolean; preserveGateMarkers?: boolean; allowEmptyOverwrite?: boolean; overrideTier?: unknown; writeGate?: WriteGateInput; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; } & ImportFenceOptions) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "function",
         "name": "importFromFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; bodyPolicy?: PageBodyPolicy; }) => Promise<ImportResult>"
         ]
       },
       {
@@ -4662,6 +4704,13 @@
         "name": "isImageFilePath",
         "signature": [
           "(relativePath: string) => boolean"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "loadBrainTimeZone",
+        "signature": [
+          "(engine: BrainEngine) => Promise<string | undefined>"
         ]
       },
       {
@@ -4870,6 +4919,13 @@
         "name": "CodeRef"
       },
       {
+        "kind": "variable",
+        "name": "EXACT_SLUG_SHAPE_RE",
+        "signature": [
+          "RegExp"
+        ]
+      },
+      {
         "kind": "interface",
         "members": [
           "dir: string",
@@ -5037,6 +5093,13 @@
         "name": "SlugResolver"
       },
       {
+        "kind": "variable",
+        "name": "TIMELINE_HEADING_RE",
+        "signature": [
+          "RegExp"
+        ]
+      },
+      {
         "kind": "interface",
         "members": [
           "effectiveDate?: string | Date | null | undefined",
@@ -5091,6 +5154,13 @@
         "name": "deriveTimelineAnchor",
         "signature": [
           "(input: TimelineAnchorInput) => TimelineCandidate | null"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "exactSlugCandidates",
+        "signature": [
+          "(value: string) => string[]"
         ]
       },
       {
@@ -5282,6 +5352,13 @@
         "name": "ContentHold"
       },
       {
+        "kind": "variable",
+        "name": "FENCE_TOGGLE_RE",
+        "signature": [
+          "RegExp"
+        ]
+      },
+      {
         "kind": "interface",
         "members": [
           "block: string",
@@ -5429,6 +5506,26 @@
         "name": "ParsedMarkdown"
       },
       {
+        "kind": "type",
+        "name": "ParsedMarkdownFields",
+        "signature": [
+          "{ title: string; slug: string; type: PageType; typeExplicit?: boolean | undefined; inferredSubtype?: { type: string; name: string; } | undefined; tags: string[]; errors?: ParseValidationError[] | undefined; warnings?: ParseValidationWarning[] | undefined; recovery?: FrontmatterRecovery | undefined; }"
+        ]
+      },
+      {
+        "kind": "interface",
+        "members": [
+          "body: string",
+          "errors: ParseValidationError[]",
+          "frontmatter: Record<string, unknown>",
+          "lifted: string",
+          "recovery?: FrontmatterRecovery | undefined",
+          "safeContent: string",
+          "warnings: ParseValidationWarning[]"
+        ],
+        "name": "ParsedMarkdownHead"
+      },
+      {
         "kind": "variable",
         "name": "RECOVERY_VERSION",
         "signature": [
@@ -5455,6 +5552,13 @@
           "frontmatterOverrides?: Record<string, unknown> | undefined"
         ],
         "name": "SerializePageOpts"
+      },
+      {
+        "kind": "function",
+        "name": "bareTimelineSectionLine",
+        "signature": [
+          "(raw: string, datedBullets: number) => \"end\" | \"blank\" | \"bullet\" | \"wrap\" | \"other\""
+        ]
       },
       {
         "kind": "function",
@@ -5486,6 +5590,13 @@
       },
       {
         "kind": "function",
+        "name": "embeddedTitleLineValue",
+        "signature": [
+          "(line: string) => string | null"
+        ]
+      },
+      {
+        "kind": "function",
         "name": "findTimelineSplitIndex",
         "signature": [
           "(lines: string[]) => number"
@@ -5507,6 +5618,20 @@
       },
       {
         "kind": "function",
+        "name": "frontmatterQuoteFence",
+        "signature": [
+          "(lifted: string) => \"none\" | \"closed\" | \"open\""
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "h1TitleLineValue",
+        "signature": [
+          "(raw: string) => string | null"
+        ]
+      },
+      {
+        "kind": "function",
         "name": "inferTypeAndSubtypeFromPack",
         "signature": [
           "(filePath: string | undefined, pack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; subtypes?: ReadonlyArray<{ name: string; when: { path_pattern?: string; frontmatter_field?: string; frontmatter_value?: unknown; }; }>; }>; }, frontmatter?: Record<string, unknown>) => { type: PageType; subtype?: string; }"
@@ -5517,6 +5642,13 @@
         "name": "inferTypeFromPack",
         "signature": [
           "(filePath: string | undefined, pack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; }>; }) => PageType"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "isBareTimelineHeading",
+        "signature": [
+          "(raw: string) => boolean"
         ]
       },
       {
@@ -5535,9 +5667,44 @@
       },
       {
         "kind": "function",
+        "name": "isTimelineHeadingAfterDash",
+        "signature": [
+          "(trimmed: string) => boolean"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "nullBytesError",
+        "signature": [
+          "(line: number) => ParseValidationError"
+        ]
+      },
+      {
+        "kind": "function",
         "name": "parseMarkdown",
         "signature": [
           "(content: string, filePath?: string, opts?: ParseOpts) => ParsedMarkdown"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "parseMarkdownHead",
+        "signature": [
+          "(content: string, opts?: ParseOpts) => ParsedMarkdownHead"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "parsedMarkdownFields",
+        "signature": [
+          "(head: ParsedMarkdownHead, bodyTitle: () => string, filePath?: string, opts?: ParseOpts) => ParsedMarkdownFields"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "quoteAmbiguousFrontmatterLine",
+        "signature": [
+          "(line: string) => { key: string; replacement: string; } | null"
         ]
       },
       {
@@ -5601,6 +5768,20 @@
         "name": "splitBody",
         "signature": [
           "(body: string) => { compiled_truth: string; timeline: string; }"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "timelineSentinelKind",
+        "signature": [
+          "(trimmed: string) => \"marker\" | \"dash\" | null"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "validatorFrontmatterFence",
+        "signature": [
+          "(lines: readonly string[]) => { firstNonEmpty: number; opens: boolean; closeLine: number; }"
         ]
       },
       {
@@ -6144,7 +6325,7 @@
       {
         "kind": "class",
         "members": [
-          "canonical?: \"unknown\" | \"keyword_candidates_incomplete\" | \"projection_pending\" | \"timeout\" | \"rate_limited\" | \"embedding_disabled\" | \"writer_lock_unavailable\" | \"writer_pool_capacity\" | \"owner_unavailable\" | \"recovery_required\" | \"queue_capacity\" | \"write_quota_exhausted\" | \"write_quota_insufficient\" | \"write_capacity_backpressure\" | \"revision_required\" | \"revision_conflict\" | \"idempotency_conflict\" | \"source_changed\" | \"write_pending\" | \"storage_error\" | \"cancelled\" | \"permission_denied\" | \"scope_denied\" | \"invalid_params\" | \"not_found\" | \"page_not_found\" | \"page_identity_changed\" | \"write_claim_lost\" | \"request_too_large\" | \"response_too_large\" | \"writer_registration_required\" | \"writer_identity_invalid\" | \"writer_not_initialized\" | \"writer_coordinator_required\" | \"fact_already_expired\" | \"source_writeback_required\" | \"unsupported_mutation_protocol\" | \"writer_upgrade_required\" | \"writer_not_quiesced\" | \"skill_bundle_required\" | \"take_row_collision\" | \"invalid_source_uri\" | \"writer_admin_locked\" | \"connector_account_changed\" | \"connector_intent_outdated\" | \"checkpoint_validation_timeout\" | \"invalid_connector_text\" | \"connector_holds_exhausted\" | \"connector_fence_below_timeline\" | \"core_budget_exceeded\" | \"core_mark_owner_only\" | \"core_remote_edit_refused\" | \"core_delete_owner_only\" | \"timeline_rows_would_be_removed\" | \"purged_content\" | \"preparation_stalled\" | \"fence_unrenderable\" | \"write_outcome_unknown\" | \"embedding_failed\" | \"bucket_not_found\" | \"database_error\" | \"unknown_transport\" | \"extraction_failed\" | \"fact_not_found\" | \"provenance_required\" | \"unavailable\" | \"budget_unsatisfiable\" | \"embedding_budget_below_worst_case\" | \"access_command_failed\" | \"access_denied_test_user\" | \"access_env_missing\" | \"acknowledgment_unavailable\" | \"admin_policy_enforced\" | \"ambient_capture_off\" | \"ambiguous_id\" | \"ambiguous_ref\" | \"ambiguous_skill\" | \"answer_not_yours\" | \"answer_pending\" | \"answer_unavailable\" | \"api_not_enabled\" | \"approval_required\" | \"autopilot_job_owned_by_other_brain\" | \"budget_below_recent_runtime\" | \"backup_dump_failed\" | \"benchmark_duplicate_task_id\" | \"benchmark_empty\" | \"benchmark_exists\" | \"benchmark_judge_llm_no_rubric\" | \"benchmark_judge_qrels_no_expected\" | \"benchmark_judge_rule_no_checks\" | \"benchmark_judge_unknown_kind\" | \"benchmark_malformed\" | \"benchmark_missing_judge\" | \"benchmark_missing_task\" | \"benchmark_missing_task_id\" | \"benchmark_not_found\" | \"benchmark_rule_check_bad_arg\" | \"benchmark_rule_check_malformed\" | \"benchmark_rule_check_unknown_op\" | \"bootstrap_empty\" | \"bootstrap_pending_review\" | \"bridge_ownership_conflict\" | \"cache_quota_exceeded\" | \"capacity_paused\" | \"catalog_capacity_exceeded\" | \"catalog_unavailable\" | \"changed_since_preview\" | \"chronicle_skipped\" | \"no_pricing\" | \"checkpoint_missing\" | \"claim_already_used\" | \"client_json_unreadable\" | \"client_json_wrong_type\" | \"client_shape_invalid\" | \"code_callees_requires_symbol\" | \"code_callers_requires_symbol\" | \"code_def_requires_symbol\" | \"code_refs_requires_symbol\" | \"code_reused\" | \"colon_slug_windows_write_through\" | \"command_failed\" | \"commit_lock_busy\" | \"commit_paths_invalid\" | \"concurrent_write\" | \"config_error\" | \"confirmation_required\" | \"conflicting_source_scope\" | \"connection_lost\" | \"chunkless_pages_healable\" | \"consent_required\" | \"consent_timeout\" | \"consumers_without_heartbeat\" | \"content_repair_needs_human\" | \"content_rejected\" | \"cost_cap_exceeded\" | \"cost_preview_requires_yes\" | \"cursor_incarnation_retired\" | \"cycle_failed\" | \"d_sel_too_small\" | \"delta_cursor_upgrade_required\" | \"deleted_page_chunks_overdue\" | \"demo_graph_failed\" | \"demo_import_failed\" | \"demo_verification_failed\" | \"derived_cap_exhausted\" | \"destination_not_ready\" | \"drain_stalled\" | \"managed_sync_not_moving\" | \"dream_breaker_tripped\" | \"dirty_tree\" | \"doctor_tier_unavailable\" | \"effect_not_failed\" | \"embedding_auth_failed\" | \"embedding_configuration\" | \"embedding_model_mismatch\" | \"embedding_plane_split\" | \"embedding_state_unknown\" | \"embedding_storage_unavailable\" | \"embedding_unavailable\" | \"embedding_unconfigured\" | \"embedding_width_mismatch\" | \"engine_graduated\" | \"eval_suite_unwired\" | \"export_limit\" | \"extractor_identity_mismatch\" | \"fact_withdrawn\" | \"facts_absorb_write_refused\" | \"facts_backstop_skipped\" | \"facts_drain_deferred\" | \"facts_drain_job_failed\" | \"facts_payload_expired\" | \"feedback_disabled\" | \"feedback_not_authorized\" | \"fetch_failed\" | \"fix_not_writable\" | \"file_removed_during_scan\" | \"file_too_large\" | \"follow_approval_required\" | \"forget_requires_owner\" | \"frontmatter_slug_conflict\" | \"full_resync_required\" | \"gate_failed\" | \"ghost_mass_delete_refused\" | \"ghost_storage_unknown\" | \"git_branch_unborn\" | \"git_checkout_required\" | \"git_detached_head\" | \"git_index_locked\" | \"git_index_stale\" | \"git_operation_in_progress\" | \"git_push_unavailable\" | \"git_target_unsafe\" | \"git_unavailable\" | \"graduation_drain_timeout\" | \"graduation_embedding_dimension_mismatch\" | \"graduation_foreign_host_binding\" | \"graduation_in_progress\" | \"graduation_interrupted\" | \"graduation_rollback_writes_lost\" | \"graduation_source_writer_held\" | \"graduation_split_brain\" | \"graduation_target_auth_failed\" | \"graduation_target_ddl_unreachable\" | \"graduation_target_not_empty\" | \"graduation_target_unsupported\" | \"graduation_unclassified_table\" | \"graduation_unsupported_platform\" | \"graduation_verify_failed\" | \"graph_incomplete\" | \"host_identity_mismatch\" | \"harness_hook_duplicates\" | \"harness_hook_unowned\" | \"head_blocked\" | \"held_failed\" | \"held_out_overlaps_benchmark\" | \"held_out_required_for_bundled\" | \"independent_principal_required\" | \"insufficient_scope\" | \"integrate_conflict\" | \"internal\" | \"internal_error\" | \"interrupted\" | \"invalid_acknowledgment\" | \"invalid_client\" | \"invalid_fence\" | \"unclosed_ambiguous_tail\" | \"tail_exposure_approval\" | \"sync_in_progress\" | \"invalid_frontmatter\" | \"invalid_grant_clock_skew\" | \"invalid_grant_revoked\" | \"invalid_grant_testing_expiry\" | \"invalid_rating\" | \"invalid_receipt\" | \"invalid_receipt_transition\" | \"invalid_request\" | \"invalid_source\" | \"invalid_source_pin\" | \"invalid_token\" | \"invalid_write_wait\" | \"legacy_job_selection_invalid\" | \"legacy_jobs_active\" | \"local_conflict\" | \"lock_busy\" | \"loops_extraction_skipped\" | \"maintenance_backpressure\" | \"maintenance_lock_busy\" | \"managed_failure_unsettled\" | \"merge_recommended\" | \"managed_sync_flag_refused\" | \"managed_pull_skipped\" | \"manual_only_skipped\" | \"membership_inactive\" | \"membership_not_found\" | \"method_not_allowed\" | \"migration_lease_lost\" | \"migration_declined\" | \"migration_failed\" | \"migrations_pending\" | \"migrations_running\" | \"missing_source_scope\" | \"missing_source_value\" | \"models_strict_violation\" | \"no_refresh_token\" | \"no_routing_eval\" | \"no_skill_md\" | \"no_worker\" | \"no_worker_surface\" | \"not_a_git_repo\" | \"not_owner_host\" | \"not_connected\" | \"no_brain\" | \"overlapping_path\" | \"page_projection_conflict\" | \"page_shrink_refused\" | \"page_too_large_for_inline\" | \"parse_error\" | \"parser_regression\" | \"pasted_wrong_url\" | \"payload_too_large\" | \"pattern_claims_pending\" | \"pending_writes\" | \"persistence_restart_required\" | \"pool_inflight_over_budget\" | \"deep_health_probe_failed\" | \"serve_self_exit_suppressed\" | \"serve_unhealthy_exit\" | \"persistence_write_stall\" | \"push_unconfirmed\" | \"schema_lock_blocked\" | \"pg_connection_recovery_failed\" | \"pg_connection_stuck\" | \"pg_pool_stalled\" | \"pg_statement_build_failed\" | \"pglite_busy\" | \"pglite_vector_index_too_large\" | \"plan_output_failed\" | \"plan_stale\" | \"port_in_use\" | \"preview_changed\" | \"profile_incompatible\" | \"projection_owner_resident\" | \"knock_on_exhausted\" | \"publication_pending\" | \"purge_blocked_pending_recovery\" | \"purge_lookup_timeout\" | \"question_not_found\" | \"question_owner_only\" | \"receipt_conflict\" | \"receipt_fence_changed\" | \"receipt_fence_required\" | \"receipt_identity_mismatch\" | \"pat_file_unreadable\" | \"redirect_uri_mismatch\" | \"ref_not_in_answer\" | \"refresh_dirty\" | \"refresh_diverged\" | \"refresh_drain_timeout\" | \"refresh_no_upstream\" | \"refresh_not_managed\" | \"refresh_not_owner\" | \"refresh_source_changed\" | \"relay_disabled\" | \"relay_session_expired\" | \"relay_unreachable\" | \"rename_held\" | \"request_already_submitted\" | \"requirements_changed\" | \"requires_local_engine\" | \"resume_spec_mismatch\" | \"result_too_large\" | \"revision_changed\" | \"revision_unavailable\" | \"scope_missing\" | \"search_cursor_requires_keyword\" | \"search_mode_local_only\" | \"search_offset_over_cap\" | \"serve_build_drift\" | \"serve_port_in_use\" | \"serve_status_only\" | \"setup_harness_unsupported\" | \"setup_hosted_connection\" | \"setup_owner_conflict\" | \"shared_skills_unavailable\" | \"shared_skills_unsupported\" | \"skill_asset_not_found\" | \"skill_candidate_invalid\" | \"skill_not_found\" | \"skill_retention_capacity\" | \"skill_unavailable\" | \"slug_page_mismatch\" | \"slug_root_mode_mismatch\" | \"source_binding_required\" | \"source_id_taken\" | \"source_mismatch\" | \"source_not_ready\" | \"source_profile_no_backfill\" | \"source_referenced\" | \"source_root_conflict\" | \"split_bad_ratio\" | \"split_unparseable\" | \"stale_unavailable\" | \"state_mismatch\" | \"sync_not_applicable\" | \"sync_cursor_replaced\" | \"sync_parser_regression\" | \"target_escape\" | \"timeline_comment_markup\" | \"topology_change_required\" | \"transcript_secret_exposure\" | \"triage_unreliable_backoff\" | \"trust_raise_refused\" | \"two_consumers_on_host\" | \"trusted_local_only\" | \"unexpected_file_bytes\" | \"unexpected_staging_bytes\" | \"unknown_command\" | \"unknown_flag\" | \"unknown_method\" | \"unknown_source\" | \"unknown_tool\" | \"unpriced_model\" | \"unmanaged_path\" | \"unsupported_export_data\" | \"upstream\" | \"verification_failed\" | \"withdrawal_capacity\" | \"withdrawal_provenance\" | \"write_capacity_low\" | \"write_gate_rejected\" | \"write_held\" | \"worktree_dirty\" | \"writer_admin_intent_required\" | \"writer_admin_state_changed\" | \"writer_busy\" | \"writer_identity_publish_failed\" | \"writer_manifest_mismatch\" | \"writer_manifest_rescope_required\" | \"writer_manifest_unsafe\" | \"writer_regrant_required\" | \"writer_transfer_conflict\" | \"writer_transfer_required\" | \"wrong_account_consented\" | \"schema_pack_too_large\" | \"schema_pack_emit_mismatch\" | undefined",
+          "canonical?: \"unknown\" | \"keyword_candidates_incomplete\" | \"projection_pending\" | \"timeout\" | \"rate_limited\" | \"embedding_disabled\" | \"writer_lock_unavailable\" | \"writer_pool_capacity\" | \"owner_unavailable\" | \"recovery_required\" | \"queue_capacity\" | \"write_quota_exhausted\" | \"write_quota_insufficient\" | \"write_capacity_backpressure\" | \"revision_required\" | \"revision_conflict\" | \"idempotency_conflict\" | \"source_changed\" | \"write_pending\" | \"storage_error\" | \"cancelled\" | \"permission_denied\" | \"scope_denied\" | \"invalid_params\" | \"not_found\" | \"page_not_found\" | \"page_identity_changed\" | \"write_claim_lost\" | \"request_too_large\" | \"response_too_large\" | \"writer_registration_required\" | \"writer_identity_invalid\" | \"writer_not_initialized\" | \"writer_coordinator_required\" | \"fact_already_expired\" | \"source_writeback_required\" | \"unsupported_mutation_protocol\" | \"writer_upgrade_required\" | \"writer_not_quiesced\" | \"skill_bundle_required\" | \"take_row_collision\" | \"invalid_source_uri\" | \"writer_admin_locked\" | \"connector_account_changed\" | \"connector_intent_outdated\" | \"checkpoint_validation_timeout\" | \"invalid_connector_text\" | \"connector_holds_exhausted\" | \"connector_fence_below_timeline\" | \"core_budget_exceeded\" | \"core_mark_owner_only\" | \"core_remote_edit_refused\" | \"core_delete_owner_only\" | \"timeline_rows_would_be_removed\" | \"purged_content\" | \"preparation_stalled\" | \"fence_unrenderable\" | \"write_outcome_unknown\" | \"embedding_failed\" | \"bucket_not_found\" | \"database_error\" | \"unknown_transport\" | \"extraction_failed\" | \"fact_not_found\" | \"provenance_required\" | \"unavailable\" | \"budget_unsatisfiable\" | \"embedding_budget_below_worst_case\" | \"access_command_failed\" | \"access_denied_test_user\" | \"access_env_missing\" | \"acknowledgment_unavailable\" | \"admin_policy_enforced\" | \"ambient_capture_off\" | \"ambiguous_id\" | \"ambiguous_ref\" | \"ambiguous_skill\" | \"answer_not_yours\" | \"answer_pending\" | \"answer_unavailable\" | \"api_not_enabled\" | \"approval_required\" | \"autopilot_job_owned_by_other_brain\" | \"body_staging_expired\" | \"budget_below_recent_runtime\" | \"backup_dump_failed\" | \"backup_too_large\" | \"belief_coverage_required\" | \"belief_stale_preparation\" | \"benchmark_duplicate_task_id\" | \"benchmark_empty\" | \"benchmark_exists\" | \"benchmark_judge_llm_no_rubric\" | \"benchmark_judge_qrels_no_expected\" | \"benchmark_judge_rule_no_checks\" | \"benchmark_judge_unknown_kind\" | \"benchmark_malformed\" | \"benchmark_missing_judge\" | \"benchmark_missing_task\" | \"benchmark_missing_task_id\" | \"benchmark_not_found\" | \"benchmark_rule_check_bad_arg\" | \"benchmark_rule_check_malformed\" | \"benchmark_rule_check_unknown_op\" | \"bootstrap_empty\" | \"bootstrap_pending_review\" | \"bridge_ownership_conflict\" | \"coverage_from\" | \"coverage_gap\" | \"cache_quota_exceeded\" | \"calendar_unreadable\" | \"capacity_paused\" | \"catalog_capacity_exceeded\" | \"catalog_unavailable\" | \"changed_since_preview\" | \"chronicle_skipped\" | \"page_body_segmented\" | \"no_pricing\" | \"checkpoint_missing\" | \"claim_already_used\" | \"client_json_unreadable\" | \"client_json_wrong_type\" | \"client_shape_invalid\" | \"code_callees_requires_symbol\" | \"code_callers_requires_symbol\" | \"code_def_requires_symbol\" | \"code_refs_requires_symbol\" | \"code_reused\" | \"colon_slug_windows_write_through\" | \"command_failed\" | \"commit_lock_busy\" | \"commit_paths_invalid\" | \"concurrent_write\" | \"config_error\" | \"confirmation_required\" | \"conflicting_source_scope\" | \"connection_lost\" | \"chunkless_pages_healable\" | \"consent_required\" | \"consent_timeout\" | \"consumers_without_heartbeat\" | \"content_repair_needs_human\" | \"content_rejected\" | \"corpus_chat_unavailable\" | \"corpus_window_backoff\" | \"corpus_window_dead_lettered\" | \"cost_cap_exceeded\" | \"cost_preview_requires_yes\" | \"cursor_incarnation_retired\" | \"cycle_failed\" | \"d_sel_too_small\" | \"delta_cursor_upgrade_required\" | \"deleted_page_chunks_overdue\" | \"demo_graph_failed\" | \"demo_import_failed\" | \"demo_verification_failed\" | \"derived_cap_exhausted\" | \"destination_not_ready\" | \"drain_stalled\" | \"managed_sync_not_moving\" | \"dream_breaker_tripped\" | \"dirty_tree\" | \"doctor_tier_unavailable\" | \"effect_not_failed\" | \"embed_backfill_stalled\" | \"embedding_auth_failed\" | \"embedding_configuration\" | \"embedding_identity_unqualified\" | \"embedding_model_mismatch\" | \"embedding_plane_split\" | \"embedding_state_unknown\" | \"embedding_storage_unavailable\" | \"embedding_unavailable\" | \"embedding_unconfigured\" | \"embedding_width_mismatch\" | \"engine_graduated\" | \"entity_types_unavailable\" | \"eval_suite_unwired\" | \"export_limit\" | \"extractor_identity_mismatch\" | \"fact_withdrawn\" | \"facts_absorb_write_refused\" | \"facts_backstop_skipped\" | \"facts_drain_deferred\" | \"facts_drain_job_failed\" | \"facts_payload_expired\" | \"feedback_disabled\" | \"feedback_not_authorized\" | \"fetch_failed\" | \"fix_not_writable\" | \"file_drift\" | \"file_removed_during_scan\" | \"file_too_large\" | \"follow_approval_required\" | \"forget_requires_owner\" | \"frontmatter_slug_conflict\" | \"full_resync_required\" | \"gate_failed\" | \"ghost_mass_delete_refused\" | \"ghost_storage_unknown\" | \"git_branch_unborn\" | \"git_durability_not_enabled\" | \"git_checkout_required\" | \"git_detached_head\" | \"git_index_locked\" | \"git_index_stale\" | \"git_target_pending\" | \"git_operation_in_progress\" | \"git_push_unavailable\" | \"git_target_unsafe\" | \"git_unavailable\" | \"graduation_drain_timeout\" | \"graduation_embedding_dimension_mismatch\" | \"graduation_foreign_host_binding\" | \"graduation_in_progress\" | \"graduation_interrupted\" | \"graduation_rollback_writes_lost\" | \"graduation_source_writer_held\" | \"graduation_split_brain\" | \"graduation_target_auth_failed\" | \"graduation_target_ddl_unreachable\" | \"graduation_target_not_empty\" | \"graduation_target_unsupported\" | \"graduation_unclassified_table\" | \"graduation_unsupported_platform\" | \"graduation_verify_failed\" | \"graph_incomplete\" | \"host_identity_mismatch\" | \"harness_hook_duplicates\" | \"harness_hook_unowned\" | \"head_blocked\" | \"held_failed\" | \"held_out_overlaps_benchmark\" | \"held_out_required_for_bundled\" | \"independent_principal_required\" | \"insufficient_scope\" | \"integrate_conflict\" | \"internal\" | \"internal_error\" | \"interrupted\" | \"invalid_acknowledgment\" | \"invalid_client\" | \"invalid_fence\" | \"unclosed_ambiguous_tail\" | \"tail_exposure_approval\" | \"sync_in_progress\" | \"invalid_frontmatter\" | \"invalid_grant_clock_skew\" | \"invalid_grant_revoked\" | \"invalid_grant_testing_expiry\" | \"invalid_rating\" | \"invalid_receipt\" | \"invalid_receipt_transition\" | \"invalid_request\" | \"invalid_source\" | \"invalid_source_pin\" | \"invalid_token\" | \"invalid_write_wait\" | \"ipc_path_too_long\" | \"legacy_job_selection_invalid\" | \"legacy_jobs_active\" | \"local_conflict\" | \"lock_busy\" | \"loops_extraction_skipped\" | \"maintenance_backpressure\" | \"maintenance_lock_busy\" | \"managed_failure_unsettled\" | \"merge_recommended\" | \"managed_sync_flag_refused\" | \"managed_pull_skipped\" | \"manual_only_skipped\" | \"membership_inactive\" | \"membership_not_found\" | \"method_not_allowed\" | \"migration_lease_lost\" | \"migration_declined\" | \"migration_failed\" | \"migrations_pending\" | \"migrations_running\" | \"missing_source_scope\" | \"missing_source_value\" | \"models_strict_violation\" | \"no_refresh_token\" | \"no_routing_eval\" | \"no_skill_md\" | \"no_worker\" | \"no_worker_surface\" | \"not_a_git_repo\" | \"not_owner_host\" | \"not_connected\" | \"no_brain\" | \"overlapping_path\" | \"page_projection_conflict\" | \"page_shrink_refused\" | \"page_too_large_for_inline\" | \"parse_error\" | \"parser_regression\" | \"pasted_wrong_url\" | \"payload_too_large\" | \"pattern_claims_pending\" | \"patterns_min_interval\" | \"pending_verify\" | \"pending_writes\" | \"persistence_restart_required\" | \"pool_inflight_over_budget\" | \"deep_health_probe_failed\" | \"serve_self_exit_suppressed\" | \"serve_unhealthy_exit\" | \"persistence_write_stall\" | \"push_unconfirmed\" | \"schema_lock_blocked\" | \"pg_connection_recovery_failed\" | \"pg_connection_stuck\" | \"pg_pool_stalled\" | \"pg_statement_build_failed\" | \"pglite_busy\" | \"pglite_vector_index_too_large\" | \"plan_output_failed\" | \"plan_stale\" | \"port_in_use\" | \"preview_changed\" | \"profile_incompatible\" | \"projection_owner_resident\" | \"knock_on_exhausted\" | \"keyword_skipped_after_timeout\" | \"publication_pending\" | \"purge_blocked_pending_recovery\" | \"purge_lookup_timeout\" | \"purge_mirror_unwritable\" | \"question_not_found\" | \"question_owner_only\" | \"read_budget_exhausted\" | \"receipt_conflict\" | \"receipt_fence_changed\" | \"receipt_fence_required\" | \"receipt_identity_mismatch\" | \"pat_file_unreadable\" | \"redirect_uri_mismatch\" | \"ref_not_in_answer\" | \"refresh_dirty\" | \"refresh_diverged\" | \"refresh_drain_timeout\" | \"refresh_no_upstream\" | \"refresh_not_managed\" | \"refresh_not_owner\" | \"refresh_source_changed\" | \"relay_disabled\" | \"relay_session_expired\" | \"relay_unreachable\" | \"rename_held\" | \"request_already_submitted\" | \"requirements_changed\" | \"requires_local_engine\" | \"resume_spec_mismatch\" | \"result_too_large\" | \"revision_changed\" | \"revision_unavailable\" | \"scope_missing\" | \"search_cursor_requires_keyword\" | \"search_mode_local_only\" | \"search_offset_over_cap\" | \"serve_build_drift\" | \"serve_port_in_use\" | \"serve_status_only\" | \"setup_harness_unsupported\" | \"setup_hosted_connection\" | \"setup_owner_conflict\" | \"shared_skills_unavailable\" | \"shared_skills_unsupported\" | \"skill_asset_not_found\" | \"skill_candidate_invalid\" | \"skill_not_found\" | \"skill_retention_capacity\" | \"skill_unavailable\" | \"slug_page_mismatch\" | \"slug_root_mode_mismatch\" | \"source_binding_required\" | \"source_id_taken\" | \"source_mismatch\" | \"source_not_ready\" | \"source_profile_no_backfill\" | \"source_referenced\" | \"source_root_conflict\" | \"split_bad_ratio\" | \"split_unparseable\" | \"stale_unavailable\" | \"state_mismatch\" | \"sync_not_applicable\" | \"sync_drain_lease_held\" | \"sync_first_run_in_progress\" | \"sync_no_successful_sync\" | \"sync_cursor_replaced\" | \"sync_parser_regression\" | \"target_escape\" | \"timeline_comment_markup\" | \"topology_change_required\" | \"transcript_secret_exposure\" | \"triage_unreliable_backoff\" | \"trust_raise_refused\" | \"two_consumers_on_host\" | \"trusted_local_only\" | \"unexpected_file_bytes\" | \"unexpected_staging_bytes\" | \"unknown_command\" | \"unknown_flag\" | \"unknown_method\" | \"unknown_source\" | \"unknown_tool\" | \"unpriced_model\" | \"unmanaged_database_path\" | \"unmanaged_path\" | \"unsupported_export_data\" | \"upstream\" | \"verification_failed\" | \"withdrawal_capacity\" | \"withdrawal_provenance\" | \"write_capacity_low\" | \"write_gate_rejected\" | \"write_held\" | \"worktree_dirty\" | \"writer_admin_intent_required\" | \"writer_admin_state_changed\" | \"writer_busy\" | \"writer_identity_publish_failed\" | \"writer_manifest_mismatch\" | \"writer_manifest_rescope_required\" | \"writer_manifest_unsafe\" | \"writer_regrant_required\" | \"writer_transfer_conflict\" | \"writer_transfer_required\" | \"wrong_account_consented\" | \"schema_pack_too_large\" | \"schema_pack_emit_mismatch\" | undefined",
           "canonicalCode: string",
           "cause?: unknown",
           "code: ErrorCode",
@@ -6356,6 +6537,7 @@
           "addTakesBatch: (rowsIn: TakeBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntriesBatch: (entries: TimelineBatchInput[], opts?: BatchOpts) => Promise<number>",
           "addTimelineEntry: (slug: string, entry: TimelineInput, opts?: { skipExistenceCheck?: boolean; sourceId?: string; }) => Promise<boolean>",
+          "allocateBodyOccurrenceIds: (count: number) => Promise<number[]>",
           "batchLoadEmotionalInputs: (slugs?: string[]) => Promise<EmotionalWeightInputRow[]>",
           "closeRetainingLock: () => Promise<LockHandle>",
           "connect: (config: EngineConfig) => Promise<void>",
@@ -6369,6 +6551,7 @@
           "countStalePagesForExtraction: (opts?: { sourceId?: string; versionTs?: string; attendance?: \"exclude\" | \"blocked\"; }) => Promise<number>",
           "countStaleTakes: (opts?: StaleTakeOpts) => Promise<number>",
           "countUnconsolidatedFacts: (source_id: string) => Promise<number>",
+          "createSegmentedPageShell: (slug: string, meta: SegmentedPageMeta, opts: { sourceId: string; }) => Promise<{ id: number; }>",
           "createVersion: (slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot; }) => Promise<PageVersion>",
           "db: PGlite",
           "deleteChunks: (slug: string, opts?: { sourceId?: string; }) => Promise<void>",
@@ -6390,6 +6573,7 @@
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
           "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
           "getAllConfig: () => Promise<Record<string, string>>",
           "getAllSlugs: (opts?: { sourceId?: string; }) => Promise<Set<string>>",
@@ -6469,6 +6653,7 @@
           "markPagesExtractedBatch: (refs: Array<{ slug: string; source_id: string; extractedAt?: string; }>, defaultExtractedAt: string) => Promise<number>",
           "mergeOntologyFact: (obs: OntologyObservationInput) => Promise<OntologyMergeResult>",
           "migrateFactsToCanonical: (phantomSlug: string, canonicalSlug: string, sourceId: string) => Promise<{ migrated: number; }>",
+          "openBodyStaging: (input: BodyStagingInput) => Promise<void>",
           "private _adoptedLock",
           "private _attachDatabase",
           "private _beforeDisconnect",
@@ -6507,8 +6692,10 @@
           "putPage: (slug: string, page: PageInput, opts?: PageWriteOptions) => Promise<Page>",
           "putRawData: (slug: string, source: string, data: object, opts?: { sourceId?: string; }) => Promise<void>",
           "readEmbeddingStateCounts: (opts: { mode: \"ops\" | \"full\"; sourceIds?: string[]; purgeWindowHours: number; }) => Promise<EmbeddingStateCounts>",
+          "readManifest: (pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number; }) => Promise<ManifestRow[]>",
           "readPageSnapshot: (slug: string, opts?: PageSnapshotOptions) => Promise<PageSnapshot | null>",
           "readPageSnapshotsBatch: (refs: ReadonlyArray<{ slug: string; sourceId: string; }>, opts?: { maxBytes?: number; includeDeleted?: boolean; absentIsNull?: boolean; }) => Promise<PageSnapshotBatch>",
+          "readSegmentTexts: (sourceId: string, sha256s: readonly Uint8Array[]) => Promise<Map<string, Uint8Array>>",
           "readonly kind: \"pglite\"",
           "reconnect: (_ctx?: { error?: unknown; }) => Promise<void>",
           "refreshPageBody: (slug: string, sourceId: string, compiledTruth: string, timeline: string, contentHash: string) => Promise<void>",
@@ -6537,17 +6724,22 @@
           "searchTakesVector: (embedding: Float32Array, opts?: SearchOpts & { takesHoldersAllowList?: string[]; eligibility?: ReadEligibility; }) => Promise<TakeHit[]>",
           "searchTitles: (query: string, opts?: SearchOpts) => Promise<SearchResult[]>",
           "searchVector: (embedding: Float32Array, opts?: SearchOpts) => Promise<SearchResult[]>",
+          "setBodyStagingState: (id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null; }) => Promise<void>",
           "setConfig: (key: string, value: string) => Promise<void>",
           "setEmotionalWeightBatch: (rows: EmotionalWeightWriteRow[]) => Promise<number>",
           "setPageAliases: (slug: string, sourceId: string, aliasNorms: string[], opts?: { inline?: boolean; }) => Promise<void>",
           "setPageEmbeddingSignature: (slug: string, opts: { sourceId?: string; signature: string; }) => Promise<void>",
           "softDeletePage: (slug: string, opts?: { sourceId?: string; }) => Promise<{ slug: string; } | null>",
           "softDeletePages: (slugs: string[], opts: { sourceId: string; }) => Promise<string[]>",
+          "stageManifestRows: (rows: readonly ManifestRowInput[]) => Promise<void>",
+          "stageSegmentChunks: (pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn; }) => Promise<number[]>",
+          "stageSegmentTexts: (sourceId: string, texts: readonly SegmentTextInput[]) => Promise<{ inserted: number; }>",
           "stripStaleFrontmatterKeys: (opts: { sourceId: string; ids: number[]; }) => Promise<number>",
           "sumStaleChunkChars: (opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; }) => Promise<number>",
           "supersedeTake: (pageId: number, oldRow: number, newRow: Omit<TakeBatchInput, \"page_id\" | \"row_num\" | \"superseded_by\">) => Promise<{ oldRow: number; newRow: number; }>",
           "sweepContradictionCache: () => Promise<number>",
           "sweepDreamVerdicts: () => Promise<number>",
+          "sweepSegments: (opts?: SegmentSweepOptions) => Promise<SegmentSweepResult>",
           "transaction: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "transactionDirect: <T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions) => Promise<T>",
           "traverseGraph: (slug: string, depth?: number, opts?: TraverseGraphOpts) => Promise<GraphNode[]>",
@@ -7520,6 +7712,7 @@
           "include_slug_prefixes?: string[] | undefined",
           "intentWeighting?: boolean | undefined",
           "keywordArmConfidenceFloor?: number | null | undefined",
+          "keywordTimeoutCache?: boolean | undefined",
           "language?: string | undefined",
           "limit?: number | undefined",
           "metadataBoostGate?: MetadataBoostGate | undefined",
@@ -7734,7 +7927,7 @@
         "kind": "function",
         "name": "cosineReScore",
         "signature": [
-          "(engine: BrainEngine, results: SearchResult[], queryEmbedding: Float32Array, column?: string, imageSpace?: { queryEmbedding: Float32Array; column: string; }, attribute?: boolean) => Promise<SearchResult[]>"
+          "(engine: BrainEngine, results: SearchResult[], queryEmbedding: Float32Array, column?: string, imageSpace?: { queryEmbedding: Float32Array; column: string; }, attribute?: boolean, onFallback?: () => void) => Promise<SearchResult[]>"
         ]
       },
       {
@@ -8251,7 +8444,7 @@
         "kind": "interface",
         "members": [
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
           "doc_comment?: string | null | undefined",
           "embedded_at: Date | null",
@@ -8278,7 +8471,7 @@
         "kind": "interface",
         "members": [
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\" | \"image_asset\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\" | \"image_asset\"",
           "chunk_text: string",
           "doc_comment?: string | undefined",
           "embedding?: Float32Array<ArrayBufferLike> | undefined",
@@ -8353,7 +8546,7 @@
         "kind": "variable",
         "name": "DEGRADED_REASONS",
         "signature": [
-          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"rate_limited\", \"unreachable\", \"auth\", \"candidate_budget\", \"iterative_scan_unavailable\", \"egress_denied\", \"embedding_disabled\"]"
+          "readonly [\"no_provider\", \"provider_error\", \"timeout\", \"variant_embed_failed\", \"original_embed_failed\", \"first_result_truncated\", \"no_key\", \"empty_result_set\", \"malformed_shape\", \"budget\", \"rate_limited\", \"unreachable\", \"auth\", \"candidate_budget\", \"iterative_scan_unavailable\", \"egress_denied\", \"embedding_disabled\", \"skipped_after_timeout\"]"
         ]
       },
       {
@@ -8367,7 +8560,7 @@
         "kind": "type",
         "name": "DegradedReason",
         "signature": [
-          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\""
+          "\"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\" | \"skipped_after_timeout\""
         ]
       },
       {
@@ -8380,7 +8573,7 @@
       {
         "kind": "interface",
         "members": [
-          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\" | undefined",
+          "reason?: \"candidate_budget\" | \"iterative_scan_unavailable\" | \"no_provider\" | \"provider_error\" | \"timeout\" | \"variant_embed_failed\" | \"original_embed_failed\" | \"first_result_truncated\" | \"no_key\" | \"empty_result_set\" | \"malformed_shape\" | \"budget\" | \"rate_limited\" | \"unreachable\" | \"auth\" | \"egress_denied\" | \"embedding_disabled\" | \"skipped_after_timeout\" | undefined",
           "stage: \"embed_unavailable\" | \"embed_timeout\" | \"expansion_failed\" | \"expansion_partial\" | \"rescore_skipped\" | \"vector_arm_failed\" | \"keyword_arm_failed\" | \"title_arm_failed\" | \"budget_dropped_all\" | \"budget_truncated\" | \"keyword_zero\" | \"cache_prestamp\" | \"reranker_skipped\" | \"rerank_passthrough\" | \"rerank_failed\" | \"keyword_relaxed_carried\" | \"safe_index_pending\" | \"vector_candidates_incomplete\" | \"keyword_candidates_incomplete\" | \"projection_pending\" | \"projection_status_unknown\" | \"keyword_count_unavailable\""
         ],
         "name": "DegradedStageEntry"
@@ -8618,6 +8811,7 @@
           "answerability?: AnswerabilityVerdict | undefined",
           "autocut?: AutocutDecision | undefined",
           "cache?: { status: \"hit\" | \"miss\" | \"disabled\"; similarity?: number; age_seconds?: number; } | undefined",
+          "cosine_rescore?: \"js_fallback\" | undefined",
           "decide?: Partial<Record<\"rerank\" | \"intent\" | \"evidence\" | \"answerable\" | \"injection\" | \"recall_needed\" | \"triage\" | \"grounding\" | \"conflict\", DecideSlotMeta>> | undefined",
           "degraded?: DegradedStageEntry[] | undefined",
           "detail_resolved: \"low\" | \"medium\" | \"high\" | null",
@@ -8781,6 +8975,8 @@
       {
         "kind": "interface",
         "members": [
+          "body_bytes?: number | null | undefined",
+          "body_storage?: BodyStorage | undefined",
           "compiled_truth: string",
           "content_hash?: string | undefined",
           "contextual_retrieval_mode?: \"none\" | \"title\" | \"per_chunk_synopsis\" | null | undefined",
@@ -8898,7 +9094,11 @@
       {
         "kind": "interface",
         "members": [
+          "body_bytes?: number | undefined",
+          "body_generation?: number | undefined",
+          "body_storage?: \"segmented\" | undefined",
           "compiled_truth: string",
+          "content_hash?: string | null | undefined",
           "frontmatter: Record<string, unknown>",
           "id: number",
           "is_deleted?: boolean | null | undefined",
@@ -9047,6 +9247,7 @@
           "hnswIterativeScan?: \"relaxed_order\" | \"strict_order\" | \"off\" | undefined",
           "include_slug_prefixes?: string[] | undefined",
           "intentWeighting?: boolean | undefined",
+          "keywordTimeoutCache?: boolean | undefined",
           "language?: string | undefined",
           "limit?: number | undefined",
           "minTrust?: \"user_confirmed\" | \"operator_curated\" | \"tool_observed\" | \"agent_written\" | \"unknown\" | \"external_untrusted\" | undefined",
@@ -9095,7 +9296,7 @@
           "chronicle_boost?: number | undefined",
           "chunk_id: number",
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
           "content_flag?: { reason: string; detail: string; } | undefined",
           "content_hash?: string | null | undefined",
@@ -9172,7 +9373,7 @@
         "kind": "interface",
         "members": [
           "chunk_index: number",
-          "chunk_source: \"compiled_truth\" | \"timeline\" | \"fenced_code\"",
+          "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
           "model: string | null",
           "page_id: number",

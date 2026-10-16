@@ -69,24 +69,27 @@ export async function assertUnmanagedCanonicalWriter(engine: SqlEngine, operatio
       user_message: `gbrain stopped ${operation} because your brain switched to managed writes while it ran. Nothing was written; running the same command again uses the managed path.` } });
 }
 
-/** The legacy engine copier cannot transfer permanent IDs, withdrawals or ownership. */
+/** The legacy engine copier cannot transfer permanent IDs, withdrawals, ownership or the belief ledger. */
 export async function assertLegacyEngineMigration(engine: SqlEngine, migration: EngineMigrationSide = { side: 'source', from: 'pglite', to: 'postgres' }): Promise<void> {
-  const tables = ['persistence_requests', 'fact_withdrawals', 'persistence_worktrees'] as const;
+  const tables = ['belief_events', 'persistence_requests', 'fact_withdrawals', 'persistence_worktrees'] as const;
   // Older migration sources can predate these tables. Do not interpret any
   // other database failure as an empty history.
   const present = await engine.executeRaw<{ name: string }>(
     'SELECT name FROM unnest($1::text[]) AS t(name) WHERE to_regclass(name) IS NOT NULL', [tables]);
+  const held: string[] = [];
   for (const table of tables) {
     if (!present.some(row => row.name === table)) continue;
     const [row] = await engine.executeRaw<{ present: boolean }>(`SELECT EXISTS(SELECT 1 FROM ${table}) AS present`);
-    if (!row?.present) continue;
-    const why = `The ${migration.side === 'source' ? 'brain' : 'target datastore'} has rows in ${table}, and the engine copier cannot carry request IDs, withdrawals or canonical ownership.`;
-    throw opError('writer_coordinator_required',
-      'Engine migration cannot discard durable write history, withdrawal protection, or canonical ownership.',
-      migration.side === 'target' ? 'Choose an empty target database; the source brain is unchanged.'
-        : 'Keep this datastore; nothing changed. Ask the user how to proceed.',
-      { why, reason: 'persistence_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
+    if (row?.present) held.push(table);
   }
+  if (!held.length) return;
+  const ledger = held.includes('belief_events') ? ' The belief ledger (belief_events) is recorded history no Markdown rebuild can recover.' : '';
+  const why = `The ${migration.side === 'source' ? 'brain' : 'target datastore'} has rows in ${held.join(', ')}, and the engine copier cannot carry request IDs, withdrawals, canonical ownership or the belief ledger.${ledger}`;
+  throw opError('writer_coordinator_required',
+    'Engine migration cannot discard durable write history, withdrawal protection, canonical ownership, or the belief ledger.',
+    migration.side === 'target' ? 'Choose an empty target database; the source brain is unchanged.'
+      : 'Keep this datastore; nothing changed. Ask the user how to proceed.',
+    { why, reason: 'persistence_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
 }
 
 /** Legacy reinit may rename only after acquiring the stable sibling kernel lock. */

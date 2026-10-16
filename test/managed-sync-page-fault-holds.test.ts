@@ -21,7 +21,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
-import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { DEFER_PER_ENTRY, performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { readGitHold, readGitSourceHolds } from '../src/core/persistence/sync-holds.ts';
 import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
 import { headCommittedBytes, HOLD_ATTEMPTS_NEEDS_HUMAN, pinnedWorktreeConflict } from '../src/core/persistence/sync-page-fault.ts';
@@ -382,7 +382,7 @@ test('when HEAD moves past the pinned target during the run, the drain takes exa
   }
 }), 120_000);
 
-test('a file committed between admission and publication (raw_file_changed) is re-frozen once and imported as HEAD has it; a file that changes again is held', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+test('a file committed between admission and publication (raw_file_changed) is retried after the manifest end and imported as HEAD has it; #6712: a file that keeps changing is held after DEFER_PER_ENTRY retries', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'a.md': note('Alpha one.'), 'b.md': note('Beta one.'), 'c.md': note('Gamma one.') });
     expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
@@ -406,18 +406,28 @@ test('a file committed between admission and publication (raw_file_changed) is r
       expect(once.converted_from_failed).toHaveLength(1);
       expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 1 change 0');
       expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
-      // A file that moves again under its re-frozen request is held (never a third request for the same entry).
+      // #6712: a file that moves again under its retried request is deferred again, and imported once it holds still.
       for (const name of ['a', 'b', 'c']) writeFileSync(join(f.root, `${name}.md`), note(`${name} four.`));
-      const pin4 = commit(f.root, 'version four');
+      commit(f.root, 'version four');
       commits = 0; versions = 2;
       const twice = await performManagedSync(engine, { ...f.opts, noBulk: true });
-      expect(twice).toMatchObject({ status: 'synced', toCommit: pin4, held_count: 1, held: [{ path: 'b.md', code: 'worktree_dirty' }] });
+      expect(twice.status).toBe('synced');
+      expect(twice.held ?? []).toEqual([]);
+      expect(twice.converted_from_failed).toHaveLength(2);
       expect(commits).toBe(2);
-      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 1 change 0');
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 2 change 1');
+      // A file that moves under every retry is held after DEFER_PER_ENTRY of them (never a fifth request for the same entry).
+      for (const name of ['a', 'b', 'c']) writeFileSync(join(f.root, `${name}.md`), note(`${name} five.`));
+      const pin5 = commit(f.root, 'version five');
+      commits = 0; versions = DEFER_PER_ENTRY + 1;
+      const restless = await performManagedSync(engine, { ...f.opts, noBulk: true });
+      expect(restless).toMatchObject({ status: 'synced', toCommit: pin5, held_count: 1, held: [{ path: 'b.md', code: 'worktree_dirty' }] });
+      expect(commits).toBe(DEFER_PER_ENTRY + 1);
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 2 change 1');
       // The next sync re-screens the hold (the blob at HEAD differs from the hold's) and imports the latest commit.
       const settled = await performManagedSync(engine, { ...f.opts, noBulk: true });
       expect(settled.status).toBe('synced');
-      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 2 change 1');
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain(`b round ${DEFER_PER_ENTRY + 1} change ${DEFER_PER_ENTRY}`);
       expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
     } finally { engine.executeRaw = executeRaw; await disposePersistenceConsumer(engine); }
   }

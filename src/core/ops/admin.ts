@@ -19,6 +19,7 @@ import { VERSION } from '../../version.ts';
 import { resolveActiveEmbeddingColumnFromEngine } from '../search/embedding-column.ts';
 import { memoizedHealth } from '../health-memo.ts';
 import { LARGE_PAGES_CAPABILITY } from './get-page-body.ts';
+import { isSegmentedPage, pageBodyBytes } from '../page-body/page-shape.ts';
 
 // --- Admin ---
 
@@ -223,9 +224,17 @@ const get_versions: Operation = {
     }
     const plain = page(await ctx.engine.getVersions(p.slug as string, opts));
     const versions = canReadWriteAttribution(ctx) ? await attributeVersions(ctx.engine, plain) : plain;
-    if (ctx.remote === false) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth),
-      ...(typeof v.timeline === 'string' ? { timeline: sanitizeRemoteBody(v.timeline) } : {}) }));
+    // Wave B: a segmented version's body is never returned whole; body_ref names its size and the windowed read.
+    return versions.map(v => {
+      if (isSegmentedPage(v)) {
+        const { compiled_truth: _b, timeline: _t, ...rest } = v;
+        return { ...rest, body_ref: { version_id: v.id, total_bytes: pageBodyBytes(v),
+          read: { tool: 'get_page', arguments: { slug: p.slug, version_id: v.id, body: 'window' } } } };
+      }
+      if (ctx.remote === false) return v;
+      return { ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth),
+        ...(typeof v.timeline === 'string' ? { timeline: sanitizeRemoteBody(v.timeline) } : {}) };
+    });
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },

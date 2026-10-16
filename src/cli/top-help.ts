@@ -110,6 +110,7 @@ TOOLS
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   backfill <kind|list>               v0.30.1: run a registered backfill (effective-date, ...)
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  beliefs <enable|status|...>        Belief ledger coverage: enable, disable, status, reconcile, backfill
   salience [--days N] [--kind P]     v0.29: pages ranked by emotional + activity salience
   anomalies [--since D] [--sigma N]  v0.29: cohort-based statistical anomalies (tag, type)
   feedback <status|reset>            retrieval feedback: learned page weights; rate answers with gbrain rate

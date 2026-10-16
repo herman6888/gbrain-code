@@ -359,6 +359,8 @@ function monthNameToIndex(name: string): number {
 // #4136 — folded-heading detection constants. The label capture is capped at
 // 48 chars (privacy: labels can carry page text into stderr/JSON) and the
 // list at 10 entries per parse.
+/** A markdown day heading (`## 2024-03-15`, levels 1-4): the date context for time-only patterns. */
+export const DAY_HEADER_RE = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
 const UNRECOGNIZED_HEADING_RE = /^(#{1,6})\s+(.{1,48}?)\s*:?\s*$/;
 const FENCE_RE = /^(```|~~~)/;
 const MAX_UNRECOGNIZED_HEADINGS = 10;
@@ -393,7 +395,7 @@ export function applyPattern(
   // of repeating a date on every message. Keep the caller's context immutable
   // while advancing a local date anchor as those headings are encountered.
   const runningCtx: DateContext = { ...dateCtx };
-  const dateHeaderRe = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
+  const dateHeaderRe = DAY_HEADER_RE;
   // #4136 — when the WINNING pattern anchors on headings, a heading-shaped
   // line whose label is outside the pattern's closed speaker set is not
   // rejected and not reported: it folds into the PREVIOUS turn's body
@@ -706,6 +708,63 @@ export function scorePatternFull(body: string, entry: PatternEntry): number {
   return scoreFromLines(getNonBlankLines(body), entry);
 }
 
+type Scored = { entry: PatternEntry; score: number; priority: number };
+
+function sortScored(arr: Scored[]): Scored[] {
+  return arr.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.priority - b.priority;
+  });
+}
+
+/**
+ * D18: score every candidate on the head; highest first. Tie-break on
+ * declared priority order (built-in declaration order; user patterns
+ * lose every tie).
+ */
+function headScores(body: string, candidates: readonly PatternEntry[]): Scored[] {
+  return sortScored(candidates.map((entry) => ({
+    entry,
+    score: scorePattern(body, entry),
+    priority: priorityOf(entry.id),
+  })));
+}
+
+/**
+ * The built-in pattern a page's head picks by parseConversation's head
+ * pass, or null when that pass would not decide alone: the best head
+ * score is below the full-body fallback threshold, or the winner needs a
+ * full-body re-score. Segmented pages choose their message-anchor cut
+ * pattern with it once, from a bounded head (page-body/segmenter.ts).
+ */
+export function pickHeadPattern(head: string): string | null {
+  if (!head) return null;
+  const top = headScores(head, BUILTIN_PATTERNS)[0];
+  if (!top || top.score < SCORING_HEAD_TRIGGER_THRESHOLD || top.entry.score_full_body) return null;
+  return top.entry.id;
+}
+
+/**
+ * Whether `line` opens a message under built-in pattern `patternId`, as
+ * applyPattern reads it (trimmed; quick_reject, then the anchor regex), and
+ * the inline date it carries when the pattern has one. Null when it does not
+ * open one (day headers never do) or the id is unknown.
+ */
+export function matchAnchorLine(patternId: string, line: string): { date: string | null } | null {
+  const entry = BUILTIN_PATTERNS.find((p) => p.id === patternId);
+  const text = line.trim();
+  if (!entry || !text) return null;
+  if (entry.quick_reject && !entry.quick_reject.test(text)) return null;
+  const m = entry.regex.exec(text);
+  if (!m) return null;
+  const group = entry.captures.date_group;
+  return { date: group === undefined ? null : m[group] ?? null };
+}
+
+export function isAnchorLine(patternId: string, line: string): boolean {
+  return matchAnchorLine(patternId, line) !== null;
+}
+
 /**
  * Parse a conversation body into messages. Tries built-in patterns
  * (minus disabled), then user patterns (D7-validated), then optional
@@ -741,21 +800,7 @@ export function parseConversation(
     return { messages: [], phase: 'no_match' };
   }
 
-  // D18: score every candidate; pick the highest. Tie-break on
-  // declared priority order (built-in declaration order; user patterns
-  // lose every tie).
-  type Scored = { entry: PatternEntry; score: number; priority: number };
-  const sortScored = (arr: Scored[]) =>
-    arr.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return a.priority - b.priority;
-    });
-  let scored: Scored[] = candidates.map((entry) => ({
-    entry,
-    score: scorePattern(body, entry),
-    priority: priorityOf(entry.id),
-  }));
-  sortScored(scored);
+  let scored = headScores(body, candidates);
 
   // REGRESSION (closes #1533 + Codex P1 #1): meeting pages have
   // ## Summary + blockquote + ## Transcript ahead of the chat. The

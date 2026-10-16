@@ -55,6 +55,7 @@ import type { FactsBackstopCtx } from './facts/backstop.ts';
 import type { CapabilityReport } from './capability.ts';
 import { maintenanceTransaction } from './persistence/attribution.ts';
 import { managedPersistenceEnabled } from './persistence/ownership.ts';
+import { isSegmentedPage } from './page-body/page-shape.ts';
 
 /** Delay before the serve-startup sweep fires (post-connect settle). */
 export const STARTUP_SWEEP_DELAY_MS = 3_000;
@@ -92,6 +93,9 @@ const CORPUS_WINDOW_SKIP = {
   partial: 'corpus_windows_pending',
   changed: 'corpus_changed',
   source_changed: 'corpus_source_changed',
+  unavailable: 'corpus_chat_unavailable',
+  backoff: 'corpus_window_backoff',
+  dead_lettered: 'corpus_window_dead_lettered',
 } as const;
 
 export interface SweepOpts {
@@ -113,6 +117,12 @@ export interface SweepOpts {
    * configured gateway (facts/extraction-availability.ts) — no network.
    */
   capabilities?: CapabilityReport;
+  /**
+   * #6786: false skips the corpus pass (pass 3). `bootstrap verify` passes
+   * false: its probes need only passes 1 and 2, and its process may not have
+   * the gateway the extraction would use.
+   */
+  corpus?: boolean;
 }
 
 export interface SweepSkip {
@@ -256,7 +266,9 @@ export async function runMaintenanceSweep(
 
     // ── Pass 3: corpus ingest [CX-P0.1] — spend-gated [CX-P0.5] ───────
     try {
-      if (overBudget()) {
+      if (opts.corpus === false) {
+        // #6786: the caller asked for passes 1 and 2 only.
+      } else if (overBudget()) {
         skip('budget_exhausted:corpus');
       } else {
         // E-N2: the budget stops the corpus pass BETWEEN files and windows
@@ -270,6 +282,7 @@ export async function runMaintenanceSweep(
           overBudget,
           signal: new AbortController().signal,
           capabilities: opts.capabilities,
+          now,
           report,
           skip,
           log,
@@ -386,6 +399,10 @@ async function runLinksTimelinePass(
     const slug = recent[i].slug;
     const page = await engine.getPage(slug, { sourceId });
     if (!page) continue;
+    if (isSegmentedPage(page)) {
+      skip('page_body_segmented:links_timeline');
+      continue;
+    }
     const snapshot = await engine.readPageSnapshot(slug, { sourceId });
     if (!snapshot || snapshot.page.compiled_truth !== page.compiled_truth || snapshot.page.timeline !== page.timeline
       || snapshot.page.type !== page.type || JSON.stringify(snapshot.page.frontmatter) !== JSON.stringify(page.frontmatter)) continue;
@@ -598,10 +615,11 @@ async function runCorpusIngestPass(
   ctx: PassCtx & {
     signal: AbortSignal;
     capabilities?: CapabilityReport;
+    now: () => number;
     log: (msg: string) => void;
   },
 ): Promise<void> {
-  const { batchLimit, overBudget, signal, report, skip, log } = ctx;
+  const { batchLimit, overBudget, signal, report, skip, log, now } = ctx;
 
   // Corpus dir: dream's session corpus (transcripts.ts:66 precedent);
   // default ~/.gbrain/transcripts/corpus (GBRAIN_HOME-aware via configDir).
@@ -613,11 +631,16 @@ async function runCorpusIngestPass(
 
   // #6268: source-stamped files live in the spool subdirectory (listed
   // first); top-level files are the legacy, unstamped corpus.
-  const { CORPUS_SPOOL_SUBDIR, corpusSpoolDir, parseWbFileName, selfCaptureSidecarJson, corpusFileSessionId, corpusTextForExtraction } = await import('./context/corpus-segments.ts');
+  const { CORPUS_SPOOL_SUBDIR, corpusSpoolDir, parseWbFileName, selfCaptureSidecarJson, corpusFileSessionId, corpusTextForExtraction, corpusFileCompletion, corpusFileFinished, CORPUS_WINDOW_FAILURE_CAP } = await import('./context/corpus-segments.ts');
   const spoolDir = corpusSpoolDir(dir);
   const windows = await import('./context/corpus-windows.ts');
   type Candidate = { base: string; name: string; location: 'spool' | 'legacy'; label: string };
   const candidates: Candidate[] = [];
+  const deferred: Candidate[] = [];
+  // #6785: a capped window re-arms once when this fingerprint changed since its last failure.
+  const { extractionConfigFingerprint } = await import('./facts/extraction-availability.ts');
+  const fingerprint = await extractionConfigFingerprint(engine).catch(() => null);
+  const parkedAt = now();
   for (const [base, location] of [[spoolDir, 'spool'], [dir, 'legacy']] as const) {
     let entries: string[];
     try {
@@ -630,12 +653,14 @@ async function runCorpusIngestPass(
     const txtFiles = entries.filter(n => n.endsWith('.txt')).sort();
     if (txtFiles.length === 0) continue;
     // #5887: finished files re-enter when changed since their `.progress`.
-    const picked = await windows.selectCorpusCandidates(base, txtFiles, entrySet, batchLimit - candidates.length, overBudget);
+    const picked = await windows.selectCorpusCandidates(base, txtFiles, entrySet, batchLimit - candidates.length, overBudget,
+      (full) => windows.corpusFileParked(full, fingerprint, parkedAt));
     skip('already_ingested', picked.alreadyIngested);
-    for (const name of picked.candidates) {
-      candidates.push({ base, name, location, label: location === 'spool' ? join(CORPUS_SPOOL_SUBDIR, name) : name });
-    }
+    const label = (name: string) => location === 'spool' ? join(CORPUS_SPOOL_SUBDIR, name) : name;
+    for (const name of picked.candidates) candidates.push({ base, name, location, label: label(name) });
+    for (const name of picked.deferred) deferred.push({ base, name, location, label: label(name) });
   }
+  candidates.push(...deferred.slice(0, Math.max(0, batchLimit - candidates.length)));
   if (candidates.length === 0) return;
 
   // #6091: every corpus file answers to the capture gate, resolved once per
@@ -683,6 +708,8 @@ async function runCorpusIngestPass(
     return;
   }
 
+  const writerRefused = await corpusWriterPreflight(engine, log);
+
   const { runFactsPipeline } = await import('./facts/backstop.ts');
   const { isDreamOutput } = await import('./cycle/transcript-discovery.ts');
   const { claudeCliSelfProjectDirs, isClaudeCliSelfSessionId } = await import('./ai/providers/claude-cli-scratch.ts');
@@ -709,14 +736,13 @@ async function runCorpusIngestPass(
     }
 
     let abortLoop = false;
+    const attempted = { count: 0 };
     try {
       // Re-check under the claim: another sweep may have finished this file
       // between our readdir and our claim (it releases its claim only after
       // writing the .ingested sidecar, so this closes the double-spend gap).
-      const doneAlready = await stat(full + CORPUS_INGESTED_SUFFIX).then(
-        () => windows.finishedCorpusFileState(full, name).then(s => s === 'done' || s === 'legacy', () => false),
-        () => false,
-      );
+      let doneAlready = false;
+      try { doneAlready = corpusFileFinished(corpusFileCompletion(full, name)); } catch { /* unreadable: not done */ }
       if (doneAlready) {
         skip('already_ingested');
         continue;
@@ -763,6 +789,10 @@ async function runCorpusIngestPass(
         skip(fileSource.reason);
         continue;
       }
+      if (await writerRefused(fileSource.sourceId)) {
+        skip('writer_coordinator_required');
+        continue;
+      }
       const pipelineCtx: FactsBackstopCtx = {
         engine,
         sourceId: fileSource.sourceId,
@@ -785,20 +815,30 @@ async function runCorpusIngestPass(
       // at turn boundaries (#5887) and may finish over several sweeps.
       let r: Awaited<ReturnType<typeof runFactsPipeline>>;
       if (wbMeta) {
-        windowsLeft -= 1;
-        r = await runFactsPipeline(corpusTextForExtraction(name, raw), pipelineCtx);
+        const turn = await windows.runCorpusTurn({
+          full, signal, incarnation: fileSource.incarnation, failures: { fingerprint, now }, attempted,
+          extract: () => runFactsPipeline(corpusTextForExtraction(name, raw), pipelineCtx),
+        });
+        if (turn.status !== 'complete') {
+          abortLoop = turn.status === 'unavailable';
+          skip(CORPUS_WINDOW_SKIP[turn.status], abortLoop ? candidates.length - i : 1);
+          if (turn.status === 'dead_lettered') log(deadLetterLine(label, CORPUS_WINDOW_FAILURE_CAP));
+          continue;
+        }
+        r = turn.result;
       } else {
         const run = await windows.runCorpusWindows({
           full, raw, fileStat, overBudget, signal,
           source: { id: fileSource.sourceId, incarnation: fileSource.incarnation },
           maxWindows: Math.min(windows.CORPUS_WINDOWS_PER_SWEEP, windowsLeft),
           extract: text => runFactsPipeline(text, pipelineCtx),
+          failures: { fingerprint, now }, attempted,
         });
-        windowsLeft -= run.windowsDone;
         report.corpus_files.push({ file: label, windows_done: run.windowsDone, windows_remaining: run.windowsRemaining });
         if (run.status !== 'complete') {
-          abortLoop = run.status === 'aborted';
+          abortLoop = run.status === 'aborted' || run.status === 'unavailable';
           skip(CORPUS_WINDOW_SKIP[run.status], abortLoop ? candidates.length - i : 1);
+          if (run.status === 'dead_lettered') log(deadLetterLine(label, CORPUS_WINDOW_FAILURE_CAP));
           continue;
         }
         r = run.result;
@@ -822,32 +862,7 @@ async function runCorpusIngestPass(
       // the guaranteed lane (receipt retry); here a publish failure is
       // fail-open and `.ingested` is written regardless (facts are durable;
       // re-extracting just to retry a link append is the worse trade).
-      let linksBanked = 0;
-      if (r.entity_slugs.length) {
-        try {
-          const segs = await import('./context/corpus-segments.ts');
-          const parsed = segs.parseSegmentFileName(name);
-          if (parsed) {
-            const verified: Array<{ slug: string; title: string }> = [];
-            for (const slug of r.entity_slugs) {
-              try {
-                const page = await engine.getPage(slug, { sourceId: fileSource.sourceId });
-                if (page) verified.push({ slug, title: page.title || slug });
-              } catch { /* a non-resolvable link is never banked */ }
-            }
-            if (verified.length) {
-              const ss = await import('./context/session-state.ts');
-              const ledger = segs.readSegmentLedger(base, parsed.sessionId);
-              const n = Math.max(1, ledger.findIndex((e) => e.hash === parsed.hash) + 1);
-              const ok = await ss.appendCheckpointManifest(
-                engine, fileSource.sourceId, null, parsed.sessionId, verified,
-                { seg: parsed.hash, n },
-              );
-              if (ok) linksBanked = verified.length;
-            }
-          }
-        } catch { /* link publish is best-effort on the backstop lane */ }
-      }
+      const linksBanked = r.entity_slugs.length ? await bankSegmentLinks(engine, base, name, fileSource.sourceId, r.entity_slugs) : 0;
 
       // Sidecar AFTER success — a crash before this line re-processes the
       // file next sweep (dedup absorbs the repeats), never loses it.
@@ -873,15 +888,72 @@ async function runCorpusIngestPass(
         skip('writeback_off_inflight');
       } else {
         skip('corpus_file_error');
-        log(`[sweep] corpus ingest failed for ${name}: ${e instanceof Error ? e.message : String(e)}`);
+        const code = (e as { code?: unknown }).code;
+        log(`[sweep] corpus ingest failed for ${name}${typeof code === 'string' ? ` (${code})` : ''}: ${e instanceof Error ? e.message : String(e)}`);
       }
     } finally {
+      // #6785: every attempted window counts against the total, a thrown one included.
+      windowsLeft -= attempted.count;
       // Success (its .ingested sidecar now stands in) and failure (retry next
       // sweep) both release the claim.
       await rm(claimPath, { force: true }).catch(() => {});
     }
     if (abortLoop) break;
   }
+}
+
+/** Cathedral 5: publish a compaction segment's verified entity links to its session manifest; the count banked, 0 on any failure. */
+async function bankSegmentLinks(engine: BrainEngine, base: string, name: string, sourceId: string, slugs: string[]): Promise<number> {
+  try {
+    const segs = await import('./context/corpus-segments.ts');
+    const parsed = segs.parseSegmentFileName(name);
+    if (!parsed) return 0;
+    const verified: Array<{ slug: string; title: string }> = [];
+    for (const slug of slugs) {
+      try {
+        const page = await engine.getPage(slug, { sourceId });
+        if (page) verified.push({ slug, title: page.title || slug });
+      } catch { /* a non-resolvable link is never banked */ }
+    }
+    if (!verified.length) return 0;
+    const ss = await import('./context/session-state.ts');
+    const ledger = segs.readSegmentLedger(base, parsed.sessionId);
+    const n = Math.max(1, ledger.findIndex((e) => e.hash === parsed.hash) + 1);
+    const ok = await ss.appendCheckpointManifest(engine, sourceId, null, parsed.sessionId, verified, { seg: parsed.hash, n });
+    return ok ? verified.length : 0;
+  } catch {
+    return 0; /* link publish is best-effort on the backstop lane */
+  }
+}
+
+/**
+ * #6785: the facts-absorb owner-readiness preflight (#5362), once per source
+ * per pass and before any model call: a claimed but not activated canonical
+ * worktree refuses the fence write AFTER extraction, which every later sweep
+ * would pay for again. Returns whether the source is held.
+ */
+async function corpusWriterPreflight(engine: BrainEngine, log: (msg: string) => void): Promise<(sourceId: string) => Promise<boolean>> {
+  const { assertSourceLegacyWriter } = await import('./persistence/filesystem-guard.ts');
+  const held = new Map<string, boolean>();
+  return async (sourceId) => {
+    if (!held.has(sourceId)) {
+      try {
+        await assertSourceLegacyWriter(engine, sourceId);
+        held.set(sourceId, false);
+      } catch (e) {
+        if ((e as { code?: unknown }).code !== 'writer_coordinator_required') throw e;
+        held.set(sourceId, true);
+        log(`[sweep] corpus extraction into source ${sourceId} is held before any model call: writer_coordinator_required `
+          + `(${e instanceof Error ? e.message : String(e)}). Check the writer: gbrain sources writer status ${sourceId}`);
+      }
+    }
+    return held.get(sourceId)!;
+  };
+}
+
+function deadLetterLine(label: string, cap: number): string {
+  return `[sweep] ${label}: corpus_window_dead_lettered — its next window failed ${cap} times after the model call, `
+    + 'so the sweep stopped paying for it. Fix the cause, then preview a retry: gbrain sweep --retry-failed';
 }
 
 /**
@@ -977,22 +1049,50 @@ export interface CorpusDrainOpts {
   clearIntervalFn?: (handle: unknown) => void;
   /** Sweep body override (tests). Default: runMaintenanceSweep with CORPUS_DRAIN_BUDGET_MS. */
   sweep?: (engine: BrainEngine) => Promise<unknown>;
+  /** #6785: diagnostic sink. Default: stderr (serve.err). */
+  log?: (msg: string) => void;
 }
 
-/** True when the corpus dir holds a `.txt` with no `.ingested` sidecar. Missing dir = false. */
+/**
+ * True when the corpus dir holds a `.txt` the sweep would extract: not
+ * finished by the one classifier (#6786), and not stopped at the failure cap
+ * at the window it starts at now (#6785; a backing-off file still counts).
+ * Missing dir = false.
+ */
 async function corpusHasPendingFiles(engine: BrainEngine): Promise<boolean> {
   let dir = await engine.getConfig('dream.synthesize.session_corpus_dir');
   if (!dir) {
     const { configDir } = await import('./config.ts');
     dir = join(configDir(), 'transcripts', 'corpus');
   }
-  const { corpusSpoolDir } = await import('./context/corpus-segments.ts');
+  const { CORPUS_FAILURE_SUFFIX, corpusFileAwaitsExtraction, corpusSpoolDir, readCorpusFailure } = await import('./context/corpus-segments.ts');
+  const { corpusFailureGate, corpusFrontierKey } = await import('./context/corpus-windows.ts');
+  const { extractionConfigFingerprint } = await import('./facts/extraction-availability.ts');
+  let fingerprint: Promise<string | null> | null = null;
+  const stopped = async (full: string, name: string): Promise<boolean> => {
+    const rec = readCorpusFailure(full);
+    // A record for a window the file no longer starts at (rewritten) is stale.
+    if (!rec || (await corpusFrontierKey(full, name)) !== rec.key) return false;
+    fingerprint ??= extractionConfigFingerprint(engine).catch(() => null);
+    return corpusFailureGate(rec, rec.key, rec.source_incarnation, await fingerprint, Date.now()) === 'dead_lettered';
+  };
   for (const base of [corpusSpoolDir(dir), dir]) {
     const names = await readdir(base).catch(() => [] as string[]);
     const present = new Set(names);
-    if (names.some(n => n.endsWith('.txt') && !present.has(n + CORPUS_INGESTED_SUFFIX))) return true;
+    for (const n of names) {
+      if (!n.endsWith('.txt') || !corpusFileAwaitsExtraction(join(base, n), n)) continue;
+      if (present.has(n + CORPUS_FAILURE_SUFFIX) && await stopped(join(base, n), n)) continue;
+      return true;
+    }
   }
   return false;
+}
+
+/** #6785: the drain's skip reasons worth an operator's eye (every reason but `already_ingested`), sorted. */
+function drainSkipReasons(report: unknown): string[] {
+  const skipped = (report as Partial<SweepReport> | null)?.skipped;
+  if (!Array.isArray(skipped)) return [];
+  return skipped.filter(s => s.reason !== 'already_ingested').map(s => `${s.reason} x${s.count}`).sort();
 }
 
 /**
@@ -1004,7 +1104,9 @@ async function corpusHasPendingFiles(engine: BrainEngine): Promise<boolean> {
  * one bounded sweep runs under the corpus pass's own gates (keyless skip,
  * the writeback gate, claims, per-file and per-sweep window caps). Never
  * overlaps itself; unref'd; never throws. `tick` runs one decision now.
- * Returns null when GBRAIN_SWEEP=0.
+ * #6785: the sweep's diagnostics and a thrown tick reach `log` (stderr),
+ * each distinct line once per serve run, and the skip reasons whenever
+ * their set changes. Returns null when GBRAIN_SWEEP=0.
  */
 export function armCorpusDrain(
   engine: BrainEngine,
@@ -1015,17 +1117,32 @@ export function armCorpusDrain(
   const setI = opts.setIntervalFn ?? ((fn: () => void, ms: number) => setInterval(fn, ms));
   const clearI = opts.clearIntervalFn
     ?? ((h: unknown) => clearInterval(h as ReturnType<typeof setInterval>));
+  const sink = opts.log ?? ((msg: string) => { process.stderr.write(`${msg}\n`); });
+  const seen = new Set<string>();
+  const log = (msg: string): void => {
+    if (seen.has(msg)) return;
+    if (seen.size >= 1000) seen.clear();
+    seen.add(msg);
+    sink(msg);
+  };
   const run = opts.sweep
-    ?? ((e: BrainEngine) => runMaintenanceSweep(e, { sourceId: opts.sourceId, budgetMs: CORPUS_DRAIN_BUDGET_MS }));
+    ?? ((e: BrainEngine) => runMaintenanceSweep(e, { sourceId: opts.sourceId, budgetMs: CORPUS_DRAIN_BUDGET_MS, log }));
   let inFlight = false;
   let cancelled = false;
+  let lastReasons = '';
   const tick = async (): Promise<void> => {
     if (inFlight || cancelled) return;
     inFlight = true;
     try {
-      if (await corpusHasPendingFiles(engine)) await run(engine);
-    } catch {
-      /* the drain is best-effort; never kill serve */
+      if (await corpusHasPendingFiles(engine)) {
+        const reasons = drainSkipReasons(await run(engine));
+        const set = reasons.map(r => r.slice(0, r.lastIndexOf(' x'))).join(',');
+        if (set !== lastReasons && reasons.length) sink(`[sweep] corpus drain skipped: ${reasons.join(', ')}`);
+        lastReasons = set;
+      }
+    } catch (e) {
+      // The drain is best-effort and never kills serve, but it says why.
+      log(`[sweep] corpus drain failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       inFlight = false;
     }

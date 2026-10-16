@@ -158,7 +158,8 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       intentWeighting: true,
       keywordOrFallback: true,
       tokenBudget: undefined,
-      expansion: true,
+      // GBRA-94 (2026-10-14): off, like the other two bundles.
+      expansion: false,
       expansion_variant_budget: null,
       searchLimit: 50,
       reranker_enabled: true,
@@ -292,19 +293,19 @@ describe('resolveSearchMode resolution chain', () => {
   test('per-call false-y values (false / 0) still beat fallback', () => {
     const r = resolveSearchMode({
       mode: 'tokenmax',
-      perCall: { expansion: false, cache_enabled: false },
+      perCall: { reranker_enabled: false, cache_enabled: false },
     });
-    expect(r.expansion).toBe(false); // beat tokenmax's true
+    expect(r.reranker_enabled).toBe(false); // beat tokenmax's true
     expect(r.cache_enabled).toBe(false); // beat tokenmax's true
   });
 
   test('undefined fields in perCall fall through (not coerced to false)', () => {
     const r = resolveSearchMode({
       mode: 'tokenmax',
-      perCall: { tokenBudget: undefined, expansion: undefined },
+      perCall: { tokenBudget: undefined, reranker_enabled: undefined },
     });
     expect(r.tokenBudget).toBeUndefined(); // from tokenmax bundle
-    expect(r.expansion).toBe(true); // from tokenmax bundle, NOT overridden
+    expect(r.reranker_enabled).toBe(true); // from tokenmax bundle, NOT overridden
   });
 });
 

@@ -4,7 +4,7 @@
  * of every compiled file that carries core, so `gbrain doctor` can name
  * stale or leftover copies and the command that refreshes them.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { atomicWriteTextFile } from '../bootstrap/atomic-write.ts';

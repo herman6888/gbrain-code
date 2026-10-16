@@ -44,10 +44,10 @@ import type { EntityCandidate } from './entity-salience.ts';
 import { reflexPointerRationale } from './reflex-rationale.ts';
 import { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } from './volunteer-events.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
-import { boundedPrefixSql, boundedRawPrefix, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
+import { boundedBodyPrefixSql, boundedRawPrefix, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
 
 /** Large pages: candidate rows carry a bounded body prefix (the synopsis reads only its first sentence). */
-const PREFIX_SQL = boundedPrefixSql('p.compiled_truth');
+const PREFIX_SQL = boundedBodyPrefixSql('p');
 
 export { reflexPointerRationale } from './reflex-rationale.ts';
 

@@ -22,7 +22,7 @@ import { resolve as resolvePath } from 'node:path';
 import { isPathContained } from './path-confine.ts';
 import { defaultCloneDir } from './sources-ops.ts';
 import { gbrainPath } from './config.ts';
-import { isUndefinedColumnError, isUndefinedTableError } from './utils.ts';
+import { isMissingSchemaObject } from './utils.ts';
 import { deleteSourceRow, EXPIRED_ARCHIVE_SQL, UNVERIFIED_ARCHIVE_SQL, unverifiedArchiveReason } from './source-delete.ts';
 
 // ── Types ───────────────────────────────────────────────────
@@ -107,13 +107,11 @@ export async function clientsReferencingSource(
     );
     return rows.map((r) => ({ clientId: r.client_id, clientName: r.client_name, deleted: r.deleted === true }));
   } catch (e) {
-    if (isUndefinedTableError(e)) return [];
-    // isUndefinedColumnError is code-first (any 42703 matches), and the
-    // primary query references BOTH optional columns — disambiguate on the
-    // message, which names the missing column.
-    const msg = e instanceof Error ? e.message : String(e);
-    if (isUndefinedColumnError(e, 'source_id') && msg.includes('source_id')) return [];
-    if (!(isUndefinedColumnError(e, 'deleted_at') && msg.includes('deleted_at'))) throw e;
+    if (isMissingSchemaObject(e, 'table', 'oauth_clients')) return [];
+    // The primary query references BOTH optional columns; the strict
+    // predicate tells them apart by the column the error names.
+    if (isMissingSchemaObject(e, 'column', 'source_id')) return [];
+    if (!isMissingSchemaObject(e, 'column', 'deleted_at')) throw e;
     try {
       const rows = await engine.executeRaw<{ client_id: string; client_name: string }>(
         `SELECT client_id, client_name FROM oauth_clients
@@ -124,7 +122,7 @@ export async function clientsReferencingSource(
       return rows.map((r) => ({ clientId: r.client_id, clientName: r.client_name, deleted: false }));
     } catch (e2) {
       // The fallback's only optional column is source_id — no column ⇒ no FK.
-      if (isUndefinedColumnError(e2, 'source_id')) return [];
+      if (isMissingSchemaObject(e2, 'column', 'source_id')) return [];
       throw e2;
     }
   }
@@ -242,7 +240,7 @@ export async function assessDestructiveImpact(
     );
     factCount = factRows[0]?.n ?? 0;
   } catch (e) {
-    if (!isUndefinedTableError(e)) throw e;
+    if (!isMissingSchemaObject(e, 'table', 'facts')) throw e;
   }
 
   // PR6 D5b: fold the FK-RESTRICT referent count into the preview so the

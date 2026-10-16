@@ -3,6 +3,10 @@ import { readProjectionSnapshot, queuePageProjection, preparePageProjection, ins
 import { quoteIdentifier, resolveActiveEmbeddingColumnFromEngine } from './search/embedding-column.ts';
 import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
 import { isMultimodalEnabled } from './sync.ts';
+import { buildSegmentedProjection } from './page-body/projection.ts';
+
+/** A segmented page with a body: its projection (`buildSegmentedProjection`) owes chunk rows even when it has none yet. */
+const SEGMENTED_BODY = `(p.body_storage = 'segmented' AND p.body_bytes > 0)`;
 
 export async function countArchivedEmbeddingWork(engine: BrainEngine, opts: { sourceId?: string; signature?: string; includeNullSignature?: boolean; includeUnsealed?: boolean } = {}, activeColumn?: string | null): Promise<number> {
   const column = activeColumn === undefined ? (await resolveActiveEmbeddingColumnFromEngine(engine)).name : activeColumn;
@@ -15,7 +19,7 @@ export async function countArchivedEmbeddingWork(engine: BrainEngine, opts: { so
         OR EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND (${vector} IS NULL
           OR c.embedded_text_hash <> md5(c.chunk_text)
           OR ($2::text IS NOT NULL AND (p.embedding_signature <> $2 OR ($3::boolean AND p.embedding_signature IS NULL)))))
-        OR ((p.compiled_truth <> '' OR p.timeline <> '') AND ${QUARANTINE_FILTER_FRAGMENT}
+        OR ((p.compiled_truth <> '' OR p.timeline <> '' OR ${SEGMENTED_BODY}) AND ${QUARANTINE_FILTER_FRAGMENT}
           AND NOT EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id)))`,
   [opts.sourceId ?? null, opts.signature ?? null, opts.includeNullSignature ?? false, opts.includeUnsealed ?? false]);
   if (!Number.isSafeInteger(row?.n) || row.n < 0) throw new Error('Cannot determine archived embedding work.');
@@ -31,16 +35,16 @@ async function pendingProjectionWhere(engine: BrainEngine, opts: ProjectionScope
   if (opts.stale) {
     const column = quoteIdentifier((await resolveActiveEmbeddingColumnFromEngine(engine)).name);
     params.push(opts.stale.signature ?? null, opts.stale.includeNullSignature ?? false);
-    eligible = `AND EXISTS(SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND (
+    eligible = `AND (${SEGMENTED_BODY} OR EXISTS(SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND (
       c.${column} IS NULL OR c.embedded_text_hash <> md5(c.chunk_text)
-      OR ($3::text IS NOT NULL AND (p.embedding_signature <> $3 OR ($4::boolean AND p.embedding_signature IS NULL)))))`;
+      OR ($3::text IS NOT NULL AND (p.embedding_signature <> $3 OR ($4::boolean AND p.embedding_signature IS NULL))))))`;
   }
   const where = `p.deleted_at IS NULL
     AND NOT (COALESCE(p.frontmatter,'{}'::jsonb) ? 'embed_skip')
     AND p.text_projection_revision IS DISTINCT FROM p.knowledge_revision
     AND ($1::text IS NULL OR p.source_id=$1)
     ${opts.activeSourcesOnly ? 'AND NOT s.archived' : ''}
-    AND (NOT $2::boolean OR EXISTS(SELECT 1 FROM content_chunks c WHERE c.page_id=p.id)) ${eligible}`;
+    AND (NOT $2::boolean OR ${SEGMENTED_BODY} OR EXISTS(SELECT 1 FROM content_chunks c WHERE c.page_id=p.id)) ${eligible}`;
   return { where, params };
 }
 
@@ -102,6 +106,11 @@ export async function prepareEmbeddingProjections(engine: BrainEngine, opts: { s
       await opts.assertOwned?.();
       try {
         if (await readProjectionSnapshot(engine, row.slug, row.source_id)) continue;
+        const [segmented] = await engine.executeRaw(`SELECT 1 FROM pages WHERE id=$1 AND body_storage='segmented'`, [row.id]);
+        if (segmented) {
+          if ((await buildSegmentedProjection(engine, { sourceId: row.source_id, slug: row.slug })).sealed) rebuilt++;
+          continue;
+        }
         const queued = await engine.transaction(async tx => {
           await opts.assertOwned?.(tx);
           await tx.lockPageKeys([{ sourceId: row.source_id, slug: row.slug }]);

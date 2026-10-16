@@ -81,7 +81,7 @@ const TERMINAL = (r: string) => `${r}.state IN ('failed','conflict','cancelled')
 /** A request holding a publication recovery record outside an in-flight claim: it blocks its root. `recovering` is the durable parked state (a blocked restore). */
 const RECOVERY = (r: string) => `(${r}.recovery IS NOT NULL AND ${r}.state IN ('committed','recovering','failed','conflict','cancelled'))`;
 
-interface KeyColumns { source_id: string; state: string; error_code: string | null; origin: string | null; reason: string | null; cause: string | null; operation: string;
+interface KeyColumns { source_id: string; state: string; error_code: string | null; origin: string | null; reason: string | null; cause: string | null; operation: string; intent_kind?: string | null;
   has_recovery: boolean; blocked_reason: string | null; compacted: boolean; knock_on: boolean; routed_message: string | null; build: string | null }
 
 function verdictOf(row: KeyColumns & { request_id?: string; slug?: string; error_detail?: Record<string, unknown> | null }): TerminalVerdict {
@@ -89,7 +89,7 @@ function verdictOf(row: KeyColumns & { request_id?: string; slug?: string; error
     ...(row.cause ? { cause: row.cause } : {}) } : null);
   return classifyTerminal({ request_id: row.request_id, source_id: row.source_id, slug: row.slug ?? '<slug>', operation: row.operation, state: row.state, error_code: row.error_code,
     error_detail: detail, recovery: row.has_recovery || null, blocked_reason: row.blocked_reason, compacted: row.compacted, knock_on: row.knock_on,
-    error_message: row.routed_message, build: row.build })!;
+    error_message: row.routed_message, build: row.build, intent_kind: row.intent_kind ?? null })!;
 }
 
 async function bounded<T>(engine: BrainEngine, sql: string, params: unknown[]): Promise<T[] | 'unknown'> {
@@ -129,7 +129,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
   const rows = await bounded<KeyColumns & { set: number; resolved: boolean | null; rows: number; in_window: number; n_24h: number; oldest: string | null; oldest_age: number | null;
     distinct_slugs: number; distinct_intents: number; recovery_ids: string[] | null; recovery_slugs: string[] | null } & Record<string, number>>(engine,
     `WITH base AS (
-      SELECT r.id, r.request_id::text AS request_id, r.source_id, r.slug, r.digest, r.sequence, r.operation, r.state, r.error_code,
+      SELECT r.id, r.request_id::text AS request_id, r.source_id, r.slug, r.digest, r.sequence, r.operation, r.intent->>'kind' AS intent_kind, r.state, r.error_code,
         r.error_detail->>'origin' AS origin, r.error_detail->>'reason' AS reason, r.error_detail->>'cause' AS cause,
         r.recovery IS NOT NULL AS has_recovery, r.blocked_reason, r.compacted, ${terminalKnockOnSql('r')} AS knock_on,
         ${ROUTED_MESSAGE('r')} AS routed_message, ${BUILD('r')} AS build, ${ENDED('r')} AS ended_at
@@ -142,7 +142,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
       SELECT b.*, (x.id IS NOT NULL) AS resolved, (b.has_recovery OR b.ended_at > now()-($3::int*interval '1 day')) AS in_window, ${HISTORICAL_BY_BUILD('b')} AS historical_build
       FROM base b LEFT JOIN resolved x ON x.id=b.id
     )
-    SELECT GROUPING(state) AS set, source_id, state, error_code, origin, reason, cause, operation, has_recovery, blocked_reason, compacted, knock_on, routed_message, build, resolved,
+    SELECT GROUPING(state) AS set, source_id, state, error_code, origin, reason, cause, operation, intent_kind, has_recovery, blocked_reason, compacted, knock_on, routed_message, build, resolved,
       count(*) FILTER (WHERE in_window)::int AS rows, count(*) FILTER (WHERE in_window)::int AS in_window,
       count(*) FILTER (WHERE state IN ('failed','conflict','cancelled') AND ended_at > now()-interval '1 day')::int AS n_24h,
       ${days},
@@ -153,7 +153,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
       (array_agg(request_id ORDER BY sequence) FILTER (WHERE has_recovery))[1:20] AS recovery_ids,
       (array_agg(slug ORDER BY sequence) FILTER (WHERE has_recovery))[1:20] AS recovery_slugs
     FROM tagged
-    GROUP BY GROUPING SETS ((source_id, state, error_code, origin, reason, cause, operation, has_recovery, blocked_reason, compacted, knock_on, routed_message, build, resolved), (source_id))
+    GROUP BY GROUPING SETS ((source_id, state, error_code, origin, reason, cause, operation, intent_kind, has_recovery, blocked_reason, compacted, knock_on, routed_message, build, resolved), (source_id))
     ORDER BY source_id`, [span, opts.sourceIds ?? null, t.windowDays]);
   if (rows === 'unknown') return { status: 'unknown', window_days: t.windowDays, reason: `the aggregate did not finish within ${TERMINAL_STATEMENT_MS} ms (or no connection within ${TERMINAL_ACQUIRE_MS} ms)` };
   const bySource = new Map<string, TerminalSourceSummary>();
@@ -294,7 +294,7 @@ export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailu
   const want = q.groupBy ? MAX_SCAN : limit + 1;
   while (out.length < want && scanned < MAX_SCAN && !exhausted) {
     const batch = await bounded<KeyColumns & { request_id: string; sequence: string; slug: string; error_detail: Record<string, unknown> | null; ended_at: string; later_state: string | null; same_intent: boolean | null }>(engine,
-      `SELECT r.request_id::text AS request_id, r.sequence::text AS sequence, r.source_id, r.slug, r.operation, r.state, r.error_code, r.error_detail,
+      `SELECT r.request_id::text AS request_id, r.sequence::text AS sequence, r.source_id, r.slug, r.operation, r.intent->>'kind' AS intent_kind, r.state, r.error_code, r.error_detail,
           r.error_detail->>'origin' AS origin, r.error_detail->>'reason' AS reason, r.error_detail->>'cause' AS cause,
           r.recovery IS NOT NULL AS has_recovery, r.blocked_reason, r.compacted, ${terminalKnockOnSql('r')} AS knock_on, ${ROUTED_MESSAGE('r')} AS routed_message, ${BUILD('r')} AS build,
           to_char(${ENDED('r')} AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ended_at, later.state AS later_state, later.same_intent

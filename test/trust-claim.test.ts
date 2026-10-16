@@ -105,6 +105,7 @@ async function seed() {
   await page('marker', src, null, { trust_tier: 'agent_written' });
   await page('confirmed-marker', src, null, { trust_tier: 'user_confirmed' });
   await page('connector-stamp', src, null, { ingested_via: 'connector:gmail' });
+  await page('atom', src, null, { type: 'atom', extracted_by: 'extract_atoms-v0.41.2.1', source_slug: 'p/plain' });
   await page('gh-plain', gh, null);
   const fact = async (source: string, fenced: string | null) => {
     const [row] = await engine.executeRaw<{ id: number }>(`INSERT INTO facts(source_id,entity_slug,fact,kind,source,source_markdown_slug,row_num)
@@ -138,6 +139,8 @@ describe('trust claim-sources', () => {
       { transcript_import: 'yes' }, { source_url: 'https://x', clipped_at: '2026' }, { source_url: 'https://x' }, { source_url: ' ', clipper: 'x' },
       { source_url: 'https://x', captured_via: 'clipper' }, { source_url: 'https://x', type: 'clipping' }, { provenance: 'auto-extracted' },
       { dream_generated: true }, { dream_generated: 'true' }, { dream_generated: false }, { provenance: 'manual', source_kind: 'inbox-folder', trust_tier: 'tool_observed' },
+      { extracted_by: 'extract_atoms-v0.41.2.1' }, { extracted_by: ' extract_atoms-v0.42 ' }, { extracted_by: 'extractXatoms-v1' },
+      { extracted_by: 'gpt-extractor' }, { extracted_by: 5 }, { extracted_by: 'extract_atoms-v0.41.2.1', trust_tier: 'external_untrusted' },
     ];
     const sql = `SELECT LEAST(${frontmatterTrustCapsSql('v.fm').join(', ')}) AS r FROM (SELECT $1::text::jsonb AS fm) v`;
     for (const fm of samples) {
@@ -155,12 +158,12 @@ describe('trust claim-sources', () => {
     const { out } = await runCli(['--dry-run']);
     expect(await snapshot(s.src)).toBe(before);
     const own = listing.sources.find(x => x.id === s.src)!;
-    expect(own).toMatchObject({ local_path: '/home/alice-example/notes', pages: 9, claimable: true, claimed: false });
+    expect(own).toMatchObject({ local_path: '/home/alice-example/notes', pages: 10, claimable: true, claimed: false });
     expect(own.current!.unknown).toBe(own.legacy_unknown);
     expect(own.projected_if_claimed.user_confirmed).toBe(0);
     expect(own.projected_if_claimed.operator_curated).toBe(5);
     expect(listing.sources.find(x => x.id === s.gh)).toMatchObject({ claimable: false, blocker: 'connector' });
-    expect(out).toContain(`${s.src} (/home/alice-example/notes): 9 page(s)`);
+    expect(out).toContain(`${s.src} (/home/alice-example/notes): 10 page(s)`);
     expect(out).toContain('github connector: cannot be claimed');
   });
 
@@ -193,13 +196,13 @@ describe('trust claim-sources', () => {
       plain: await tierOf('pages', p.plain!), mcp: await tierOf('pages', p.mcp!), capture: await tierOf('pages', p.capture!),
       ownTranscript: await tierOf('pages', p['own-transcript']!), otherTranscript: await tierOf('pages', p['other-transcript']!),
       clipped: await tierOf('pages', p.clipped!), marker: await tierOf('pages', p.marker!), confirmedMarker: await tierOf('pages', p['confirmed-marker']!),
-      connectorStamp: await tierOf('pages', p['connector-stamp']!), gh: await tierOf('pages', p['gh-plain']!),
+      connectorStamp: await tierOf('pages', p['connector-stamp']!), atom: await tierOf('pages', p.atom!), gh: await tierOf('pages', p['gh-plain']!),
       factPlain: await tierOf('facts', s.facts.plain), factBackstop: await tierOf('facts', s.facts.backstop),
       factOnPlain: await tierOf('facts', s.facts.onPlain), factOnMcp: await tierOf('facts', s.facts.onMcp),
       take: await tierOf('takes', s.take), entry: await tierOf('timeline_entries', s.entry),
     }).toEqual({
       plain: 'operator_curated', mcp: 'agent_written', capture: 'agent_written', ownTranscript: 'agent_written', otherTranscript: 'external_untrusted',
-      clipped: 'external_untrusted', marker: 'agent_written', confirmedMarker: 'operator_curated', connectorStamp: 'external_untrusted', gh: 'unknown',
+      clipped: 'external_untrusted', marker: 'agent_written', confirmedMarker: 'operator_curated', connectorStamp: 'external_untrusted', atom: 'agent_written', gh: 'unknown',
       factPlain: 'operator_curated', factBackstop: 'agent_written', factOnPlain: 'operator_curated', factOnMcp: 'agent_written',
       take: 'operator_curated', entry: 'external_untrusted',
     });

@@ -87,6 +87,53 @@ async function scenario(engine: BrainEngine, config: HarnessConfig) {
     installFaultHook(undefined);
     await consumer.stop();
   }
+  const churn = await admitWrite(engine, admission(config, sources[1]!, 'stall/churn', 'churning body'));
+  const churnToken = randomUUID();
+  await engine.executeRaw(`UPDATE persistence_requests SET state='running',execution_token=$2::uuid,claim_expires_at=now()+interval '30 seconds',
+    claim_phase=jsonb_build_object('phase','preparing','claimed_at',now()::text,'since',now()::text,'token',$2::text),created_at=now()-interval '39 hours'
+    WHERE id=$1::uuid`, [churn.id, churnToken]);
+  const churnCheck = await writeStallCheck(engine);
+  expect(churnCheck.status).toBe('warn');
+  expect(churnCheck.details).toMatchObject({ stalls: [{ request_id: churn.request_id, source_id: sources[1]!.id, root: churn.worktree_id }] });
+  expect((churnCheck.details as { stalls: Array<{ why: string }> }).stalls[0]!.why).toContain('No request on this root reached a terminal state');
+  expect(churnCheck.message).toContain('after 2340 min');
+
+  const progress = await admitWrite(engine, admission(config, sources[1]!, 'stall/progress', 'progress body'));
+  await engine.executeRaw(`UPDATE persistence_requests SET state='committed',completed_at=now()-interval '1 minute' WHERE id=$1::uuid`, [progress.id]);
+  const progressCheck = await writeStallCheck(engine);
+  expect(progressCheck.status).toBe('ok');
+  expect(progressCheck.details).toMatchObject({ count: 0, stalls: [] });
+
+  await engine.executeRaw('DELETE FROM persistence_requests WHERE id=$1::uuid OR id=$2::uuid', [churn.id, progress.id]);
+  const young = await admitWrite(engine, admission(config, sources[1]!, 'stall/young', 'young body'));
+  const youngToken = randomUUID();
+  await engine.executeRaw(`UPDATE persistence_requests SET state='running',execution_token=$2::uuid,claim_expires_at=now()+interval '30 seconds',
+    claim_phase=jsonb_build_object('phase','preparing','claimed_at',now()::text,'since',now()::text,'token',$2::text),created_at=now()-interval '2 minutes'
+    WHERE id=$1::uuid`, [young.id, youngToken]);
+  const youngCheck = await writeStallCheck(engine);
+  expect(youngCheck.status).toBe('ok');
+  expect(youngCheck.details).toMatchObject({ count: 0, stalls: [] });
+
+  // A database-only root (no worktree): progress is judged per source among database-only requests.
+  await engine.executeRaw('DELETE FROM persistence_requests WHERE id=$1::uuid', [young.id]);
+  const dbOnly = await admitWrite(engine, admission(config, sources[1]!, 'stall/db-only', 'db-only body'));
+  const dbOnlyToken = randomUUID();
+  await engine.executeRaw(`UPDATE persistence_requests SET state='running',worktree_id=NULL,execution_token=$2::uuid,claim_expires_at=now()+interval '30 seconds',
+    claim_phase=jsonb_build_object('phase','preparing','claimed_at',now()::text,'since',now()::text,'token',$2::text),created_at=now()-interval '39 hours'
+    WHERE id=$1::uuid`, [dbOnly.id, dbOnlyToken]);
+  const dbOnlyCheck = await writeStallCheck(engine);
+  expect(dbOnlyCheck.status).toBe('warn');
+  expect(dbOnlyCheck.details).toMatchObject({ stalls: [{ request_id: dbOnly.request_id, source_id: sources[1]!.id, root: null }] });
+  expect(dbOnlyCheck.message).toContain('root database-only');
+  // A worktree request's completion on the same source is not progress of the database-only root.
+  const worktreeDone = await admitWrite(engine, admission(config, sources[1]!, 'stall/worktree-done', 'worktree body'));
+  await engine.executeRaw(`UPDATE persistence_requests SET state='committed',completed_at=now()-interval '1 minute' WHERE id=$1::uuid`, [worktreeDone.id]);
+  expect((await writeStallCheck(engine)).status).toBe('warn');
+  const dbOnlyDone = await admitWrite(engine, admission(config, sources[1]!, 'stall/db-only-done', 'db-only done body'));
+  await engine.executeRaw(`UPDATE persistence_requests SET state='committed',worktree_id=NULL,completed_at=now()-interval '1 minute' WHERE id=$1::uuid`, [dbOnlyDone.id]);
+  expect((await writeStallCheck(engine)).status).toBe('ok');
+  await engine.executeRaw('DELETE FROM persistence_requests WHERE id=ANY($1::uuid[])', [[dbOnly.id, worktreeDone.id, dbOnlyDone.id]]);
+
   // An owner that predates phase recording never stamps its claim: the request's own age stands in for the claim's.
   const legacy = await admitWrite(engine, admission(config, sources[1]!, 'stall/legacy', 'legacy body'));
   await engine.executeRaw(`UPDATE persistence_requests SET state='running',execution_token=$2::uuid,claim_expires_at=now()+interval '30 seconds',

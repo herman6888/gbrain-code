@@ -8,7 +8,8 @@
  * (the written-back file, not the input) and a file whose disk bytes differ from the pinned blob only by line endings;
  * a record without them (older releases, repairs) is read and replaced by the next publish of the page.
  * Regression it catches: a record that hashes the pinned input instead of the bytes on disk, or omits the revision.
- * Code and image pages write no import provenance, so they have no case here. Synthetic content only.
+ * #6712 PR 1: code and image pages record the same fields (their parser names the code chunker or the image importer),
+ * so the discovery prescreen can match them. Synthetic content only.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
@@ -21,7 +22,8 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
-import { readSyncImportProvenance, SYNC_IMPORT_PARSER_VERSION, SYNC_IMPORT_PROVENANCE_OP } from '../src/core/persistence/sync-holds.ts';
+import { readSyncImportProvenance, SYNC_IMPORT_PARSER_VERSION, SYNC_IMPORT_PROVENANCE_OP, syncImportParserFor } from '../src/core/persistence/sync-holds.ts';
+import { chunkerStamp } from '../src/core/chunkers/code.ts';
 import { loadActivePackForEngine } from '../src/core/schema-pack/engine-resolution.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -52,14 +54,14 @@ describe('managed-sync import provenance records the bytes on disk, the revision
   const each = (fn: (engine: BrainEngine) => Promise<void>) => withEnv({ GBRAIN_HOME: home, OPENAI_API_KEY: undefined, ANTHROPIC_API_KEY: undefined },
     async () => { for (const engine of engines) await fn(engine); });
 
-  async function fixture(engine: BrainEngine, files: Record<string, string>) {
+  async function fixture(engine: BrainEngine, files: Record<string, string | Buffer>, config: Record<string, string> = {}) {
     await disposePersistenceConsumer(engine);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     const id = `prov-${randomUUID().slice(0, 12)}`, root = join(home, id);
     mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
     for (const [path, body] of Object.entries(files)) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), body); }
     const head = commit(root, 'seed');
-    await engine.executeRaw("INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,'{}')", [id, root]);
+    await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)', [id, root, JSON.stringify(config)]);
     await claimWorktree(engine, id, root);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
     const [{ incarnation }] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [id]);
@@ -131,6 +133,20 @@ describe('managed-sync import provenance records the bytes on disk, the revision
       const record = await expectDisk(engine, f, slug, path);
       expect(record.revision).toBe(before.get(slug)!);
       expect(record.disk_sha256).toBe(record.raw_sha256);
+    }
+  })), 120_000);
+
+  test('#6712 PR 1: a code page and an image page record the file bytes, the revision and their own parser', async () => withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: 'true', GBRAIN_EMBEDDING_IMAGE_OCR: 'false' }, () => each(async engine => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+    const f = await fixture(engine, { 'src/example.ts': 'export const example = 1;\n', 'notes/photo.png': png, 'notes/plain.md': note('A synthetic note beside code.') }, { strategy: 'auto' });
+    expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
+    for (const [path, parser] of [['src/example.ts', `code=1;chunker=${chunkerStamp()}`], ['notes/photo.png', 'image=1']] as const) {
+      const [{ slug }] = await engine.executeRaw<{ slug: string }>('SELECT slug FROM pages WHERE source_id=$1 AND source_path=$2', [f.id, path]);
+      const { snapshot, record } = await provenanceOf(engine, f, slug);
+      const disk = readFileSync(join(f.root, path));
+      expect(record).toMatchObject({ origin: path, disk_sha256: sha256(disk), disk_blob_oid: git(f.root, 'rev-parse', `HEAD:${path}`), revision: snapshot.revision,
+        parser: { parser_version: parser, markdown_chunker: MARKDOWN_CHUNKER_VERSION, schema_pack: null } });
+      expect(record.parser).toEqual(syncImportParserFor(path, null));
     }
   })), 120_000);
 

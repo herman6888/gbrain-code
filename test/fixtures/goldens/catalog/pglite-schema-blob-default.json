@@ -3,6 +3,15 @@
     "constraints": {
       "access_tokens.access_tokens_pkey": "p PRIMARY KEY (id)",
       "access_tokens.access_tokens_token_hash_key": "u UNIQUE (token_hash)",
+      "belief_commit_marks.belief_commit_marks_pkey": "p PRIMARY KEY (publication_id)",
+      "belief_events.belief_events_event_key_key": "u UNIQUE (event_key)",
+      "belief_events.belief_events_origin_check": "c CHECK ((origin = ANY (ARRAY['live'::text, 'unmanaged'::text, 'baseline'::text, 'backfill'::text, 'reconcile'::text])))",
+      "belief_events.belief_events_pkey": "p PRIMARY KEY (id)",
+      "belief_events.belief_events_subject_kind_check": "c CHECK ((subject_kind = ANY (ARRAY['page'::text, 'fact'::text, 'take'::text, 'link'::text, 'link_transition'::text, 'coverage'::text])))",
+      "belief_events.belief_events_tier_basis_check": "c CHECK ((tier_basis = ANY (ARRAY['row'::text, 'writer'::text, 'unknown'::text])))",
+      "belief_page_lifetimes.belief_page_lifetimes_pkey": "p PRIMARY KEY (page_lifetime)",
+      "belief_redactions.belief_redactions_pkey": "p PRIMARY KEY (id)",
+      "belief_retier_manifest.belief_retier_manifest_pkey": "p PRIMARY KEY (summary_event, subject_kind, subject_key)",
       "calibration_profiles.calibration_profiles_pkey": "p PRIMARY KEY (id)",
       "calibration_profiles.calibration_profiles_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "chat_usage_log.chat_usage_log_pkey": "p PRIMARY KEY (id)",
@@ -140,6 +149,23 @@
       "open_loops.open_loops_status_check": "c CHECK ((status = ANY (ARRAY['open'::text, 'done'::text, 'dropped'::text, 'stale'::text])))",
       "page_aliases.page_aliases_pkey": "p PRIMARY KEY (id)",
       "page_aliases.page_aliases_uniq": "u UNIQUE (source_id, alias_norm, slug)",
+      "page_body_manifest.page_body_manifest_cut_kind_check": "c CHECK ((cut_kind = ANY (ARRAY['heading'::text, 'day'::text, 'message'::text, 'blank'::text, 'forced'::text, 'region_end'::text, 'eof'::text])))",
+      "page_body_manifest.page_body_manifest_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "page_body_manifest.page_body_manifest_pkey": "p PRIMARY KEY (page_id, occurrence_id, gen_from, staging_key)",
+      "page_body_manifest.page_body_manifest_region_check": "c CHECK ((region = ANY (ARRAY['truth'::text, 'timeline'::text])))",
+      "page_body_manifest.page_body_manifest_source_id_sha256_fkey": "f FOREIGN KEY (source_id, sha256) REFERENCES page_segment_texts(source_id, sha256)",
+      "page_body_staging_parts.page_body_staging_parts_byte_len_check": "c CHECK (((byte_len >= 1) AND (byte_len <= 4194304)))",
+      "page_body_staging_parts.page_body_staging_parts_part_no_check": "c CHECK ((part_no >= 0))",
+      "page_body_staging_parts.page_body_staging_parts_pkey": "p PRIMARY KEY (staging_id, part_no)",
+      "page_body_staging_parts.page_body_staging_parts_staging_id_fkey": "f FOREIGN KEY (staging_id) REFERENCES page_body_stagings(id) ON DELETE CASCADE",
+      "page_body_stagings.page_body_stagings_declared_bytes_check": "c CHECK ((declared_bytes >= 0))",
+      "page_body_stagings.page_body_stagings_kind_check": "c CHECK ((kind = ANY (ARRAY['upload'::text, 'import'::text, 'sync'::text, 'put'::text, 'append'::text, 'edit'::text, 'resegment'::text])))",
+      "page_body_stagings.page_body_stagings_mode_check": "c CHECK ((mode = ANY (ARRAY['create'::text, 'replace'::text, 'append'::text])))",
+      "page_body_stagings.page_body_stagings_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "page_body_stagings.page_body_stagings_pkey": "p PRIMARY KEY (id)",
+      "page_body_stagings.page_body_stagings_principal_kind_principal_id_client_reque_key": "u UNIQUE (principal_kind, principal_id, client_request_id)",
+      "page_body_stagings.page_body_stagings_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
+      "page_body_stagings.page_body_stagings_state_check": "c CHECK ((state = ANY (ARRAY['open'::text, 'sealed'::text, 'prepared'::text, 'committed'::text, 'aborted'::text, 'expired'::text])))",
       "page_embedding_budget.page_embedding_budget_cap_usd_check": "c CHECK (((cap_usd IS NULL) OR (cap_usd >= (0)::double precision)))",
       "page_embedding_budget.page_embedding_budget_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "page_embedding_budget.page_embedding_budget_pkey": "p PRIMARY KEY (page_id)",
@@ -158,6 +184,11 @@
       "page_purges.page_purges_pkey": "p PRIMARY KEY (source_id, content_hash)",
       "page_purges.page_purges_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "page_retrievals.page_retrievals_pkey": "p PRIMARY KEY (page_id)",
+      "page_segment_texts.page_segment_texts_byte_len_check": "c CHECK (((byte_len >= 1) AND (byte_len <= 1048576)))",
+      "page_segment_texts.page_segment_texts_line_count_check": "c CHECK ((line_count >= 0))",
+      "page_segment_texts.page_segment_texts_pkey": "p PRIMARY KEY (source_id, sha256)",
+      "page_segment_texts.page_segment_texts_sha256_check": "c CHECK ((octet_length(sha256) = 32))",
+      "page_segment_texts.page_segment_texts_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "page_versions.page_versions_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "page_versions.page_versions_pkey": "p PRIMARY KEY (id)",
       "page_write_guards.page_write_guards_pkey": "p PRIMARY KEY (source_incarnation, slug)",
@@ -322,9 +353,9 @@
     ],
     "functions": {
       "bump_page_generation_clock_fn()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=c40a0a3b86e640b6c8979976173dd93ae92c8c1b9a9e3595cae2af1e265328fe",
-      "bump_page_generation_fn()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=c4135ae3f74177aa71313a6c73f22bda7a298bbf12435a8def390212ae11466a",
+      "bump_page_generation_fn()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=314d4775d7c90f8ed650ea12ae3687f388f714ed3d30582dc8ff678dfea1dc97",
       "enforce_minion_queue_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=be82640d1979fc81dc812efb78bb3596ef536f656d20750e5e4aa19016bf4784",
-      "gbrain_advance_page_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=ae793ff5263f7b76311e0c22593fb658db9f82e7b3781914421d9508b6da0e88",
+      "gbrain_advance_page_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=2a431195dc4c4150e3428251d0dec0a685cdc2992525c1b4b54dff103d5d99c9",
       "gbrain_advance_tag_revision()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=7807b26b4933148aa63c67fca824a60d3492396728205d04e16c48c81174cbd5",
       "gbrain_forget_page_retrievals()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=0f053c08f9d5a4512d10406f7b20b9c60ec43d9bbea48b28b7e4cf7187ee191b",
       "gbrain_fts_input(t text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[search_path=pg_catalog] body_sha256=c73d0dbc333c6dccc9714a6b8d1b7785f48170556b9024002ddca1c80b25d87d",
@@ -334,12 +365,27 @@
       "gbrain_guard_skill_publication()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e854c0d058e75a65c3a90127c5c417380975100e83fc34288f6085e786df10a9",
       "gbrain_lease_shared_skill_delivery()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=5e493c1ac8dce8cb025a736629e563437c4b214744137c302c532c20bf7e7acf",
       "gbrain_queue_page_projection()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=6c544b9c129b6a17dcabeb5ee8d44a2b0e0af9d02ca3fe47c7d7f22ec313042c",
-      "gbrain_require_managed_writer()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=d444fd431abe188062c7266caa9ab41327336c916805d7dd02a362affe2f26a7",
+      "gbrain_require_managed_writer()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=f29ded3a50b998bbe342052444996675f57ddf2de3fd786b2373015d35e6d859",
       "gbrain_require_persistence_protocol(required integer)": "RETURNS void kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=af07b7fac60dec0a4fe568217931ac449d32f73b3a53a047b3b02a5f59cb5058",
-      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=a2a8cb721548b59c270080ad486950ea523bb6331ab085e0d543e243f2999360"
+      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=f354d9571ef5de74a98cfd1661e09aebca711541cbdd6eb86effa48aae8822cc"
     },
     "grants": {
       "access_tokens": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "belief_commit_marks": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "belief_events": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "belief_page_lifetimes": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "belief_redactions": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "belief_retier_manifest": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "calibration_profiles": [
@@ -492,6 +538,15 @@
       "page_aliases": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "page_body_manifest": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "page_body_staging_parts": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "page_body_stagings": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "page_embedding_budget": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -511,6 +566,9 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "page_retrievals": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "page_segment_texts": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "page_versions": [
@@ -664,6 +722,22 @@
     "indexes": {
       "access_tokens_pkey": "CREATE UNIQUE INDEX access_tokens_pkey ON public.access_tokens USING btree (id)",
       "access_tokens_token_hash_key": "CREATE UNIQUE INDEX access_tokens_token_hash_key ON public.access_tokens USING btree (token_hash)",
+      "belief_commit_marks_pkey": "CREATE UNIQUE INDEX belief_commit_marks_pkey ON public.belief_commit_marks USING btree (publication_id)",
+      "belief_events_claim_fp": "CREATE INDEX belief_events_claim_fp ON public.belief_events USING btree (source_id, claim_fp) WHERE (claim_fp IS NOT NULL)",
+      "belief_events_event_key_key": "CREATE UNIQUE INDEX belief_events_event_key_key ON public.belief_events USING btree (event_key)",
+      "belief_events_lifetime": "CREATE INDEX belief_events_lifetime ON public.belief_events USING btree (page_lifetime, id) WHERE (page_lifetime IS NOT NULL)",
+      "belief_events_page": "CREATE INDEX belief_events_page ON public.belief_events USING btree (source_id, slug, id)",
+      "belief_events_pkey": "CREATE UNIQUE INDEX belief_events_pkey ON public.belief_events USING btree (id)",
+      "belief_events_publication": "CREATE INDEX belief_events_publication ON public.belief_events USING btree (publication_id)",
+      "belief_events_recorded": "CREATE INDEX belief_events_recorded ON public.belief_events USING btree (recorded_at)",
+      "belief_events_subject": "CREATE INDEX belief_events_subject ON public.belief_events USING btree (source_id, subject_kind, subject_key, id)",
+      "belief_page_lifetimes_open": "CREATE UNIQUE INDEX belief_page_lifetimes_open ON public.belief_page_lifetimes USING btree (source_incarnation, slug) WHERE (ended_at IS NULL)",
+      "belief_page_lifetimes_pkey": "CREATE UNIQUE INDEX belief_page_lifetimes_pkey ON public.belief_page_lifetimes USING btree (page_lifetime)",
+      "belief_page_lifetimes_slug": "CREATE INDEX belief_page_lifetimes_slug ON public.belief_page_lifetimes USING btree (source_id, slug)",
+      "belief_redactions_field_hash": "CREATE INDEX belief_redactions_field_hash ON public.belief_redactions USING btree (source_id, field_hash)",
+      "belief_redactions_pkey": "CREATE UNIQUE INDEX belief_redactions_pkey ON public.belief_redactions USING btree (id)",
+      "belief_redactions_subject": "CREATE INDEX belief_redactions_subject ON public.belief_redactions USING btree (source_id, subject_key, field)",
+      "belief_retier_manifest_pkey": "CREATE UNIQUE INDEX belief_retier_manifest_pkey ON public.belief_retier_manifest USING btree (summary_event, subject_kind, subject_key)",
       "calibration_profiles_bias_tags_gin": "CREATE INDEX calibration_profiles_bias_tags_gin ON public.calibration_profiles USING gin (active_bias_tags)",
       "calibration_profiles_holder_recent_idx": "CREATE INDEX calibration_profiles_holder_recent_idx ON public.calibration_profiles USING btree (source_id, holder, generated_at DESC)",
       "calibration_profiles_pkey": "CREATE UNIQUE INDEX calibration_profiles_pkey ON public.calibration_profiles USING btree (id)",
@@ -827,6 +901,15 @@
       "page_aliases_pkey": "CREATE UNIQUE INDEX page_aliases_pkey ON public.page_aliases USING btree (id)",
       "page_aliases_slug_idx": "CREATE INDEX page_aliases_slug_idx ON public.page_aliases USING btree (source_id, slug)",
       "page_aliases_uniq": "CREATE UNIQUE INDEX page_aliases_uniq ON public.page_aliases USING btree (source_id, alias_norm, slug)",
+      "page_body_manifest_live_bytes": "CREATE INDEX page_body_manifest_live_bytes ON public.page_body_manifest USING btree (page_id, byte_start) WHERE (gen_to IS NULL)",
+      "page_body_manifest_live_seq": "CREATE UNIQUE INDEX page_body_manifest_live_seq ON public.page_body_manifest USING btree (page_id, seq) WHERE ((gen_to IS NULL) AND (staging_id IS NULL))",
+      "page_body_manifest_pkey": "CREATE UNIQUE INDEX page_body_manifest_pkey ON public.page_body_manifest USING btree (page_id, occurrence_id, gen_from, staging_key)",
+      "page_body_manifest_staging": "CREATE INDEX page_body_manifest_staging ON public.page_body_manifest USING btree (staging_id) WHERE (staging_id IS NOT NULL)",
+      "page_body_manifest_text": "CREATE INDEX page_body_manifest_text ON public.page_body_manifest USING btree (source_id, sha256)",
+      "page_body_staging_parts_pkey": "CREATE UNIQUE INDEX page_body_staging_parts_pkey ON public.page_body_staging_parts USING btree (staging_id, part_no)",
+      "page_body_stagings_expiry": "CREATE INDEX page_body_stagings_expiry ON public.page_body_stagings USING btree (hard_expires_at) WHERE (state = ANY (ARRAY['open'::text, 'sealed'::text, 'prepared'::text]))",
+      "page_body_stagings_pkey": "CREATE UNIQUE INDEX page_body_stagings_pkey ON public.page_body_stagings USING btree (id)",
+      "page_body_stagings_principal_kind_principal_id_client_reque_key": "CREATE UNIQUE INDEX page_body_stagings_principal_kind_principal_id_client_reque_key ON public.page_body_stagings USING btree (principal_kind, principal_id, client_request_id)",
       "page_embedding_budget_pkey": "CREATE UNIQUE INDEX page_embedding_budget_pkey ON public.page_embedding_budget USING btree (page_id)",
       "page_embedding_budget_state_idx": "CREATE INDEX page_embedding_budget_state_idx ON public.page_embedding_budget USING btree (state) WHERE (state <> 'open'::text)",
       "page_extraction_state_pkey": "CREATE UNIQUE INDEX page_extraction_state_pkey ON public.page_extraction_state USING btree (page_id, pipeline)",
@@ -835,6 +918,7 @@
       "page_projection_jobs_pkey": "CREATE UNIQUE INDEX page_projection_jobs_pkey ON public.page_projection_jobs USING btree (source_incarnation, slug)",
       "page_purges_pkey": "CREATE UNIQUE INDEX page_purges_pkey ON public.page_purges USING btree (source_id, content_hash)",
       "page_retrievals_pkey": "CREATE UNIQUE INDEX page_retrievals_pkey ON public.page_retrievals USING btree (page_id)",
+      "page_segment_texts_pkey": "CREATE UNIQUE INDEX page_segment_texts_pkey ON public.page_segment_texts USING btree (source_id, sha256)",
       "page_versions_pkey": "CREATE UNIQUE INDEX page_versions_pkey ON public.page_versions USING btree (id)",
       "page_write_guards_pkey": "CREATE UNIQUE INDEX page_write_guards_pkey ON public.page_write_guards USING btree (source_incarnation, slug)",
       "pages_coalesce_date_idx": "CREATE INDEX pages_coalesce_date_idx ON public.pages USING btree (COALESCE(effective_date, updated_at))",
@@ -954,6 +1038,8 @@
     },
     "policies": {},
     "sequences": {
+      "belief_events_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=belief_events.id",
+      "belief_redactions_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=belief_redactions.id",
       "calibration_profiles_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=calibration_profiles.id",
       "chat_usage_log_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=chat_usage_log.id",
       "chronicle_judge_reservations_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=chronicle_judge_reservations.id",
@@ -982,6 +1068,7 @@
       "oauth_grant_audit_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=oauth_grant_audit.id",
       "open_loops_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=open_loops.id",
       "page_aliases_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=page_aliases.id",
+      "page_body_occurrence_id_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=-",
       "page_generation_clock_seq": "bigint start=1 min=1 max=9223372036854775807 increment=1 cycle=false cache=1 owned_by=-",
       "page_versions_id_seq": "integer start=1 min=1 max=2147483647 increment=1 cycle=false cache=1 owned_by=page_versions.id",
       "pages_id_seq": "integer start=1 min=1 max=2147483647 increment=1 cycle=false cache=1 owned_by=pages.id",
@@ -1015,6 +1102,83 @@
           "7 revoked_at timestamp with time zone/timestamptz NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
+      },
+      "belief_commit_marks": {
+        "columns": [
+          "1 publication_id uuid/uuid NOT NULL",
+          "2 observed_at timestamp with time zone/timestamptz NOT NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "belief_events": {
+        "columns": [
+          "1 id bigint/int8 NOT NULL DEFAULT nextval('belief_events_id_seq'::regclass)",
+          "2 event_key bytea/bytea NOT NULL",
+          "3 source_id text/text NOT NULL",
+          "4 source_incarnation uuid/uuid NOT NULL",
+          "5 page_lifetime uuid/uuid NULL",
+          "6 slug text/text NOT NULL",
+          "7 subject_kind text/text NOT NULL",
+          "8 subject_key text/text NOT NULL",
+          "9 event_type text/text NOT NULL",
+          "10 origin text/text NOT NULL DEFAULT 'live'::text",
+          "11 trust_tier text/text NOT NULL",
+          "12 writer_tier text/text NULL",
+          "13 tier_basis text/text NOT NULL DEFAULT 'row'::text",
+          "14 visibility text/text NOT NULL",
+          "15 publication_id uuid/uuid NOT NULL",
+          "16 ord integer/int4 NOT NULL",
+          "17 recorded_at timestamp with time zone/timestamptz NOT NULL DEFAULT clock_timestamp()",
+          "18 source_time timestamp with time zone/timestamptz NULL",
+          "19 valid_from timestamp with time zone/timestamptz NULL",
+          "20 valid_until timestamp with time zone/timestamptz NULL",
+          "21 value jsonb/jsonb NULL",
+          "22 value_hash text/text NULL",
+          "23 prior_hash text/text NULL",
+          "24 state_hash text/text NOT NULL",
+          "25 cause jsonb/jsonb NOT NULL",
+          "26 claim_fp text/text NULL",
+          "27 purged boolean/bool NOT NULL DEFAULT false",
+          "28 redacted_fields ARRAY/_text NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "belief_page_lifetimes": {
+        "columns": [
+          "1 page_lifetime uuid/uuid NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 source_incarnation uuid/uuid NOT NULL",
+          "4 slug text/text NOT NULL",
+          "5 page_id integer/int4 NULL",
+          "6 started_at timestamp with time zone/timestamptz NOT NULL DEFAULT clock_timestamp()",
+          "7 ended_at timestamp with time zone/timestamptz NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "belief_redactions": {
+        "columns": [
+          "1 id bigint/int8 NOT NULL DEFAULT nextval('belief_redactions_id_seq'::regclass)",
+          "2 source_id text/text NOT NULL",
+          "3 subject_key text/text NOT NULL",
+          "4 field text/text NOT NULL",
+          "5 purge_request uuid/uuid NOT NULL",
+          "6 field_hash text/text NOT NULL",
+          "7 released_by uuid/uuid NULL",
+          "8 released_hash text/text NULL",
+          "9 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "belief_retier_manifest": {
+        "columns": [
+          "1 summary_event bigint/int8 NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 subject_kind text/text NOT NULL",
+          "4 subject_key text/text NOT NULL",
+          "5 from_tier text/text NULL",
+          "6 to_tier text/text NOT NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "calibration_profiles": {
         "columns": [
@@ -1859,6 +2023,74 @@
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
+      "page_body_manifest": {
+        "columns": [
+          "1 page_id integer/int4 NOT NULL",
+          "2 occurrence_id bigint/int8 NOT NULL",
+          "3 gen_from bigint/int8 NOT NULL",
+          "4 gen_to bigint/int8 NULL",
+          "5 seq integer/int4 NOT NULL",
+          "6 region text/text NOT NULL",
+          "7 source_id text/text NOT NULL",
+          "8 sha256 bytea/bytea NOT NULL",
+          "9 byte_start bigint/int8 NOT NULL",
+          "10 byte_len integer/int4 NOT NULL",
+          "11 line_start bigint/int8 NOT NULL",
+          "12 line_count integer/int4 NOT NULL",
+          "13 cut_kind text/text NOT NULL",
+          "14 entry_state jsonb/jsonb NOT NULL",
+          "15 protected_regions jsonb/jsonb NOT NULL DEFAULT '[]'::jsonb",
+          "16 facts_slots jsonb/jsonb NOT NULL DEFAULT '[]'::jsonb",
+          "17 static_proj_bytes bigint/int8 NOT NULL",
+          "18 static_proj_lines integer/int4 NOT NULL",
+          "19 outline jsonb/jsonb NOT NULL DEFAULT '[]'::jsonb",
+          "20 date_min date/date NULL",
+          "21 date_max date/date NULL",
+          "22 hash_state bytea/bytea NOT NULL",
+          "23 staging_id uuid/uuid NULL",
+          "24 staging_key uuid/uuid NOT NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "page_body_staging_parts": {
+        "columns": [
+          "1 staging_id uuid/uuid NOT NULL",
+          "2 part_no integer/int4 NOT NULL",
+          "3 byte_start bigint/int8 NOT NULL",
+          "4 byte_len integer/int4 NOT NULL",
+          "5 sha256 bytea/bytea NOT NULL",
+          "6 body bytea/bytea NOT NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "page_body_stagings": {
+        "columns": [
+          "1 id uuid/uuid NOT NULL",
+          "2 kind text/text NOT NULL",
+          "3 principal_kind text/text NOT NULL",
+          "4 principal_id text/text NOT NULL",
+          "5 client_request_id uuid/uuid NOT NULL",
+          "6 source_id text/text NOT NULL",
+          "7 source_incarnation uuid/uuid NOT NULL",
+          "8 slug text/text NOT NULL",
+          "9 page_id integer/int4 NULL",
+          "10 mode text/text NOT NULL",
+          "11 base_revision uuid/uuid NULL",
+          "12 base_generation bigint/int8 NULL",
+          "13 declared_bytes bigint/int8 NOT NULL",
+          "14 declared_sha256 bytea/bytea NULL",
+          "15 received_bytes bigint/int8 NOT NULL DEFAULT 0",
+          "16 next_part integer/int4 NOT NULL DEFAULT 0",
+          "17 reserved_bytes bigint/int8 NOT NULL",
+          "18 state text/text NOT NULL DEFAULT 'open'::text",
+          "19 commit_request_id uuid/uuid NULL",
+          "20 idle_expires_at timestamp with time zone/timestamptz NOT NULL",
+          "21 hard_expires_at timestamp with time zone/timestamptz NOT NULL",
+          "22 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "23 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
       "page_embedding_budget": {
         "columns": [
           "1 page_id integer/int4 NOT NULL",
@@ -1917,6 +2149,17 @@
         "columns": [
           "1 page_id integer/int4 NOT NULL",
           "2 last_retrieved_at timestamp with time zone/timestamptz NOT NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "page_segment_texts": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 sha256 bytea/bytea NOT NULL",
+          "3 byte_len integer/int4 NOT NULL",
+          "4 line_count integer/int4 NOT NULL",
+          "5 body bytea/bytea NOT NULL",
+          "6 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -2693,6 +2936,8 @@
     "triggers": {
       "minion_jobs.minion_queue_protocol": "CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON public.minion_jobs FOR EACH ROW EXECUTE FUNCTION enforce_minion_queue_protocol()",
       "page_aliases.managed_writer_guard": "CREATE TRIGGER managed_writer_guard BEFORE INSERT OR DELETE OR UPDATE ON public.page_aliases FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()",
+      "page_body_manifest.managed_writer_guard": "CREATE TRIGGER managed_writer_guard BEFORE INSERT OR DELETE OR UPDATE ON public.page_body_manifest FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()",
+      "page_segment_texts.managed_writer_guard": "CREATE TRIGGER managed_writer_guard BEFORE INSERT OR DELETE OR UPDATE ON public.page_segment_texts FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()",
       "pages.bump_page_generation_clock_trg": "CREATE TRIGGER bump_page_generation_clock_trg AFTER INSERT OR DELETE OR UPDATE ON public.pages FOR EACH STATEMENT EXECUTE FUNCTION bump_page_generation_clock_fn()",
       "pages.bump_page_generation_trg": "CREATE TRIGGER bump_page_generation_trg BEFORE INSERT OR UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION bump_page_generation_fn()",
       "pages.managed_writer_guard": "CREATE TRIGGER managed_writer_guard BEFORE INSERT OR DELETE OR UPDATE ON public.pages FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()",

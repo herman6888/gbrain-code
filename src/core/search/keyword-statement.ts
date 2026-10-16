@@ -20,7 +20,7 @@
  * round-trips through JSON exactly.
  */
 import type { SearchOpts } from '../types.ts';
-import { escapeLikePattern, hasCJK, splitCJKQueryTerms } from '../cjk.ts';
+import { escapeLikePattern, hasCJK, cjkMatchTerms } from '../cjk.ts';
 import { getFtsLanguage } from '../fts-language.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import { buildHardExcludeClause, buildSourceFactorCase, buildVisibilityClause } from './sql-ranking.ts';
@@ -44,7 +44,7 @@ export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): 
   let predicate: string;
   let rank: () => string;
   if (hasCJK(query)) {
-    const terms = splitCJKQueryTerms(query);
+    const terms = cjkMatchTerms(query);
     if (terms.length === 0) return null;
     const likes = terms.map(term => {
       params.push(`%${escapeLikePattern(term)}%`);
@@ -77,7 +77,7 @@ export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): 
   else if (opts?.sourceId) filters += add(opts.sourceId, n => `p.source_id = ${n}`);
   const hardExclude = buildHardExcludeClause('p.slug', resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes));
   const factor = buildSourceFactorCase('p.slug', opts?.source_boosts ?? resolveBoostMap(), opts?.detail);
-  const where = `${predicate}${filters} ${hardExclude} ${buildVisibilityClause('p', 's', opts)} AND cc.modality = 'text'`;
+  const where = `${predicate}${filters} ${hardExclude} ${buildVisibilityClause('p', 's', { ...opts, chunkAlias: 'cc' })} AND cc.modality = 'text'`;
   const whereParamCount = params.length;
   return { where, score: `((${rank()}) * ${factor})::float8`, params, whereParamCount };
 }

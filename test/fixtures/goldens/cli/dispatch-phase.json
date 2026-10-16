@@ -139,6 +139,13 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "beliefs": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "bench": {
         "hasSwitchCase": false,
         "phase": "pre-connect",

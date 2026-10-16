@@ -288,6 +288,20 @@ separate, disclosed choice, never the default repair: `--operations all` for a
 client (`--reset-default operations` for a token) stores no snapshot, so the
 scopes and surface allow every operation, including ones later upgrades add.
 
+Two exceptions no snapshot change alone covers (the grant diagnosis lists them
+in `prerequisites[]` as `{operation, prerequisite, fix}`):
+
+- Membership operations (`join_brain`, `sync_brain_skills`, `leave_brain`)
+  need explicit approval by name. A grant with no snapshot never reaches them,
+  so the diagnosis counts them as unreachable. On a token with no snapshot,
+  `--refresh-operations` previews them, and `--refresh-operations --add
+  join_brain` writes a snapshot of every operation the scopes allow today plus
+  exactly the added one. Operations later upgrades add then need their own
+  refresh. `--all-new` is refused there; name each membership operation.
+- `confirm_memory` promotes trust only with the `memory_confirm` scope, which
+  the brain owner grants from the local CLI. Admitting it to a snapshot lets
+  its dry-run and no-op paths run, not promotion.
+
 ### Access-token lifetime
 
 An access token lives at most 90 days (7,776,000 seconds), whatever a

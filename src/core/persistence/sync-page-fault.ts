@@ -36,7 +36,7 @@ import { readSyncFile, syncGitPath, type SyncDiscovery, type SyncEntry, type Syn
 import { readTreeBlobs } from './sync-blobs.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import type { HeldEntry } from './sync-screen.ts';
-import type { GitHoldMeta } from './sync-holds.ts';
+import type { GitHoldMeta, GitHoldRecord } from './sync-holds.ts';
 import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
 
 export { HOLD_ATTEMPTS_NEEDS_HUMAN } from './sync-fault-class.ts';
@@ -80,6 +80,42 @@ export async function pageChangeProof(engine: Pick<BrainEngine, 'executeRaw'>, i
 }
 
 /**
+ * #6600: proof that a deletion entry the origin check refuses was already carried out: its exact page (the id and the
+ * revision this sync enumerated) is soft-deleted, the revision was written by a committed, authorized delete of that
+ * page in the same source incarnation, and no live page records the entry's origin. Such an entry settles as an
+ * idempotent deletion and clears its hold; a live replacement at the origin, a revision that moved since enumeration or
+ * any other writer keeps the hold.
+ */
+export async function idempotentDeletionProof(engine: Pick<BrainEngine, 'executeRaw'>, input: { sourceId: string; incarnation: string; pageId: number | null;
+  revision: string | null; sourcePath: string }): Promise<{ request_id: string } | null> {
+  if (input.pageId === null || input.revision === null) return null;
+  const [page] = await engine.executeRaw<{ revision: string; writer: string | null; deleted: boolean }>(
+    'SELECT knowledge_revision::text AS revision, revision_write_request_id::text AS writer, deleted_at IS NOT NULL AS deleted FROM pages WHERE id=$1 AND source_id=$2', [input.pageId, input.sourceId]);
+  if (!page?.deleted || !page.writer || page.revision !== input.revision) return null;
+  const [writer] = await engine.executeRaw<{ request_id: string; operation: string; kind: string | null; state: string; incarnation: string; page_id: number | null }>(
+    `SELECT request_id::text, operation, intent->>'kind' AS kind, state, source_incarnation::text AS incarnation, page_id FROM persistence_requests WHERE id=$1::uuid`, [page.writer]);
+  if (!writer || writer.state !== 'committed' || writer.incarnation !== input.incarnation || Number(writer.page_id) !== input.pageId
+    || !(writer.operation === 'delete_page' || writer.kind === 'managed_sync_delete')) return null;
+  const live = await engine.executeRaw('SELECT 1 FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND id<>$2 AND source_path=$3 LIMIT 1', [input.sourceId, input.pageId, input.sourcePath]);
+  return live.length ? null : { request_id: writer.request_id };
+}
+
+/**
+ * #6712 dependency edge: the hold of an entry whose slug or page id an earlier entry of the same sync shares, when that
+ * entry was held in the sync: it takes the predecessor's code and waits on it (`meta.blocked_on`) instead of publishing
+ * against a page whose earlier change never landed.
+ */
+export function dependentHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid'>,
+  predecessor: { path: string; code: GitHoldRecord['code'] }): HeldEntry {
+  const rename: SyncRename | undefined = entry.renameFrom ?? entry.renameHeld;
+  return { path: entry.path, source_path: entry.sourcePath, slug, page_id: pageId, code: predecessor.code,
+    message: `${entry.path} changes page ${slug}, which ${predecessor.path} changes earlier in the same sync, and ${predecessor.path} is held (${predecessor.code}); this file waits on it and the next sync after that hold clears imports it.`,
+    upstream_version: typeof intent.content === 'string' ? sha256(intent.content) : null,
+    meta: { recovery_version: RECOVERY_VERSION, ...(typeof intent.blobOid === 'string' ? { blob_oid: intent.blobOid } : {}), ...(entry.working ? { working: true } : {}),
+      ...(rename ? { rename_from: rename } : {}), ...(entry.action === 'delete' ? { deleted: true as const } : {}), blocked_on: predecessor.path } };
+}
+
+/**
  * The page's current revision, soft-deleted pages included (a deletion advances the revision, and a new-file entry whose slug
  * a page now occupies has moved too); null when no row exists. For a hold that records what it observed.
  */
@@ -90,12 +126,43 @@ export async function liveRevision(engine: Pick<BrainEngine, 'executeRaw'>, sour
   return row?.revision ?? null;
 }
 
-function base(entry: HoldEntry, slug: string, pageId: number | null, code: 'concurrent_write' | 'worktree_dirty',
+function base(entry: HoldEntry, slug: string, pageId: number | null, code: 'concurrent_write' | 'worktree_dirty' | 'file_drift',
   message: string, content: string | null, blobOid: string | null | undefined, meta: Partial<GitHoldMeta>): HeldEntry {
   const rename: SyncRename | undefined = entry.renameFrom ?? entry.renameHeld;
   return { path: entry.path, source_path: entry.sourcePath, slug, page_id: pageId, code, message, upstream_version: content === null ? null : sha256(content),
     meta: { recovery_version: RECOVERY_VERSION, ...(blobOid ? { blob_oid: blobOid } : {}), ...(entry.working ? { working: true } : {}),
       ...(rename ? { rename_from: rename } : {}), ...(entry.action === 'delete' ? { deleted: true as const } : {}), ...meta } };
+}
+
+/**
+ * #6712 PR 1: the `file_drift` hold for an import whose page moved since its file was last imported (`sides`, from the
+ * discovery baseline, sync-prescreen.ts) and whose import is not a no-op: importing would overwrite a database version
+ * sync never saw. `proof` names the database-only request that wrote the current revision when one did. Identifiers
+ * and revisions only, never content. `repair file-drift` is the exit; the hold is re-screened when the file or the
+ * page revision changes.
+ */
+export function fileDriftHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid'>,
+  observed: { sides: 'database' | 'both' | 'unknown'; revision: string | null; proof: PageChangeProof | null; sharedOrigin: boolean }): HeldEntry {
+  const by = observed.proof ? `${observed.proof.operation} request ${observed.proof.request_id} wrote page ${slug} straight to the database` : `page ${slug} changed in the database`;
+  const file = observed.sides === 'database' ? 'its file did not change in Git' : observed.sides === 'both' ? 'its file changed too'
+    : 'there is no import record to tell which side changed';
+  return base(entry, slug, pageId, 'file_drift',
+    `${entry.path}: ${by} since the file was last imported and ${file}, so sync held the import instead of overwriting the database version; the rest of the source synced.`,
+    intent.content ?? null, intent.blobOid, { sides: observed.sides, ...(observed.revision ? { page_revision: observed.revision } : {}),
+      ...(observed.proof ? { competing_request_id: observed.proof.request_id, competing_operation: observed.proof.operation } : {}),
+      ...(observed.sharedOrigin ? { shared_origin: true as const } : {}) });
+}
+
+/**
+ * #6517: whether `sourcePath`'s page survived a shared-origin delete (another page recording the same file was soft-deleted
+ * with `write_through.skipped: shared_origin`, keeping the file). Its `file_drift` hold leads with importing the file, as
+ * the delete's receipt does.
+ */
+export async function sharedOriginSurvivor(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, sourcePath: string): Promise<boolean> {
+  const rows = await engine.executeRaw(`SELECT 1 FROM pages d JOIN persistence_requests r ON r.source_id=d.source_id AND r.slug=d.slug
+    WHERE d.source_id=$1 AND d.deleted_at IS NOT NULL AND d.source_path=$2 AND r.operation='delete_page' AND r.state='committed'
+      AND r.outcome->'write_through'->>'skipped'='shared_origin' LIMIT 1`, [sourceId, sourcePath]);
+  return rows.length > 0;
 }
 
 /**

@@ -36,6 +36,7 @@ import { connectorStateKey } from '../persistence/connector-state.ts';
 import { LOOPS_EXTRACT_ENQUEUE_CEILING, LOOPS_EXTRACT_JOB, LOOPS_EXTRACT_WINDOW_DAYS, isLoopsExtractionEnabled, loopExtractionEligibility } from './loops-extract.ts';
 import { openDueGraceHold, type ThreadLoopVerdict } from './loop-detect.ts';
 import { NO_EXCLUSION, type LoopsExclusionPolicy } from './loops-exclusion.ts';
+import { muteRecheckThreads } from '../loops/loops-store.ts';
 import { loopsSpendGate } from './loops-spend.ts';
 import type { GmailThreadData, GoogleSourceState, LoopGraceHold } from './types.ts';
 
@@ -98,6 +99,60 @@ export async function seedGraceBackfill(engine: BrainEngine, sourceId: string, s
   pruneGraceHolds(holds, log);
   log(`[google] loop grace backfill: ${seeded} thread(s) from the last ${GRACE_BACKFILL_DAYS} days held for re-evaluation`);
   return seeded;
+}
+
+/**
+ * #5012: queues threads for a re-fetch through the grace-hold path (a due hold
+ * with no spec). Every sweep: threads with loops an unmute queued for
+ * re-check. Once: the newest thread of each of the WITHHELD_BACKFILL_SENDERS
+ * senders with the most open reply-owed loops, so the withheld-senders record
+ * covers loops opened before the automated-mail rule existed. `walkFromMs` is
+ * the lower bound of an unfinished backfill walk: that walk runs after the
+ * grace settle and fetches threads active since then itself, so they are not
+ * queued twice.
+ */
+export async function seedLoopRechecks(engine: BrainEngine, sourceId: string, state: GoogleSourceState, log: Log, now = Date.now(), walkFromMs: number | null = null): Promise<number> {
+  const holds = state.loop_grace_holds ??= {};
+  const seed = (rows: Array<{ thread_id: string; page_slug: string | null }>) => rows.reduce((n, r) => {
+    if (holds[r.thread_id]) return n;
+    holds[r.thread_id] = { due_ms: now, slug: r.page_slug, rev: null, spec: null };
+    return n + 1;
+  }, 0);
+  const rechecks = seed(await muteRecheckThreads(engine, sourceId));
+  let backfill = 0;
+  if (!state.loop_automated_backfill_done) {
+    backfill = seed(await engine.executeRaw<{ thread_id: string; page_slug: string | null }>(
+      `SELECT DISTINCT ON (counterparty_email) thread_id, page_slug, n, last_activity_at FROM (
+         SELECT counterparty_email, thread_id, page_slug, last_activity_at,
+                count(*) OVER (PARTITION BY counterparty_email) AS n
+           FROM open_loops
+          WHERE source_id = $1 AND status = 'open' AND loop_type = 'unanswered_inbound'
+            AND counterparty_email IS NOT NULL AND thread_id IS NOT NULL) l
+        ORDER BY counterparty_email, last_activity_at DESC`, [sourceId])
+      .then((rows) => (rows as Array<{ thread_id: string; page_slug: string | null; n: number; last_activity_at: Date | string | null }>)
+        .sort((a, b) => Number(b.n) - Number(a.n)).slice(0, WITHHELD_BACKFILL_SENDERS)
+        .filter((r) => walkFromMs == null || r.last_activity_at == null || new Date(r.last_activity_at).getTime() < walkFromMs + DAY_MS)));
+    state.loop_automated_backfill_done = true;
+  }
+  pruneGraceHolds(holds, log);
+  if (rechecks + backfill > 0) log(`[google] loop re-checks queued: ${rechecks} unmuted thread(s), ${backfill} sender backfill thread(s)`);
+  return rechecks + backfill;
+}
+
+export const WITHHELD_BACKFILL_SENDERS = 500;
+export const WITHHELD_SENDERS_CAP = 2_000;
+
+/** #5012: keeps the per-sender record of withheld reply-owed loops current with one fresh verdict. */
+export function recordWithheldVerdict(state: GoogleSourceState, verdict: ThreadLoopVerdict, now = Date.now()): void {
+  const record = state.loop_withheld_senders ??= {};
+  for (const spec of verdict.open) if (spec.loopType === 'unanswered_inbound') delete record[spec.counterpartyEmail];
+  if (!verdict.withheld) return;
+  const key = sanitizeForJsonb(verdict.withheld.counterpartyEmail);
+  const prior = record[key];
+  record[key] = { reason: verdict.withheld.reason, count: (prior?.count ?? 0) + 1, last_ms: now };
+  const keys = Object.keys(record);
+  if (keys.length <= WITHHELD_SENDERS_CAP) return;
+  for (const k of keys.sort((a, b) => record[a].last_ms - record[b].last_ms).slice(0, keys.length - WITHHELD_SENDERS_CAP)) delete record[k];
 }
 
 export type GraceRefetch = (threadId: string) => Promise<'ok' | 'gone' | 'failed'>;

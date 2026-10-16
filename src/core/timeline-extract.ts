@@ -176,9 +176,20 @@ export async function retractRemovedTimelineEntries(
     for (const key of markdownTimelineKeys(text, slug)) produced.add(key);
     for (const entry of supersededCitationTimeline(text)) superseded.add(tupleKey(entry));
   }
-  const orphans = extra.filter(row => produced.has(tupleKey(row)) || (superseded.has(tupleKey(row)) && hasExtractorDetail(row)))
+  const found = extra.filter(row => produced.has(tupleKey(row)) || (superseded.has(tupleKey(row)) && hasExtractorDetail(row)))
     .map(({ detail: _detail, ...row }) => row);
-  if (!orphans.length || opts.dryRun) return orphans;
+  if (!found.length) return [];
+  // W1 #6783 §12 (a): a row more trusted than the page's restatement, or held by an open contest, stays; the owner decides.
+  const [{ contestHeldRows, heldRows }, { derivedWriteTrust }, { storedTrustTier }] = await Promise.all([
+    import('./trust/fence-guard.ts'), import('./trust/taint.ts'), import('./trust/tier.ts')]);
+  const [page] = await engine.executeRaw<{ id: number; trust_tier: string | null }>('SELECT id, trust_tier FROM pages WHERE source_id = $1 AND slug = $2', [sourceId, slug]);
+  const writer = derivedWriteTrust({ channel: 'derive:timeline', inputs: page ? [{ table: 'pages', id: Number(page.id), tier: storedTrustTier(page.trust_tier) }] : [], projection: true }).tier;
+  const held = await heldRows(engine as BrainEngine, 'timeline_entries', found.map(row => Number(row.id)), { writer, pending: true });
+  const orphans = found.filter(row => !held.has(Number(row.id)));
+  if (opts.dryRun) return orphans;
+  await contestHeldRows(engine as BrainEngine, { sourceId, slug, table: 'timeline_entries', proposer: 'timeline_reconcile', writer,
+    rows: [...held].map(([id, tier]) => ({ id, tier, change: 'removed' as const })) });
+  if (!orphans.length) return orphans;
   await engine.executeRaw(
     `DELETE FROM timeline_entries WHERE id IN (SELECT jsonb_array_elements_text($1::text::jsonb)::int)`,
     [JSON.stringify(orphans.map(row => row.id))]);

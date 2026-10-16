@@ -42,6 +42,8 @@ export interface GoogleSyncSummary {
    * over-filtering without leaking mail content into logs.
    */
   extractEligibility: Record<string, number>;
+  /** #5012: reply-owed loops the detector withheld this sweep, by reason (counts only). */
+  loopsWithheld: Record<string, number>;
   failedFiles: number;
 }
 

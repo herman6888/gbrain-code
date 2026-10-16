@@ -29,7 +29,7 @@ import { formatFenceDate, parseFactsFence, upsertFactRow } from '../facts-fence.
 import { digest } from '../persistence/digest.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { WriteRequest } from '../persistence/model.ts';
-import { applyPreservingTakeResolutions, readFacts, type FactSnapshot } from '../persistence/prepared-maintenance.ts';
+import { readFacts, type FactSnapshot } from '../persistence/prepared-maintenance.ts';
 import { decideSingleFact } from './single-prepare.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
 import { appendContextNote } from './subject-infer.ts';
@@ -226,7 +226,7 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
         outcome.skipped.push({ id: c.id, reason: c.reason });
       }
     }
-    const published = page ? await applyPreservingTakeResolutions(tx, row.page_id, page) : {};
+    const published = page ? await page.apply(tx) : {};
     for (const c of planned) {
       if (c.action === 'skip') continue;
       const f = byId.get(c.id)!;
@@ -274,7 +274,13 @@ export async function submitRelinkGroup(engine: BrainEngine, config: GBrainConfi
   }
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return { ok: false, reason: 'no_page', message: `${slug} no longer exists` };
-  const target = await resolveFactWriteTarget(engine, sourceId, source);
+  let target: Awaited<ReturnType<typeof resolveFactWriteTarget>>;
+  try {
+    target = await resolveFactWriteTarget(engine, sourceId, source, { fileBacked: Boolean(snapshot.page.source_path), remote: false });
+  } catch (error) {
+    if (error instanceof OperationError && error.code === 'owner_unavailable') return { ok: false, reason: 'unfenceable', message: error.message };
+    throw error;
+  }
   if (target.kind === 'unbound') return { ok: false, reason: 'unfenceable', message: `source ${sourceId} writes through to ${target.root} but has no canonical owner` };
   const authority = await submissionAuthority(ctx, RELINK_OPERATION, sourceId, source.incarnation, slug);
   if (target.databaseOnlyReason) authority.databaseOnlyReason = target.databaseOnlyReason;

@@ -115,6 +115,21 @@ export interface GoogleSourceState {
   loop_grace_backfill_done?: boolean;
   /** #5867: managed-source 30-day loops_extract catch-up progress. */
   loops_catchup?: LoopsCatchupState;
+  /**
+   * #5012: the record of reply-owed loops the detector withheld, per sender
+   * (src/core/google/loop-catchup.ts, capped). A sender leaves it when a later
+   * thread of theirs opens a loop. `gbrain waiting` counts the open loops
+   * from these senders that the rule would not have opened.
+   */
+  loop_withheld_senders?: Record<string, LoopWithheldSender>;
+  /** #5012: one-shot re-check of the senders behind open reply-owed loops (set when seeded). */
+  loop_automated_backfill_done?: boolean;
+  /**
+   * #5012 item 9: set when `events.list` on the configured calendar returned
+   * 403 or 404 (the account cannot read it), cleared by the next successful
+   * list. `gbrain doctor` and `gbrain google status --no-probe` read it.
+   */
+  calendar_unreadable?: CalendarUnreadable | null;
   calendar_sync_token: string | null;
   /**
    * Calendar id `calendar_sync_token` was minted for. A token is only valid
@@ -196,6 +211,21 @@ export interface LoopGraceHold {
   } | null;
 }
 
+/** #5012: one sender whose reply-owed loops the detector withheld. */
+export interface LoopWithheldSender {
+  reason: 'automated_mail' | 'updates_without_reciprocity';
+  count: number;
+  last_ms: number;
+}
+
+/** #5012 item 9: the configured calendar could not be read. */
+export interface CalendarUnreadable {
+  code: 'calendar_unreadable';
+  calendar_id: string;
+  http_status: 403 | 404;
+  at: string;
+}
+
 /** #5867: the managed catch-up's window floor, its one-retry set and its done marker. */
 export interface LoopsCatchupState {
   version: 1;
@@ -219,6 +249,12 @@ export interface GmailMessageMeta {
   listUnsubscribe: boolean;
   /** RFC 3834 `Auto-Submitted` other than `no` (tracker notices, auto-replies); absent means human mail. */
   autoSubmitted?: boolean;
+  /** #5012: the `Precedence` header, trimmed and lowercased (`bulk`, `list`, `junk`); absent or '' when not sent. */
+  precedence?: string;
+  /** #5012: an RFC 2919 `List-Id` header was present (mailing-list or list-manager mail). */
+  listId?: boolean;
+  /** #5012: bare lowercased `Reply-To` addresses; absent or empty when not sent. */
+  replyTo?: string[];
   /**
    * iCalendar method when the message carries a `text/calendar` part or an
    * `.ics` attachment — 'REQUEST' | 'REPLY' | 'CANCEL' | 'COUNTER' | '' when a

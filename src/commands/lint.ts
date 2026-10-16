@@ -41,6 +41,7 @@ import { pathToSlug } from '../core/sync.ts';
 import { isManagedBrain } from '../core/cycle/phase-table.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../core/persistence/prepared-maintenance.ts';
 import { fileMatchesSnapshot, prepareFileTarget } from '../core/persistence/page-prepare.ts';
+import { scannerSlugRootMode, scannerSourcePath } from '../core/write-through.ts';
 import { heldFileDiagnostic, writeFailureDiagnostic } from '../core/persistence/verb-errors.ts';
 import { loadActivePackForEngine } from '../core/schema-pack/engine-resolution.ts';
 import { OperationError, opError } from '../core/ops/contract.ts';
@@ -221,9 +222,13 @@ export function lintContent(content: string, filePath: string, opts: LintContent
   // DOCUMENTING date formats (```\ncreated: YYYY-MM-DD\n``` or `YYYY-MM-DD`)
   // is not a page with an unfilled one. stripCodeBlocks masks fenced blocks
   // and inline spans in place, so line numbers stay exact.
+  // #6538: in the body, a YYYY-MM-DD token followed by `-word`, `.ext` or `/` is a filename/path template
+  // (`YYYY-MM-DD-topic.md`), not an unfilled date; frontmatter stays strict.
   const prose = stripCodeBlocks(content).split('\n');
+  const frontmatterLines = content.startsWith('---') ? lines.indexOf('---', 1) : -1;
   for (let i = 0; i < lines.length; i++) {
-    if (prose[i].match(/\bYYYY-MM-DD\b/) || prose[i].match(/\bXX-XX\b/) || prose[i].match(/\b\d{4}-XX-XX\b/)) {
+    const datePlaceholder = i <= frontmatterLines ? /\bYYYY-MM-DD\b/ : /\bYYYY-MM-DD\b(?![-./][A-Za-z0-9]|\/)/;
+    if (prose[i].match(datePlaceholder) || prose[i].match(/\bXX-XX\b/) || prose[i].match(/\b\d{4}-XX-XX\b/)) {
       issues.push({
         file: filePath, line: i + 1, rule: 'placeholder-date',
         message: `Placeholder date found: ${lines[i].trim().slice(0, 60)}`,
@@ -725,7 +730,8 @@ async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthori
   const scanned = existsSync(page) ? readSourceFileSync(page, 'utf-8') : null;
   const fixed = scanned === null ? null : fixContent(scanned);
   if (scanned === null ? !authority.binding : fixed === scanned) return null;
-  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, activePack))) {
+  const importPath = async () => scannerSourcePath(root, page, await scannerSlugRootMode(engine, sourceId, root));
+  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, importPath, activePack))) {
     const current = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
     if (current?.revision !== snapshot.revision) return pendingIssue(relPath, slug, 'revision_changed', changedWhileLinting(sourceId, slug));
     try {

@@ -6,6 +6,9 @@ import { withdrawnFact, withdrawalFenceBlocks } from './withdrawal-overlay.ts';
 import { ambiguousFenceClaims, discoverWithdrawalTargets, withdrawalDiscoveryFailure } from './withdrawal-discovery.ts';
 import { dropPurgedFenceRows } from './purge-overlay.ts';
 import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
+import { coverageActive, noteBelief, readLedgerSource, withBeliefBatch } from '../belief/ledger.ts';
+import { createPageVersion } from '../page-state/versions.ts';
+import { validateSlug } from '../utils.ts';
 
 export interface WithdrawalCommit {
   withdrawn: boolean;
@@ -48,7 +51,7 @@ export function reviewWithdrawOn(raw: string | null | undefined): boolean {
 
 export async function recordFactWithdrawal(
   engine: BrainEngine, id: number, sourceId: string, worldOnly = false,
-  opts: { requestId?: string; semanticReview?: boolean; excludePrivate?: boolean } = {},
+  opts: { requestId?: string; publicationId?: string; semanticReview?: boolean; excludePrivate?: boolean; beliefReport?: { appended: number } } = {},
 ): Promise<WithdrawalCommit> {
   return engine.transaction(async tx => {
     // A managed caller takes this EXCLUSIVE source lock before authority,
@@ -66,42 +69,60 @@ export async function recordFactWithdrawal(
       WHERE source_id=$1 AND visibility=$2 AND fact_hash IN ($3,gbrain_fact_fingerprint_v1($5)) AND (subject='*' OR subject=$4) LIMIT 1`,
     [sourceId, visibility, fact_hash, subject, fact]);
     const affected = existing.length ? [] : await discoverWithdrawalTargets(tx, sourceId, [{ visibility, fact_hash, subject, claim: fact }]).catch(withdrawalDiscoveryFailure);
-    await tx.lockPageKeys(affected.map(({ slug }) => ({ sourceId, slug })));
+    // The belief ledger's streams of the facts this withdrawal expires (fence pages and database-only subjects), locked with the pages.
+    const streams = (await tx.executeRaw<{ slug: string }>(`SELECT DISTINCT COALESCE(source_markdown_slug, entity_slug) AS slug FROM facts
+      WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=$3 AND ($4='*' OR entity_slug=$4) AND expired_at IS NULL
+        AND COALESCE(source_markdown_slug, entity_slug) IS NOT NULL`, [sourceId, visibility, fact_hash, subject]))
+      .map(r => r.slug).filter(slug => { try { validateSlug(slug); return true; } catch { return false; } });
+    const slugs = [...new Set([...affected.map(page => page.slug), ...streams])];
+    await tx.lockPageKeys(slugs.map(slug => ({ sourceId, slug })));
     const rows = await tx.executeRaw<{ visibility: string; fact: string; subject: string }>(
       `SELECT visibility,fact,COALESCE(entity_slug,'*') AS subject FROM facts WHERE id=$1 AND source_id=$2
         AND ($3::boolean=false OR visibility='world')${opts.excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''} FOR UPDATE`, [id, sourceId, worldOnly]);
     if (!rows.length) return { withdrawn: false, pages: [] };
     const row = rows[0];
-    // Scoped to the forgotten row's entity: the same claim about another
-    // entity stays active and rememberable. A subjectless fact withdraws
-    // source-wide ('*').
-    const inserted = await tx.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
-      VALUES ($1,$2,$4,gbrain_fact_fingerprint($3)) ON CONFLICT DO NOTHING RETURNING fact_hash`, [sourceId,row.visibility,row.fact,row.subject]);
-    await tx.executeRaw(`UPDATE facts SET expired_at=now(),valid_until=LEAST(COALESCE(valid_until,now()),now())
-      WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($3)
-        AND ($4='*' OR entity_slug=$4) AND expired_at IS NULL`, [sourceId,row.visibility,row.fact,row.subject]);
-    if (!inserted.length) return { withdrawn: false, pages: [] };
-    // Overnight semantic review (decide review lane): queued with the ledger row so a late commit is never skipped.
-    // Not queued when the caller opted out (`semantic_review: false`, also used by review-accepted withdrawals).
-    if (opts.semanticReview !== false && reviewWithdrawOn(await tx.getConfig(REVIEW_WITHDRAW_KEY))) {
-      await tx.executeRaw(`INSERT INTO decide_review_queue(kind,source_id,a_ref) VALUES ('withdraw',$1,$2) ON CONFLICT DO NOTHING`, [sourceId, String(id)]);
+    const ledger = affected.length ? await readLedgerSource(tx, sourceId) : null;
+    // W1 (docs/designs/BELIEF_LEDGER.md section 10): the pre-withdrawal body stays readable at its revision.
+    if (ledger && coverageActive(ledger.coverage)) {
+      for (const page of affected) {
+        const preimage = await tx.readPageSnapshot(page.slug, { sourceId, includeDeleted: true });
+        if (preimage) await createPageVersion(tx, page.slug, sourceId, preimage);
+      }
     }
-    // Logical revision and projection invalidation commit with the withdrawal.
-    // The revision trigger queues durable rebuild work even for unmanaged calls.
-    const pages = affected.length ? await tx.executeRaw<{ id: number; slug: string; knowledge_revision: string }>(
-      `UPDATE pages SET knowledge_revision=gen_random_uuid(),text_projection_revision=NULL,embedding_signature=NULL
-        WHERE source_id=$1 AND slug=ANY($2::text[]) RETURNING id,slug,knowledge_revision`, [sourceId, affected.map(page => page.slug)]) : [];
-    if (pages.length) await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=ANY($1::integer[])', [pages.map(page => page.id)]);
-    if (opts.requestId) {
-      await tx.executeRaw(`INSERT INTO persistence_effects(request_id,kind,data,source_id,source_incarnation,worktree_id)
-        SELECT $1::uuid,k.kind,$3::text::jsonb,s.id,s.incarnation,b.worktree_id
-        FROM sources s LEFT JOIN persistence_source_bindings b ON b.source_id=s.id AND b.source_incarnation=s.incarnation
-        CROSS JOIN (VALUES ('withdrawal-mirror'),('git'),('embedding')) AS k(kind)
-        WHERE s.id=$2 ON CONFLICT(request_id,kind) DO NOTHING`, [opts.requestId, sourceId, JSON.stringify({ version: 2, targets: pages.map(page => ({ slug: page.slug, page_id: page.id, revision: page.knowledge_revision })).sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0) })]);
-    }
-    const committed = pages.map(page => ({ sourceId, slug: page.slug, revision: page.knowledge_revision }));
-    for (const invalidate of withdrawalInvalidations) await invalidate(tx, { sourceId, factId: id, subject: row.subject, pages: committed });
-    return { withdrawn: true, pages: committed };
+    return withBeliefBatch(tx, { sourceId, slugs, publicationId: opts.requestId ?? opts.publicationId ?? null, op: 'forget', pageEventType: 'page.view_changed',
+      remote: worldOnly, ...(opts.beliefReport ? { report: opts.beliefReport } : {}) }, async () => {
+      // Scoped to the forgotten row's entity: the same claim about another
+      // entity stays active and rememberable. A subjectless fact withdraws
+      // source-wide ('*').
+      const inserted = await tx.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+        VALUES ($1,$2,$4,gbrain_fact_fingerprint($3)) ON CONFLICT DO NOTHING RETURNING fact_hash`, [sourceId,row.visibility,row.fact,row.subject]);
+      const expired = await tx.executeRaw<{ id: number }>(`UPDATE facts SET expired_at=now(),valid_until=LEAST(COALESCE(valid_until,now()),now())
+        WHERE source_id=$1 AND visibility=$2 AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($3)
+          AND ($4='*' OR entity_slug=$4) AND expired_at IS NULL RETURNING id`, [sourceId,row.visibility,row.fact,row.subject]);
+      noteBelief({ kind: 'withdrawn', factIds: expired.map(r => Number(r.id)) });
+      if (!inserted.length) return { withdrawn: false, pages: [] };
+      // Overnight semantic review (decide review lane): queued with the ledger row so a late commit is never skipped.
+      // Not queued when the caller opted out (`semantic_review: false`, also used by review-accepted withdrawals).
+      if (opts.semanticReview !== false && reviewWithdrawOn(await tx.getConfig(REVIEW_WITHDRAW_KEY))) {
+        await tx.executeRaw(`INSERT INTO decide_review_queue(kind,source_id,a_ref) VALUES ('withdraw',$1,$2) ON CONFLICT DO NOTHING`, [sourceId, String(id)]);
+      }
+      // Logical revision and projection invalidation commit with the withdrawal.
+      // The revision trigger queues durable rebuild work even for unmanaged calls.
+      const pages = affected.length ? await tx.executeRaw<{ id: number; slug: string; knowledge_revision: string }>(
+        `UPDATE pages SET knowledge_revision=gen_random_uuid(),text_projection_revision=NULL,embedding_signature=NULL
+          WHERE source_id=$1 AND slug=ANY($2::text[]) RETURNING id,slug,knowledge_revision`, [sourceId, affected.map(page => page.slug)]) : [];
+      if (pages.length) await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=ANY($1::integer[])', [pages.map(page => page.id)]);
+      if (opts.requestId) {
+        await tx.executeRaw(`INSERT INTO persistence_effects(request_id,kind,data,source_id,source_incarnation,worktree_id)
+          SELECT $1::uuid,k.kind,$3::text::jsonb,s.id,s.incarnation,b.worktree_id
+          FROM sources s LEFT JOIN persistence_source_bindings b ON b.source_id=s.id AND b.source_incarnation=s.incarnation
+          CROSS JOIN (VALUES ('withdrawal-mirror'),('git'),('embedding')) AS k(kind)
+          WHERE s.id=$2 ON CONFLICT(request_id,kind) DO NOTHING`, [opts.requestId, sourceId, JSON.stringify({ version: 2, targets: pages.map(page => ({ slug: page.slug, page_id: page.id, revision: page.knowledge_revision })).sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0) })]);
+      }
+      const committed = pages.map(page => ({ sourceId, slug: page.slug, revision: page.knowledge_revision }));
+      for (const invalidate of withdrawalInvalidations) await invalidate(tx, { sourceId, factId: id, subject: row.subject, pages: committed });
+      return { withdrawn: true, pages: committed };
+    });
   });
 }
 

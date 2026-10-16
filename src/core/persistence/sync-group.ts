@@ -21,6 +21,7 @@ import type { WriteRequest } from './model.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import type { SyncAuthority } from './sync-authority.ts';
+import { assertDrainLease } from './sync-lease.ts';
 
 /** What sets a drain's lane ceiling: lanes off, the configured maximum, or the connection pool. */
 export type LanesCap = 'disabled' | 'maximum' | 'pool';
@@ -105,14 +106,23 @@ export function nextGroupSize(settings: BulkSettings, perMemberMs: number | null
   return Math.max(1, Math.min(settings.size, Math.floor(budget / perMemberMs)));
 }
 
+/** #6712: the page keys a sync member occupies (its slug, and its page id when it has one); two members sharing one depend on each other. */
+export function dependencyKeys(member: Pick<WaiverEntry, 'slug' | 'pageId'>): string[] {
+  return [`slug:${member.slug}`, ...(member.pageId !== null ? [`page:${member.pageId}`] : [])];
+}
+
 /**
  * Followers for a group: frozen in manifest order after the head, four at a
  * time, stopping at the first entry that is not groupable, was overtaken by
  * another cursor, would be waived (the waiver handles it as a head) or is held (#5988).
+ * #6712 dependency edges: also at the first entry that shares a slug or page id with a member still in flight or held by
+ * the run (`taken`: the head, the groups admitted ahead, the run's held entries, and the followers frozen so far), so a
+ * delete and an import of one slug are never co-scheduled and the later one is frozen only after the earlier one settled.
  */
 export async function freezeFollowers<P extends WaiverEntry & { rebound?: true }>(engine: BrainEngine, cursor: WaiverCursor & { entries: unknown[] }, config: GBrainConfig,
-  count: number, freezeAt: (index: number) => Promise<P | null>): Promise<P[]> {
+  count: number, freezeAt: (index: number) => Promise<P | null>, taken: Iterable<string> = []): Promise<P[]> {
   const followers: P[] = [];
+  const occupied = new Set(taken);
   for (let next = cursor.index + 1; followers.length < count && next < cursor.entries.length;) {
     const batch = Array.from({ length: Math.min(4, count - followers.length, cursor.entries.length - next) }, (_, i) => next + i);
     const frozen = await Promise.all(batch.map(async index => {
@@ -120,7 +130,8 @@ export async function freezeFollowers<P extends WaiverEntry & { rebound?: true }
       return !entry || entry.rebound || !groupableIntent(entry.intent) || await wouldWaiveEntry(engine, { ...cursor, index }, entry, config) ? null : entry;
     }));
     for (const entry of frozen) {
-      if (!entry) return followers;
+      if (!entry || dependencyKeys(entry).some(key => occupied.has(key))) return followers;
+      for (const key of dependencyKeys(entry)) occupied.add(key);
       followers.push(entry);
     }
     next += batch.length;
@@ -143,6 +154,7 @@ export async function admitGroup(engine: BrainEngine, members: WaiverEntry[], cu
         principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: member.intent, intent: member.intent }))),
     ]) as [unknown, WriteRequest[]];
     if (!await cursorHolds(tx)) throw new GroupMoved();
+    await assertDrainLease(tx, cursor.sourceId);
     return rows;
   }), undefined, error => engine.reconnect({ error })).catch(error => { if (error instanceof GroupMoved) return null; throw error; });
 }

@@ -24,7 +24,7 @@
  * (`runStaleImageSweepFirst`), inside the run's cost cap.
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync } from './spawn.ts';
 import type { BrainEngine } from './engine.ts';
 import { importImageFile } from './import-file.ts';
 import { resolveRecordedImageFile, type DirectoryListings, type RecordedImageFile } from './image-asset-resolver.ts';

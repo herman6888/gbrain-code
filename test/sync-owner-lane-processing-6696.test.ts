@@ -1,16 +1,14 @@
 /**
- * #6696 C1: the resident-owner sync lane (`writer_sync` → `runAuthenticatedSyncSlice`) keeps the in-process
- * processing-option contract.
+ * #6696 C1, revised by #6712 PR 1: the resident-owner sync lane (`writer_sync` → `runAuthenticatedSyncSlice`) resumes
+ * a cursor with the cursor's processing opt-outs.
  *
  * What these tests protect:
- *   - a payload without an explicit list counts only its true-valued processing keys as typed: a `false` value is not
- *     a typed flag (`explicitSyncProcessing` marks it explicit, which made a flagless resume conflict with a cursor
- *     that stores `noEmbed=true` and refuse `invalid_params`);
- *   - a list the caller supplied is preserved exactly instead of recomputed from the booleans: `[]` adopts the
- *     cursor's stored options, and `['noEmbed']` with `noEmbed=false` is honored (it conflicts and refuses).
+ *   - a `false` processing key is not an opt-in that conflicts with the cursor: a flagless resume of a cursor that
+ *     stores `noEmbed=true` finishes it instead of refusing `invalid_params`;
+ *   - an older CLI's `explicitProcessing` list is accepted and ignored (`WIRE_SKEW_WINDOWS.explicitProcessing`): the
+ *     opt-outs are inherited OR-wise, so `['noEmbed']` with `noEmbed=false` finishes with `noEmbed` and reports it.
  *
- * Regression that fails it: the owner lane recomputing the list with `explicitSyncProcessing`, or the wire refusing a
- * supplied list.
+ * Regression that fails it: the owner lane refusing a resume over processing options, or the wire refusing the list.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -49,7 +47,7 @@ async function partialSource(): Promise<string> {
   await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,\'{}\')', [id, root]);
   await claimWorktree(engine, id, root);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-  expect(await performManagedSync(engine, { sourceId: id, noPull: true, noEmbed: true, explicitProcessing: [] } as SyncOpts, { maxPages: 1, maxMs: 1000 }))
+  expect(await performManagedSync(engine, { sourceId: id, noPull: true, noEmbed: true } as SyncOpts, { maxPages: 1, maxMs: 1000 }))
     .toMatchObject({ status: 'partial' });
   return id;
 }
@@ -74,10 +72,10 @@ test('a payload without a list counts only true-valued keys as typed: noEmbed=fa
   expect(await engine.getPage('notes/n2', { sourceId: id })).not.toBeNull();
 }), 180_000);
 
-test('a supplied list is preserved: [] adopts the stored options, [\'noEmbed\'] with noEmbed=false is honored and refuses', async () => withEnv(env, async () => {
-  const conflicting = await partialSource();
-  expect(await slice({ sourceId: conflicting, noPull: true, noEmbed: false, explicitProcessing: ['noEmbed'] }))
-    .toMatchObject({ error: { code: 'invalid_params', message: expect.stringContaining('processing options') } });
+test('an older CLI\'s list is accepted and ignored: [] and [\'noEmbed\'] with noEmbed=false both inherit the cursor\'s noEmbed', async () => withEnv(env, async () => {
+  const listed = await partialSource();
+  expect(await slice({ sourceId: listed, noPull: true, noEmbed: false, explicitProcessing: ['noEmbed'] })).toMatchObject({ status: 'first_sync', source_id: listed, inherited_options: ['noEmbed'] });
+  expect(await engine.getPage('notes/n2', { sourceId: listed })).not.toBeNull();
   const adopting = await partialSource();
   expect(await slice({ sourceId: adopting, noPull: true, explicitProcessing: [] })).toMatchObject({ status: 'first_sync', source_id: adopting });
 }), 180_000);

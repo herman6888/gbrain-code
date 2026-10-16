@@ -184,7 +184,7 @@ function harness(state: Partial<GoogleSourceState> = {}, opts: { idLookup?: bool
   const full: GoogleSourceState = { gmail_history_id: null, gmail_backfill_floor_ms: null, gmail_backfill_done: false, gmail_newest_ms: null,
     calendar_sync_token: null, contacts_sync_token: null, last_full_at: null, ...state };
   const summary: GoogleSyncSummary = { status: 'synced', added: 0, modified: 0, deleted: 0, chunksCreated: 0, embedded: 0, pagesAffected: [], threadsSeen: 0,
-    attachmentInspection: {}, extractEligibility: {}, failedFiles: 0 };
+    attachmentInspection: {}, extractEligibility: {}, loopsWithheld: {}, failedFiles: 0 };
   const run = (people: PeopleClient, syncOpts: { full?: boolean } = {}) => {
     const deps = { managed, engine, sourceId: 'g', cfg: { dir: '/nonexistent/google', contactsDir: 'people', account: 'owner@example.invalid' },
       opts: { ...syncOpts, signal: controller.signal }, entry: { meta: {} }, log: (m: string) => log.push(m), tick: () => {}, exclusion: {}, extractCandidates: [], processedThreads: new Set() };

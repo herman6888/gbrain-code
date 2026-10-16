@@ -15,7 +15,7 @@ import { inspectLegacyWriterLocks } from './legacy-locks.ts';
 import { deleteLockRowExact } from '../db-lock.ts';
 import { catalogueError } from '../error-catalogue.ts';
 import { isConnectorSourceKind } from './connector-identity.ts';
-import { gitDurabilityState } from './git-durability-policy.ts';
+import { gitDurabilityPolicy, gitDurabilityState } from './git-durability-policy.ts';
 import { writeThroughConfigured } from './switches.ts';
 import { DATABASE_ONLY_SOURCES_KEY, unboundBindCommand } from './unbound-source.ts';
 
@@ -33,6 +33,13 @@ export interface ActivationReport {
    * until `gbrain sources writer git-durability <source> --enable` runs.
    */
   git_durability?: Array<{ source_id: string; state: 'on' | 'off' | 'unknown'; enable_command: string | null }>;
+  /**
+   * #5182: one `git_durability_not_enabled` warning per filesystem source whose
+   * owner will not commit or push page writes (durability off, or not recorded
+   * and no legacy hook): their Git effects complete as skipped until the source
+   * is enabled, which re-queues them. Activation still proceeds.
+   */
+  warnings?: ActivationWarning[];
   /**
    * #6449: rooted, non-connector sources with no canonical owner on a brain whose `sync.write_through` is off. They are
    * database-only (page writes publish to the database with `databaseOnlyReason: disabled_by_config`, `writer status`
@@ -55,6 +62,45 @@ const gitDurabilityListing = (bindings: WorktreeBinding[]): NonNullable<Activati
   const state = gitDurabilityState(binding);
   return { source_id: binding.source_id, state, enable_command: state === 'on' ? null : `gbrain sources writer git-durability ${binding.source_id} --enable --dry-run` };
 });
+export interface ActivationWarning {
+  code: 'git_durability_not_enabled';
+  source_id: string;
+  state: 'off' | 'unknown';
+  message: string;
+  enable_command: string;
+  /** The legacy hook probe failed, so durability could not be verified (fail-closed: not durable). */
+  probe_error?: string;
+  fix: Action;
+}
+/** #5182: the sources whose Git effects activation would leave skipped, by the same policy the effect runner applies. */
+async function gitDurabilityWarnings(bindings: WorktreeBinding[]): Promise<{ warnings?: ActivationWarning[] }> {
+  const warnings: ActivationWarning[] = [];
+  for (const binding of bindings) {
+    const state = gitDurabilityState(binding);
+    if (state === 'on' || !binding.local_path) continue;
+    let probeError: string | undefined;
+    if (state === 'unknown') {
+      const policy = await gitDurabilityPolicy(binding, binding.local_path).catch((error: unknown) => {
+        probeError = error instanceof Error ? error.message : String(error);
+        return null;
+      });
+      if (policy?.durable) continue;
+    }
+    const id = binding.source_id;
+    const enableCommand = `gbrain sources writer git-durability ${id} --enable --dry-run`;
+    const why = state === 'off' ? 'Git durability is disabled on its binding'
+      : probeError ? `Git durability is not recorded and the post-commit hook probe failed (${probeError})`
+      : 'Git durability is not recorded and no harden post-commit hook is installed';
+    warnings.push({ code: 'git_durability_not_enabled', source_id: id, state, enable_command: enableCommand,
+      ...(probeError ? { probe_error: probeError } : {}),
+      message: `Source ${id}: ${why}, so the owner will not commit or push its page writes; their Git effects complete as skipped (durability_not_enabled). `
+        + `Preview with ${enableCommand}, then apply it without --dry-run (admin-intent writer_git_durability); enabling re-queues the Git effects skipped while it was off.`,
+      fix: { ...readFix('Previews enabling Git durability for this source, the checkout checks and the skipped Git effects it would re-queue; changes nothing.',
+        { argv: ['gbrain', 'sources', 'writer', 'git-durability', id, '--enable', '--dry-run', '--json'] }),
+      verify: { argv: ['gbrain', 'sources', 'writer', 'status', '--source', id, '--json'] } } });
+  }
+  return warnings.length ? { warnings } : {};
+}
 interface SourceRoot { id: string; incarnation: string; root: string | null; connector: boolean; }
 const quiescence = () => new OperationError('writer_not_quiesced', 'Managed activation requires all older writers and maintenance jobs to be stopped.',
   WRITER_INSPECTION_HINT);
@@ -199,7 +245,7 @@ export async function activatePersistence(engine: BrainEngine, opts: { confirmQu
       if (legacyLocks.some(row => !opts.cleanupDeadLocalLocks || row.liveness !== 'dead_eligible')) throw quiescence();
       if ((await tx.executeRaw(`SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1`)).length
         || (await tx.executeRaw('SELECT id FROM persistence_effects WHERE recovery IS NOT NULL LIMIT 1')).length) throw await notQuiescedError(tx, quiescence().message, { queuedEffects: false });
-      if (opts.dryRun) return { enabled: false, activated: false, filesystem_sources: bindings.length, native_lock: native, legacy_locks: legacyLocks, drift_audit: driftAudit, git_durability: gitDurabilityListing(bindings), ...databaseOnlyListing };
+      if (opts.dryRun) return { enabled: false, activated: false, filesystem_sources: bindings.length, native_lock: native, legacy_locks: legacyLocks, drift_audit: driftAudit, git_durability: gitDurabilityListing(bindings), ...await gitDurabilityWarnings(bindings), ...databaseOnlyListing };
       for (const row of legacyLocks) {
         if (!(await deleteLockRowExact(tx, row.id, row.holder_pid, row.acquisition_token)).deleted) throw quiescence();
       }
@@ -212,7 +258,7 @@ export async function activatePersistence(engine: BrainEngine, opts: { confirmQu
       // Any fsync/marker failure rolls back enabled=true. A conservative stale
       // refusal record after rollback is safe and cannot grant writer authority.
       await refreshManagedFilesystemRoots(tx, managedFilesystemDatastorePath(engine));
-      return { enabled: true, activated: true, filesystem_sources: bindings.length, native_lock: native, legacy_locks: legacyLocks, git_durability: gitDurabilityListing(bindings), ...databaseOnlyListing };
+      return { enabled: true, activated: true, filesystem_sources: bindings.length, native_lock: native, legacy_locks: legacyLocks, git_durability: gitDurabilityListing(bindings), ...await gitDurabilityWarnings(bindings), ...databaseOnlyListing };
     });
   } finally { for (const lock of locks.reverse()) await lock.release(); }
 }

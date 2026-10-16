@@ -96,9 +96,16 @@ interface WatermarkRow { last_commit_at: unknown; admitted: number | string }
 interface HeadRow { request_id: string; state: string; claim_phase: unknown; execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean | null }
 interface HoldRow { count: number | string | null; stalled: number | string | null; fences: number | string | null; concurrent: number | string | null; updated_at: unknown }
 
-/** #6706: the id of the active `sync` Minions job with a live lock that is draining `sourceId`, or null. Never rejects. */
+/**
+ * #6706: the id of the active `sync` Minions job with a live lock that is draining `sourceId`, or null. Never rejects.
+ * #6712 PR 1: a job drains under the source's drain lease, so its holder row names the job first; the job-table read
+ * stays for a job an older gbrain started (it takes no lease).
+ */
 export async function liveSyncJob(engine: BrainEngine, sourceId: string): Promise<number | null> {
-  const [row] = await engine.executeRaw<{ id: number | string }>(`SELECT id FROM minion_jobs WHERE name='sync' AND status='active' AND lock_until > now()
+  const holder = await (await import('./sync-lease.ts')).readDrainHolder(engine, sourceId).catch(() => null);
+  if (holder?.kind === 'job' && holder.id && /^\d+$/.test(holder.id)) return Number(holder.id);
+  // The lease's beacon row (sync-lease.ts) is for older binaries; this build reads the lease holder above.
+  const [row] = await engine.executeRaw<{ id: number | string }>(`SELECT id FROM minion_jobs WHERE name='sync' AND status='active' AND lock_until > now() AND queue <> 'gbrain-drain-lease'
     AND (COALESCE(data->>'sourceId', data->>'source_id')=$1 OR (COALESCE(data->>'sourceId', data->>'source_id') IS NULL
       AND (data->>'repoPath' IS NULL AND $1='default' OR data->>'repoPath'=(SELECT local_path FROM sources WHERE id=$1)))) ORDER BY started_at LIMIT 1`, [sourceId]).catch(() => []);
   return row ? Number(row.id) : null;

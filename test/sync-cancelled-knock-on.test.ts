@@ -2,8 +2,8 @@
  * #6402: a knock-on `cancelled` receipt is a retryable page fault, the same verdict sync's own `Next:` gives.
  *
  * Protects: `cancelled` is in the fault table (page / retry / not needs_human), so `sync status` hands the
- * loop the retry instead of paging a person; a group head whose window predecessor was never admitted is
- * cancelled with a message naming that request, not "an earlier page did not commit"; the failure ledger
+ * loop the retry instead of paging a person (an older build's knock-on cancel still renders that way); since
+ * #6712 a group head whose window predecessor was never admitted or failed publishes on its own fate; the failure ledger
  * restarts `first_seen`/`attempts` when a run targets a new commit (a `--retry-failed` of the same target keeps
  * counting, as `persistence-sync-failures.serial.test.ts` pins) and moves `updated_at`; a resume refused for conflicting
  * cursor options (`invalid_params`, a caller error) leaves the recorded diagnosis untouched.
@@ -24,7 +24,7 @@ import { classifySyncFault } from '../src/core/persistence/sync-fault-class.ts';
 import { managedSyncRetryCommand, readManagedSyncFailures, recordManagedSyncFailure } from '../src/core/persistence/sync-failures.ts';
 import { claimedHeadOrder, laneFaultBlockedReason, laneFaultCancelMessage, laneFaultInMessage, laneFaultOf, WINDOW_CANCEL_MESSAGE } from '../src/core/persistence/sync-window.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
-import { admitWrite, claimNextWrite } from '../src/core/persistence/journal.ts';
+import { admitWrite, claimNextWrite, getWriteRequestById } from '../src/core/persistence/journal.ts';
 import { localHostId, registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -76,11 +76,16 @@ test('sync status turns a cancelled knock-on into the retry sync prints, not a h
   expect([...status.next!.argv!].sort()).toEqual([...printed].sort());
 }), 120_000);
 
-test('a resume refused for conflicting cursor options leaves the recorded failure untouched', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+// #6712 PR 1: a resume with other processing flags is no longer refused; it inherits the cursor's opt-outs and meets
+// the same failure, which it must not re-record or replace.
+test('a resume with other processing flags inherits the cursor options and leaves the recorded failure untouched', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   const f = await blockedRun();
   const [before] = await readManagedSyncFailures(engine, [f.id]);
   expect(before!.code).toBe('source_changed');
-  await expect(performManagedSync(engine, { ...f.opts, noEmbed: false, explicitProcessing: ['noEmbed'] })).rejects.toMatchObject({ code: 'invalid_params' });
+  // Holds stay off as in the blocked run, so the page fault is still a failure rather than converted to a hold.
+  await engine.setConfig('sync.holds', 'fail');
+  try { expect(await performManagedSync(engine, { ...f.opts, noEmbed: false })).toMatchObject({ status: 'blocked_by_failures' }); }
+  finally { await engine.executeRaw("DELETE FROM config WHERE key='sync.holds'"); }
   const [after] = await readManagedSyncFailures(engine, [f.id]);
   expect(after).toMatchObject({ code: 'source_changed', observation_id: before!.observation_id, attempts: before!.attempts });
 }), 120_000);
@@ -105,7 +110,7 @@ test('the ledger restarts first_seen and attempts when the run targets a new com
   expect((await updatedAt()) > t2).toBe(true);
 }));
 
-test('a head whose window predecessor was never admitted is cancelled naming that request', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+test('#6712: a head whose window predecessor was never admitted publishes on its own fate, never cancelled for it', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   await registerLocalWriter(engine, 'cli');
   const [source] = await engine.executeRaw<{ incarnation: string }>("SELECT incarnation FROM sources WHERE id='default'");
   const ctx: OperationContext = { engine, config: { engine: 'pglite' }, dryRun: false, remote: false, sourceId: 'default', logger: { info() {}, warn() {}, error() {} } } as OperationContext;
@@ -115,16 +120,12 @@ test('a head whose window predecessor was never admitted is cancelled naming tha
   await admitWrite(engine, { principal: authority.principal, authority, operation: 'put_page', sourceId: 'default', sourceIncarnation: source!.incarnation,
     slug: 'notes/knock-on', pageId: null, requestId: randomUUID(), callerIntent: intent, intent });
   const head = (await claimNextWrite(engine, localHostId()))!;
-  const settled = await claimedHeadOrder(engine, head, false);
-  expect(Array.isArray(settled)).toBe(true);
-  const [row] = settled as Awaited<ReturnType<typeof claimNextWrite>>[];
-  expect(row!.state).toBe('cancelled');
-  expect(row!.error_code).toBe('cancelled');
-  expect(row!.error_message).toContain(missing);
-  expect(row!.error_message).not.toBe(WINDOW_CANCEL_MESSAGE);
+  expect(await claimedHeadOrder(engine, head, false)).toBeNull();
+  expect(await claimedHeadOrder(engine, head, true)).toBeNull();
+  expect((await getWriteRequestById(engine, head.id))!.state).toBe('running');
 }));
 
-test('#6402 residual (P4.3): a lane group released after a lock timeout keeps the fault on its rows, and its cancel names it', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+test('#6402 residual (P4.3) / #6712: a lane group released after a lock timeout keeps the fault on its rows and publishes after a failed predecessor', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   expect(laneFaultBlockedReason('lock_timeout')).toBe('lane_lock_timeout');
   expect(laneFaultOf('lane_statement_timeout')).toBe('statement_timeout');
   expect(laneFaultOf('group_member_waiting')).toBeNull();
@@ -152,16 +153,11 @@ test('#6402 residual (P4.3): a lane group released after a lock timeout keeps th
   const head = (await claimNextWrite(engine, localHostId()))!;
   expect(head.request_id).toBe(headId);
   expect(head.blocked_reason).toBeNull();
-  // Claimed as a window head (a lane head re-runs through laneFallback, which names the fault itself).
-  const settled = await claimedHeadOrder(engine, head, false);
-  expect(Array.isArray(settled)).toBe(true);
-  const rows = settled as Awaited<ReturnType<typeof claimNextWrite>>[];
-  expect(rows.map(row => row!.state)).toEqual(['cancelled', 'cancelled']);
-  for (const row of rows) {
-    expect(row!.error_code).toBe('cancelled');
-    expect(row!.error_message).toBe(laneFaultCancelMessage('lock_timeout'));
-    expect(row!.error_message).toContain('after lock_timeout on its lane group');
-  }
+  // #6712: claimed as a window head behind a predecessor that failed, it publishes on its own fate instead of being cancelled.
+  expect(await claimedHeadOrder(engine, head, false)).toBeNull();
+  expect((await getWriteRequestById(engine, head.id))!.state).toBe('running');
+  // An older build's cancel text still names the fault, and still classifies as a retryable page fault.
+  expect(laneFaultCancelMessage('lock_timeout')).toContain('after lock_timeout on its lane group');
   expect(classifySyncFault({ code: 'cancelled' })).toMatchObject({ class: 'page', safe_actions: ['retry'], needs_human: false });
 }));
 

@@ -455,7 +455,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "delete_page",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the next sync imports the file's current content into the surviving page. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.",
+    "description": "Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the warning names gbrain repair file-drift --prefer file, which imports the file's current content into the surviving page (sync holds that page file_drift rather than overwrite it). purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.",
     "params": {
       "source_id": {
         "type": "string",
@@ -553,7 +553,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "restore_page",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag.",
+    "description": "Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag. A restore that writes no file refuses (source_changed, detail canonical_file_absent) when the page's recorded file is gone from the checkout, because the next full sync would delete it again; the user chooses between putting the file back and detach: true.",
     "params": {
       "source_id": {
         "type": "string",
@@ -575,6 +575,10 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "string",
         "required": true,
         "description": "Slug of the soft-deleted page to restore, e.g. 'people/alice-example'."
+      },
+      "detach": {
+        "type": "boolean",
+        "description": "Restore a page whose recorded canonical file is gone from the checkout as a database-only page: it forgets the file, so sync never deletes it again. Only accepted when a plain restore refuses with canonical_file_absent; ask the user first."
       }
     },
     "mutating": true,
@@ -1149,7 +1153,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "expand": {
         "type": "boolean",
-        "description": "Default per search mode (tokenmax on)."
+        "description": "Default off; search.expansion overrides."
       },
       "detail": {
         "type": "string",
@@ -5412,7 +5416,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Stored contradiction reports are temporarily available only to trusted local callers without a source filter. Remote or source-scoped callers receive {contradictions: [], note} with an availability note. For eligible local callers, return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. An eligible read loads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
+    "description": "Return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. Remote, source-scoped or min_trust callers get only findings whose two sides they can read now (each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. Reads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
     "scope": "read",
     "params": {
       "slug": {
@@ -5431,6 +5435,19 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "limit": {
         "type": "number",
         "description": "Max findings to return. Default 20."
+      },
+      "min_trust": {
+        "type": "string",
+        "enum": [
+          "user_confirmed",
+          "operator_curated",
+          "tool_observed",
+          "agent_written",
+          "unknown",
+          "external_untrusted"
+        ],
+        "description": "Lowest trust tier to return (the connection floor still applies).",
+        "fullSurfaceOnly": true
       }
     },
     "cliHints": {
@@ -6021,7 +6038,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in no_counterparty (null when none). Loops come from the deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and completeness: when it is \"partial\", some mail in the window is held after repeated import failures; present the answer as partial and name the held items and their retry command.",
+    "description": "The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in no_counterparty (null when none). Loops come from the deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and completeness: when it is \"partial\", some mail in the window is held after repeated import failures; present the answer as partial and name the held items and their retry command. The grouped view also returns withheld_noise (null when none): open reply-owed loops from senders whose mail the detector now treats as automated, with a per-sender preview_command for closing them.",
     "params": {
       "group_by": {
         "type": "string",
@@ -6124,7 +6141,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "loops_mute",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback primitive behind \"never track this sender\". Existing loops keep their state.",
+    "description": "Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback primitive behind \"never track this sender\". It also closes that sender's (or thread's) open reply-owed (unanswered_inbound) loops as dropped with closed_by \"muted\" and lists their ids in `closed`; other loop types keep their state. dry_run lists `would_close` and changes nothing. loops_unmute re-checks the closed loops.",
     "params": {
       "kind": {
         "type": "string",
@@ -6153,7 +6170,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "loops_unmute",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for it again. Exact-match only. Does not reopen loops closed while the mute was in place.",
+    "description": "Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for it again. Exact-match only. The reply-owed loops the mute closed (unless another mute still covers them) are queued for re-check on the next Gmail sync and listed in `requeued`: a loop reopens only when nothing answered its thread since the mute. `unverifiable` lists closed loops with no thread to re-check (they stay closed); `stale_source` means the re-check waits on a sync that has not run in 24h. Manually closed loops are never touched. dry_run lists `would_requeue` and changes nothing.",
     "params": {
       "kind": {
         "type": "string",

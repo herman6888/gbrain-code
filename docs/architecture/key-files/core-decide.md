@@ -32,7 +32,7 @@ The capability contract (API, providers, egress, extension points) is `docs/arch
 
 - `src/core/ai/decide/store.ts` — `executeRaw` storage (no engine method): buffered receipts and spend rows with a background-work drainer (500 ms exit bound), `decide_state` (internal keys: receipt salt, S1 ownership), `receiptSalt` (insert-if-absent) + `hmacRef`, the 60 s cached daily spend, calibrations CRUD, aggregate receipt reads, retention pruning for the purge phase.
 
-- `src/core/ai/decide/receipts.ts` — `buildReceiptRows`/`writeReceipts`: one row per question with HMAC hashes only, the thresholded value, outcome, reason, policy fingerprint, calibration ref and replay fields; fire-and-forget.
+- `src/core/ai/decide/receipts.ts` — `buildReceiptRows`/`writeReceipts`: one row per question with HMAC hashes only, the thresholded value, outcome, reason, policy fingerprint, calibration ref and replay fields; fire-and-forget. An error row with no `result` takes `partial` (`DecideError.partial`: the answers settled batches returned before the decision failed, `model_resolved` null when they disagree), so `outcome: error` with `answer_value` set means returned but never applied; replay and calibration read only acted outcomes.
 
 - `src/core/ai/decide/runtime.ts` — Per-query decide budget (`createQueryBudget`, `stageDeadlineMs`), shadow sampling, and detached shadow work under its own `BudgetTracker` with a bounded queue and a drainer.
 

@@ -38,6 +38,7 @@ const DIRECTLY_READ_SINGLETONS = [
   'search.hnsw_iterative_scan',              // search/hnsw-iterative-scan.ts via loadConfigWithEngine
   'search.cjk_keyword_deadline_ms',          // search/cjk-keyword-deadline.ts via loadConfigWithEngine
   'search.keyword_statement_timeout_ms',     // postgres-engine/keyword-statement-timeout.ts (engine.getConfig once per connection) + loadConfigWithEngine
+  'search.keyword_timeout_negative_cache_seconds', // postgres-engine/keyword-timeout-cache.ts (read on the first keyword timeout)
   'search.crag_escalation',                  // ops/search.ts
   'search.alias_fanout_max',                 // search/alias-fanout.ts
   'search.demote_generated',                 // search/provenance-demotion.ts

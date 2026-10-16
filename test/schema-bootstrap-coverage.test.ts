@@ -1121,6 +1121,34 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // doctor reader probes for the column on older brains.
   'pages.links_attendance_blocked_revision',
   'pages.links_attendance_blocked_at',
+  // Wave B segmented page storage (migration v248). Deliberately absent from
+  // both schema blobs so fresh and upgraded brains share their ordinals; no
+  // index in either blob references them (content_chunks_occurrence_idx is
+  // migration-built), and the blob functions that read them
+  // (bump_page_generation_fn, gbrain_advance_page_revision,
+  // update_page_search_vector) reach them only when compiled_truth/timeline is
+  // NULL, which no brain before v248 can hold; the writer guard reads
+  // body_generation by key.
+  'pages.body_storage',
+  'pages.body_bytes',
+  'pages.truth_bytes',
+  'pages.body_lines',
+  'pages.body_generation',
+  'pages.segment_count',
+  'pages.segmenter_version',
+  'pages.body_flags',
+  'pages.truth_lead',
+  'pages.timeline_lead',
+  'content_chunks.occurrence_id',
+  'content_chunks.local_ordinal',
+  'content_chunks.raw_byte_start',
+  'content_chunks.raw_byte_end',
+  'content_chunks.body_generation',
+  'content_chunks.retired_generation',
+  'page_versions.body_storage',
+  'page_versions.body_generation',
+  'page_versions.body_bytes',
+  'page_versions.content_hash',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

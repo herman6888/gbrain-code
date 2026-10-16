@@ -27,6 +27,12 @@ export type EvidenceKind = 'page' | 'fact' | 'timeline' | 'take' | 'owner';
 /** Content hashes computed in SQL, identically at capture and at read. */
 export const FACT_HASH_SQL = (a: string) => `md5(${a}.fact || '|' || ${a}.visibility || '|' || COALESCE(${a}.entity_slug, '') || '|' || ${a}.kind)`;
 export const TIMELINE_HASH_SQL = (a: string) => `md5(${a}.date::text || '|' || ${a}.summary || '|' || ${a}.detail)`;
+/**
+ * The owner-evidence change signal of a question page: md5 of its body, or its
+ * content_hash once the body is segmented (no body column to hash; a stored
+ * md5 never equals it, so the owner's claims read as edited).
+ */
+export const OWNER_BODY_HASH_SQL = (a: string) => `CASE WHEN ${a}.body_storage = 'segmented' THEN ${a}.content_hash ELSE md5(${a}.compiled_truth) END`;
 export const TAKE_HASH_SQL = (a: string) => `md5(${a}.claim || '|' || ${a}.holder || '|' || COALESCE(${a}.weight::text, '') || '|' || COALESCE(${a}.resolved_outcome::text, ''))`;
 
 export interface EvaluatedSentence extends AnswerSentence {
@@ -128,7 +134,7 @@ export async function evaluateAnswer(
   const rows = pin.answer.length === 0 ? [] : await engine.executeRaw<EvidenceJoinRow>(
     `SELECT e.sentence_id, e.kind, e.source_id, e.page_id, e.page_generation, e.page_revision, e.content_hash,
        p.id AS p_id, p.generation AS p_generation, p.knowledge_revision::text AS p_revision, p.deleted_at AS p_deleted,
-       s.archived AS p_source_archived, md5(p.compiled_truth) AS p_body_hash,
+       s.archived AS p_source_archived, ${OWNER_BODY_HASH_SQL('p')} AS p_body_hash,
        f.id AS f_id, f.expired_at AS f_expired, (f.valid_until IS NOT NULL AND f.valid_until <= now()) AS f_valid_until_passed,
        f.superseded_by AS f_superseded, ${FACT_HASH_SQL('f')} AS f_hash,
        (f.id IS NOT NULL AND NOT ${quarantinedProvenanceFilterFragment('f')}) AS f_source_quarantined,

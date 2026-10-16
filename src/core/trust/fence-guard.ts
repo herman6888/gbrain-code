@@ -14,6 +14,11 @@
  * - Row gate (ENG-1): every new fence row is gated like other fact writers at
  *   the writer's tier; a held row is not inserted (the hold keeps it), a
  *   flagged row records its receipt after insert.
+ * - Held removals (W1 #6783 §12 (a)): the same rule for a page's takes and
+ *   timeline rows. A row more trusted than the writer is never deleted,
+ *   replaced or deactivated by it; it stays as it is and a `forget` proposal
+ *   asks the owner, whose accept applies the page's text to that row
+ *   (trust/held-removals.ts).
  */
 import type { BrainEngine, NewFact } from '../engine.ts';
 import { currentWriteTrust } from '../persistence/context.ts';
@@ -22,7 +27,7 @@ import { decideFactWrite, recordFlaggedRow, recordWriteGateHold, type GatedRowDe
 import { gateInput } from './gate-outcomes.ts';
 import { insertTrustProposal } from './proposals.ts';
 import { recordContestedFact } from './supersede-handlers.ts';
-import { compareTrust, storedTrustTier, trustRankSql, type WriteTrust } from './tier.ts';
+import { compareTrust, storedTrustTier, trustRankSql, type TrustTier, type WriteTrust } from './tier.ts';
 
 type FenceFact = NewFact & { row_num: number };
 const WRITER_RANK = trustRankSql(`COALESCE(NULLIF(current_setting('gbrain.write_trust_tier', true), ''), 'unknown')`);
@@ -113,4 +118,75 @@ export async function guardFenceRows<T extends FenceFact>(tx: BrainEngine, input
       return refs;
     },
   };
+}
+
+/** The page's live fence facts more trusted than the writer: the rows its field rewrite could lower. */
+export async function factsAboveWriter(tx: BrainEngine, sourceId: string, slug: string): Promise<Array<{ id: number; tier: TrustTier }>> {
+  return (await tx.executeRaw<{ id: number; trust_tier: string }>(`SELECT id, trust_tier FROM facts WHERE source_id = $1 AND source_markdown_slug = $2
+      AND row_num IS NOT NULL AND expired_at IS NULL AND ${trustRankSql('trust_tier')} > ${WRITER_RANK}`, [sourceId, slug]))
+    .map(r => ({ id: Number(r.id), tier: storedTrustTier(r.trust_tier) }));
+}
+
+/** What a lower-tier write would have done to a held take or timeline row. */
+export type HeldChange = 'removed' | 'replaced' | 'deactivated' | 'detail_changed';
+export type HeldTable = 'takes' | 'timeline_entries';
+export interface HeldRow { id: number; tier: TrustTier; change: HeldChange }
+
+const OPEN_CONTEST = (table: HeldTable) => `EXISTS (SELECT 1 FROM trust_proposals tp WHERE tp.status = 'pending' AND tp.action = 'forget'
+  AND tp.target_table = '${table}' AND tp.target_id = x.id)`;
+
+/**
+ * Of `ids`, the rows a write may not delete or overwrite, locked: rows more trusted than `writer` (the transaction's
+ * declared tier when omitted) and, with `pending`, rows an open contest already holds. A reconcile that restates the
+ * page text passes `pending`: the held row is absent from that text by design.
+ */
+export async function heldRows(tx: BrainEngine, table: HeldTable, ids: readonly number[], opts: { writer?: TrustTier; pending?: boolean } = {}): Promise<Map<number, TrustTier>> {
+  if (!ids.length) return new Map();
+  const writer = opts.writer ? trustRankSql('$2::text') : WRITER_RANK;
+  const rows = await tx.executeRaw<{ id: number; trust_tier: string }>(`SELECT x.id, x.trust_tier FROM ${table} x WHERE x.id = ANY($1::bigint[])
+      AND (${trustRankSql('x.trust_tier')} > ${writer}${opts.pending ? ` OR ${OPEN_CONTEST(table)}` : ''}) ORDER BY x.id FOR UPDATE`,
+  opts.writer ? [[...ids], opts.writer] : [[...ids]]);
+  return new Map(rows.map(r => [Number(r.id), storedTrustTier(r.trust_tier)]));
+}
+
+/**
+ * The page's takes a fence re-projection would delete (`gone` row numbers), replace (claim, kind or holder differ at the
+ * same row number) or deactivate, that are more trusted than the writer, locked before any of those statements run.
+ */
+export async function guardFenceTakes(tx: BrainEngine, pageId: number, incoming: ReadonlyArray<{ rowNum: number; claim: string; kind: string; holder: string; active: boolean }>,
+  gone: readonly number[], opts: { pending?: boolean } = {}): Promise<Array<HeldRow & { page_id: number; row_num: number }>> {
+  return guardTakeRows(tx, incoming.map(t => ({ page_id: pageId, row_num: t.rowNum, claim: t.claim, kind: t.kind, holder: t.holder, active: t.active })),
+    gone.map(rowNum => ({ page_id: pageId, row_num: rowNum })), opts);
+}
+
+/** guardFenceTakes over several pages' rows at once (a reconcile batch); `pending` also holds rows an open contest holds. */
+export async function guardTakeRows(tx: BrainEngine, incoming: ReadonlyArray<{ page_id: number; row_num: number; claim: string; kind: string; holder: string; active: boolean }>,
+  gone: ReadonlyArray<{ page_id: number; row_num: number }>, opts: { pending?: boolean } = {}): Promise<Array<HeldRow & { page_id: number; row_num: number }>> {
+  if (!incoming.length && !gone.length) return [];
+  const rows = await tx.executeRaw<{ id: number; page_id: number; row_num: number; trust_tier: string; change: HeldChange }>(`SELECT x.id, x.page_id, x.row_num, x.trust_tier,
+      CASE WHEN n.row_num IS NULL THEN 'removed' WHEN (x.claim, x.kind, x.holder) IS DISTINCT FROM (n.claim, n.kind, n.holder) THEN 'replaced'
+        ELSE 'deactivated' END AS change
+    FROM takes x
+    LEFT JOIN jsonb_to_recordset($1::text::jsonb) AS n(page_id integer, row_num integer, claim text, kind text, holder text, active boolean)
+      ON n.page_id = x.page_id AND n.row_num = x.row_num
+    LEFT JOIN jsonb_to_recordset($2::text::jsonb) AS g(page_id integer, row_num integer) ON g.page_id = x.page_id AND g.row_num = x.row_num
+    WHERE x.page_id = ANY($3::integer[]) AND (${trustRankSql('x.trust_tier')} > ${WRITER_RANK}${opts.pending ? ` OR ${OPEN_CONTEST('takes')}` : ''})
+      AND (g.row_num IS NOT NULL OR (n.row_num IS NOT NULL
+        AND ((x.claim, x.kind, x.holder) IS DISTINCT FROM (n.claim, n.kind, n.holder) OR (x.active AND NOT n.active))))
+    ORDER BY x.page_id, x.row_num FOR UPDATE OF x`,
+  [JSON.stringify(incoming), JSON.stringify(gone), [...new Set([...incoming, ...gone].map(r => r.page_id))]]);
+  return rows.map(r => ({ id: Number(r.id), page_id: Number(r.page_id), row_num: Number(r.row_num), tier: storedTrustTier(r.trust_tier), change: r.change }));
+}
+
+/** Files the owner's `forget` proposal for each held row (an open one is reused); returns their tp refs. */
+export async function contestHeldRows(tx: BrainEngine, input: { sourceId: string; slug: string; table: HeldTable; proposer: string; writer?: TrustTier; rows: readonly HeldRow[] }): Promise<string[]> {
+  if (!input.rows.length) return [];
+  const writer = input.writer ?? (await currentWriteTrust(tx))?.tier ?? 'unknown';
+  const refs: string[] = [];
+  for (const row of input.rows) {
+    const { id } = await insertTrustProposal(tx, { action: 'forget', sourceId: input.sourceId, target: { table: input.table, id: row.id }, proposer: input.proposer,
+      before: { guard: input.proposer, change: row.change, row: { id: row.id, tier: row.tier }, writer_tier: writer, slug: input.slug } });
+    refs.push(`tp${id}`);
+  }
+  return refs;
 }

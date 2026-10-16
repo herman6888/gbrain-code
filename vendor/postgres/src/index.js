@@ -228,7 +228,7 @@ function Postgres(a, b) {
 
   function own(c) {
     const queue = Queue()
-    let busy = false, fence = null, holding = null, releasing = false
+    let busy = false, fence = null, holding = null, releasing = false, discarding = false, discardPromise = null
     const reservation = c.reserved = (ended = false) => {
       if (c.reserved !== reservation)
         return
@@ -252,7 +252,7 @@ function Postgres(a, b) {
       }
     }
     reservation.enqueue = q => {
-      if (c.reserved !== reservation || releasing)
+      if (c.reserved !== reservation || releasing || discarding)
         return q.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is no longer owned'))
       queue.push(q)
       pump()
@@ -268,6 +268,52 @@ function Postgres(a, b) {
       reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection was discarded'))
       c.terminate()
     }
+    // A Terminate message on the busy socket cannot interrupt its current
+    // statement. Preserve the fenced Query/canceller until CancelRequest and
+    // the query's backend response settle; never let a later query use it.
+    // The bounded fallback still discards, but rejects as unconfirmed.
+    reservation.cancelAndDiscard = ({ timeout = 2000 } = {}) => {
+      if (discardPromise)
+        return discardPromise
+      if (c.reserved !== reservation)
+        return Promise.resolve()
+      discarding = true
+      reservation.reject(Errors.generic('CONNECTION_CLOSED', 'Connection is being discarded'))
+      const q = fence || holding
+      if (!q) {
+        // A busy, unfenced query has no retained canceller/settlement proof.
+        // Retire the socket but never report that as confirmed server stop.
+        const unconfirmed = busy
+        reservation.discard()
+        return discardPromise = unconfirmed
+          ? Promise.reject(Errors.generic('CANCEL_UNCONFIRMED', 'Busy unfenced query cancellation cannot be confirmed'))
+          : Promise.resolve()
+      }
+      let timer
+      let cancelling
+      try {
+        cancelling = q.cancel()
+      } catch (error) {
+        reservation.discard()
+        return discardPromise = Promise.reject(error)
+      }
+      discardPromise = Promise.race([
+        Promise.all([
+          cancelling,
+          Promise.prototype.then.call(q, () => {}, error => {
+            if (!error || error.code !== '57014')
+              throw error
+          })
+        ]),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(Errors.generic('CANCEL_UNCONFIRMED', 'Query cancellation did not settle before discard')), timeout)
+        })
+      ]).then(() => {}).finally(() => {
+        clearTimeout(timer)
+        reservation.discard()
+      })
+      return discardPromise
+    }
     reservation.releaseConnection = () => {
       if (c.reserved !== reservation)
         return
@@ -277,7 +323,7 @@ function Postgres(a, b) {
     return reservation
 
     function pump() {
-      if (c.reserved !== reservation || holding || fence)
+      if (c.reserved !== reservation || discarding || holding || fence)
         return
       while (queue.length) {
         const q = queue.peek()
@@ -348,6 +394,7 @@ function Postgres(a, b) {
       const sql = Sql(reservation.enqueue)
       sql.release = reservation.releaseConnection
       sql.discard = reservation.discard
+      sql.cancelAndDiscard = reservation.cancelAndDiscard
       return sql
     }
   }
@@ -376,6 +423,7 @@ function Postgres(a, b) {
       sql.savepoint = savepoint
       sql.prepare = x => prepare = x.replace(/[^a-z0-9$-_. ]/gi)
       sql.discard = reservation.discard
+      sql.cancelAndDiscard = reservation.cancelAndDiscard
       let uncaughtError
         , result
 

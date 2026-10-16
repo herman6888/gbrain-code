@@ -62,15 +62,15 @@ export const SEARCH_MATCH_DESCRIPTION = 'keyword: every match, paged.';
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const FIND_CONTRADICTIONS_DESCRIPTION =
-  "Stored contradiction reports are temporarily available only to trusted local callers without a source filter. " +
-  "Remote or source-scoped callers receive {contradictions: [], note} with an availability note. " +
-  "For eligible local callers, return suspected-contradiction findings from the most recent " +
+  "Return suspected-contradiction findings from the most recent " +
   "`gbrain eval suspected-contradictions` probe run, optionally filtered by slug " +
   "and/or severity. Use this when the user asks 'what's inconsistent in my " +
   "brain', 'show me contradictions about Acme', 'high-severity issues only', or " +
   "wants to act on the probe's findings without re-running it. Returns " +
   "{contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. " +
-  "An eligible read loads the stored run without triggering a new probe; users run " +
+  "Remote, source-scoped or min_trust callers get only findings whose two sides they can read now " +
+  "(each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. " +
+  "Reads the stored run without triggering a new probe; users run " +
   "`gbrain eval suspected-contradictions` for that.";
 
 export const FIND_TRAJECTORY_DESCRIPTION =

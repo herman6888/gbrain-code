@@ -14,6 +14,7 @@ import { type VectorArm, pushVectorList } from '../fusion-lists.ts';
 import { buildRelationalArm } from '../relational-recall.ts';
 import { isAmbiguousModalityQuery } from '../query-intent.ts';
 import { isDbAccessFailure } from '../../pg-access-classify.ts';
+import { isKeywordSkippedAfterTimeout } from '../../postgres-engine/keyword-timeout-cache.ts';
 import { isTimeoutError, pushDegraded } from './degraded.ts';
 import { markKeywordHits } from '../evidence.ts';
 import { resolveEffectiveRecency, resolveEffectiveSalience } from './effective-modes.ts';
@@ -76,8 +77,13 @@ export async function runLexicalArms(req: HybridRequest, earlyModality: Modality
     earlyModality === 'image'
       ? [[], []]
       : await Promise.all([
-          req.timer.overlap('keyword_arm', engine.searchKeyword(query, searchOpts)).catch((err: unknown) => {
+          req.timer.overlap('keyword_arm', engine.searchKeyword(query, opts?.useCache === false ? searchOpts : { ...searchOpts, keywordTimeoutCache: true })).catch((err: unknown) => {
             if (isDatetimeInputError(err)) throw err;
+            if (isKeywordSkippedAfterTimeout(err)) {
+              pushDegraded(degraded, 'keyword_arm_failed', 'skipped_after_timeout');
+              warnOncePerProcess('search-keyword-arm-skipped', `[gbrain] searchKeyword arm skipped (fail-open): ${err.message}`);
+              return [] as SearchResult[];
+            }
             if (isDbAccessFailure(err)) keywordAccessError = err;
             pushDegraded(degraded, 'keyword_arm_failed', isTimeoutError(err) ? 'timeout' : 'provider_error');
             warnOncePerProcess(

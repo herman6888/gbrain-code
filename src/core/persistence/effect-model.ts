@@ -29,7 +29,7 @@ export function contentRepairCommit(path: string, receipt: Pick<ContentRepairRec
   return { subject: contentRepairCommitSubject(path), line: `${safe(path)} (frontmatter_slug_conflict)`, trailer: contentRepairTrailer(receipt) };
 }
 export interface ParkedTarget { slug?: string; error_code: string }
-export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' }
+export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' | 'page_body_segmented' }
 /** A Git or withdrawal target parks after this many consecutive execution failures. */
 export const PARK_AFTER_FAILURES = 5;
 export interface EffectRecovery {
@@ -57,6 +57,8 @@ export interface PersistenceEffect {
   source_incarnation: string;
   worktree_id: string | null;
   data: { version?: 2; targets?: WithdrawalTarget[]; slug?: string; page_id?: number; relative_path?: string; expected_hash?: string | null; after_slug?: string; source_id?: string; source_scan?: boolean; visibility?: 'private' | 'world'; embedding_attempt_base?: number; embedding_retry_base?: number;
+    /** Wave B: the occurrences a segmented write added; its embedding effect embeds only their chunk rows. */
+    occurrence_ids?: number[];
     /** A single-file Git target's GitCommitNote, when its preparer gave one. */
     commit_subject?: string;
     commit_line?: string;

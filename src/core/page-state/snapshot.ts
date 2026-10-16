@@ -1,6 +1,7 @@
 import { fenceClaimHashes, overlayWithdrawalBody } from '../facts/withdrawal-overlay.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { ReadQuery } from '../search/read-enrichment.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { rowToPage } from '../utils.ts';
 import type { GlobalPurgeMarker, PageSnapshot, PageSnapshotOptions, PageWithdrawal } from './types.ts';
 import { PageSnapshotAmbiguousError, REVISION_BACKFILL_PENDING } from './types.ts';
@@ -126,8 +127,10 @@ async function readSnapshotStatement(query: ReadQuery, slug: string, opts?: Page
   const globalPurges: GlobalPurgeMarker = { count: Number(raw?.count ?? 0), latest: raw?.latest == null ? null : String(raw.latest), world_only: opts?.excludePrivate === true };
   const withdrawals = [...row.snapshot_withdrawals as PageWithdrawal[], ...await resolveGlobalPurges(query, page.source_id, globalPurges,
     [String(row.fingerprint_body ?? ''), String(row.fingerprint_timeline ?? '')])];
-  page.compiled_truth = overlayWithdrawalBody(page.compiled_truth, String(row.fingerprint_body ?? ''), withdrawals);
-  page.timeline = overlayWithdrawalBody(page.timeline, String(row.fingerprint_timeline ?? ''), withdrawals);
+  if (!isSegmentedPage(page)) {
+    page.compiled_truth = overlayWithdrawalBody(page.compiled_truth, String(row.fingerprint_body ?? ''), withdrawals);
+    page.timeline = overlayWithdrawalBody(page.timeline, String(row.fingerprint_timeline ?? ''), withdrawals);
+  }
   return { page, tags: row.snapshot_tags as string[], revision: row.knowledge_revision == null ? REVISION_BACKFILL_PENDING : String(row.knowledge_revision),
     sourceIncarnation: String(row.source_incarnation), withdrawals, ...(globalPurges.count > 0 ? { globalPurges } : {}) };
 }

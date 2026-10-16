@@ -22,7 +22,7 @@ export const DEFAULT_OUTLINE_LIMIT = 100;
 export const MAX_OUTLINE_LIMIT = 500;
 /** Outline block size for pages without headings (conversation logs). */
 export const OUTLINE_BLOCK_BYTES = 64 * 1024;
-const HEADING_MAX_CHARS = 200;
+export const HEADING_MAX_CHARS = 200;
 const FIRST_LINE_MAX_CHARS = 120;
 
 const NL = 0x0a;
@@ -209,11 +209,12 @@ export interface PageOutline {
   next_from_index?: number;
 }
 
-const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
-const FENCE = /^ {0,3}(```|~~~)/;
-const DATE = /\b((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
+export const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+export const FENCE = /^ {0,3}(```|~~~)/;
+export const DATE = /\b((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
 
-function clip(text: string, max: number): string {
+/** `text` cut to `max` UTF-16 units on a code point, with an ellipsis when cut. */
+export function clip(text: string, max: number): string {
   if (text.length <= max) return text;
   let cut = max;
   const c = text.charCodeAt(cut - 1);

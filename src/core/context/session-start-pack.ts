@@ -76,3 +76,24 @@ export async function requestSessionStartPack(
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
 }
+
+/**
+ * #5941: the source the hook's context arms (session-start pack, user-prompt)
+ * ask for. `GBRAIN_SOURCE` wins; else, with a session, its frozen source
+ * record (the one capture stamps: env, then the payload cwd's
+ * `.gbrain-source` walk), so context and capture never disagree within a
+ * session; without one, the cwd walk itself. Undefined (the serve's own
+ * binding) when nothing names a source or anything fails. A named source with
+ * no live keyed serve reaches the legacy socket, whose serve answers
+ * `source_mismatch` (the heartbeat reason) instead of another source's context.
+ */
+export async function contextSourceId(openSession: (() => Promise<{ source?: string }>) | null, cwd: string): Promise<string | undefined> {
+  if (process.env.GBRAIN_SOURCE) return process.env.GBRAIN_SOURCE;
+  try {
+    if (openSession) return (await openSession()).source;
+    const { resolveSourceIdEngineFree } = await import('../source-resolver.ts');
+    return resolveSourceIdEngineFree(null, cwd) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}

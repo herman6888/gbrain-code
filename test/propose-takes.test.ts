@@ -687,6 +687,25 @@ New prose appended here.`;
     });
   });
 
+  test('default extractor skips cleanly when a non-Anthropic chat model has no key (#6705)', async () => {
+    await withEnv({ GBRAIN_HOME: emptyHome(), OPENAI_API_KEY: undefined }, async () => {
+      configureGateway({ chat_model: 'openai:gpt-5.6', env: {} });
+      try {
+        const { engine, captured } = buildMockEngine({
+          pages: [buildPage({ slug: 'wiki/c', body: 'claim-ish prose' })],
+        });
+        const result = await runPhaseProposeTakes(buildCtx(engine));
+
+        expect(result.status).toBe('skipped');
+        expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
+        expect(result.summary).toContain('OPENAI_API_KEY');
+        expect(captured).toHaveLength(0);
+      } finally {
+        resetGateway();
+      }
+    });
+  });
+
   test('an injected extractor is never gated on provider availability', async () => {
     await withEnv({ GBRAIN_HOME: emptyHome(), ANTHROPIC_API_KEY: undefined }, async () => {
       configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: {} });

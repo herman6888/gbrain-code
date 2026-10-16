@@ -8,6 +8,7 @@
  * There is no default: nothing is guessed from the model id at query time.
  */
 import type { BrainEngine } from '../engine.ts';
+import { embedQuery } from '../embedding.ts';
 
 export const EMBEDDING_QUERY_PREFIX_KEY = 'embedding_query_prefix';
 
@@ -18,6 +19,24 @@ export async function loadEmbeddingQueryPrefix(engine: BrainEngine): Promise<str
   } catch {
     return '';
   }
+}
+
+/**
+ * #3783: the query-side embedding for callers outside hybrid search (think,
+ * takes, CRAG escalation, auto-think, search diagnose, eval's vector
+ * baseline). It loads the selected brain's prefix and embeds with the
+ * unbounded `embedQuery`, so each call site keeps its own deadline behavior;
+ * hybrid search keeps its bounded `embedQueryBounded`. Every query embed
+ * outside these two paths is a bug the call-site guard
+ * (test/query-embed-call-sites.test.ts) refuses.
+ */
+export async function embedQueryWithPrefix(
+  engine: BrainEngine,
+  text: string,
+  opts?: { embeddingModel?: string; dimensions?: number },
+): Promise<Float32Array> {
+  const queryPrefix = await loadEmbeddingQueryPrefix(engine);
+  return embedQuery(text, { ...(opts ?? {}), ...(queryPrefix ? { queryPrefix } : {}) });
 }
 
 /** Model families whose model cards ask for a query instruction, with the documented value. */

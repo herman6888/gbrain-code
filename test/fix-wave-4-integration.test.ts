@@ -92,7 +92,7 @@ test('X1: an upgrade from v178 builds the request indexes; managed working-tree 
       await importFromContent(engine, 'hand', legacy.toString('utf8'), { sourceId: id, noEmbed: true, sourcePath: 'hand.md' });
       await claimWorktree(engine, id, root);
     });
-    const opts = { sourceId: id, noPull: true, noEmbed: true, noExtract: true, workingTree: true, explicitProcessing: [] };
+    const opts = { sourceId: id, noPull: true, noEmbed: true, noExtract: true, workingTree: true };
     for (let run = 0; run < 3; run++) {
       const result = await performManagedSync(engine, opts);
       await disposePersistenceConsumer(engine);

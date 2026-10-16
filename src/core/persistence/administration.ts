@@ -188,13 +188,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     return runGitDurabilityAdministration(engine, params);
   }
   if (operation === 'writer_retry_effects') {
-    keys(params, ['source_id', 'request_id', 'dry_run']);
+    keys(params, ['source_id', 'request_id', 'dry_run', 'admin_intent', 'expected_state']);
     if (!isWriteRequestId(params.request_id)) throw invalid('A valid original write request UUID is required.',
       'Pass --request-id with the original write\'s request id (a UUID); gbrain sources writer status for that source lists blocked effects with their request ids.',
       typeof params.source_id === 'string' && isValidSourceId(params.source_id)
         ? readFix(`Lists source ${params.source_id}'s blocked effects with their request ids, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', params.source_id, '--json'] })
         : undefined);
-    return (await import('./effect-retry.ts')).retryRequestEffects(engine, source(params.source_id), params.request_id, params.dry_run === true, config, embeddingRetryPolicy);
+    // #6697 (D6): the admin-intent handshake is the owner's approval to retry a revoked writer's parked Git effect under owner authority.
+    const ownerHost = params.admin_intent !== undefined || params.expected_state !== undefined;
+    if (ownerHost) await requireWriterAdminIntent(engine, 'writer_retry_effects', params);
+    return (await import('./effect-retry.ts')).retryRequestEffects(engine, source(params.source_id), params.request_id, params.dry_run === true, config, embeddingRetryPolicy, ownerHost);
   }
   if (operation === 'source_add' || operation === 'source_lifecycle') {
     const { managedPersistenceEnabled } = await import('./ownership.ts');

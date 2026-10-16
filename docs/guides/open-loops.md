@@ -44,8 +44,12 @@ only), list mail (`List-Unsubscribe`), Gmail's bulk categories
 (`CATEGORY_PROMOTIONS` / `CATEGORY_SOCIAL` / `CATEGORY_FORUMS`, unless you
 wrote a substantive message in the thread; `CATEGORY_UPDATES` is not bulk),
 CC-only delivery, FYI/forwards without a question, self-threads, and muted
-senders/threads never open loops. None of these gates closes a loop: only a
-turn flip does. Sent-mail
+senders/threads never open loops. Positively automated mail opens no
+reply-owed loop either (#5012): a `Precedence: bulk`, `list` or `junk`
+header, a `List-Id` header, or a no-reply `Reply-To`. Each of these is a
+header the sender set, so a person writing from the same domain is
+unaffected. None of these gates closes a loop: only a
+turn flip does (a mute is the one exception, below). Sent-mail
 ingestion is what makes "unanswered" honest — your own replies are the
 negative filter.
 
@@ -248,10 +252,13 @@ gbrain loops list|show <id>          inspect
 gbrain loops done <id> | drop <id>   close (a closed commitment retires its
                                      projected fact too; see Close semantics)
 gbrain loops mute sender <email>     never open loops for this sender again
-gbrain loops mute thread <id>        ...or this thread (existing loops keep
-                                     their state)
-gbrain loops unmute sender <email>   undo a mute — the detector may open new
-gbrain loops unmute thread <id>      loops for it again
+gbrain loops mute thread <id>        ...or this thread; both also close its
+                                     open reply-owed loops (--dry-run lists them)
+gbrain loops unmute sender <email>   undo a mute: new loops can open again, and
+gbrain loops unmute thread <id>      the loops it closed are re-checked on the
+                                     next sync (--dry-run lists them)
+gbrain loops drop sender <email>     close every open reply-owed loop from one
+                                     sender (--dry-run first; cannot be undone)
 ```
 
 **Say to your agent:** *"Who is waiting on me?"* / *"open loops"* — routes to
@@ -269,17 +276,63 @@ none or more than one (`--source` disambiguates). `loops unmute` resolves
 its source the same way, so an unmute cannot aim at a different source than
 the mute it reverses.
 
-**Unmute is exact and forward-only.** It deletes the one
+**Mute closes; unmute re-checks (#5012).** A mute also closes the muted
+sender's or thread's open reply-owed (`unanswered_inbound`) loops as
+`dropped` with `closed_by: muted`, and prints how many it closed plus the
+exact unmute command. Commitment and decision loops keep their state. A
+sweep never reopens a muted loop for the same counterparty, even on newer
+activity. `--dry-run` lists the loops a mute would close and changes nothing.
+
+Unmute is exact. It deletes the one
 `(source_id, kind, value)` row the mute wrote — the same lower-casing, so
 `unmute sender BOB@Example.com` reverses `mute sender bob@example.com`, while
 a sibling source, the other `kind`, or a different value are untouched. It
-does **not** reopen loops: suppressions gate NEW detection only, so anything
-closed or never opened while the mute was in place stays that way; the
-detector simply resumes opening loops from the next sync. A repeated unmute
+then queues the loops that mute closed for a re-check (`closed_by:
+mute_recheck`): the next Gmail sync re-fetches each thread and reopens a loop
+only when nothing answered the thread since. A thread you answered during the
+mute stays closed. A loop another remaining mute still covers is left alone,
+a manual `done`/`drop` is never touched, and a loop with no thread to re-check
+stays closed (`unverifiable`, `closed_by: unmuted`). When the source has not
+synced in 24 hours, unmute says so and prints the sync that runs the
+re-check. A repeated unmute
 is a no-op that reports `removed: false` and exits 0, so a script may call it
 unconditionally without special-casing "was not muted".
 
-MCP: the `open_loops`, `loops_close`, `loops_mute`, `loops_unmute` ops. `open_loops` is
+**Dropping a noisy sender's backlog.** `gbrain loops drop sender <email>
+--dry-run` lists the ids and count of that sender's open reply-owed loops and
+changes nothing; that preview is the consent step. Running it without
+`--dry-run` closes them as `dropped`, one `loops_close` per loop. A drop
+cannot be undone: no command reopens a dropped loop. Use `loops mute sender`
+when you want a reversible stop.
+
+**Loops the automated-mail rule would not open now.** Loops opened before the
+rule existed stay open until you act. Each Gmail sync records, in the
+source's connector state (not in any page), the senders whose threads the
+rule withheld (`loop_withheld_senders`: reason, count, last time; at most
+2,000 senders). The first sync after upgrading also re-checks the newest
+thread of up to 500 senders with open reply-owed loops, so the record covers
+older loops. `gbrain waiting` then prints how many open reply-owed loops come
+from those senders and the exact `gbrain loops drop sender <email> --source
+<id> --dry-run` to preview for each (JSON and the `open_loops` grouped view:
+`withheld_noise`). Nothing is closed automatically. The sync log prints
+`[google] reply-owed loops withheld: automated_mail=N`.
+
+**Opt-in: Updates mail needs reciprocity.** With
+`gbrain config set loops.updates_require_reciprocity true` (key
+`loops.updates_require_reciprocity`, default `false`, unit boolean, off value
+`false`), a thread whose newest message Gmail filed under `CATEGORY_UPDATES`
+opens a reply-owed loop only when you have written to the sender (they appear
+in a stored thread you wrote in) or wrote a substantive message in this
+thread. Off, the default, Updates mail opens loops like any other mail, so a
+cold introduction Gmail files under Updates is never hidden. Withheld threads
+are recorded as `updates_without_reciprocity`.
+
+MCP: the `open_loops`, `loops_close`, `loops_mute`, `loops_unmute` ops.
+`loops_mute` returns the closed loop ids in `closed` (dry run: `would_close`)
+and an `undo_command`; `loops_unmute` returns `requeued`, `unverifiable`,
+`stale_source` with its `recheck_command`, and an `undo_command` (dry run:
+`would_requeue`). The `open_loops` grouped view adds `withheld_noise` (null
+when none). `open_loops` is
 served to remote callers with **fail-closed evidence redaction** — counts,
 counterparty, summary, due date; verbatim quotes, deep links, and the
 injectable `text` digest are trusted-local only. Remote callers also need a

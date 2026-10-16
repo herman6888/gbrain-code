@@ -41,6 +41,7 @@ import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
 import { expandEngineTypeFilters } from '../schema-pack/query-types.ts';
+import { reconcileTypeFilter } from './search-type-filter.ts';
 import { probeProjectionReadiness } from '../search/projection-readiness.ts';
 import { resolveBoostMap, resolveHardExcludes } from '../search/source-boost.ts';
 import { pageReadFilter } from '../search/read-policy-sql.ts';
@@ -253,40 +254,6 @@ async function hasUnsealedPagesInScope(ctx: OperationContext, scope: SourceScope
   }
 }
 
-/**
- * Agents guess page types ("company", "account", "deal") that a brain may not
- * have, and a filter on a type with no pages silently hides every page
- * (gbrain-evals Cat 40: type-filtered agent runs failed 62% of tasks against
- * 51% unfiltered). Requested types with no readable pages in scope are
- * dropped, the rest stay; when none remain the filter is lifted. Either way
- * the caller is told which types exist so it can refine.
- */
-async function reconcileTypeFilter(ctx: OperationContext, scope: SourceScope, excludePrivate: boolean,
-  types: string[] | undefined): Promise<{ types: string[] | undefined; notice?: string }> {
-  if (!types || scope.sourceIds?.length === 0) return { types };
-  const params: unknown[] = [];
-  let present: Set<string>;
-  try {
-    const rows = await ctx.engine.executeRaw<{ type: string }>(
-      `SELECT DISTINCT p.type FROM pages p WHERE ${pageReadFilter('p', { ...scope, excludePrivate }, params, true)} LIMIT 500`, params);
-    present = new Set(rows.map(r => r.type));
-  } catch {
-    return { types };
-  }
-  const keep: string[] = [];
-  const missing: string[] = [];
-  for (const type of types) {
-    // A schema-pack lookup failure propagates: typed reads fail closed rather than fall back to literal types.
-    const expanded = (await expandEngineTypeFilters(ctx.engine, { types: [type], ...scope })).types ?? [type];
-    (expanded.length === 0 || expanded.some(t => present.has(t)) ? keep : missing).push(type);
-  }
-  if (missing.length === 0) return { types };
-  const available = [...present].sort().join(', ');
-  return keep.length === 0
-    ? { types: undefined, notice: `No pages have type ${missing.join(', ')}, so the type filter was dropped and every page type was searched. Page types in this brain: ${available}.` }
-    : { types: keep, notice: `No pages have type ${missing.join(', ')}; filtered to ${keep.join(', ')}. Page types in this brain: ${available}.` };
-}
-
 const FACT_MATCH_STOPWORDS = new Set(['the', 'and', 'for', 'who', 'what', 'when', 'where', 'which', 'with', 'from', 'that', 'this', 'are', 'was', 'were', 'our', 'your', 'their', 'now', 'current', 'currently', 'should', 'does', 'did', 'has', 'have', 'how', 'any', 'all', 'about', 'into', 'its', 'next']);
 
 export interface AliasDeclaration { name: string; alias: string; slug: string }
@@ -461,22 +428,21 @@ async function buildRetrievalResponseMeta(
     : undefined;
   const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
   const excludeSlugPrefixes = resolveHardExcludes();
-  const safeIndexPending = ctx.remote !== false
-    && await hasUnsealedPagesInScope(ctx, scope, excludePrivate, { types: opts.types, excludeSlugPrefixes });
-  const readiness = await probeProjectionReadiness(ctx.engine, {
-    ...scope,
-    excludePrivate,
-    types: opts.types,
-    excludeSlugPrefixes,
-  });
   const aliases = (opts.declarations ?? new DeclarationMemo()).scan(results as DeclarationRow[], queryText);
-  // Facts saved about the entity the query names come first (newest first, one hop through entities they name).
-  const entityFacts = opts.entity && ctx.emitResponseMeta ? await entitySavedFacts(ctx.engine, opts.entity, { remote: ctx.remote !== false, excludePrivate }) : [];
+  // #6721: these reads depend on nothing but the inputs above, so they run at once: on a pooled Postgres
+  // the wall time is the slowest read's round trips, not their sum. The answer-feedback write still runs last.
+  const [safeIndexPending, readiness, entityFacts, matchedFacts, heldFiles] = await Promise.all([
+    ctx.remote !== false && hasUnsealedPagesInScope(ctx, scope, excludePrivate, { types: opts.types, excludeSlugPrefixes }),
+    probeProjectionReadiness(ctx.engine, { ...scope, excludePrivate, types: opts.types, excludeSlugPrefixes }),
+    // Facts saved about the entity the query names come first (newest first, one hop through entities they name).
+    opts.entity && ctx.emitResponseMeta ? entitySavedFacts(ctx.engine, opts.entity, { remote: ctx.remote !== false, excludePrivate }) : [],
+    matchingSavedFacts(ctx, scope, queryText, aliases),
+    stampHeldHits(ctx.engine, results as SearchResult[], scope, ctx).catch(() => []),
+  ]);
   // A fact the facts arm already returned as a row is not repeated beside the blocks.
   const factRowIds = new Set((results as SearchResult[]).flatMap(r => r.fact_row ? [r.fact_row.id] : []));
-  const savedFacts = [...entityFacts, ...(await matchingSavedFacts(ctx, scope, queryText, aliases)).filter(m => !entityFacts.some(e => e.id === m.id))]
+  const savedFacts = [...entityFacts, ...matchedFacts.filter(m => !entityFacts.some(e => e.id === m.id))]
     .filter(f => !factRowIds.has(f.id));
-  const heldFiles = await stampHeldHits(ctx.engine, results as SearchResult[], scope, ctx).catch(() => []);
   const heldNotice = heldFilesNotice(heldFiles, ctx.remote !== false);
   if (heldNotice) ctx.emitNotice?.(heldNotice);
   const degraded = [...(m?.degraded ?? [])];
@@ -500,6 +466,7 @@ async function buildRetrievalResponseMeta(
       ...(m.answerability ? { answerability: m.answerability } : {}),
       ...(m.relational_plan ? { relational_plan: m.relational_plan } : {}),
       ...(m.rerank_gate ? { rerank_gate: m.rerank_gate } : {}),
+      ...(m.cosine_rescore ? { cosine_rescore: m.cosine_rescore } : {}),
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
@@ -758,8 +725,9 @@ const search: Operation = {
           if (hit && !text.includes(names[0]!.toLowerCase())) row.matched_alias = hit;
         }
       }
-      const keywordCount = page ? null : timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, undefined, keywordOpts));
-      const results = (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts })))).map(r => ({ ...r }));
+      const lexicalDone = Promise.withResolvers<void>();
+      const keywordCount = page ? null : timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, undefined, keywordOpts, lexicalDone.promise));
+      const results = (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts })).finally(lexicalDone.resolve))).map(r => ({ ...r }));
       await stampKeywordRows(ctx, results, { ...scope, excludePrivate }, queryText, startedAt, timings);
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
       return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, null, snippetCap, timings,
@@ -770,7 +738,8 @@ const search: Operation = {
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
     // expansion OFF (no per-call LLM cost). `query` op is the full-control variant.
     let capturedMeta: HybridSearchMeta | null = null;
-    const keywordCount = timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, types, readOpts));
+    const searchDone = Promise.withResolvers<void>();
+    const keywordCount = timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, types, readOpts, searchDone.promise));
     const explainPrep = await setup(() => prepareExplainTarget(ctx, p, scope, excludePrivate, 'search'));
     const searchOpts = {
       limit,
@@ -791,7 +760,7 @@ const search: Operation = {
     };
     const primary = await hybridSearchCached(ctx.engine, queryText, {
       ...searchOpts, onMeta: (m) => { capturedMeta = m; }, explain: p.explain === true, explainTarget: explainPrep?.trace,
-    });
+    }).finally(searchDone.resolve);
     const declarations = new DeclarationMemo();
     const fanned = offset === 0
       ? await timings.stage('alias_fanout', () => withAliasFanOut(ctx.engine, primary, queryText, { ...scope, excludePrivate },
@@ -855,7 +824,7 @@ const query: Operation = {
     return_unit: RETURN_UNIT_PARAM,
     return_window: RETURN_WINDOW_PARAM,
     token_budget: { type: 'number', description: 'Evidence token cap.' },
-    expand: { type: 'boolean', description: 'Default per search mode (tokenmax on).' },
+    expand: { type: 'boolean', description: 'Default off; search.expansion overrides.' },
     detail: { type: 'string', description: 'low (compiled truth), medium (default) or high (all chunks).' },
     fields: FIELDS_PARAM,
     mode: { type: 'string', description: 'Local callers only.' },
@@ -1081,8 +1050,8 @@ const query: Operation = {
       // the first pass actually did (`expansion_applied`), not what was
       // requested: a first pass that produced expansion variants doesn't pay
       // for a second expansion LLM call + rerank over a near-identical query,
-      // while one that ran without expansion (the mode default outside
-      // tokenmax, an explicit opt-out, or an expander that produced nothing)
+      // while one that ran without expansion (the default, an explicit
+      // opt-out, or an expander that produced nothing)
       // can still escalate.
       if (shouldEscalateRetrieval(grade, {
         enabled: escalationCfg === 'true',
@@ -1152,7 +1121,7 @@ const query: Operation = {
         if (thinkCfg === 'true' && ctx.remote === false) {
           try {
             const { runThink } = await import('../think/index.ts');
-            const { embedQuery } = await import('../embedding.ts');
+            const { embedQueryWithPrefix } = await import('../search/query-prefix.ts');
             const thinkScope = thinkScopeFromQueryScope(querySourceScope);
             const t = await runThink(ctx.engine, {
               question: queryText,
@@ -1161,7 +1130,7 @@ const query: Operation = {
               ...thinkScope,
               remote: false,
               // #3734: activate takes' vector retrieval arm for CRAG think escalation.
-              embedQuestion: (q) => embedQuery(q),
+              embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
             });
             crag.think = {
               answer: t.answer,

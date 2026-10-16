@@ -55,9 +55,24 @@ export const TERM_STUFFING_RATIO = 3;
 /** The two preregistered admission rules; dev picks one (`recall.question_admission`). */
 export const QUESTION_ADMISSION_RULES = ['reserve', 'facts_arm'] as const;
 export type QuestionAdmissionRule = (typeof QUESTION_ADMISSION_RULES)[number];
-const RESERVE_COSINE_MIN = 0.5;
+/**
+ * Absolute cosine floors: a fact passes on similarity alone at or above them.
+ * They are a property of the embedding model's cosine scale and no model has
+ * a measured floor yet (#6590): on a high-baseline embedder an unrelated
+ * question clears them, so an empty facts list stops meaning "nothing
+ * matched". Doctor `fact_admission_floors` says so for the configured model.
+ */
+export const RESERVE_COSINE_MIN = 0.5;
 const RESERVE_TERM_SHARE_MIN = 0.34;
-const FACTS_ARM_COSINE_MIN = 0.6;
+/** The facts-arm floor; `query`'s facts arm (facts-arm.ts) and the `facts_arm` admission rule share it. */
+export const FACTS_ARM_COSINE_MIN = 0.6;
+/**
+ * Embedding models whose admission floors an eval measured, keyed
+ * `provider:model@dims` (facts/supersession-threshold.ts calibrationKey). Add
+ * a row only with an eval behind it. Doctor `fact_admission_floors` and
+ * recall's `facts_calibration` (#6590) read it.
+ */
+export const FACT_ADMISSION_FLOOR_EVIDENCE: Readonly<Record<string, string>> = {};
 
 export interface FactPoolScope {
   sourceId?: string; sourceIds?: string[]; remote: boolean;

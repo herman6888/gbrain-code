@@ -699,6 +699,41 @@ describe('GmailClient', () => {
     expect(thread.messages.map((m) => m.autoSubmitted)).toEqual(cases.map(([, expected]) => expected));
   });
 
+  test('#5012: getThread captures Precedence, List-Id and Reply-To; absent headers read as human mail', async () => {
+    const headerSets: Array<Array<{ name: string; value: string }>> = [
+      [{ name: 'Precedence', value: ' Bulk ' }],
+      [{ name: 'list-id', value: 'Team updates <updates.example.com>' }],
+      [{ name: 'Reply-To', value: 'Alerts <no-reply@bank.example.com>, help@bank.example.com' }],
+      [],
+    ];
+    const rawThread = {
+      id: '17aa5555dddd0000',
+      messages: headerSets.map((extra, i) => ({
+        id: `18c2f4a9b3d21a${String(i).padStart(2, '0')}`,
+        threadId: '17aa5555dddd0000',
+        labelIds: [],
+        internalDate: String(Date.parse('2026-08-10T09:00:00Z') + i * 60_000),
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'From', value: 'Sender <sender@example.com>' },
+            { name: 'To', value: 'a@example.com' },
+            { name: 'Subject', value: `Notice ${i}` },
+            ...extra,
+          ],
+          body: { data: b64url('Your statement is ready.') },
+        },
+      })),
+    };
+    const h = makeHarness(() => json(rawThread));
+    const thread = await new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID).getThread('17aa5555dddd0000', 'a@example.com');
+    const [bulk, list, replyTo, human] = thread.messages as unknown as Array<Record<string, unknown>>;
+    expect(bulk.precedence).toBe('bulk');
+    expect(list.listId).toBe(true);
+    expect(replyTo.replyTo).toEqual(['no-reply@bank.example.com', 'help@bank.example.com']);
+    expect([human.precedence, human.listId, human.replyTo]).toEqual(['', false, []]);
+  });
+
   test('getThread stamps calendarMethod from a real-shape text/calendar part; plain messages get null', async () => {
     const rawThread = {
       id: '17aa7777eeee8888',

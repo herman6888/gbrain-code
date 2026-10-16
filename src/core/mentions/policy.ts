@@ -20,6 +20,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
+import { requestConfigRows } from '../config-snapshot.ts';
 
 export const ALWAYS_LINKABLE_TYPES = ['person', 'company', 'organization', 'entity'] as const;
 const EXCLUDED_LINKABLE_ALIASES: ReadonlySet<string> = new Set(['product']);
@@ -66,8 +67,13 @@ export function parseNameList(value: unknown): string[] {
 const POLICY_KEYS = ['auto_link', 'mentions.auto_link', 'mentions.entity_types', 'mentions.ignore', 'mentions.exclude_slugs',
   'mentions.alias_deny', 'mentions.multiword_aliases', 'mentions.sibling_merge'] as const;
 
-/** The policy keys in one config read when the engine can run SQL (the write path counts statements), else one read per key. */
+/**
+ * The policy keys from the request's config snapshot when one is open (no statement, #6721), else in one
+ * config read when the engine can run SQL (the write path counts statements), else one read per key.
+ */
 async function readPolicyKeys(engine: Pick<BrainEngine, 'getConfig'> & Partial<Pick<BrainEngine, 'executeRaw' | 'kind'>>): Promise<Array<string | null>> {
+  const held = await requestConfigRows(engine);
+  if (held) return POLICY_KEYS.map(k => held[k] ?? null);
   if (engine.executeRaw && (engine.kind === 'pglite' || engine.kind === 'postgres')) {
     try {
       const rows = await engine.executeRaw<{ key: string; value: string }>('SELECT key, value FROM config WHERE key = ANY($1::text[])', [[...POLICY_KEYS]]);

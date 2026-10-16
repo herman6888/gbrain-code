@@ -269,7 +269,9 @@ const READ_ONLY_SUBCOMMANDS = new Set(['config get', 'sources list', 'sources st
   // #6650: the terminal-failure drill-down and the sync operator status only read receipts and cursors.
   'sources writer failures', 'sync status',
   // #6466: `--list` returns before the orchestration lock and never runs an orchestrator or writes the ledger.
-  'apply-migrations --list']);
+  'apply-migrations --list',
+  // #6661: [X12] --status takes no lock, makes no home dir and writes no receipt; it probes the serve over HTTP.
+  'bootstrap harness --status']);
 
 function tsFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];

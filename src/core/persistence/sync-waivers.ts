@@ -9,12 +9,15 @@ import { join } from 'node:path';
 import type { BrainEngine, PageSnapshot } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { prepareManagedSyncMutation, type SyncIntent } from './sync-prepare.ts';
-import { recordSyncImportProvenances, syncDiskProvenance, type SyncImportProvenance, type SyncImportProvenanceBase } from './sync-holds.ts';
+import { heldGitPaths, readSyncImportProvenances, syncImportParserFor, recordSyncImportProvenances, syncDiskProvenance, type SyncImportProvenance, type SyncImportProvenanceBase } from './sync-holds.ts';
+import { sameParser } from './sync-prescreen.ts';
+import { isSyncReadBound } from './sync-screen.ts';
+import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { sha256 } from './digest.ts';
 import { startClaimPhase } from './claim-phase.ts';
-import { inspectUnchanged, screeningRequest, type NoopKernelWaiver } from './noop-kernel.ts';
+import { inspectUnchanged, KERNEL_PAGE_SQL, kernelPageWork, screeningRequest, type KernelPage, type NoopKernelWaiver } from './noop-kernel.ts';
 import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
-import { readSyncFile } from './sync-discovery.ts';
+import { readSyncFile, type SyncEntry } from './sync-discovery.ts';
 import { isImageFilePath } from '../sync.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { assertSyncPageOrigin, syncOriginScope } from './sync-origin.ts';
@@ -238,6 +241,79 @@ export async function waiveNoopRun<C extends WaiverCursor>(engine: BrainEngine, 
   }
 }
 
+/** #6712 PR 1: a prescreened manifest entry (sync-prescreen.ts), as the guarded kernel run checks it. */
+export interface PrescreenedEntry { slug: string; pageId: number; revision: string; path: string; sourcePath: string }
+/** The most prescreened entries one kernel transaction passes. */
+export const PRESCREEN_RUN_MAX = 500;
+/** The consecutive prescreened manifest entries from `index` (none the kernel already declined in this run), at most `limit`. */
+export function prescreenedHead(entries: ReadonlyArray<SyncEntry>, index: number, missed: ReadonlySet<number>, limit: number): PrescreenedEntry[] {
+  const run: PrescreenedEntry[] = [];
+  for (let at = index; at < entries.length && run.length < Math.min(PRESCREEN_RUN_MAX, limit); at++) {
+    const entry = entries[at]!;
+    if (!entry.prescreened || missed.has(at)) break;
+    run.push({ slug: entry.slug!, pageId: Number(entry.pageId), revision: String(entry.revision), path: entry.path, sourcePath: entry.sourcePath });
+  }
+  return run;
+}
+/**
+ * #6712 PR 1 (L1): the guarded no-op kernel's bounded checks for a run of consecutive prescreened entries at the cursor
+ * head, with no preparation: the prescreen already matched each file to its recorded import, so only the database side
+ * and the file on disk are re-checked here. One transaction takes every page guard, then the cursor row (still at the
+ * run's first entry, nothing pending), confirms the owner epoch, and passes the contiguous prefix whose entries each
+ * hold: authority (checked before the transaction; a revoked grant throws), identity (the same page id, live, at the
+ * frozen revision), projection and metadata (`kernelPageWork`), the import provenance (the record still names the
+ * frozen revision, and the file on disk still has the recorded bytes), no unfinished request for the page, and no
+ * active hold on the path. Returns null when not even the first entry holds (or on a lock or statement timeout): the
+ * caller imports that entry through the ordinary path. Only this run skips durably; the prescreen never does.
+ */
+export async function waivePrescreenedRun<C extends WaiverCursor & { binding: { owner_epoch: string | number } }>(engine: BrainEngine, cursor: C,
+  run: readonly PrescreenedEntry[], key: string, input: { embeddingRequested: boolean; noSchemaPack: boolean },
+  advance: (tx: BrainEngine, count: number) => Promise<C>, reread: (tx: BrainEngine) => Promise<C>): Promise<{ cursor: C; waived: number } | null> {
+  if (!run.length || !noopWaiversEnabled()) return null;
+  for (let i = 0; i < run.length; i += 16) await Promise.all(run.slice(i, i + 16).map(entry => validateSyncAuthority(engine, cursor.authority, entry.slug)));
+  // A cursor frozen by another binary or under another schema pack re-checks the parser fingerprint its prescreen matched.
+  const pack = input.noSchemaPack ? null : await loadActivePackForEngine(engine, { remote: false, sourceId: cursor.sourceId }).catch(() => null);
+  try {
+    return await engine.transaction(async tx => {
+      await tx.executeRaw("SELECT set_config('lock_timeout','2s',true),set_config('statement_timeout','10s',true)");
+      await tx.lockPageKeys(run.map(entry => ({ sourceId: cursor.sourceId, slug: entry.slug })));
+      const [held] = await tx.executeRaw<{ run_id: string | null; index: number | string | null; request_id: string | null }>(`SELECT completed_keys->0->>'runId' AS run_id,
+        completed_keys->0->'index' AS index,completed_keys->0->'pending'->>'requestId' AS request_id FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1 FOR UPDATE`, [key]);
+      if (held?.run_id !== cursor.runId || Number(held.index) !== cursor.index || held.request_id != null) return { cursor: await reread(tx), waived: 0 };
+      await faultPoint('sync:prescreened', { sourceId: cursor.sourceId });
+      const binding = await getWorktreeBinding(tx, cursor.sourceId);
+      if (!binding || String(binding.owner_epoch) !== String(cursor.binding.owner_epoch)) return null;
+      const pages = new Map((await tx.executeRaw<KernelPage>(`${KERNEL_PAGE_SQL} WHERE p.source_id=$1 AND p.slug=ANY($2::text[]) AND p.deleted_at IS NULL`,
+        [cursor.sourceId, run.map(entry => entry.slug)])).map(page => [page.slug, page]));
+      const records = await readSyncImportProvenances(tx, cursor.sourceId, cursor.incarnation, run.map(entry => entry.pageId));
+      const holds = await heldGitPaths(tx, cursor.sourceId, cursor.incarnation, run.map(entry => entry.path));
+      let valid = 0;
+      chunks: for (let from = 0; from < run.length; from += WAIVER_PIPELINE_MAX) {
+        const chunk = run.slice(from, from + WAIVER_PIPELINE_MAX);
+        noteDrainSql(UNFINISHED_PAGE_REQUEST_SQL);
+        const unfinished = await pipelined(tx, chunk.map(entry => () => tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL,
+          unfinishedPageRequestParams(cursor, { slug: entry.slug, pageId: entry.pageId, intent: { path: entry.path, sourcePath: entry.sourcePath } as SyncIntent })))) as unknown[][];
+        for (const [i, entry] of chunk.entries()) {
+          const page = pages.get(entry.slug), record = records.get(entry.pageId);
+          if (!page || Number(page.id) !== entry.pageId || page.knowledge_revision !== entry.revision || unfinished[i]!.length || holds.has(entry.path)) break chunks;
+          if (kernelPageWork(page, { sourcePath: entry.sourcePath, embeddingRequested: input.embeddingRequested }) !== null) break chunks;
+          if (!record?.disk_sha256 || record.revision !== entry.revision || !sameParser(record.parser, syncImportParserFor(entry.sourcePath, pack?.identity ?? null))) break chunks;
+          let bytes: Buffer | null;
+          try { bytes = readSyncFile(cursor.root, entry.path); } catch (error) { if (isSyncReadBound(error)) break chunks; throw error; }
+          if (!bytes || sha256(bytes) !== record.disk_sha256) break chunks;
+          valid++;
+        }
+      }
+      if (!valid) return null;
+      return { cursor: await advance(tx, valid), waived: valid };
+    });
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code === '55P03' || code === '57014') return null;
+    throw error;
+  }
+}
+
 /** #5984: whether `waiveNoopEntry` would waive this frozen entry now (read-only; the bulk group stops before such an entry). */
 export async function wouldWaiveEntry(engine: BrainEngine, cursor: WaiverCursor, pending: WaiverEntry, config: GBrainConfig, signal?: AbortSignal): Promise<boolean> {
   if (!noopWaiversEnabled() || pending.pageId === null) return false;
@@ -299,7 +375,8 @@ export async function unchangedSyncImport(engine: BrainEngine, cursor: WaiverCur
       waive: intent.working === true ? ['contextual_mode', 'canonical_file_differs'] : undefined });
     if (inspected.admitReason) return null;
     await prepared.validate?.(engine);
-    return { kernel: inspected.waived ?? [], ...(prepared.importProvenance ? { provenance: prepared.importProvenance } : {}) };
+    // #6712 PR 1: a #5751 waiver records no provenance, since the prescreen would skip the file where the kernel admits it.
+    return { kernel: inspected.waived ?? [], ...(prepared.importProvenance && !inspected.waived?.length ? { provenance: prepared.importProvenance } : {}) };
   } catch (error) {
     rethrowAbort(error, signal);
     return null;

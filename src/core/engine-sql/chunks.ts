@@ -33,7 +33,7 @@ import {
   COLUMN_NAME_REGEX,
   EmbeddingColumnNotRegisteredError,
 } from '../search/embedding-column.ts';
-import { chunkWriteInvalidations, currentTextProjectionFilter, movableChunkSql, requiresSafeChunks, safeChunksFilter } from '../search/safe-chunks.ts';
+import { chunkDocumentOrder, chunkGenerationFilter, chunkManifestJoin, chunkVisibleFilter, chunkWriteInvalidations, currentTextProjectionFilter, movableChunkSql, requiresSafeChunks, safeChunksFilter } from '../search/safe-chunks.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import { splitEmbeddingSignature, lockEmbeddingSources } from '../embedding-invalidation.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from '../embed-skip.ts';
@@ -354,6 +354,7 @@ export async function upsertChunksOnce(
  */
 async function moveDisplacedChunksAndPrune(exec: SqlExecutor, pageId: number, chunks: ChunkInput[], writeColId: string): Promise<void> {
   const newIndices = chunks.map(c => c.chunk_index);
+  // chunk-visibility-ok: inline projection write path (upsertChunks); segmented pages stage rows through stageSegmentChunks
   const { rows } = await exec.run<{ id: number; chunk_index: number; chunk_source: string | null; text_md5: string; movable: boolean }>(sqlFragment`
     SELECT id, chunk_index, chunk_source, md5(chunk_text) AS text_md5, ${trustedSql(movableChunkSql(writeColId))} AS movable
     FROM content_chunks WHERE page_id = ${pageId} ORDER BY chunk_index`);
@@ -386,7 +387,7 @@ async function moveDisplacedChunksAndPrune(exec: SqlExecutor, pageId: number, ch
   await exec.run(sqlFragment`UPDATE content_chunks SET chunk_index = -1 - chunk_index WHERE page_id = ${pageId} AND chunk_index < 0`);
 }
 
-/** The by-slug chunk read predicate shared by getChunks and getChunkPage: scope, privacy, sealed text, safe chunks. */
+/** The by-slug chunk read predicate shared by getChunks and getChunkPage: scope, privacy, sealed text and live body generation, safe chunks. */
 function chunkReadWhere(
   slug: string,
   scope: { sourceIds?: string[]; sourceId: string },
@@ -397,7 +398,7 @@ function chunkReadWhere(
     : sqlFragment`p.source_id = ${scope.sourceId}`;
   return sqlFragment`p.slug = ${slug} AND ${scopeSql}
           ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
-          ${opts?.includeUnsealed ? sqlFragment`` : trustedSql(`AND ${currentTextProjectionFilter('p')}`)}
+          AND ${trustedSql(opts?.includeUnsealed ? chunkGenerationFilter('p', 'cc') : chunkVisibleFilter('p', 'cc'))}
           ${requiresSafeChunks(opts) ? trustedSql(`AND ${safeChunksFilter('p')}`) : sqlFragment``}`;
 }
 
@@ -406,7 +407,7 @@ export async function getChunks(
   column: string,
   slug: string,
   scope: { sourceIds?: string[]; sourceId: string },
-  opts?: { includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean; indexRange?: { from: number; to: number } },
+  opts?: { includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean; indexRange?: { from: number; to: number; ordinal?: boolean } },
 ): Promise<Chunk[]> {
       const colId = trustedSql(quoteIdentifier(column));
       const includeEmbedding = opts?.includeEmbedding === true;
@@ -420,21 +421,37 @@ export async function getChunks(
       // rebuild NULLs vectors without touching embedded_at). S2: it reports
       // the registry-ACTIVE column's truth — `embed <page>` filters on it.
       const embedCol = includeEmbedding ? sqlFragment`, cc.${colId} AS embedding` : sqlFragment``;
-      const range = opts?.indexRange
-        ? sqlFragment`AND cc.chunk_index >= ${opts.indexRange.from} AND cc.chunk_index < ${opts.indexRange.to}` : sqlFragment``;
-      const { rows } = await exec.run(sqlFragment`
-        SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+      const columns = sqlFragment`cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
                cc.model, cc.token_count, cc.embedded_at, cc.language,
                cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line,
                cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality,
                cc.projected_byte_start, cc.projected_byte_end,
                (cc.${colId} IS NULL) AS embedding_is_null
-               ${embedCol}
-        FROM content_chunks cc
+               ${embedCol}`;
+      const from = sqlFragment`FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
-        WHERE ${chunkReadWhere(slug, scope, opts)}
-          ${range}
-        ORDER BY cc.chunk_index
+        ${trustedSql(chunkManifestJoin('p', 'cc', 'm'))}
+        WHERE ${chunkReadWhere(slug, scope, opts)}`;
+      const order = trustedSql(chunkDocumentOrder('cc', 'm'));
+      const range = opts?.indexRange;
+      if (range?.ordinal) {
+        const { rows } = await exec.run(sqlFragment`
+          SELECT * FROM (
+            SELECT ${columns},
+                   (row_number() OVER (PARTITION BY cc.page_id ORDER BY ${order}) - 1)::int AS page_position,
+                   row_number() OVER (ORDER BY ${order}) AS document_position
+            ${from}
+          ) r
+          WHERE r.page_position >= ${range.from} AND r.page_position < ${range.to}
+          ORDER BY r.document_position
+        `);
+        return rows.map((r) => rowToChunk(r, includeEmbedding));
+      }
+      const { rows } = await exec.run(sqlFragment`
+        SELECT ${columns}
+        ${from}
+          ${range ? sqlFragment`AND cc.chunk_index >= ${range.from} AND cc.chunk_index < ${range.to}` : sqlFragment``}
+        ORDER BY ${order}
       `);
       return rows.map((r) => rowToChunk(r, includeEmbedding));
   }
@@ -445,7 +462,9 @@ export async function getChunks(
  * applies, plus the count of every chunk that predicate admits and the
  * highest chunk_index, so the caller knows whether more remain. A range,
  * not a row LIMIT, so a slug that matches one page in each of two federated
- * sources never splits a chunk_index between two calls.
+ * sources never splits a chunk_index between two calls. A segmented page's
+ * chunk_index is an insertion sequence, so its range is over positions in
+ * document order instead (`fromIndex` and `max_chunk_index` are positions).
  */
 export async function getChunkPage(
   exec: ScopedRead,
@@ -454,14 +473,20 @@ export async function getChunkPage(
   scope: { sourceIds?: string[]; sourceId: string },
   opts: { fromIndex: number; limit: number; excludePrivate?: boolean; requireSafeChunks?: boolean },
 ): Promise<{ chunks: Chunk[]; total_chunks: number; max_chunk_index: number | null }> {
-      const { rows } = await exec.run<{ total: number | string; max_index: number | null }>(sqlFragment`
-        SELECT count(*) AS total, max(cc.chunk_index) AS max_index
-        FROM content_chunks cc
-        JOIN pages p ON p.id = cc.page_id
-        WHERE ${chunkReadWhere(slug, scope, opts)}
+      const { rows } = await exec.run<{ total: number | string; max_index: number | null; segmented: boolean | null; max_page_chunks: number | string | null }>(sqlFragment`
+        SELECT COALESCE(sum(t.n), 0) AS total, max(t.max_index) AS max_index, bool_or(t.segmented) AS segmented, max(t.n) AS max_page_chunks
+        FROM (
+          SELECT count(*) AS n, max(cc.chunk_index) AS max_index, bool_or(cc.body_generation IS NOT NULL) AS segmented
+          FROM content_chunks cc
+          JOIN pages p ON p.id = cc.page_id
+          WHERE ${chunkReadWhere(slug, scope, opts)}
+          GROUP BY cc.page_id
+        ) t
       `);
-      const chunks = await getChunks(exec, column, slug, scope, { ...opts, indexRange: { from: opts.fromIndex, to: opts.fromIndex + opts.limit } });
-      return { chunks, total_chunks: Number(rows[0]?.total ?? 0), max_chunk_index: rows[0]?.max_index == null ? null : Number(rows[0].max_index) };
+      const segmented = rows[0]?.segmented === true;
+      const chunks = await getChunks(exec, column, slug, scope, { ...opts, indexRange: { from: opts.fromIndex, to: opts.fromIndex + opts.limit, ordinal: segmented } });
+      const maxIndex = segmented ? Number(rows[0]?.max_page_chunks) - 1 : rows[0]?.max_index == null ? null : Number(rows[0].max_index);
+      return { chunks, total_chunks: Number(rows[0]?.total ?? 0), max_chunk_index: maxIndex };
   }
 
 /**
@@ -476,7 +501,7 @@ export async function getChunkPage(
  */
 function staleChunkWhere(column: string, opts?: StaleChunkOpts): SqlFragment {
   const staleColRef = trustedSql(`cc.${quoteIdentifier(column)}`);
-  const conds: SqlFragment[] = [sqlFragment`p.deleted_at IS NULL`];
+  const conds: SqlFragment[] = [sqlFragment`p.deleted_at IS NULL`, sqlFragment`${trustedSql(chunkGenerationFilter('p', 'cc'))}`];
   if (opts?.signature !== undefined) {
     conds.push(
       opts.includeNullSignature
@@ -616,6 +641,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
     // BEFORE the scoped transaction, falling back to legacy on a broken registry).
     const staleColId = trustedSql(quoteIdentifier(column));
     const read = async (fragment: SqlFragment) => (await exec.run(fragment)).rows as unknown as StaleChunkRow[];
+    const generation = trustedSql(chunkGenerationFilter('p', 'cc'));
 
       // v0.41.18.0 (A13, codex #9): --priority recent path. Composite cursor
       // (updated_at DESC NULLS LAST, page_id ASC, chunk_index ASC). Backed by
@@ -632,6 +658,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
             JOIN pages p ON p.id = cc.page_id
             WHERE cc.${staleColId} IS NULL AND p.deleted_at IS NULL
               AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open')
+              AND ${generation}
             ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
             LIMIT ${limit}
           `) : read(sqlFragment`
@@ -642,6 +669,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
             JOIN pages p ON p.id = cc.page_id
             WHERE cc.${staleColId} IS NULL AND p.deleted_at IS NULL
               AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open')
+              AND ${generation}
               AND (
                 p.updated_at < ${afterUpdated}::timestamptz
                 OR (p.updated_at = ${afterUpdated}::timestamptz AND p.id > ${afterPid})
@@ -660,6 +688,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
           WHERE cc.${staleColId} IS NULL AND p.deleted_at IS NULL
             AND p.source_id = ${opts.sourceId}
             AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open')
+              AND ${generation}
           ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
           LIMIT ${limit}
         `) : read(sqlFragment`
@@ -671,6 +700,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
           WHERE cc.${staleColId} IS NULL AND p.deleted_at IS NULL
             AND p.source_id = ${opts.sourceId}
             AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open')
+              AND ${generation}
             AND (
               p.updated_at < ${afterUpdated}::timestamptz
               OR (p.updated_at = ${afterUpdated}::timestamptz AND p.id > ${afterPid})
@@ -689,6 +719,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
           JOIN pages p ON p.id = cc.page_id
           WHERE cc.${staleColId} IS NULL AND p.deleted_at IS NULL
             AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open')
+              AND ${generation}
             AND (cc.page_id, cc.chunk_index) > (${afterPid}, ${afterIdx})
           ORDER BY cc.page_id, cc.chunk_index
           LIMIT ${limit}
@@ -702,6 +733,7 @@ export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
         WHERE cc.${staleColId} IS NULL AND p.deleted_at IS NULL
           AND p.source_id = ${opts.sourceId}
           AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open')
+              AND ${generation}
           AND (cc.page_id, cc.chunk_index) > (${afterPid}, ${afterIdx})
         ORDER BY cc.page_id, cc.chunk_index
         LIMIT ${limit}
@@ -718,8 +750,9 @@ function chunklessPagesWhere(opts?: { sourceId?: string }): SqlFragment {
     sqlFragment`p.deleted_at IS NULL`,
     // healChunklessPages chunks BOTH compiled_truth and timeline (mirrors
     // embedPage) — a timeline-only page (rare but schema-legal) has
-    // something to heal even with compiled_truth = ''.
-    sqlFragment`(p.compiled_truth <> '' OR p.timeline <> '')`,
+    // something to heal even with compiled_truth = ''. A segmented page's
+    // body columns are NULL; its body_bytes says it has one.
+    sqlFragment`(p.compiled_truth <> '' OR p.timeline <> '' OR (p.body_storage = 'segmented' AND p.body_bytes > 0))`,
     sqlFragment`${trustedSql(EMBED_SKIP_FILTER_FRAGMENT)}`,
     sqlFragment`${trustedSql(QUARANTINE_FILTER_FRAGMENT)}`,
     sqlFragment`NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)`,
@@ -842,7 +875,7 @@ export async function readEmbeddingStateCounts(exec: ScopedRead, column: string,
         FROM (SELECT ${chunkEmbeddingState(column)} AS state, ${trustedSql(EMBED_SKIP_FILTER_FRAGMENT)} AS eligible,
                      COALESCE(${overdue}, false) AS overdue, cc.embedding_pending_since IS NULL AS unstamped, cc.created_at
                 FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-               WHERE ${where}${scope}) s
+               WHERE ${where} AND ${trustedSql(chunkGenerationFilter('p', 'cc'))}${scope}) s
        GROUP BY s.state`);
   const chunkRows = (await aggregate(opts.mode === 'ops' ? sqlFragment`${colRef} IS NULL` : sqlFragment`TRUE`)).rows.map(row => normalizeStateCount(row));
   let pendingUnstamped = 0;
@@ -920,7 +953,7 @@ export async function listEmbeddingStateRows(exec: ScopedRead, column: string,
                p.frontmatter -> 'quarantine' ->> 'reason' AS quarantine_reason, p.deleted_at,
                COALESCE(p.deleted_at < now() - make_interval(hours => ${opts.purgeWindowHours}::int), false) AS overdue
           FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-         WHERE TRUE${scope}
+         WHERE ${trustedSql(chunkGenerationFilter('p', 'cc'))}${scope}
          GROUP BY p.id, 3
         UNION ALL
         SELECT p.slug, p.source_id, ${chunklessPageState()}, 0::bigint,
@@ -980,7 +1013,7 @@ export async function getEmbeddingsByChunkIds(exec: LegacyUnscopedRead, ids: num
     const quotedCol = trustedSql(quoteIdentifier(column));
     const { text, params } = renderFragment(sqlFragment`
       SELECT cc.id, vector_send(cc.${quotedCol}::vector) AS embedding FROM content_chunks cc JOIN pages p ON p.id=cc.page_id
-      WHERE cc.id = ANY(${ids}::int[]) AND cc.${quotedCol} IS NOT NULL AND ${trustedSql(currentTextProjectionFilter('p'))}
+      WHERE cc.id = ANY(${ids}::int[]) AND cc.${quotedCol} IS NOT NULL AND ${trustedSql(chunkVisibleFilter('p', 'cc'))}
     `);
     const { rows } = await exec.unsafe(text, params);
     const result = new Map<number, Float32Array>();
@@ -990,6 +1023,26 @@ export async function getEmbeddingsByChunkIds(exec: LegacyUnscopedRead, ids: num
     }
     return result;
   }
+
+/**
+ * The text-space cosine re-score in SQL (`search/cosine-rescore.ts`): one
+ * `(id, cosine)` row per hydrated chunk, the rows `getEmbeddingsByChunkIds`
+ * returns (same active column, halfvec read exactly as vector, same
+ * visibility). A hydrated vector whose dimensions differ from the query's,
+ * or a zero-norm vector or query, scores 0 without reaching the operator, as
+ * `cosineSimilarity` does; an absent or invisible chunk returns no row.
+ */
+export function cosineByChunkIdsStatement(ids: number[], column: string, query: Float32Array): { text: string; params: unknown[] } {
+  if (!COLUMN_NAME_REGEX.test(column)) throw new EmbeddingColumnNotRegisteredError(column, []);
+  const col = trustedSql(`cc.${quoteIdentifier(column)}`);
+  const q = `[${Array.from(query).join(',')}]`;
+  return renderFragment(sqlFragment`
+    SELECT cc.id, CASE WHEN vector_dims(${col}::vector) <> ${query.length}::int OR vector_norm(${col}::vector) = 0 OR vector_norm(${q}::vector) = 0
+                       THEN 0::float8 ELSE 1 - (${col}::vector <=> ${q}::vector) END AS cosine
+      FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+     WHERE cc.id = ANY(${ids}::int[]) AND ${col} IS NOT NULL AND ${trustedSql(chunkVisibleFilter('p', 'cc'))}
+  `);
+}
 
 /**
  * Evidence delivery: ONE batched read of chunk_index windows, keyed by
@@ -1015,7 +1068,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
       SELECT * FROM unnest(${requests.map(r => r.page_id)}::int[], ${requests.map(r => r.from_index)}::int[],
                            ${requests.map(r => r.to_index)}::int[], ${requests.map(r => r.priority)}::int[]) AS r(page_id, lo, hi, prio)
     ), auth AS (
-      SELECT p.id, p.slug, p.source_id, p.type, p.knowledge_revision::text AS revision, p.compiled_truth, p.timeline,
+      SELECT p.id, p.slug, p.source_id, p.type, p.knowledge_revision::text AS revision, p.compiled_truth, p.timeline, p.body_generation,
              (COALESCE(p.chunker_version, 0) >= ${SAFE_FENCE_CHUNKER_VERSION}) AS sealed,
              (SELECT MIN(req.prio) FROM req WHERE req.page_id = p.id) AS prio
         FROM pages p
@@ -1027,7 +1080,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
       SELECT cc.page_id, cc.id AS chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.projected_byte_start, cc.projected_byte_end, a.prio
         FROM auth a
         JOIN content_chunks cc ON cc.page_id = a.id
-       WHERE a.sealed
+       WHERE a.sealed AND ${trustedSql(chunkGenerationFilter('a', 'cc'))}
          AND cc.chunk_source = ANY(${opts.chunkSources}::text[])
          AND COALESCE(cc.modality, 'text') = 'text'
          AND EXISTS (SELECT 1 FROM req r WHERE r.page_id = cc.page_id AND cc.chunk_index BETWEEN r.lo AND r.hi)
@@ -1035,7 +1088,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
        LIMIT ${maxRows + 1}
     )
     SELECT 'page' AS kind, a.id AS page_id, a.slug, a.source_id, a.type, a.revision, a.sealed, a.prio,
-           (SELECT MAX(c2.chunk_index) FROM content_chunks c2 WHERE c2.page_id = a.id) AS max_chunk_index,
+           (SELECT MAX(c2.chunk_index) FROM content_chunks c2 WHERE c2.page_id = a.id AND ${trustedSql(chunkGenerationFilter('a', 'c2'))}) AS max_chunk_index,
            a.compiled_truth, a.timeline,
            NULL::int AS chunk_id, NULL::int AS chunk_index, NULL::text AS chunk_text, NULL::text AS chunk_source,
            NULL::bigint AS projected_byte_start, NULL::bigint AS projected_byte_end
@@ -1050,7 +1103,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
 
 export async function getChunksWithEmbeddings(exec: LegacyUnscopedRead, slug: string, opts?: { sourceId?: string; includeUnsealed?: boolean }): Promise<Chunk[]> {
     const sourceId = opts?.sourceId;
-    const projection = trustedSql(opts?.includeUnsealed ? 'TRUE' : currentTextProjectionFilter('p'));
+    const projection = trustedSql(opts?.includeUnsealed ? chunkGenerationFilter('p', 'cc') : chunkVisibleFilter('p', 'cc'));
     const { rows } = sourceId
       ? await exec.run(sqlFragment`
           SELECT cc.* FROM content_chunks cc

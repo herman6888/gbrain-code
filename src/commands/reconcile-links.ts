@@ -23,6 +23,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
+import { PageMissingError } from '../core/engine-errors.ts';
 import { extractCodeRefs } from '../core/link-extraction.ts';
 import { slugifyCodePath } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
@@ -129,12 +130,11 @@ export async function runReconcileLinks(
         await engine.addLink(codeSlug, mdSlug, ref.path, 'documented_by', 'markdown', mdSlug, 'compiled_truth', linkOpts); // gbrain-allow-direct-insert: gbrain reconcile-links command — reverse documented_by edge
       } catch (e: unknown) {
         // Per-link errors don't abort the batch. Track them for the summary.
-        const msg = e instanceof Error ? e.message : String(e);
-        if (/not found|does not exist/i.test(msg)) {
+        if (e instanceof PageMissingError) {
           edgesTargetsMissing++;
         } else {
           // Real error — log but keep going. Agents can inspect progress events.
-          console.warn(`[reconcile-links] ${mdSlug} → ${codeSlug}: ${msg}`);
+          console.warn(`[reconcile-links] ${mdSlug} → ${codeSlug}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }

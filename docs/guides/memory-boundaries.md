@@ -245,8 +245,9 @@ mention after the real fence. Pinned by `test/fence-marker-code-context.test.ts`
 ("remote privacy boundary" and "remote page replacement").
 
 Markdown export is a portable view of pages, **not a full database backup**.
-DB-only facts and pages, revision history, withdrawal state, jobs, settings, and
-authentication records may not be recoverable from Markdown. Use the engine's
+DB-only facts and pages, revision history, the belief ledger (what the brain
+had recorded, and when; `gbrain beliefs`), withdrawal state, jobs, settings,
+and authentication records may not be recoverable from Markdown. Use the engine's
 full backup/restore path and verify a restore into a separate location. Treat
 database backups as sensitive. See the [system-of-record contract](../architecture/system-of-record.md)
 and [isolated local backup guide](in-agent-setup.md#6-back-up-the-complete-local-database).
@@ -319,7 +320,9 @@ the same request id).
 it is not physical erasure. Out of its reach, and named in every receipt: the
 brain repository's git history (the commits that carry the row are listed,
 never rewritten) and every other clone or remote, backups taken before the
-purge (a restore brings back the content and an older purge ledger), provider
+purge (a restore brings back the content and an older purge ledger; with the
+belief ledger on, `gbrain doctor --only belief_ledger_coverage` asks you to
+replay those purges when the restore could not), provider
 copies (embedding and decision providers), Markdown exports and compiled
 context files, and deleted rows in database pages and the write-ahead log until
 vacuum. On PGLite, `--vacuum` compacts the touched tables; on Postgres the

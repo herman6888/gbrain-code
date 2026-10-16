@@ -56,7 +56,7 @@ async function fixture(engine: BrainEngine) {
   await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,\'{}\')', [id, root]);
   await claimWorktree(engine, id, root);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-  return { id, root, opts: { sourceId: id, noPull: true, noEmbed: true, noExtract: true, explicitProcessing: [] } };
+  return { id, root, opts: { sourceId: id, noPull: true, noEmbed: true, noExtract: true } };
 }
 const leak = (value: unknown) => JSON.stringify(value, (_key, v) => typeof v === 'bigint' ? String(v) : v).includes(PRIVATE);
 const PUBLIC = { origin: 'database_trigger', sqlstate: 'P0001', raiser: 'operator_hook_example', table: 'pages', reason: 'unknown', stage: 'publication' };

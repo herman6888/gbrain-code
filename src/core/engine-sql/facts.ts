@@ -430,7 +430,7 @@ export async function listFactsSince(
       SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
         AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}
-        ${entitySlug ? sqlFragment`AND entity_slug = ${entitySlug}` : sqlFragment``}
+        ${entitySlug != null ? sqlFragment`AND entity_slug = ${entitySlug}` : sqlFragment``}
         ${sessionId ? sqlFragment`AND source_session = ${sessionId}` : sqlFragment``}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
         ${unconsolidatedOnly ? sqlFragment`AND consolidated_at IS NULL` : sqlFragment``}

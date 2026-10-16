@@ -62,7 +62,7 @@ import {
   type GoogleSourceState,
 } from './types.ts';
 import { LOOPS_EXTRACT_WINDOW_DAYS, loopExtractionEligibility } from './loops-extract.ts';
-import { recordGraceVerdict, runLoopsCatchup, seedGraceBackfill, settleDueGraceHolds, type LoopsEnqueueReport } from './loop-catchup.ts';
+import { recordGraceVerdict, recordWithheldVerdict, runLoopsCatchup, seedGraceBackfill, seedLoopRechecks, settleDueGraceHolds, type LoopsEnqueueReport } from './loop-catchup.ts';
 
 export type { GoogleSourceConfig } from './types.ts';
 export { runGoogleAttachmentBackfill } from './attachment-backfill.ts';
@@ -152,7 +152,8 @@ async function saveGoogleState(deps: GoogleSyncDeps, state: GoogleSourceState): 
 
 /** #5867/#5868 state a partial managed run still publishes (E20): never the Gmail cursor. */
 function loopRecoveryState(state: GoogleSourceState): Record<string, unknown> {
-  const fields = { loop_grace_holds: state.loop_grace_holds, loop_grace_backfill_done: state.loop_grace_backfill_done, loops_catchup: state.loops_catchup };
+  const fields = { loop_grace_holds: state.loop_grace_holds, loop_grace_backfill_done: state.loop_grace_backfill_done, loops_catchup: state.loops_catchup,
+    loop_withheld_senders: state.loop_withheld_senders, loop_automated_backfill_done: state.loop_automated_backfill_done, calendar_unreadable: state.calendar_unreadable };
   return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 }
 
@@ -187,6 +188,8 @@ async function processThread(
   deps.processedThreads.add(thread.threadId);
   const verdict = await applyLoopDetection(deps, thread, slug);
   if (verdict && deps.loopState) recordGraceVerdict(deps.loopState, thread, verdict, slug, myAddressSet(deps.entry), deps.log, deps.exclusion);
+  if (verdict && deps.loopState) recordWithheldVerdict(deps.loopState, verdict);
+  if (verdict?.withheld) summary.loopsWithheld[verdict.withheld.reason] = (summary.loopsWithheld[verdict.withheld.reason] ?? 0) + 1;
   // LLM extraction candidates: trickle + the bounded recent window only —
   // the deep historical backfill is never extracted (spend honesty, F9).
   const newestMs = thread.messages[thread.messages.length - 1]?.internalDateMs ?? 0;
@@ -412,7 +415,7 @@ async function sweepGmail(g: GmailSweep, onCurrent?: () => Promise<void>): Promi
     if (deps.opts.signal?.aborted) return false;
     await attemptThread(g, tid, null);
   }
-  if (await settleGraceHolds(g) === 'aborted') return false;
+  if (await settleGraceHolds(g, cutoffMs) === 'aborted') return false;
   const isCurrent = (): boolean => {
     if (delta !== 'done' || state.gmail_gap_floor_ms != null) return false;
     if (state.gmail_backfill_done) return true;
@@ -442,13 +445,18 @@ async function sweepGmail(g: GmailSweep, onCurrent?: () => Promise<void>): Promi
  * A re-fetch goes straight through processThread (never the item holds), so
  * a failed grace re-fetch keeps the grace hold and is not an item failure.
  */
-async function settleGraceHolds(g: GmailSweep): Promise<'aborted' | void> {
+async function settleGraceHolds(g: GmailSweep, cutoffMs: number): Promise<'aborted' | void> {
   const { deps, state } = g;
   try {
     await seedGraceBackfill(deps.engine, deps.sourceId, state, deps.log);
     deps.graceBackfillSeeded = true;
   } catch (e) {
     deps.log(`[google] loop grace backfill failed (retried next sweep): ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    await seedLoopRechecks(deps.engine, deps.sourceId, state, deps.log, Date.now(), state.gmail_backfill_done ? null : cutoffMs);
+  } catch (e) {
+    deps.log(`[google] loop re-check seeding failed (retried next sweep): ${e instanceof Error ? e.message : String(e)}`);
   }
   const settled = await settleDueGraceHolds({ engine: deps.engine, sourceId: deps.sourceId, state, log: deps.log, signal: deps.opts.signal,
     exclusion: deps.exclusion, processed: deps.processedThreads, refetch: async (tid) => {
@@ -743,6 +751,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
     threadsSeen: 0,
     attachmentInspection: {},
     extractEligibility: {},
+    loopsWithheld: {},
     failedFiles: 0,
   };
   const countedSlugs = new Set<string>();
@@ -899,6 +908,9 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
             .map(([k, v]) => `${k}=${v}`)
             .join(' ')}`,
         );
+      }
+      if (Object.keys(summary.loopsWithheld).length > 0) {
+        log(`[google] reply-owed loops withheld: ${Object.entries(summary.loopsWithheld).map(([k, v]) => `${k}=${v}`).join(' ')}`);
       }
     }
 

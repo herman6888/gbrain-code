@@ -16,6 +16,7 @@ export async function brainHasImageVectors(engine: Pick<BrainEngine, 'executeRaw
   if (hit && now - hit.at < TTL_MS) return hit.value;
   let value = true;
   try {
+    // chunk-visibility-ok: image vectors live on image pages, which are never segmented (chooseBodyStorage)
     const [row] = await engine.executeRaw<{ present: boolean }>('SELECT EXISTS (SELECT 1 FROM content_chunks WHERE embedding_image IS NOT NULL) AS present');
     value = row?.present === true || (row?.present as unknown) === 't';
   } catch {

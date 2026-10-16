@@ -838,7 +838,7 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1132 column(s) verified against live schema",
+          "message": "1243 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -888,6 +888,13 @@
           "elapsed_ms": "<volatile>",
           "message": "no embedding migration in flight",
           "name": "embedding_migration_state",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "message": "The brain records its embedding model with its provider (voyage:voyage-4).",
+          "name": "embedding_identity_unqualified",
           "status": "ok"
         },
         {
@@ -959,6 +966,22 @@
           },
           "message": "Embedding model openai:text-embedding-3-large@3072 has no calibrated fact supersession threshold, so a saved fact never replaces a similar older one by similarity: it is inserted beside it (exact-text duplicates still collapse), and the conflict review sweep judges the pair where it is on. Measure one with the C2 fixture (about a cent), then register it in facts.supersession_thresholds. See docs/eval/decisions/supersession-threshold-dev/README.md.",
           "name": "supersession_calibration",
+          "readiness_state": "degraded",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "evidence": null,
+            "facts_arm_cosine_min": 0.6,
+            "key": "openai:text-embedding-3-large@3072",
+            "measured": false,
+            "reserve_cosine_min": 0.5
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Fact admission floors (cosine 0.5 for recall questions, 0.6 for the query facts arm) are not measured for openai:text-embedding-3-large@3072. If this model scores unrelated text high, recall --question can return facts for a question nothing answers, so an empty facts list is the reliable signal only on a measured model.",
+          "name": "fact_admission_floors",
           "readiness_state": "degraded",
           "severity": "info",
           "status": "ok"
@@ -1378,6 +1401,18 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/google-connect.md#unreadable-calendar",
+            "sources": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No Google source recorded an unreadable calendar at its last sync.",
+          "name": "google_calendar_readable",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "ambiguous": 0,
@@ -1711,6 +1746,20 @@
           "elapsed_ms": "<volatile>",
           "message": "Brain-wide maintenance jobs are finishing within their deadline.",
           "name": "global_maintenance_timeouts",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "No automatic embed-backfill is repeating the same failure.",
+          "name": "embed_backfill_stalled",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "No connector source is waiting for its account to be repinned.",
+          "name": "connector_account_mismatch",
           "status": "ok"
         },
         {
@@ -2268,6 +2317,7 @@
               "timeline_entries"
             ],
             "engine": "pglite",
+            "expression_indexes_without_statistics": [],
             "fix": "gbrain repair planner-stats --apply",
             "missing_search_statistics": [],
             "stale": []
@@ -2308,6 +2358,45 @@
           "elapsed_ms": "<volatile>",
           "message": "Every page has its revision; the page revision backfill is complete.",
           "name": "revision_backfill",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "beliefs",
+              "enable",
+              "--source",
+              "default",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain beliefs enable --source default --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/designs/BELIEF_LEDGER.md#73-the-doctor-coverage-check",
+            "next": "ask_user",
+            "requires_exclusive": false,
+            "user_message": "Do you want gbrain to keep a belief ledger (a recorded history of facts, takes and links) for this source?",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "belief_ledger_coverage",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Enabling baselines every page of the source and records each later change; only a managed source is certified."
+          },
+          "message": "The belief ledger is off: no source records what this brain had recorded, and when.",
+          "name": "belief_ledger_coverage",
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -2519,6 +2608,20 @@
         {
           "category": "brain",
           "details": {
+            "count": 0,
+            "docs": "docs/storage-tiering.md#restoring-a-page-whose-file-is-gone",
+            "sources": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Not applicable: no source is a classic checkout on this host (managed sources are checked by ghost_pages).",
+          "name": "missing_recorded_files",
+          "readiness_state": "not_applicable",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "docs": "docs/guides/write-refusals.md#invalid_fence",
             "model_repair": {
               "max_usd_per_day": 1,
@@ -2581,6 +2684,10 @@
                 "top_writers": []
               }
             ],
+            "unbound_legacy_facts": {
+              "pages": [],
+              "total": 0
+            },
             "uncommitted_repairs": 0,
             "unrenderable_legacy_facts": {
               "complete": true,

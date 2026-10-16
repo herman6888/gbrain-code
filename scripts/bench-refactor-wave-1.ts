@@ -457,7 +457,7 @@ async function buildOps(engine: BrainEngine, fx: Fixtures, onHybridMeta: (status
 }
 
 interface TimingRow { op: string; query: string; total_ms: number | null; stages_ms: Record<string, number> | null; other_ms: number | null;
-  overlapped_ms: Record<string, number> | null; residual: ReturnType<typeof timingResidual> | null; degraded: string[]; results: number; digest: string }
+  overlapped_ms: Record<string, number> | null; residual: ReturnType<typeof timingResidual> | null; degraded: string[]; results: number; digest: string; scores: Array<number | null> }
 
 /** Every bench query through the search and query ops: a warm pass, then the measured pass. */
 async function measureOpTimings(engine: BrainEngine, queries: string[], resultsOnly: boolean) {
@@ -471,10 +471,12 @@ async function measureOpTimings(engine: BrainEngine, queries: string[], resultsO
     const m = meta as Record<string, any> | null;
     const t = m?.timings as { total_ms: number; stages_ms: Record<string, number>; other_ms: number; overlapped_ms?: Record<string, number> } | undefined;
     // chunk_id is an insert-order surrogate (it differs between two imports); the chunk is (source, slug, chunk_index).
-    const digest = createHash('sha256').update(JSON.stringify(rows.map(r => [r.source_id, r.slug, r.chunk_index, r.score]))).digest('hex').slice(0, 16);
+    // Order-only digest: scores ride beside it and compare within a tolerance (scripts/bench/contract-parity.ts).
+    const digest = createHash('sha256').update(JSON.stringify(rows.map(r => [r.source_id, r.slug, r.chunk_index]))).digest('hex').slice(0, 16);
+    const scores = rows.map(r => (typeof r.score === 'number' ? r.score : null));
     return { op: name, query, total_ms: t?.total_ms ?? null, stages_ms: t?.stages_ms ?? null, other_ms: t?.other_ms ?? null,
       overlapped_ms: t?.overlapped_ms ?? null, residual: t ? timingResidual(t) : null,
-      degraded: ((m?.degraded ?? []) as Array<{ stage: string; reason?: string }>).map(d => d.reason ? `${d.stage}:${d.reason}` : d.stage), results: rows.length, digest };
+      degraded: ((m?.degraded ?? []) as Array<{ stage: string; reason?: string }>).map(d => d.reason ? `${d.stage}:${d.reason}` : d.stage), results: rows.length, digest, scores };
   };
   for (const name of ['search', 'query'] as const) for (const q of queries) await run(name, q);
   const rows: TimingRow[] = [];

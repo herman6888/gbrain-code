@@ -53,6 +53,7 @@ const ALLOWLIST = new Map([
 // string in a reviewer-visible edit. Modules reached from `scripts/**` carry
 // reason 'script-reachable', which the guard verifies.
 const PERMITTED_TEST_ONLY = [
+  { path: 'src/core/belief/history.ts', reason: 'held: the belief ledger history reader ships in W1 with its remote privacy probe (docs/designs/BELIEF_LEDGER.md probe 14); W2 history reads are its product caller' },
   { path: 'src/core/bootstrap/template-repo.ts', reason: 'script-reachable' },
   { path: 'src/eval/longmemeval/diagnostics.ts', reason: 'script-reachable' },
   { path: 'src/eval/longmemeval/evidence-brief.ts', reason: 'held: eval-only wave 1 brief builder (10x memory advantage plan A3), loaded by path from gbrain-evals eval/runner/pilot; product wiring is plan item A8, conditional on the A5 pilot' },

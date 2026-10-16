@@ -42,6 +42,7 @@ const OOS = {
   dream: 'out-of-scope:dream-verdicts',
   raw: 'out-of-scope:raw-data',
   stub: 'out-of-scope:no-sql-stub',
+  pageBody: 'out-of-scope:page-body (Wave B segmented storage, born in engine-sql/page-body.ts; pinned by test/engine-sql-page-body.test.ts)',
 } as const;
 
 export const DOMAIN_OF: Record<string, string> = {
@@ -113,6 +114,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'invalidateContentDriftEmbeddings': 'chunks', 'listStaleChunks': 'chunks',
   'countChunklessPagesWithContent': 'chunks', 'listChunklessPagesWithContent': 'chunks', 'deleteChunks': 'chunks',
   'readEmbeddingStateCounts': 'chunks', 'listEmbeddingStateRows': 'chunks',
+  'allocateBodyOccurrenceIds': OOS.pageBody, 'stageSegmentTexts': OOS.pageBody, 'readSegmentTexts': OOS.pageBody, 'stageManifestRows': OOS.pageBody, 'readManifest': OOS.pageBody, 'stageSegmentChunks': OOS.pageBody, 'createSegmentedPageShell': OOS.pageBody, 'flipBodyGeneration': OOS.pageBody, 'openBodyStaging': OOS.pageBody, 'setBodyStagingState': OOS.pageBody, 'sweepSegments': OOS.pageBody,
   'getEmbeddingsByChunkIds': 'chunks', 'getChunksWithEmbeddings': 'chunks',
   // facts (incl. the ontology rows of the facts table)
   'insertFact': 'facts', 'expireFact': 'facts', 'insertFacts': 'facts', 'deleteFactsForPage': 'facts',

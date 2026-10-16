@@ -12,7 +12,7 @@
  * incarnation, so the checkpoint purge keeps it while the source lives.
  * Location, hashes and the fix classes only, never a cell value.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
 import { existsSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import { shellQuote } from '../agent-output.ts';

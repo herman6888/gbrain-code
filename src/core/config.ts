@@ -1385,6 +1385,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.hnsw_iterative_scan',
   'search.cjk_keyword_deadline_ms',
   'search.keyword_statement_timeout_ms',
+  'search.keyword_timeout_negative_cache_seconds', // #6495: seconds, default 600, 0 = off (postgres-engine/keyword-timeout-cache.ts)
   'search.adaptive_return',
   'search.adaptive_return_entity_max',
   'search.adaptive_return_other_max',
@@ -1482,6 +1483,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // W14 P4.6b: USD per UTC day that loops_extract jobs may spend, brain-wide
   // (default 2.00; 0 = no paid loop extraction). Validated in google/loops-spend.ts.
   'loops.extraction_max_usd_per_day',
+  // #5012: boolean, default false (off). On, Gmail Updates mail opens a reply-owed loop only for a sender the owner wrote to.
+  'loops.updates_require_reciprocity',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
   // Automatic facts drain caps (src/core/facts/drain.ts FACTS_DRAIN_KEYS).
@@ -1579,6 +1582,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // dream.synthesize.* pair from #1594).
   'dream.patterns.subagent_timeout_ms',
   'dream.patterns.subagent_wait_timeout_ms',
+  'dream.patterns.min_interval_hours', 'dream.patterns.child_read_budget_kb', // #6297: hours (default 6) / KB (default 200), 0 = off; cycle/phase-config-values.ts
   // Paid-loop breaker: dead submissions of one dream key within 24h before
   // it is refused (default 3; 0 disables). `gbrain dream reset-key` clears one.
   'dream.breaker.max_dead_submissions',
@@ -1589,6 +1593,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4348: IANA timezone that owns the dream-cycle calendar day (summary
   // bucketing). Unset → host timezone → UTC. Validated at set time.
   'cycle.timezone',
+  'cycle.consolidate.enabled', // #6667: default on; read in cycle/phases/consolidate.ts
   'cycle.consolidate.cluster_threshold', // #5363: (0, 1], default 0.85; read + validated in cycle/phases/consolidate.ts
   // A11: IANA timezone for offset-less frontmatter datetimes in effective_date.
   // Unset → UTC (date-only values are always UTC calendar dates). Validated at set time.
@@ -1741,9 +1746,6 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.hold_escalate_count',
   'sync.hold_escalate_pct',
   'sync.parser_regression',
-  // #6643: knock-on re-freezes in a row at one index (default 3; 0 turns automatic re-freeze off) and per run (default 25).
-  'sync.knock_on_refreeze_limit',
-  'sync.knock_on_run_limit',
   'fences.normalize', // #6188: inline Tier 1 fence normalization (fence-repair/config.ts); default on
   'fences.repair.enabled', 'fences.repair.llm', // #6188: the fence_repair cycle phase and its Tier 3 model step (fence-repair/config.ts); default on
   'fences.repair.max_usd_per_page', 'fences.repair.max_usd_per_day', // #6188: Tier 3 fence repair caps; 0 = no model spend
@@ -1788,6 +1790,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'consent.preapprove.paid.max_usd_per_run', 'consent.preapprove.persistent_install', // A4: file plane, core/consent.ts
   // F4b: PGLite row-delta ANALYZE (src/core/planner-stats.ts); F4a: get_health memo TTL (src/core/health-memo.ts, 0 disables).
   'planner.auto_analyze', 'planner.first_read_budget_ms', 'import.analyze_every_pages', 'health.cache_ttl_ms',
+  // Wave B segmented page storage (src/core/page-body/limits.ts PAGE_BODY_CONFIG_KEYS; switch defaults off).
+  'pages.segmented_storage', 'pages.max_bytes', 'pages.flip_retire_max_rows', 'versions.segmented_max_per_page', 'versions.segmented_max_pinned_bytes',
 ];
 
 /**

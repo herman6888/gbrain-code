@@ -41,8 +41,10 @@ export async function writeSyncSlice(tx: Exec, sourceId: string, incarnation: st
     ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()`,
   [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options), JSON.stringify([{ ...slice, recorded_at: new Date().toISOString() }])]);
 }
-export async function clearSyncSlice(tx: Exec, sourceId: string, incarnation: string, options: SyncCursorOptions): Promise<void> {
-  await tx.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options)]);
+/** `target` (#6834) clears the record only while it still names that target. */
+export async function clearSyncSlice(tx: Exec, sourceId: string, incarnation: string, options: SyncCursorOptions, target?: string): Promise<void> {
+  await tx.executeRaw("DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND ($3::text IS NULL OR completed_keys->0->>'target'=$3)",
+    [SYNC_SLICE_OP, sliceFingerprint(sourceId, incarnation, options), target ?? null]);
 }
 
 /** Code-unit order: the cursor's `after` must compare the same way on every host, which `localeCompare` does not promise. */

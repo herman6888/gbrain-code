@@ -29,7 +29,7 @@ import { VERSION } from '../../version.ts';
 import { sha256 } from './digest.ts';
 import { readPagePurgeTombstones } from './page-purge.ts';
 import { readSyncContent, readSyncFile, syncGitPath, type SyncDiscovery, type SyncEntry } from './sync-discovery.ts';
-import { PINNED_WINDOW, readBlobBytes, readBlobContents, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
+import { pinnedWindowBlock, readBlobBytes, readBlobContents, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { screenSyncImport, type SyncImportScreenInput } from './sync-prepare.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
 import { gitHoldItem, readSyncHoldPolicy, readSyncImportProvenance, type GitHoldItem, type GitHoldRecord, type PreparationStallMeta, type SyncHoldPolicy } from './sync-holds.ts';
@@ -60,11 +60,11 @@ export function isSyncReadBound(error: unknown): boolean {
 
 type PinnedCursor = Pick<SyncDiscovery, 'root' | 'gitRoot' | 'target' | 'entries'> & { index: number };
 
-/** Git paths of the committed imports from the cursor's entry on: the window one pinned read lists. */
+/** Git paths of the committed imports in the cursor entry's aligned block (`pinnedWindowBlock`): the window one pinned read lists. */
 function upcomingGitPaths(cursor: PinnedCursor): () => string[] {
   return () => {
-    const gitRoot = realpathSync.native(cursor.gitRoot), root = realpathSync.native(cursor.root);
-    return cursor.entries.slice(cursor.index, cursor.index + PINNED_WINDOW).filter(entry => entry.action === 'import' && !entry.working)
+    const gitRoot = realpathSync.native(cursor.gitRoot), root = realpathSync.native(cursor.root), block = pinnedWindowBlock(cursor.index);
+    return cursor.entries.slice(block.start, block.end).filter(entry => entry.action === 'import' && !entry.working)
       .map(entry => relative(gitRoot, resolve(root, entry.path)).split(sep).join('/'));
   };
 }

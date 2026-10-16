@@ -27,9 +27,11 @@ import { validateSourceId } from '../utils.ts';
 import { closedLoopWithActiveFact, retireLoopFact } from '../persistence/loop-fact-retirement.ts';
 import {
   addSuppression,
+  closeMutedLoops,
   closeOpenLoop,
   listOpenLoops,
   removeSuppression,
+  requeueMutedLoops,
   type LoopStatus,
   type LoopType,
   type OpenLoopRow,
@@ -133,6 +135,45 @@ async function heldCoverage(ctx: OperationContext, sources: GoogleSourceFreshnes
   } catch {
     // Fail toward partial: an unreadable hold state must not read as complete coverage.
     return { completeness: 'partial', held: [] };
+  }
+}
+
+interface WithheldNoiseSender { source_id: string; email: string; open_loops: number; reason: string; preview_command: string }
+
+/**
+ * #5012: open reply-owed loops from senders the detector now withholds (the
+ * `loop_withheld_senders` record in each google source's connector state):
+ * loops the automated-mail rule would not have opened. Null when there are
+ * none or the record cannot be read (advisory; never blocks the answer).
+ */
+async function withheldNoise(ctx: OperationContext, sources: GoogleSourceFreshness[]): Promise<{ loop_count: number; sender_count: number; senders: WithheldNoiseSender[] } | null> {
+  if (!sources.length) return null;
+  try {
+    const { managedBrain, readConnectorCursorState } = await import('../connectors/item-holds-store.ts');
+    const rows = await ctx.engine.executeRaw<{ id: string; incarnation: string; local_path: string | null; config: Record<string, unknown> }>(
+      `SELECT id, incarnation::text AS incarnation, local_path, config FROM sources WHERE id = ANY(string_to_array($1, E'\n'))`,
+      [sources.map((x) => x.id).join('\n')]);
+    const managed = await managedBrain(ctx.engine);
+    const senders: WithheldNoiseSender[] = [];
+    for (const row of rows) {
+      const record = ((await readConnectorCursorState(ctx.engine, row, managed))?.loop_withheld_senders ?? {}) as Record<string, { reason?: string }>;
+      const emails = Object.keys(record);
+      if (!emails.length) continue;
+      const counts = await ctx.engine.executeRaw<{ email: string; n: number }>(
+        `SELECT counterparty_email AS email, count(*)::int AS n FROM open_loops
+          WHERE source_id = $1 AND status = 'open' AND loop_type = 'unanswered_inbound'
+            AND counterparty_email = ANY(string_to_array($2, E'\n'))
+          GROUP BY counterparty_email`, [row.id, emails.join('\n')]);
+      for (const c of counts) {
+        senders.push({ source_id: row.id, email: c.email, open_loops: Number(c.n), reason: record[c.email]?.reason ?? 'automated_mail',
+          preview_command: `gbrain loops drop sender ${c.email} --source ${row.id} --dry-run` });
+      }
+    }
+    if (!senders.length) return null;
+    senders.sort((a, b) => b.open_loops - a.open_loops || a.email.localeCompare(b.email));
+    return { loop_count: senders.reduce((n, x) => n + x.open_loops, 0), sender_count: senders.length, senders: senders.slice(0, 10) };
+  } catch {
+    return null;
   }
 }
 
@@ -361,7 +402,9 @@ const open_loops: Operation = {
     'redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, ' +
     'entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and ' +
     'completeness: when it is "partial", some mail in the window is held after repeated import failures; present the ' +
-    'answer as partial and name the held items and their retry command.',
+    'answer as partial and name the held items and their retry command. The grouped view also returns withheld_noise ' +
+    '(null when none): open reply-owed loops from senders whose mail the detector now treats as automated, with a ' +
+    'per-sender preview_command for closing them.',
   params: {
     group_by: { type: 'string', enum: ['counterparty', 'none'], description: "Default 'counterparty' (ranked groups)." },
     status: { type: 'string', enum: ['open', 'done', 'dropped', 'stale'], description: "Default 'open', except with `id`, where any status matches." },
@@ -548,6 +591,7 @@ const open_loops: Operation = {
     return {
       groups,
       no_counterparty: noCounterparty,
+      ...(loopId === undefined ? { withheld_noise: await withheldNoise(ctx, freshness.sources) } : {}),
       count: loops.length,
       truncated,
       stale: freshness.stale,
@@ -693,13 +737,20 @@ const loops_close: Operation = {
   },
 };
 
+/** #5012: the CLI command that reverses a mute or unmute. */
+function undoCommand(verb: 'mute' | 'unmute', kind: unknown, value: string, sourceId: string): string {
+  return `gbrain loops ${verb} ${String(kind)} ${value} --source ${sourceId}`;
+}
+
 const loops_mute: Operation = {
   name: 'loops_mute',
   idempotent: true,
   outputRedaction: 'no_stored_text',
   description:
     'Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback ' +
-    'primitive behind "never track this sender". Existing loops keep their state.',
+    'primitive behind "never track this sender". It also closes that sender\'s (or thread\'s) open reply-owed ' +
+    '(unanswered_inbound) loops as dropped with closed_by "muted" and lists their ids in `closed`; other loop types ' +
+    'keep their state. dry_run lists `would_close` and changes nothing. loops_unmute re-checks the closed loops.',
   params: {
     kind: { type: 'string', required: true, enum: ['sender', 'thread'], description: 'What to mute.' },
     value: { type: 'string', required: true, description: 'The sender email or Gmail thread id.' },
@@ -728,9 +779,17 @@ const loops_mute: Operation = {
     if (p.source_id === undefined && !(await sourceHasGoogleContent(ctx, sourceId))) {
       throw noGoogleContent(ctx, `loops_mute: source "${sourceId}" holds no Google content — a suppression there can never match; pass source_id naming the google source`);
     }
-    if (ctx.dryRun) return { dry_run: true, action: 'loops_mute', kind: p.kind, value: p.value };
-    await addSuppression(ctx.engine, sourceId, p.kind as 'sender' | 'thread', p.value as string);
-    return { muted: true, kind: p.kind, value: (p.value as string).toLowerCase(), source_id: sourceId };
+    const kind = p.kind as 'sender' | 'thread';
+    const value = (p.value as string).toLowerCase();
+    const undo = undoCommand('unmute', kind, value, sourceId);
+    if (ctx.dryRun) {
+      const wouldClose = await closeMutedLoops(ctx.engine, sourceId, kind, value, false);
+      return { dry_run: true, action: 'loops_mute', kind, value, source_id: sourceId, would_close: wouldClose, count: wouldClose.length, undo_command: undo };
+    }
+    await addSuppression(ctx.engine, sourceId, kind, value);
+    const closed = await closeMutedLoops(ctx.engine, sourceId, kind, value, true);
+    (await import('../google/loop-detect.ts')).invalidateSuppressionCache(ctx.engine);
+    return { muted: true, kind, value, source_id: sourceId, closed, count: closed.length, undo_command: undo };
   },
 };
 
@@ -740,7 +799,11 @@ const loops_unmute: Operation = {
   outputRedaction: 'no_stored_text',
   description:
     'Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for ' +
-    'it again. Exact-match only. Does not reopen loops closed while the mute was in place.',
+    'it again. Exact-match only. The reply-owed loops the mute closed (unless another mute still covers them) are queued ' +
+    'for re-check on the next Gmail sync and listed in `requeued`: a loop reopens only when nothing answered its thread ' +
+    'since the mute. `unverifiable` lists closed loops with no thread to re-check (they stay closed); `stale_source` ' +
+    'means the re-check waits on a sync that has not run in 24h. Manually closed loops are never touched. dry_run lists ' +
+    '`would_requeue` and changes nothing.',
   params: {
     kind: { type: 'string', required: true, enum: ['sender', 'thread'], description: 'What to unmute.' },
     value: { type: 'string', required: true, description: 'The sender email or Gmail thread id.' },
@@ -767,20 +830,31 @@ const loops_unmute: Operation = {
     if (p.source_id === undefined && !(await sourceHasGoogleContent(ctx, sourceId))) {
       throw noGoogleContent(ctx, `loops_unmute: source "${sourceId}" holds no Google content — pass source_id naming the google source`);
     }
-    if (ctx.dryRun) return { dry_run: true, action: 'loops_unmute', kind: p.kind, value: p.value };
-    const removed = await removeSuppression(
-      ctx.engine,
-      sourceId,
-      p.kind as 'sender' | 'thread',
-      p.value as string,
-    );
+    const kind = p.kind as 'sender' | 'thread';
+    const value = (p.value as string).toLowerCase();
+    const undo = undoCommand('mute', kind, value, sourceId);
+    if (ctx.dryRun) {
+      const preview = await requeueMutedLoops(ctx.engine, sourceId, kind, value, false);
+      return { dry_run: true, action: 'loops_unmute', kind, value, source_id: sourceId, would_requeue: preview.requeued,
+        unverifiable: preview.unverifiable, count: preview.requeued.length, undo_command: undo };
+    }
+    const removed = await removeSuppression(ctx.engine, sourceId, kind, value);
+    const { requeued, unverifiable } = await requeueMutedLoops(ctx.engine, sourceId, kind, value, true);
+    (await import('../google/loop-detect.ts')).invalidateSuppressionCache(ctx.engine);
+    const fresh = (await googleSourceFreshness(ctx, { sourceId })).sources[0];
+    const stale = requeued.length > 0 && (fresh?.stale ?? true);
     // removed:false is the ordinary "was not muted" answer, never an error —
     // a retried unmute must be safe.
     return {
       removed: removed > 0,
-      kind: p.kind,
-      value: (p.value as string).toLowerCase(),
+      kind,
+      value,
       source_id: sourceId,
+      requeued,
+      unverifiable,
+      count: requeued.length,
+      ...(stale ? { stale_source: true, recheck_command: `gbrain sync --source ${sourceId}` } : {}),
+      undo_command: undo,
       ...(removed > 0 ? {} : { reason: 'no matching suppression' }),
     };
   },

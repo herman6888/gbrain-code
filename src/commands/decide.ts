@@ -55,7 +55,7 @@ Subcommands:
   disable <slot> | --all                     Turn a slot (or every slot) off
   calibrate --slot <slot> --dataset <jsonl> [--target precision|recall|f1] [--min <x>]
             [--call-site <site>] [--dry-run] [--json]
-  qualify --slot <slot> --dataset <jsonl> [--call-site <site>] [--json]
+  qualify --slot <slot> --dataset <jsonl> [--call-site <site>] [--items-out <path>] [--json]
   calibrations list [--slot <slot>] [--json] | adopt <id> | retire <id> | restore <id>
   dataset --slot <slot> --from <source> <path> [--out <file>]
   receipts [--slot <slot>] [--since <hours>] [--what-if-threshold <t>] [--json]

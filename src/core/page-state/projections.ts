@@ -16,6 +16,8 @@ import { getEmbeddingModel } from '../ai/gateway.ts';
 import { jsonRowBatches } from '../batch-rows.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { belowSafeChunkFence, movableChunkSql } from '../search/safe-chunks.ts';
+import { buildSegmentedProjection } from '../page-body/projection.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { acceptedEmbeddingInputHashes, embeddingInputHash, plainEmbeddingTier, synopsisBodyHash,
   type EmbeddingInputContext, type EmbeddingTier } from '../embedding-input-hash.ts';
 
@@ -140,7 +142,11 @@ async function indexingContext(engine: BrainEngine, snapshot: PageSnapshot, maxC
     corpusGeneration: projection?.corpus_generation ?? null };
 }
 
-/** A short guarded read binds the exact chunk set and title/body revision. */
+/**
+ * A short guarded read binds the exact chunk set and title/body revision.
+ * Null for a segmented page: its projection is `buildSegmentedProjection` and
+ * its embedding `page-body/segmented-embedding.ts`, never this body read.
+ */
 export async function readProjectionSnapshot(engine: BrainEngine, slug: string, sourceId: string,
   opts: { allowUnsealed?: boolean; maxChunkTokens?: number; requireLiveSource?: boolean } = {}): Promise<ProjectionSnapshot | null> {
   return engine.transaction(async tx => {
@@ -153,7 +159,7 @@ export async function readProjectionSnapshot(engine: BrainEngine, slug: string, 
 async function readGuardedProjectionSnapshot(tx: BrainEngine, slug: string, sourceId: string,
   opts: { allowUnsealed?: boolean; maxChunkTokens?: number; requireLiveSource?: boolean }): Promise<ProjectionSnapshot | null> {
   const snapshot = await tx.readPageSnapshot(slug, { sourceId, ...(opts.requireLiveSource && { requireLiveSource: true }) });
-  if (!snapshot || (!opts.allowUnsealed && snapshot.page.text_projection_revision !== snapshot.revision)) return null;
+  if (!snapshot || isSegmentedPage(snapshot.page) || (!opts.allowUnsealed && snapshot.page.text_projection_revision !== snapshot.revision)) return null;
   const context = await indexingContext(tx, snapshot, opts.maxChunkTokens);
   const fenceOverlay = context.pageKind === 'markdown' ? await loadFenceChunkOverlay(tx, { sourceId, slug, compiled_truth: snapshot.page.compiled_truth, timeline: snapshot.page.timeline }) : undefined;
   return { snapshot, chunks: await tx.getChunks(slug, { sourceId, includeUnsealed: true }), indexingContext: context.key,
@@ -282,7 +288,7 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
     await tx.lockPageKeys([{ sourceId, slug }]);
     const current = await tx.readPageSnapshot(slug, { sourceId });
     if (!current || current.page.deleted_at || current.sourceIncarnation !== snapshot.sourceIncarnation || current.page.id !== snapshot.page.id
-      || current.page.text_projection_revision !== current.revision) return refused;
+      || current.page.text_projection_revision !== current.revision || isSegmentedPage(current.page)) return refused;
     const [source] = await tx.executeRaw<{ archived: boolean }>('SELECT archived FROM sources WHERE id=$1', [sourceId]);
     if (!source || source.archived) return refused;
     const context = await indexingContext(tx, current, prepared.maxChunkTokensOverride);
@@ -354,7 +360,7 @@ export async function queuePageProjection(engine: Pick<BrainEngine, 'executeRaw'
 /** #5050/#5247: whether a live page's installed chunks predate the safe-chunk fence. */
 export async function projectionBelowSafeFence(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number): Promise<boolean> {
   const [row] = await engine.executeRaw<{ chunker_version: number | null }>(
-    'SELECT chunker_version FROM pages WHERE id=$1 AND deleted_at IS NULL', [pageId]) ?? [];
+    "SELECT chunker_version FROM pages WHERE id=$1 AND deleted_at IS NULL AND body_storage IS DISTINCT FROM 'segmented'", [pageId]) ?? [];
   return row !== undefined && belowSafeChunkFence(row.chunker_version === null ? null : Number(row.chunker_version));
 }
 
@@ -398,7 +404,7 @@ export async function preparePageProjection(prepared: ProjectionSnapshot) {
 const PROJECTION_JOB_PROBES = `CROSS JOIN LATERAL (SELECT s.id FROM sources s
       WHERE s.incarnation=j.source_incarnation AND NOT s.archived OFFSET 0) s
     CROSS JOIN LATERAL (SELECT p.page_kind FROM pages p WHERE p.source_id=s.id AND p.slug=j.slug
-      AND p.deleted_at IS NULL AND p.page_kind IN ('markdown','code') OFFSET 0) p`;
+      AND p.deleted_at IS NULL AND p.page_kind IN ('markdown','code') AND p.body_storage IS DISTINCT FROM 'segmented' OFFSET 0) p`;
 
 /**
  * Rebuilds between statistics refreshes, per engine. Like autovacuum's analyze
@@ -456,6 +462,21 @@ export async function projectionBacklog(engine: Pick<BrainEngine, 'executeRaw'>)
 }
 
 /**
+ * #6803: the read-only preview of `gbrain projections drain`: the queued
+ * Markdown and code rows a drain would try, in the order it tries them (at most `limit`),
+ * with each row's queue reason, so a row that last failed (`rebuild_failed`)
+ * is named before anything is rebuilt.
+ */
+export async function previewProjectionDrain(engine: Pick<BrainEngine, 'executeRaw'>, limit = 50):
+  Promise<{ pending: number; failed: number; rows: Array<{ source_id: string; slug: string; reason: string; updated_at: string }> }> {
+  const backlog = await projectionBacklog(engine);
+  const rows = await engine.executeRaw<{ source_id: string; slug: string; reason: string; updated_at: string }>(`SELECT s.id AS source_id,j.slug,j.reason,j.updated_at::text AS updated_at
+    FROM page_projection_jobs j ${PROJECTION_JOB_PROBES}
+    ORDER BY j.updated_at,j.source_incarnation,j.slug LIMIT $1`, [Math.max(1, limit)]);
+  return { pending: backlog.pending, failed: backlog.failed, rows };
+}
+
+/**
  * Bounded and keyless. Unsupported media remains queued for its source importer.
  *
  * A queue row that no longer matches its live page is healed under the page
@@ -497,7 +518,11 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
           WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, observed);
         if (!pending.length) return null;
         const read = await readGuardedProjectionSnapshot(tx, job.slug, job.source_id, { allowUnsealed: true });
-        if (!read) return null;
+        if (!read) {
+          const [segmented] = await tx.executeRaw(`SELECT 1 FROM pages WHERE source_id=$1 AND slug=$2 AND body_storage='segmented' AND deleted_at IS NULL`,
+            [job.source_id, job.slug]);
+          return segmented ? 'segmented' : null;
+        }
         const { snapshot } = read;
         if (snapshot.sourceIncarnation === job.source_incarnation && snapshot.revision === job.revision) return read;
         if (snapshot.sourceIncarnation !== job.source_incarnation || snapshot.page.text_projection_revision === snapshot.revision) {
@@ -510,6 +535,15 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
       });
       if (!prepared) { superseded++; continue; }
       if (prepared === 'removed') { superseded++; opts.onHeal?.({ kind: 'removed', source_id: job.source_id, slug: job.slug }); continue; }
+      if (prepared === 'segmented') {
+        const built = await buildSegmentedProjection(engine, { sourceId: job.source_id, slug: job.slug });
+        await engine.executeRaw(built.sealed
+          ? 'DELETE FROM page_projection_jobs WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid'
+          : 'UPDATE page_projection_jobs SET updated_at=now() WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid', observed);
+        if (built.sealed) rebuilt++;
+        else superseded++;
+        continue;
+      }
       const projection = await preparePageProjection(prepared);
       await installPageProjection(engine, prepared, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
       rebuilt++;

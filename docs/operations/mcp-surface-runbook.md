@@ -242,9 +242,10 @@ than take-driven salience touches.
 
 Semantic result caching is temporarily disabled even when configuration enables
 it. Searches run fresh, so repeated requests may cost more and take longer.
-Stored rows and cache maintenance remain available. Stored contradiction reports
-are temporarily available only to trusted local callers without a source filter;
-other callers receive an empty list and an availability note.
+Stored rows and cache maintenance remain available. Remote callers of
+`find_contradictions` get only findings whose two sides they can read now, each
+side re-read live with its source and trust tier; stored report text never
+leaves (docs/contradictions.md, "Trust posture").
 
 ## Served instruction settings
 

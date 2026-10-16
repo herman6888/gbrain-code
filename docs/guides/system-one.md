@@ -426,6 +426,13 @@ the harmful side take the no-change outcome. `qualify` refuses with
 `insufficient_n` and prints the number of families needed when the dataset
 is too small to prove the bound (35 of 35 correct is the minimum at 0.90).
 Use `--call-site think` to calibrate a slot's `think` question separately.
+To see which items were behind a failing bound, add `--items-out <path>`:
+`qualify` writes the harmful actions it judged (item id, family, split,
+slice, protected, the answer value and whether the action was correct) with
+a header naming the calibration, model and policy fingerprint, mode 0600 and
+no input text. It reuses the answers `qualify` already has, so it makes no
+extra provider call. Keep this file out of the calibration dataset: tuning
+on the eval half's failures spoils the bound.
 
 ### Escape hatches
 

@@ -399,7 +399,7 @@ const recall: Operation = {
       ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
         scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
       ({ rows, ambiguousEntity } = ranking);
-      for (const notice of questionRecallNotices(ranking)) ctx.emitNotice?.(notice);
+      for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
     } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
       // same as the sibling fact-list arms — a post-merge filter would let a
@@ -607,6 +607,7 @@ const recall: Operation = {
       total: packedFacts.length,
       facts_order: ranking ? 'relevance' : 'newest',
       ...(ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
+      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}),
       ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).

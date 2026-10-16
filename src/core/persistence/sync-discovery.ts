@@ -23,9 +23,10 @@ import type { CompanyBrainPlan } from '../company-brain/types.ts';
 import { assertDistinctSyncOrigins, legacySyncOrigin, sameSyncOrigin, selectOriginClaimant, sharedOriginExit, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
 import { assertManagedSyncActive } from './sync-authority.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
-import { holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
+import { holdBasisMoved, holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
 import { readBlobContents, readTreeBlobs, SYNC_READ_BOUND } from './sync-blobs.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { movedDriftHolds, prescreenSyncEntries, type SyncDriftSide } from './sync-prescreen.ts';
 import { readSyncSlice, sliceEntries, syncCursorOptions, type SyncSliceCursor, type SyncSliceState } from './sync-slices.ts';
 
 /** The page an import takes over from its previous origin: a Git rename, or a file that replaced a vanished origin at the same slug. */
@@ -35,7 +36,11 @@ export interface SyncEntry { path: string; sourcePath: string; action: 'import' 
   /** #5565: a deleted file no page records as its origin; its slug's page keeps another origin, so the deletion is a fenced no-op. */
   unownedDeletion?: boolean;
   /** #5988: a held rename destination whose source page changed since the rename was recorded; the freeze screen holds it as `rename_held`. */
-  renameHeld?: SyncRename; }
+  renameHeld?: SyncRename;
+  /** #6712 PR 1: the import provenance matches the pinned blob, the frozen revision and this parser; the no-op kernel decides (sync-prescreen.ts). */
+  prescreened?: true;
+  /** #6712 PR 1: the page moved since its last recorded import (or has no record); imported only when the freeze proves it a no-op, else held `file_drift`. */
+  drift?: SyncDriftSide; }
 /** Files that map to a slug another origin keeps; they are left out of the manifest until one is renamed. */
 export interface SyncSlugCollision { slug: string; kept: string; skipped: string[]; }
 /** #5032: a file sync skipped on this host with a named refusal, without failing the run. */
@@ -258,12 +263,12 @@ function cutDiscoveryToSlice(discovered: SyncDiscovery, slicing: Pick<SyncSliceC
   if (cut.done && discovered.target === head) delete discovered.stagedHead; else discovered.stagedHead = head;
 }
 export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, context?: ManagedSyncContext,
-  stage?: { target: string; head: string; slice?: Pick<SyncSliceCursor, 'phase' | 'after'> }): Promise<SyncDiscovery> {
+  stage?: { target: string; head: string; slice?: Pick<SyncSliceCursor, 'phase' | 'after'> }, walk = false): Promise<SyncDiscovery> {
   const { binding, root, gitRoot, sourceId, incarnation, source } = context ?? await resolveManagedSyncContext(engine, opts);
   const company = currentCompanyBrainSync(sourceId);
   if (!company && !stage && !opts.dryRun) {
     const resume = await resumableSliceStage(engine, opts, gitRoot, sourceId, incarnation);
-    if (resume) return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, resume);
+    if (resume) return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, resume, walk);
   }
   const strategy = opts.strategy ?? source.config?.strategy ?? 'markdown';
   const nativeRoot = realpathSync.native(root), nativeGitRoot = realpathSync.native(gitRoot);
@@ -287,7 +292,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
   // #6349: a staged run stops at a commit, so uncommitted working-tree changes wait for the stage that reaches HEAD.
   const working = !company && !stage && (detached || (opts.workingTree ?? (await engine.getConfig('sync.include_working_tree') === 'true')));
   const dirty = company ? { added: [], modified: [], deleted: [], renamed: [] } : buildDetachedWorkingTreeManifest(gitRoot);
-  const delta = !opts.full && source.last_commit ? computeSyncDelta(gitRoot, source.last_commit, target) : null;
+  const delta = !opts.full && !walk && source.last_commit ? computeSyncDelta(gitRoot, source.last_commit, target) : null;
   const entries = new Map<string, SyncEntry>();
   const renamedFrom = new Map<string, string>();
   let workingTreeKept: string[] | undefined;
@@ -383,11 +388,12 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
       const hold = holdByPath.get(path), blob = blobs.get(toGitPath(path));
       return hold && !hold.meta.blob_oid && !hold.meta.working && blob ? [blob] : [];
     });
-    const contents = readBlobContents(gitRoot, unversioned);
+    const contents = readBlobContents(gitRoot, unversioned), movedDrift = await movedDriftHolds(engine, sourceId, holds);
+    const moved = await holdBasisMoved(engine, sourceId, holdByPath, checked);
     for (const path of checked) {
       const hold = holdByPath.get(path), gitPath = toGitPath(path), blob = blobs.get(gitPath);
       const workingHold = working && (hold?.meta.working === true || !blob);
-      let changed = !hold || holdRescreenDue(hold, retry.has(path));
+      let changed = !hold || holdRescreenDue(hold, retry.has(path)) || moved.has(path) || movedDrift.has(path);
       let present = !!blob;
       if (workingHold) {
         let bytes: Buffer | null = null;
@@ -440,7 +446,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
       `This sync of ${sourceId} selected ${selected.length} entries, above the 100,000-entry and 16 MiB cursor bound; nothing was written. Narrow it with --exclude or the sync.exclude config, then run gbrain sync --no-pull --source ${sourceId}.`);
     // #6349 (P4.4): a first sync or a `--full` tree walk has no commit axis to stage on; the target is cut into path slices
     // (re-entered as a stage so the slices read the pinned tree alone, never the working tree).
-    return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, { target, head, slice: { phase: 'import', after: null } });
+    return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, { target, head, slice: { phase: 'import', after: null } }, walk);
   }
   const discovered: SyncDiscovery = { discoveredAt, ...(released.length ? { releasedHolds: released } : {}), ...(retryTaken.length ? { retryTaken } : {}),
     ...(refused.size ? { fileRefusals: [...refused.values()] } : {}), binding: { ...binding, owner_epoch: String(binding.owner_epoch), topology_generation: String(binding.topology_generation) }, root, gitRoot, sourceId, incarnation, from: source.last_commit, target, entries: selected, slugMode, ...(company ? { companyPlan: company.plan } : {}), ...(stage ? { stagedHead: stage.head } : {}),
@@ -546,6 +552,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
   if (collisions.length) discovered.slugCollisions = collisions;
   // Identities and origin collisions were resolved over the whole target above; only the frozen manifest is cut.
   if (slicing) cutDiscoveryToSlice(discovered, slicing, head);
+  await prescreenSyncEntries(engine, discovered, { full: !!opts.full, treeWalk: delta?.status !== 'ok', noSchemaPack: !!opts.noSchemaPack, dryRun: !!opts.dryRun, held: holdByPath });
   if (!working) {
     const uncommitted = { added: new Set([...dirty.added,...dirty.renamed.map(r=>r.to)].filter(eligible)).size,
       modified: new Set(dirty.modified.filter(eligible)).size,

@@ -120,8 +120,60 @@ shows the claimed source's remaining rows as "your notes".
 Each lifted row keeps `write_origin.channel = "trust_claim"`. The source
 records when it was claimed and when its lift finished.
 
+Atoms extracted before gbrain recorded `extracted_by` as an agent signal
+could be lifted to "your notes" by an earlier claim (#6533).
+`gbrain trust claim-sources --relower --dry-run` lists the claim-lifted rows
+whose own signals now say lower, and `gbrain trust claim-sources --relower`
+lowers them. It only lowers: it never raises a row, it touches only rows with
+`write_origin.channel = "trust_claim"`, rows on a lowered page follow it, and
+each lowered row records `write_origin.channel = "trust_relower"`.
+
 `gbrain sources set-trust <id> <lower tier>` or `--clear` ends a claim. Rows
 it already lifted keep their tier.
+
+## Repair unknown markers
+
+Before v0.60.249.0, an agent edit of a page with no tier yet wrote a
+`trust_tier: unknown` marker into its frontmatter (#6550). The backfill later
+gave the page its real tier, but the marker stayed. Agents copy the
+frontmatter back when they edit, so the next agent edit lowered the page to
+"unverified origin" and filed a `lower_page` item you never needed to see.
+`gbrain trust review` adds a `repair` command to those items.
+
+```bash
+gbrain trust backfill --repair-unknown-markers     # read-only preview
+```
+
+The preview lists every page whose marker is `unknown` while its stored tier
+is higher. For each page it shows the slug, the current marker, the stored
+tier, the proposed marker and the tier after a repair (unchanged). It also
+shows the evidence:
+
+- the first saved version that shows the marker, and whether that was before
+  or after this brain first ran the fixed release (the release date is a hard
+  bound; an upgrade recorded in `~/.gbrain/upgrade-state.json` is more precise);
+- whether the page already had the marker when it was first imported.
+
+The time a marker appeared cannot prove it was accidental, so gbrain never
+decides for you. Pages with a version from before the fix that shows the
+marker, and no marker at first import, are listed as consistent with #6550,
+and the printed apply command names them. Every other page is listed as
+ambiguous. A page imported with the marker was probably marked on purpose.
+Pages an agent edit already lowered are listed with their `gbrain trust
+revert` command. Revert them first, then run the preview again.
+
+When any page is listed, the preview ends with the exact command:
+
+```bash
+gbrain trust backfill --repair-unknown-markers --slug notes/a-example --expect mr_0123456789abcdef
+```
+
+Apply rewrites only the pages you name with `--slug` (repeatable). They must
+be at the revisions the preview showed, and the preview must still hash to
+`--expect`; otherwise it refuses with `preview_changed` and changes nothing.
+The marker becomes the page's stored tier (pages at "your notes" or higher
+get no marker), and the page keeps its tier. This runs on the local CLI only.
+Run the preview again to verify: repaired pages no longer show.
 
 ## Scan older memory (only when you agree)
 
@@ -143,7 +195,9 @@ Claim your own sources first, so your notes are not treated as unverified.
 - `trust_sources_unclaimed` warns while unclaimed, non-connector sources hold
   rows from before trust tiers, with `fix.next: tell_user_to_run` naming
   `gbrain trust claim-sources`. It also warns, with the resume command, while
-  a claim's lift has not finished. A fresh or empty brain is ok.
+  a claim's lift has not finished, and names `gbrain trust claim-sources
+  --relower` while claim-lifted rows rank above their own signals. A fresh or
+  empty brain is ok.
 - `trust_scan` warns while older rows at "written by an agent" or below have
   not been scanned. Its fix is yours to run (`tell_user_to_run`).
 - `trust_tiers` reports the tier mix and recommends `gbrain trust backfill`.

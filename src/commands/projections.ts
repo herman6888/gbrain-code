@@ -16,20 +16,23 @@ import type { LockHolderInfo } from '../core/pglite-lock.ts';
 import type { ProgressReporter } from '../core/progress.ts';
 import { type ProjectionRebuildFailure } from '../core/page-state/projections.ts';
 // #6286: the drain lives in core so `migrate` can run it on its target before the config flip.
-export { drainProjections, type ProjectionDrainResult } from '../core/page-state/projections.ts';
+export { drainProjections, previewProjectionDrain, type ProjectionDrainResult } from '../core/page-state/projections.ts';
 import { SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT } from '../core/serve-service.ts';
 import { resolveAutopilotJob } from '../core/autopilot-paths.ts';
 import { detectInstalledJob } from './autopilot/jobs.ts';
 
 export const PROJECTION_DRAIN_DOCS = 'docs/guides/repair.md#projection-drain';
 
-export const PROJECTIONS_HELP = `Usage: gbrain projections drain [--limit <n>] [--json]
+export const PROJECTIONS_HELP = `Usage: gbrain projections drain [--dry-run] [--limit <n>] [--json]
 
 Rebuild queued Markdown and code text projections now, in batches of up to 100,
 until every row queued before the run started has been tried once.
 
+  --dry-run     Rebuild nothing: list the queued rows a drain would try, rows
+                that last failed (rebuild_failed) first, up to --limit (default 50)
   --limit <n>   Try at most n pages in this run (default: no cap)
   --json        Print {rebuilt, superseded, failed, remaining} to stdout
+                ({pending, failed, rows} with --dry-run)
 
 Exit codes: 0 nothing tried failed; 1 some pages failed; 2 did not run
 (projection_owner_resident: a resident gbrain process holds this PGLite brain

@@ -154,15 +154,22 @@ beforeAll(async () => {
 
   // Links: filler→filler hub noise plus a fan-in/out around every target
   // (the card reads getLinks/getBacklinks — targets must have real edges).
+  // #6646: g is in the join predicate (7919·g mod PAGES is distinct and non-zero for g = 1..5), so each filler page
+  // gets LINKS/PAGES distinct targets; the cross join used to run after the join and every edge was produced 5 times.
   await db.query(
     `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
      SELECT p1.id, p2.id, 'mentions', 'mentions'
      FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE 'filler/%') p1
-     JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE 'filler/%') p2
-       ON p2.rn = ((p1.rn * 7919) % ${PAGES}) + 1 AND p1.id <> p2.id
      CROSS JOIN generate_series(1, ${Math.ceil(LINKS / PAGES)}) g
+     JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE 'filler/%') p2
+       ON p2.rn = ((p1.rn + 7919 * g) % ${PAGES}) + 1 AND p1.id <> p2.id
      ON CONFLICT DO NOTHING`,
   );
+  const [{ n: fillerLinks }] = (await db.query(
+    `SELECT count(*)::int AS n FROM links l JOIN pages a ON a.id = l.from_page_id JOIN pages b ON b.id = l.to_page_id
+      WHERE a.slug LIKE 'filler/%' AND b.slug LIKE 'filler/%'`,
+  )).rows as Array<{ n: number }>;
+  expect(fillerLinks).toBe(LINKS);
   await db.query(
     `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
      SELECT t.id, f.id, 'works_at', 'markdown'

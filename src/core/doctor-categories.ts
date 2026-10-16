@@ -78,6 +78,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'safe_index_pending',
   'self_capture',
   'brain_score',
+  // W1: belief ledger coverage intervals, drift, orphan lifetimes and unsafe restores.
+  'belief_ledger_coverage',
   'calibration_freshness',
   'child_table_orphans',
   'chronicle_projection_health',
@@ -104,6 +106,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'embed_staleness',
   'embedding_column_registry',
   'embedding_env_override',
+  // #6113: a bare legacy embedding_model DB row; the fix previews migrate embeddings.
+  'embedding_identity_unqualified',
   // #5137: an env provider key shadowing a different config key.
   'embedding_key_source',
   'embedding_migration_state',
@@ -166,6 +170,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stub_guard_24h',
   // Fact supersession threshold calibrated for the active embedding model (facts/supersession-threshold.ts).
   'supersession_calibration',
+  // #6590: whether the embedding model has measured fact admission cosine floors (search/fact-relevance.ts).
+  'fact_admission_floors',
   'sync_failures',
   // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
   'managed_sync_backlog',
@@ -190,6 +196,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'undeclared_db_only_pages',
   // #6696 B5: live pages whose canonical file is missing on the owner host (doctor/checks/ghost-pages.ts).
   'ghost_pages',
+  // #6609: live pages of a classic checkout whose recorded file a full sync would not find (doctor/checks/missing-recorded-files.ts).
+  'missing_recorded_files',
   'unified_multimodal_coverage',
   'unverified_extractions',
   'voice_gate_health',
@@ -255,6 +263,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'db_only_collector_collision',
   'federation_health',
   'google_file_modes',
+  // #5012 item 9: a Google source's configured calendar was unreadable at its last sync (doctor/checks/google-calendar.ts).
+  'google_calendar_readable',
   'google_oauth',
   'home_dir_in_worktree',
   'index_audit',
@@ -290,6 +300,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'writer_version',
   'pgbouncer_prepare',
   'pglite_data_dir',
+  // #6573: a local IPC socket path over the platform's AF_UNIX budget (doctor/checks/local-ipc.ts).
+  'ipc_socket_path',
   // db-availability loop: engine-fit + repair-recurrence signals.
   'pglite_scale',
   'db_repair_recurrence',
@@ -304,6 +316,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'queue_health',
   // #4578: brain-wide maintenance jobs dying at their deadline.
   'global_maintenance_timeouts',
+  'embed_backfill_stalled',
+  'connector_account_mismatch',
   // #5157: queued jobs from before the v0.50 authority cutover block every worker.
   'legacy_job_authority',
   // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).

@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { isUndefinedTableError } from '../utils.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 import type { ParsedPage } from '../import-file.ts';
 import { buildBasenameIndex, extractPageLinks, isGlobalBasenameEnabled, makeResolver } from '../link-extraction.ts';
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -9,6 +9,7 @@ import { collectWantedLinks, isWantedPagesEnabled, possibleWantedRows } from '..
 import { readFix } from '../ops/op-fix.ts';
 import { readLineGrammarSettings, type LineGrammarSettings } from '../line-grammar.ts';
 import { primeRelationSemantics } from '../link-semantics-pack.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 
 async function liveSlugAliases(engine: BrainEngine, sourceId: string, targets: string[]): Promise<Map<string, string>> {
   if (!targets.length) return new Map();
@@ -19,7 +20,7 @@ async function liveSlugAliases(engine: BrainEngine, sourceId: string, targets: s
         AND EXISTS (SELECT 1 FROM pages c WHERE c.source_id=a.source_id AND c.slug=a.canonical_slug AND c.deleted_at IS NULL)`, [sourceId, [...new Set(targets)]]);
     return new Map(rows.map(row => [row.alias_slug, row.canonical_slug]));
   } catch (error) {
-    if (isUndefinedTableError(error)) return new Map();
+    if (isMissingSchemaObject(error, 'table', 'slug_aliases')) return new Map();
     throw error;
   }
 }
@@ -130,7 +131,7 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
     { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
   ])], apply: async (tx: BrainEngine) => {
     if (!attendanceComplete) return { created: 0, removed: 0, errors: 1, unresolved_count: Math.max(1, unresolved.length) };
-    const snapshot = await tx.readPageSnapshot(slug, { sourceId });
+    const snapshot = await materializedSnapshot(tx, await tx.readPageSnapshot(slug, { sourceId }));
     if (!snapshot) throw new Error('Automatic link origin disappeared');
     try {
       const result = await tx.replaceDerivedLinks({ slug, sourceId, expectedRevision: snapshot.revision,

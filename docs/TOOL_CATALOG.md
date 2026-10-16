@@ -88,7 +88,7 @@ Every non-localOnly operation on the MCP surface: 151 tools across 25 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `find_anomalies` | Anomalies in recent page activity, grouped by cohort (tag or type) against a baseline. | read | yes |  |
-| `find_contradictions` | Stored contradiction reports are temporarily available only to trusted local callers without a source filter. | read |  |  |
+| `find_contradictions` | Return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. | read |  |  |
 | `find_experts` | Answers 'who in my brain knows about <topic>'. | read |  |  |
 | `find_trajectory` | Return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). | read |  |  |
 | `get_calibration_profile` | Read the active calibration profile for a holder. | read |  |  |

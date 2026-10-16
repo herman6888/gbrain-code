@@ -64,6 +64,21 @@ export interface ConsolidatePhaseOpts {
   /** Minimum age (ms) of the OLDEST fact in a bucket before consolidation. Default 24h. */
   minOldestAgeMs?: number;
   sourceId?: string;
+  /** `gbrain dream --phase consolidate --once`: run even when `cycle.consolidate.enabled` is false. */
+  once?: boolean;
+}
+
+/**
+ * #6667: `cycle.consolidate.enabled` (default on) is the off switch for this
+ * phase, which promotes unreviewed facts into takes. Only an explicit falsy
+ * value skips it; unset, a truthy value and a config read failure keep it on.
+ */
+export const CONSOLIDATE_ENABLED_KEY = 'cycle.consolidate.enabled';
+
+async function disabledSkip(engine: BrainEngine, opts: ConsolidatePhaseOpts): Promise<PhaseResult | null> {
+  if (opts.once || !/^\s*(false|0|off|no)\s*$/i.test(await engine.getConfig(CONSOLIDATE_ENABLED_KEY).catch(() => null) ?? '')) return null;
+  return { phase: 'consolidate', status: 'skipped', duration_ms: 0, summary: `consolidate skipped: ${CONSOLIDATE_ENABLED_KEY}=false`,
+    details: { reason: 'disabled', enable_hint: `gbrain config set ${CONSOLIDATE_ENABLED_KEY} true` } };
 }
 
 export const CLUSTER_THRESHOLD_KEY = 'cycle.consolidate.cluster_threshold';
@@ -86,6 +101,8 @@ export async function runPhaseConsolidate(
   engine: BrainEngine,
   opts: ConsolidatePhaseOpts = {},
 ): Promise<PhaseResult> {
+  const disabled = await disabledSkip(engine, opts);
+  if (disabled) return disabled;
   const dryRun = opts.dryRun === true;
   const managed = await managedPersistenceEnabled(engine);
   const { threshold, thresholdInvalid } = await resolveClusterThreshold(engine, opts.clusterThreshold);

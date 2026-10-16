@@ -46,7 +46,7 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { isUndefinedTableError } from './utils.ts';
+import { isMissingSchemaObject } from './utils.ts';
 import { registerBackgroundWorkDrainer } from './background-work.ts';
 
 let _trackRetrievalCache: { ts: number; enabled: boolean } | null = null;
@@ -212,7 +212,7 @@ export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): voi
     } catch (err) {
       // Pre-v224 brain (table missing) falls through silently — the search
       // op already returned, the LSD signal just stays NULL until upgrade.
-      if (isUndefinedTableError(err)) return;
+      if (isMissingSchemaObject(err, 'table', 'page_retrievals')) return;
       // Other errors: stderr-warn but don't break the op response.
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[last-retrieved] write-back failed (best-effort): ${msg}`);
