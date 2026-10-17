@@ -4,6 +4,8 @@
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
 import { resolveJobPull } from './job-pull.ts';
+import { UnrecoverableError } from '../errors.ts';
+import type { SyncResult } from '../../../commands/sync.ts';
 
 export function makeSyncHandler(engine: BrainEngine): MinionHandler {
   return async (job) => {
@@ -188,6 +190,14 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
 
     await progress.flush();
     const drained = await settleJobDrain(engine, job, result, sourceId ?? 'default', plan);
+    // #6858: a drain stopped on something only a person clears (a blocked run, a stalled holder, a cap) does not end `completed`:
+    // the job ends dead with the run's next step, and its progress keeps the drain fields `jobs get` would otherwise have shown.
+    if (drained.incomplete === true && (await import('../../persistence/sync-drain.ts')).jobDisposition(result, sourceId ?? 'default') === 'needs_operator') {
+      const { outcome, drain, next } = drained as { outcome?: string; drain?: SyncResult['drain']; next?: { command?: string; why?: string } };
+      await job.updateProgress({ blocked: true, outcome, drain, next }).catch(() => undefined);
+      throw new UnrecoverableError(`Managed sync of source ${sourceId ?? 'default'} is ${result.status === 'blocked_by_failures' ? 'blocked' : 'stopped'}`
+        + ` (${drain?.stop_reason ?? result.status}${drain?.remaining != null ? `, ${drain.remaining} entries left` : ''}). ${next?.why ?? ''}${next?.command ? ` Next: ${next.command}` : ''}`.trim());
+    }
     return { ...result, ...drained, embed_job_id: embedJobId, embed_skip_reason: embedSkipReason };
   };
 }

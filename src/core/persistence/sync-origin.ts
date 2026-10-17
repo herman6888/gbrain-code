@@ -36,7 +36,7 @@ export function sameSyncOrigin(stored: string, origin: string, context?: SyncOri
   if (nested && existsSync(join(context.root, stripped))) {
     const error = new OperationError('page_identity_changed', 'A recorded page origin could name two files in this source.',
       `Source '${context.sourceId}' records '${recorded}', which can mean the file '${stripped}' or the file '${recorded}' under the source directory. `
-      + `On the source host, rename or move one of those two files, commit, then run gbrain sync --source ${context.sourceId} --no-pull --retry-failed.`);
+      + `On the source host, rename or move one of those two files, commit, then run gbrain sync --source ${context.sourceId} --no-pull.`);
     error.detail = 'ambiguous_source_path';
     throw error;
   }

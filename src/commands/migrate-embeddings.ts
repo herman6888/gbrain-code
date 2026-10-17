@@ -700,7 +700,7 @@ export async function executeMigrationFlow(
 
     await assertOwned();
     const readiness = await prepareEmbeddingProjections(engine, { repair: true, assertOwned });
-    if (readiness.blocked) return { status: 'apply_failed', reason: `projection_blocked: ${readiness.blocked} page(s) remain; no migration-wide embedding invalidation performed. Canonical projection recovery may have made durable progress. Inspect blockers before retrying: archived sources require deliberate gbrain sources restore <id>; unsupported media requires its source importer. See docs/guides/embedding-migration.md#recovery.` };
+    if (readiness.blocked) return { status: 'apply_failed', reason: `projection_blocked: ${readiness.blocked} page(s) remain; no migration-wide embedding invalidation performed. Canonical projection recovery may have made durable progress. Inspect blockers before retrying: archived sources require deliberate gbrain sources restore <id>; image pages are counted by class in gbrain doctor --only text_projection_readiness --json (gbrain projections drain seals the sealable ones). See docs/guides/embedding-migration.md#recovery.` };
 
     const applied = await applyEmbeddingMigration(engine, plan, {
       ignoreEnvOverride: opts.ignoreEnvOverride,

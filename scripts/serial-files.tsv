@@ -213,6 +213,7 @@ test/graduation-serve-guard.serial.test.ts	global-state	global-state: spawns rea
 test/graph-query-thin-client-source-flag.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
 test/guarded-http-tls.serial.test.ts	global-state	global-state: binds local servers/ports
 test/harness-delivery-recovery.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll; R4: PGLiteEngine without an afterAll disconnect
+test/held-embedding-printed-commands.serial.test.ts	global-state	global-state: installs the process-wide CLI fix routing (installCliRouting) that every renderAction in the process reads
 test/hook-backup-notice.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAIN_BACKUP_CHECK)
 test/hook-command.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAIN_HOOKS, GBRAIN_HOOK_LANE, GBRAIN_SOURCE (+3 more))
 test/hook-push-banner-superseded.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAIN_BACKUP_CHECK)
@@ -272,6 +273,7 @@ test/migrate-embeddings-hardening.serial.test.ts	R1	R1: mutates process.env (GBR
 test/migrate-embeddings-op-contract.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAIN_EMBEDDING_MODEL, GBRAIN_EMBEDDING_DIMENSIONS)
 test/migrate-embeddings-recovery-cli.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll; R4: PGLiteEngine without an afterAll disconnect; process-wide test seams __setEmbedTransportForTests
 test/migrate-engine-completeness.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, DATABASE_URL, GBRAIN_DATABASE_URL)
+test/migrate-engine-image-vectors-6871.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll; R4: PGLiteEngine without an afterAll disconnect; R6: reads the process-wide CLI exit verdict (currentExitCode); withEnv scopes GBRAIN_HOME, DATABASE_URL and GBRAIN_DATABASE_URL
 test/migrate-engine-page-copy-failure.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, DATABASE_URL, GBRAIN_DATABASE_URL)
 test/migrate-engine-pagination.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, DATABASE_URL, GBRAIN_DATABASE_URL)
 test/migrate-full-row-projections.serial.test.ts	global-state	global-state: runMigrateEngine sets the process-wide CLI exit verdict (reset in afterEach) and the run swaps GBRAIN_HOME through withEnv and writes config.json (saveConfig)
@@ -358,6 +360,9 @@ test/search/relational-rerank-pin-hybrid.serial.test.ts	R1	R1: mutates process.e
 test/seed-pglite.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll; R4: PGLiteEngine without an afterAll disconnect
 test/self-upgrade-checkonly.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME)
 test/serve-http-mcp-dispatch-context.serial.test.ts	R2	R2: mock.module(../src/mcp/dispatch.ts) replaces modules for every file in the process
+test/on-commit-embedding.serial.test.ts	global-state	global-state: installs the gateway embedding transport (__setEmbedTransportForTests) and starts syncs through the process-wide delegated-sync runner singleton; withEnv scopes GBRAIN_HOME
+test/serve-head-watcher-managed.serial.test.ts	global-state	global-state: starts real syncs through the process-wide delegated-sync runner singleton (reset with __resetDelegatedSyncForTests); withEnv scopes GBRAIN_HOME
+test/serve-http-head-watcher.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAIN_SERVE_HEAD_POLL_MS); spies on global setInterval/clearInterval, emits SIGINT on the process and reads the process-wide cleanup registry
 test/serve-http-run-teardown.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME)
 test/serve-http-status-mode.serial.test.ts	R1	R1: sets process.env.GBRAIN_HOME for the status marker reads; binds local servers/ports
 test/serve-idle-sweep-source.serial.test.ts	R2	R2: mock.module(../src/core/sweep.ts) replaces modules for every file in the process
@@ -423,3 +428,4 @@ test/writeback-review-fixes.serial.test.ts	global-state	global-state: process-wi
 test/resolve-ipc-rebind.serial.test.ts	global-state	global-state: binds real Unix sockets and spawns a child serve that is SIGKILLed; withEnv scopes GBRAIN_HOME
 test/backup-preflight-6649.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine inside the restore-drill and fixture-brain steps (each disconnected in finally); creates symlinked homes and 8 GiB sparse files
 test/windows-ipc-long-path-6573.serial.test.ts	R1	R1: mutates process.env (USERPROFILE) to place the per-user run dir under a non-ASCII profile path; native windows-latest only
+test/coordination-lock.serial.test.ts	global-state	global-state: withEnv holds GBRAIN_HOME and GBRAIN_COORDINATION_HOME across awaited PGLite claims and transfers, and real native lock files are held across them

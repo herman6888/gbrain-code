@@ -67,6 +67,7 @@ import { fenceWhere } from '../fence-repair/refusal.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
 import { fenceRepairCommit } from './effect-model.ts';
+import { withoutSafetyAssessments } from './reconcile-safety.ts';
 import { preparePagePurge, purgePageInTransaction, type PreparedPagePurge } from './page-purge.ts';
 import { withTrustKeep } from './context.ts';
 import { isFenceEditWrite, pageGateTrust, pageWriteTrust, recordAgentPageLowering, stampPageTrustMarker, storedPageTier } from '../trust/page-write.ts';
@@ -164,7 +165,7 @@ export function readCanonicalAsImported(bytes: string, sourcePath: string): { co
  */
 export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, bytes: string, snapshot: PageSnapshot,
   sourcePath: string | (() => Promise<string>), activePack?: ParseOpts['activePack']): Promise<boolean> {
-  const expected = digest(canonical(snapshot.page, snapshot.tags));
+  const expected = digest(canonical({ ...snapshot.page, frontmatter: withoutSafetyAssessments(snapshot.page.frontmatter ?? {}) }, snapshot.tags));
   const matches = async (content: string, inferred: boolean) => {
     const parsed = parseMarkdown(content, slug, { activePack });
     // #5521 parity for subtype (#5928): a pack rule is not part of the file's bytes, so a file
@@ -180,7 +181,7 @@ export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, byt
     const type = parsed.typeExplicit && !inferred ? parsed.type : snapshot.page.type;
     // Withdrawal overlays intentionally precede physical mirroring. The ledger
     // is applied by the import preparation and cannot be undone by this check.
-    const actual = canonical({ ...parsed, type, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
+    const actual = canonical({ ...parsed, frontmatter: withoutSafetyAssessments(parsed.frontmatter), type, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
       parsed.compiled_truth, parsed.timeline ?? '', snapshot.withdrawals, { sourceId: snapshot.page.source_id, marker: snapshot.globalPurges }) }, parsed.tags);
     return digest(actual) === expected;
   };

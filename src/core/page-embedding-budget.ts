@@ -24,8 +24,9 @@
  * page waits for the user's approval (the oversized-page upgrade backfill, or
  * a sampled junk hit). Held and capped pages leave the stale-chunk queue
  * (engine-sql/chunks.ts staleChunkWhere) so the sweep never retries them; an explicit
- * approval (`gbrain embed --slugs <slug> --max-usd N`, `gbrain embed --held
- * --max-usd N`) passes `approvedCapUsd`, lifts the hold and raises the cap.
+ * approval (`gbrain embed --held --source S --max-usd N`, or `--slugs <slug>
+ * --source S --max-usd N`) passes `approvedCapUsd`, lifts the hold and raises the
+ * cap. Every printed approve and its N come from held-embedding-action.ts.
  *
  * Crash safety: a reservation older than an hour (the provider call never
  * settled) is counted as spent, never released, so a crash cannot reopen
@@ -35,18 +36,17 @@ import type { BrainEngine } from './engine.ts';
 import { JUNK_SAMPLE_CHARS, assessJunkWindows, assessSampledJunk } from './content-sanity.ts';
 import type { BodyStorage, ManifestRow } from './page-body/types.ts';
 import { isSegmentedPage, pageBodyBytes } from './page-body/page-shape.ts';
-import { estimateCostFromChars, lookupEmbeddingPrice } from './embedding-pricing.ts';
+import { estimateCostFromChars } from './embedding-pricing.ts';
 import { PAGE_INLINE_MAX_BYTES, isLargePageBytes } from './page-size-policy.ts';
 import { isEmbedSkipped } from './embed-skip.ts';
 import { parseUsdLimit, resolveSpendPosture } from './spend-posture.ts';
 import { chunkGenerationFilter } from './search/safe-chunks.ts';
 import { quoteIdentifier } from './search/embedding-column.ts';
 import { embeddingWriteTarget } from './page-state/projections.ts';
+import { approvalAmount, approvalBasis, heldApproveAction, heldPreviewCommand, ledgerPricePerMTok, renderedCommand } from './held-embedding-action.ts';
 
 export const PAGE_EMBED_CAP_KEY = 'embed.max_usd_per_page';
 export const DEFAULT_PAGE_EMBED_CAP_USD = 2;
-/** Price assumed for a model with no known rate (the conservative OpenAI large rate). */
-const UNPRICED_RATE_PER_MTOK = 0.13;
 
 export type PageBudgetState = 'open' | 'held' | 'capped';
 
@@ -106,12 +106,6 @@ async function segmentedSampleWindows(engine: BrainEngine, pageId: number): Prom
   return [await forward(0), await forward(Math.max(0, middle)), tail.slice(-JUNK_SAMPLE_CHARS)];
 }
 
-function currentPricePerMTok(signature: string | null | undefined): { rate: number; priced: boolean } {
-  if (!signature) return { rate: UNPRICED_RATE_PER_MTOK, priced: false };
-  const hit = lookupEmbeddingPrice(signature.slice(0, signature.lastIndexOf(':')) || signature);
-  return hit.kind === 'known' ? { rate: hit.pricePerMTok, priced: true } : { rate: UNPRICED_RATE_PER_MTOK, priced: false };
-}
-
 /** Hold a large page's embedding until the user approves it (`reason` names why). Idempotent; never touches open spend. */
 export async function holdPageEmbedding(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number, reason: string): Promise<void> {
   await engine.executeRaw(`INSERT INTO page_embedding_budget (page_id, state, reason) VALUES ($1, 'held', $2)
@@ -130,7 +124,7 @@ export async function planPageEmbedding(engine: BrainEngine, page: BudgetPage,
   if (!isLargePageBytes(pageBodyBytes(page)) || stale.length === 0) return { kind: 'unmetered' };
   const approved = opts.approvedCapUsd !== undefined;
   const configured = await resolvePageEmbedCapUsd(engine);
-  const { rate, priced } = currentPricePerMTok(opts.signature);
+  const { rate, priced } = ledgerPricePerMTok(opts.signature);
   return engine.transaction(async tx => {
     await tx.executeRaw('INSERT INTO page_embedding_budget (page_id) VALUES ($1) ON CONFLICT (page_id) DO NOTHING', [page.id]);
     const [row] = await tx.executeRaw<BudgetRow>(`SELECT state, reason, embedding_signature, spent_usd, reserved_usd, cap_usd,
@@ -186,14 +180,14 @@ export async function planPageEmbedding(engine: BrainEngine, page: BudgetPage,
 export interface PageBudgetReport { slug: string; source_id: string; state: Exclude<PageBudgetState, 'open'>; reason: string | null;
   spent_usd: number; cap_usd: number | null; pending_chunks: number; pending_chars: number }
 
-/** Estimated provider cost of embedding `chars` of chunk text with the model in `signature` (unknown models use the conservative rate). */
+/** Estimated provider cost of embedding `chars` of chunk text with the model in `signature` (unknown models use the conservative rate, free recipes $0). */
 export function estimatePageEmbedUsd(chars: number, signature: string | null | undefined): number {
-  return estimateCostFromChars(chars, currentPricePerMTok(signature).rate);
+  return estimateCostFromChars(chars, ledgerPricePerMTok(signature).rate);
 }
 
-/** Held and capped pages with their stale chunk counts (doctor `partial_embedding`, `gbrain embed --held`). */
-export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: { state?: 'held' | 'capped'; sourceId?: string; limit?: number } = {}): Promise<PageBudgetReport[]> {
-  const params: unknown[] = [opts.limit ?? 1000];
+/** Held and capped pages with their stale chunk counts (`gbrain embed --held`); `limit: null` lists every one. */
+export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: { state?: 'held' | 'capped'; sourceId?: string; limit?: number | null } = {}): Promise<PageBudgetReport[]> {
+  const params: unknown[] = [opts.limit === undefined ? 1000 : opts.limit];
   const filters = [`b.state <> 'open'`, 'p.deleted_at IS NULL'];
   if (opts.state) filters.push(`b.state = $${params.push(opts.state)}`);
   if (opts.sourceId) filters.push(`p.source_id = $${params.push(opts.sourceId)}`);
@@ -202,7 +196,7 @@ export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeR
       (SELECT count(*)::int FROM content_chunks cc WHERE cc.page_id = p.id AND ${pending} AND ${chunkGenerationFilter('p', 'cc')}) AS pending_chunks,
       (SELECT COALESCE(sum(length(cc.chunk_text)), 0)::bigint FROM content_chunks cc WHERE cc.page_id = p.id AND ${pending} AND ${chunkGenerationFilter('p', 'cc')}) AS pending_chars
     FROM page_embedding_budget b JOIN pages p ON p.id = b.page_id
-    WHERE ${filters.join(' AND ')} ORDER BY b.updated_at DESC, p.id LIMIT $1`, params);
+    WHERE ${filters.join(' AND ')} ORDER BY b.updated_at DESC, p.id LIMIT $1::int`, params);
   return rows.map(row => ({ ...row, spent_usd: Number(row.spent_usd), cap_usd: row.cap_usd === null ? null : Number(row.cap_usd), pending_chunks: Number(row.pending_chunks), pending_chars: Number(row.pending_chars) }));
 }
 
@@ -219,52 +213,36 @@ export async function spendGrant<T>(grant: PageEmbedGrant | undefined, call: () 
   }
 }
 
+/** The approve command for one page's waiting chunks, with a concrete --max-usd ceiling (held-embedding-action.ts). */
+async function pageApproveCommand(page: { slug: string; source_id?: string }, waiting: ReadonlyArray<{ chunk_text: string }>): Promise<string> {
+  const basis = await approvalBasis();
+  const amount = approvalAmount(waiting.reduce((n, c) => n + c.chunk_text.length, 0), basis);
+  return renderedCommand(heldApproveAction({ source_id: page.source_id ?? 'default', slug: page.slug, pending_chunks: waiting.length, ...amount }, basis.free));
+}
+
 /**
  * One embedding run's per-page step: meter `candidates` (the page's chunks
  * without a vector) and narrow them to the grant, saying on stderr why chunks
  * wait. Null means embed nothing now (held, or the cap left no chunk);
  * otherwise `chunks` is the batch to embed, every candidate on an unmetered page.
  */
-export async function meterPageBatch<C extends { chunk_index: number; chunk_text: string }>(engine: BrainEngine, page: BudgetPage & { slug: string },
+export async function meterPageBatch<C extends { chunk_index: number; chunk_text: string }>(engine: BrainEngine, page: BudgetPage & { slug: string; source_id?: string },
   candidates: readonly C[], opts: { signature?: string | null; approvedCapUsd?: number; announceHeld?: boolean }): Promise<{ grant?: PageEmbedGrant; chunks: C[] } | null> {
   const decision = await planPageEmbedding(engine, page, candidates, opts);
   if (decision.kind === 'unmetered') return { chunks: [...candidates] };
-  const approve = `gbrain embed --slugs ${page.slug} --max-usd <N>`;
   if (decision.kind === 'held') {
-    if (opts.announceHeld) process.stderr.write(`[embed] ${page.slug}: embedding held (${decision.reason}); the page stays keyword-searchable. Approve with: ${approve}\n`);
+    if (opts.announceHeld) process.stderr.write(`[embed] ${page.slug}: embedding held (${decision.reason}); the page stays keyword-searchable. With the user's approval: ${await pageApproveCommand(page, candidates)}\n`);
     return null;
   }
   const { grant } = decision;
   const chunks = candidates.filter(c => grant.chunkIndexes.has(c.chunk_index));
-  if (grant.deferred) process.stderr.write(`[embed] ${page.slug}: per-page cap $${grant.capUsd.toFixed(2)} reached; ${grant.deferred} older chunk(s) stay keyword-only until it rises (${approve})\n`);
+  if (grant.deferred) {
+    const waiting = candidates.filter(c => !grant.chunkIndexes.has(c.chunk_index));
+    process.stderr.write(`[embed] ${page.slug}: per-page cap $${grant.capUsd.toFixed(2)} reached; ${grant.deferred} older chunk(s) stay keyword-only until it rises (${await pageApproveCommand(page, waiting)})\n`);
+  }
   if (chunks.length) return { grant, chunks };
   await grant.settle({ ok: true });
   return null;
-}
-
-/**
- * `gbrain embed --held`: list the held and capped large pages with what each
- * would cost to finish, then return the `--source S --slugs ...` argv that
- * embeds them under the user's `--max-usd` (one source per approval).
- */
-export async function heldEmbedArgv(engine: BrainEngine, args: readonly string[], signature: string | null, say: (line: string) => void): Promise<{ argv: string[] } | { error: string } | null> {
-  if (args.includes('--background')) return { error: '[embed] --held runs in the foreground: the per-page approval is not carried into background jobs.' };
-  const sourceIdx = args.indexOf('--source');
-  const limited = await listBudgetLimitedPages(engine, sourceIdx >= 0 ? { sourceId: args[sourceIdx + 1] } : {});
-  if (limited.length === 0) {
-    say('[embed] No large pages are held or capped by embed.max_usd_per_page.');
-    return null;
-  }
-  for (const row of limited) {
-    say(`[embed] ${row.slug} (${row.source_id}): ${row.state}${row.reason ? ` (${row.reason})` : ''}, ${row.pending_chunks} chunk(s) without a vector, `
-      + `spent $${row.spent_usd.toFixed(2)}, about $${estimatePageEmbedUsd(row.pending_chars, signature).toFixed(2)} to finish`);
-  }
-  const sources = [...new Set(limited.map(row => row.source_id))];
-  if (sources.length > 1) {
-    return { error: `[embed] Held pages span ${sources.length} sources; one approval covers one source. Run per source: ${sources.map(id => `gbrain embed --held --source ${id} --max-usd <N>`).join('; ')}` };
-  }
-  const rest = args.filter((a, i) => a !== '--held' && a !== '--source' && args[i - 1] !== '--source');
-  return { argv: [...rest, '--source', sources[0], '--slugs', ...limited.map(row => row.slug)] };
 }
 
 /**
@@ -292,7 +270,7 @@ export function pageSizeState(bytes: number, frontmatter: Record<string, unknown
  * pageSizeState for stored pages of one source with a non-null state: the given slugs, or (null) every
  * such page in the source, as a full sync walked them all.
  */
-export async function readPageSizeStates(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slugs: readonly string[] | null): Promise<Array<{ slug: string } & PageSizeState>> {
+export async function readPageSizeStates(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slugs: readonly string[] | null): Promise<Array<{ slug: string; source_id?: string } & PageSizeState>> {
   if (slugs?.length === 0) return [];
   const bytes = `(CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END)`;
   const rows = await engine.executeRaw<{ slug: string; bytes: number; segmented: boolean; frontmatter: Record<string, unknown> | null; state: PageBudgetState | null; reason: string | null }>(
@@ -303,7 +281,7 @@ export async function readPageSizeStates(engine: Pick<BrainEngine, 'executeRaw'>
     slugs ? [sourceId, PAGE_INLINE_MAX_BYTES, [...slugs]] : [sourceId, PAGE_INLINE_MAX_BYTES]);
   return rows.flatMap(row => {
     const state = pageSizeState(Number(row.bytes), row.frontmatter, row.state ? { state: row.state, reason: row.reason } : null, row.segmented === true);
-    return state ? [{ slug: row.slug, ...state }] : [];
+    return state ? [{ slug: row.slug, ...(state.embedding === 'held' ? { source_id: sourceId } : {}), ...state }] : [];
   });
 }
 
@@ -318,10 +296,10 @@ export async function sizeStateField(engine: Pick<BrainEngine, 'executeRaw'>, so
 }
 
 /** #6722: the sync receipt's tally of pages a run left large or embed_skip: the total and the first SIZE_STATE_SAMPLE. */
-export interface SyncSizeStates { total: number; pages: Array<{ slug: string; path?: string } & PageSizeState> }
+export interface SyncSizeStates { total: number; pages: Array<{ slug: string; path?: string; source_id?: string } & PageSizeState> }
 export const SIZE_STATE_SAMPLE = 50;
 
-export function addSizeState(tally: SyncSizeStates | undefined, entry: { slug: string; path?: string } & PageSizeState): SyncSizeStates {
+export function addSizeState(tally: SyncSizeStates | undefined, entry: { slug: string; path?: string; source_id?: string } & PageSizeState): SyncSizeStates {
   const pages = tally?.pages ?? [];
   return { total: (tally?.total ?? 0) + 1, pages: pages.length < SIZE_STATE_SAMPLE ? [...pages, entry] : pages };
 }
@@ -329,9 +307,9 @@ export function addSizeState(tally: SyncSizeStates | undefined, entry: { slug: s
 /** One line per sampled page for the sync output, and the rest as a count. */
 export function sizeStateLines(tally: SyncSizeStates | undefined): string[] {
   if (!tally?.total) return [];
-  const what = (s: PageSizeState) => s.embedding === 'skipped'
+  const what = (s: PageSizeState & { source_id?: string }) => s.embedding === 'skipped'
     ? `no vectors (${s.reason === 'oversized' ? 'over the content_sanity.bytes_block limit' : 'embed_skip marker'}); chunks keep it in keyword search`
-    : s.embedding === 'held' ? `embedding held (${s.reason}); \`gbrain reindex --held\` previews the cost`
+    : s.embedding === 'held' ? `embedding held (${s.reason}); \`${heldPreviewCommand(s.source_id)}\` previews the cost`
     : s.embedding === 'partial' ? 'partly embedded under embed.max_usd_per_page; the rest stays keyword-only'
     : 'large page; embedding runs after the commit under embed.max_usd_per_page';
   const lines = tally.pages.slice(0, 20).map(p => `  Size ${p.path ?? p.slug} (${p.bytes} bytes): ${what(p)}.`);

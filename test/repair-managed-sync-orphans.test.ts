@@ -89,7 +89,8 @@ test('orphans are classified by what nothing current can do, doctor names the re
   expect(check.message).toContain('cannot be resumed or cleared by any sync');
   expect(check.message).toContain(`gbrain repair managed-sync-orphans --source ${SOURCE}`);
   expect(check.message).toContain('ck-legacy'.slice(0, 12) + ' principal_unadoptable');
-  expect(check.message).toContain('--retry-failed');
+  expect(check.message).toContain(`Fix the cause, then run gbrain sync --source ${SOURCE} --no-pull`);
+  expect(check.message).not.toContain('--retry-failed');
   expect((check.details as { orphans: unknown[] }).orphans).toHaveLength(3);
   const remote = (await checkSyncFailures(engine, { remote: true, sourceIds: [SOURCE] }))!;
   expect(remote.message).not.toContain('ck-legacy');

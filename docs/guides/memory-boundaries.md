@@ -84,7 +84,7 @@ running `gbrain embed`.
 **Say to your agent:** *"I upgraded gbrain. Which of my big pages couldn't be
 found before, and what would it cost to embed them now?"* The agent runs
 `gbrain reindex --oversized --dry-run --json` and `gbrain doctor --json`, then
-asks before `gbrain embed --held --max-usd <N>`.
+asks before `gbrain embed --held --source <id> --max-usd <N>`, one source at a time.
 
 A page stays one page whatever its size: one slug, one title, one set of
 links. Size no longer decides whether search can find it. Every Markdown page
@@ -127,7 +127,7 @@ An ordinary page carries no field.
 | --- | --- | --- |
 | `deferred` | `large_page` | Over 1 MiB: committed with chunks and no vectors; the embedding sweep embeds it after the commit, under `embed.max_usd_per_page`. |
 | `partial` | `spend_cap` | The per-page cap stopped embedding; the rest stays keyword-only. |
-| `held` | e.g. `upgrade_backfill` | Embedding waits for the user's approval of the previewed cost (`gbrain embed --held`). |
+| `held` | e.g. `upgrade_backfill` | Embedding waits for the user's approval of the previewed cost (`gbrain embed --held --dry-run`, then one source at a time). |
 | `skipped` | `oversized` | Over the operator's `bytes_block`: chunked and keyword-searchable, never embedded. |
 | `skipped` | `operator_marker` | Another `embed_skip` marker: chunked and keyword-searchable, never embedded. |
 
@@ -174,9 +174,10 @@ are not yet metered by this cap. When several caps apply,
 the lowest wins: the per-page cap, the run's consent cap (`--max-usd`),
 `embed.backfill_max_usd` and `embed.backfill_max_usd_per_source_24h`. A page
 over its cap is still keyword-searchable, and its newest chunks are embedded
-first, up to the cap. Doctor's `partial_embedding` check names each such page
-with the exact fix, `gbrain embed --slugs <slug> --max-usd <N>`; raising a cap
-is the user's call.
+first, up to the cap. Doctor's `partial_embedding` check counts such pages by
+source and prints each source's approve command with a concrete N,
+`gbrain embed --held --source <id> --max-usd <N>`; raising a cap is the
+user's call.
 
 <a id="large-pages-upgrade"></a>
 **After upgrading.** Older releases stored a page over 500 KB with an
@@ -188,16 +189,32 @@ resumes where it stopped. It removes only gate-written markers whose reason is
 `oversized`, and the matching `content_flag: oversized`; a page above the
 operator's effective `bytes_block` keeps both and is re-chunked for keyword
 search with no vectors. The backfill never embeds.
-Backfilled pages over 1 MiB are held for consent; the post-upgrade notice and
-doctor's `partial_embedding` check show how many are held and what embedding
-them would cost. Pages between 500 KB and 1 MiB cost a cent or two each and
-embed through the normal sweep under the existing caps.
+Backfilled pages over 1 MiB are held for consent; the post-upgrade notice,
+`gbrain embed --stale` (its `budget_limited` line) and doctor's
+`partial_embedding` check show how many are held and what embedding them
+would cost. Pages between 500 KB and 1 MiB cost a cent or two each and embed
+through the normal sweep under the existing caps.
+
+Nothing releases a hold automatically. `gbrain embed --held --dry-run` lists
+every source, writes nothing and prints one approve command per source; an
+approval covers one source, so `--held --max-usd` needs `--source` when held
+pages span several sources. `--max-usd N` is two things at once: the run's
+hard cap and the extra allowance saved on each page it approves, so the
+printed N is a ceiling (the estimate x1.5, at least $0.25), not the estimate.
+It works on every provider; on a local one that bills nothing the printed N is
+$0.01 and the run costs nothing. A run stopped by its cap, or interrupted,
+keeps every vector it wrote: the page it was on is no longer held and the stale
+sweep finishes it under its new allowance, and pages it never reached stay
+held for the next approval. `--yes` never approves a held page. An approval is
+refused, with every hold and cap unchanged, when embeddings are unavailable
+(disabled, no provider credentials) or the paid model has no price.
 
 ```bash
 gbrain reindex --oversized --dry-run --json      # preview the backfill: free, no provider calls
 gbrain reindex --oversized --source <id>         # run it now for one source
-gbrain embed --held --max-usd 2                  # embed every held page, capped at $2 (paid)
-gbrain embed --slugs <slug> --max-usd 1          # embed one page, capped at $1 (paid)
+gbrain embed --held --dry-run                    # every source: held pages, the cost to finish, one approve command each (free)
+gbrain embed --held --source <id> --max-usd 2    # embed one source's held pages: $2 caps the run and is each page's extra allowance (paid)
+gbrain embed --slugs <slug> --source <id> --max-usd 1  # embed one page, capped at $1 (paid)
 gbrain search "<a phrase from deep in the page>" # keyword search finds it before any embedding
 gbrain doctor --only partial_embedding --json    # pages embedded only up to their cap
 gbrain config set embed.max_usd_per_page 5       # raise the per-page cap (ask the user first)

@@ -19,7 +19,7 @@
  * RECORD_ROWS_PER_CALL per call, allotted in input order.
  */
 import type { BrainEngine } from '../engine.ts';
-import { entityLookupScope, readAka, selectEntityCandidates, type EntityLookupScope } from './entity-card.ts';
+import { readAka, selectAcrossSources, type EntityLookupScope } from './entity-card.ts';
 import { readSiblingIdentity } from './entity-card-identity.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
 import { boundedBodyPrefixSql, overlaidBoundedRows } from '../page-window/bounded-lead.ts';
@@ -34,7 +34,7 @@ const CONCURRENCY = 8;
 
 export interface EntityNamePage extends RowReferences { slug: string; title: string; type: string | null; aka: string[]; lead: string }
 export type EntityNameRow =
-  | ({ name: string; found: true } & EntityNamePage & { siblings?: EntityNamePage[] })
+  | ({ name: string; found: true; source_id: string } & EntityNamePage & { siblings?: EntityNamePage[] })
   | { name: string; found: false; suggestions?: Array<{ slug: string; title: string }> };
 
 /** The opening prose of a page body: fences and secrets removed, headings, markers and table rows dropped, up to `max` characters. */
@@ -47,28 +47,39 @@ export function pageLead(body: string | null, max = ENTITY_LEAD_CHARS): string {
 }
 
 export async function lookupEntityNames(engine: BrainEngine, sourceId: string, names: string[],
-  opts: { remote: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full'; emitNotice?: (n: Notice) => void }): Promise<{ results: EntityNameRow[]; found: number; missing: number }> {
+  opts: { remote: boolean; sources?: readonly string[]; surfaceCeiling?: 'verbs' | 'starter' | 'full'; emitNotice?: (n: Notice) => void }): Promise<{ results: EntityNameRow[]; found: number; missing: number }> {
   const unique = [...new Set(names.map(n => n.trim()).filter(Boolean))];
-  const scope = await entityLookupScope(engine, sourceId, opts.remote);
+  // #6723: each name resolves in the first source (home first) with a hit; a source's lookup scope is read once per batch.
+  const sources = opts.sources?.length ? opts.sources : [sourceId];
+  const scopes = new Map<string, Promise<EntityLookupScope>>();
+  const excludePrivate = new Map<string, boolean>();
   const rows = new Map<string, EntityNameRow>();
   for (let i = 0; i < unique.length; i += CONCURRENCY) {
-    await Promise.all(unique.slice(i, i + CONCURRENCY).map(async name => rows.set(name, await lookupOne(engine, sourceId, name, scope, opts))));
+    await Promise.all(unique.slice(i, i + CONCURRENCY).map(async name => {
+      const { sourceId: hitSource, scope, selected } = await selectAcrossSources(engine, sources, name, opts.remote, { omitQuarantined: opts.remote, scopes });
+      excludePrivate.set(hitSource, scope.excludePrivate);
+      rows.set(name, await lookupOne(engine, hitSource, name, scope, selected, opts));
+    }));
   }
   const results = unique.map(n => rows.get(n)!);
-  await attachReferences(engine, sourceId, results, scope.excludePrivate, opts);
+  for (const [src, exclude] of excludePrivate) {
+    await attachReferences(engine, src, results.filter(r => r.found && r.source_id === src), exclude, { ...opts, home: sources[0]! });
+  }
   const found = results.filter(r => r.found).length;
   return { results, found, missing: results.length - found };
 }
 
-/** One batched reference read for every found page and sibling, in input order (page first, then its siblings). */
+/** One batched reference read per source for every found page and sibling, in input order (page first, then its siblings). */
 async function attachReferences(engine: BrainEngine, sourceId: string, results: EntityNameRow[], excludePrivate: boolean,
-  opts: { remote: boolean; surfaceCeiling?: 'verbs' | 'starter' | 'full'; emitNotice?: (n: Notice) => void }): Promise<void> {
+  opts: { remote: boolean; home: string; surfaceCeiling?: 'verbs' | 'starter' | 'full'; emitNotice?: (n: Notice) => void }): Promise<void> {
   const pages: EntityNamePage[] = [];
   for (const r of results) if (r.found) pages.push(r, ...(r.siblings ?? []));
   if (!pages.length) return;
   const refs = await readRowReferences(engine, sourceId, pages.map(p => ({ slug: p.slug, sourceId })),
     { remote: opts.remote, excludePrivate, surfaceCeiling: opts.surfaceCeiling, surface: 'names', emitNotice: opts.emitNotice });
-  pages.forEach((p, i) => Object.assign(p, refs.rows[i]));
+  // A follow-up for a page outside the caller's home source names its source.
+  pages.forEach((p, i) => Object.assign(p, refs.rows[i], sourceId !== opts.home && refs.rows[i]?.next
+    ? { next: { ...refs.rows[i]!.next, arguments: { ...refs.rows[i]!.next!.arguments, source_id: sourceId } } } : {}));
   if (refs.notice) opts.emitNotice?.(refs.notice);
   if (!refs.rows.some(r => r.referenced_by_count !== undefined || r.records)) return;
   const coverage = await readMentionCoverage(engine, [sourceId]).catch(() => null);
@@ -77,8 +88,7 @@ async function attachReferences(engine: BrainEngine, sourceId: string, results: 
 }
 
 async function lookupOne(engine: BrainEngine, sourceId: string, name: string, scope: EntityLookupScope,
-  opts: { remote: boolean }): Promise<EntityNameRow> {
-  const selected = await selectEntityCandidates(engine, sourceId, name, scope, { omitQuarantined: opts.remote });
+  selected: Awaited<ReturnType<typeof selectAcrossSources>>['selected'], opts: { remote: boolean }): Promise<EntityNameRow> {
   if (selected.kind !== 'hit') {
     const suggestions = (selected.kind === 'miss' ? selected.suggestions : []).slice(0, 3).map(s => ({ slug: s.slug, title: s.title }));
     return { name, found: false, ...(suggestions.length ? { suggestions } : {}) };
@@ -96,7 +106,7 @@ async function lookupOne(engine: BrainEngine, sourceId: string, name: string, sc
     for (const s of await overlaidBoundedRows(engine, sib)) bodies.set(s.slug, s.compiled_truth);
   }
   return {
-    name, found: true, slug: row.slug, title: row.title ?? row.slug, type: row.type ?? null, aka, lead: pageLead(bodies.get(row.slug) ?? null),
+    name, found: true, source_id: sourceId, slug: row.slug, title: row.title ?? row.slug, type: row.type ?? null, aka, lead: pageLead(bodies.get(row.slug) ?? null),
     ...(siblingPages.length ? { siblings: siblingPages.map(p => ({ slug: p.slug, title: p.title, type: p.type, aka: p.aka, lead: pageLead(bodies.get(p.slug) ?? null) })) } : {}),
   };
 }

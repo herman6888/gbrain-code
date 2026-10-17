@@ -85,7 +85,7 @@ describe('in-pass governor over the real head read (engineStallProbe)', () => {
   }, 120_000);
   afterAll(async () => { for (const [kind, engine] of engines) if (kind === 'pglite') await engine.disconnect(); await closePostgres?.(); });
 
-  test('a running request stamped publishing for 10 minutes stops publication_overdue naming it; with no request left the stop is no_admission', async () => {
+  test('a running request stamped publishing for 10 minutes stops publication_overdue naming it; with no request left the stop is no_progress (#6712 PR 2 retired no_admission)', async () => {
     for (const [, engine] of engines) {
       const id = `gov-${randomUUID().slice(0, 8)}`;
       await engine.executeRaw("INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,'{}')", [id, `/tmp/${id}`]);
@@ -106,7 +106,7 @@ describe('in-pass governor over the real head read (engineStallProbe)', () => {
       expect(hung.drain!.stall!.stalled_seconds).toBeGreaterThanOrEqual(599);
       await engine.executeRaw('DELETE FROM persistence_requests WHERE id=$1::uuid', [row!.id]);
       const idle = await runDrain({ governMs: 10, noProgressMs: 80, publicationCeilingMs: 100, probe, pass: () => new Promise<SyncResult>(() => undefined) });
-      expect(idle.drain).toMatchObject({ outcome: 'blocked', stop_reason: 'drain_stalled', stall: { cause: 'no_admission', head_request_id: null } });
+      expect(idle.drain).toMatchObject({ outcome: 'blocked', stop_reason: 'drain_stalled', stall: { cause: 'no_progress', head_request_id: null } });
     }
   }, 60_000);
 });

@@ -102,12 +102,12 @@ export async function upsertChunksOnce(
       gatewayModel = gw.getEmbeddingModelProvenance();
     } catch {}
     const writesRows = chunks.length > 0;
-    const columnRows = writesRows && !opts?.embeddingColumn ? memo('config:embedding-columns', async () =>
-      (await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')`)).rows)
+    // #6712 L6: the column and model keys are one statement (a round trip where pipelining is off).
+    const configRows = writesRows && (!opts?.embeddingColumn || !gatewayModel) ? memo('config:embedding-write', async () =>
+      (await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns', 'embedding_model')`)).rows)
       .then(rows => rows, () => null) : undefined;
-    const modelRows = writesRows && !gatewayModel ? memo('config:embedding-model', async () =>
-      (await exec.run<{ value?: string }>(sqlFragment`SELECT value FROM config WHERE key = 'embedding_model'`)).rows)
-      .then(rows => rows, () => null) : undefined;
+    const columnRows = opts?.embeddingColumn ? undefined : configRows;
+    const modelRows = gatewayModel ? undefined : configRows?.then(rows => rows && rows.filter(row => row.key === 'embedding_model'));
     const sealed = seal !== undefined && opts?.pageId !== undefined && chunks.length > 0 ? opts.pageId : undefined;
     const sealPage = () => exec.run<{ id: number }>(sqlFragment`UPDATE pages SET chunker_version = ${seal} WHERE slug = ${slug} AND source_id = ${sourceId} RETURNING id`);
     const pages = sealed !== undefined ? [{ id: sealed }] : (await (seal === undefined

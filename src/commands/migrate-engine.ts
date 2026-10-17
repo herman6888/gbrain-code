@@ -547,6 +547,7 @@ export async function copyPageToTarget(
       chunk_text: c.chunk_text,
       chunk_source: c.chunk_source,
       embedding: c.embedding || undefined,
+      embedding_image: c.embedding_image || undefined,
       model: c.model,
       token_count: c.token_count || undefined,
     })), sourceOpts);

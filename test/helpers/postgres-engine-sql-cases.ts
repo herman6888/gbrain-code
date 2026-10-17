@@ -373,8 +373,8 @@ export const SQL_CASES: SqlCase[] = [
     ['sourceId', (e) => e.revertToVersion(SLUG, 3, { sourceId: SRC })],
   ]),
   ...variants('updateSlug', [
-    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]]]],
-    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2')],
+    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]], [/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
+    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2'), [[/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
   ]),
   ...variants('resolveSlugWithAlias', [['default', (e) => e.resolveSlugWithAlias('alice', SRC)]]),
   ...variants('resolveSlugWithAliasDetailed', [

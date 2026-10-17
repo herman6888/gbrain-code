@@ -15,6 +15,7 @@ import { opTransport, paramUse } from './op-fix.ts';
 import {
   readPolicyOpts,
   readHolders,
+  sourceScopeOpts,
   thinkSourceScopeOpts,
   enforceClientSlugFence,
   validatePageSlug,
@@ -146,8 +147,23 @@ const takes_scorecard: Operation = {
     domain_prefix: { type: 'string', description: 'Slug prefix (e.g. companies/) to scope the scorecard' },
     since: { type: 'string', description: 'Window start (YYYY-MM-DD)' },
     until: { type: 'string', description: 'Window end (YYYY-MM-DD)' },
+    group_by: { type: 'string', enum: ['holder', 'source'], description: 'Trusted local CLI only: per-group journal statistics' },
+    min_n: { type: 'number', description: 'Trusted local CLI only: groups with fewer resolved predictions are flagged low_n (default 10)' },
   },
   handler: async (ctx, p) => {
+    // W7: the grouped journal statistics are private. A remote caller that
+    // asks for them is refused, never silently given today's output.
+    const grouped = p.group_by !== undefined || p.min_n !== undefined;
+    if (grouped && ctx.remote !== false) {
+      throw opError('scorecard_group_by_local_only', 'takes_scorecard: group_by and min_n read the private forecast journal and run only from the trusted local CLI.',
+        'Omit group_by and min_n, or ask the brain owner to run gbrain takes scorecard --group-by on the brain host.');
+    }
+    if (grouped && p.group_by !== 'holder' && p.group_by !== 'source') {
+      throw opError('invalid_params', 'takes_scorecard: group_by must be holder or source.', 'Pass group_by: "holder" or "source".');
+    }
+    if (p.min_n !== undefined && !(Number.isSafeInteger(p.min_n) && (p.min_n as number) >= 1)) {
+      throw opError('invalid_params', 'takes_scorecard: min_n must be a positive integer.', 'Pass min_n as a whole number, e.g. 10.');
+    }
     const card = await ctx.engine.getScorecard(
       {
         ...await readPolicyOpts(ctx),
@@ -164,7 +180,20 @@ const takes_scorecard: Operation = {
     // ground truth. Op-layer SQL (plain executeRaw both engines share) —
     // no engine method added, parity untouched. Unfiltered by the window/
     // domain params (coarse by design; documented).
-    return { ...card, mcp_resolved: await countMcpResolved(ctx) };
+    const base = { ...card, mcp_resolved: await countMcpResolved(ctx) };
+    if (!grouped) return base;
+    const { readForecastJournal, scorecardGroups } = await import('../forecast-journal.ts');
+    const scope = sourceScopeOpts(ctx);
+    const query = {
+      ...(scope.sourceIds?.length ? { sourceIds: scope.sourceIds } : scope.sourceId ? { sourceId: scope.sourceId } : {}),
+      ...(p.holder ? { holder: p.holder as string } : {}), ...(p.domain_prefix ? { about: p.domain_prefix as string } : {}),
+      ...(p.since ? { since: p.since as string } : {}), ...(p.until ? { until: p.until as string } : {}),
+    };
+    return {
+      ...base,
+      groups: await scorecardGroups(ctx.engine, { ...query, groupBy: p.group_by as 'holder' | 'source', ...(p.min_n !== undefined ? { minN: p.min_n as number } : {}) }),
+      journal: (await readForecastJournal(ctx.engine, { ...query, limit: 0 })).totals,
+    };
   },
   cliHints: { name: 'takes-scorecard' },
 };

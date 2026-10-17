@@ -43,7 +43,7 @@ export async function graduationBlockers(source: BrainEngine, hostId: string): P
       blockers.push({ kind: 'foreign_host_binding', id: r.request_id, detail: `${detail} is bound to a worktree owned by host ${r.owner_host_id}`,
         argv: ['gbrain', 'sources', 'writer', 'transfer', 'prepare', r.source_id], needsUser: true });
     } else if (r.recovering || r.state === 'recovering') {
-      blockers.push({ kind: 'request', id: r.request_id, detail, argv: ['gbrain', 'sync', '--source', r.source_id, '--no-pull', '--retry-failed'], needsUser: false });
+      blockers.push({ kind: 'request', id: r.request_id, detail, argv: ['gbrain', 'sync', '--source', r.source_id, '--no-pull'], needsUser: false });
     } else {
       blockers.push({ kind: 'request', id: r.request_id, detail, needsUser: false });
     }

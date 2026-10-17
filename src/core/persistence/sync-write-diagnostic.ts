@@ -14,6 +14,7 @@ import { writeFailureDiagnostic } from './verb-errors.ts';
 import { checkpointRetryCommand } from './checkpoint-validation.ts';
 import { readSyncFile } from './sync-discovery.ts';
 import { sha256 } from './digest.ts';
+import { classifyTerminal } from './terminal-classify.ts';
 
 export function managedSyncWriteDiagnostic(cursor: { sourceId: string; root: string; processingOptions?: SyncProcessingOptions; syncOptions: SyncCursorOptions | null },
   pending: { slug: string; intent: SyncIntent }, row: WriteRequest): ManagedSyncWriteDiagnostic {
@@ -26,12 +27,17 @@ export function managedSyncWriteDiagnostic(cursor: { sourceId: string; root: str
     reason: blockedReason, message: 'The write is accepted but not committed; the sync checkpoint has not advanced.',
     suggestion: 'Re-run the same sync options to resume this request. Do not submit a replacement request or skip the pending write.',
   };
+  // #6712 PR 2 (L5): a terminal receipt's diagnosis category, and the public one beside it, from the one classifier.
+  const verdict = terminal ? classifyTerminal({ request_id: row.request_id, source_id: row.source_id, slug: row.slug, operation: row.operation, state: row.state, error_code: row.error_code,
+    error_detail: row.error_detail ?? null, recovery: row.recovery, blocked_reason: row.blocked_reason, compacted: row.compacted, publication_started: row.publication_started,
+    error_message: row.error_message, intent_kind: typeof row.intent?.kind === 'string' ? row.intent.kind : null }) : null;
   const diagnostic: ManagedSyncWriteDiagnostic = { source_id: cursor.sourceId, slug: pending.slug,
-    path: pending.intent.path, write_error: code, ...detail, write_request: publicWriteReceipt(receiptFor(row)) };
-  // #6194: an import that lost to a database write the hold could not prove; --retry-failed re-imports the Git version over it.
+    path: pending.intent.path, write_error: code, ...detail, ...(verdict ? { category: verdict.category, public_category: verdict.public_category } : {}),
+    write_request: publicWriteReceipt(receiptFor(row)) };
+  // #6194: an import that lost to a database write the hold could not prove; the retry re-imports the Git version unless discovery's drift guard holds it.
   if (terminal && code === 'revision_conflict' && pending.intent.kind === 'managed_sync_import') diagnostic.suggestion = `The page changed in the database after this import was frozen. `
     + `Before retrying, compare the file and the page with gbrain sources reconcile ${cursor.sourceId} ${pending.slug} --preview (it writes nothing): a retry re-imports the Git version over the database one. ${diagnostic.suggestion}`;
-  if (terminal) diagnostic.suggestion += ` After repair, run ${checkpointRetryCommand({ sourceId: cursor.sourceId, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? null, repoPath: pending.intent.repoPath })} to start a new request. Without --retry-failed, the frozen terminal request returns the same outcome. Skipping failures cannot bypass a managed write.`;
+  if (terminal) diagnostic.suggestion += ` After repair, run ${checkpointRetryCommand({ sourceId: cursor.sourceId, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? null, repoPath: pending.intent.repoPath })} to retry it under a new request. Skipping failures cannot bypass a managed write.`;
   if (diagnostic.reason === 'pinned_git_worktree_conflict' && pending.intent.path && pending.intent.content !== null) {
     try {
       const bytes = readSyncFile(cursor.root, pending.intent.path);

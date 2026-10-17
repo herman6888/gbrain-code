@@ -7,6 +7,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import type { GBrainConfig } from '../core/config.ts';
 import { RELINK_DEFAULT_LIMIT, RELINK_DEFAULT_MAX_USD, runFactsRelink, type RelinkOptions, type RelinkReport } from '../core/facts/relink.ts';
 import { RELINK_REASONS, type RelinkReason } from '../core/facts/relink-reasons.ts';
+import { CONVERSATION_RELINK_PAGES, runConversationRelink, type ConversationRelinkReport } from '../core/facts/conversation-relink.ts';
 
 export function factsHelpText(): string {
   return `Usage: gbrain facts <subcommand>
@@ -28,6 +29,14 @@ gbrain facts relink [flags]
   --no-conflict-queue    Do not queue linked facts for the conflict sweep
   --examples <n>         Example facts per outcome (default 3)
   --json                 Machine-readable report (schema_version ${1})
+
+gbrain facts relink --conversation [--source <id>] [--slugs <a,b>] [--dry-run] [--json]
+  Link the conversation extractor's facts saved without an entity (plain
+  relink never examines them), free only: a fact naming exactly one entity
+  page in full is linked, one write per page. Without --slugs, the
+  ${CONVERSATION_RELINK_PAGES} pages with the most untried unlinked facts. Facts it cannot
+  resolve are recorded, and the report prints the paid re-extraction for
+  their pages.
 
 Relink never creates pages and never supersedes a fact. Exact duplicates are
 retired (expired, kept in history). Linked facts are queued for the System One
@@ -124,6 +133,41 @@ export function formatRelinkReport(report: RelinkReport, args: string[]): string
   return lines.join('\n');
 }
 
+export function formatConversationRelinkReport(r: ConversationRelinkReport, args: string[]): string {
+  const lines = [`${r.dry_run ? 'DRY RUN: would link' : 'Linked'} ${r.linked} conversation fact(s) on ${r.pages.length} page(s) in source ${r.source_id}`
+    + ` (mention tier, no model call); ${r.unresolved} unresolved${r.changed ? `; ${r.changed} changed before the write (run again)` : ''}.`];
+  for (const p of r.pages) lines.push(`  ${p.slug}: ${p.linked} linked, ${p.unresolved} unresolved`);
+  if (r.dry_run && r.linked) lines.push(`Apply with:\n  gbrain facts relink ${args.filter(a => a !== '--dry-run').join(' ')}`);
+  if (r.reextract_slugs.length) {
+    const base = `gbrain extract-conversation-facts --source-id ${r.source_id} --slugs ${r.reextract_slugs.join(',')} --force`;
+    lines.push(`No entity could be proven for ${r.unresolved} fact(s). Re-extraction calls the fact model again (paid); preview, then run with the amount the user approves:\n  ${base} --dry-run\n  ${base} --max-cost-usd <N>`);
+  }
+  return lines.join('\n');
+}
+
+/** `--conversation` flags: --source, --slugs, --dry-run, --json; anything else is a usage error. */
+async function runConversation(engine: BrainEngine, args: string[], config: GBrainConfig, sourceId: string): Promise<number> {
+  const opts: { sourceId: string; slugs?: string[]; dryRun?: boolean } = { sourceId };
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const v = args[i + 1];
+    if (a === '--conversation') continue;
+    if (a === '--json') json = true;
+    else if (a === '--dry-run') opts.dryRun = true;
+    else if ((a === '--source' || a === '--slugs') && v !== undefined && !v.startsWith('--')) {
+      if (a === '--source') opts.sourceId = v; else opts.slugs = v.split(',').map(s => s.trim()).filter(Boolean);
+      i++;
+    } else {
+      console.error(`gbrain facts relink --conversation: ${a === '--source' || a === '--slugs' ? `${a} requires a value` : `unknown flag ${a} (takes --source, --slugs, --dry-run, --json)`}`);
+      return 1;
+    }
+  }
+  const report = await runConversationRelink(engine, config, opts);
+  console.log(json ? JSON.stringify(report, null, 2) : formatConversationRelinkReport(report, args));
+  return 0;
+}
+
 /** Exit code: 0 for complete and partial runs (limit or budget), 1 for usage errors. */
 export async function runFactsCommand(engine: BrainEngine, args: string[], config: GBrainConfig, sourceId: string): Promise<number> {
   const sub = args[0];
@@ -140,6 +184,7 @@ export async function runFactsCommand(engine: BrainEngine, args: string[], confi
     console.log(factsHelpText());
     return 0;
   }
+  if (rest.includes('--conversation')) return runConversation(engine, rest, config, sourceId);
   const parsed = parseRelinkArgs(rest, sourceId);
   if (parsed.error) {
     console.error(`gbrain facts relink: ${parsed.error}`);

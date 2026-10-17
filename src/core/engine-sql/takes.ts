@@ -61,11 +61,14 @@ async function _addTakesBatchOnce(exec: SqlExecutor, rowsIn: TakeBatchInput[]): 
     // Weight clamp/round + NUL-stripping live in buildTakeRows (shared w/ PGLite).
     // NOTE: ON CONFLICT here is DO UPDATE (not DO NOTHING) — an intra-batch
     // duplicate (page_id, row_num) errors, identical to the pre-#1861 unnest path.
+    // A stored row that already holds the values is left unwritten (no trigger,
+    // no updated_at bump) and still counts: every row is inserted, updated or
+    // already current, else the statement throws.
     const { rows, weightClamped } = buildTakeRows(rowsIn);
     if (weightClamped > 0) {
       process.stderr.write(`[takes] TAKES_WEIGHT_CLAMPED: ${weightClamped} row(s) had weight outside [0,1]; clamped\n`);
     }
-    const result = await executeRawJsonb(
+    await executeRawJsonb(
       exec,
       `INSERT INTO takes (page_id, row_num, claim, kind, holder, weight, since_date, until_date, source, superseded_by, active)
        SELECT v.page_id, v.row_num, v.claim, v.kind, v.holder, v.weight,
@@ -89,11 +92,13 @@ async function _addTakesBatchOnce(exec: SqlExecutor, rowsIn: TakeBatchInput[]): 
          superseded_by = EXCLUDED.superseded_by,
          active        = EXCLUDED.active,
          updated_at    = now()
-       RETURNING 1`,
+       WHERE (takes.claim, takes.kind, takes.holder, takes.weight, takes.since_date, takes.until_date, takes.source, takes.superseded_by, takes.active)
+         IS DISTINCT FROM (EXCLUDED.claim, EXCLUDED.kind, EXCLUDED.holder, EXCLUDED.weight, EXCLUDED.since_date, EXCLUDED.until_date,
+           EXCLUDED.source, EXCLUDED.superseded_by, EXCLUDED.active)`,
       [],
       [{ rows }],
     );
-    return result.length;
+    return rows.length;
   }
 
   /**

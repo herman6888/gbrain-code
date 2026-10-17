@@ -86,7 +86,7 @@ function previewCommand(scope: RepairScope): string {
 /** The command that produces an owner-internal write again, from current content. */
 function producerCommand(producer: string, sourceId: string): string {
   const parts = producer.split(':');
-  if (parts.some(part => part.startsWith('managed_sync') || part === 'managed_file_import')) return `gbrain sync --source ${sourceId} --no-pull --retry-failed --json`;
+  if (parts.some(part => part.startsWith('managed_sync') || part === 'managed_file_import')) return `gbrain sync --source ${sourceId} --no-pull --json`;
   if (parts.includes('canonical_reconcile')) return `gbrain sources reconcile ${sourceId} --audit`;
   if (parts.includes('managed_file_repair')) return `gbrain repair frontmatter --source ${sourceId} (a frontmatter repair) or gbrain repair fences --source ${sourceId} (a fence repair)`;
   if (parts.includes('relink_facts')) return `gbrain facts relink --source ${sourceId} --dry-run`;

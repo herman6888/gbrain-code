@@ -198,7 +198,7 @@ const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 
 export interface PageBatchMember { id: string; index: number; size: number; requestId: string; repeats?: number[] }
 
 export async function submitPageMutation(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection }): Promise<Record<string, unknown>> {
+  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection; databaseOnly?: 'overwrite_restore' }): Promise<Record<string, unknown>> {
   assertPersistenceAccepting(ctx.engine);
   // #6007: wait_ms is a reply deadline from arrival, never part of the write's identity.
   const arrived = performance.now();
@@ -234,7 +234,9 @@ export async function submitPageMutation(ctx: OperationContext,
  * the admission to submit. `put_pages` admits several of these together.
  */
 export async function preparePageAdmission(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection }
+  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection;
+    /** #6712 `repair overwritten-edits`: publish to the database only, so the restore never rewrites the committed file. */
+    databaseOnly?: 'overwrite_restore' }
 ): Promise<{ prior: WriteRequest; admission?: undefined; typeWarning?: undefined; slugAdvisory?: undefined } | { prior?: undefined; admission: WriteAdmission; typeWarning: PageTypeWarning | null; slugAdvisory: string | null }> {
   if (input.operation === 'put_page' && ['kind', 'preview', 'backup_reference'].some(key => Object.hasOwn(input.params, key))) {
     if (ctx.remote !== false || input.managedFileImport !== true || !OWNER_FILE_INTENTS.has(String(input.params.kind)) ||
@@ -355,9 +357,10 @@ export async function preparePageAdmission(ctx: OperationContext,
   let binding = boundAtStart;
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
   const configuredWriteThrough = !/^(false|0|off|no)$/i.test(writeThroughSetting ?? 'true');
-  const writeThrough = configuredWriteThrough && !sandbox;
+  const writeThrough = configuredWriteThrough && !sandbox && !input.databaseOnly;
   const root = source.local_path || repoPath;
   if (sandbox) authority.databaseOnlyReason = 'subagent_sandbox';
+  else if (input.databaseOnly) authority.databaseOnlyReason = input.databaseOnly;
   else if (!configuredWriteThrough) authority.databaseOnlyReason = 'disabled_by_config';
   else if (!root && !binding) authority.databaseOnlyReason = 'no_repo_configured';
   if (p.local_dir !== undefined) {

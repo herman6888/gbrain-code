@@ -132,6 +132,7 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'sync',
   'fence_repair',                // #6188 — fence repair (global maintenance lane)
   'content_repair',              // #6377 — the rest of the content-repair lane (slug conflicts)
+  'unindexed_files',             // #6865 — committed files with no page and no hold, scheduled for a re-screen
   'synthesize',
   'extract',
   'extract_facts',               // v0.32.2 — reconcile fence → DB facts index

@@ -75,6 +75,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
   'foreign_ownership_marker',
+  'coordination_lock_location',
   'safe_index_pending',
   'self_capture',
   'brain_score',
@@ -156,6 +157,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_ratio',
   'oversized_pages',
   'parked_effects',
+  // #6741: managed purges parked after repeated failures (doctor/checks/purge-parks.ts).
+  'purge_parked_pages',
   'partial_embedding',
   'pglite_scratch_probe',
   'quarantined_pages',
@@ -176,6 +179,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
   'managed_sync_backlog',
   'sync_freshness',
+  // #6858 ask 6: p95 commit→searchable of managed sources over 24 h (doctor/checks/managed-sync-latency.ts).
+  'managed_sync_latency',
   // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
   'git_convergence',
   // #5186: an ownership marker committed to a source checkout's Git index.
@@ -196,8 +201,14 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'undeclared_db_only_pages',
   // #6696 B5: live pages whose canonical file is missing on the owner host (doctor/checks/ghost-pages.ts).
   'ghost_pages',
+  // #6729: inexact renames whose identity sync did not keep, until the pair gets a disposition (doctor/checks/rename-identity-downgrades.ts).
+  'rename_identity_downgrades',
   // #6609: live pages of a classic checkout whose recorded file a full sync would not find (doctor/checks/missing-recorded-files.ts).
   'missing_recorded_files',
+  // #6865: committed files of a managed Git source with no page and no hold, from the stored detector result (doctor/checks/unindexed-files.ts).
+  'unindexed_files',
+  // #6712: live pages whose database-only edit an incremental sync overwrote without a hold (doctor/checks/overwritten-edits.ts).
+  'sync_overwritten_db_edits',
   'unified_multimodal_coverage',
   'unverified_extractions',
   'voice_gate_health',
@@ -274,6 +285,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'persistence_capacity',
   'persistence_compaction',
+  // #6712 PR 2: the managed-sync soak counters (interventions, content decisions), informational.
+  'sync_soak_counters',
   'persistence_counter_drift',
   'worktree_refresh_stuck',
   'managed_guard_schema_drift',
@@ -287,6 +300,10 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stale_frontmatter_keys',
   'maintenance_write_drift',
   'managed_sync_not_moving',
+  // #6858: a managed sync run stopped on a page that did not commit, failed past an hour (doctor/checks/managed-sync-blocked.ts).
+  'managed_sync_blocked',
+  // #6712 PR 4a: the read-only convergence shadow's counts (doctor/checks/managed-sync-convergence.ts).
+  'managed_sync_convergence',
   'persistence_session_timeouts',
   // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
   'two_consumers_on_host',
@@ -378,6 +395,8 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'schema_pack_source_drift',
   'schema_version',
   'slug_fallback_audit',
+  // #6712 PR 2: retired sync.* keys stored on the brain and no longer applied.
+  'sync_config_keys',
   'timeline_dedup_index',
   'type_proliferation',
   'upgrade_errors',

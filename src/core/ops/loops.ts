@@ -540,7 +540,9 @@ const open_loops: Operation = {
 
     const backlinks = new Map<string, number>();
     try {
-      const slugs = [...byKey.values()]
+      // Backlink counts span every source, so they rank trusted-local reads
+      // only: an untrusted caller's order must not depend on pages outside its grant.
+      const slugs = !trusted ? [] : [...byKey.values()]
         .map((g) => g.counterparty_slug)
         .filter((s): s is string => s !== null);
       if (slugs.length > 0) {

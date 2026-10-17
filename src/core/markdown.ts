@@ -330,6 +330,12 @@ export function parseMarkdown(
   };
 }
 
+/** #6729: parseMarkdown's title from the content alone (frontmatter, first H1, embedded fence), with no filename fallback; '' when none. */
+export function explicitMarkdownTitle(content: string): string {
+  const head = parseMarkdownHead(content);
+  return coerceFrontmatterString(head.frontmatter.title).trim() || inferTitleFromBody(head.body) || inferTitleFromEmbeddedFrontmatter(head.body);
+}
+
 /**
  * What parseMarkdown reads before the body split. `lifted` and `safeContent` are the strings the frontmatter
  * readers saw; page-body/body-scan.ts checks that a bounded file head reads the same as the whole file.

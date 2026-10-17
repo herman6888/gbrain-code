@@ -1476,6 +1476,8 @@ CREATE INDEX IF NOT EXISTS persistence_requests_compactable
   ON persistence_requests(completed_at) WHERE recovery IS NULL AND NOT compacted AND state IN ('committed','conflict','failed','cancelled');
 CREATE INDEX IF NOT EXISTS persistence_requests_slug_intent
   ON persistence_requests(source_id,slug,sequence) WHERE intent IS NOT NULL AND NOT compacted;
+CREATE INDEX IF NOT EXISTS persistence_requests_request_id
+  ON persistence_requests(source_id,request_id);
 CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC);
 CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,

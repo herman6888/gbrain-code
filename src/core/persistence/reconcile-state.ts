@@ -1,5 +1,5 @@
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { loadConfig, loadConfigWithEngine } from '../config.ts';
 import { loadOperatorLiterals } from '../content-sanity-literals.ts';
@@ -10,7 +10,7 @@ import { readFix } from '../ops/op-fix.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
-import { findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
+import { absentCanonicalPath, findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
 import { sharedOriginExit } from './sync-origin.ts';
 export { fileClaimCandidatesQuery } from './file-claims.ts';
 import { localHostId } from './identity.ts';
@@ -23,6 +23,7 @@ import type { ParsedPage } from '../import-file.ts';
 import type { AutoDecision } from './reconcile-additive.ts';
 import { publishesDatabaseOnly, readCanonicalAsImported } from './page-prepare.ts';
 import { isMirrorOnlyPage } from './mirror-read-only.ts';
+import { hardenedGitSync } from '../hardened-git.ts';
 
 export interface ReconcilePins {
   brain_id: string; source_id: string; source_incarnation: string; slug: string; page_id: number;
@@ -68,6 +69,59 @@ export async function reconcilePolicyDigest(engine: BrainEngine, sourceId: strin
   const source = row ? { ...row, config: sourceConfig } : row;
   return digest({ version: 1, config, source, literals: loadOperatorLiterals(), disabled: process.env.GBRAIN_NO_SANITY ?? null });
 }
+/**
+ * #6712 wave: the `raw_file_hash` pin of a preview that observed the canonical file absent (`readReconcileState` with
+ * `fileGone`). No file's sha256 is all zeros, so a file that reappears before apply never matches it.
+ */
+export const ABSENT_FILE_HASH = '0'.repeat(64);
+/** The read options a stored preview implies: its slug-path adoption, and whether it observed the file absent. */
+export function reconcileReadOptions(artifact: Pick<ReconcileArtifact, 'preimages' | 'preconditions'>): { adoptSlugPath: boolean; fileGone: boolean } {
+  return { adoptSlugPath: reconcilePreviewAdopts(artifact), fileGone: artifact.preconditions.raw_file_hash === ABSENT_FILE_HASH };
+}
+/**
+ * #6712 wave: where a missing canonical file's deletion stands in Git. `in_head`: still committed at HEAD (deleted only in
+ * the worktree, staged or not); `gone`: not in HEAD's tree, or the checkout has no commit or no Git; `unknown`: Git
+ * could not say. Filter-free plumbing only, each call bounded (hardened-git.ts).
+ */
+export function canonicalDeletionState(root: string, path: string): 'in_head' | 'gone' | 'unknown' {
+  const limits = { timeoutMs: 10_000, maxBytes: 1024 * 1024 };
+  const top = hardenedGitSync(root, ['rev-parse', '--show-toplevel'], limits);
+  if (!top.ok) return insideGitCheckout(root) ? 'unknown' : 'gone';
+  const head = hardenedGitSync(root, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], limits);
+  if (!head.ok) return head.reason === 'exit' && head.status === 1 ? 'gone' : 'unknown';
+  let repoPath: string;
+  try { repoPath = relative(realpathSync(top.stdout.toString('utf8').trim()), absentCanonicalPath(path)).split(sep).join('/'); } catch { return 'unknown'; }
+  if (!repoPath || repoPath.startsWith('..')) return 'unknown';
+  const listed = hardenedGitSync(root, ['ls-tree', '-z', '--full-tree', 'HEAD', '--', repoPath], limits);
+  if (!listed.ok) return 'unknown';
+  return listed.stdout.toString('utf8').split('\0').some(entry => entry.split('\t')[1] === repoPath) ? 'in_head' : 'gone';
+}
+/** Whether `root` or an ancestor holds a `.git` entry (a checkout Git should answer for). */
+function insideGitCheckout(root: string): boolean {
+  for (let dir = root; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, '.git'))) return true;
+    if (dirname(dir) === dir) return false;
+  }
+}
+/**
+ * #6712 wave: the route for a page whose canonical file `rel` (source-relative) is missing, by where its deletion stands
+ * in Git: still committed at HEAD goes to committing the deletion or `repair ghost-pages`; gone from HEAD goes to
+ * `repair file-drift`.
+ */
+export function missingFileRoute(sourceId: string, slug: string, rel: string, state: ReturnType<typeof canonicalDeletionState>): string {
+  const fileDrift = `gbrain repair file-drift --source ${sourceId} --slug ${slug} --prefer database`;
+  const ghosts = `gbrain repair ghost-pages --source ${sourceId}`;
+  if (state === 'in_head') return `${rel} is deleted in the worktree but still committed, so this is not file drift: commit the deletion (sync then imports it), or remove the page with ${ghosts}; to keep the page, restore the file from Git (git checkout -- ${rel}) and sync.`;
+  if (state === 'gone') return `${rel} is gone from the last commit. Preview the resolution with ${fileDrift} (recreates the file from the page) or with --prefer file (soft-deletes the page), then apply the printed command after the user decides.`;
+  return `Git could not say whether the deletion of ${rel} is committed. If it is (gone from HEAD), preview ${fileDrift} or --prefer file; if it is deleted only in the worktree, commit the deletion or remove the page with ${ghosts}.`;
+}
+/** The refusal for a canonical file that is gone, routed by where its deletion stands in Git (#6712 wave). */
+function missingCanonicalFile(sourceId: string, slug: string, root: string, path: string): OperationError {
+  const rel = relative(root, path).split(sep).join('/');
+  return opError('source_changed', 'The recorded canonical file is missing.',
+    `Nothing changed. The canonical file of ${slug} in '${sourceId}' is missing. ${missingFileRoute(sourceId, slug, rel, canonicalDeletionState(root, path))}`,
+    { detail: 'canonical_file_missing' });
+}
 export function staleReconcile(what: string): never {
   throw new OperationError('source_changed', `Reconciliation preview is stale: ${what}.`, 'Generate a fresh preview; submit a corrected intent with a new request ID.');
 }
@@ -88,7 +142,7 @@ async function assertSoleFileClaim(engine: BrainEngine, target: FileClaimTarget)
  * slug, a never-filed derive-phase page) or a mirror-only page never adopts one.
  */
 export async function readReconcileState(engine: BrainEngine, sourceId: string, slug: string, assessmentAt = new Date().toISOString(),
-  opts: { adoptSlugPath?: boolean } = {}): Promise<ReconcileState> {
+  opts: { adoptSlugPath?: boolean; fileGone?: boolean } = {}): Promise<ReconcileState> {
   const binding = await getWorktreeBinding(engine, sourceId);
   if (!binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active') {
     throw new OperationError('owner_unavailable', 'Reconciliation requires the existing active owner on this host.', 'Run repair on the current owner; repair never claims or activates a source.');
@@ -121,9 +175,17 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     const info = lstatSync(path);
     if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw new Error('not an ordinary file');
     size = info.size;
-  } catch {
-    throw opError('source_changed', 'The recorded canonical file is missing or is not an ordinary file; repair does not restore files.',
-      `Nothing changed. Restore the canonical file of ${slug} in '${sourceId}' as a regular file (for example from git), then preview the page again.`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw opError('source_changed', 'The recorded canonical file is not an ordinary file; repair does not replace it.',
+      `Nothing changed. Make the canonical file of ${slug} in '${sourceId}' a regular file (not a symlink, directory or hard link), then preview the page again.`);
+    if (!opts.fileGone || origin !== 'recorded') throw missingCanonicalFile(sourceId, slug, root, path);
+    // #6712 wave: `repair file-drift --prefer database` recreates the file from the page; the preview pins the observed absence.
+    const canonicalPath = absentCanonicalPath(path);
+    await assertSoleFileClaim(engine, { sourceId, slug, pageId: snapshot.page.id, root, mode, path, canonicalPath,
+      recordedUri: recorded ? snapshot.page.source_uri ?? null : null, absent: true });
+    return { binding, root, path, importPath: scannerSourcePath(root, path, mode), raw: Buffer.alloc(0), snapshot, storedPage,
+      file: reconcileCanonical(snapshot.page, snapshot.tags), origin, originSourcePath: null,
+      pins: await reconcilePins(engine, { brain_id: brain.brain_id, sourceId, binding, snapshot, slug, assessmentAt, root, path, canonicalPath, rawFileHash: ABSENT_FILE_HASH }) };
   }
   const { readJournalLimits } = await import('./limits.ts');
   const limits = await readJournalLimits(engine);
@@ -159,11 +221,16 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     throw opError('invalid_params', 'Canonical file metadata cannot be parsed losslessly; repair its syntax before previewing.',
       `Nothing changed. Fix the frontmatter of the canonical file of ${slug} in '${sourceId}' (close the --- block, keep its slug), then preview the page again.`);
   }
-  const pins: ReconcilePins = { brain_id: brain.brain_id, source_id: sourceId, source_incarnation: snapshot.sourceIncarnation, slug,
-    page_id: snapshot.page.id, worktree_id: binding.worktree_id, binding_digest: digest({ binding, root, path: canonicalPath }), owner_epoch: String(binding.owner_epoch),
-    revision: snapshot.revision, raw_file_hash: sha256(raw), relative_path: relative(root, path),
-    policy_digest: await reconcilePolicyDigest(engine, sourceId), withdrawals_digest: digest({ withdrawals: snapshot.withdrawals, global_purges: snapshot.globalPurges ?? null }), assessment_at: assessmentAt };
+  const pins = await reconcilePins(engine, { brain_id: brain.brain_id, sourceId, binding, snapshot, slug, assessmentAt, root, path, canonicalPath, rawFileHash: sha256(raw) });
   return { binding, root, path, importPath, raw, snapshot, storedPage, file: reconcileCanonical(parsed, parsed.tags), pins, origin, originSourcePath: derived?.sourcePath ?? null };
+}
+async function reconcilePins(engine: BrainEngine, input: { brain_id: string; sourceId: string; binding: WorktreeBinding; snapshot: PageSnapshot; slug: string; assessmentAt: string;
+  root: string; path: string; canonicalPath: string; rawFileHash: string }): Promise<ReconcilePins> {
+  const { binding, snapshot, root, path } = input;
+  return { brain_id: input.brain_id, source_id: input.sourceId, source_incarnation: snapshot.sourceIncarnation, slug: input.slug,
+    page_id: snapshot.page.id, worktree_id: binding.worktree_id, binding_digest: digest({ binding, root, path: input.canonicalPath }), owner_epoch: String(binding.owner_epoch),
+    revision: snapshot.revision, raw_file_hash: input.rawFileHash, relative_path: relative(root, path),
+    policy_digest: await reconcilePolicyDigest(engine, input.sourceId), withdrawals_digest: digest({ withdrawals: snapshot.withdrawals, global_purges: snapshot.globalPurges ?? null }), assessment_at: input.assessmentAt };
 }
 /** #6394: a preview made with --adopt-slug-path recorded a page with no origin; apply and publication adopt the same pinned file. */
 export function reconcilePreviewAdopts(artifact: Pick<ReconcileArtifact, 'preimages'>): boolean {

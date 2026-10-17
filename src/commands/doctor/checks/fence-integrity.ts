@@ -34,6 +34,7 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { agentFix, doctorVerify } from '../check-fix.ts';
+import { scanDeadline } from '../budget.ts';
 import { auditUnadoptableFacts, planUnfencedFacts, unboundRefusedSentence, type UnadoptableFactRecord, type UnfencedFactsOutcome } from '../../../core/facts/unfenced-facts.ts';
 import { UNBOUND_SOURCE_DOCS, UNBOUND_WRITE_KEY } from '../../../core/persistence/unbound-source.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
@@ -141,10 +142,13 @@ function unrenderableSentence(found: Omit<UnrenderableLegacyFacts, 'unbound'>): 
     + (found.complete ? '' : ' The scan did not finish within its time budget, so more rows may be affected; run gbrain doctor --only fence_integrity again.');
 }
 
-/** The check's verdict after a bounded census scan (`sourceIds`: only those sources, for a scoped remote caller). */
-export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutMs?: number; now?: () => Date; sourceIds?: string[] } = {}): Promise<Omit<Check, 'name'>> {
+/**
+ * The check's verdict after a bounded census scan (`sourceIds`: only those sources, for a scoped remote caller).
+ * `deadlineAt` (wall clock): the doctor entry's deadline; both scans stop at it when it comes before their timeout.
+ */
+export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutMs?: number; now?: () => Date; sourceIds?: string[]; deadlineAt?: number } = {}): Promise<Omit<Check, 'name'>> {
   const now = opts.now ?? (() => new Date());
-  const timeoutMs = opts.timeoutMs ?? fenceScanTimeoutMs();
+  const timeoutMs = Math.max(0, Math.min(opts.timeoutMs ?? fenceScanTimeoutMs(), (opts.deadlineAt ?? Infinity) - Date.now()));
   const runs = await runFenceCensus(engine, { deadline: now().getTime() + timeoutMs, now, ...(opts.sourceIds ? { sourceIds: opts.sourceIds } : {}) });
   const census = await summarizeFenceCensus(engine, opts.sourceIds, runs);
   const from = new Date(now().getTime() - (TREND_DAYS - 1) * 86_400_000).toISOString().slice(0, 10);
@@ -159,7 +163,7 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
   // T2: legacy fence repairs written and imported but not committed yet (counts for a scoped remote caller, paths locally).
   const uncommitted = await readUncommittedFenceRepairs(engine, opts.sourceIds ?? census.map(c => c.source_id)).catch(() => []);
   // The audit's deadline is on the wall clock (it bounds real work; the census's `now` is for dates).
-  const { unbound, ...unrenderable } = await unrenderableLegacyFacts(engine, opts.sourceIds, Date.now() + timeoutMs)
+  const { unbound, ...unrenderable } = await unrenderableLegacyFacts(engine, opts.sourceIds, Math.min(Date.now() + timeoutMs, opts.deadlineAt ?? Infinity))
     .catch((): UnrenderableLegacyFacts => ({ total: 0, complete: false, pages: [], unbound: [] }));
   const details = {
     total, partial: partial.length > 0, partial_sources: partial.map(c => c.source_id), sources: census, trend, warn_at_normalized_7d: FENCE_NORMALIZATION_WARN_7D,
@@ -228,7 +232,7 @@ async function runFenceIntegrity(ctx: DoctorContext): Promise<Check[]> {
   const checks: Check[] = [];
   ctx.progress.heartbeat('fence_integrity');
   try {
-    checks.push({ name: 'fence_integrity', ...await fenceIntegrityResult(engine) });
+    checks.push({ name: 'fence_integrity', ...await fenceIntegrityResult(engine, { deadlineAt: scanDeadline(ctx, fenceScanTimeoutMs()) }) });
   } catch (error) {
     checks.push({ name: 'fence_integrity', status: 'warn', fix_unavailable_reason: 'check_errored', details: { health: 'unknown' },
       message: `The fence census could not run: ${error instanceof Error ? error.message : String(error)}. Fence health is unknown; run gbrain doctor --only fence_integrity again.` });

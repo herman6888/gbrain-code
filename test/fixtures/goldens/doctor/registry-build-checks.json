@@ -267,7 +267,15 @@
       },
       {
         "category": "ops",
+        "name": "managed_sync_blocked"
+      },
+      {
+        "category": "ops",
         "name": "persistence_compaction"
+      },
+      {
+        "category": "ops",
+        "name": "sync_soak_counters"
       },
       {
         "category": "ops",
@@ -280,6 +288,14 @@
       {
         "category": "brain",
         "name": "embedding_state"
+      },
+      {
+        "category": "brain",
+        "name": "links_extraction_lag"
+      },
+      {
+        "category": "brain",
+        "name": "partial_embedding"
       },
       {
         "category": "ops",
@@ -471,6 +487,10 @@
       },
       {
         "category": "brain",
+        "name": "coordination_lock_location"
+      },
+      {
+        "category": "brain",
         "name": "unbound_source"
       },
       {
@@ -580,10 +600,6 @@
       {
         "category": "brain",
         "name": "oversized_pages"
-      },
-      {
-        "category": "brain",
-        "name": "partial_embedding"
       },
       {
         "category": "brain",
@@ -715,10 +731,6 @@
       },
       {
         "category": "brain",
-        "name": "links_extraction_lag"
-      },
-      {
-        "category": "brain",
         "name": "cycle_freshness"
       },
       {
@@ -736,6 +748,10 @@
       {
         "category": "ops",
         "name": "db_only_collector_collision"
+      },
+      {
+        "category": "brain",
+        "name": "managed_sync_latency"
       },
       {
         "category": "brain",
@@ -839,7 +855,31 @@
       },
       {
         "category": "brain",
+        "name": "rename_identity_downgrades"
+      },
+      {
+        "category": "brain",
+        "name": "purge_parked_pages"
+      },
+      {
+        "category": "brain",
         "name": "missing_recorded_files"
+      },
+      {
+        "category": "brain",
+        "name": "unindexed_files"
+      },
+      {
+        "category": "brain",
+        "name": "sync_overwritten_db_edits"
+      },
+      {
+        "category": "meta",
+        "name": "sync_config_keys"
+      },
+      {
+        "category": "ops",
+        "name": "managed_sync_convergence"
       },
       {
         "category": "brain",

@@ -84,7 +84,12 @@ d('planner stats on Postgres', () => {
       const after = (await readPostgresPlannerStats(engine)).find(t => t.table === 'facts')!;
       expect(after.stale).toBe(false);
     } finally {
+      // Leave facts as the test found it: 2,000 rows left behind give idx_facts_fts index tuples, and
+      // whenever autovacuum vacuums them before it analyzes, the expression-index test below sees that
+      // index without statistics too.
+      await engine.executeRaw("DELETE FROM facts WHERE source = 'test' AND fact LIKE 'pg claim %'");
       await engine.executeRaw('ALTER TABLE facts RESET (autovacuum_enabled)');
+      await engine.executeRaw('ANALYZE facts');
     }
   });
 

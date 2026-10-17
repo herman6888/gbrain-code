@@ -16,8 +16,8 @@
  * POSIX the slash-only basename is rechecked on the rows it finds. Tombstones
  * are not claimants (#6517): a soft-deleted twin has given the file up.
  */
-import { realpathSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { BrainEngine } from '../engine.ts';
 import { resolveSourceLocalFilePath } from '../markdown.ts';
@@ -28,8 +28,18 @@ import { recordedPathFromFileUri } from '../write-through.ts';
 export interface FileClaimTarget {
   sourceId: string; slug: string; pageId: number; root: string; mode: 'git-root' | 'source-root';
   path: string; canonicalPath: string; recordedUri: string | null;
+  /** #6712 wave: the target file is gone (`absentCanonicalPath`), so a candidate whose recorded file is gone too claims it by path. */
+  absent?: true;
 }
 export interface FileClaimant { id: number; slug: string }
+
+/** A path that may not exist, canonicalized the way `isWriteTargetContained` does: its nearest existing ancestor's realpath plus the rest. */
+export function absentCanonicalPath(path: string): string {
+  const tail: string[] = [];
+  let existing = path;
+  while (!existsSync(existing) && dirname(existing) !== existing) { tail.unshift(basename(existing)); existing = dirname(existing); }
+  return join(realpathSync(existing), ...tail);
+}
 
 export function recordedReconcilePath(root: string, page: { slug: string; source_path?: string | null; source_uri?: string | null },
   mode: 'git-root' | 'source-root'): string | null {
@@ -87,7 +97,10 @@ export async function findLiveFileClaimants(engine: BrainEngine, target: FileCla
       let canonicalCandidate: string;
       try { canonicalCandidate = realpathSync(candidatePath); }
       catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          if (target.absent && absentCanonicalPath(candidatePath) === canonicalPath) claimants.push({ id: Number(candidate.id), slug: candidate.slug });
+          continue;
+        }
         throw opError('source_changed', 'A candidate canonical file origin could not be verified.',
           `Nothing changed. Page ${candidate.slug} in '${sourceId}' records a file that could not be resolved; check that the source checkout is readable, then preview ${slug} again.`);
       }

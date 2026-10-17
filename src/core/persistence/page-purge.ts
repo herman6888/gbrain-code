@@ -24,6 +24,12 @@
  * on a large journal, not contention: it ends the request `failed` with the
  * typed `purge_lookup_timeout` (the queue behind it moves) instead of being
  * released as `database_contention` and retried without bound.
+ *
+ * #6884: that sweep read and lowered the whole journal once per purged page,
+ * so a batch of purges cost N full sweeps. A preparation now sweeps once for
+ * its own claims and those of the next queued purges of the source
+ * (`sweepForPurge`), and each of those finds its census cached here and
+ * scans only the tail past that sweep's ceiling (the source's watermark).
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -36,7 +42,8 @@ import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { PERSISTENCE_REQUEST_SLUG_INTENT_INDEX } from './schema.ts';
 import { readRequestIndexStates, REQUEST_INDEXES_REPAIR_COMMAND, type RequestIndexState } from './checkpoint-validation.ts';
 import { faultPoint } from './fault-points.ts';
-import { findRequestsForSlugs, recheckRequestsCarrying, redactRequestIntents, sweepRequestsCarrying, type JournalSweep } from './intent-redaction.ts';
+import { carryingNeedles, findRequestsForSlugs, JOURNAL_SWEEP_MATCH_CAP, recheckRequestsCarrying, redactRequestIntents, sweepRequestsCarrying, sweepRequestsForGroups,
+  type JournalSweep } from './intent-redaction.ts';
 import { dropPurgedFenceRows } from '../facts/purge-overlay.ts';
 import { derivedRowsFrom, hideDerivedRows } from '../facts/derivation-inputs.ts';
 import { contentHash } from '../utils.ts';
@@ -73,6 +80,67 @@ async function readPurgeClaims(engine: Pick<BrainEngine, 'executeRaw'>, sourceId
   return { factRows, takeRows, needles };
 }
 
+/** #6884: how many queued purges of the source one preparation's journal sweep covers at most, this one included. */
+export const PURGE_SWEEP_BATCH_MEMBERS = 32;
+/** #6884: the most claim forms one batch sweep tests per journal row; members past it sweep on their own. */
+export const PURGE_SWEEP_BATCH_NEEDLES = 256;
+/** A member's census is cached only up to this many targets, and this process caches at most this many members. */
+const PURGE_SWEEP_CACHE_TARGETS = 1000;
+const PURGE_SWEEP_CACHE_LIMIT = 128;
+/**
+ * #6884: what a batch sweep found for each queued purge it covered, keyed by that purge's request row id, in this process
+ * only (like `purgeContext`, the journal must never hold the claims): the claim forms searched for and the census up to
+ * the sweep's ceiling. Rows at or below the ceiling that were terminal stay as the sweep saw them (a terminal row's text
+ * only shrinks, by compaction or redaction); rows that were pending, the leader's own row included, are re-tested at
+ * publication; rows past it are the member's tail.
+ */
+const batchSweeps = new Map<string, { sourceId: string; forms: Set<string>; sweep: JournalSweep }>();
+
+/**
+ * #6884: the purge's census. A purge a batch sweep already covered for all of its current claims scans only the tail past
+ * that sweep's ceiling; otherwise it sweeps once for its own claims and those of the next queued purges of the source
+ * (in queue order, bounded by member count and claim forms) and caches each member's result.
+ */
+async function sweepForPurge(engine: BrainEngine, row: WriteRequest, claims: string[], clock: ClaimPhaseClock | undefined): Promise<JournalSweep> {
+  const onChunk = () => faultPoint('purge:sweep_chunk', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
+  const forms = carryingNeedles(claims);
+  const cached = batchSweeps.get(row.id);
+  if (cached && cached.sourceId === row.source_id && forms.every(form => cached.forms.has(form))) {
+    const tail = await sweepRequestsCarrying(engine, row.source_id, claims, { clock, exclude: row.id, after: cached.sweep.ceiling ?? '0', onChunk });
+    const targets = [...new Map([...cached.sweep.targets, ...tail.targets].map(t => [t.id, t])).values()];
+    const complete = cached.sweep.complete && tail.complete && targets.length <= JOURNAL_SWEEP_MATCH_CAP;
+    return { targets: targets.slice(0, JOURNAL_SWEEP_MATCH_CAP), pendingAtScan: [...new Set([...cached.sweep.pendingAtScan, ...tail.pendingAtScan])].filter(id => id !== row.id),
+      ceiling: tail.ceiling, scanned: tail.scanned, complete, watermark: cached.sweep.ceiling, batch: cached.sweep.batch ?? 1 };
+  }
+  const groups = [{ key: row.id, claims }], memberForms = new Map<string, Set<string>>();
+  enterClaimStep(clock, 'purge_batch', undefined, 'db');
+  const queued = forms.length ? await engine.executeRaw<{ id: string; slug: string }>(`SELECT id::text AS id,slug FROM persistence_requests
+    WHERE state='queued' AND source_id=$1 AND sequence>$2::bigint AND operation='delete_page' AND intent->>'purge'='true' ORDER BY sequence LIMIT $3`,
+  [row.source_id, String(row.sequence), PURGE_SWEEP_BATCH_MEMBERS - 1]) : [];
+  let budget = forms.length;
+  for (const member of queued) {
+    const [page] = await engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE source_id=$1 AND slug=$2', [row.source_id, member.slug]);
+    if (!page) continue;
+    const memberClaims = (await readPurgeClaims(engine, row.source_id, member.slug, Number(page.id))).needles;
+    const memberNeedles = carryingNeedles(memberClaims);
+    if (!memberNeedles.length) continue;
+    if (budget + memberNeedles.length > PURGE_SWEEP_BATCH_NEEDLES) break;
+    budget += memberNeedles.length;
+    groups.push({ key: member.id, claims: memberClaims });
+    memberForms.set(member.id, new Set(memberNeedles));
+  }
+  const sweeps = await sweepRequestsForGroups(engine, row.source_id, groups, { clock, exclude: row.id, onChunk });
+  for (const [id, memberNeedles] of memberForms) {
+    const sweep = sweeps.get(id)!;
+    if (!sweep.complete || sweep.targets.length > PURGE_SWEEP_CACHE_TARGETS) continue;
+    batchSweeps.delete(id);
+    // The leader was running when the sweep passed it (excluded from the scan), so for every member it is a pending row.
+    batchSweeps.set(id, { sourceId: row.source_id, forms: memberNeedles, sweep: { ...sweep, pendingAtScan: [...sweep.pendingAtScan.filter(p => p !== id), row.id], batch: groups.length } });
+  }
+  while (batchSweeps.size > PURGE_SWEEP_CACHE_LIMIT) batchSweeps.delete(batchSweeps.keys().next().value!);
+  return { ...sweeps.get(row.id)!, watermark: null, batch: groups.length };
+}
+
 /** What the delete preparation hands the purge apply: the claims it searched for, the journal census, and the slug index's state for the failure hint. */
 export interface PreparedPagePurge {
   needles: string[]; sweep: JournalSweep; slugIndex: RequestIndexState['state'];
@@ -103,8 +171,7 @@ export async function preparePagePurge(engine: BrainEngine, row: WriteRequest, s
   enterClaimStep(clock, 'purge_claims', undefined, 'db');
   const { needles, factRows, takeRows } = await readPurgeClaims(engine, row.source_id, snapshot.page.slug, snapshot.page.id);
   const [slugIndex] = await readRequestIndexStates(engine, [PERSISTENCE_REQUEST_SLUG_INTENT_INDEX]);
-  const sweep = await sweepRequestsCarrying(engine, row.source_id, needles, { clock, exclude: row.id,
-    onChunk: () => faultPoint('purge:sweep_chunk', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation }) });
+  const sweep = await sweepForPurge(engine, row, needles, clock);
   const retention = row.intent?.retention === true;
   const ledger = await sourceHasBeliefEvents(engine, row.source_id);
   const derived = ledger && !retention ? [...(await derivedStreamSlugs(engine, row.source_id, (await derivedRowsFrom(engine, [{ table: 'pages', id: snapshot.page.id },
@@ -227,8 +294,8 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   const forSlug = await lookup('slug_lookup', () => findRequestsForSlugs(tx, sourceId, [slug]));
   const requests = [...new Map([...forSlug, ...prepared.sweep.targets, ...recheck.targets].map(r => [r.id, r])).values()];
   removed.persistence_requests = await lookup('redaction_read', () => redactRequestIntents(tx, requests, row.id, { skipPending: true, needles }));
-  const journalSweep = { scanned: prepared.sweep.scanned, ceiling: prepared.sweep.ceiling, tail: recheck.tail, pending_rechecked: recheck.pendingRechecked,
-    complete: prepared.sweep.complete && recheck.complete };
+  const journalSweep = { scanned: prepared.sweep.scanned, ceiling: prepared.sweep.ceiling, watermark: prepared.sweep.watermark ?? null, batch: prepared.sweep.batch ?? 1,
+    tail: recheck.tail, pending_rechecked: recheck.pendingRechecked, complete: prepared.sweep.complete && recheck.complete };
   const files = await tx.executeRaw<{ storage_path: string }>(`DELETE FROM files WHERE (page_id=$1 OR (page_slug=$2 AND (source_id=$3 OR source_id IS NULL)))
     RETURNING storage_path`, [page.id, slug, sourceId]);
   removed.files = files.length;

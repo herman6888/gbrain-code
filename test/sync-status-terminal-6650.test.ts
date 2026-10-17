@@ -48,7 +48,8 @@ async function human(sourceId: string): Promise<string> {
   const lines: string[] = [];
   const log = console.log;
   console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
-  try { await withEnv({ GBRAIN_SOURCE: undefined }, () => runSyncStatus(engine, ['--source', sourceId])); } finally { console.log = log; }
+  // #6712 PR 2 (L5): the terminal summary is a heavy read a plain status skips; these assertions read it with --detail.
+  try { await withEnv({ GBRAIN_SOURCE: undefined }, () => runSyncStatus(engine, ['--source', sourceId, '--detail'])); } finally { console.log = log; }
   return lines.join('\n');
 }
 

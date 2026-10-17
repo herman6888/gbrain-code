@@ -66,7 +66,7 @@ export async function resolveEntitySlug(
   //    a row exactly), use it.
   if (looksLikeSlug(trimmed)) {
     const exact = await tryExactSlug(engine, source_id, trimmed);
-    if (exact) return exact;
+    if (exact) return exact.retired ? (await followRetirement(engine, source_id, exact.slug))?.slug ?? fallbackSlugify(trimmed) : exact.slug;
   }
 
   // 1.25. Exact own name: a live page whose slug basename IS the mention wins
@@ -166,6 +166,113 @@ export function sameEntityName(reference: string, candidateTitle: string | null 
 }
 
 /**
+ * #6898: a page that hands its identity to another page. Frontmatter
+ * `canonical: false`, a `superseded_by` or `merged_into` (the concept-merge
+ * record, cycle/concept-redirects.ts) target, or a `status` that names the
+ * page an alias or a redirect (`historical-retired-alias`). A status that
+ * describes the entity itself (`retired`, `archived`, `merged`, `superseded`)
+ * does not retire the page: a person who retired is still that person's page,
+ * and a merged company or a superseded decision is still a record of its own
+ * unless it names a target.
+ */
+export function retiredPageSql(p: string): string {
+  return `(lower(COALESCE(${p}.frontmatter->>'canonical', '')) IN ('false', 'no')
+    OR btrim(COALESCE(${p}.frontmatter->>'superseded_by', '')) <> ''
+    OR btrim(COALESCE(${p}.frontmatter->>'merged_into', '')) <> ''
+    OR lower(COALESCE(${p}.frontmatter->>'status', '')) ~ '(^|[^a-z])(alias|redirect|redirected)([^a-z]|$)')`;
+}
+
+const MAX_RETIREMENT_HOPS = 5;
+
+/** A frontmatter redirect value as a slug: `[[people/x|X]]`, `people/x.md` and `/people/x` are `people/x`. */
+function redirectSlug(value: string): string | null {
+  const slug = value.trim().replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].trim().replace(/\.md$/i, '').replace(/^\/+/, '');
+  return slug || null;
+}
+
+/**
+ * #6898: the live page that answers for `slug`. A page that is not retired
+ * answers for itself; a retired page hands over to its `superseded_by` (else
+ * `merged_into`) target in the same source, hop by hop up to
+ * MAX_RETIREMENT_HOPS. Null when the chain has no target, reaches a missing,
+ * deleted or (with `privacy`) unreadable page, cycles, or runs too long: the
+ * caller refuses rather than guess. The target is a human-written redirect,
+ * so it is followed whatever its type; the strict resolver still applies its
+ * fact-entity check to the page it lands on.
+ */
+async function followRetirement(
+  engine: BrainEngine,
+  source_id: string,
+  slug: string,
+  privacy = '',
+): Promise<{ slug: string; type: string | null } | null> {
+  const seen = new Set<string>();
+  let current: string | null = slug;
+  while (current && !seen.has(current) && seen.size <= MAX_RETIREMENT_HOPS) {
+    seen.add(current);
+    const [row]: Array<{ slug: string; type: string | null; retired: boolean; target: string | null }> = await engine.executeRaw(
+      `SELECT p.slug, p.type, ${retiredPageSql('p')} AS retired,
+              COALESCE(NULLIF(btrim(p.frontmatter->>'superseded_by'), ''), NULLIF(btrim(p.frontmatter->>'merged_into'), '')) AS target
+         FROM pages p
+        WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NULL ${privacy}
+        LIMIT 1`,
+      [source_id, current],
+    );
+    if (!row) return null;
+    if (!row.retired) return { slug: row.slug, type: row.type };
+    current = row.target ? redirectSlug(row.target) : null;
+  }
+  return null;
+}
+
+/** #6898: the distinct live pages that answer for `slugs` (see followRetirement); unfollowable ones drop out. */
+async function canonicalPages(
+  engine: BrainEngine,
+  source_id: string,
+  slugs: string[],
+  privacy = '',
+): Promise<Array<{ slug: string; type: string | null }>> {
+  const out = new Map<string, { slug: string; type: string | null }>();
+  for (const slug of new Set(slugs)) {
+    const page = await followRetirement(engine, source_id, slug, privacy);
+    if (page) out.set(page.slug, page);
+  }
+  return [...out.values()];
+}
+
+/**
+ * #6898: the normalized alias spellings a reference may be stored under.
+ * `/`, `-`, `_` and whitespace separate the same name words, so
+ * `Alice Example`, `alice_example` and `alice-example` meet whichever one
+ * the page declared. A slug-shaped reference (`people/alice-example`) names
+ * its last segment. The literal normalized form comes first.
+ */
+function aliasSpellings(raw: string): { literal: string; folded: string[]; dir: string | null } {
+  const literal = normalizeAlias(raw);
+  const segments = looksLikeSlug(raw.trim()) ? literal.split('/') : [literal];
+  const tokens = segments[segments.length - 1].split(/[\s/_-]+/u).filter(Boolean);
+  const folded = tokens.length ? [...new Set([' ', '-', '_'].map(sep => tokens.join(sep)))].filter(s => s !== literal) : [];
+  return { literal, folded, dir: segments.length > 1 ? segments[segments.length - 2] : null };
+}
+
+/**
+ * Slugs of the pages whose page_aliases row carries the reference: the
+ * literal spelling's hits when it has any, else the separator-folded
+ * spellings'. A folded hit for a slug-shaped reference must sit in the same
+ * directory (`projects/acme-example` never lands on a `companies/` alias).
+ * Throws what resolveAliases throws.
+ */
+async function aliasHitSlugs(engine: BrainEngine, source_id: string, raw: string): Promise<string[]> {
+  const { literal, folded, dir } = aliasSpellings(raw);
+  if (!literal) return [];
+  const hits = await engine.resolveAliases([literal, ...folded], { sourceId: source_id });
+  const exact = (hits.get(literal) ?? []).map(h => h.slug);
+  if (exact.length) return exact;
+  const parentDir = (slug: string) => slug.split('/').slice(-2, -1)[0] ?? null;
+  return folded.flatMap(s => hits.get(s) ?? []).map(h => h.slug).filter(slug => dir === null || parentDir(slug) === dir);
+}
+
+/**
  * Alias-exact arm (v0.46.15, #3730): unambiguous single-slug page_aliases hit,
  * verified against LIVE pages — page_aliases has no FK to pages, so stale
  * alias rows for deleted/renamed pages linger (outside-voice R2-8).
@@ -177,17 +284,11 @@ export function sameEntityName(reference: string, candidateTitle: string | null 
  */
 let aliasExactWarned = false;
 async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
-  const norm = normalizeAlias(raw);
-  if (!norm) return null;
   try {
-    const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
+    const hits = await aliasHitSlugs(engine, source_id, raw);
     if (!hits.length) return null;
-    const rows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])`,
-      [source_id, [...new Set(hits.map((h) => h.slug))]],
-    );
-    const live = [...new Set(rows.map((r) => r.slug))];
-    return live.length === 1 ? live[0] : await siblingCanonical(engine, source_id, live);
+    const live = await canonicalPages(engine, source_id, hits);
+    return live.length === 1 ? live[0].slug : await siblingCanonical(engine, source_id, live.map(p => p.slug));
   } catch (err) {
     if (!isMissingSchemaObject(err, 'table', 'page_aliases') && !aliasExactWarned) {
       aliasExactWarned = true;
@@ -231,8 +332,9 @@ async function findExactBasenameCandidates(
 ): Promise<Array<{ slug: string }>> {
   const token = slugify(raw);
   if (raw.includes('/') || !token.includes('-')) return [];
+  let rows: Array<{ slug: string }>;
   try {
-    return await engine.executeRaw<{ slug: string }>(
+    rows = await engine.executeRaw<{ slug: string }>(
       `SELECT slug FROM pages
         WHERE source_id = $1 AND deleted_at IS NULL AND slug = ANY($2::text[])
         LIMIT 2`,
@@ -241,6 +343,7 @@ async function findExactBasenameCandidates(
   } catch {
     return [];
   }
+  return canonicalPages(engine, source_id, rows.map(r => r.slug));
 }
 
 /**
@@ -282,7 +385,10 @@ export async function resolveEntitySlugWithSource(
   // Mirror resolveEntitySlug's resolution chain but tag each branch.
   if (looksLikeSlug(trimmed)) {
     const exact = await tryExactSlug(engine, source_id, trimmed);
-    if (exact) return { slug: exact, source: 'exact_page' };
+    if (exact) {
+      const canonical = exact.retired ? (await followRetirement(engine, source_id, exact.slug))?.slug : exact.slug;
+      return canonical ? { slug: canonical, source: 'exact_page' } : fallbackResult(trimmed);
+    }
   }
 
   const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
@@ -359,12 +465,15 @@ export async function resolveStrictEntityReference(
     linkable ??= new Set((await (await import('../mentions/policy.ts')).loadLinkableTypes(engine, source_id).catch(() => ({ types: [] as string[] }))).types);
     return r.type != null && linkable.has(r.type);
   };
-  const pick = async (rows: Array<{ slug: string; type: string | null }>, arm: StrictResolutionArm): Promise<StrictResolution | null> => {
+  const pick = async (found: Array<{ slug: string; type: string | null }>, arm: StrictResolutionArm): Promise<StrictResolution | null> => {
+    if (found.length === 0) return null;
+    // #6898: a retired page answers through its superseded_by target, which must be readable too.
+    const rows = await canonicalPages(engine, source_id, found.map(r => r.slug), privacy);
+    if (rows.length === 0) return { slug: null, miss: 'not_entity' };
     if (rows.length > 1) {
       const sibling = await siblingCanonical(engine, source_id, rows.map(r => r.slug), { excludePrivate: opts.excludePrivate });
       return sibling ? { slug: sibling, arm } : { slug: null, miss: 'ambiguous' };
     }
-    if (rows.length === 0) return null;
     return await isEntity(rows[0]) ? { slug: rows[0].slug, arm } : { slug: null, miss: 'not_entity' };
   };
 
@@ -377,21 +486,17 @@ export async function resolveStrictEntityReference(
     const basename = await pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
     if (basename) return basename;
   }
-  const norm = normalizeAlias(trimmed);
-  if (norm) {
-    try {
-      const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
-      const aliased = await pick(await live(hits.map(h => h.slug)), 'alias_exact');
-      if (aliased) return aliased;
-    } catch (err) {
-      if (!isMissingSchemaObject(err, 'table', 'page_aliases')) throw err;
-    }
+  try {
+    const aliased = await pick(await live(await aliasHitSlugs(engine, source_id, trimmed)), 'alias_exact');
+    if (aliased) return aliased;
+  } catch (err) {
+    if (!isMissingSchemaObject(err, 'table', 'page_aliases')) throw err;
   }
   if (opts.sameName && !isBareName(trimmed)) {
     try {
       const rows = await engine.executeRaw<{ slug: string; title: string; type: string | null }>(
         `SELECT p.slug, p.title, p.type FROM pages p
-          WHERE p.source_id = $1 AND p.deleted_at IS NULL ${privacy}
+          WHERE p.source_id = $1 AND p.deleted_at IS NULL ${privacy} AND NOT ${retiredPageSql('p')}
             AND (lower(p.title) % $2 OR p.slug ILIKE '%' || $3 || '%')
           ORDER BY GREATEST(similarity(lower(p.title), $2), similarity(p.slug, $3)) DESC, p.slug ASC
           LIMIT 5`,
@@ -527,6 +632,7 @@ export async function findPrefixCandidates(
        FROM pages p
        WHERE p.source_id = $1
          AND p.deleted_at IS NULL
+         AND NOT ${retiredPageSql('p')}
          AND p.slug LIKE ANY($2::text[])
        ORDER BY connection_count DESC, p.slug ASC
        LIMIT 10`,
@@ -562,14 +668,14 @@ async function tryUnambiguousPrefixExpansion(
   try {
     const dirs = await engine.executeRaw<{ dir: string }>(
       `SELECT DISTINCT split_part(slug, '/', 1) AS dir FROM pages
-        WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE ANY($2::text[])
+        WHERE source_id = $1 AND deleted_at IS NULL AND NOT ${retiredPageSql('pages')} AND slug LIKE ANY($2::text[])
         LIMIT 2`,
       [source_id, patterns],
     );
     if (dirs.length !== 1) return null;
     const rows = await engine.executeRaw<{ slug: string; title: string | null }>(
       `SELECT slug, title FROM pages
-        WHERE source_id = $1 AND deleted_at IS NULL
+        WHERE source_id = $1 AND deleted_at IS NULL AND NOT ${retiredPageSql('pages')}
           AND slug LIKE ANY($2::text[]) AND lower(title) = lower($3)
         LIMIT 3`,
       [source_id, patterns, raw.trim()],
@@ -626,6 +732,7 @@ async function tryPrefixExpansion(
          FROM pages p
          WHERE p.source_id = $1
            AND p.deleted_at IS NULL
+           AND NOT ${retiredPageSql('p')}
            AND p.slug LIKE $2
          ORDER BY connection_count DESC, p.slug ASC
          LIMIT 5`,
@@ -663,14 +770,17 @@ async function tryExactSlug(
   engine: BrainEngine,
   source_id: string,
   candidate: string,
-): Promise<string | null> {
+): Promise<{ slug: string; retired: boolean } | null> {
   // A database error propagates: degrading to the fallback slug would
   // silently attribute the caller's facts to a different entity.
-  const rows = await engine.executeRaw<{ slug: string }>(
-    `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+  const exact = (retired: boolean) => engine.executeRaw<{ slug: string }>(
+    `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL AND ${retired ? '' : 'NOT'} ${retiredPageSql('pages')} LIMIT 1`,
     [source_id, candidate],
   );
-  return rows[0]?.slug ?? null;
+  const [live] = await exact(false);
+  if (live) return { slug: live.slug, retired: false };
+  const [retired] = await exact(true);
+  return retired ? { slug: retired.slug, retired: true } : null;
 }
 
 async function tryFuzzyMatch(
@@ -694,6 +804,7 @@ async function tryFuzzyMatch(
        FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
+         AND NOT ${retiredPageSql('pages')}
          AND (
            lower(title) % $2
            OR slug ILIKE '%' || $3 || '%'

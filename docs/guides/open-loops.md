@@ -375,8 +375,10 @@ CLI or token-minting gateway; see
 
 Memory verbs: entity cards' `open_threads[]` entries backed by loop rows
 carry additive optional fields (`direction`, `due`, `counterparty`,
-`status`, `loop_id`) — visible through `entity`, `context_pack`, and
-`delta` on any harness.
+`status`, `loop_id`) — visible through `entity`, and through `context_pack`
+and `delta` with `include_private`, to the trusted local CLI only. Remote
+callers (every MCP transport) get cards without loop-backed threads and read
+loops inside their grant with `open_loops`.
 
 ## Close semantics
 

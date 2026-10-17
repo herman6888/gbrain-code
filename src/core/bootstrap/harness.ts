@@ -42,7 +42,8 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { askHarnessConsent } from './harness-consent.ts';
-import { CONFIRMATION_REQUIRED_EXIT_CODE, HARNESS_PENDING_VERIFY_EXIT_CODE } from '../exit-codes.ts';
+import { CONFIRMATION_REQUIRED_EXIT_CODE, HARNESS_CLEANUP_PENDING_EXIT_CODE, HARNESS_PENDING_VERIFY_EXIT_CODE } from '../exit-codes.ts';
+import { cleanupLines, cleanupOutcomeFields, convergeHarnessCleanup, credentialRevoked, defaultTokenStates, harnessCleanupReport, leaveRevokedEnrollment, type TokenStateLookup } from './harness-cleanup.ts';
 import { finishPendingVerify, harnessOutcomeFields, harnessVerifyPending, pendingVerifyStatusLine } from './harness-pending-verify.ts';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -338,6 +339,7 @@ export interface HarnessDeps {
   }>;
   nativeSkillsDir?: (host: HarnessTarget['host']) => string | undefined;
   revokeById?: (id: string) => Promise<boolean>;
+  tokenStates?: TokenStateLookup; // #6743: read-only token-row states for the cleanup lane; tests inject a fake.
   /** Resolve the source the hooks + token bind to, through the SAME resolver
    * the serve's resolve-IPC binding uses (resolveSourceWithTier: env →
    * dotfile → local_path → sources.default → sole non-default → seed
@@ -389,6 +391,7 @@ export function resolveHarnessDeps(deps: HarnessDeps): Required<Omit<HarnessDeps
       return config ? join(dirname(config), 'skills') : nativeSharedSkillsDirectory(host) ?? undefined;
     }),
     revokeById: deps.revokeById ?? defaultRevokeById,
+    tokenStates: deps.tokenStates ?? defaultTokenStates,
     resolveHookSource: deps.resolveHookSource ?? defaultResolveHookSource,
     pgliteLiveServe: deps.pgliteLiveServe ?? defaultPgliteLiveServe,
     // #4325: config-dir fallback mirrors detectCodex/detectOpencode below —
@@ -828,6 +831,7 @@ async function leaveHarnessSkills(
       rmSync(join(entry.root, 'credentials.json'), { force: true });
       return true;
     }
+    if (await credentialRevoked(entry, d)) return leaveRevokedEnrollment(entry, d);
     const credentials = readCredentials(join(entry.root, 'credentials.json'));
     if (credentials.mcp_url !== entry.url) throw new Error('credential endpoint mismatch');
     const result = await d.installSharedSkills(credentials, { harness: entry.host, root: entry.root, name: entry.name, remove: true });
@@ -1964,40 +1968,9 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       save();
     }
   }
-  const priorEnrollment = (prior?.shared_skills ?? []).some(entry => !entry.status.startsWith('left') &&
-    existsSync(join(entry.root, 'shared-skills', 'receipt.json')));
-  let skillsCleanupComplete = skillsReady || !priorEnrollment;
-  if ((allConfirmed && smokeOk && skillsCleanupComplete) || skillsPolicy === 'memory-only') {
-    for (const entry of receipt.shared_skills ?? []) {
-      if (!currentSkills.has(entry) && !(await leaveHarnessSkills(entry, d))) skillsCleanupComplete = false;
-      save();
-    }
-    receipt.shared_skills = receipt.shared_skills?.filter(entry => entry.status !== 'left');
-    save();
-  }
-  if (allConfirmed && smokeOk && skillsCleanupComplete && receipt.token.previous_ids?.length) {
-    const remaining: string[] = [];
-    for (const id of receipt.token.previous_ids) {
-      try {
-        const revoked = await d.revokeById(id);
-        d.log(revoked ? `previous harness token revoked (id ${id}).` : `previous harness token was already revoked (id ${id}).`);
-      } catch (e) {
-        remaining.push(id);
-        d.logError(
-          `could not revoke a previous harness token (${e instanceof Error ? e.message : String(e)}) — ` +
-            `revoke it manually: gbrain auth revoke with the id flag (${id}); kept on the receipt.`,
-        );
-      }
-    }
-    if (remaining.length > 0) receipt.token.previous_ids = remaining;
-    else delete receipt.token.previous_ids;
-    save();
-  } else if (receipt.token.previous_ids?.length) {
-    d.logError(
-      `${receipt.token.previous_ids.length} previous harness token(s) NOT revoked (wiring incomplete or smoke failed) — ` +
-        'old clients keep working; re-run `gbrain bootstrap harness` to converge.',
-    );
-  }
+  // #6743: per-id leave-then-revoke; a revoked credential's enrollment is inert (logic in harness-cleanup.ts).
+  const cleanup = await convergeHarnessCleanup({ receipt, prior, current: currentSkills, wired: allConfirmed && smokeOk, skillsReady,
+    memoryOnly: skillsPolicy === 'memory-only', leave: leaveHarnessSkills, save }, d);
 
   // 11. Degradation + skew honesty.
   if (health.engine === 'postgres') {
@@ -2021,6 +1994,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       JSON.stringify(
         {
           schema_version: 1, ...harnessOutcomeFields(pendingFix, allConfirmed && smokeOk),
+          ...cleanupOutcomeFields(cleanup, !pendingFix && allConfirmed && smokeOk, flags.raw),
           url,
           engine: health.engine ?? null,
           serve_version: health.version ?? null,
@@ -2038,7 +2012,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       ),
     );
   }
-  return pendingFix ? HARNESS_PENDING_VERIFY_EXIT_CODE : allConfirmed && smokeOk ? 0 : 1;
+  return pendingFix ? HARNESS_PENDING_VERIFY_EXIT_CODE : allConfirmed && smokeOk ? (cleanup.length ? HARNESS_CLEANUP_PENDING_EXIT_CODE : 0) : 1;
 }
 
 // ── Remove [C9/F2/C8] ───────────────────────────────────────────────────────
@@ -2491,6 +2465,21 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
     });
   const instructionsOk = instructionsProbes.every((p) => p.probe === 'installed');
   const hookCarriers = harnessHookCarrierStatus(receipt, d);
+  // Cron contract: 0 means ALL-VERIFIED (or honest degrades only) — a
+  // crashed apply's pending/failed targets are NOT success just because
+  // /health answers (ship-review P2); an unconverged rotation or shared-skills
+  // cleanup exits bootstrap_cleanup_pending (#6743). The
+  // token-unrecoverable honest degrade stays 0 per the documented contract.
+  const allTargetsConfirmed = liveTargets.every((t) => t.state === 'confirmed');
+  // Half-removed state (red-team CRITICAL): --remove under a live PGLite
+  // serve strips every host target but defers the revoke, leaving a
+  // zero-target receipt whose minted token is STILL ACTIVE. Vacuous
+  // every() would read that as green forever.
+  const removalPending = receipt.targets.length === 0 && ((receipt.token.minted && receipt.token.id !== undefined) ||
+    Object.values(receipt.harness_tokens ?? {}).some(t => t.minted && t.id) ||
+    (receipt.shared_skills ?? []).some(entry => !entry.status.startsWith('left')));
+  const statusOk = health.ok && tokenVerified !== false && allTargetsConfirmed && !removalPending && instructionsOk && !receipt.verify_pending;
+  const cleanup = await harnessCleanupReport(receipt, d.tokenStates);
 
   if (flags.json) {
     d.log(
@@ -2514,6 +2503,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
           ...(hookCarriers.length > 0 ? { hook_carriers: hookCarriers } : {}),
           pending_previous_tokens: receipt.token.previous_ids ?? [],
           ...(receipt.verify_pending ? { status: 'partial', verify_pending: receipt.verify_pending } : {}),
+          ...cleanupOutcomeFields(cleanup, statusOk, null),
           receipt_path: harnessReceiptPath(d.gbrainHome),
         },
         null,
@@ -2543,37 +2533,20 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
       d.log(`  hook entries in ${c.path}: ${c.state === 'ok' ? `${c.ours} gbrain (${c.unmarked} without the _gbrain marker)` : c.state}` +
         `${c.duplicates.length ? `; duplicated: ${c.duplicates.join(', ')}` : ''}${c.unowned.length ? `; not this install's (left in place): ${c.unowned.join(', ')}` : ''}`);
     }
-    if (receipt.token.previous_ids?.length) {
-      d.log(`  pending: ${receipt.token.previous_ids.length} previous token(s) await revocation (re-run to converge): ${receipt.token.previous_ids.join(', ')}`);
-    }
+    for (const line of cleanupLines(cleanup)) d.log(line);
     if (receipt.verify_pending) d.log(pendingVerifyStatusLine(receipt.verify_pending));
     if (degraded) {
       d.log('per-turn injection: needs a running gbrain serve on Postgres (MCP tools are the active seam).');
     }
     if (skew) d.log(`note: ${skew}`);
   }
-  // Cron contract: 0 means ALL-VERIFIED (or honest degrades only) — a
-  // crashed apply's pending/failed targets and an unconverged rotation are
-  // NOT success just because /health answers (ship-review P2). The
-  // token-unrecoverable honest degrade stays 0 per the documented contract.
-  const allTargetsConfirmed = liveTargets.every((t) => t.state === 'confirmed');
-  const rotationConverged = (receipt.token.previous_ids?.length ?? 0) === 0;
-  // Half-removed state (red-team CRITICAL): --remove under a live PGLite
-  // serve strips every host target but defers the revoke, leaving a
-  // zero-target receipt whose minted token is STILL ACTIVE. Vacuous
-  // every() would read that as green forever.
-  const removalPending = receipt.targets.length === 0 && ((receipt.token.minted && receipt.token.id !== undefined) ||
-    Object.values(receipt.harness_tokens ?? {}).some(t => t.minted && t.id) ||
-    (receipt.shared_skills ?? []).some(entry => !entry.status.startsWith('left')));
   if (removalPending) {
     d.logError(
       `removal pending: host wiring is gone but token revocation or shared-skills cleanup is unfinished — ` +
         'stop the serve and re-run `gbrain bootstrap harness --remove`, or revoke it with `gbrain auth revoke` and the id flag.',
     );
   }
-  return health.ok && tokenVerified !== false && allTargetsConfirmed && rotationConverged && !removalPending && instructionsOk && !receipt.verify_pending
-    ? 0
-    : 1;
+  return statusOk ? (cleanup.length ? HARNESS_CLEANUP_PENDING_EXIT_CODE : 0) : 1;
 }
 
 // ── Home preflight ──────────────────────────────────────────────────────────

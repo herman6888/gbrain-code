@@ -126,7 +126,7 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
     operation: row.operation, source_id: row.source_id, slug: row.slug,
     ...(mismatch ? { owner_build: mismatch } : {}),
     ...(diagnostic ? { write_error: row.error_code, write_error_message: diagnostic.message, write_error_reason: diagnostic.reason, suggestion: diagnostic.suggestion } : {}),
-    ...(terminal ? { diagnosis: { category: terminal.category, code: terminal.code, class: terminal.class, safe_actions: terminal.safe_actions, needs_human: terminal.needs_human,
+    ...(terminal ? { diagnosis: { category: terminal.category, public_category: terminal.public_category, code: terminal.code, class: terminal.class, safe_actions: terminal.safe_actions, needs_human: terminal.needs_human,
       ...(terminal.human_reason ? { human_reason: terminal.human_reason } : {}), escalate: terminal.escalate, historical: terminal.historical,
       fix: renderAction(terminal.action, render) } } : {}),
     ...(withdrawn ? { withdrawn } : {}),

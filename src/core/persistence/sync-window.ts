@@ -18,8 +18,6 @@ export const WINDOW_CANCEL_MESSAGE = 'An earlier page of the same sync did not c
 /** #6402 residual (P4.3): the lane fault a group released under, kept on its rows as `blocked_reason`. */
 export type LaneFault = 'lock_timeout' | 'statement_timeout';
 export const laneFaultBlockedReason = (fault: LaneFault) => `lane_${fault}` as const;
-export const laneFaultOf = (blockedReason: string | null | undefined): LaneFault | null =>
-  blockedReason === 'lane_lock_timeout' ? 'lock_timeout' : blockedReason === 'lane_statement_timeout' ? 'statement_timeout' : null;
 /** The lane-fault cancel text older builds wrote (no producer since #6712). */
 export const laneFaultCancelMessage = (fault: LaneFault) =>
   `An earlier page of the same sync did not commit after ${fault} on its lane group; this page was not published and is re-frozen on the next sync pass.`;

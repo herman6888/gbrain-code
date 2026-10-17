@@ -12,6 +12,7 @@ import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
 import { startMovementWatch, type MovementWatch } from '../core/persistence/sync-movement.ts';
+import { startServeHeadWatcher } from '../core/serve-head-watcher.ts';
 import { onForwardProgress } from '../core/forward-progress.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
 import {
@@ -593,13 +594,16 @@ function installFactsDrain(engine: BrainEngine, opts: ServeOptions, deps: StdioL
 /**
  * #6317 (B4): the facts drain plus the movement watch (one `[gbrain notice]`
  * when a managed source's sync data stops moving; reader in
- * persistence/sync-movement.ts), stopped together at shutdown.
+ * persistence/sync-movement.ts), stopped together at shutdown. #6858 ask 6:
+ * the on-commit HEAD watcher (`sync.on_commit`, core/serve-head-watcher.ts)
+ * stops with them, before shutdownDelegatedSync aborts the sync it started.
  */
 function installResidentTickers(engine: BrainEngine, opts: ServeOptions, deps: StdioLifecycleDeps, shuttingDown: () => boolean): { stop(): Promise<void> } {
   const factsDrain = installFactsDrain(engine, opts, deps, shuttingDown);
   // The watch keeps its own unref'd timer: the injected lifecycle timers are the parent watchdog's and the idle sweep's, which tests count.
   const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log });
-  return { stop: async () => { movementWatch.stop(); await factsDrain?.stop(); } };
+  const headWatcher = startServeHeadWatcher(engine, { log: deps.log });
+  return { stop: async () => { const settled = headWatcher.stop(); movementWatch.stop(); await settled; await factsDrain?.stop(); } };
 }
 
 function installStdioLifecycle(

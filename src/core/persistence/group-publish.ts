@@ -50,9 +50,9 @@ import { setMemberAttribution, withCoordinatedWrite } from './context.ts';
 import { publicationAttribution } from './attribution.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects, queuesMentionLinks, reconcileFinishedBatch } from './effect-journal.ts';
+import { timePublicationStep } from './publication-timing.ts';
 import { assertUnboundPublication, classifyUnboundPage } from './unbound-source.ts';
-import { declareDurablePersistence } from './protocol.ts';
-import { bindPublicationTimeouts, boundPublication, publicationLeaseMs, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
+import { boundPublication, declarePublication, publicationLeaseMs, publicationTransaction, type PublicationBound } from './publication-deadline.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
@@ -285,8 +285,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       const keys = rows.flatMap((row, i) => [{ sourceId: row.source_id, slug: row.slug, incarnation: row.source_incarnation },
         ...(prepared[i]!.additionalPageKeys ?? []).map(key => key.sourceId === row.source_id ? { ...key, incarnation: row.source_incarnation } : key)]);
       const ready = pipelined(tx, [
-        () => bindPublicationTimeouts(opened),
-        () => declareDurablePersistence(tx),
+        () => declarePublication(tx, opened),
         () => guardOwnership(tx, head, hostId),
         // A published file needs recovery even if this transaction rolls back; claims are verified first.
         () => members.length ? tx.executeRaw(`UPDATE persistence_requests r SET publication_started=true FROM unnest($1::uuid[],$2::uuid[]) AS t(id,token)
@@ -297,7 +296,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
         () => prepared.some(member => member.file && !member.noop) ? tx.executeRaw(HOST_BINDING_SQL, [head.worktree_id]) : Promise.resolve([]),
         ...storedAuthorizationReads(tx, rows, true),
       ]).then(results => {
-        const [, , live, started, readOnly] = results as [unknown, unknown, Awaited<ReturnType<typeof guardOwnership>>, unknown[], boolean];
+        const [, live, started, readOnly] = results as [unknown, Awaited<ReturnType<typeof guardOwnership>>, unknown[], boolean];
         if (String(live?.owner_epoch) !== String(binding.owner_epoch)) throw new OperationError('owner_unavailable', 'Owner epoch changed before publication.', 'Inspect the source owner with gbrain sources writer status; do not claim or transfer the source to push this write.');
         if (started.length !== members.length) throw new OperationError('write_claim_lost', 'Execution claim changed before publication.', 'Another worker holds the request; inspect it rather than resubmitting.');
         // A file target prepared before the source became a read-only mirror is never published (as in publishMutation, noop included).
@@ -350,14 +349,15 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
               if (attribute) await setMemberAttribution(tx, publicationAttribution(row, member.trust));
             }
             member.postimage = undefined;
-            const outcome = await withBeliefBatch(tx, publicationBeliefOptions(row, member.additionalPageKeys, beliefReport), () => member.apply(tx, snapshot));
+            const outcome = await withBeliefBatch(tx, publicationBeliefOptions(row, member.additionalPageKeys, beliefReport),
+              () => timePublicationStep('apply', row.slug, () => member.apply(tx, snapshot)));
             await classifyUnboundPage(tx, row);
             if (member.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
             const final = await publicationPostimage(tx, row, member);
             decoratePublicationOutcome(row, member, outcome, final, file ? 1 : 0, false);
             effects = async () => {
               await recordPublicationFenceTrend(tx, row, outcome);
-              await queuePublicationEffects(tx, row, final, outcome, member, singleWrite(row) ? {} : { deferBatchReconcile: true });
+              await timePublicationStep('effects', row.slug, () => queuePublicationEffects(tx, row, final, outcome, member, singleWrite(row) ? {} : { deferBatchReconcile: true }));
             };
             outcomes.push(outcome);
           } catch (error) { throw tag(error, i); }
@@ -656,7 +656,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
           // The member's signal reaches its preparer through its clock (enterClaimStep), never as a blanket statement signal: see the memo rule.
           const prep = startPreparation(async signal => {
             signal.addEventListener('abort', () => cancels[offset]!.abort(signal.reason), { once: true });
-            await faultPoint('consumer:preparing', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation, signal });
+            await faultPoint('consumer:preparing', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id, operation: row.operation, signal });
             return run.prepare(row, reads, undefined, clocks[i]);
           }, budget, { onDeadline: () => {
             if (!ordered) return;

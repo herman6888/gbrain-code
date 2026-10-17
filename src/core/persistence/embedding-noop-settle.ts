@@ -33,8 +33,11 @@ import { faultPoint } from './fault-points.ts';
 import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 
-/** At most this many effects settle in one statement. */
-export const NOOP_SETTLE_BATCH = 200;
+/**
+ * At most this many effects settle in one statement. A pass and its reservation true-up hold the event loop on PGLite,
+ * so the batch bounds how long a request waits behind the drain.
+ */
+export const NOOP_SETTLE_BATCH = 50;
 
 /** Guard failures that leave an effect for the runner, which records them as it does today. */
 const LEFT_FOR_RUNNER = new Set(['owner_unavailable', 'source_changed', 'recovery_required']);

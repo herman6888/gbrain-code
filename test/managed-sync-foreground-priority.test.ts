@@ -91,7 +91,7 @@ afterAll(async () => {
  * Starts a drain, waits until it has sync groups queued that nobody claimed, then writes `slug` from another
  * process. Returns the queued sync rows admitted before the write, the drain's claims and the final rows.
  */
-async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, laneHold = 0, preparingHoldMs = 0) {
+async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, laneHold = 0, preparingHoldMs = 0, force = false) {
   const e = engine!, source = await fixture(e, 64);
   const recorder = recordClaims(e);
   // Each sync page holds its group open a little before commit, so groups stay queued while the writer starts. With
@@ -101,15 +101,22 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
   let laneOpen = 0, armed = false, holdStarts = false;
   const beside: boolean[] = [];
   const written = Promise.withResolvers<void>();
-  // Without `laneHold`, from the moment 4 unstarted groups are seen until `before` is read, each lane parks its group
-  // at `lane:applied`, so no lane starts another group and the groups queued ahead of the write stay queued however
-  // long the write takes to be admitted (each lane can take at most one more group before it parks).
+  // Without `laneHold`, from the moment 4 unstarted rows are seen until `before` is read, the drain's process claims
+  // nothing (`consumer:claiming`): no lane takes another group, while the groups the lanes hold run on and commit, so the
+  // groups queued ahead of the write stay queued however long the write takes to be admitted. (Parking a lane at
+  // `lane:applied` of its next group instead let each lane past that point claim one more group first: with as many
+  // groups queued as lanes, both could start before the write was admitted.)
   const counted = Promise.withResolvers<void>();
+  // `force` (forced probe of that race): the write is admitted only after every group running when the test parked has
+  // committed and the lanes have had their chance to claim the queued ones, and the drain admits no new group meanwhile
+  // (`sync:after_freeze`), so only the parking keeps groups queued ahead of the write.
+  const runningAtReady = new Set<string>();
   // With `preparingHoldMs`, whichever process claims the write holds its preparation that long, and this process stamps
   // its claims with another process's owner, so either way the write is claimed elsewhere and unpublished meanwhile.
   let heldHere: [number, number] | undefined;
   if (preparingHoldMs) setClaimOwnerForTest({ kind: 'mcp', pid: 1, version: 'test', nonce: 'another-process' });
   installFaultHook(async (point, detail) => {
+    if (!laneHold && holdStarts && point === 'consumer:claiming') await Promise.race([counted.promise, Bun.sleep(30_000)]);
     if (preparingHoldMs && point === 'consumer:preparing' && detail.operation === 'put_page' && !heldHere) {
       const start = Date.now();
       await Bun.sleep(preparingHoldMs);
@@ -122,7 +129,7 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
       laneOpen++;
       try { await Promise.race([written.promise, Bun.sleep(laneHold)]); } finally { laneOpen--; }
     }
-    if (!laneHold && holdStarts && point === 'lane:applied') await Promise.race([counted.promise, Bun.sleep(30_000)]);
+    if (force && holdStarts && point === 'sync:after_freeze') await Promise.race([counted.promise, Bun.sleep(30_000)]);
     if (!laneHold && point === 'publication:before_commit' && detail.operation === 'submit_job') await Bun.sleep(150);
   });
   try {
@@ -137,13 +144,22 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
       queued = all.filter(row => row.state === 'queued' && row.kind?.startsWith('managed_sync_') && !(row.grp && begun.has(row.grp)) && !begun.has(row.request_id));
       // With lanes the drain admits groups ahead; without them only the publishing group is out, so the write comes while one runs.
       const ready = all.some(row => row.state === 'committed') && (lanes > 1 ? queued.length >= 4 : all.some(row => row.state === 'running' && row.kind?.startsWith('managed_sync_')));
-      if (ready && lanes > 1) holdStarts = true;
+      if (ready && lanes > 1) {
+        for (const row of all) if (row.state === 'running' && row.kind?.startsWith('managed_sync_')) runningAtReady.add(row.grp ?? row.request_id);
+        holdStarts = true;
+      }
       return ready;
     });
     const target = slug(queued.length ? queued : await rows(e, source).then(all => all.filter(row => row.state === 'queued')));
     armed = true;
     // With `laneHold`, the write is sent while a lane group holds the worktree lease, so only the drain's process can publish it.
     if (laneHold) await until(async () => laneOpen > 0);
+    if (force) {
+      const ids = new Set(queued.map(row => row.grp ?? row.request_id));
+      await until(async () => (await rows(e, source)).every(row => !runningAtReady.has(row.grp ?? row.request_id) || !['queued', 'running'].includes(row.state)));
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline && (await rows(e, source)).some(row => ids.has(row.request_id) && row.state === 'queued')) await Bun.sleep(10);
+    }
     writeFileSync(go, target);
     let before: Row[] = [];
     await until(async () => {
@@ -163,11 +179,11 @@ async function writeDuringDrain(lanes: number, slug: (queued: Row[]) => string, 
   } finally { counted.resolve(); recorder.restore(); installFaultHook(undefined); setClaimOwnerForTest(undefined); }
 }
 
-for (const lanes of [2, 1]) {
-  test(`a write to a page no queued group names commits before another sync group starts (lanes ${lanes})`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_BULK_SIZE: '4' }, async () => {
+for (const [lanes, force] of [[2, false], [1, false], [2, true]] as const) {
+  test(`a write to a page no queued group names commits before another sync group starts (lanes ${lanes})${force ? ', forced probe: the lanes finish their groups before the write is admitted' : ''}`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_BULK_SIZE: '4' }, async () => {
     if (!engine) return;
     resetWriteSwitches();
-    const run = await writeDuringDrain(lanes, () => `notes/foreground-${lanes}`);
+    const run = await writeDuringDrain(lanes, () => `notes/foreground-${lanes}${force ? '-forced' : ''}`, 0, 0, force);
     expect(run.written.state).toBe('committed');
     expect(run.result.status).toBe('first_sync');
     // With lanes, groups admitted ahead were queued when the write arrived; it still went first.

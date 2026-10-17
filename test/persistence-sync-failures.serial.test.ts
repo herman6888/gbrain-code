@@ -16,6 +16,7 @@ import { loadSyncFailures, acknowledgeFailures, autoSkipFailures } from '../src/
 import { printSyncResult, runSync } from '../src/commands/sync.ts';
 import { buildSingleSyncJsonEnvelope } from '../src/core/sync-embed-backfill.ts';
 import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
+import { classifyManagedSyncOrphans, retireManagedSyncOrphan } from '../src/core/persistence/managed-sync-orphans.ts';
 import { checkSyncFailures } from '../src/commands/doctor/checks/sync-failures.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
@@ -57,7 +58,8 @@ beforeAll(async () => {
   for (const engine of engines) await engine.setConfig('sync.holds', 'fail');
 }, 120_000);
 
-test('withdrawal-conflicted sync resumes only through explicit guarded rediscovery and cannot restore the fact', async () => withEnv(env, async () => {
+// #6712 PR 3 (L7): the next plain sync retries a recorded failure through the guarded rediscovery --retry-failed used to run.
+test('withdrawal-conflicted sync resumes through guarded rediscovery on the next plain sync and cannot restore the fact', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const body = renderFactsTable([{ rowNum: 1, claim: 'synthetic sync withdrawal', visibility: 'world', kind: 'fact', confidence: 1,
       notability: 'medium', active: true }]);
@@ -73,8 +75,7 @@ test('withdrawal-conflicted sync resumes only through explicit guarded rediscove
     await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => recordFactWithdrawal(tx, fact.id, f.id), TEST_WRITE_ATTRIBUTION));
     await expect(performManagedSync(engine, options)).rejects.toMatchObject({ code: 'revision_conflict' });
     expect(await readManagedSyncFailures(engine, [f.id])).toEqual([expect.objectContaining({ phase: 'freeze', path: 'z.md', code: 'revision_conflict' })]);
-    await expect(performManagedSync(engine, options)).rejects.toMatchObject({ code: 'revision_conflict' });
-    const repaired = await performManagedSync(engine, { ...options, retryFailed: true });
+    const repaired = await performManagedSync(engine, options);
     expect(repaired.status).toBe('synced');
     const current = (await engine.readPageSnapshot('z', { sourceId: f.id }))!;
     expect(current.page.compiled_truth).toContain('Preserve this new prose.');
@@ -88,7 +89,8 @@ afterAll(async () => {
   await closePostgres?.(); rmSync(home, { recursive: true, force: true });
 });
 
-test('failed managed receipt stays diagnostic across replay, restart, and explicit repaired admission', async () => withEnv(env, async () => {
+// #6712 PR 3 (L7): an unchanged file replays its recorded failure (no new request); once the fix is committed, the plain sync retries it.
+test('failed managed receipt stays diagnostic across replay and restart, and the plain sync admits it again once repaired', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'a.md': 'Useful stable first observation.\n', 'bad.md': '---\ntitle: [broken\n---\nBroken content.\n' });
     const options = { sourceId: f.id, noPull: true };
@@ -101,8 +103,6 @@ test('failed managed receipt stays diagnostic across replay, restart, and explic
     expect(ledger[0]).toMatchObject({ code: failed.failureCodes![0].code, request_id: failed.failures![0].request_id });
     expect(acknowledgeFailures(f.id).count).toBe(0); expect(autoSkipFailures(f.id, ['bad.md']).count).toBe(0);
     await disposePersistenceConsumer(engine);
-    writeFileSync(join(f.root, 'bad.md'), 'Repaired useful second observation.\n');
-    const repairedHead = commit(f.root);
     const replay = await performManagedSync(engine, options);
     expect(replay).toEqual(failed);
     expect(loadSyncFailures().filter(r => r.source_id === f.id)).toEqual(ledger);
@@ -110,8 +110,11 @@ test('failed managed receipt stays diagnostic across replay, restart, and explic
     expect((await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBeNull();
     expect(buildSingleSyncJsonEnvelope(f.id, failed)).toMatchObject({ failures: (failed as any).failures, failure_codes: failed.failureCodes });
     let output = ''; printSyncResult(failed, { write: (text: string) => { output += text; } } as any);
-    expect(output).toContain('bad.md'); expect(output).toContain('--retry-failed'); expect(output).not.toContain('--skip-failed');
-    const repaired = await performManagedSync(engine, { ...options, retryFailed: true });
+    expect(output).toContain('bad.md'); expect(output).toContain(`After repair, run gbrain sync --source ${f.id} --no-pull to retry it under a new request.`);
+    expect(output).not.toContain('--retry-failed'); expect(output).not.toContain('--skip-failed');
+    writeFileSync(join(f.root, 'bad.md'), 'Repaired useful second observation.\n');
+    const repairedHead = commit(f.root);
+    const repaired = await performManagedSync(engine, options);
     expect(repaired).toMatchObject({ status: 'first_sync', toCommit: repairedHead });
     expect(loadSyncFailures().filter(r => r.source_id === f.id)).toHaveLength(0);
     expect((await engine.getPage('bad', { sourceId: f.id }))?.compiled_truth).toContain('Repaired');
@@ -169,7 +172,7 @@ test('CRLF checkout of a newer commit does not replace the stale blob pinned by 
     const pinned = commit(f.root);
     expect(await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial', filesImported: 1, toCommit: pinned });
     const newer = 'Newer last observation.\n';
-    writeFileSync(join(f.root, 'z.md'), newer); commit(f.root);
+    writeFileSync(join(f.root, 'z.md'), newer); const newerHead = commit(f.root);
     writeFileSync(join(f.root, 'z.md'), newer.replace(/\n/g, '\r\n'));
     const blocked = await performManagedSync(engine, options);
     expect(blocked).toMatchObject({ status: 'blocked_by_failures', toCommit: pinned, failureCodes: [{ code: 'source_changed', count: 1 }] });
@@ -177,7 +180,11 @@ test('CRLF checkout of a newer commit does not replace the stale blob pinned by 
     expect((await engine.getPage('z', { sourceId: f.id }))?.compiled_truth).toBe('Original last observation.');
     expect(readFileSync(join(f.root, 'z.md'), 'utf8')).toBe(newer.replace(/\n/g, '\r\n'));
     expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
-    expect(await performManagedSync(engine, options)).toEqual(blocked);
+    // #6712 PR 3 (L7): the next plain sync retries the recorded failure as --retry-failed did: it rediscovers at HEAD, so the
+    // newer bytes import under their own commit and the pinned run never publishes them.
+    expect(await performManagedSync(engine, options)).toMatchObject({ status: 'synced', toCommit: newerHead });
+    expect((await engine.getPage('z', { sourceId: f.id }))?.compiled_truth).toBe('Newer last observation.');
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(newerHead);
   }
 }), 120_000);
 
@@ -196,11 +203,8 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
     const replay = await performManagedSync(engine, options);
     expect(replay).toEqual(blocked);
     expect(await engine.executeRaw('SELECT id,state,intent,error_code FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [f.id])).toEqual(receipts);
-    writeFileSync(join(f.root, 'bad.md'), 'Repaired valid source observation.\n');
-    const fullTarget = commit(f.root);
-    // #6712 PR 1: one cursor per source, so `--full` resumes the failed cursor instead of starting its own: it stays
-    // blocked on the same failure and moves nothing (before, a full run synced under a separate key beside it).
-    expect(fullTarget).not.toBe(target);
+    // #6712 PR 1: one cursor per source, so `--full` resumes the failed cursor instead of starting its own; with the file
+    // unchanged it replays the same failure and moves nothing (before, a full run synced under a separate key beside it).
     expect(await performManagedSync(engine, { ...options, full: true })).toMatchObject({ status: 'blocked_by_failures', runId: blocked.runId, toCommit: target });
     const [source] = await engine.executeRaw('SELECT last_commit,last_sync_at FROM sources WHERE id=$1', [f.id]);
     expect(await performManagedSync(engine, options)).toEqual(blocked);
@@ -217,8 +221,13 @@ test('full sync cannot hide an older failed incremental cursor or repeat its com
     await engine.executeRaw("UPDATE op_checkpoints SET updated_at=now()-interval '10 days' WHERE op LIKE 'managed-sync%'");
     await purgeStaleCheckpoints(engine);
     expect(await performManagedSync(engine, options)).toEqual(blocked);
-    const repaired = await performManagedSync(engine, { ...options, retryFailed: true });
-    expect(repaired.status).toBe('synced'); expect(repaired.runId).not.toBe(blocked.runId);
+    // #6712 PR 3 (L7): once the file's fix is committed, the `--full` run retries the recorded failure by rediscovering from
+    // HEAD: it converges at the new commit under a new run and does not repeat the committed deletion.
+    writeFileSync(join(f.root, 'bad.md'), 'Repaired valid source observation.\n');
+    const fullTarget = commit(f.root);
+    expect(fullTarget).not.toBe(target);
+    const repaired = await performManagedSync(engine, { ...options, full: true });
+    expect(repaired).toMatchObject({ status: 'synced', toCommit: fullTarget, deleted: 0 }); expect(repaired.runId).not.toBe(blocked.runId);
     expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(0);
     expect(loadSyncFailures().filter(row => row.source_id === f.id)).toHaveLength(0);
   }
@@ -248,7 +257,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
     const recorded = { full: true, workingTree: false, srcSubpath: null, exclude: [QUOTED_EXCLUDE], includeHidden: [], strategy: null };
     expect(blocked.failures).toEqual([expect.objectContaining({ syncOptions: recorded, processingOptions: expect.objectContaining({ noEmbed: true }) })]);
     expect(await readManagedSyncFailures(engine, [f.id])).toEqual([expect.objectContaining({ syncOptions: recorded })]);
-    const retry = `gbrain sync --source ${f.id} --no-pull --retry-failed --no-embed --full --exclude 'it'\\''s a dir/**'`;
+    const retry = `gbrain sync --source ${f.id} --no-pull --no-embed --full --exclude 'it'\\''s a dir/**'`;
 
     const local = await checkSyncFailures(engine, { sourceIds: [f.id], remote: false });
     expect(local?.message).toContain(`Fix the cause, then run ${retry}.`);
@@ -258,7 +267,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
     expect(remote?.message).not.toContain('--exclude');
 
     const printed = await captureCli(() => printSyncResult(blocked));
-    expect(printed).toContain(`After repair, run ${retry} to start a new request.`);
+    expect(printed).toContain(`After repair, run ${retry} to retry it under a new request.`);
     const { managedWrite: _diagnostic, ...bare } = blocked;
     const printedBare = await captureCli(() => printSyncResult(bare));
     expect(printedBare).toContain(`Fix the cause, then run: ${retry} (this admits a fresh run after active work drains).`);
@@ -266,7 +275,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
     const legacy = { ...blocked.failures![0] };
     delete legacy.syncOptions; delete legacy.processingOptions;
     const printedLegacy = await captureCli(() => printSyncResult({ ...bare, failures: [legacy] }));
-    expect(printedLegacy).toContain(`Fix the cause, then run: gbrain sync --source ${f.id} --no-pull --retry-failed with the same options as the failed run (this receipt no longer records them)`);
+    expect(printedLegacy).toContain(`Fix the cause, then run: gbrain sync --source ${f.id} --no-pull with the same options as the failed run (this receipt no longer records them)`);
 
     const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
     const execute = engine.executeRaw;
@@ -278,7 +287,7 @@ test('managed failure retry hints name the failed cursor options locally, shell-
     try { await performManagedSync(engine, { sourceId: d.id, noPull: true, exclude: [QUOTED_EXCLUDE] }); }
     catch (error) { thrown = error as Error; }
     finally { engine.executeRaw = execute; }
-    expect(thrown?.message).toContain(`Fix the cause, then run: gbrain sync --source ${d.id} --no-pull --retry-failed --exclude 'it'\\''s a dir/**'`);
+    expect(thrown?.message).toContain(`Fix the cause, then run: gbrain sync --source ${d.id} --no-pull --exclude 'it'\\''s a dir/**'`);
   }
 }), 120_000);
 
@@ -307,7 +316,13 @@ test('checkpoint, discovery, and freeze failures remain diagnosable without a fi
     const blocked = await performManagedSync(engine, options);
     expect(blocked).toEqual(expect.objectContaining({ status: 'blocked_by_failures', failures: [expect.objectContaining({ path: '<checkpoint>', phase: 'checkpoint', code: 'revision_conflict' })] }));
     expect(await performManagedSync(engine, options)).toEqual(blocked);
-    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toMatchObject({ status: 'synced' });
+    // #6712 PR 3 (L7): --retry-failed is a plain sync now, and no sync rediscovers a checkpoint the source's last_commit moved
+    // away from (#6834); the orphan repair retires the cursor and the next sync discovers from the commit the source records.
+    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toEqual(blocked);
+    const [moved] = (await classifyManagedSyncOrphans(engine, [f.id])).orphans;
+    expect(moved).toMatchObject({ kind: 'unfinished_cursor', reason: 'checkpoint_moved' });
+    expect((await retireManagedSyncOrphan(engine, moved!)).cursor).toBe(true);
+    expect(await performManagedSync(engine, options)).toMatchObject({ status: 'synced' });
     expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(0);
 
     const d = await fixture(engine, { 'note.md': 'A stable discovery observation.\n' });
@@ -321,7 +336,7 @@ test('checkpoint, discovery, and freeze failures remain diagnosable without a fi
       await expect(performManagedSync(engine, { sourceId: d.id, noPull: true })).rejects.toMatchObject({ code: 'storage_error' });
     } finally { engine.executeRaw = execute; }
     expect(await readManagedSyncFailures(engine, [d.id])).toEqual([expect.objectContaining({ phase: 'discovery', path: '<discovery>', request_id: null, target: d.head, attempts: 1 })]);
-    await performManagedSync(engine, { sourceId: d.id, noPull: true, retryFailed: true });
+    await performManagedSync(engine, { sourceId: d.id, noPull: true });
     expect(await readManagedSyncFailures(engine, [d.id])).toHaveLength(0);
 
     const c = await fixture(engine, { 'a.md': 'First enumerated page.\n', 'b.md': 'Second enumerated page.\n' });
@@ -377,7 +392,8 @@ test('local single and all-source CLI JSON carry durable diagnostics and fail th
       await runSync(engine, [...flags, '--source', f.id]);
       const single = JSON.parse(stdout.trim());
       expect(single).toEqual(expect.objectContaining({ sync_status: 'blocked_by_failures', failures: [expect.objectContaining({ path: 'bad.md', source_id: f.id, request_id: expect.any(String), phase: 'receipt' })], counts_scope: 'run_cumulative' }));
-      expect(currentExitCode()).toBe(1); expect(stderr).toContain('--retry-failed'); expect(stderr).not.toContain('--skip-failed');
+      expect(currentExitCode()).toBe(1); expect(stderr).toContain(`After repair, run gbrain sync --source ${f.id} --no-pull --no-embed --no-extract --no-schema-pack to retry it under a new request.`);
+      expect(stderr).not.toContain('--retry-failed'); expect(stderr).not.toContain('--skip-failed');
       stdout = ''; stderr = '';
       try { await runSync(engine, [...flags, '--all', '--serial']); } catch (error) { if ((error as Error).message !== 'fixture-cli-exit') throw error; }
       const all = JSON.parse(stdout.trim());
@@ -481,18 +497,21 @@ test('missing manifest re-discovers against HEAD on the next sync; the page the 
   }
 }), 120_000);
 
+// #6712 PR 3 (L7): an unchanged file replays its recorded failure; a changed one is admitted again by the plain sync.
 test('a new failed admission increments attempts but repeating retry during repaired progress does not reset the run', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine, { 'a.md': 'Useful successful first observation.\n', 'bad.md': '---\ntitle: [broken\n---\nFailed observation.\n' });
     const options = { sourceId: f.id, noPull: true };
     const first = await performManagedSync(engine, options);
-    const second = await performManagedSync(engine, { ...options, retryFailed: true });
+    expect(await performManagedSync(engine, { ...options, retryFailed: true })).toEqual(first);
+    writeFileSync(join(f.root, 'bad.md'), '---\ntitle: [still broken\n---\nFailed observation.\n');
+    const second = await performManagedSync(engine, options);
     expect(second.failures![0].request_id).not.toBe(first.failures![0].request_id);
     expect(second.failures![0].attempts).toBe(2);
     expect(await performManagedSync(engine, options)).toEqual(second);
     writeFileSync(join(f.root, 'bad.md'), 'Repaired successful second observation.\n'); commit(f.root);
     const slice = { maxPages: 1, maxMs: 1000 };
-    const start = await performManagedSync(engine, { ...options, retryFailed: true }, slice);
+    const start = await performManagedSync(engine, options, slice);
     expect(start.status).toBe('partial'); expect(start.filesImported).toBe(1);
     const continued = await performManagedSync(engine, { ...options, retryFailed: true }, slice);
     expect(continued.runId).toBe(start.runId); expect(continued.filesImported).toBe(2);

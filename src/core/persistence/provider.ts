@@ -12,7 +12,7 @@ import { LOCAL_CLI_OWNER_OPERATIONS, type PersistenceIpcProvider } from './ipc.t
 import { runPersistenceAdministration } from './administration.ts';
 import { boundedWriteWaitMs } from './write-wait.ts';
 export { residentPersistenceConfig } from './local-client.ts';
-import { projectionBacklog } from '../page-state/projections.ts';
+import { startProjectionStatusCache } from '../page-state/projection-status.ts';
 import { trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 
@@ -37,7 +37,8 @@ export async function createPersistenceIpcProvider(engine: BrainEngine, config: 
   }
   const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
   startPersistenceConsumer(engine, config);
-  return { brainId: brain.brain_id, projectionStatus: () => projectionBacklog(engine), dispatch: request => withVerifiedLocalRegistration(engine, request.registration, async verified => {
+  const projectionStatus = startProjectionStatusCache(engine);
+  return { brainId: brain.brain_id, projectionStatus: () => projectionStatus.read(), dispatch: request => withVerifiedLocalRegistration(engine, request.registration, async verified => {
     assertPersistenceAccepting(engine);
     if (request.brain_id !== brain.brain_id) {
       throw opError('permission_denied', 'This registration belongs to a different brain.',

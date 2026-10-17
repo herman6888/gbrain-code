@@ -49,7 +49,8 @@ describe('classifyTerminal', () => {
   test('routes source_changed by its recorded cause; without one it is diagnosis_required', () => {
     const drift = classifyTerminal({ ...base, state: 'conflict', error_code: 'source_changed', error_message: 'The canonical file contains an uncoordinated local edit.' })!;
     expect(drift).toMatchObject({ category: 'file_conflict', safe_actions: ['reconcile'], needs_human: true });
-    expect(drift.action.argv).toEqual(['gbrain', 'sources', 'reconcile', 'src', 'notes/a', '--preview']);
+    // #6712 PR 2 (L4): two-sided drift routes to the scoped file-drift preview (the one exit), not the generic reconcile preview.
+    expect(drift.action.argv).toEqual(['gbrain', 'repair', 'file-drift', '--source', 'src', '--slug', 'notes/a', '--prefer', 'database']);
     expect(classifyTerminal({ ...base, state: 'conflict', error_code: 'source_changed', error_message: 'The imported file changed after sync admission.' }))
       .toMatchObject({ category: 'sync_fault', safe_actions: ['retry'] });
     // Compaction nulls the message: the same row no longer says why, so nothing is guessed.

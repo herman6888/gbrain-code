@@ -16,7 +16,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { extractStaleFromDB } from '../src/commands/extract.ts';
-import { countMentionDuePages, runMentionPass } from '../src/core/mentions/pass.ts';
+import { MENTION_EXTRACTOR_VERSION, countMentionDuePages, runMentionPass } from '../src/core/mentions/pass.ts';
 import { buildGazetteer } from '../src/core/by-mention.ts';
 import { readMentionCoverage } from '../src/core/mentions/coverage.ts';
 import { mentionIndexUpgradeNotice } from '../src/core/mentions/upgrade-notice.ts';
@@ -131,6 +131,21 @@ describe('short codes the entity page declares for itself', () => {
 });
 
 describe('reconcile scope, off switch and failure', () => {
+  test('a name only inside an HTML comment never links, and a row an older scanner wrote from a comment is removed on upgrade (#6740)', async () => {
+    await page(engine, 'companies/acme', 'company', 'Acme Example', 'A company.');
+    await page(engine, 'notes/n1', 'note', 'n1', 'Weekly notes.\n<!--- acme example:facts:begin -->\n<!--- acme example:facts:end -->');
+    await sweep(engine);
+    expect(await mentionLinks(engine)).toEqual([]);
+    // The release before the comment mask (the previous MENTION_EXTRACTOR_VERSION) wrote this row and stamped the page scanned.
+    await engine.addLinksBatch([{ from_slug: 'notes/n1', to_slug: 'companies/acme', link_type: 'mentions', link_source: 'mentions', context: 'Acme Example' } as never]);
+    await engine.executeRaw(`UPDATE page_mention_state SET mention_version = $1 WHERE page_id = (SELECT id FROM pages WHERE slug = 'notes/n1')`, [MENTION_EXTRACTOR_VERSION - 1]);
+    expect(await mentionLinks(engine)).toEqual(['notes/n1 -> companies/acme']);
+    const r = await sweep(engine);
+    expect(await mentionLinks(engine)).toEqual([]);
+    expect(r.mentions?.removed).toBe(1);
+    expect(await countMentionDuePages(engine)).toBe(0);
+  });
+
   test('typed_ner rows survive a reconcile and an off/on cycle while an obsolete plain mention goes', async () => {
     await page(engine, 'companies/acme', 'company', 'Acme Example', 'A company.');
     await page(engine, 'people/alice', 'person', 'Alice Example', 'Alice works at Acme Example.');

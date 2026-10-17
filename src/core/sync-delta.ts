@@ -65,6 +65,18 @@ function unique<T>(items: T[]): T[] {
   return [...new Set(items)];
 }
 
+/** Merges a working-tree manifest into a commit-range manifest (paths deduplicated; renames and #6729 downgrades appended). */
+export function mergeSyncManifests(into: SyncManifest, from: SyncManifest): SyncManifest {
+  const downgradedRenames = [...(into.downgradedRenames ?? []), ...(from.downgradedRenames ?? [])];
+  return {
+    added: unique([...into.added, ...from.added]),
+    modified: unique([...into.modified, ...from.modified]),
+    deleted: unique([...into.deleted, ...from.deleted]),
+    renamed: [...into.renamed, ...from.renamed],
+    ...(downgradedRenames.length ? { downgradedRenames } : {}),
+  };
+}
+
 /**
  * Working-tree manifest: tracked changes (`git diff --name-status -M HEAD`)
  * PLUS untracked files (`ls-files --others --exclude-standard`). Built for
@@ -144,12 +156,5 @@ export function computeSyncDelta(
       : opts.detached
         ? buildDetachedWorkingTreeManifest(repoPath, run)
         : null;
-  if (detached) {
-    manifest.added = unique([...manifest.added, ...detached.added]);
-    manifest.modified = unique([...manifest.modified, ...detached.modified]);
-    manifest.deleted = unique([...manifest.deleted, ...detached.deleted]);
-    manifest.renamed = [...manifest.renamed, ...detached.renamed];
-  }
-
-  return { status: 'ok', manifest };
+  return { status: 'ok', manifest: detached ? mergeSyncManifests(manifest, detached) : manifest };
 }

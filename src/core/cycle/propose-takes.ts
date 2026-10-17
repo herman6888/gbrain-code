@@ -563,53 +563,22 @@ export async function defaultExtractor(
     }
   }
 
-  // ChatResult.text is already the concatenated text content.
-  const takes = parseExtractorOutput(result.text);
-  // A parse-level `[]` is AMBIGUOUS: it means either "the model genuinely
-  // found no gradeable claims" OR "the model returned malformed/prose/
-  // truncated output we couldn't parse." The caller memoizes empty
-  // extractions with a tombstone, so a transient parse failure would
-  // PERMANENTLY suppress a page that actually has claims. Only a cleanly
-  // parsed empty array is a real "no claims" result worth memoizing; treat
-  // anything else as a transient error and throw, so the phase's catch
-  // retries the page next cycle (writing no tombstone).
-  if (takes.length === 0 && !isWellFormedEmptyExtraction(result.text)) {
+  // ChatResult.text is already the concatenated text content. The caller
+  // memoizes an empty extraction with a tombstone, so only a reply whose first
+  // JSON value is a complete empty array (and that carries no takes after it)
+  // counts as "no claims"; anything unparseable is transient and throws, so the
+  // phase retries the page next cycle (writing no tombstone).
+  const outcome = extractorOutcome(result.text);
+  if (outcome.kind === 'invalid') {
     throw new Error('propose_takes extractor: no parseable takes JSON (transient — retry)');
   }
+  const takes = outcome.kind === 'valid_nonempty' ? outcome.takes : [];
   // #4737: model_id provenance comes from the RESPONSE, not the request —
   // ChatResult.model is the 'provider:modelId' that actually answered.
   const servedModel =
     typeof result.model === 'string' && result.model.trim() !== '' ? result.model : undefined;
   return servedModel ? takes.map((t) => ({ ...t, served_model: servedModel })) : takes;
 }
-
-/**
- * True only when `raw` is a cleanly-parseable EMPTY JSON array — the
- * well-behaved "no gradeable claims" response (the prompt instructs the model
- * to return `[]`). Distinguishes a genuine empty extraction (safe to memoize
- * via a tombstone) from malformed / prose / truncated output (transient —
- * must be retried, never tombstoned). Mirrors parseExtractorOutput's
- * think-strip + fence-strip + first-array handling so both agree on what
- * "the model returned []" means.
- */
-export function isWellFormedEmptyExtraction(raw: string): boolean {
-  if (!raw || raw.trim().length === 0) return false;
-  let text = raw.trim();
-  // Strip <think>...</think> reasoning tags (MiniMax-M3, DeepSeek-R1, etc.),
-  // same as parseExtractorOutput (#2559).
-  text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  const fenced = text.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
-  if (fenced) text = (fenced[1] ?? '').trim();
-  const arrStart = text.indexOf('[');
-  if (arrStart === -1) return false;
-  try {
-    const parsed = JSON.parse(text.slice(arrStart));
-    return Array.isArray(parsed) && parsed.length === 0;
-  } catch {
-    return false;
-  }
-}
-
 
 /**
  * #4736: kinds the pre-fix EXTRACT_TAKES_PROMPT asked for. Cached and
@@ -623,40 +592,81 @@ const LEGACY_EXTRACTOR_KIND_MAP: Record<string, ProposedTake['kind']> = {
 };
 
 /**
- * Parse extractor output into ProposedTake[]. Handles common LLM output
- * sins (markdown fence wrapping, leading/trailing prose, single-object
- * instead of array). Returns [] on any unrecoverable parse error rather
- * than throwing. Kind tokens are case/whitespace-normalized, matched
- * against the fence vocabulary (with the #4736 legacy mapping), and
- * anything else coerces to 'take'.
+ * #6782: what one extractor reply holds. `valid_empty` only when the reply's
+ * first JSON value is a complete empty array and no JSON object, and no array
+ * holding a take-shaped object, follows it (a later `[1]` citation does not
+ * count); `valid_nonempty` when the first value (an array, or a lone object)
+ * yields at least one take; `invalid` for everything else (prose only,
+ * truncated or malformed JSON, a claim-less value, or an empty array followed
+ * by takes), which the caller retries and never tombstones.
+ */
+export type ExtractorOutcome = { kind: 'valid_empty' } | { kind: 'valid_nonempty'; takes: ProposedTake[] } | { kind: 'invalid' };
+
+export function extractorOutcome(raw: string): ExtractorOutcome {
+  const located = locateFirstJsonValue(raw);
+  if (!located) return { kind: 'invalid' };
+  if (Array.isArray(located.value) && located.value.length === 0) {
+    return carriesLaterTakes(located.rest) ? { kind: 'invalid' } : { kind: 'valid_empty' };
+  }
+  const takes = takesOf(located.value);
+  return takes.length ? { kind: 'valid_nonempty', takes } : { kind: 'invalid' };
+}
+
+/**
+ * Parse extractor output into ProposedTake[] (the takes of a `valid_nonempty`
+ * outcome, else none). Handles common LLM output sins (markdown fence
+ * wrapping, leading/trailing prose, single-object instead of array). Kind
+ * tokens are case/whitespace-normalized, matched against the fence vocabulary
+ * (with the #4736 legacy mapping), and anything else coerces to 'take'.
  */
 export function parseExtractorOutput(raw: string): ProposedTake[] {
-  if (!raw || raw.trim().length === 0) return [];
-  let text = raw.trim();
-  // Strip <think>...</think> reasoning tags (MiniMax-M3, DeepSeek-R1, etc.).
-  text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  // Strip markdown code fence wrapper.
+  const outcome = extractorOutcome(raw);
+  return outcome.kind === 'valid_nonempty' ? outcome.takes : [];
+}
+
+/**
+ * The reply's first JSON array or object after stripping `<think>` reasoning
+ * (#2559) and a whole-reply code fence: the whole remainder when it parses,
+ * else only up to the value's own closing bracket (#5209), with the text after it.
+ */
+function locateFirstJsonValue(raw: string): { value: unknown; rest: string } | null {
+  if (!raw || raw.trim().length === 0) return null;
+  let text = raw.trim().replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   const fenced = text.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
   if (fenced) text = (fenced[1] ?? '').trim();
-  // First-array-or-object substring extraction (defends against leading prose).
   const firstArr = text.indexOf('[');
   const firstObj = text.indexOf('{');
-  if (firstArr === -1 && firstObj === -1) return [];
+  if (firstArr === -1 && firstObj === -1) return null;
   const start = firstArr !== -1 && (firstObj === -1 || firstArr < firstObj) ? firstArr : firstObj;
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(text.slice(start));
+    return { value: JSON.parse(text.slice(start)), rest: '' };
   } catch {
-    // Trailing noise (a leftover fence, a `[Source: X]` citation): parse only
-    // up to the value's own closing bracket, never the last bracket in the text.
     const end = matchingCloseBracket(text, start);
-    if (end === -1) return [];
+    if (end === -1) return null;
     try {
-      parsed = JSON.parse(text.slice(start, end + 1));
+      return { value: JSON.parse(text.slice(start, end + 1)), rest: text.slice(end + 1) };
     } catch {
-      return [];
+      return null;
     }
   }
+}
+
+/** True when `text` holds a parseable JSON object, or an array holding a take-shaped object. */
+function carriesLaterTakes(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '[' && text[i] !== '{') continue;
+    const end = matchingCloseBracket(text, i);
+    if (end === -1) continue;
+    let value: unknown;
+    try { value = JSON.parse(text.slice(i, end + 1)); } catch { continue; }
+    if (!Array.isArray(value) && value !== null && typeof value === 'object') return true;
+    if (Array.isArray(value) && value.some(v => v !== null && typeof v === 'object' && typeof (v as Record<string, unknown>).claim_text === 'string')) return true;
+    i = end;
+  }
+  return false;
+}
+
+function takesOf(parsed: unknown): ProposedTake[] {
   const arr = Array.isArray(parsed) ? parsed : [parsed];
   const out: ProposedTake[] = [];
   for (const raw of arr) {

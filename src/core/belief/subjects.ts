@@ -28,16 +28,18 @@ const pageRef = (ctx: KeyContext, id: number | null | undefined, slug: string | 
 const endpointRef = (ctx: KeyContext, e: RawEndpoint | null): SubjectRef | null => e == null ? null
   : ctx.lifetimes.has(e.id) ? lifetimeRef(ctx.lifetimes.get(e.id)!) : slugRef(e.incarnation, e.slug);
 
+/** Built with its keys in canonical order, so `canonicalJson` does not sort them. */
 export function factValue(f: RawFact, entity: SubjectRef | null, count: number): Record<string, unknown> {
-  return { fact: f.fact, kind: f.kind, notability: f.notability, context: f.context, confidence: f.confidence, valid_from: f.valid_from,
-    valid_until: f.valid_until, claim_metric: f.claim_metric, claim_value: f.claim_value, claim_unit: f.claim_unit, claim_period: f.claim_period,
-    event_type: f.event_type, value: f.value, ...(f.sms != null ? { entity } : {}), ...(count > 1 ? { count } : {}) };
+  return { claim_metric: f.claim_metric, claim_period: f.claim_period, claim_unit: f.claim_unit, claim_value: f.claim_value, confidence: f.confidence,
+    context: f.context, ...(count > 1 ? { count } : {}), ...(f.sms != null ? { entity } : {}), event_type: f.event_type, fact: f.fact, kind: f.kind,
+    notability: f.notability, valid_from: f.valid_from, valid_until: f.valid_until, value: f.value };
 }
 
+/** Built with its keys in canonical order, so `canonicalJson` does not sort them. */
 export function takeValue(t: RawTake): Record<string, unknown> {
-  return { claim: t.claim, kind: t.kind, holder: t.holder, weight: t.weight, since_date: t.since_date, until_date: t.until_date, source: t.source,
-    active: t.active, resolved_at: t.resolved_at, resolved_outcome: t.resolved_outcome, resolved_value: t.resolved_value, resolved_unit: t.resolved_unit,
-    resolved_source: t.resolved_source, resolved_by: t.resolved_by, resolved_quality: t.resolved_quality };
+  return { active: t.active, claim: t.claim, holder: t.holder, kind: t.kind, resolved_at: t.resolved_at, resolved_by: t.resolved_by,
+    resolved_outcome: t.resolved_outcome, resolved_quality: t.resolved_quality, resolved_source: t.resolved_source, resolved_unit: t.resolved_unit,
+    resolved_value: t.resolved_value, since_date: t.since_date, source: t.source, until_date: t.until_date, weight: t.weight };
 }
 
 /** One fact row keyed: claim facts by (subject, fp, visibility); ontology observations by their stint identity. */
@@ -50,10 +52,23 @@ export function keyFact(ctx: KeyContext, f: RawFact): { key: string; stream: str
   return { stream, entity, key: factKey(subject, f.fp, f.visibility) };
 }
 
-export function keyedSubjects(ctx: KeyContext, state: RawState, pageVisibility: (pageId: number) => string): Subject[] {
+/**
+ * `earlier`: the same batch's other side, keyed with the same lifetimes. Its fact and take subjects are reused when
+ * `state` carries the very same row arrays over the same pages at the same slugs (the post-read reused them), with
+ * take visibility taken from this side.
+ */
+export function keyedSubjects(ctx: KeyContext, state: RawState, pageVisibility: (pageId: number) => string,
+  earlier?: { state: RawState; subjects: Subject[] }): Subject[] {
+  const samePages = earlier != null && earlier.state.pages.length === state.pages.length
+    && state.pages.every(p => earlier.state.pages.some(q => q.id === p.id && q.slug === p.slug));
+  const reuse = (kind: 'fact' | 'take', rows: unknown[], before: unknown[]) => samePages && rows === before ? earlier!.subjects.filter(s => s.kind === kind) : null;
+  const pageIdBySlug = new Map(state.pages.map(p => [p.slug, p.id]));
   const out: Subject[] = [];
+  const reusedFacts = reuse('fact', state.facts, earlier?.state.facts ?? []);
+  const reusedTakes = reuse('take', state.takes, earlier?.state.takes ?? []);
+  if (reusedFacts) out.push(...reusedFacts);
   const facts = new Map<string, { rows: RawFact[]; stream: string; entity: SubjectRef | null }>();
-  for (const f of state.facts) {
+  for (const f of reusedFacts ? [] : state.facts) {
     const { key, stream, entity } = keyFact(ctx, f);
     const group = facts.get(key) ?? { rows: [], stream, entity };
     group.rows.push(f);
@@ -68,8 +83,9 @@ export function keyedSubjects(ctx: KeyContext, state: RawState, pageVisibility: 
       label: { subject_slug: stream, ...(head.entity_slug && head.entity_slug !== stream ? { entity_slug: head.entity_slug } : {}) } });
   }
   const pagesById = new Map(state.pages.map(p => [p.id, p]));
+  if (reusedTakes) out.push(...reusedTakes.map(t => ({ ...t, visibility: pageVisibility(pageIdBySlug.get(t.stream)!) })));
   const byClaim = new Map<string, RawTake[]>();
-  for (const t of state.takes) {
+  for (const t of reusedTakes ? [] : state.takes) {
     const group = `${t.page_id}\u0000${takeClaimHash(t.claim, t.kind, t.holder)}`;
     byClaim.set(group, [...byClaim.get(group) ?? [], t]);
   }

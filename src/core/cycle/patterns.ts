@@ -17,8 +17,10 @@ import { managedPersistenceEnabled } from '../persistence/ownership.ts';
  *   - Single Sonnet subagent (no fan-out — one job per cycle is plenty).
  *   - Idempotent: if reflection set is below `min_evidence`, phase is skipped.
  *   - Pattern slug uses LLM's chosen topic-slug (subagent prompt instructs format).
- *   - Existing pattern pages are updated in place via put_page (idempotent
- *     ON CONFLICT semantics in importFromContent).
+ *   - Existing pattern pages are rewritten through put_page with the
+ *     revision get_page returned as expected_revision, appended to with
+ *     add_timeline_entry, or skipped (#6779: a put_page without the revision
+ *     is refused revision_required).
  */
 
 import { join, dirname } from 'node:path';
@@ -662,7 +664,8 @@ function buildPatternsPrompt(
 OUTPUT POLICY
 - Only name a pattern if it appears in at least ${minEvidence} DISTINCT reflections.
 - Each pattern page MUST cite the reflections that constitute its evidence (use [[${sourceSlugPrefix}/...]] wikilinks).
-- Use \`search\` to check whether a similar pattern page already exists; if yes, update it (use the same slug). If no, create a new one.
+- Use \`search\` to check whether a similar pattern page already exists. If no, create a new one.
+- If one exists, keep its slug. Skip it when its cited evidence already covers the pattern. Otherwise read it with \`get_page\` and write the merged page back with \`put_page\`, passing the \`revision\` get_page returned as \`expected_revision\` (a \`put_page\` without it is refused \`revision_required\`). When the read comes back summarized (\`read_budget_exhausted\`), do not rewrite the page: append the new evidence with \`add_timeline_entry\` or skip it.
 - Pattern slug format: \`${outputSlugPrefix}/<topic-slug>\` (lowercase alphanumeric + hyphens; no underscores, no extension, no date).
 - A "pattern" is a recurring theme, anxiety, decision pattern, relationship dynamic, or self-knowledge motif. NOT a single insight. NOT a list of unrelated topics.
 
@@ -1103,6 +1106,7 @@ function makeError(cls: string, code: string, message: string, hint?: string): P
 // source-scoping contract (#1586) without driving a whole dream cycle.
 // Mirrors synthesize.ts's `__testing` block.
 export const __testing = {
+  buildPatternsPrompt,
   collectChildTimelineAppends,
   countChildTimelineAppends,
   gatherReflections,

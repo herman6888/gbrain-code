@@ -154,6 +154,24 @@ describe('parseJudgeOutput', () => {
     expect(parseJudgeOutput('')).toBeNull();
   });
 
+  // W6 dev round: Sonnet 5.5 answered twice in 9 of 118 calls (an object, then
+  // "Correction: here is the output in the required format." and a second
+  // object), and prose after the object also failed the parse, so the take was
+  // re-graded and re-billed every cycle and never got a verdict.
+  test('a corrected second answer that agrees parses, keeping the lower confidence', () => {
+    const raw = '{"verdict":"correct","confidence":0.85,"reasoning":"first","note":null}\n\nCorrection: here is the output in the required format.\n\n{"verdict":"correct","confidence":0.9,"reasoning":"second {braces} in a string"}';
+    expect(parseJudgeOutput(raw)).toEqual({ verdict: 'correct', confidence: 0.85, reasoning: 'second {braces} in a string' });
+  });
+
+  test('prose before and after the object parses', () => {
+    const raw = 'The later document is the more direct evidence.\n\n{"verdict":"incorrect","confidence":0.7,"reasoning":"missed \\"the target\\""}\n\nDone.';
+    expect(parseJudgeOutput(raw)).toEqual({ verdict: 'incorrect', confidence: 0.7, reasoning: 'missed "the target"' });
+  });
+
+  test('two answers that disagree are no verdict', () => {
+    expect(parseJudgeOutput('{"verdict":"correct","confidence":0.9,"reasoning":"a"} {"verdict":"incorrect","confidence":0.9,"reasoning":"b"}')).toBeNull();
+  });
+
   test('truncates reasoning longer than 400 chars', () => {
     const longReason = 'x'.repeat(600);
     const raw = `{"verdict":"correct","confidence":0.9,"reasoning":"${longReason}"}`;

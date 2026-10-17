@@ -26,6 +26,12 @@
  * pending rows, so a carrying request admitted or settled after the scan is
  * still redacted. `findRequestsCarrying` (one needle, one statement) stays
  * the fact purge's planning read.
+ *
+ * #6884: `sweepRequestsForGroups` runs that census once for several needle
+ * groups (the queued purges of a batch), reading and lowering each journal
+ * row once and attributing every hit to the groups whose needles it carries;
+ * `after` starts a sweep past an earlier sweep's ceiling, so a purge whose
+ * claims an earlier batch sweep already covered scans only the tail.
  */
 
 import { opError } from '../ops/contract.ts';
@@ -48,15 +54,17 @@ export function carryingNeedles(claims: readonly string[]): string[] {
   return [...new Set(forms.filter(Boolean))];
 }
 
-interface SweepRow extends IntentRedactionTarget { sequence: string; pending: boolean; matched: boolean; chunk_rows: string; chunk_last: string | null }
+interface SweepRow extends IntentRedactionTarget { sequence: string; pending: boolean; hits: number[] | null; chunk_rows: string; chunk_last: string | null }
+type ChunkRow = IntentRedactionTarget & { sequence: string; pending: boolean; matched: boolean; hits: number[] };
 /**
  * One chunk of the carrying predicate: the rows of `sourceId` with `after < sequence <= ceiling` (`ceiling` null: no upper
  * bound), in sequence order, at most `limit`. The chunk is materialised once and each text column lowered once per row;
- * only the rows that match a needle or are still pending come back, plus the chunk's row count and last scanned
- * sequence (as text: bigint) so the caller continues past a chunk that matched nothing.
+ * only the rows that match a needle or are still pending come back, with the 0-based indexes of the needles each carries
+ * (`hits`), plus the chunk's row count and last scanned sequence (as text: bigint) so the caller continues past a chunk
+ * that matched nothing.
  */
 async function sweepChunk(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, needles: readonly string[], after: string, ceiling: string | null, limit: number,
-  ids: readonly string[] | null = null, exclude: string | null = null): Promise<{ rows: Array<IntentRedactionTarget & { sequence: string; pending: boolean; matched: boolean }>; scanned: number; last: string | null }> {
+  ids: readonly string[] | null = null, exclude: string | null = null): Promise<{ rows: ChunkRow[]; scanned: number; last: string | null }> {
   const rows = await engine.executeRaw<SweepRow>(`WITH chunk AS MATERIALIZED (
       SELECT id,principal_kind,principal_id,sequence,
         (state IN ('queued','running','recovering') OR recovery IS NOT NULL) AS pending,
@@ -66,14 +74,16 @@ async function sweepChunk(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: str
       ORDER BY sequence LIMIT $5),
     stats AS (SELECT count(*)::text AS chunk_rows,max(sequence)::text AS chunk_last FROM chunk),
     tested AS (SELECT id,principal_kind,principal_id,sequence,pending,
-        EXISTS (SELECT 1 FROM unnest($4::text[]) AS n WHERE strpos(i,n)>0 OR strpos(o,n)>0 OR strpos(d,n)>0 OR strpos(m,n)>0) AS matched FROM chunk)
-    SELECT t.id::text AS id,t.principal_kind,t.principal_id,t.sequence::text AS sequence,t.pending,t.matched,s.chunk_rows,s.chunk_last
-      FROM tested t CROSS JOIN stats s WHERE t.matched OR t.pending
-    UNION ALL SELECT NULL,NULL,NULL,NULL,false,false,s.chunk_rows,s.chunk_last FROM stats s`,
+        ARRAY(SELECT (n.ord-1)::int FROM unnest($4::text[]) WITH ORDINALITY AS n(v,ord)
+          WHERE strpos(i,n.v)>0 OR strpos(o,n.v)>0 OR strpos(d,n.v)>0 OR strpos(m,n.v)>0 ORDER BY n.ord) AS hits FROM chunk)
+    SELECT t.id::text AS id,t.principal_kind,t.principal_id,t.sequence::text AS sequence,t.pending,t.hits,s.chunk_rows,s.chunk_last
+      FROM tested t CROSS JOIN stats s WHERE cardinality(t.hits)>0 OR t.pending
+    UNION ALL SELECT NULL,NULL,NULL,NULL,false,NULL::int[],s.chunk_rows,s.chunk_last FROM stats s`,
   [sourceId, after, ceiling, [...needles], limit, ids ? [...ids] : null, exclude]);
   // Every row carries the chunk statistics; the sentinel row guarantees at least one.
   const stats = rows[0]!;
-  return { rows: rows.filter(row => row.id !== null).map(({ id, principal_kind, principal_id, sequence, pending, matched }) => ({ id, principal_kind, principal_id, sequence, pending, matched })),
+  return { rows: rows.filter(row => row.id !== null).map(({ id, principal_kind, principal_id, sequence, pending, hits }) => ({ id, principal_kind, principal_id, sequence, pending,
+    matched: (hits?.length ?? 0) > 0, hits: (hits ?? []).map(Number) })),
     scanned: Number(stats.chunk_rows), last: stats.chunk_last };
 }
 
@@ -87,6 +97,10 @@ export interface JournalSweep {
   scanned: number;
   /** False when the match cap was hit: rows past it were not tested. */
   complete: boolean;
+  /** #6884: the sequence this sweep started past (an earlier batch sweep's ceiling); null when it scanned from the start. */
+  watermark?: string | null;
+  /** #6884: how many purges the journal sweep this result comes from covered (1: this purge alone). */
+  batch?: number;
 }
 /**
  * The preparation-time census (#6511): every request of `sourceId` up to the sequence ceiling read at the start, in
@@ -96,26 +110,63 @@ export interface JournalSweep {
  * `boundedReads` ends the chunk statement at the same bound. Needles stay in memory; no text is returned.
  */
 export async function sweepRequestsCarrying(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, claims: readonly string[],
-  opts: { clock?: ClaimPhaseClock; chunkRows?: number; matchCap?: number; onChunk?: () => Promise<void> | void; now?: () => number;
-    /** The purge's own request row (running while it scans): never a target, never pending. */ exclude?: string } = {}): Promise<JournalSweep> {
-  const needles = carryingNeedles(claims);
+  opts: SweepOptions = {}): Promise<JournalSweep> {
+  return (await sweepRequestsForGroups(engine, sourceId, [{ key: '', claims }], opts)).get('')!;
+}
+
+export interface SweepOptions {
+  clock?: ClaimPhaseClock; chunkRows?: number; matchCap?: number; onChunk?: () => Promise<void> | void; now?: () => number;
+  /** The purge's own request row (running while it scans): never a target, never pending. */ exclude?: string;
+  /** #6884: start past this sequence (an earlier sweep's ceiling): only the tail is read. */ after?: string;
+}
+/**
+ * #6884: one census for several needle groups. Each journal row is read and lowered once and tested against the union of
+ * the groups' needles; a hit counts for every group carrying that needle, and a pending row is pending for every group.
+ * The match cap applies per group: a group that reaches it stops collecting (`complete: false`) and the sweep ends once
+ * no group is collecting.
+ */
+export async function sweepRequestsForGroups(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, groups: ReadonlyArray<{ key: string; claims: readonly string[] }>,
+  opts: SweepOptions = {}): Promise<Map<string, JournalSweep>> {
   const chunkRows = opts.chunkRows ?? JOURNAL_SWEEP_CHUNK_ROWS, matchCap = opts.matchCap ?? JOURNAL_SWEEP_MATCH_CAP, now = opts.now ?? Date.now;
+  const needles: string[] = [], owners: Array<Set<string>> = [];
+  for (const group of groups) for (const needle of carryingNeedles(group.claims)) {
+    let at = needles.indexOf(needle);
+    if (at < 0) { at = needles.push(needle) - 1; owners.push(new Set()); }
+    owners[at]!.add(group.key);
+  }
   const [top] = await engine.executeRaw<{ ceiling: string | null }>('SELECT max(sequence)::text AS ceiling FROM persistence_requests WHERE source_id=$1', [sourceId]);
   const ceiling = top?.ceiling ?? null;
-  const sweep: JournalSweep = { targets: [], pendingAtScan: [], ceiling, scanned: 0, complete: true };
-  if (ceiling === null || !needles.length) return sweep;
-  for (let after = '0'; ;) {
+  let scanned = 0;
+  const sweeps = new Map(groups.map(group => [group.key, { targets: [] as IntentRedactionTarget[], pendingAtScan: [] as string[], ceiling, scanned: 0, complete: true,
+    ...(opts.after !== undefined ? { watermark: opts.after } : {}) }]));
+  const collecting = new Set(groups.filter(group => carryingNeedles(group.claims).length).map(group => group.key));
+  const stopped = new Set<string>();
+  const finish = () => { for (const [key, sweep] of sweeps) if (!stopped.has(key)) sweep.scanned = scanned; return sweeps; };
+  if (ceiling === null || !needles.length || (opts.after !== undefined && BigInt(opts.after) >= BigInt(ceiling))) return finish();
+  for (let after = opts.after ?? '0'; ;) {
     enterClaimStep(opts.clock, 'purge_journal_sweep', undefined, 'db');
     if (opts.clock?.deadlineAt !== undefined && now() >= opts.clock.deadlineAt) throw journalSweepDeadline(opts.clock);
     await opts.onChunk?.();
     const chunk = await sweepChunk(engine, sourceId, needles, after, ceiling, chunkRows, null, opts.exclude ?? null);
-    sweep.scanned += chunk.scanned;
+    scanned += chunk.scanned;
     for (const row of chunk.rows) {
-      if (row.pending) sweep.pendingAtScan.push(row.id);
-      else if (row.matched) sweep.targets.push({ id: row.id, principal_kind: row.principal_kind, principal_id: row.principal_id });
+      const target = { id: row.id, principal_kind: row.principal_kind, principal_id: row.principal_id };
+      const hit = new Set(row.hits.flatMap(i => [...owners[i] ?? []]));
+      for (const key of collecting) {
+        if (row.pending) sweeps.get(key)!.pendingAtScan.push(row.id);
+        else if (hit.has(key)) sweeps.get(key)!.targets.push(target);
+      }
     }
-    if (sweep.targets.length >= matchCap) { sweep.targets.length = matchCap; sweep.complete = false; return sweep; }
-    if (chunk.scanned < chunkRows || chunk.last === null) return sweep;
+    for (const key of [...collecting]) {
+      const sweep = sweeps.get(key)!;
+      if (sweep.targets.length < matchCap) continue;
+      sweep.targets.length = matchCap;
+      sweep.complete = false;
+      sweep.scanned = scanned;
+      collecting.delete(key);
+      stopped.add(key);
+    }
+    if (!collecting.size || chunk.scanned < chunkRows || chunk.last === null) return finish();
     after = chunk.last;
   }
 }

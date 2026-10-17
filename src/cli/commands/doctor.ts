@@ -57,6 +57,10 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
   const { startDoctorDeadline } = await import('../../commands/doctor/budget.ts');
   let deadline: import('../../commands/doctor/budget.ts').DoctorDeadline;
   try { deadline = startDoctorDeadline(args); } catch (error) { await renderDoctorParamError(error, args); return; }
+  // #6803 C5: a plain non-interactive --json run caps its check run (started after connect and migrations).
+  const { nonInteractiveDefaultBudget, defaultBudgetNotice } = await import('../../commands/doctor/default-budget.ts');
+  const deferred = nonInteractiveDefaultBudget(args, { stderrIsTty: !!process.stderr.isTTY });
+  if (deferred !== null) Object.assign(deadline, { deferredBudgetMs: deferred, deferredNotice: defaultBudgetNotice(deferred) });
 
   // Doctor runs filesystem checks first (no DB needed), then DB checks.
   // --fast skips DB checks entirely.

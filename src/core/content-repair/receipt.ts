@@ -9,7 +9,8 @@
  * nothing and lives on the hold instead), the tier that decided it (`deterministic`
  * or `llm`) with its confidence (`high` for the deterministic rules, `medium`
  * for a model verdict), the model (llm only), the model spend and the sha256
- * of the bytes before and after. Hashes and codes only, so it is safe in
+ * of the bytes before and after; a `remove_slug` also lists the style-only
+ * frontmatter fix codes it left as written (`style_only`, e.g. `NESTED_QUOTES`). Hashes and codes only, so it is safe in
  * receipts, results and commit messages; `parseContentRepairReceipt` rejects
  * anything else before it reaches a write.
  */
@@ -28,9 +29,15 @@ export interface ContentRepairReceipt {
   cost_usd: number | null;
   before_sha256: string;
   after_sha256: string;
+  /** remove_slug: style-only frontmatter fix codes (`NESTED_QUOTES`) the edit left as written; omitted when there are none. */
+  style_only?: string[];
+  /** #6865 remove_slug (absent_page): the removed line's slug, recorded as an alias of the page in the same write so links written against it keep resolving. */
+  declared_alias?: string;
 }
 
 const SHA = /^[0-9a-f]{64}$/;
+const FIX_CODE = /^[A-Z][A-Z_]{0,39}$/;
+const ALIAS = /^[^\s/\u0000-\u001f\u007f][^\s\u0000-\u001f\u007f]{0,254}$/u;
 
 /** A receipt as stored: well-formed or null, so a forged or damaged value never reaches a receipt or a commit message. */
 export function parseContentRepairReceipt(value: unknown): ContentRepairReceipt | null {
@@ -43,8 +50,12 @@ export function parseContentRepairReceipt(value: unknown): ContentRepairReceipt 
   if (r.cost_usd !== null && (typeof r.cost_usd !== 'number' || !Number.isFinite(r.cost_usd) || r.cost_usd < 0)) return null;
   if (typeof r.before_sha256 !== 'string' || !SHA.test(r.before_sha256) || typeof r.after_sha256 !== 'string' || !SHA.test(r.after_sha256)) return null;
   if (r.action === 'import' && r.before_sha256 !== r.after_sha256) return null;
+  if (r.style_only !== undefined && (r.action !== 'remove_slug' || !Array.isArray(r.style_only) || r.style_only.length === 0 || r.style_only.length > 8
+    || !r.style_only.every(code => typeof code === 'string' && FIX_CODE.test(code)))) return null;
+  if (r.declared_alias !== undefined && (r.action !== 'remove_slug' || typeof r.declared_alias !== 'string' || !ALIAS.test(r.declared_alias))) return null;
   return { actor: CONTENT_REPAIR_ACTOR, hold_code: CONTENT_REPAIR_HOLD_CODE, action: r.action, tier: r.tier, confidence: r.confidence,
-    model: r.model as string | null, cost_usd: r.cost_usd as number | null, before_sha256: r.before_sha256, after_sha256: r.after_sha256 };
+    model: r.model as string | null, cost_usd: r.cost_usd as number | null, before_sha256: r.before_sha256, after_sha256: r.after_sha256,
+    ...(r.style_only !== undefined ? { style_only: [...r.style_only as string[]] } : {}), ...(r.declared_alias !== undefined ? { declared_alias: r.declared_alias as string } : {}) };
 }
 
 /** `gbrain: repair frontmatter slug in <path>`, the subject of a repaired file's commit. */

@@ -1,7 +1,7 @@
 import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
 import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { deferPublishOrThrow, loadCommittedSynthesisOutputs, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict, type RetainedOutput } from './synthesize-postprocess.ts';
+import { deferPublishOrThrow, finishDeferredPostprocess, loadCommittedOutputsOrDefer, postprocessManagedSynthesis, withPostprocessConflicts, withPublishPending, type PostprocessConflict, type RetainedOutput } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -396,7 +396,8 @@ export async function runPhaseSynthesize(
   // calls keep their own job:* tag — the innermost AsyncLocalStorage phase
   // wins (minions/worker.ts wraps each job), and that is intentional: the
   // authoritative child spend rolls up from minion_jobs token columns below.
-  return withChatPhase('phase:synthesize', () => runPhaseSynthesizeInner(engine, opts));
+  const startedAt = Date.now(); // #6757: outputs an earlier pass deferred finish even when this pass returns before postprocessing
+  return withChatPhase('phase:synthesize', async () => finishDeferredPostprocess(engine, opts, startedAt, await runPhaseSynthesizeInner(engine, opts), loadSynthConfig));
 }
 
 async function runPhaseSynthesizeInner(
@@ -1138,8 +1139,8 @@ async function runPhaseSynthesizeInner(
     // F6 rule-D visibility: track which children wrote pages, so a rescued/passed transcript
     // whose child declined to write (task D) is distinguishable from a triage miss in telemetry.
     const jobsWithPages = new Set<number>();
-    const committedOutputs = maintenance ? await loadCommittedSynthesisOutputs(engine, maintenance, childIds) : undefined;
-    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages, committedOutputs), worthProcessing);
+    const committedOutputs = maintenance ? await loadCommittedOutputsOrDefer(engine, maintenance, childIds, { jobRawSource, transcripts: worthProcessing, signal: opts.signal }) : undefined;
+    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages, committedOutputs?.outputs), worthProcessing);
     let finalizedRefs = writtenRefs;
 
     // Grounding gate: verify every page the children wrote (whole page when
@@ -1148,7 +1149,7 @@ async function runPhaseSynthesizeInner(
     // chunks or the markdown body. Fail-open (abort still unwinds); kill
     // switch: dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
-    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [];
+    let publishPending = 0, postprocessConflicts: PostprocessConflict[] = [], postprocessDeferral: Awaited<ReturnType<typeof postprocessManagedSynthesis>>['deferral'] = null;
     const sinceByTranscript = await loadChildWriteEpochs(engine, childIds, jobRawSource, verifySince);
     const grounding = config.quoteVerify ? await resolveGroundingDecide(engine) : undefined;
     if (maintenance) {
@@ -1156,7 +1157,7 @@ async function runPhaseSynthesizeInner(
         worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding, committedOutputs, meetingTranscriptsDir: config.meetingTranscriptsDir });
       writtenRefs = processed.writtenRefs;
       finalizedRefs = processed.finalizedRefs;
-      [publishPending, postprocessConflicts] = [processed.pending, processed.conflicts];
+      [publishPending, postprocessConflicts, postprocessDeferral] = [processed.pending, processed.conflicts, processed.deferral];
       quoteVerifyStats = config.quoteVerify ? processed.stats : null;
     } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(worthProcessing.map(t => [t.filePath, { content: t.content }]));
@@ -1420,7 +1421,7 @@ async function runPhaseSynthesizeInner(
         // child counters + triage pass usage). cost_usd null when unpriced.
         spend: spendBlock,
       },
-    })));
+    }), postprocessDeferral));
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL', e instanceof Error ? (e.message || 'synthesize phase threw') : String(e),
       e instanceof OperationError ? e.suggestion : undefined), e instanceof OperationError ? { error_code: e.code } : {});
@@ -3102,10 +3103,10 @@ async function writeSummaryPage(
     {
       dream_generated: true,
       dream_cycle_date: summaryDate,
-      // #4337: immutable mirror — reruns preserve the first cycle date via
-      // stampDreamProvenance/renderPageToMarkdown; the summary is per-date so
-      // both keys are simply the summary's own date.
+      // #4337: immutable mirror (reruns keep the first date via stampDreamProvenance); #6773: `created` is the
+      // temporal key lint requires. The summary is per-date, so each key is simply the summary's own date.
       dream_created_cycle_date: summaryDate,
+      created: summaryDate,
       // #1978: deterministic index page — no source document of its own;
       // raw traces live on the listed pages. Explicit exemption keeps the
       // doctor raw_provenance check quiet.

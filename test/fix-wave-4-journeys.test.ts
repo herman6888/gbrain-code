@@ -282,7 +282,7 @@ test('journey (c): a checkpoint timeout with a dropped index recovers with the r
     } finally { restore(); }
     expect(refused.text).toContain('checkpoint_validation_timeout');
     expect((await j.run(engine, printed(refused.text, 'gbrain repair request-indexes'))).exit).toBe(0);
-    const retried = await j.run(engine, printed(refused.text, `gbrain sync --source ${id} --no-pull --retry-failed`));
+    const retried = await j.run(engine, printed(refused.text, `gbrain sync --source ${id} --no-pull`));
     expect(retried.exit).toBe(0);
     expect(await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND state<>'committed' AND state<>'failed'", [id])).toEqual([]);
     expect((await engine.getPage('a', { sourceId: id }))?.title).toBe('a');

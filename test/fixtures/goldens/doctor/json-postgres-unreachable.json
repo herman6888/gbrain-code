@@ -9,6 +9,7 @@
     "exit_code": 1,
     "report": {
       "brain_checks_score": 100,
+      "budget_ms": "<volatile>",
       "category_scores": {
         "brain": 100,
         "meta": 100,
@@ -334,10 +335,13 @@
           "status": "fail"
         }
       ],
+      "complete": true,
       "db_url_source": "config-file",
+      "elapsed_ms": "<volatile>",
       "health_score": 75,
       "schema_version": 2,
       "status": "unhealthy",
+      "tier": "standard",
       "top_issues": [
         {
           "action": {
@@ -380,12 +384,14 @@
       ],
       "unknown_scores": [
         "brain"
-      ]
+      ],
+      "unknown_sections": []
     },
     "stderr": [
       "[doctor] DB-backed doctor run failed (Cannot connect to database: connect ECONNREFUSED  <REDACTED:ipv4>:1. Fix: Check the database URL; `gbrain engine status --probe` names where it comes from (environment variable or the config file under GBRAIN_HOME)) — falling back to filesystem-only checks",
       "GBRAIN_DB_ACCESS conn_refused",
-      "Connection refused: nothing accepted the connection at the configured host and port. Check that the database server is running and that the URL names the right host and port. Run: gbrain db-repair"
+      "Connection refused: nothing accepted the connection at the configured host and port. Check that the database server is running and that the URL names the right host and port. Run: gbrain db-repair",
+      "[gbrain doctor] non-interactive run: the check run (not connect or migrations) is capped at 90000 ms (doctor.default_budget_ms); checks past it report health unknown. Off for one run: --budget-ms 0; off for good: gbrain config set doctor.default_budget_ms 0. On PGLite a statement already running cannot be stopped, so a check can finish late."
     ],
     "stdout": "<json>"
   },

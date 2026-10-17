@@ -29,6 +29,8 @@ export const CONTRACT_VERSION = 1 as const;
 export type Effect = 'paid' | 'destructive' | 'credentials' | 'egress' | 'persistent_install';
 export type Actor = 'agent' | 'user' | 'host_admin' | 'provider';
 export type Next = 'run' | 'ask_user' | 'tell_user_to_run' | 'wait' | 'report';
+/** A fix expected to run longer than this is the user's or host admin's (`tell_user_to_run`), never the agent's. */
+export const AGENT_TOOL_LIMIT_MS = 120_000;
 export type Transport = 'cli' | 'stdio' | 'http';
 export type Surface = 'verbs' | 'starter' | 'full';
 export type ErrorClass = 'caller' | 'consent' | 'retryable' | 'unavailable' | 'server' | 'host_only';

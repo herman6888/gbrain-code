@@ -46,7 +46,14 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
   const config = persistenceConfigForBrain(loadConfig(), brainId, brainId === 'host' ? [] : loadMounts());
   if (config?.engine === 'pglite' && config.database_path && !config.database_url) {
     const holder = inspectLockHolder(config.database_path);
-    if (holder.held) { await refuse(projections.projectionOwnerResidentError(holder, config.database_path, brainId)); return; }
+    if (holder.held) {
+      // #6803: the preview counts come from the resident's own projection_status (null: an older resident, or none listening).
+      const { persistenceSocketPathForConfig, requestPersistenceProjectionStatus } = await import('../../core/persistence/ipc.ts');
+      const socketPath = persistenceSocketPathForConfig(config);
+      const status = socketPath ? await requestPersistenceProjectionStatus(socketPath).catch(() => null) : null;
+      await refuse(projections.projectionOwnerResidentError(holder, config.database_path, brainId, status));
+      return;
+    }
   }
 
   const { createProgress } = await import('../../core/progress.ts');
@@ -56,30 +63,21 @@ export async function run(args: string[], ctx: CliDispatchContext): Promise<void
     // #6803: the preview reads the queue and rebuilds nothing.
     try {
       const preview = await projections.previewProjectionDrain(engine, limit ?? 50);
-      if (json) { await writeStdoutFinal(JSON.stringify(preview) + '\n'); return; }
-      const lines = preview.rows.map(row => `  ${row.reason === 'rebuild_failed' ? 'last failed' : 'queued'}: ${row.source_id}/${row.slug} (${row.reason}, since ${row.updated_at})`);
-      await writeStdoutFinal([`projections drain --dry-run: ${preview.pending} queued, ${preview.failed} last failed; nothing was rebuilt.`, ...lines,
-        preview.pending ? 'Run `gbrain projections drain` to rebuild them; a page that fails again is printed with its next step.' : 'The projection backlog is empty.'].join('\n') + '\n');
+      await writeStdoutFinal((json ? JSON.stringify(preview) : projections.formatDrainPreview(preview)) + '\n');
     } finally {
       await finishCliTeardown({ engine });
     }
     return;
   }
   try {
-    const result = await projections.drainProjections(engine, { limit, progress: createProgress(cliOptsToProgressOptions(getCliOptions())) });
+    const result = await projections.drainProjections(engine, { limit, media: true, progress: createProgress(cliOptsToProgressOptions(getCliOptions())) });
     if (json) {
-      const { limited: _limited, ...payload } = result;
-      await writeStdoutFinal(JSON.stringify(payload) + '\n');
+      await writeStdoutFinal(JSON.stringify(result) + '\n');
     } else {
       for (const failure of result.failed) {
         console.error(`failed: ${failure.source_id}/${failure.slug}: ${failure.reason}\n  next: ${projections.projectionFailureNextAction(failure)}`);
       }
-      const summary = `projections drain: ${result.rebuilt} rebuilt, ${result.superseded} superseded, ${result.failed.length} failed, ${result.remaining} remaining.`;
-      const tail = result.remaining === 0 ? ' The projection backlog is empty.'
-        : result.limited ? ` Stopped at --limit ${limit}; run \`gbrain projections drain\` again to continue.`
-          : result.failed.length ? ' Failed pages stay queued; fix them as shown above, then run `gbrain projections drain` again.'
-            : ' Rows queued during this run are left for the next run or the resident owner.';
-      await writeStdoutFinal(summary + tail + '\n');
+      await writeStdoutFinal(projections.formatDrainResult(result, limit) + '\n');
     }
     if (result.failed.length) setCliExitVerdict(1);
   } finally {

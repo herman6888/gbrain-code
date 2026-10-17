@@ -57,6 +57,7 @@
 import { isAdmissionOrigin, withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
 import { withLegacySyncDelegation } from './persistence/sync-authority.ts';
+import { retiredWireNotice } from './wire-skew.ts';
 import { verifyLocalWriter, withVerifiedLocalRegistration } from './persistence/identity.ts';
 import { readManagedMode } from './persistence/managed-mode.ts';
 import { OperationError } from './ops/contract.ts';
@@ -213,6 +214,12 @@ function startDelegatedSyncScoped(
     settled: Promise.resolve(),
   };
   current = job;
+  // An older client's retired fields (src/core/wire-skew.ts) were dropped: say so in the serve log and to that client.
+  if (v.ignored) {
+    const notice = retiredWireNotice(v.ignored);
+    log(notice);
+    job.lines.push({ seq: ++job.lineSeq, text: notice });
+  }
   ensureDrainerRegistered();
 
   // Per-job hard deadline: 0 is the single unbounded encoding (an explicit

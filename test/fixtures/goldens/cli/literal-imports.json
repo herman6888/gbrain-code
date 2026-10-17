@@ -59,7 +59,8 @@
         "./commands/edges-backfill.ts"
       ],
       "embed": [
-        "./commands/embed.ts"
+        "./commands/embed.ts",
+        "./core/held-embedding.ts"
       ],
       "enrich": [
         "./commands/enrich.ts"

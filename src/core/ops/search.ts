@@ -447,7 +447,8 @@ async function buildRetrievalResponseMeta(
   if (heldNotice) ctx.emitNotice?.(heldNotice);
   const degraded = [...(m?.degraded ?? [])];
   if (safeIndexPending) degraded.push({ stage: 'safe_index_pending' });
-  if (readiness.status !== 'ready') {
+  if (readiness.status === 'by_design') degraded.push({ stage: 'projection_by_design' });
+  else if (readiness.status !== 'ready') {
     degraded.push({ stage: readiness.status === 'projection_pending' ? 'projection_pending' : 'projection_status_unknown' });
   }
   const planNotice = relationalPlanNotice(m?.relational_plan);

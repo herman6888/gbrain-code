@@ -13,6 +13,7 @@ import { checkUnverifiedExtractions } from './extraction-sync.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
+import { scanDeadline } from '../budget.ts';
 
 async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
   const { args, progress } = ctx;
@@ -104,34 +105,6 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       status: 'ok',
       message: `Skipped (${msg})`,
     });
-  }
-
-  progress.heartbeat('partial_embedding');
-  try {
-    const { listBudgetLimitedPages } = await import('../../../core/page-embedding-budget.ts');
-    const limited = await listBudgetLimitedPages(engine, { limit: 100 });
-    if (limited.length === 0) {
-      checks.push({ name: 'partial_embedding', status: 'ok', message: 'No large page is held or capped by embed.max_usd_per_page.' });
-    } else {
-      const sources = [...new Set(limited.map(row => row.source_id))];
-      const sample = limited.slice(0, 3).map(row => `${row.slug} (${row.state}${row.reason ? `: ${row.reason}` : ''}, ${row.pending_chunks} chunk(s) without a vector)`).join('; ');
-      const approve = limited.length === 1
-        ? ['gbrain', 'embed', '--slugs', limited[0]!.slug, '--source', limited[0]!.source_id, '--max-usd', '<N>']
-        : ['gbrain', 'embed', '--held', ...(sources.length === 1 ? ['--source', sources[0]!] : []), '--max-usd', '<N>'];
-      checks.push({
-        name: 'partial_embedding',
-        status: 'warn',
-        message: `${limited.length} large page(s) are keyword-searchable but partially embedded: the per-page cap stopped them or they wait for approval. ${sample}. `
-          + `Preview the cost with gbrain embed --held --dry-run; with the user's approval: ${approve.join(' ')}`,
-        fix: { argv: approve, consent: ['paid', 'egress'], actor: 'agent', ask_user: true,
-          inputs: [{ name: 'N', how: 'The dollar amount the user approves per page, after seeing the cost from preview_argv.' }],
-          preview_argv: ['gbrain', 'embed', '--held', ...(sources.length === 1 ? ['--source', sources[0]!] : []), '--dry-run'],
-          why: 'Embedding the rest calls the paid embedding provider; the approved amount raises each page\'s cap (the lowest cap still wins).',
-          verify: doctorVerify('partial_embedding'), requires_exclusive: false, docs: 'docs/guides/memory-boundaries.md#large-pages' },
-      });
-    }
-  } catch (err) {
-    checks.push(checkError('partial_embedding', 'read the per-page embedding budget', err));
   }
 
   progress.heartbeat('scraper_junk_pages');
@@ -261,8 +234,35 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
 
 export const contentSanityEntry: DoctorEntry = {
   name: 'oversized_pages',
-  emits: ['oversized_pages', 'partial_embedding', 'scraper_junk_pages', 'content_sanity_audit_recent'],
+  emits: ['oversized_pages', 'scraper_junk_pages', 'content_sanity_audit_recent'],
   run: runContentSanity,
+};
+
+/**
+ * #6803 part 3: its own entry, so the full `pages` scans above never spend its
+ * budget and `--only partial_embedding` runs only this indexed read. The
+ * finding, its per-source approve Actions and their N live in core/held-embedding.ts.
+ */
+async function runPartialEmbedding(ctx: DoctorContext): Promise<Check[]> {
+  const engine = connectedEngine(ctx);
+  const checks: Check[] = [];
+  ctx.progress.heartbeat('partial_embedding');
+  try {
+    const { budgetLimitedFinding } = await import('../../../core/held-embedding.ts');
+    const { currentEmbeddingSignature } = await import('../../../core/embedding.ts');
+    const found = await budgetLimitedFinding(engine, currentEmbeddingSignature());
+    if (!found) checks.push({ name: 'partial_embedding', status: 'ok', message: 'No large page has chunks waiting for embedding approval (held or capped by embed.max_usd_per_page).' });
+    else checks.push({ name: 'partial_embedding', status: 'warn', message: found.message, fix: found.fix, details: found.details });
+  } catch (err) {
+    checks.push(checkError('partial_embedding', 'read the per-page embedding budget', err));
+  }
+  return checks;
+}
+
+export const partialEmbeddingEntry: DoctorEntry = {
+  name: 'partial_embedding',
+  emits: ['partial_embedding'],
+  run: runPartialEmbedding,
 };
 
 async function runQuarantine(ctx: DoctorContext): Promise<Check[]> {
@@ -357,10 +357,11 @@ async function runFrontmatter(ctx: DoctorContext): Promise<Check[]> {
   progress.heartbeat('frontmatter_integrity');
   const fmHb = startHeartbeat(progress, 'scanning frontmatter…');
   const { frontmatterScanTimeoutMs, frontmatterRepairableFromReport } = await import('./frontmatter-repairable.ts');
-  const fmTimeoutMs = frontmatterScanTimeoutMs();
+  // #6803 C3: the walk also stops at the entry's (and so the run's) deadline, and reports what it read.
+  const fmDeadline = scanDeadline(ctx, frontmatterScanTimeoutMs());
+  const fmTimeoutMs = Math.max(0, fmDeadline - Date.now());
   try {
     const { scanBrainSources } = await import('../../../core/brain-writer.ts');
-    const fmDeadline = Date.now() + fmTimeoutMs;
     const fmAbort = AbortSignal.timeout(fmTimeoutMs);
     // Per-source DB denominator. Coarse — DB pages and on-disk syncable
     // files are overlapping but not identical (unsynced disk files,
@@ -368,6 +369,7 @@ async function runFrontmatter(ctx: DoctorContext): Promise<Check[]> {
     // message makes the mismatch honest. Failure of the COUNT degrades to
     // null and the message falls back to bare numerator.
     const dbPageCountForSource = async (sourceId: string): Promise<number | null> => {
+      if (Date.now() >= fmDeadline) return null;
       try {
         const rows = await engine.executeRaw<{ n: string }>(
           `SELECT COUNT(*)::text AS n FROM pages WHERE source_id = $1 AND deleted_at IS NULL`,

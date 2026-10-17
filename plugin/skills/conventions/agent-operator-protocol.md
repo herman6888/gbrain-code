@@ -627,7 +627,8 @@ interface RenderedAction {
 `verify.argv`, `then`) names the brain and source the failing call acted on:
 `--brain <id>` for commands that open a brain, `--source <id>` for commands that
 resolve their source through the ambient chain (shared ops, and CLI commands the
-command table marks `routes_source`). gbrain appends them when it renders the
+command table marks `routes_source`; `gbrain extract`, whose `--source` is the
+fs|db mode, gets `--source-id <id>`). gbrain appends them when it renders the
 fix, before any bare `--`, and keeps flags the fix already carries. So you can
 run the fix later from another directory, or under a different `GBRAIN_BRAIN_ID`,
 `GBRAIN_SOURCE`, `.gbrain-mount` or `.gbrain-source`, and it still acts on the
@@ -662,6 +663,8 @@ per-token price), obtain each value as `how` describes and substitute it for
 | `user` | the user, in their own terminal or app (for example a credential prompt, or a CLI-only fix while you are on stdio MCP) |
 | `host_admin` | the operator of the brain host (a remote brain over HTTP, scope grants, server restarts). Never authorizable from MCP |
 | `provider` | an outside service you wait on (rate limits, outages) |
+
+A fix expected to run past 120 s (`AGENT_TOOL_LIMIT_MS`) is never `agent`; it renders `tell_user_to_run`.
 
 ### The `next` decision table
 
@@ -997,6 +1000,7 @@ that work in this conversation.
 | 10 | write accepted, still pending | poll the receipt (`gbrain write-request -- <id>`) |
 | 11 | partial, resumable budget stop | run `resume_command` |
 | 13 | `pending_verify`: a harness wired, verification waits for the serve | start the serve, then run `fix.command` |
+| 14 | `bootstrap_cleanup_pending`: a harness is wired; old shared-skills enrollments or token ids still await cleanup | follow `fix.next` (re-run, or relay the owner's revoke step), then re-run |
 | 75 | another runner holds the migration lock | wait, then retry |
 | 124 | the command's deadline elapsed | inspect what is still running |
 | 130 | interrupted | ask the user whether to re-run |

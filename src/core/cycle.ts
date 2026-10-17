@@ -71,6 +71,7 @@ export type CyclePhase =
   | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
   | 'fence_repair' // #6188: repairs held and stored malformed facts/takes fences (global maintenance lane)
   | 'content_repair' // #6377: the rest of the content-repair lane (slug conflicts and later kinds), right after fence_repair
+  | 'unindexed_files' // #6865: committed files with no page and no hold, scheduled for a re-screen on the next sync
   | 'resolve_symbol_edges'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   // v0.36.1.0 Hindsight calibration wave:
@@ -131,6 +132,8 @@ export const ALL_PHASES: CyclePhase[] = [
   'fence_repair',
   // #6377: the other content-repair kinds (src/core/repair/content-lane.ts) right after it, same reason.
   'content_repair',
+  // #6865: after the repair lane, so its holds are settled; schedules unindexed files for the next sync.
+  'unindexed_files',
   'synthesize',
   'extract',
   // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
@@ -332,6 +335,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'sync',
   'fence_repair', // #6188: writes repaired fences through coordinated writes
   'content_repair', // #6377: writes content repairs through the same coordinated file-repair path
+  'unindexed_files', // #6865: writes the re-screen schedule and its stored result
   'synthesize',
   'extract',
   // v0.32.2 — wipes + re-inserts facts per affected page.
@@ -1739,7 +1743,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         details: { dry_run: true, purged_sources_count: 0, purged_pages_count: 0, purged_orphan_clones_count: 0 },
       };
     }
-    const [{ purgeExpiredSources }, { purgeDeletedPagesCoordinated }] = await Promise.all([import('./destructive-guard.ts'), import('./persistence/purge-deleted.ts')]);
+    const [{ purgeExpiredSources }, { purgeDeletedPagesCoordinated, purgePhaseNote, purgePhaseStatus }] = await Promise.all([import('./destructive-guard.ts'), import('./persistence/purge-deleted.ts')]);
     // gbrain#4115: {purged, blocked} — a RESTRICT-FK-held source (revoked
     // oauth_client, v64) is reported and skipped instead of aborting the sweep.
     const purgeResult = await purgeExpiredSources(engine);
@@ -1794,12 +1798,12 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     try { purgedFeedback = await (await import('./feedback/store.ts')).pruneRetrievalFeedback(engine, (await (await import('./feedback/settings.ts')).loadFeedbackSettings(engine)).eventRetentionDays); } catch { /* pre-v207 brain */ }
     return {
       phase: 'purge',
-      status: purgedPages.error ? 'fail' : 'ok', error: purgedPages.error,
+      status: purgePhaseStatus(purgedPages), error: purgedPages.error, // #6741: a writer in recovery or a parked page warns
       duration_ms: 0,
       summary:
         `purged ${purgedSources.length} source(s)` +
         (purgeResult.blocked.length > 0 ? ` (${purgeResult.blocked.length} blocked, see details)` : '') +
-        `, ${purgedPages.count} page(s), ` +
+        `, ${purgedPages.count} page(s)${purgePhaseNote(purgedPages)}, ` +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
         `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s), ` +
@@ -1807,7 +1811,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       details: {
         purged_sources_count: purgedSources.length,
         purged_sources_blocked: purgeResult.blocked,
-        purged_pages_count: purgedPages.count, purged_pages_blocked: purgedPages.blocked, purged_pages_deferred: purgedPages.deferred,
+        purged_pages_count: purgedPages.count, purged_pages_blocked: purgedPages.blocked, purged_pages_deferred: purgedPages.deferred, purged_pages_capacity_deferred: purgedPages.capacity_deferred,
         purged_orphan_clones_count: purgedClones.count,
         purged_orphan_clone_names: purgedClones.names,
         purged_sources: purgedSources,
@@ -1880,13 +1884,14 @@ async function runPhaseOrphans(engine: BrainEngine, sourceId?: string): Promise<
 
 
 /**
- * #6188 / #6377: the two repair-lane phases that run right after `sync`, in this order. `runCycle` dispatches them
- * through one loop; each phase module owns its gate, budget and report.
+ * #6188 / #6377 / #6865: the bounded phases that run right after `sync`, in this order: the two repair-lane phases, then
+ * the unindexed-file detector. `runCycle` dispatches them through one loop; each phase module owns its gate, budget and report.
  */
-const REPAIR_LANE_PHASES = ['fence_repair', 'content_repair'] as const;
+const REPAIR_LANE_PHASES = ['fence_repair', 'content_repair', 'unindexed_files'] as const;
 
 async function runRepairLanePhase(phase: typeof REPAIR_LANE_PHASES[number], engine: BrainEngine | null,
   opts: { dryRun: boolean; signal?: AbortSignal; deadlineAtMs: number | null }): Promise<PhaseResult> {
+  if (phase === 'unindexed_files') return (await import('./cycle/unindexed-files.ts')).runUnindexedFilesPhase(engine, opts);
   return phase === 'fence_repair' ? (await import('./cycle/fence-repair.ts')).runFenceRepairPhase(engine, opts) : (await import('./cycle/content-repair.ts')).runContentRepairPhase(engine, opts);
 }
 

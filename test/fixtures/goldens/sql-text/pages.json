@@ -777,8 +777,8 @@
             "params": [
               "number"
             ],
-            "sql": "DELETE FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval RETURNING slug",
-            "textSha256": "f92fe640850731cd347ca2ea99eef26d1adb3f7cd9b5a16584159313ce298e07"
+            "sql": "DELETE FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval -- #6729: the old page of an open rename-identity downgrade waits for its disposition (identityDowngradePurgeHold). AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz) RETURNING slug",
+            "textSha256": "8fc15609300a1a13325d70453a322bc25eedbd57d6c0029beefca7d0c2bcfeb4"
           }
         ],
         "dryRun": [
@@ -787,8 +787,8 @@
             "params": [
               "number"
             ],
-            "sql": "SELECT slug, deleted_at FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval ORDER BY deleted_at ASC, slug ASC",
-            "textSha256": "3f3ea375a23f949c89c760499ed7542180bbe9bb1e4e146359337e8693079d09"
+            "sql": "SELECT slug, deleted_at FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz) ORDER BY deleted_at ASC, slug ASC",
+            "textSha256": "6d9afbd5ee5480399ddcd577977b106ccf5005eee1be7b84044daebff995d3e2"
           }
         ]
       },
@@ -1499,6 +1499,34 @@
             "params": [
               "string",
               "string",
+              "string",
+              "string"
+            ],
+            "sql": "WITH chosen AS ( SELECT p.* FROM pages p WHERE p.slug=$1 AND p.source_id=$2 ORDER BY (p.slug=$3) DESC, (p.source_id=$4) DESC, p.source_id ASC LIMIT 1 ) SELECT p.*, (SELECT s.incarnation FROM sources s WHERE s.id=p.source_id) AS source_incarnation, COALESCE((SELECT jsonb_agg(t.tag ORDER BY t.tag) FROM tags t WHERE t.page_id=p.id), '[]'::jsonb) AS snapshot_tags, wd.snapshot_withdrawals, wd.snapshot_global_purges, CASE WHEN wd.snapshot_withdrawals <> '[]'::jsonb OR (wd.snapshot_global_purges->>'count')::int > 0 THEN (SELECT string_agg(regexp_replace(lower(line), '[[:space:]]+', ' ', 'g'), chr(10) ORDER BY ord) FROM unnest(string_to_array(p.compiled_truth,chr(10))) WITH ORDINALITY AS lines(line,ord)) END AS fingerprint_body, CASE WHEN wd.snapshot_withdrawals <> '[]'::jsonb OR (wd.snapshot_global_purges->>'count')::int > 0 THEN (SELECT string_agg(regexp_replace(lower(line), '[[:space:]]+', ' ', 'g'), chr(10) ORDER BY ord) FROM unnest(string_to_array(p.timeline,chr(10))) WITH ORDINALITY AS lines(line,ord)) END AS fingerprint_timeline FROM chosen p CROSS JOIN LATERAL (SELECT COALESCE((SELECT jsonb_agg(jsonb_build_object('visibility',w.visibility,'fact_hash',w.fact_hash,'withdrawn_at',w.withdrawn_at) ORDER BY w.visibility,w.fact_hash) FROM (SELECT visibility,fact_hash,min(withdrawn_at) AS withdrawn_at FROM fact_withdrawals WHERE source_id=p.source_id AND (subject='*' OR subject=p.slug) GROUP BY visibility,fact_hash) w), '[]'::jsonb) || COALESCE((SELECT jsonb_agg(jsonb_build_object('visibility',x.visibility,'fact_hash',x.fact_hash,'withdrawn_at',x.purged_at,'purged',true) ORDER BY x.visibility,x.fact_hash) FROM (SELECT visibility,fact_hash,min(purged_at) AS purged_at FROM fact_purges WHERE source_id=p.source_id AND subject=p.slug GROUP BY visibility,fact_hash) x), '[]'::jsonb) AS snapshot_withdrawals, (SELECT jsonb_build_object('count',count(*),'latest',max(g.purged_at)) FROM fact_purges g WHERE g.source_id=p.source_id AND g.subject='*' ) AS snapshot_global_purges) wd",
+            "textSha256": "d49abdfac0d474258cc62de6b765f6c2bd3d4dc6f1098394ab26b05e48e8bc1c"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "number",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "boolean",
+              "null"
+            ],
+            "sql": "INSERT INTO page_versions (page_id,compiled_truth,frontmatter,knowledge_revision,timeline,title,type,tags,is_deleted,source_path) VALUES ($1,$2,$3::text::jsonb,$4::uuid,$5,$6,$7,$8::text::jsonb,$9,$10) RETURNING *",
+            "textSha256": "b2ff46c472f9770ffbf0c2aec78494499be17ecdd7f5661d0c268d3dd6c7e9bb"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
+              "string",
               "string"
             ],
             "sql": "UPDATE pages SET slug = $1, updated_at = now() WHERE slug = $2 AND source_id = $3 RETURNING id",
@@ -1655,6 +1683,34 @@
           {
             "event": "begin",
             "lane": "tx"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "WITH chosen AS ( SELECT p.* FROM pages p WHERE p.slug=$1 AND p.source_id=$2 ORDER BY (p.slug=$3) DESC, (p.source_id=$4) DESC, p.source_id ASC LIMIT 1 ) SELECT p.*, (SELECT s.incarnation FROM sources s WHERE s.id=p.source_id) AS source_incarnation, COALESCE((SELECT jsonb_agg(t.tag ORDER BY t.tag) FROM tags t WHERE t.page_id=p.id), '[]'::jsonb) AS snapshot_tags, wd.snapshot_withdrawals, wd.snapshot_global_purges, CASE WHEN wd.snapshot_withdrawals <> '[]'::jsonb OR (wd.snapshot_global_purges->>'count')::int > 0 THEN (SELECT string_agg(regexp_replace(lower(line), '[[:space:]]+', ' ', 'g'), chr(10) ORDER BY ord) FROM unnest(string_to_array(p.compiled_truth,chr(10))) WITH ORDINALITY AS lines(line,ord)) END AS fingerprint_body, CASE WHEN wd.snapshot_withdrawals <> '[]'::jsonb OR (wd.snapshot_global_purges->>'count')::int > 0 THEN (SELECT string_agg(regexp_replace(lower(line), '[[:space:]]+', ' ', 'g'), chr(10) ORDER BY ord) FROM unnest(string_to_array(p.timeline,chr(10))) WITH ORDINALITY AS lines(line,ord)) END AS fingerprint_timeline FROM chosen p CROSS JOIN LATERAL (SELECT COALESCE((SELECT jsonb_agg(jsonb_build_object('visibility',w.visibility,'fact_hash',w.fact_hash,'withdrawn_at',w.withdrawn_at) ORDER BY w.visibility,w.fact_hash) FROM (SELECT visibility,fact_hash,min(withdrawn_at) AS withdrawn_at FROM fact_withdrawals WHERE source_id=p.source_id AND (subject='*' OR subject=p.slug) GROUP BY visibility,fact_hash) w), '[]'::jsonb) || COALESCE((SELECT jsonb_agg(jsonb_build_object('visibility',x.visibility,'fact_hash',x.fact_hash,'withdrawn_at',x.purged_at,'purged',true) ORDER BY x.visibility,x.fact_hash) FROM (SELECT visibility,fact_hash,min(purged_at) AS purged_at FROM fact_purges WHERE source_id=p.source_id AND subject=p.slug GROUP BY visibility,fact_hash) x), '[]'::jsonb) AS snapshot_withdrawals, (SELECT jsonb_build_object('count',count(*),'latest',max(g.purged_at)) FROM fact_purges g WHERE g.source_id=p.source_id AND g.subject='*' ) AS snapshot_global_purges) wd",
+            "textSha256": "d49abdfac0d474258cc62de6b765f6c2bd3d4dc6f1098394ab26b05e48e8bc1c"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "number",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "boolean",
+              "null"
+            ],
+            "sql": "INSERT INTO page_versions (page_id,compiled_truth,frontmatter,knowledge_revision,timeline,title,type,tags,is_deleted,source_path) VALUES ($1,$2,$3::text::jsonb,$4::uuid,$5,$6,$7,$8::text::jsonb,$9,$10) RETURNING *",
+            "textSha256": "b2ff46c472f9770ffbf0c2aec78494499be17ecdd7f5661d0c268d3dd6c7e9bb"
           },
           {
             "lane": "tx",

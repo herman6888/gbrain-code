@@ -67,8 +67,8 @@ deactivate converts the whole brain back to classic mode (it takes no <source>):
 --dry-run prints every blocker with its exit and what would change, and changes
 nothing. It refuses while the writer admin lock is set or any request, effect,
 recovery or connector/maintenance lease is pending, naming each blocker's exit
-(gbrain cancel-write-request <request_id>, gbrain sync --source <id> --no-pull
---retry-failed, gbrain repair embedding-effects --source <id>, gbrain sources
+(gbrain cancel-write-request <request_id>, gbrain sync --source <id> --no-pull,
+gbrain repair embedding-effects --source <id>, gbrain sources
 writer retry-effects <source> --request-id <id> --dry-run, gbrain sources writer
 unlock). It retires every worktree, removes source and host bindings, and keeps
 canonical files and database pages. Its output and status report the database

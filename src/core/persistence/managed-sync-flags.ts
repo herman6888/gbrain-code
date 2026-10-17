@@ -13,7 +13,7 @@ import { shellQuote } from '../agent-output.ts';
 export type ManagedForbiddenFlag = '--skip-failed' | '--include-gitignored';
 
 const WHY: Record<ManagedForbiddenFlag, string> = {
-  '--skip-failed': 'A managed sync never acknowledges a failed receipt to move past it: fix the file, then retry it with --retry-failed.',
+  '--skip-failed': 'A managed sync never acknowledges a failed receipt to move past it: fix the file, and the plain sync retries it.',
   '--include-gitignored': 'A managed sync imports only files Git tracks and does not ignore: commit the file, or change .gitignore, to sync it.',
 };
 

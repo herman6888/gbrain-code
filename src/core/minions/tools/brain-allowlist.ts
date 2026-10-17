@@ -31,7 +31,7 @@ import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import { normalizeOptionalParams, validateParams } from '../../../mcp/validate-params.ts';
 import { validateSourceId } from '../../utils.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
-import { putPageRejection } from './put-page-result.ts';
+import { putPageRejection, rethrowWithCurrentRevision } from './put-page-result.ts';
 import { BRAIN_TOOL_ALLOWLIST } from './brain-tool-allowlist.ts';
 
 // The allow-list itself lives in a handler-free module so the MCP surface
@@ -286,7 +286,9 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
         if (op.name === 'get_page' && params.include_content === true) params.content_only = true;
         const validationError = validateParams(op, params);
         if (validationError) throw new Error(`${toolName}: ${validationError}`);
-        const output = await op.handler(opCtx, params);
+        const output = op.name === 'put_page'
+          ? await op.handler(opCtx, params).catch(e => rethrowWithCurrentRevision(ctx.engine, opCtx.sourceId ?? 'default', params.slug, e))
+          : await op.handler(opCtx, params);
         const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
         if (rejection) throw new Error(rejection);
         if (op.name === 'get_page' && opts.readBudgetBytes) return budgetedPageRead(ctx.engine, ctx.jobId, opts.readBudgetBytes, params.slug, output);

@@ -10,6 +10,7 @@
       "exit_code": 1,
       "report": {
         "brain_checks_score": 45,
+        "budget_ms": "<volatile>",
         "capped_by": [
           "embeddings_disabled"
         ],
@@ -505,18 +506,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 196014,
+                    "max_day_7d": 196974,
                     "net_per_day_7d": 58822,
                     "pct": 0,
-                    "per_day_7d": 196014,
-                    "reclaimable_bytes": 137192,
+                    "per_day_7d": 196974,
+                    "reclaimable_bytes": 138152,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196014,
+                    "used": 196974,
                     "window_days": 1
                   },
                   {
@@ -542,18 +543,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 196014,
+                    "max_day_7d": 196974,
                     "net_per_day_7d": 58822,
                     "pct": 0,
-                    "per_day_7d": 196014,
-                    "reclaimable_bytes": 137192,
+                    "per_day_7d": 196974,
+                    "reclaimable_bytes": 138152,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196014,
+                    "used": 196974,
                     "window_days": 1
                   }
                 ],
@@ -620,7 +621,7 @@
               "unresolved": {
                 "distinct_intents": 0,
                 "distinct_slugs": 0,
-                "oldest_age_seconds": null,
+                "oldest_age_seconds": "<volatile>",
                 "rows": 0
               },
               "window_days": 7
@@ -636,11 +637,19 @@
               "count": 0,
               "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
               "parked": 0,
-              "sources": []
+              "sources": [],
+              "stranded": 0
             },
             "elapsed_ms": "<volatile>",
             "message": "No managed sync is pending.",
             "name": "managed_sync_not_moving",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "No managed sync run is blocked.",
+            "name": "managed_sync_blocked",
             "status": "ok"
           },
           {
@@ -661,6 +670,39 @@
             "elapsed_ms": "<volatile>",
             "message": "Receipt compaction last ran 0 hour(s) ago (compacted 0, freed 0 bytes).",
             "name": "persistence_compaction",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "by_day": [
+                {
+                  "content_decisions": 0,
+                  "day": "<soak-day>",
+                  "interventions": 1
+                }
+              ],
+              "content_decisions": {
+                "file_drift_apply": 0,
+                "file_drift_hold": 0,
+                "total": 0
+              },
+              "docs": "docs/guides/sync-unblock-runbook.md#soak-counters",
+              "interventions": {
+                "needs_human": 1,
+                "repair_apply": 0,
+                "retry_held": 0,
+                "sync_non_plain": 0,
+                "total": 1,
+                "unblock_apply": 0
+              },
+              "since": "<ts>",
+              "window_days": 7
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Last 7 days: 1 managed-sync intervention(s) (needs_human 1), 0 content decision(s).",
+            "name": "sync_soak_counters",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -808,6 +850,20 @@
             "status": "ok"
           },
           {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "Extraction lag not applicable (20 pages — too few to assess); 1 page(s) pending link extraction (gbrain extract --stale finishes them)",
+            "name": "links_extraction_lag",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "No large page has chunks waiting for embedding approval (held or capped by embed.max_usd_per_page).",
+            "name": "partial_embedding",
+            "status": "ok"
+          },
+          {
             "category": "ops",
             "elapsed_ms": "<volatile>",
             "message": "Extension installed",
@@ -831,12 +887,59 @@
           {
             "category": "brain",
             "details": {
+              "archived": 0,
+              "as_of": "<ts>+00",
+              "failed": 0,
+              "ocr_required": 0,
+              "oldest_age_seconds": "<volatile>",
+              "pending": 1,
+              "protected": 0,
               "readiness": "projection_pending",
-              "ready": false
+              "ready": false,
+              "reimport": 0,
+              "sealable": 0,
+              "sealable_with_visual": 0
             },
             "elapsed_ms": "<volatile>",
-            "fix_unavailable_reason": "unstructured",
-            "message": "Visible pages have missing or stale text projections; search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--limit",
+                "4800",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain projections drain --limit 4800 --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#projection-drain",
+              "next": "run",
+              "preview_argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--dry-run",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "projections",
+                  "drain",
+                  "--dry-run",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Rebuilds queued Markdown and code projections and seals importer-attested image pages in place, at most 4800 pages per run; repeat until the dry run shows sealable 0."
+            },
+            "message": "Visible pages have missing or stale text projections (1 queued Markdown/code page(s)); search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
             "name": "text_projection_readiness",
             "status": "warn"
           },
@@ -913,7 +1016,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 145/145 public tables",
+            "message": "RLS enabled on 146/146 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -1281,12 +1384,16 @@
                 {
                   "name": "persistence_requests_slug_intent",
                   "state": "valid"
+                },
+                {
+                  "name": "persistence_requests_request_id",
+                  "state": "valid"
                 }
               ],
               "repair": "request-indexes"
             },
             "elapsed_ms": "<volatile>",
-            "message": "Managed sync request indexes are valid.",
+            "message": "Request-table indexes are valid.",
             "name": "persistence_request_indexes",
             "status": "ok"
           },
@@ -1519,6 +1626,18 @@
             "elapsed_ms": "<volatile>",
             "message": "Every ownership marker beside a source checkout belongs to this brain.",
             "name": "foreign_ownership_marker",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "checkouts": [],
+              "count": 0,
+              "docs": "docs/architecture/topologies.md#coordination-lock"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every checkout's recorded coordination lock agrees with GBRAIN_COORDINATION_HOME, or the variable does not apply.",
+            "name": "coordination_lock_location",
             "status": "ok"
           },
           {
@@ -1855,13 +1974,6 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "No large page is held or capped by embed.max_usd_per_page.",
-            "name": "partial_embedding",
-            "status": "ok"
-          },
-          {
-            "category": "brain",
-            "elapsed_ms": "<volatile>",
             "message": "No junk-pattern hits in 20 recent page(s) (use --content-audit for full scan)",
             "name": "scraper_junk_pages",
             "status": "ok"
@@ -2026,7 +2138,7 @@
             "category": "ops",
             "details": {
               "depth": 0,
-              "oldest_age_seconds": null,
+              "oldest_age_seconds": "<volatile>",
               "worker_alive": true
             },
             "elapsed_ms": "<volatile>",
@@ -2330,13 +2442,6 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "Extraction lag not applicable (20 pages — too few to assess); 1 page(s) pending link extraction (gbrain extract --stale finishes them)",
-            "name": "links_extraction_lag",
-            "status": "ok"
-          },
-          {
-            "category": "brain",
-            "elapsed_ms": "<volatile>",
             "message": "No full cycle yet for 'default', 'notes', 'plain': they hold no pages or only pages from the last 24h, so there is nothing to consolidate yet.",
             "name": "cycle_freshness",
             "readiness_state": "not_applicable",
@@ -2374,6 +2479,73 @@
           {
             "category": "brain",
             "details": {
+              "docs": "docs/guides/on-commit-sync.md",
+              "fail_seconds": 3600,
+              "graded": false,
+              "on_commit": false,
+              "sources": [
+                {
+                  "commit_to_embedded": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "pending": 0,
+                    "samples": 0
+                  },
+                  "commit_to_searchable": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "samples": 0
+                  },
+                  "commits": 0,
+                  "source_id": "default",
+                  "unresolved_commits": 0,
+                  "window_hours": 24
+                },
+                {
+                  "commit_to_embedded": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "pending": 0,
+                    "samples": 0
+                  },
+                  "commit_to_searchable": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "samples": 0
+                  },
+                  "commits": 0,
+                  "source_id": "notes",
+                  "unresolved_commits": 0,
+                  "window_hours": 24
+                },
+                {
+                  "commit_to_embedded": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "pending": 0,
+                    "samples": 0
+                  },
+                  "commit_to_searchable": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "samples": 0
+                  },
+                  "commits": 0,
+                  "source_id": "plain",
+                  "unresolved_commits": 0,
+                  "window_hours": 24
+                }
+              ],
+              "target_seconds": 300
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
+            "name": "managed_sync_latency",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "checkouts": 1,
               "tracked": []
             },
@@ -2392,12 +2564,14 @@
           {
             "category": "brain",
             "details": {
+              "conversation": null,
               "fix": "preview links: gbrain facts relink --dry-run",
               "inferred_7d": {
                 "mention": 0,
                 "page": 0
               },
               "new_7d": {
+                "conversation_unresolved": 0,
                 "eligible": 3,
                 "facts": 3,
                 "no_subject": 0,
@@ -2411,6 +2585,7 @@
               "window": {
                 "active": 3,
                 "capped": false,
+                "conversation": 0,
                 "fence_owned": 0,
                 "unlinked": 0
               }
@@ -2979,6 +3154,29 @@
           {
             "category": "brain",
             "details": {
+              "by_source": [],
+              "count": 0,
+              "docs": "docs/guides/live-sync.md#renaming-a-page",
+              "samples": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No rename that lost its page identity is waiting for a disposition.",
+            "name": "rename_identity_downgrades",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "parked": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No soft-deleted page is parked by the managed purge.",
+            "name": "purge_parked_pages",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "count": 0,
               "docs": "docs/storage-tiering.md#restoring-a-page-whose-file-is-gone",
               "sources": []
@@ -2988,6 +3186,115 @@
             "name": "missing_recorded_files",
             "readiness_state": "not_applicable",
             "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#unindexed-files",
+              "sources": [
+                {
+                  "source_id": "default",
+                  "state": "missing"
+                },
+                {
+                  "source_id": "notes",
+                  "state": "missing"
+                },
+                {
+                  "source_id": "plain",
+                  "state": "missing"
+                }
+              ]
+            },
+            "elapsed_ms": "<volatile>",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "sources",
+                "retry-held",
+                "default",
+                "--unindexed",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain sources retry-held default --unindexed --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#unindexed-files",
+              "next": "run",
+              "requires_exclusive": false,
+              "then": {
+                "actor": "agent",
+                "argv": [
+                  "gbrain",
+                  "sync",
+                  "--source",
+                  "default",
+                  "--no-pull",
+                  "--brain",
+                  "host"
+                ],
+                "command": "gbrain sync --source default --no-pull --brain host",
+                "consent": [],
+                "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#unindexed-files",
+                "next": "run",
+                "requires_exclusive": false,
+                "verify": {
+                  "argv": [
+                    "gbrain",
+                    "doctor",
+                    "--only",
+                    "unindexed_files",
+                    "--json",
+                    "--brain",
+                    "host"
+                  ]
+                },
+                "why": "The sync re-screens the scheduled files of default: each one that passes imports, each one that refuses is recorded as a hold that gbrain sources status default lists."
+              },
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "unindexed_files",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Finds the committed files of default with no page and no hold (bounded; it continues an incomplete scan), schedules them for a re-screen and stores the result this check reads."
+            },
+            "message": "Unindexed files are not known for default (not computed yet), notes (not computed yet), plain (not computed yet). The maintenance phase unindexed_files computes them on each run and continues an incomplete scan; to compute them now, run gbrain sources retry-held <id> --unindexed.",
+            "name": "unindexed_files",
+            "readiness_state": "unknown",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/repair.md#overwritten-edits",
+              "sources": [],
+              "truncated": false,
+              "unknown": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No page shows a database edit that a sync import overwrote.",
+            "name": "sync_overwritten_db_edits",
+            "status": "ok"
+          },
+          {
+            "category": "meta",
+            "details": {
+              "rollback": [],
+              "unapplied": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No retired sync config key is stored on this brain.",
+            "name": "sync_config_keys",
             "status": "ok"
           },
           {
@@ -3439,7 +3746,7 @@
             "category": "meta",
             "details": {
               "counts": {
-                "global": 15,
+                "global": 16,
                 "mixed": 2,
                 "source": 12
               },
@@ -3472,11 +3779,12 @@
                 "standing_questions": "global",
                 "sync": "source",
                 "synthesize": "mixed",
-                "synthesize_concepts": "global"
+                "synthesize_concepts": "global",
+                "unindexed_files": "global"
               }
             },
             "elapsed_ms": "<volatile>",
-            "message": "Phase taxonomy: 12 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+            "message": "Phase taxonomy: 12 source-scoped, 16 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
             "name": "cycle_phase_scope",
             "status": "ok"
           },
@@ -3585,14 +3893,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "Active pack gbrain-base-v2@1.3.0+a50a67b9 is current (no successor declared)",
+            "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
             "name": "pack_upgrade_available",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "5 distinct typed values (pack gbrain-base-v2 declares 20)",
+            "message": "5 distinct typed values (pack gbrain-base-v2 declares 21)",
             "name": "type_proliferation",
             "status": "ok"
           },
@@ -3604,11 +3912,14 @@
             "status": "ok"
           }
         ],
+        "complete": true,
         "db_url_source": null,
+        "elapsed_ms": "<volatile>",
         "engine": "postgres",
         "health_score": 35,
         "schema_version": 2,
         "status": "unhealthy",
+        "tier": "standard",
         "top_issues": [
           {
             "action": {
@@ -3829,7 +4140,45 @@
             "tier": "symptom"
           },
           {
-            "fix": "Visible pages have missing or stale text projections; search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
+            "action": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--limit",
+                "4800",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain projections drain --limit 4800 --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#projection-drain",
+              "next": "run",
+              "preview_argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--dry-run",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "projections",
+                  "drain",
+                  "--dry-run",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Rebuilds queued Markdown and code projections and seals importer-attested image pages in place, at most 4800 pages per run; repeat until the dry run shows sealable 0."
+            },
+            "fix": "Visible pages have missing or stale text projections (1 queued Markdown/code page(s)); search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
             "name": "text_projection_readiness",
             "status": "warn",
             "tier": "symptom"
@@ -3866,9 +4215,11 @@
             "status": "warn",
             "tier": "symptom"
           }
-        ]
+        ],
+        "unknown_sections": []
       },
       "stderr": [
+        "[gbrain doctor] non-interactive run: the check run (not connect or migrations) is capped at 90000 ms (doctor.default_budget_ms); checks past it report health unknown. Off for one run: --budget-ms 0; off for good: gbrain config set doctor.default_budget_ms 0. On PGLite a statement already running cannot be stopped, so a check can finish late.",
         "[backup] checked 3 asset(s): 1 without a git remote (computed_by=doctor)"
       ],
       "stdout": "<json>"
@@ -3883,6 +4234,7 @@
       "exit_code": 1,
       "report": {
         "brain_checks_score": 45,
+        "budget_ms": "<volatile>",
         "capped_by": [
           "embeddings_disabled"
         ],
@@ -4378,18 +4730,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 196014,
+                    "max_day_7d": 196974,
                     "net_per_day_7d": 58822,
                     "pct": 0,
-                    "per_day_7d": 196014,
-                    "reclaimable_bytes": 137192,
+                    "per_day_7d": 196974,
+                    "reclaimable_bytes": 138152,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196014,
+                    "used": 196974,
                     "window_days": 1
                   },
                   {
@@ -4415,18 +4767,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 196014,
+                    "max_day_7d": 196974,
                     "net_per_day_7d": 58822,
                     "pct": 0,
-                    "per_day_7d": 196014,
-                    "reclaimable_bytes": 137192,
+                    "per_day_7d": 196974,
+                    "reclaimable_bytes": 138152,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196014,
+                    "used": 196974,
                     "window_days": 1
                   }
                 ],
@@ -4493,7 +4845,7 @@
               "unresolved": {
                 "distinct_intents": 0,
                 "distinct_slugs": 0,
-                "oldest_age_seconds": null,
+                "oldest_age_seconds": "<volatile>",
                 "rows": 0
               },
               "window_days": 7
@@ -4509,11 +4861,19 @@
               "count": 0,
               "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
               "parked": 0,
-              "sources": []
+              "sources": [],
+              "stranded": 0
             },
             "elapsed_ms": "<volatile>",
             "message": "No managed sync is pending.",
             "name": "managed_sync_not_moving",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "No managed sync run is blocked.",
+            "name": "managed_sync_blocked",
             "status": "ok"
           },
           {
@@ -4534,6 +4894,39 @@
             "elapsed_ms": "<volatile>",
             "message": "Receipt compaction last ran 0 hour(s) ago (compacted 0, freed 0 bytes).",
             "name": "persistence_compaction",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "by_day": [
+                {
+                  "content_decisions": 0,
+                  "day": "<soak-day>",
+                  "interventions": 1
+                }
+              ],
+              "content_decisions": {
+                "file_drift_apply": 0,
+                "file_drift_hold": 0,
+                "total": 0
+              },
+              "docs": "docs/guides/sync-unblock-runbook.md#soak-counters",
+              "interventions": {
+                "needs_human": 1,
+                "repair_apply": 0,
+                "retry_held": 0,
+                "sync_non_plain": 0,
+                "total": 1,
+                "unblock_apply": 0
+              },
+              "since": "<ts>",
+              "window_days": 7
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Last 7 days: 1 managed-sync intervention(s) (needs_human 1), 0 content decision(s).",
+            "name": "sync_soak_counters",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -4681,6 +5074,20 @@
             "status": "ok"
           },
           {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "Extraction lag not applicable (20 pages — too few to assess); 1 page(s) pending link extraction (gbrain extract --stale finishes them)",
+            "name": "links_extraction_lag",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "No large page has chunks waiting for embedding approval (held or capped by embed.max_usd_per_page).",
+            "name": "partial_embedding",
+            "status": "ok"
+          },
+          {
             "category": "ops",
             "elapsed_ms": "<volatile>",
             "message": "Extension installed",
@@ -4704,12 +5111,59 @@
           {
             "category": "brain",
             "details": {
+              "archived": 0,
+              "as_of": "<ts>+00",
+              "failed": 0,
+              "ocr_required": 0,
+              "oldest_age_seconds": "<volatile>",
+              "pending": 1,
+              "protected": 0,
               "readiness": "projection_pending",
-              "ready": false
+              "ready": false,
+              "reimport": 0,
+              "sealable": 0,
+              "sealable_with_visual": 0
             },
             "elapsed_ms": "<volatile>",
-            "fix_unavailable_reason": "unstructured",
-            "message": "Visible pages have missing or stale text projections; search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--limit",
+                "4800",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain projections drain --limit 4800 --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#projection-drain",
+              "next": "run",
+              "preview_argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--dry-run",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "projections",
+                  "drain",
+                  "--dry-run",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Rebuilds queued Markdown and code projections and seals importer-attested image pages in place, at most 4800 pages per run; repeat until the dry run shows sealable 0."
+            },
+            "message": "Visible pages have missing or stale text projections (1 queued Markdown/code page(s)); search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
             "name": "text_projection_readiness",
             "status": "warn"
           },
@@ -4786,7 +5240,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 145/145 public tables",
+            "message": "RLS enabled on 146/146 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -5154,12 +5608,16 @@
                 {
                   "name": "persistence_requests_slug_intent",
                   "state": "valid"
+                },
+                {
+                  "name": "persistence_requests_request_id",
+                  "state": "valid"
                 }
               ],
               "repair": "request-indexes"
             },
             "elapsed_ms": "<volatile>",
-            "message": "Managed sync request indexes are valid.",
+            "message": "Request-table indexes are valid.",
             "name": "persistence_request_indexes",
             "status": "ok"
           },
@@ -5392,6 +5850,18 @@
             "elapsed_ms": "<volatile>",
             "message": "Every ownership marker beside a source checkout belongs to this brain.",
             "name": "foreign_ownership_marker",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "checkouts": [],
+              "count": 0,
+              "docs": "docs/architecture/topologies.md#coordination-lock"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every checkout's recorded coordination lock agrees with GBRAIN_COORDINATION_HOME, or the variable does not apply.",
+            "name": "coordination_lock_location",
             "status": "ok"
           },
           {
@@ -5728,13 +6198,6 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "No large page is held or capped by embed.max_usd_per_page.",
-            "name": "partial_embedding",
-            "status": "ok"
-          },
-          {
-            "category": "brain",
-            "elapsed_ms": "<volatile>",
             "message": "No junk-pattern hits in 20 recent page(s) (use --content-audit for full scan)",
             "name": "scraper_junk_pages",
             "status": "ok"
@@ -5899,7 +6362,7 @@
             "category": "ops",
             "details": {
               "depth": 0,
-              "oldest_age_seconds": null,
+              "oldest_age_seconds": "<volatile>",
               "worker_alive": true
             },
             "elapsed_ms": "<volatile>",
@@ -6203,13 +6666,6 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "Extraction lag not applicable (20 pages — too few to assess); 1 page(s) pending link extraction (gbrain extract --stale finishes them)",
-            "name": "links_extraction_lag",
-            "status": "ok"
-          },
-          {
-            "category": "brain",
-            "elapsed_ms": "<volatile>",
             "message": "No full cycle yet for 'default', 'notes', 'plain': they hold no pages or only pages from the last 24h, so there is nothing to consolidate yet.",
             "name": "cycle_freshness",
             "readiness_state": "not_applicable",
@@ -6247,6 +6703,73 @@
           {
             "category": "brain",
             "details": {
+              "docs": "docs/guides/on-commit-sync.md",
+              "fail_seconds": 3600,
+              "graded": false,
+              "on_commit": false,
+              "sources": [
+                {
+                  "commit_to_embedded": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "pending": 0,
+                    "samples": 0
+                  },
+                  "commit_to_searchable": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "samples": 0
+                  },
+                  "commits": 0,
+                  "source_id": "default",
+                  "unresolved_commits": 0,
+                  "window_hours": 24
+                },
+                {
+                  "commit_to_embedded": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "pending": 0,
+                    "samples": 0
+                  },
+                  "commit_to_searchable": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "samples": 0
+                  },
+                  "commits": 0,
+                  "source_id": "notes",
+                  "unresolved_commits": 0,
+                  "window_hours": 24
+                },
+                {
+                  "commit_to_embedded": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "pending": 0,
+                    "samples": 0
+                  },
+                  "commit_to_searchable": {
+                    "p50_seconds": null,
+                    "p95_seconds": null,
+                    "samples": 0
+                  },
+                  "commits": 0,
+                  "source_id": "plain",
+                  "unresolved_commits": 0,
+                  "window_hours": 24
+                }
+              ],
+              "target_seconds": 300
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
+            "name": "managed_sync_latency",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "checkouts": 1,
               "tracked": []
             },
@@ -6265,12 +6788,14 @@
           {
             "category": "brain",
             "details": {
+              "conversation": null,
               "fix": "preview links: gbrain facts relink --dry-run",
               "inferred_7d": {
                 "mention": 0,
                 "page": 0
               },
               "new_7d": {
+                "conversation_unresolved": 0,
                 "eligible": 3,
                 "facts": 3,
                 "no_subject": 0,
@@ -6284,6 +6809,7 @@
               "window": {
                 "active": 3,
                 "capped": false,
+                "conversation": 0,
                 "fence_owned": 0,
                 "unlinked": 0
               }
@@ -6852,6 +7378,29 @@
           {
             "category": "brain",
             "details": {
+              "by_source": [],
+              "count": 0,
+              "docs": "docs/guides/live-sync.md#renaming-a-page",
+              "samples": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No rename that lost its page identity is waiting for a disposition.",
+            "name": "rename_identity_downgrades",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "parked": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No soft-deleted page is parked by the managed purge.",
+            "name": "purge_parked_pages",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "count": 0,
               "docs": "docs/storage-tiering.md#restoring-a-page-whose-file-is-gone",
               "sources": []
@@ -6861,6 +7410,115 @@
             "name": "missing_recorded_files",
             "readiness_state": "not_applicable",
             "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#unindexed-files",
+              "sources": [
+                {
+                  "source_id": "default",
+                  "state": "missing"
+                },
+                {
+                  "source_id": "notes",
+                  "state": "missing"
+                },
+                {
+                  "source_id": "plain",
+                  "state": "missing"
+                }
+              ]
+            },
+            "elapsed_ms": "<volatile>",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "sources",
+                "retry-held",
+                "default",
+                "--unindexed",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain sources retry-held default --unindexed --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#unindexed-files",
+              "next": "run",
+              "requires_exclusive": false,
+              "then": {
+                "actor": "agent",
+                "argv": [
+                  "gbrain",
+                  "sync",
+                  "--source",
+                  "default",
+                  "--no-pull",
+                  "--brain",
+                  "host"
+                ],
+                "command": "gbrain sync --source default --no-pull --brain host",
+                "consent": [],
+                "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#unindexed-files",
+                "next": "run",
+                "requires_exclusive": false,
+                "verify": {
+                  "argv": [
+                    "gbrain",
+                    "doctor",
+                    "--only",
+                    "unindexed_files",
+                    "--json",
+                    "--brain",
+                    "host"
+                  ]
+                },
+                "why": "The sync re-screens the scheduled files of default: each one that passes imports, each one that refuses is recorded as a hold that gbrain sources status default lists."
+              },
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "unindexed_files",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Finds the committed files of default with no page and no hold (bounded; it continues an incomplete scan), schedules them for a re-screen and stores the result this check reads."
+            },
+            "message": "Unindexed files are not known for default (not computed yet), notes (not computed yet), plain (not computed yet). The maintenance phase unindexed_files computes them on each run and continues an incomplete scan; to compute them now, run gbrain sources retry-held <id> --unindexed.",
+            "name": "unindexed_files",
+            "readiness_state": "unknown",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/repair.md#overwritten-edits",
+              "sources": [],
+              "truncated": false,
+              "unknown": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No page shows a database edit that a sync import overwrote.",
+            "name": "sync_overwritten_db_edits",
+            "status": "ok"
+          },
+          {
+            "category": "meta",
+            "details": {
+              "rollback": [],
+              "unapplied": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No retired sync config key is stored on this brain.",
+            "name": "sync_config_keys",
             "status": "ok"
           },
           {
@@ -7312,7 +7970,7 @@
             "category": "meta",
             "details": {
               "counts": {
-                "global": 15,
+                "global": 16,
                 "mixed": 2,
                 "source": 12
               },
@@ -7345,11 +8003,12 @@
                 "standing_questions": "global",
                 "sync": "source",
                 "synthesize": "mixed",
-                "synthesize_concepts": "global"
+                "synthesize_concepts": "global",
+                "unindexed_files": "global"
               }
             },
             "elapsed_ms": "<volatile>",
-            "message": "Phase taxonomy: 12 source-scoped, 15 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+            "message": "Phase taxonomy: 12 source-scoped, 16 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [fence_repair, content_repair, unindexed_files, resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, standing_questions, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
             "name": "cycle_phase_scope",
             "status": "ok"
           },
@@ -7458,14 +8117,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "Active pack gbrain-base-v2@1.3.0+a50a67b9 is current (no successor declared)",
+            "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
             "name": "pack_upgrade_available",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "5 distinct typed values (pack gbrain-base-v2 declares 20)",
+            "message": "5 distinct typed values (pack gbrain-base-v2 declares 21)",
             "name": "type_proliferation",
             "status": "ok"
           },
@@ -7477,11 +8136,14 @@
             "status": "ok"
           }
         ],
+        "complete": true,
         "db_url_source": null,
+        "elapsed_ms": "<volatile>",
         "engine": "postgres",
         "health_score": 35,
         "schema_version": 2,
         "status": "unhealthy",
+        "tier": "standard",
         "top_issues": [
           {
             "action": {
@@ -7702,7 +8364,45 @@
             "tier": "symptom"
           },
           {
-            "fix": "Visible pages have missing or stale text projections; search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
+            "action": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--limit",
+                "4800",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain projections drain --limit 4800 --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#projection-drain",
+              "next": "run",
+              "preview_argv": [
+                "gbrain",
+                "projections",
+                "drain",
+                "--dry-run",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "projections",
+                  "drain",
+                  "--dry-run",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Rebuilds queued Markdown and code projections and seals importer-attested image pages in place, at most 4800 pages per run; repeat until the dry run shows sealable 0."
+            },
+            "fix": "Visible pages have missing or stale text projections (1 queued Markdown/code page(s)); search and code results may be incomplete. Run `gbrain projections drain` to rebuild queued Markdown and code projections now; it is safe while `gbrain serve` runs on Postgres. For code metadata repair, run `gbrain reindex-code --force --no-embed`. If work stays pending, inspect the recorded source path. No repair or embedding was started by this check.",
             "name": "text_projection_readiness",
             "status": "warn",
             "tier": "symptom"
@@ -7739,9 +8439,12 @@
             "status": "warn",
             "tier": "symptom"
           }
-        ]
+        ],
+        "unknown_sections": []
       },
-      "stderr": [],
+      "stderr": [
+        "[gbrain doctor] non-interactive run: the check run (not connect or migrations) is capped at 90000 ms (doctor.default_budget_ms); checks past it report health unknown. Off for one run: --budget-ms 0; off for good: gbrain config set doctor.default_budget_ms 0. On PGLite a statement already running cannot be stopped, so a check can finish late."
+      ],
       "stdout": "<json>"
     }
   },

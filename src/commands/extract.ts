@@ -101,6 +101,8 @@ import { isAborted } from '../core/abort-check.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { loadAllSources } from '../core/sources-load.ts';
 import { plannerStatsForLinkDrain } from '../core/planner-stats.ts';
+import { STALE_TIME_BUDGET_MS, formatStaleCounts, staleExtractionCounts } from '../core/extraction-lag.ts';
+import { assertStaleSourceModeUnambiguous } from './extract-stale-options.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -117,12 +119,10 @@ const BATCH_SIZE = 100;
 // 25 caps the worst case at ~625MB even if every page is a 25MB transcript.
 // Normal pages are KBs; raise via GBRAIN_EXTRACT_STALE_BATCH for throughput.
 const STALE_BATCH_SIZE = Math.max(1, Number(process.env.GBRAIN_EXTRACT_STALE_BATCH) || 25);
-// v0.42.7: wall-clock budget for one `extract --stale` invocation (default
-// 30 min). `--catch-up` removes the cap (loops until 0 stale). Mirrors
-// embedAllStale's time-budget shape. Exported so the #2849 deferred-sweep
-// submitters (sync's size-gate defer branch + the jobs continuation chain)
-// derive their job timeout_ms from the SAME budget instead of hardcoding.
-export const STALE_TIME_BUDGET_MS = Math.max(1000, Number(process.env.GBRAIN_EXTRACT_TIME_BUDGET_MS) || 30 * 60 * 1000);
+// v0.42.7: wall-clock budget for one `extract --stale` invocation (default 30 min; `--catch-up` removes it). It lives
+// with the shared extraction-lag read (#6803) so doctor's and the sync nudge's estimates use it; re-exported for the
+// #2849 deferred-sweep submitters, which derive their job timeout_ms from it.
+export { STALE_TIME_BUDGET_MS };
 
 /**
  * v0.42.7 (#1696): best-effort extraction stamp for the source-correct write
@@ -879,11 +879,11 @@ Incremental sweep:
 ${ATTENDANCE_REPAIR_HELP}
   gbrain extract --stale [--source-id <id>] [--include-frontmatter]
                          [--catch-up] [--dry-run] [--json]
-      Re-extract links + timeline only for stale pages, then run the mention
-      pass: refresh entity pages' declared aliases and title subjects and link
-      every page that names an entity (link_source='mentions'). DB-source;
-      safe to cron. --catch-up loops past the 30-minute budget until none
-      remain. Off: gbrain config set mentions.auto_link false.
+      Re-extract links + timeline for stale pages, then the mention pass (entity
+      aliases and title subjects; link_source='mentions'; off: gbrain config set
+      mentions.auto_link false). DB-source; safe to cron; 30 min per run, the next
+      resumes; --catch-up runs until none remain. Scope with --source-id (--source
+      is fs|db). Done when --dry-run --json reports actionable 0 and mention_due 0.
 
 Inspection:
   gbrain extract mentions --explain <name|slug> [--page <slug>] [--source-id <id>] [--json]
@@ -962,15 +962,8 @@ export async function runExtract(engine: BrainEngine, args: string[], authority?
   // works with no subcommand (and `gbrain extract all --stale` too). DB-source
   // only — reads page content from the DB so it runs on checkout-less brains.
   if (args.includes('--stale')) {
-    const sIdx = args.indexOf('--source');
-    const src = (sIdx >= 0 && sIdx + 1 < args.length) ? args[sIdx + 1] : 'db';
-    if (src === 'fs') {
-      console.error(
-        `extract --stale is DB-source only (reads page content from the database\n` +
-        `so it works on checkout-less brains). Drop '--source fs' or pass '--source db'.`,
-      );
-      process.exit(1);
-    }
+    // #6803 (D2): --source fs|<id> was refused before connecting (extract-stale-options.ts); --source db is ambiguous only when a source is named db.
+    await assertStaleSourceModeUnambiguous(engine, args);
     const sidIdx = args.indexOf('--source-id');
     const staleSourceId = (sidIdx >= 0 && sidIdx + 1 < args.length) ? args[sidIdx + 1] : undefined;
     await extractStaleFromDB(engine, {
@@ -2112,11 +2105,11 @@ export async function extractStaleFromDB(
   // Pre-flight count — cheap indexed COUNT. dry-run reports and returns.
   const totalStale = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
   if (dryRun) {
-    const m = await previewMentionPass(engine, sourceIdFilter);
+    const m = await previewMentionPass(engine, sourceIdFilter), counts = opts.quiet ? null : await staleExtractionCounts(engine, sourceIdFilter);
     if (jsonMode && !opts.quiet) {
-      process.stdout.write(JSON.stringify({ action: 'extract_stale_dry_run', stale_pages: totalStale, mention_due_pages: m.due, mention_last_pass_at: m.last_pass_at }) + '\n');
+      process.stdout.write(JSON.stringify({ action: 'extract_stale_dry_run', stale_pages: totalStale, mention_due_pages: m.due, mention_last_pass_at: m.last_pass_at, ...counts }) + '\n');
     } else {
-      log(`(dry run) ${totalStale} page(s) need link/timeline extraction; ${m.due} page(s) need a mention pass (last pass: ${m.last_pass_at ?? 'never'}). Run without --dry-run to extract.`);
+      log(`(dry run) ${totalStale} page(s) need link/timeline extraction; ${m.due} page(s) need a mention pass (last pass: ${m.last_pass_at ?? 'never'}). Run without --dry-run to extract.${counts ? `\n${formatStaleCounts(counts)}` : ''}`);
     }
     return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0, staleRemaining: totalStale + m.due };
   }
@@ -2124,8 +2117,8 @@ export async function extractStaleFromDB(
   // canonical timeline rows and the watermark publish on the one managed path
   // (the mention pass runs inside it).
   if (await managedPersistenceEnabled(engine)) {
-    const { extractManagedStaleLinks, formatManagedStaleExtraction } = await import('../core/persistence/links-maintenance.ts');
-    const r = await extractManagedStaleLinks(engine, { sourceId: sourceIdFilter, ...(catchUp ? {} : { timeBudgetMs }) });
+    const { runManagedStaleExtraction, formatManagedStaleExtraction } = await import('../core/persistence/links-maintenance.ts');
+    const r = await runManagedStaleExtraction(engine, { sourceId: sourceIdFilter, catchUp, timeBudgetMs, counts: !opts.quiet });
     if (!jsonMode) log(formatManagedStaleExtraction(r, false, false));
     else if (!opts.quiet) process.stdout.write(formatManagedStaleExtraction(r, false, true) + '\n');
     return { linksCreated: r.created, timelineCreated: r.timeline, pagesProcessed: r.pages, staleRemaining: r.remaining + (r.mentions?.remaining ?? 0),
@@ -2314,6 +2307,7 @@ export async function extractStaleFromDB(
   if (packUnavailable) throw new Error('Cannot extract links: active schema pack is unavailable.');
   const mentions = await runMentionPass(engine, { sourceId: sourceIdFilter, ...(catchUp ? {} : { deadline: startMs + timeBudgetMs }) });
   const staleRemaining = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs }) + mentions.remaining;
+  const counts = opts.quiet ? null : await staleExtractionCounts(engine, sourceIdFilter);
 
   if (!jsonMode) {
     const mentionLine = formatMentionSummary(mentions);
@@ -2332,13 +2326,14 @@ export async function extractStaleFromDB(
     if (budgetHit && staleRemaining > 0) {
       log(`Time budget reached — ${staleRemaining} page(s) still stale. Re-run 'gbrain extract --stale' (or pass --catch-up) to continue.`);
     }
+    if (counts) log(formatStaleCounts(counts));
   } else if (!opts.quiet) {
     process.stdout.write(JSON.stringify({
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
       skipped_missing_target: skippedMissingTarget, skipped_cross_source: skippedCrossSource,
       ...(skippedAttendanceIncomplete ? { skipped_attendance_incomplete: skippedAttendanceIncomplete } : {}), ...(skippedChanged ? { skipped_changed: skippedChanged } : {}),
-      ...(skippedConcurrentWrite ? { skipped_concurrent_write: skippedConcurrentWrite } : {}), ...mentionJsonFields(mentions),
+      ...(skippedConcurrentWrite ? { skipped_concurrent_write: skippedConcurrentWrite } : {}), ...mentionJsonFields(mentions), ...counts,
     }) + '\n');
   }
   return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource,

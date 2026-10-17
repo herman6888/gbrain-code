@@ -30,6 +30,7 @@ import { loadPageTrust } from '../eligibility/stamp.ts';
 import { loadRelationshipNotes, relationshipNoteKey } from '../link-relationship-notes.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { slugify } from '../entities/resolve.ts';
+import { exactMatchPreference } from '../entities/exact-match-preference.ts';
 import { safeSynopsis } from '../context/retrieval-reflex.ts';
 import { stampEvidence, markKeywordHits } from '../search/evidence.ts';
 import type { Link, SearchResult } from '../types.ts';
@@ -48,7 +49,7 @@ const OPEN_THREADS_CAP = 3;
 const OPEN_THREAD_TIMELINE_WINDOW_DAYS = 90;
 const SUGGESTION_CAP = 3;
 const FACT_FETCH_CAP = 100;
-const RECENT_FACTS_CAP = 5;
+export const RECENT_FACTS_CAP = 5;
 
 export interface EntityCardEdge {
   type: string;
@@ -82,7 +83,8 @@ export interface EntityOpenThread {
 }
 
 export interface EntityCard {
-  entity: { slug: string; title: string; type: string | null };
+  /** #6723: `source_id` is the source the page lives in; (source_id, slug) is the entity's identity. */
+  entity: { slug: string; title: string; type: string | null; source_id: string };
   /** page_aliases reverse lookup (normalized forms). Empty on pre-migration brains. */
   aka: string[];
   /** Privacy-safe synopsis — same fence boundary as get_page. */
@@ -158,6 +160,8 @@ export interface EntitySuggestion {
   slug: string;
   title: string;
   create_safety: string;
+  /** #6723: the source the suggested page lives in. */
+  source_id?: string;
 }
 
 export interface EntityCardResult {
@@ -166,10 +170,24 @@ export interface EntityCardResult {
   suggestions?: EntitySuggestion[];
   /** On a miss with `includeReferences`: the source's mention coverage (a miss may be a not-yet-indexed name). */
   coverage?: MentionCoverage;
+  /** #6723: the source of the resolved page (absent on a miss). */
+  source_id?: string;
+  /**
+   * #6724: the full fact rows the card read (newest first, visibility and
+   * eligibility already applied), for context_pack's `entity_facts`. Never part
+   * of the card: the `entity` verb does not return it.
+   */
+  factRows?: FactRow[];
 }
 
 export interface EntityCardOpts {
   remote: boolean;
+  /**
+   * #6723: the sources to resolve the name in, probed in this order (home
+   * first); the first source with a hit owns the card and every read behind
+   * it. Absent: the positional source alone.
+   */
+  sources?: readonly string[];
   /**
    * Compute `referenced_by`, `referenced_by_count` and `coverage` (the `entity`
    * verb). Ambient callers (context_pack, delta) leave it off.
@@ -254,7 +272,7 @@ export async function selectEntityCandidates(
   sourceId: string,
   trimmed: string,
   scope: EntityLookupScope,
-  opts: { omitQuarantined?: boolean } = {},
+  opts: { omitQuarantined?: boolean; suggest?: boolean } = {},
 ): Promise<EntityCandidates> {
   const { privatePagesFilterFragment } = await import('../search/private-visibility.ts');
   // Predicate text lives ONCE (private-visibility.ts) — both card queries
@@ -350,7 +368,9 @@ export async function selectEntityCandidates(
     if (live.length === 0) return { kind: 'withheld' };
     candidates.splice(0, candidates.length, ...live);
   }
-  if (candidates.length === 0) return { kind: 'miss', suggestions: await nearMissSuggestions(engine, sourceId, trimmed, scope.excludePrivate) };
+  if (candidates.length === 0) {
+    return { kind: 'miss', suggestions: opts.suggest === false ? [] : await nearMissSuggestions(engine, sourceId, trimmed, scope.excludePrivate) };
+  }
 
   // Large pages: the hit carries a bounded, withdrawal-overlaid body prefix (its summary and lead read only that).
   const [row] = await overlaidBoundedRows(engine, [candidates[0].row]);
@@ -362,8 +382,34 @@ export async function selectEntityCandidates(
       title: c.row.title ?? c.slug,
       // A page that resolved through the precision arms exists by definition.
       create_safety: 'exists',
+      source_id: sourceId,
     })),
   };
+}
+
+/**
+ * #6723: resolve a name across sources in the given order (home first, then
+ * the rest of the caller's grant). The first source with a hit owns the
+ * result; a source is read with its own lookup scope (pack, linkable types).
+ * Without a hit anywhere, the first source's miss (its near-miss suggestions)
+ * or withheld result is returned. Sources outside the list are never read.
+ */
+export async function selectAcrossSources(
+  engine: BrainEngine,
+  sources: readonly string[],
+  trimmed: string,
+  remote: boolean,
+  opts: { omitQuarantined?: boolean; scopes?: Map<string, Promise<EntityLookupScope>> } = {},
+): Promise<{ sourceId: string; scope: EntityLookupScope; selected: EntityCandidates }> {
+  let first: { sourceId: string; scope: EntityLookupScope; selected: EntityCandidates } | undefined;
+  for (const sourceId of sources) {
+    if (opts.scopes && !opts.scopes.has(sourceId)) opts.scopes.set(sourceId, entityLookupScope(engine, sourceId, remote));
+    const scope = await (opts.scopes?.get(sourceId) ?? entityLookupScope(engine, sourceId, remote));
+    const selected = await selectEntityCandidates(engine, sourceId, trimmed, scope, { omitQuarantined: opts.omitQuarantined, suggest: first === undefined });
+    if (selected.kind === 'hit') return { sourceId, scope, selected };
+    first ??= { sourceId, scope, selected };
+  }
+  return first!;
 }
 
 export async function buildEntityCard(
@@ -376,33 +422,31 @@ export async function buildEntityCard(
   if (!trimmed) return { found: false, suggestions: [] };
 
   // Covers entity, context_pack, and delta (all route through buildEntityCard).
-  const scope = await entityLookupScope(engine, sourceId, opts.remote);
-  const selected = await selectEntityCandidates(engine, sourceId, trimmed, scope, { omitQuarantined: opts.omitQuarantined });
+  // #6723: the source with the hit owns the card; every read below uses it.
+  const sources = opts.sources?.length ? opts.sources : [sourceId];
+  const { sourceId: hitSource, scope, selected } = await selectAcrossSources(engine, sources, trimmed, opts.remote, { omitQuarantined: opts.omitQuarantined });
   if (selected.kind === 'withheld') return { found: false, suggestions: [] };
   if (selected.kind === 'miss') {
     return {
       found: false, suggestions: selected.suggestions,
-      ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [sourceId]).catch(() => undefined) } : {}),
+      ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [...sources]).catch(() => undefined) } : {}),
     };
   }
 
   const { row, runnersUp } = selected;
-  const card = await assembleCard(engine, sourceId, row, opts.remote, scope.excludePrivate, opts.eligibility ?? {});
+  const { card, facts: factRows } = await assembleCard(engine, hitSource, row, opts.remote, scope.excludePrivate, opts.eligibility ?? {});
   if (opts.includeReferences) {
-    Object.assign(card, await cardReferences(engine, sourceId, row, opts, scope.excludePrivate, scope.entityTypes),
-      await readCardIdentity(engine, sourceId, row, { excludePrivate: scope.excludePrivate, excludeQuarantined: opts.omitQuarantined === true, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
-    await attachCardRecords(engine, sourceId, card, opts, scope.excludePrivate);
+    Object.assign(card, await cardReferences(engine, hitSource, row, opts, scope.excludePrivate, scope.entityTypes),
+      await readCardIdentity(engine, hitSource, row, { excludePrivate: scope.excludePrivate, excludeQuarantined: opts.omitQuarantined === true, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
+    await attachCardRecords(engine, hitSource, card, opts, scope.excludePrivate);
   }
   return {
     found: true,
     card,
+    source_id: hitSource,
+    factRows,
     ...(runnersUp.length ? { suggestions: runnersUp } : {}),
   };
-}
-
-function exactMatchPreference(row: CardPageRow, exactSlugs: string[], entityTypes: ReadonlySet<string>): number {
-  if (exactSlugs.includes(row.slug)) return 0;
-  return entityTypes.has(row.type ?? '') ? 1 : 2;
 }
 
 /**
@@ -454,7 +498,7 @@ async function assembleCard(
   remote: boolean,
   excludePrivate: boolean,
   eligibility: ReadEligibility,
-): Promise<EntityCard> {
+): Promise<{ card: EntityCard; facts: FactRow[] }> {
   const pageSlug = row.slug;
   const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
   // Facts saved about this entity may sit under a sibling page or the bare subject slug (siblings.ts).
@@ -570,8 +614,11 @@ async function assembleCard(
     // belongs to this card when its counterparty page is THIS (source, slug):
     // a Gmail-source loop whose person page lives in `default` shows on the
     // default card, a pre-v236 row (NULL counterparty source) on its own
-    // source's card (#5504).
-    const loopRows = await engine.executeRaw<{
+    // source's card (#5504). Loops carry no visibility or grant of their own
+    // (summaries derive from private mail, often another source), so a
+    // world-only card never reads them; open_loops serves remote callers
+    // inside their grant.
+    const loopRows = remote ? [] : await engine.executeRaw<{
       id: number;
       loop_type: string;
       summary: string;
@@ -634,8 +681,8 @@ async function assembleCard(
   }
 
   const pageTrust = (await loadPageTrust(engine, [{ source_id: sourceId, slug: pageSlug }]).catch(() => null))?.byKey.get(`${sourceId}\u0000${pageSlug}`);
-  return {
-    entity: { slug: pageSlug, title: row.title ?? pageSlug, type: row.type ?? null },
+  return { facts, card: {
+    entity: { slug: pageSlug, title: row.title ?? pageSlug, type: row.type ?? null, source_id: sourceId },
     ...(pageTrust ?? { trust_tier: 'unknown' as const, origin: 'unrecorded' }),
     ...(isQuarantined(row.frontmatter) ? { quarantined: true as const } : {}),
     aka,
@@ -656,7 +703,7 @@ async function assembleCard(
       id: String(f.id), fact: f.fact, kind: f.kind, valid_from: f.valid_from ? toIso(f.valid_from as Date | string) : null,
       ...(f.entity_slug && f.entity_slug !== pageSlug ? { entity_slug: f.entity_slug } : {}),
     })) } : {}),
-  };
+  } };
 }
 
 /** The card's `aka`: the page's normalized aliases (page_aliases reverse lookup); empty on a pre-migration brain. */
@@ -695,6 +742,7 @@ async function nearMissSuggestions(
       slug: r.slug,
       title: r.title ?? r.slug,
       create_safety: r.create_safety ?? 'unknown',
+      source_id: r.source_id ?? sourceId,
     }));
   } catch {
     return [];

@@ -41,30 +41,56 @@ export interface SyncFaultRule {
 
 /** #6340: a hold earned at or after this many re-holds of one path says the page keeps moving under the sync. */
 export const HOLD_ATTEMPTS_NEEDS_HUMAN = 3;
+/**
+ * #6712 PR 2 (L4): and only once this long has passed since the path was first held with its code, so a burst of re-holds
+ * (three syncs in ten minutes) never pages a person; a live `worktree_dirty` editor and image holds never escalate.
+ */
+export const HOLD_ESCALATE_MS = 24 * 60 * 60 * 1000;
+const ESCALATE_AFTER = `${HOLD_ATTEMPTS_NEEDS_HUMAN} failed attempts over ${HOLD_ESCALATE_MS / 3_600_000} h`;
 
 export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
   // Page class: one entry, held; the run finished.
   { code: 'worktree_dirty', class: 'page', safe_actions: ['retry_when_clean'], needs_human: false,
-    escalate: `held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times: the file keeps changing without being committed`, human_reason: 'Someone (or an agent) keeps editing the file without committing it; find out who and commit or restore it.' },
+    escalate: `${ESCALATE_AFTER} with no edit in the last ${HOLD_ESCALATE_MS / 3_600_000} h: the uncommitted edit is abandoned`, human_reason: 'An uncommitted edit of the file has sat in the checkout for a day without being committed; find out who made it and commit or restore it.' },
   { code: 'concurrent_write', class: 'page', safe_actions: ['reconcile'], needs_human: true, escalate: 'always: the file and the database page diverge',
     human_reason: 'The Git file and the database page both changed; a person chooses which version wins (gbrain sources reconcile <source> <slug> --preview shows both and writes nothing).' },
   { code: 'file_drift', class: 'page', safe_actions: ['reconcile'], needs_human: true, escalate: 'always: the page changed in the database since its file was last imported',
     human_reason: 'The database page moved since sync last imported its file, and importing would replace it; a person chooses which version wins (gbrain repair file-drift --source <source> --slug <slug> --prefer database|file previews it and writes nothing until applied).' },
   { code: 'preparation_stalled', class: 'page', safe_actions: ['retry', 'upgrade'], needs_human: false,
-    escalate: `held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times, or writer status names a step that never finishes`, human_reason: 'The write owner cannot finish preparing this file; writer status names the step, fix or report it.' },
+    escalate: `${ESCALATE_AFTER}, or writer status names a step that never finishes`, human_reason: 'The write owner cannot finish preparing this file; writer status names the step, fix or report it.' },
   { code: 'invalid_fence', class: 'page', safe_actions: ['repair'], needs_human: false, escalate: 'the fence repair preview offers no plan (a manual reason)', human_reason: 'Edit the facts or takes table the hold names and commit.' },
   { code: 'invalid_frontmatter', class: 'page', safe_actions: ['repair'], needs_human: false, escalate: 'the repair preview needs an interpretation (--include-ambiguous)', human_reason: 'Approve the proposed frontmatter fix or edit the file.' },
-  { code: 'frontmatter_slug_conflict', class: 'page', safe_actions: ['repair'], needs_human: false, escalate: 'the repair preview needs an interpretation', human_reason: 'Decide which page keeps the slug.' },
+  { code: 'frontmatter_slug_conflict', class: 'page', safe_actions: ['repair'], needs_human: false, escalate: 'the lane recorded why it could not decide', human_reason: 'The content-repair lane could not clear the hold; its recorded verdict names the page, edit or setting.' },
   { code: 'rename_held', class: 'page', safe_actions: ['repair'], needs_human: false, escalate: 'the repair preview needs an interpretation', human_reason: 'Approve re-binding the rename to the current page.' },
   { code: 'file_too_large', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The file is over the page size limit; exclude it with sync.exclude, or split it into files under the limit.' },
   { code: 'content_rejected', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The content-sanity gate rejected the file; remove the junk or change junk_disposition.' },
   { code: 'parser_regression', class: 'page', safe_actions: ['upgrade'], needs_human: true, escalate: 'always: a gbrain bug', human_reason: 'Report the file and gbrain version, then upgrade or pin the last good release.' },
   { code: 'managed_image_sync_unsupported', class: 'page', safe_actions: ['none'], needs_human: false, escalate: 'never: images stay held while multimodal embedding is off', human_reason: 'Leave images held, exclude them with sync.exclude, or set GBRAIN_EMBEDDING_MULTIMODAL=true so the next sync imports them.' },
+  // #6712 PR 2 (L4): two content refusals that hold the file; only the owner or the user changes the outcome.
+  { code: 'purged_content', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always: only the owner clears a purge tombstone',
+    human_reason: 'The file carries content the owner purged; delete or edit the file and commit, or (only if the purge was a mistake) the owner clears it with gbrain pages unpurge <slug> --source <source> on the brain host.' },
+  { code: 'write_gate_rejected', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always: write_gate.external_mode=reject is the user\'s setting',
+    human_reason: 'The write gate refuses the file\'s external instruction-like content under write_gate.external_mode=reject; the user decides whether to edit the file or switch the setting back to quarantine.' },
+  // #6727: pages an older gbrain imported without recording their file fold to the file's slug, several or one sync cannot write; a person decides.
+  { code: 'legacy_slug_conflict', class: 'page', safe_actions: ['none'], needs_human: true, escalate: 'always: only a person decides which legacy page the file takes over',
+    human_reason: 'Pages an older gbrain imported without recording their file match this file and sync cannot pick one to import into; a person keeps the one that is its page and removes the others (gbrain delete --source <source> -- <slug>), or renames the file, then syncs.' },
   // Older releases recorded these as run failures; a rerun on this release holds the page instead.
   { code: 'revision_conflict', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
   { code: 'page_identity_changed', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
   { code: 'pinned_git_worktree_conflict', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
   { code: 'source_changed', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun' },
+  // #6712 PR 2 (L4): `source_changed` refined by its recorded reason (`detail`); an admission race (`pending_import`, a file that moved
+  // between freeze and publication) keeps the retry above, two-sided drift and a missing file need a decision, a binding change an inspection.
+  { code: 'pending_import', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path refuses again after a sync imported its file' },
+  { code: 'raw_file_changed', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same path fails again after a rerun re-freezes it' },
+  { code: 'file_database_drift', class: 'page', safe_actions: ['reconcile'], needs_human: true, escalate: 'always: the file and the database page diverge',
+    human_reason: 'The canonical file and the database page both changed; a person chooses which version wins (gbrain repair file-drift --source <source> --slug <slug> --prefer database|file previews it and writes nothing until applied).' },
+  { code: 'canonical_file_missing', class: 'page', safe_actions: ['repair'], needs_human: true, escalate: 'always: no sync can import a file that is not there',
+    human_reason: 'The page is live but its canonical file is gone (a ghost page); a person restores the file and syncs, or removes the page (gbrain repair ghost-pages --source <source> previews it and writes nothing).' },
+  { code: 'source_binding_changed', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always: the source or its checkout binding moved',
+    human_reason: 'The source was replaced, archived or re-bound under the write; inspect it with gbrain sources writer status --source <source> --json before anything is resubmitted.' },
+  { code: 'unsafe_file_target', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always: the file target resolves outside its source',
+    human_reason: 'The canonical file target resolves outside its source (a symlink or a moved checkout); inspect the checkout with gbrain sources writer status --source <source> --json, then the user decides how to repair it.' },
   { code: 'cancelled', class: 'page', safe_actions: ['retry'], needs_human: false, escalate: 'the same group is cancelled again after a rerun' },
   // #6643: refinements of `cancelled` / `revision_conflict` by the receipt's recorded cause; they take precedence over the code.
   // #6712 retired both producers (one page, one fate); the rows render what older builds wrote as superseded.
@@ -104,7 +130,7 @@ export const SYNC_FAULT_TABLE: ReadonlyArray<SyncFaultRule> = [
   { code: 'plan_stale', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The approved company-brain manifest changed; inspect and approve the repository again.' },
   // #6694: the source's pinned slug-root mode changed under a run of a subdirectory source; the checkpoint waits for the choice.
   { code: 'slug_root_mode_mismatch', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always: the two modes give different slugs',
-    human_reason: 'The source pins one slug-root mode and the sync ran under the other. A person chooses: set sources.config.slug_root_mode back to the mode the run used and rerun gbrain sync --no-pull --source <source> (the checkpoint is retried by itself), or keep the pin and run gbrain sync --no-pull --source <source> --retry-failed (the pages the refused run wrote keep their old slugs beside the new ones).' },
+    human_reason: 'The source pins one slug-root mode and the sync ran under the other. A person chooses: set sources.config.slug_root_mode back to the mode the run used and rerun gbrain sync --no-pull --source <source> (the checkpoint is retried by itself), or keep the pin, retire the refused cursor with gbrain repair managed-sync-orphans --source <source> (preview, then apply with its hash) and rerun the sync (the pages the refused run wrote keep their old slugs beside the new ones).' },
   { code: 'invalid_params', class: 'systemic', safe_actions: ['none'], needs_human: true, escalate: 'always', human_reason: 'The resume options conflict with the stored cursor; use the resume command the error prints.' },
   // #6518: bookkeeping of an incarnation the source no longer has; a retry selects a different key, so only the repair clears it.
   { code: 'cursor_incarnation_retired', class: 'systemic', safe_actions: ['repair'], needs_human: false, escalate: 'the repair preview lists nothing to retire, or the same code returns after the apply' },
@@ -121,6 +147,45 @@ export interface ContentRepairHoldInput {
   type?: string;
   path: string;
   slug: string | null;
+  /** #6865: the lane version that recorded the verdict, the other frontmatter fix codes (`still_invalid`), a named page with no file. */
+  lane_version?: number;
+  other_codes?: string[];
+  named_db_only?: true;
+}
+
+/** #6865: the content-repair lane's verdict version; a verdict an older lane recorded (or one with none) is rechecked once, never shown as a person's decision. */
+export const CONTENT_REPAIR_LANE_VERSION = 2;
+
+/** Whether this release's lane recorded the verdict. */
+export function contentRepairLaneCurrent(state: { lane_version?: number } | null | undefined): boolean {
+  return (state?.lane_version ?? 1) >= CONTENT_REPAIR_LANE_VERSION;
+}
+
+const SLUG_PAID: ReadonlySet<string> = new Set(['llm_disabled', 'budget_exhausted', 'no_measured_model', 'no_pricing']);
+const SLUG_TRANSIENT: ReadonlySet<string> = new Set(['llm_unavailable', 'ledger_unavailable', 'sync_in_progress', 'claimed_elsewhere', 'changed_since_read', 'changed_since_preview']);
+
+/**
+ * #6865: what a person does about a slug-conflict hold, from what the lane actually found; undefined while an agent or the
+ * lane itself can still clear it (no verdict yet, an older lane's verdict awaiting its recheck, a transient retry), so the
+ * attempts escalation never names a person then. "Decide which page keeps the slug" only when the line names a live page.
+ */
+export function slugConflictEscalation(input: ContentRepairHoldInput | null | undefined): string | undefined {
+  if (!input || !contentRepairLaneCurrent(input) || SLUG_TRANSIENT.has(input.reason)) return undefined;
+  const named = input.named ? `page \`${input.named}\`${input.named_db_only ? ' (a database-only page with no file)' : ''}` : null;
+  if (input.action === 'pending') {
+    if (!SLUG_PAID.has(input.reason)) return undefined;
+    return `\`${input.path}\` declares the slug of ${named ?? 'the page its slug: line names'}; whether they are the same page needs the content-repair model, which waits on a setting only the user changes (${input.reason}). `
+      + `Allow it, or decide which page keeps the slug: delete the slug: line of \`${input.path}\` if they differ, or merge them and delete the duplicate, then commit.`;
+  }
+  if (input.action !== 'remove_slug') return undefined;
+  if (input.reason === 'still_invalid') {
+    return `Removing the slug: line of \`${input.path}\` alone leaves it unimportable${input.other_codes?.length ? ` (the frontmatter also needs ${input.other_codes.join(', ')})` : ''}; `
+      + `the user approves the frontmatter fix (gbrain repair frontmatter --only ${input.path} --include-ambiguous previews it and writes nothing) or edits the file.`;
+  }
+  if (input.reason === 'slug_page_mismatch') {
+    return `Sync files \`${input.path}\` as page \`${input.slug ?? '?'}\`, which its slug: line does not name exactly; make the line name that slug or move the file, then commit.`;
+  }
+  return `gbrain decided to remove the slug: line of \`${input.path}\` but could not write it (${input.reason}); delete the line by hand and commit.`;
 }
 
 /**
@@ -140,7 +205,7 @@ export function contentRepairHumanReason(input: ContentRepairHoldInput): string 
       + 'the hold clears on the next sync after the file is removed. gbrain does not merge pages by itself yet.';
   }
   if (input.action === 'needs_human') {
-    return `gbrain could not decide whether \`${input.path}\`${other ? ` and page \`${other}\`` : ' and the page its slug: line names'} are the same page; decide which keeps the slug: `
+    return `gbrain could not decide whether \`${input.path}\`${other ? ` and page \`${other}\`${input.named_db_only ? ' (a database-only page with no file)' : ''}` : ' and the page its slug: line names'} are the same page; decide which keeps the slug: `
       + `remove the slug: line of \`${input.path}\` if they differ, or merge them by hand and delete the duplicate, then commit; the hold clears on the next sync.`;
   }
   return undefined;
@@ -149,20 +214,28 @@ export function contentRepairHumanReason(input: ContentRepairHoldInput): string 
 export interface SyncFaultVerdict { class: SyncFaultClass; safe_actions: SyncSafeAction[]; needs_human: boolean; human_reason?: string }
 
 /**
- * The verdict for one fault. `attempts` is a hold's re-hold count: a page held `HOLD_ATTEMPTS_NEEDS_HUMAN` times with the
- * same code keeps moving under the sync, so its own safe action is exhausted and a person is named. `detail` is a receipt's
+ * The verdict for one fault. `attempts` is a hold's failed-attempt count (re-holds plus failed safe actions): a page held
+ * `HOLD_ATTEMPTS_NEEDS_HUMAN` times with the same code for at least `HOLD_ESCALATE_MS` (`held_for_ms`) keeps moving under the
+ * sync, so its own safe action is exhausted and a person is named; a live editor (`live_editor`) is never escalated. `detail` is a receipt's
  * `reason` (for example `pinned_git_worktree_conflict` under `source_changed`) or a drain stop's `cause`; it refines the code
  * when the table knows it. `content_repair` is a slug-conflict hold's recorded verdict: a recommended merge or an
  * undecidable pair names a person. An unknown code is systemic and human: an agent must not guess at it.
  */
-export function classifySyncFault(input: { code: string; detail?: string | null; attempts?: number | null; message?: string | null; content_repair?: ContentRepairHoldInput | null }): SyncFaultVerdict {
-  const judged = input.content_repair && input.code === 'frontmatter_slug_conflict' ? contentRepairHumanReason(input.content_repair) : undefined;
+export function classifySyncFault(input: { code: string; detail?: string | null; attempts?: number | null; message?: string | null; content_repair?: ContentRepairHoldInput | null;
+  /** #6712 PR 2: how long ago the path was first held with this code (`holdEscalation`); escalation needs `HOLD_ESCALATE_MS`. */
+  held_for_ms?: number | null;
+  /** #6712 PR 2: a `worktree_dirty` hold whose uncommitted bytes changed within `HOLD_ESCALATE_MS`: someone is still editing. */
+  live_editor?: boolean }): SyncFaultVerdict {
+  const slugRepair = input.code === 'frontmatter_slug_conflict' ? input.content_repair : undefined;
+  const judged = slugRepair && contentRepairLaneCurrent(slugRepair) ? contentRepairHumanReason(slugRepair) : undefined;
   if (judged) return { class: 'page', safe_actions: ['none'], needs_human: true, human_reason: judged };
+  const slugHuman = input.code === 'frontmatter_slug_conflict' ? slugConflictEscalation(slugRepair) : undefined;
   const rule = (input.detail ? BY_CODE.get(input.detail) : undefined) ?? BY_CODE.get(input.code)
     ?? (/ECONN|ETIMEDOUT|EPIPE|connection.*closed|CONNECTION_ENDED/i.test(input.message ?? '') ? BY_CODE.get('connection_lost') : undefined);
   if (!rule) return { class: 'systemic', safe_actions: ['none'], needs_human: true, human_reason: `Unknown code ${input.code}; run gbrain doctor --json and read gbrain errors ${input.code}.` };
-  const exhausted = !rule.needs_human && (input.attempts ?? 0) >= HOLD_ATTEMPTS_NEEDS_HUMAN && rule.safe_actions[0] !== 'none' && rule.class === 'page';
+  const exhausted = !rule.needs_human && (input.attempts ?? 0) >= HOLD_ATTEMPTS_NEEDS_HUMAN && (input.held_for_ms ?? 0) >= HOLD_ESCALATE_MS && !input.live_editor
+    && rule.safe_actions[0] !== 'none' && rule.class === 'page' && (input.code !== 'frontmatter_slug_conflict' || slugHuman !== undefined);
   if (!exhausted) return { class: rule.class, safe_actions: rule.safe_actions, needs_human: rule.needs_human, ...(rule.needs_human && rule.human_reason ? { human_reason: rule.human_reason } : {}) };
   return { class: rule.class, safe_actions: ['none'], needs_human: true,
-    human_reason: `${rule.human_reason ?? 'The page keeps moving under the sync.'} (held ${input.attempts} times with code ${rule.code})` };
+    human_reason: `${(slugHuman ?? rule.human_reason ?? 'The page keeps moving under the sync.').replace(/\.$/, '')} (held ${input.attempts} times over ${Math.floor(input.held_for_ms! / 3_600_000)} h with code ${rule.code}).` };
 }

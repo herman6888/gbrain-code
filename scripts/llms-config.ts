@@ -174,6 +174,12 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/live-sync.md",
       },
       {
+        title: "docs/guides/on-commit-sync.md",
+        description: "Opt-in on-commit sync in gbrain serve (sync.on_commit) and the per-source commit→searchable/embedded latency.",
+        path: "docs/guides/on-commit-sync.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/shared-checkout-git.md",
         description:
           "Committing and pushing when several agents share one brain checkout: `gbrain git commit-push` / `scripts/brain-commit-push.sh` (writer lock, path-scoped commit, in-memory merge, fast-forward-only advance), the outcome table, conflict resolution with --resolve, recovering a stuck rebase, the lock contract for host daemons, and the git commands never to run there.",
@@ -336,6 +342,7 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/minions-fix.md",
         description: "Troubleshooting the Minions job queue.",
         path: "docs/guides/minions-fix.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/repair.md",

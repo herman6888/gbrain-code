@@ -12,7 +12,7 @@ import { listHostConsumers, type ConsumerPool, type ListedConsumer } from './con
 import type { WriteRequestState } from './types.ts';
 import { preparationBudgetMs } from './preparation-budget.ts';
 import { readWriteSwitchSnapshot } from './switches.ts';
-import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT } from './connector-errors.ts';
+import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT, ownerExceptionHint, unknownOriginHint } from './connector-errors.ts';
 import { readQueuedHeadBlockers } from './head-blocker.ts';
 
 export const WRITER_NEXT_ACTIONS: Record<string, string> = {
@@ -135,6 +135,13 @@ export function capacityDiagnostics(counters: Counter[], limits: JournalLimits) 
     });
   });
 }
+/** #6719: the next step a recorded origin supports; only a database origin reads as a database refusal. */
+function recentFailureNextAction(origin: unknown, requestId: string): string {
+  if (origin === 'database_guard') return DATABASE_REFUSAL_HINT;
+  if (origin === 'database_trigger' || origin === 'database') return DATABASE_TRIGGER_HINT;
+  return origin === 'owner_exception' ? ownerExceptionHint(requestId) : unknownOriginHint(requestId);
+}
+
 /** Trusted-admin counts only: neither normalized intent nor private paths leave here. */
 export async function readWriterDiagnostics(engine: BrainEngine) {
   // #6482: writer status is the probe the mode refusal names, so a malformed singleton is reported here, never refused.
@@ -190,7 +197,7 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     : 'The resident consumer of the process that answered this status.' };
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
     local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits), preparation_policy,
-    recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
+    recent_failures: failures.map(row => ({ ...row, next_action: recentFailureNextAction(row.error_detail?.origin, row.request_id) })),
     backend_visibility: backends.visibility,
     blockers: blockers.map(({ id: rowId, claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }, index) => {
       const health = writeHealth(row);

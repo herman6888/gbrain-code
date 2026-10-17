@@ -55,7 +55,7 @@ and failure report; if one page fails, the pages before it commit, that page is
 reported, and the pages after it are cancelled and re-frozen once it is fixed.
 The first group is one or two pages; later groups hold about 5 s of measured
 apply time with lanes (2 s while foreground writes are recent), else
-`sync.bulk_max_txn_ms` (default 15 s).
+`GBRAIN_SYNC_BULK_MAX_TXN_MS` (default 15 s).
 
 Up to 16 groups publish at once in **lanes**, each on its own connection
 (`--lanes N`, `--no-lanes`, `sync.lanes` or `GBRAIN_SYNC_LANES`), capped by the
@@ -63,13 +63,13 @@ pool: the default pool of 10 runs 6, `GBRAIN_POOL_SIZE=20` runs 16. Lanes apply 
 sees a later page without the earlier ones. While lanes publish, the drain keeps
 freezing and admitting the next groups. A page write goes ahead of
 queued groups that do not name its page (lanes finish their groups, then one
-group runs between writes); `sync.foreground_priority false` restores FIFO. Groups after a failed page are cancelled ("An earlier
+group runs between writes); the rollback key `sync.foreground_priority false` restores FIFO (see [config keys](#sync-config-keys)). Groups after a failed page are cancelled ("An earlier
 page of the same sync did not commit") and re-frozen once it is fixed. A lock or statement timeout in a lane costs one lane for
 the rest of the run.
 
 A lane drain ends with a `[sync] lanes:` line naming what limited it and what
 setting, if any, raises it. Turn bulk off with
-`--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
+`--no-bulk` or `GBRAIN_SYNC_BULK=0` (the rollback key `sync.bulk false` still works; see [config keys](#sync-config-keys)). The
 final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
 `largest_group`, `admitted_ahead`, and `lanes`: `maximum`, `configured`,
 `effective`, `reason` when fewer, `step_down`, `overlapped_groups`,
@@ -115,8 +115,35 @@ Timing knobs the drain uses:
 | `preparation_deadlines` write switch (`persistence.preparation_deadlines`, `GBRAIN_PREPARATION_DEADLINES`) | Kill switch for the four keys above and the attempt counter. `remember`, `put_page` and `edit_page` keep their own 30 s budget either way. | on | `gbrain config set persistence.preparation_deadlines false` (or `GBRAIN_PREPARATION_DEADLINES=0`) restores the previous behaviour exactly: no deadline on sync or maintenance writes, no counter, no `preparation_stalled` holds. A running `serve` picks the change up within 5 seconds. |
 | Page write wait | One page's (or group's) publication before the drain re-checks. | 30 s inside a drain (5 s, checkpoint 8 s, for a single pass) | The drain re-enters; this is not a stop. |
 | `sync` job deadline | A managed `sync` Minions job's drain: its `timeout_ms` (autopilot stamps `max(2 × --interval, 300 s)`), or the queue's wall-clock limit for a job without one, capped at an hour, less a 60 s reserve. `sync.job_drain=false` (or job data `drain: false`) keeps the single pass. | per job | Stops as `resumable` / `deadline`; on a worker-backed brain a stop that is safe to repeat queues one follow-up job (`continuation_job_id`). |
-| `sync.bulk_max_txn_ms` / `GBRAIN_SYNC_BULK_MAX_TXN_MS` | Target time per bulk group; sizes the next group from the last one's time per page. | 15000 | A smaller next group. |
+| `GBRAIN_SYNC_BULK_MAX_TXN_MS` (was `sync.bulk_max_txn_ms`, retired in 0.60.266.0) | Target time per bulk group; sizes the next group from the last one's time per page. | 15000 | A smaller next group. |
 | `sync.bulk_size` / `GBRAIN_SYNC_BULK_SIZE` | Largest bulk group. | 16 | — |
+
+### Sync config keys
+
+`gbrain config` keeps three kinds of `sync.*` keys (`src/core/sync-config-keys.ts`):
+
+- **Tunables** you set and keep: `sync.bulk_size`, `sync.lanes`, `sync.exclude`, `sync.include_hidden`,
+  `sync.include_working_tree`, `sync.holds`, `sync.write_through`, `sync.cost_gate_min_usd`, `sync.on_commit`,
+  `sync.freshness_target_seconds` ([on-commit sync](on-commit-sync.md)).
+- **Rollback keys**, the way back a notice or migration promised: `sync.job_drain`, `sync.foreground_priority`,
+  `sync.federated_v2`, `sync.waive_batch`, `sync.bulk`. Each one set to `false` restores the earlier behavior, and
+  stays honored until at least 2027-01-14 (`CONFIG_ROLLBACK_WINDOWS` in `src/core/wire-skew.ts`). They are not
+  tunables: `config set` says so, and no help text or printed fix recommends them.
+- **Retired keys**, no longer read since 0.60.266.0, each with an environment variable for the process that syncs
+  (the serve when it runs the catch-up, the cron line or the shell):
+
+| Retired key | Replacement | Default |
+|---|---|---|
+| `sync.bulk_max_txn_ms` | `GBRAIN_SYNC_BULK_MAX_TXN_MS` | 15000 |
+| `sync.hold_cap` | `GBRAIN_SYNC_HOLD_CAP` | 500 |
+| `sync.hold_escalate_count` | `GBRAIN_SYNC_HOLD_ESCALATE_COUNT` | 50 |
+| `sync.hold_escalate_pct` | `GBRAIN_SYNC_HOLD_ESCALATE_PCT` | 5 |
+| `sync.parser_regression` | `GBRAIN_SYNC_PARSER_REGRESSION` | stop |
+| `sync.knock_on_refreeze_limit`, `sync.knock_on_run_limit` | none (removed with the knock-on re-freeze in 0.60.255.0) | — |
+
+`gbrain config set` of a retired key warns, names the variable and writes nothing. `gbrain config get <key>` prints
+the value a sync runs with for a retired or rollback key and, on stderr, where it comes from. `gbrain doctor`
+(`sync_config_keys`) reports a retired key still stored on the brain as unapplied.
 
 ### One consumer per host
 
@@ -313,6 +340,57 @@ and refuses `revision_conflict` if that page changed after the sync admitted
 it; the Git projection is the sync's own commit. Keep `frontmatter.id` as it
 is; a changed id is a different page.
 
+Git reports a move that also changed the file as a similarity guess (`R087`),
+and two template-shaped files moved in one commit can be paired the wrong way
+round (#6729). So sync keeps the page identity across an inexact rename only
+when the files confirm it: both carry the same `frontmatter.id` and no other
+file or page shares it, or neither carries an id and they share a `slug:` line
+or title that no other file in the source uses. The title is the one the page
+row gets: the frontmatter `title:`, else the body's first `# Heading` (never
+the filename), and the old side counts as the title the brain stores for that
+page now. An exact move (`R100`) needs no signal. Any other pair is imported as a delete plus an add: the new file
+starts a fresh page, and the old page keeps its facts, links and aliases on
+its soft-deleted slug. The sync report prints each such pair, `gbrain sync
+status --source <id> --json` lists it under `identity_downgrades`, doctor
+`rename_identity_downgrades` names it, and the purge leaves the old page alone
+until the pair gets a disposition; there is no time limit, so a pair can still
+be repaired later. Each pair names its remedy, `gbrain repair rename-identity
+--source <id> --slug <new-slug>`: preview it, and after the user agrees apply it
+to carry the old page's identity (history, links, facts) onto the new page, or
+add `--close` to release the hold without carrying it. On a managed source only
+`--close` is available (`managed_remedy_unavailable`). See
+[rename identity](repair.md#rename-identity). Restoring the old page also
+settles the pair: run
+`gbrain restore <old-slug> --source-id <id> --force` (it then lives beside the
+new page; where the old file cannot be re-created the restore names
+`--detach`). An unbound classic source on Postgres refuses page writes outside
+its checkout, so the report and doctor do not offer the restore there. To move and rewrite a page so it keeps its identity, give it a
+stable id or move, commit and sync first, then edit:
+
+```yaml
+---
+id: roadmap-2026
+title: Roadmap
+---
+```
+
+Two rules decide by `frontmatter.id`. A pair Git reports as a rename (`R<n>`)
+whose two files carry the same id, held by no other file in the range and no
+other live page, is a rename. A new file and a deleted file that Git did not
+pair are a rename only when they share such an id and also show continuity:
+the same file name, the same title, or the same bytes. So a note moved to
+another folder and rewritten keeps its page, while a new note that reuses a
+deleted note's template id starts a fresh page, even when no live page holds
+that id.
+
+With `--working-tree`, the decision reads the files on disk and holds only for
+the bytes it read. A renamed file edited before its page moves keeps nothing:
+classic sync fails that file and the next sync decides again, and a managed
+sync refuses `source_changed` and names
+`gbrain sync --no-pull --working-tree --source <id>`. A managed sync refuses `page_identity_changed`
+(`rename_identity_conflict`) when a file would take over a page whose
+`frontmatter.id` differs from the file's own.
+
 `put_page` at a new slug is not a rename. A content-only write cannot prove the
 old file is gone, so a create-only `put_page` whose `frontmatter.id` and
 content match an existing page resolves to that page (`duplicate`: the receipt
@@ -425,14 +503,17 @@ vars — incident-time escape hatches, not everyday knobs.
    sync only, `gbrain sync --skip-failed` acknowledges a known-bad set.
    **Managed sync never acknowledges or auto-skips failed cursors.** Its
    durable failed receipt remains immutable on ordinary replay. Correct the
-   cause, inspect local `gbrain doctor`, then explicitly retry an idle
-   ordinary-source cursor with the same full/working-tree/filter options:
+   cause, inspect local `gbrain doctor`, then rerun the plain
+   sync for that source with the same full/working-tree/filter options; it
+   retries what the previous invocation recorded:
 
    ```bash
-   gbrain sync --source <source-id> --no-pull --retry-failed
+   gbrain sync --source <source-id> --no-pull
    ```
 
-   This retries with fresh admission; do not add `--skip-failed`. A successful
+   This retries with fresh admission; do not add `--skip-failed`
+   (`--retry-failed` is a deprecated alias of the plain sync on a managed
+   brain). A successful
    full run does not clear a separate failed incremental cursor. Doctor reports
    the remaining run; CLI blocked results exit nonzero and local diagnostics
    include source/path/code/request/run/target. Counts are cumulative for the

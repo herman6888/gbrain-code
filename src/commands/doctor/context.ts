@@ -78,6 +78,8 @@ export interface DoctorContext {
   deadline?: DoctorDeadline;
   /** #6696 B2: the remote caller's readable sources (run_doctor tier/only); undefined: brain-wide or `--source`. */
   sourceIds?: string[];
+  /** #6803 C3: the running entry's absolute deadline (scans stop at it and report what they read); undefined: unbounded. */
+  entryDeadlineAt?: number;
   /** #6696 B1: one `getHealth()` per run, shared by every entry that reads it (`doctorHealth`). */
   healthMemo?: Promise<BrainHealth>;
 }

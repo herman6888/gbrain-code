@@ -7,7 +7,8 @@
  *
  * Capacity is brain-wide host state (one band for the brain and every
  * principal), read from the shared 60 s capacity snapshot (`cachedCapacitySnapshot`); write failures are scoped to the caller's readable sources. A
- * section that could not be read is `unknown`, never a clear band. Answers are
+ * section that could not be read is `unknown`, never a clear band. A source whose managed sync run stays blocked past
+ * the doctor threshold (#6858) turns the status to `attention`. Answers are
  * cached per engine and scope for 60 s, so a polling agent costs one read a
  * minute.
  */
@@ -18,6 +19,7 @@ import { readCapacityThresholds } from '../../core/persistence/capacity-forecast
 import { cachedTerminalSummary } from '../serve-http-metrics.ts';
 import { readEmbeddingState } from '../../core/embedding-state.ts';
 import { readGhostPages } from '../../core/ghost-pages.ts';
+import { MANAGED_SYNC_BLOCKED_FAIL_MS, readBlockedManagedSyncs } from '../../core/persistence/sync-blocked.ts';
 
 export const BRAIN_HEALTH_TTL_MS = 60_000;
 export type CountBand = 'none' | '1-9' | '10-99' | '100-999' | '1000+' | 'unknown';
@@ -36,6 +38,8 @@ export interface BrainHealthBands {
   unsearchable: { band: CountBand; lower_bound: boolean };
   /** Live pages whose canonical file is gone on the owner host; `reason` when not counted here (for example not_owner_host). */
   ghost_pages: { band: CountBand; reason?: string };
+  /** #6858: sources whose managed sync run has been blocked on a page longer than the doctor `managed_sync_blocked` threshold. */
+  sync_blocked: { band: CountBand };
   /** The read-only command an operator runs on the brain host for the full report. */
   host_command: string[];
 }
@@ -55,7 +59,7 @@ export function readBrainHealthBands(engine: BrainEngine, opts: { sourceIds?: st
 }
 
 async function computeBands(engine: BrainEngine, sourceIds: string[] | undefined): Promise<BrainHealthBands> {
-  const [capacity, failures, unsearchable, ghostPages] = await Promise.all([
+  const [capacity, failures, unsearchable, ghostPages, syncBlocked] = await Promise.all([
     Promise.all([cachedCapacitySnapshot(engine), readCapacityThresholds(engine)])
       .then(([snapshot, thresholds]) => snapshot.status !== 'ok'
         ? { capacity: 'unknown' as const, days: 'unknown' as const, max_pct_band: 'unknown' as const, forecast: 'unavailable' as const }
@@ -73,10 +77,14 @@ async function computeBands(engine: BrainEngine, sourceIds: string[] | undefined
     readGhostPages(engine, { sampleLimit: 0, ...(sourceIds ? { sourceIds } : {}) })
       .then((g): { band: CountBand; reason?: string } => g.status === 'known' ? { band: countBand(g.count) } : { band: 'unknown', ...(g.reason ? { reason: g.reason } : {}) })
       .catch(() => ({ band: 'unknown' as const })),
+    readBlockedManagedSyncs(engine, sourceIds)
+      .then((blocked): { band: CountBand } => ({ band: countBand(new Set(blocked.filter(b => Date.now() - Date.parse(b.blocked_since) > MANAGED_SYNC_BLOCKED_FAIL_MS).map(b => b.source_id)).size) }))
+      .catch(() => ({ band: 'unknown' as const })),
   ]);
-  const bands = { capacity: { band: capacity.capacity, days: capacity.days, max_pct_band: capacity.max_pct_band, forecast: capacity.forecast }, write_failures: failures, unsearchable, ghost_pages: ghostPages };
+  const bands = { capacity: { band: capacity.capacity, days: capacity.days, max_pct_band: capacity.max_pct_band, forecast: capacity.forecast }, write_failures: failures, unsearchable, ghost_pages: ghostPages,
+    sync_blocked: syncBlocked };
   const unknown = bands.capacity.band === 'unknown' || failures.band === 'unknown';
   const attention = bands.capacity.band === 'low' || bands.capacity.band === 'critical' || (failures.active_blockers !== 'none' && failures.active_blockers !== 'unknown')
-    || (ghostPages.band !== 'none' && ghostPages.band !== 'unknown');
+    || (ghostPages.band !== 'none' && ghostPages.band !== 'unknown') || (syncBlocked.band !== 'none' && syncBlocked.band !== 'unknown');
   return { schema_version: 1, status: attention ? 'attention' : unknown ? 'unknown' : 'ok', ...bands, host_command: ['gbrain', 'doctor', '--tier', 'ops', '--json'] };
 }

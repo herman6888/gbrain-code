@@ -75,9 +75,11 @@ export function printManagedSyncNotes(result: SyncResult, write: (line: string) 
   const skips = result.legacySkips;
   if (skips?.contextualMode) write(`  ${skips.contextualMode} legacy file(s) skipped because they parse to the same page but have no contextual retrieval mode, which a skipped import cannot stamp; to stamp it: gbrain repair contextual-mode`);
   if (skips?.canonicalBytes) write(`  ${skips.canonicalBytes} legacy file(s) skipped because they parse to the same page but their bytes are not what gbrain reads back (for example, not valid UTF-8); re-save them as UTF-8 to publish them exactly.`);
+  // #6803 (D4): the count is this sync's imports the tail left underived, never the source's whole stale backlog.
   const links = result.links;
-  if (links && (links.created || links.removed || links.remaining)) {
+  const underived = result.tail?.underived ?? 0;
+  if (links && (links.created || links.removed || underived)) {
     write(`  Links: ${links.created} created, ${links.removed} removed across ${links.pages} page(s)` +
-      (links.remaining ? `; ${links.remaining} page(s) still owe extraction — run 'gbrain extract --stale'.` : '.'));
+      (underived ? `; ${underived} page(s) this sync imported still owe extraction — run 'gbrain extract --stale'.` : '.'));
   }
 }

@@ -48,6 +48,7 @@ import { embedStaleForSource } from '../../embed-stale.ts';
 import { createEmbedStallWatchdog, resolveEmbedStallAbortSeconds } from '../../embed-stall.ts';
 import { currentEmbeddingSignature } from '../../embedding.ts';
 import { readEmbedBackfillBlockers } from '../../embed-backfill-stall.ts';
+import { budgetLimitedField, type BudgetLimitedReport } from '../../held-embedding.ts';
 import { UnrecoverableError } from '../errors.ts';
 import { type DbPacer, createDbPacer, createNoopPacer } from '../../db-pacer.ts';
 import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../../pace-mode.ts';
@@ -85,6 +86,8 @@ export interface EmbedBackfillResult {
   spentUsd: number;
   /** Set when status === 'budget_exhausted'. */
   budgetCapUsd?: number;
+  /** #6803: large pages of this source waiting for embedding approval (informational; never a failure or a stall). */
+  budget_limited?: BudgetLimitedReport;
 }
 
 /**
@@ -389,6 +392,7 @@ export function makeEmbedBackfillHandler(
         invalidated: result.invalidated,
         ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
         spentUsd: tracker.totalSpent,
+        ...(await budgetLimitedField(engine, sourceId, currentEmbeddingSignature())),
       };
     } catch (err) {
       if (err instanceof BudgetExhausted) {

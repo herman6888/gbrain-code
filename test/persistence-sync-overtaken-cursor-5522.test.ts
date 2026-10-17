@@ -14,6 +14,7 @@ import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { SYNC_IMPORT_PROVENANCE_OP } from '../src/core/persistence/sync-holds.ts';
 
 // #5522: a commit-driven cursor and a --working-tree cursor of one source used
 // different cursor keys. When the working-tree run imports a file the sliced
@@ -132,6 +133,9 @@ test('#5522 a page soft-deleted at that origin, or a pinned page deleted and rec
   await legacy(engine, `${pinned.id}-commit`, () => performManagedSync(engine, pinned.base, { maxPages: 1, maxMs: 60_000 }));
   const before = await engine.getPage('b', { sourceId: pinned.id });
   await engine.transaction(tx => withCoordinatedWrite(tx, [pinned.id], () => tx.softDeletePage('b', { sourceId: pinned.id }), TEST_WRITE_ATTRIBUTION));
+  // The older gbrain recorded no import provenance, so its working-tree run recreates the page (#6712 holds it when a record
+  // shows the database side moved).
+  await engine.executeRaw("DELETE FROM op_checkpoints WHERE op=$1 AND completed_keys->0->>'page_id'=$2", [SYNC_IMPORT_PROVENANCE_OP, String(before!.id)]);
   await legacy(engine, `${pinned.id}-working`, () => performManagedSync(engine, pinned.working), `${pinned.id}-commit`);
   const after = await engine.getPage('b', { sourceId: pinned.id });
   expect(after?.compiled_truth).toContain('Revised observation b');

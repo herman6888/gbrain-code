@@ -14,7 +14,7 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import { loadCompletedMigrations, type CompletedMigrationEntry } from './preferences.ts';
+import { loadCompletedMigrations, preferencesPaths, type CompletedMigrationEntry } from './preferences.ts';
 
 /**
  * Version strings of every registered host migration, in registry order.
@@ -53,6 +53,11 @@ export async function declinedMigrations(engine: Pick<BrainEngine, 'getConfig'>)
 
 /** Bug 3 attempt cap — consecutive partials before a version counts wedged. */
 export const MAX_CONSECUTIVE_PARTIALS = 3;
+
+/** Where a wedged migration's failure reasons are recorded: its partial rows in this brain's completion ledger (not every partial row carries phases). */
+export function wedgedLedgerHint(): string {
+  return `the migration's partial rows in ${preferencesPaths.completedJsonl()} (phases[].detail, if present)`;
+}
 
 /**
  * Compare two semver strings (MAJOR.MINOR.PATCH). Returns -1 / 0 / 1.

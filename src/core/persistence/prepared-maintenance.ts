@@ -501,6 +501,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
   if (row.intent?.kind === 'managed_maintenance_restore_extractor_facts') return (await import('../repair/extractor-facts.ts')).prepareExtractorFactsRestore(engine, row);
   if (row.intent?.kind === 'managed_maintenance_expire_captured_facts') return (await import('../repair/captured-facts.ts')).prepareCapturedFactsExpiry(engine, row);
   if (row.intent?.kind === 'managed_maintenance_conversation_label_retire') return (await import('../repair/conversation-labels.ts')).prepareConversationLabelRetirement(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_conversation_relink') return (await import('../facts/conversation-relink.ts')).prepareConversationRelink(engine, row);
   if (row.intent?.kind === 'managed_maintenance_conversation_facts') return (await import('../facts/conversation-publication.ts')).prepareConversationFactsPublication(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_fence_facts') return (await import('../cycle/extract-facts.ts')).prepareFenceFactsReconcile(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_deleted_page_facts_expire') return (await import('../cycle/extract-facts.ts')).prepareDeletedPageFactsExpiry(engine, row);

@@ -765,7 +765,24 @@ reader pins and the judge pins all land on one receipt.
   `--yes` (exit 2); at run time the lane soft-stops at the cap and stamps the
   remaining rows `judge_skipped: "budget"`. An unpriced judge model requires
   `--max-usd off`. Reader spend is not metered here — wrap a paid receipt in
-  `scripts/eval-spend-guard.sh`.
+  `scripts/eval-spend-guard.sh`. The guard runs the command in its own
+  process group and stops the whole group (helpers and grandchildren
+  included) on interruption, after the kill grace, and when the command
+  exits leaving processes behind. A process group cannot read the terminal,
+  so a terminal stdin is replaced with EOF and the guard prints a notice;
+  pipe or redirect input if the command needs any (piped and file stdin pass
+  through). No eval entrypoint reads stdin; a TTY-only Ctrl-C grace window
+  (such as `eval suspected-contradictions`' cost notice) proceeds as it does
+  off a terminal, and Ctrl-C reaches the guard, which stops the run. While
+  the command runs, the guard keeps a lease in `<ledger>.leases/`. If a
+  guard is SIGKILLed and its process group may still be running, the next
+  guard on that host reports it on stderr with the lease path, the pgid and
+  the commands to inspect (`ps -o pid,pgid,cmd -g <pgid>`) and stop it
+  (`kill -TERM -- -<pgid>`), and records a cost-0 `status: "unknown"`
+  ledger row, once. It stops nothing itself, and that run's reservation
+  stays counted at the estimate. The lease is kept as `<lease>.reported`
+  and retired by a later guard once the group has exited (or by
+  `rm <lease>.reported`).
 
 Row fields with `--judge`: exactly one of `judge_correct` / `judge_error`
 (+ `judge_error_detail`) / `judge_skipped`, plus `judge_model`,

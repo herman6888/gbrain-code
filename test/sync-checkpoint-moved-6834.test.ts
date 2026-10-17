@@ -230,7 +230,7 @@ describe('#6834 a managed-sync checkpoint whose source checkpoint moved', () => 
     expect(await unfinished(engine, f)).toBe(0);
   }), 180_000);
 
-  test.each([['the run\'s own target'], ['a newer commit']] as const)('a path slice short of its target whose checkpoint moved to %s is listed, and retiring it clears its slice record', moved => each(async engine => {
+  test.each([['the run\'s own target'], ['a newer commit']] as const)('a path slice short of its target whose checkpoint moved to %s is listed, no sync rediscovers it, and retiring it clears its slice record', moved => each(async engine => {
     _setCursorBoundForTest();
     await disposePersistenceConsumer(engine);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
@@ -256,6 +256,14 @@ describe('#6834 a managed-sync checkpoint whose source checkpoint moved', () => 
       await moveCheckpoint(engine, f, moved === 'a newer commit' ? newer : target);
       expect((await outcome(performManagedSync(engine, f.opts))).status).toBe('blocked_by_failures');
       expect((await classifyManagedSyncOrphans(engine, [id])).orphans.map(orphan => orphan.reason)).toEqual(['checkpoint_moved']);
+      // #6712 PR 3 (L7): neither a plain sync nor its --retry-failed alias rediscovers it. Rediscovering would resume the slice
+      // record and finish at the slice's target, moving last_commit back from a newer commit; the repair clears the record.
+      _setCursorBoundForTest();
+      for (const retryFailed of [false, true]) {
+        expect((await outcome(performManagedSync(engine, { ...f.opts, retryFailed }))).status).toBe('blocked_by_failures');
+        expect(await lastCommit(engine, f)).toBe(moved === 'a newer commit' ? newer : target);
+        expect(await slices()).toBe(1);
+      }
       const preview = await repair(engine, f);
       expect((await repair(engine, f, preview.preview_hash)).applied).toBe(1);
       expect(await slices()).toBe(0);
@@ -275,11 +283,13 @@ describe('#6834 a managed-sync checkpoint whose source checkpoint moved', () => 
     expect((await outcome(performManagedSync(engine, f.opts))).status).toBe('blocked_by_failures');
     const preview = await repair(engine, f);
     const previewed = (await classifyManagedSyncOrphans(engine, [f.id])).orphans[0]!;
-    // --retry-failed replaces the run under the same key; the replacement stops before its checkpoint, which moves too.
+    // A run replaced under the same key (here: its manifest is lost, so the next sync re-discovers at HEAD; #6712 PR 3 took
+    // that rediscovery away from --retry-failed); the replacement stops before its checkpoint, which moves too.
+    await engine.executeRaw("DELETE FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [previewed.run_id]);
     writeFileSync(join(f.root, 'notes', 'beta.md'), note('beta', 'A revised observation'));
     const head = commit(f.repo, 'beta');
     const abort = new AbortController();
-    expect((await outcome(performManagedSync(engine, { ...f.opts, retryFailed: true, signal: abort.signal, onProgress: p => { if (p.total && p.bankedFiles === p.total) abort.abort(); } }))).status).toBe('partial');
+    expect((await outcome(performManagedSync(engine, { ...f.opts, signal: abort.signal, onProgress: p => { if (p.total && p.bankedFiles === p.total) abort.abort(); } }))).status).toBe('partial');
     await moveCheckpoint(engine, f, f.seed);
     expect((await outcome(performManagedSync(engine, f.opts))).status).toBe('blocked_by_failures');
     const current = (await classifyManagedSyncOrphans(engine, [f.id])).orphans[0]!;

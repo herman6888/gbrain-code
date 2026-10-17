@@ -68,6 +68,7 @@ import {
   type WireSyncResult,
 } from '../core/context/sync-ipc.ts';
 import { OperationError } from '../core/ops/contract.ts';
+import { SYNC_FLAGS, syncFlagsRouted, type SyncFlagSpec } from '../core/sync-flags.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { ConsumerRow } from '../core/persistence/consumer-heartbeat.ts';
 import type { SyncOpts, SyncResult } from './sync.ts';
@@ -84,28 +85,17 @@ const MAX_POLL_FAILURES = 60;
 const PID_PROBE_EVERY = 5;
 
 /**
- * Flags forwardable over the wire (boolean → DelegatedSyncOptions field).
- * Everything not in this table, VALUE_FLAGS, or IGNORED_FLAGS refuses —
- * default-deny is what keeps a future flag from being silently dropped.
+ * The serve hand-off's view of the one sync flag table (`src/core/sync-flags.ts`). Everything the table does not
+ * route through the serve refuses: default-deny is what keeps a future flag from being silently dropped.
  */
-export const WIRE_BOOL_FLAGS: Record<string, keyof DelegatedSyncOptions> = {
-  '--full': 'full',
-  '--dry-run': 'dryRun',
-  '--no-pull': 'noPull',
-  '--no-embed': 'noEmbed',
-  '--no-extract': 'noExtract',
-  '--no-schema-pack': 'noSchemaPack',
-  '--skip-failed': 'skipFailed',
-  '--retry-failed': 'retryFailed',
-  '--include-gitignored': 'includeGitignored',
-  '--no-bulk': 'noBulk',
-};
+const SERVE_FLAGS = SYNC_FLAGS as Record<string, SyncFlagSpec>;
+/** Boolean flags forwarded over the wire (flag → DelegatedSyncOptions field). */
+export const WIRE_BOOL_FLAGS: Record<string, keyof DelegatedSyncOptions> = Object.fromEntries(syncFlagsRouted('serve', 'forward')
+  .filter(flag => SERVE_FLAGS[flag].arity === 'boolean' && SERVE_FLAGS[flag].sets === undefined).map(flag => [flag, SERVE_FLAGS[flag].field as keyof DelegatedSyncOptions]));
 /** Value-taking flags the ladder consumes itself (`--lanes` is validated and forwarded; the deadlines are derived). */
-export const VALUE_FLAGS = new Set(['--source', '--timeout', '--hard-deadline', '--lanes']);
+export const VALUE_FLAGS = new Set<string>([...syncFlagsRouted('serve', 'client'), ...syncFlagsRouted('serve', 'forward')].filter(flag => SERVE_FLAGS[flag].arity === 'value'));
 /** Flags that are meaningful only outside delegation, handled pre-ladder, or rendered by this client (`--json`). */
-export const IGNORED_FLAGS = new Set(['--yes', '--no-delegate', '--no-hard-deadline', '--json']);
-/** `--no-lanes` is `--lanes 1` (`src/commands/sync/args.ts`). */
-const NO_LANES_FLAG = '--no-lanes';
+export const IGNORED_FLAGS = new Set<string>(syncFlagsRouted('serve', 'client').filter(flag => SERVE_FLAGS[flag].arity === 'boolean'));
 
 export type ParsedDelegatedArgs =
   | { ok: true; options: Omit<DelegatedSyncOptions, 'timeoutSeconds'>; explicitSource: string | null }
@@ -124,8 +114,9 @@ export function parseDelegatedSyncArgs(args: string[]): ParsedDelegatedArgs {
       options[WIRE_BOOL_FLAGS[tok]] = true;
       continue;
     }
-    if (tok === NO_LANES_FLAG) {
-      options.lanes = 1;
+    const fixed = SERVE_FLAGS[tok];
+    if (fixed?.serve === 'forward' && fixed.sets !== undefined && fixed.field) {
+      options[fixed.field] = fixed.sets;
       continue;
     }
     if (IGNORED_FLAGS.has(tok)) continue;
@@ -496,7 +487,7 @@ export type ManagedDelegationOutcome =
   | { kind: 'delegated'; result: SyncResult; pid: number }
   /** Not delegated; `reason` names the rung, `line` is the one line printed (null when nothing was printed). */
   | { kind: 'own_consumer'; reason: 'opted_out' | 'not_host' | 'not_postgres' | 'not_managed' | 'no_owner' | 'owner_not_serve' | 'probe_failed'
-      | 'kill_switch' | 'unsupported_flag' | 'no_socket' | 'older_serve' | 'serve_refused' | 'serve_lost' | 'serve_no_admission'; line: string | null };
+      | 'kill_switch' | 'unsupported_flag' | 'no_socket' | 'older_serve' | 'serve_refused' | 'serve_lost'; line: string | null };
 
 /**
  * #6543: only a forced rung (the serve cannot take the run) really runs a consumer beside the serve; on the others this
@@ -581,7 +572,8 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   const options: DelegatedSyncOptions = {
     // #6696 (A5): an operator's sync keeps the capacity background producers leave free.
     sourceId, timeoutSeconds, origin: 'interactive',
-    ...pick(opts, ['dryRun', 'full', 'noPull', 'noEmbed', 'noExtract', 'noSchemaPack', 'skipFailed', 'retryFailed', 'includeGitignored', 'noBulk'] as const),
+    // The table's forwarded booleans only: a field a newer gbrain retired (src/core/wire-skew.ts) is never in it, so it is never sent.
+    ...pick(opts as unknown as Record<string, boolean | undefined>, Object.values(WIRE_BOOL_FLAGS)) as Partial<DelegatedSyncOptions>,
     ...(opts.lanes !== undefined ? { lanes: opts.lanes } : {}),
     // Sent only when set, so a serve that predates the field keeps accepting every run without a deferral.
     ...(opts.embedDeferred ? { embedDeferred: true } : {}),
@@ -621,13 +613,6 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   if (polled.kind === 'lost') return own('serve_lost', '[sync] continuing the catch-up with this process\'s own consumer; the durable cursor resumes where the serve left it.');
   if (polled.kind === 'failed') throw polled.error;
   const { result, pagesAffectedTotal } = syncResultFromWire(polled.result);
-  // #6405/#6423: a delegated drain that admitted nothing left no request a publisher could still be writing, so this run
-  // takes the catch-up over with its own consumer, once (the fallback itself never delegates). A publication that never
-  // returned is different: the serve may still hold its locks, so that stop is reported as it is (restart the serve).
-  if (result.drain?.stop_reason === 'drain_stalled' && result.drain.stall?.cause === 'no_admission') {
-    return own('serve_no_admission', `[sync] the serve (PID ${pid}) admitted no write for ${result.drain.stall.stalled_seconds}s${result.drain.stall.step ? ` at step ${result.drain.stall.step}` : ''}; `
-      + 'continuing the catch-up with this process\'s own consumer, once (the durable cursor resumes where the serve left it).');
-  }
   if (pagesAffectedTotal > polled.result.pagesAffected.length) {
     serr(`[sync] (+${pagesAffectedTotal - polled.result.pagesAffected.length} more pages affected — list truncated for the IPC wire)`);
   }

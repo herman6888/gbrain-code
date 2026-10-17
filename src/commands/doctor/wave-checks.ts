@@ -195,6 +195,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/orphan-bindings.ts')).checkForeignOwnershipMarkers(engine),
   },
   {
+    id: 'coordination_lock_location', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Coordination lock reservations are private files beside the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'GBRAIN_COORDINATION_HOME names another directory than a checkout\'s recorded coordination lock, which stays in use',
+    instruction: 'Make the recorded lock directory doctor names survive container recreation and unset GBRAIN_COORDINATION_HOME for that checkout if it was meant to move the lock (docs/architecture/topologies.md#coordination-home-ignored); never edit or delete the reservation.',
+    run: async engine => (await import('./checks/coordination-lock.ts')).checkCoordinationLockLocation(engine),
+  },
+  {
     id: 'unbound_source', resolution: 'operator', registration: 'wave',
     count: d => (d.sources ?? []).filter((source: { bound?: boolean }) => source.bound).reduce((sum: number, source: { pages?: number }) => sum + Number(source.pages ?? 0), 0),
     impact: 'Some pages written database-only while their source was unbound now sit outside canonical files',

@@ -65,6 +65,7 @@ import { suffixedFrontmatterSlugHold } from '../persistence/suffixed-slug.ts';
 import { logSlugFallback } from '../audit-slug-fallback.ts';
 import { extractCodeRefs } from '../link-extraction.ts';
 import { hasMalformedPathSegment, slugifyCodePath, slugifyPath } from '../sync.ts';
+import { addCodeReferenceLinks } from '../engine-sql/links.ts';
 import { isEmbedSkipped } from '../embed-skip.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { applySegmentedBody, sealSegmentedPage, segmentedLivePage } from '../persistence/segmented-apply.ts';
@@ -326,7 +327,6 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
   const meta = { type: parsed.type, title: parsed.title, frontmatter: parsed.frontmatter as JsonObject, page_kind: 'markdown' as const,
     effective_date: effectiveDate, effective_date_source: effectiveDateSource, import_filename: filename, source_path: relativePath,
     source_kind: null, source_uri: fileOriginUri(existing?.source_uri, sourceRoot, relativePath), ingested_via: null };
-  const linkOpts = { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId };
   const refs = prepared.body.body_flags.has_protected ? [] : [...codeRefs.refs.values()];
   const apply = async (tx: BrainEngine, preimage?: PageSnapshot | null) => {
     if (existing) await tx.createVersion(slug, preimage ? { sourceId, preimage } : { sourceId });
@@ -337,10 +337,9 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
     await addPageTags(tx, result.pageId, parsed.tags, 'frontmatter');
     await writePageAliases(tx, slug, sourceId, { ...parsed, compiled_truth: '', timeline: '' }, opts.activePack, mentionPolicy);
     if (result.complete) await sealSegmentedPage(tx, result.pageId);
-    for (const ref of refs) {
-      const codeSlug = slugifyCodePath(ref.path);
-      await tx.transaction(savepoint => savepoint.addLink(slug, codeSlug, ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path, 'documents', 'markdown', slug, 'compiled_truth', linkOpts)).catch(() => undefined);
-      await tx.transaction(savepoint => savepoint.addLink(codeSlug, slug, ref.path, 'documented_by', 'markdown', slug, 'compiled_truth', linkOpts)).catch(() => undefined);
+    if (refs.length) {
+      await tx.transaction(savepoint => addCodeReferenceLinks(savepoint, slug, sourceId,
+        refs.map(ref => ({ codeSlug: slugifyCodePath(ref.path), path: ref.path, line: ref.line })))).catch(() => undefined);
     }
     const { verifyPageReadable } = await import('../import-file.ts');
     await verifyPageReadable(tx, slug, hash, sourceId, 'importStreamedMarkdownFile');

@@ -44,6 +44,7 @@ const EXEMPT = {
   'src/commands/extract-timeline-db.ts': 'writes timeline rows; timeline never enters core',
   'src/core/extract-timeline-from-meetings.ts': 'writes meeting timeline rows on entity pages; page text is unchanged',
   'src/core/facts/conversation-publication.ts': 'writes database-only conversation fact rows; page text is unchanged',
+  'src/core/facts/conversation-relink.ts': 'sets entity_slug on database-only conversation fact rows; page text is unchanged',
   'src/core/cycle/extract-facts.ts': 'fence reconcile and deleted-page expiry write fact rows only; page text is unchanged',
   'src/core/cycle/extract-takes.ts': 'takes reextract writes take rows only; page text is unchanged',
   'src/core/repair/take-supersession.ts': 'reprojection writes takes.superseded_by only; fence edits go through put_page (preparePageMutation)',

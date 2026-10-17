@@ -74,8 +74,8 @@ export async function reportBlockedProjections(engine: BrainEngine, opts: Projec
   samples.push(`${blocked} page(s) still need a text projection, so their chunks were not embedded (${named.map(page => `${page.source_id}:${page.slug}`).join(', ')}${more}); every other stale chunk was embedded. `
     + (pages.some(page => page.page_kind !== 'markdown' && page.page_kind !== 'code')
       ? isMultimodalEnabled()
-        ? `Image and media pages are rebuilt only by their importer; this run's image sweep (images: missing_samples) could not rebuild these: restore their source files, then run gbrain embed --stale${sourceArg} again. `
-        : `Image and media pages are rebuilt only by their importer: set GBRAIN_EMBEDDING_MULTIMODAL=true so gbrain embed --stale${sourceArg} sweeps them (or run gbrain embed --stale --images${sourceArg}), or run gbrain sync --full${sourceArg}. ` : '')
+        ? `Image pages are sealed only by gbrain projections drain (importer-attested images, keyless; preview with gbrain projections drain --dry-run) or by their importer; this run's image sweep (images: missing_samples) could not rebuild the rest: restore their source files, then run gbrain embed --stale${sourceArg} again; gbrain doctor --only text_projection_readiness --json counts each class. `
+        : `Image pages are sealed only by gbrain projections drain (importer-attested images, keyless; preview with gbrain projections drain --dry-run) or by their importer: set GBRAIN_EMBEDDING_MULTIMODAL=true so gbrain embed --stale${sourceArg} sweeps the rest (preview with gbrain embed --stale --images --dry-run${sourceArg}); gbrain doctor --only text_projection_readiness --json counts each class. ` : '')
     + 'Rerun gbrain embed --stale to retry bounded projection recovery.');
   return new Set(pages.map(page => `${page.source_id}::${page.slug}`));
 }
@@ -91,13 +91,15 @@ export async function prepareEmbeddingProjections(engine: BrainEngine, opts: { s
   };
   let rebuilt = 0;
   let blocked = await countBlocked();
-  // #6223: a keyset cursor visits each candidate once, so a batch of pages
-  // only their importer can rebuild (image/media) never hides repairable pages
-  // behind it, and a catch-up run cannot retry the same batch forever.
+  // #6223: a keyset cursor visits each candidate once, so a catch-up run
+  // cannot retry the same batch forever. #6803: it walks only the kinds a
+  // rebuild can build; image pages stay counted as blocked (their seal is the
+  // importer's or `gbrain projections drain`'s), never queued or re-stamped.
   let afterPageId = 0;
   while (opts.repair && blocked > 0 && !opts.signal?.aborted && Date.now() < (opts.deadline ?? Infinity)) {
     const rows = await engine.executeRaw<{ id: number; slug: string; source_id: string }>(`SELECT p.slug,p.source_id,p.id FROM pages p
       JOIN sources s ON s.id=p.source_id WHERE ${where} AND NOT s.archived AND p.id>$${params.length + 1}
+        AND (p.page_kind IN ('markdown','code') OR p.body_storage='segmented')
       ORDER BY p.id LIMIT $${params.length + 2}`, [...params, afterPageId, limit]);
     if (!rows.length) break;
     afterPageId = Number(rows[rows.length - 1]!.id);

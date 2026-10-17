@@ -234,7 +234,7 @@ export async function runAppended(opts: AppendedOpts): Promise<{ arms: ArmRun[];
           const r = await readerAnswer(opts.arms.reader, opts.readerModel, q, context);
           arm.reads.push({ entity: e.slug, batch: b, gold, correct: correctFor(r.text, gold), stale: staleFor(r.text, gold, past), usd: priced(r.model, r.input_tokens, r.output_tokens) });
         };
-        const pack = await pinnedAnswersForPack(ctx, [e.slug]);
+        const pack = await pinnedAnswersForPack(ctx, [{ source_id: ctx.sourceId, slug: e.slug }]);
         const pinnedText = (pack?.pinned_questions ?? []).flatMap(p => p.answer).join(' ');
         answerTexts.push(...(pack?.pinned_questions ?? []).flatMap(p => p.answer));
         await read(pinned, pinnedText);

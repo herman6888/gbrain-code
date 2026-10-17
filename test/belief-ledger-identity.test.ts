@@ -271,6 +271,7 @@ for (const engineCase of testBackends().map(beliefEngineCase)) {
       const events = await since(b, () => maintenanceTransaction(b.engine, async tx => {
         await tx.lockPageKeys(['notes/a-example', 'notes/b-example'].map(slug => ({ sourceId: b.sourceId, slug })));
         await withBeliefBatch(tx, { sourceId: b.sourceId, slugs: ['notes/a-example', 'notes/b-example'], op: 'review_probe' }, async () => {
+          for (const slug of ['notes/a-example', 'notes/b-example']) await tx.createVersion(slug, { sourceId: b.sourceId, preimage: (await tx.readPageSnapshot(slug, { sourceId: b.sourceId }))! });
           await tx.executeRaw('UPDATE pages SET slug=$1 WHERE source_id=$2 AND slug=$3', ['notes/swap-example', b.sourceId, 'notes/a-example']);
           await tx.executeRaw('UPDATE pages SET slug=$1 WHERE source_id=$2 AND slug=$3', ['notes/a-example', b.sourceId, 'notes/b-example']);
           await tx.executeRaw('UPDATE pages SET slug=$1 WHERE source_id=$2 AND slug=$3', ['notes/b-example', b.sourceId, 'notes/swap-example']);

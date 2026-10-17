@@ -2209,23 +2209,22 @@ export class PostgresEngine implements BrainEngine {
       const formatted = rows?.[0]?.formatted ?? null;
       // halfvec match first — halfvec contains "vec" so a /vector/i
       // regex would shadow it. See readFactsEmbeddingDim's identical
-      // ordering note.
-      if (formatted && /halfvec\(\d+\)/i.test(formatted)) {
-        this._factsEmbeddingCastSuffix = '::halfvec';
-      } else {
-        // Default to '::vector' (the pre-v0.41.15 behavior). On a brain
-        // without the facts.embedding column yet (pre-v40), the cast
-        // suffix is irrelevant — the INSERT would fail elsewhere
-        // anyway. Caching the default still saves the SELECT on
-        // subsequent inserts.
-        this._factsEmbeddingCastSuffix = '::vector';
-      }
+      // ordering note. Otherwise '::vector' (the pre-v0.41.15 behavior);
+      // on a brain without the facts.embedding column yet (pre-v40) the
+      // INSERT would fail elsewhere anyway.
+      const suffix = formatted && /halfvec\(\d+\)/i.test(formatted) ? '::halfvec' : '::vector';
+      // #6712 L6: a transaction engine is an Object.create clone of the engine it runs on, so a probe answered
+      // inside a transaction is cached on that root engine: one probe per process, not one per publication.
+      let root: PostgresEngine = this;
+      while (Object.getPrototypeOf(root) instanceof PostgresEngine) root = Object.getPrototypeOf(root) as PostgresEngine;
+      root._factsEmbeddingCastSuffix = suffix;
+      return suffix;
     } catch {
       // Probe failed — fall back to '::vector' default. Cache so we
       // don't re-probe on every insert.
       this._factsEmbeddingCastSuffix = '::vector';
+      return '::vector';
     }
-    return this._factsEmbeddingCastSuffix;
   }
 
   async insertFact(

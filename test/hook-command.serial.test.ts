@@ -596,6 +596,32 @@ describe('user-prompt', () => {
     expect(hb?.turns).toBe(1);
   });
 
+  // #6739: Claude Code creates projects/<project>/ only after the first
+  // prompt in a new working folder, so the first user-prompt hook there sees
+  // a transcript whose PARENT folder is missing too. It is the same absent
+  // transcript as #5465 and must not record transcript_unreadable.
+  test('#6739: a transcript whose project folder does not exist yet delivers prompt-only context', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'CTX: new-folder context' });
+    const projectsRoot = join(tmp, 'projects-root-6739');
+    mkdirSync(projectsRoot, { recursive: true });
+    const absent = join(projectsRoot, '-home-alice-example-new-project', 'fresh-session.jsonl');
+    const out = collectStdout();
+    expect(
+      await runHook(['user-prompt'], {
+        ...out.io,
+        stdin: JSON.stringify({ prompt: 'first prompt in a new folder', transcript_path: absent }),
+        transcriptRoot: projectsRoot,
+      }),
+    ).toBe(0);
+    const parsed = JSON.parse(out.get().trim());
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('CTX: new-folder context');
+    const hb = await lastHeartbeat();
+    expect(hb?.outcome).toBe('ok');
+    expect(hb?.reason).not.toBe('transcript_unreadable');
+  });
+
   test('unauthorized (server holds a different secret) degrades cleanly', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);

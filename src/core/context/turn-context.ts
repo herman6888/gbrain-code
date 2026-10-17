@@ -39,7 +39,8 @@ import { volunteerContext, type VolunteeredPage } from './volunteer.ts';
 import { getBrainHotMemoryMeta } from '../facts/meta-hook.ts';
 import { collapseHotFacts } from '../facts/capture-dedup.ts';
 import type { ArmStatus, RawFactRef } from './delta-cursor.ts';
-import { buildEntityCard, type EntityCard, type EntityOpenThread } from '../verbs/entity-card.ts';
+import { buildEntityCard, RECENT_FACTS_CAP, type EntityCard, type EntityOpenThread } from '../verbs/entity-card.ts';
+import type { FactRow } from '../engine.ts';
 import { isNewerMentionsEnabled, readNewerMentions, renderNewerMentionRow, NEWER_MENTIONS_HEADER, NEWER_MENTIONS_PACK_CHARS, type NewerMentions } from '../mentions/newer-mentions.ts';
 import { estimateTokens } from '../search/token-budget.ts';
 import type { DecideSlotMeta } from '../search/decide-stage.ts';
@@ -99,6 +100,28 @@ export interface TurnContextFact {
   origin?: string;
 }
 
+/**
+ * #6724: one fact about a packed entity, from the rows its card already read,
+ * attributed to the card's (source_id, slug). `provenance` is the stored
+ * `facts.source`.
+ */
+export interface EntityFact extends TurnContextFact {
+  source_id: string;
+  slug: string;
+  provenance: string | null;
+}
+
+/** Up to RECENT_FACTS_CAP of a card's fact rows (newest first) as entity facts. */
+function entityFactsOf(card: EntityCard, rows: FactRow[]): EntityFact[] {
+  const iso = (v: Date | string | null | undefined) => (v == null ? undefined : v instanceof Date ? v.toISOString() : String(v));
+  return rows.slice(0, RECENT_FACTS_CAP).map((f) => ({
+    id: Number(f.id), fact: f.fact, kind: f.kind, notability: f.notability ?? null, entity_slug: f.entity_slug,
+    valid_from: iso(f.valid_from), created_at: iso(f.created_at), context: f.context ?? null, attributed_to: f.attributed_to ?? null,
+    confidence: Number(f.confidence), ...trustFields(f.trust_tier, f.write_origin),
+    source_id: card.entity.source_id, slug: card.entity.slug, provenance: f.source ?? null,
+  }));
+}
+
 /** One page in a `delta` result (updated after the cursor). */
 export interface DeltaPage {
   slug: string;
@@ -154,6 +177,8 @@ export interface TurnContextResult {
   deltaOverflow?: boolean;
   /** pack/delta mode — the hot facts included (structured, for the verb JSON). */
   facts?: TurnContextFact[];
+  /** #6724 pack mode — the packed entities' own facts (each card's newest, eligibility applied), deduplicated by id. */
+  entityFacts?: EntityFact[];
   /**
    * delta mode — per-arm completion captured in the SAME snapshot as the
    * arrays: `ok` (read completed), `failed` (read threw), `unknown` (the
@@ -239,6 +264,13 @@ export interface AssembleTurnContextOpts {
   includePrivate?: boolean;
   /** pack — cap on entity-card fan-out (default 8; push path passes smaller). */
   maxEntities?: number;
+  /**
+   * #6723 pack — the sources an unqualified entity name resolves in, home
+   * first (verbs/entity-source.ts). Absent: `sourceId` alone.
+   */
+  sources?: readonly string[];
+  /** #6723 pack — source-qualified entities, each resolved in its own source only (after `entities`, inside the same cap). */
+  entityRefs?: ReadonlyArray<{ name: string; sourceId: string }>;
   /**
    * Wall-clock budget (ms). When set, arms race the deadline and whatever has
    * resolved is returned as a PARTIAL pack (degradedReason 'deadline'); the
@@ -571,11 +603,15 @@ async function assemblePack(
 ): Promise<TurnContextResult> {
   const remote = opts.includePrivate !== true; // fail-closed: only explicit true widens
   const maxEntities = clampPositive(opts.maxEntities, PACK_DEFAULT_MAX_ENTITIES);
-  const entities = (opts.entities ?? [])
-    .filter((e) => typeof e === 'string' && e.trim())
-    .slice(0, maxEntities);
+  const sources = opts.sources?.length ? opts.sources : [opts.sourceId];
+  const entities = [
+    ...(opts.entities ?? []).filter((e) => typeof e === 'string' && e.trim()).map((name) => ({ name, sources })),
+    ...(opts.entityRefs ?? []).map((ref) => ({ name: ref.name, sources: [ref.sourceId] })),
+  ].slice(0, maxEntities);
 
-  const acc: { cards: EntityCard[]; facts: TurnContextFact[]; withheld: number; mentions: Map<string, NewerMentions> } = { cards: [], facts: [], withheld: 0, mentions: new Map() };
+  // Cards and their newer mentions are keyed by (source_id, slug): two pages sharing a slug in two sources are two entities.
+  const acc: { cards: EntityCard[]; facts: TurnContextFact[]; entityFacts: EntityFact[]; withheld: number; mentions: Map<string, NewerMentions> } = { cards: [], facts: [], entityFacts: [], withheld: 0, mentions: new Map() };
+  const keyOf = (c: EntityCard) => pageKey({ source_id: c.entity.source_id, slug: c.entity.slug });
   // #5575 (CEO-20): context_pack is a proactive surface.
   const policy: ReadEligibility = opts.eligibility ?? await proactiveEligibility({ engine }, 'context_pack').catch(() => ({ suppressFlagged: true }));
   // Cooperative deadline (perf review): raceDeadline abandons but cannot stop
@@ -585,16 +621,20 @@ async function assemblePack(
   const deadlineAt =
     typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0 ? Date.now() + opts.deadlineMs : null;
   const build = (async () => {
-    for (const name of entities) {
+    for (const { name, sources: nameSources } of entities) {
       if (deadlineAt !== null && Date.now() >= deadlineAt) return;
       try {
-        const res = await buildEntityCard(engine, opts.sourceId, name, { remote, eligibility: policy, omitQuarantined: opts.includeQuarantined !== true });
-        if (res.found && res.card) {
-          const verdict = (await pageActivationVerdicts(engine, [{ source_id: opts.sourceId, slug: res.card.entity.slug }], policy))
-            .get(pageKey({ source_id: opts.sourceId, slug: res.card.entity.slug }));
+        const res = await buildEntityCard(engine, nameSources[0]!, name, { remote, eligibility: policy, omitQuarantined: opts.includeQuarantined !== true, sources: nameSources });
+        if (res.found && res.card && !acc.cards.some((c) => keyOf(c) === keyOf(res.card!))) {
+          // The card's OWN source decides activation: a same-slug page in another source never gates or admits it.
+          const ref = { source_id: res.card.entity.source_id, slug: res.card.entity.slug };
+          const verdict = (await pageActivationVerdicts(engine, [ref], policy)).get(pageKey(ref));
           if (verdict?.suppressed) acc.withheld++;
           // Under trust.agent_activation=allow (the default) a flagged entity page stays, labeled unconfirmed.
-          else if (verdict && !verdict.belowFloor) acc.cards.push(verdict.unconfirmed ? { ...res.card, unconfirmed: true as const } : res.card);
+          else if (verdict && !verdict.belowFloor) {
+            acc.cards.push(verdict.unconfirmed ? { ...res.card, unconfirmed: true as const } : res.card);
+            acc.entityFacts.push(...entityFactsOf(res.card, res.factRows ?? []).filter((f) => !acc.entityFacts.some((e) => e.id === f.id)));
+          }
         }
       } catch {
         /* fail-soft: skip this entity */
@@ -611,11 +651,11 @@ async function assemblePack(
     let left = NEWER_MENTIONS_PACK_CHARS;
     for (const card of acc.cards) {
       if (left <= 0 || (deadlineAt !== null && Date.now() >= deadlineAt)) return;
-      const m = await readNewerMentions(engine, opts.sourceId, card.entity.slug,
+      const m = await readNewerMentions(engine, card.entity.source_id, card.entity.slug,
         { excludePrivate, keepVisibility: remote ? ['world'] : ['private', 'world'], charBudget: left, eligibility: policy, includeQuarantined: opts.includeQuarantined === true });
       if (!m) continue;
-      acc.mentions.set(card.entity.slug, m);
-      left -= renderNewerMentionLines({ ...card, newer_mentions: m }).join('\n').length + 1;
+      acc.mentions.set(keyOf(card), m);
+      left -= renderNewerMentionLines({ ...card, newer_mentions: m }, sources[0]).join('\n').length + 1;
     }
   })();
 
@@ -625,15 +665,16 @@ async function assemblePack(
   // response could diverge from the rendered text after the first await
   // downstream. Copies freeze the delivered view.
   const mentions = new Map(acc.mentions);
-  const cards = acc.cards.map((c) => (mentions.has(c.entity.slug) ? { ...c, newer_mentions: mentions.get(c.entity.slug) } : c));
+  const cards = acc.cards.map((c) => (mentions.has(keyOf(c)) ? { ...c, newer_mentions: mentions.get(keyOf(c)) } : c));
   const facts = [...acc.facts];
+  const entityFacts = [...acc.entityFacts];
   // `since` filter (adversarial review: was documented but dead) — open-thread
   // events are cut to those after the cursor, matching the verb contract.
   const since = typeof opts.since === 'string' && opts.since.trim() ? opts.since : undefined;
   const openThreads = cards
     .flatMap((c) => c.open_threads ?? [])
     .filter((t) => !since || (t.date !== null && isAfter(t.date, since)));
-  const text = renderPack(cards, openThreads, facts, opts.checkpointLinks);
+  const text = renderPack(cards, openThreads, facts, opts.checkpointLinks, sources[0], entityFacts);
   return {
     text,
     pointers: [],
@@ -641,6 +682,7 @@ async function assemblePack(
     cards,
     openThreads,
     facts,
+    ...(entityFacts.length ? { entityFacts } : {}),
     mode: 'pack',
     ...(opts.checkpointLinks?.length ? { checkpointLinks: opts.checkpointLinks } : {}),
     ...(degradedReason ? { degradedReason } : {}),
@@ -867,8 +909,11 @@ const labeled = (item: { trust_tier?: TrustTier; origin?: string }, text: string
   item.trust_tier ? renderTrustedInline(text, labelOf(item)) : text;
 const cardSummary = (c: EntityCard, text: string): string =>
   c.quarantined ? renderTrustedInline(text, { trust_tier: 'external_untrusted', origin: 'quarantined' }) : labeled(c, text);
-export const renderCardLine = (c: EntityCard): string =>
-  `- **${c.entity.title}** → \`${c.entity.slug}\`${c.summary ? ` — ${cardSummary(c, c.summary)}` : c.trust_tier ? ` — ${cardSummary(c, '')}` : ''}${c.relationship_note ? ` [${c.relationship_note}]` : ''} (use get_page/entity before relying on details)`;
+/** #6723: a card from outside the pack's home source names its source, so a follow-up reads the right page. */
+const sourceNote = (c: EntityCard, home?: string): string =>
+  home !== undefined && c.entity.source_id !== undefined && c.entity.source_id !== home ? ` (source ${c.entity.source_id})` : '';
+export const renderCardLine = (c: EntityCard, home?: string): string =>
+  `- **${c.entity.title}** → \`${c.entity.slug}\`${sourceNote(c, home)}${c.summary ? ` — ${cardSummary(c, c.summary)}` : c.trust_tier ? ` — ${cardSummary(c, '')}` : ''}${c.relationship_note ? ` [${c.relationship_note}]` : ''} (use get_page/entity before relying on details)`;
 export const renderThreadLine = (t: EntityOpenThread): string =>
   `- [${t.kind}] ${labeled(t, t.text)}${t.date ? ` (${t.date})` : ''}`;
 export const renderFactLine = (f: TurnContextFact): string =>
@@ -876,17 +921,19 @@ export const renderFactLine = (f: TurnContextFact): string =>
 export const renderPageLine = (p: DeltaPage): string => `- **${labeled(p, p.title)}** → \`${p.slug}\` (${p.updated_at})`;
 
 /** One card's newer-mentions block: a line naming the entity and its page date, then one line per page. [] when there are none. */
-export const renderNewerMentionLines = (c: EntityCard): string[] => {
+export const renderNewerMentionLines = (c: EntityCard, home?: string): string[] => {
   const m = c.newer_mentions;
   if (!m?.rows.length) return [];
   return [
-    `- **${c.entity.title}** (\`${c.entity.slug}\`, page dated ${m.since.slice(0, 10)}):`,
+    `- **${c.entity.title}** (\`${c.entity.slug}\`${sourceNote(c, home)}, page dated ${m.since.slice(0, 10)}):`,
     ...m.rows.map(renderNewerMentionRow),
-    ...(m.more ? [`  - more pages dated after ${m.since.slice(0, 10)} mention it: entity("${c.entity.slug}") lists them all`] : []),
+    ...(m.more ? [`  - more pages dated after ${m.since.slice(0, 10)} mention it: entity("${c.entity.slug}"${sourceNote(c, home) ? `, source_id "${c.entity.source_id}"` : ''}) lists them all`] : []),
   ];
 };
 
 const PACK_HEADERS = ['## Standing entities', '## Open threads', '## Hot memory (recent facts)'] as const;
+/** #6724: the packed entities' own facts render under their own header, before hot memory; a fact in both renders once, here. */
+export const ENTITY_FACTS_HEADER = '## Entity facts (about the standing entities)';
 const deltaHeaders = (since?: string): readonly [string, string, string] => {
   const s = since ? ` since ${since}` : '';
   return [`## Pages changed${s}`, `## New facts${s}`, `## Thread updates${s}`];
@@ -905,9 +952,13 @@ export function renderPack(
   openThreads: EntityOpenThread[],
   facts: TurnContextFact[],
   checkpointLinks?: TurnContextResult['checkpointLinks'],
+  home?: string,
+  entityFacts: TurnContextFact[] = [],
 ): string {
   const links = checkpointLinks ?? [];
-  if (!cards.length && !openThreads.length && !facts.length && !links.length) return '';
+  const shown = new Set(entityFacts.map((f) => f.id));
+  const hot = facts.filter((f) => !shown.has(f.id));
+  if (!cards.length && !openThreads.length && !hot.length && !entityFacts.length && !links.length) return '';
   const lines: string[] = [TURN_CONTEXT_ENVELOPE];
   if (links.length) {
     lines.push('', '## Compaction checkpoints');
@@ -919,10 +970,11 @@ export function renderPack(
       're-pull with get_page. Trust these links over the compaction summary.',
     );
   }
-  if (cards.length) lines.push('', PACK_HEADERS[0], ...cards.map(renderCardLine));
+  if (cards.length) lines.push('', PACK_HEADERS[0], ...cards.map((c) => renderCardLine(c, home)));
   if (openThreads.length) lines.push('', PACK_HEADERS[1], ...openThreads.map(renderThreadLine));
-  if (facts.length) lines.push('', PACK_HEADERS[2], ...facts.map(renderFactLine));
-  const mentionLines = cards.flatMap(renderNewerMentionLines);
+  if (entityFacts.length) lines.push('', ENTITY_FACTS_HEADER, ...entityFacts.map(renderFactLine));
+  if (hot.length) lines.push('', PACK_HEADERS[2], ...hot.map(renderFactLine));
+  const mentionLines = cards.flatMap((c) => renderNewerMentionLines(c, home));
   if (mentionLines.length) lines.push('', NEWER_MENTIONS_HEADER, ...mentionLines);
   return lines.join('\n');
 }

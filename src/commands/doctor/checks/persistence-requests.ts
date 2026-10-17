@@ -8,17 +8,25 @@ import { readPreparationPolicy } from '../../../core/persistence/switches.ts';
 import { resolvePrepare, resolveSessionTimeouts } from '../../../core/db.ts';
 import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
 import { lostCallerWrites } from '../../../core/repair/failed-writes.ts';
-import { readCapacityForecast, readCapacityThresholds } from '../../../core/persistence/capacity-forecast.ts';
+import { readCapacityThresholds } from '../../../core/persistence/capacity-forecast.ts';
+import { doctorCapacityForecast, forecastOrNull } from '../capacity-memo.ts';
+import { withStatementDeadline } from '../../../core/statement-deadline.ts';
+import { DEFERRED_READ_LABEL, repeatedPostprocessDeferrals } from '../../../core/cycle/synthesize-postprocess-deferral.ts';
+import { PERSISTENCE_REQUEST_ID_INDEX } from '../../../core/persistence/schema.ts';
 
 const WINDOW_DAYS = 7;
 const SAMPLE = 10_000;
 const HORIZON_DAYS = 3650;
 
 /**
- * #5762: the managed sync checkpoint validation relies on two request
- * indexes that Postgres builds CONCURRENTLY. Reports each one missing, left
- * INVALID by an interrupted build, or still building (with progress), and the
- * one command that rebuilds it on a current schema.
+ * #5762: managed sync checkpoint validation, the page purge's slug lookup and
+ * dream synthesis postprocessing read the request table through indexes that
+ * Postgres builds CONCURRENTLY. Reports each one missing, left INVALID by an
+ * interrupted build, or still building (with progress), and the one command
+ * that rebuilds it on a current schema. #6757: also names a source whose
+ * synthesis postprocessing deferred three or more passes in a row on a
+ * statement timeout, with the read, its elapsed time and the pending outputs;
+ * the rebuild is named only when the request-id index is what is missing.
  */
 export async function requestIndexesCheck(engine: BrainEngine): Promise<Check> {
   const docs = 'docs/guides/repair.md#request-indexes';
@@ -26,14 +34,24 @@ export async function requestIndexesCheck(engine: BrainEngine): Promise<Check> {
     const indexes = await readRequestIndexStates(engine);
     const broken = indexes.filter(index => index.state === 'missing' || index.state === 'invalid');
     const building = indexes.filter(index => index.state === 'building');
-    const details = { count: broken.length, indexes, repair: 'request-indexes', command: REQUEST_INDEXES_REPAIR_COMMAND, docs };
+    const deferred = await repeatedPostprocessDeferrals(engine).catch(() => []);
+    const postprocess = deferred.map(d => ({ source_id: d.source_id, consecutive_passes: d.consecutive, read: d.last_read ?? null,
+      elapsed_ms: d.last_elapsed_ms ?? null, pending_outputs: d.pending.length, last_deferred_at: d.last_deferred_at ?? null }));
+    const details = { count: broken.length, indexes, repair: 'request-indexes', command: REQUEST_INDEXES_REPAIR_COMMAND, docs,
+      ...(postprocess.length ? { postprocess_deferred: postprocess } : {}) };
+    const deferral = postprocess.length ? ` Dream synthesis postprocessing deferred on a statement timeout ${postprocess.map(d => `${d.consecutive_passes} passes in a row on source ${d.source_id} `
+      + `(${d.read ? DEFERRED_READ_LABEL[d.read] : 'a request read'}, ${d.elapsed_ms ?? '?'} ms; ${d.pending_outputs} output(s) pending)`).join('; ')}.` : '';
     if (broken.length) return { name: 'persistence_request_indexes', status: 'warn', details,
-      message: `${broken.map(index => `${index.name} is ${index.state === 'invalid' ? 'INVALID' : 'missing'}`).join('; ')}: managed sync checkpoints can time out `
-        + `on a large request table. Rebuild on the brain host: ${REQUEST_INDEXES_REPAIR_COMMAND}` };
+      message: `${broken.map(index => `${index.name} is ${index.state === 'invalid' ? 'INVALID' : 'missing'}`).join('; ')}: request-table reads (managed sync checkpoints, page purges, `
+        + `dream synthesis postprocessing) can time out on a large request table. Rebuild on the brain host: ${REQUEST_INDEXES_REPAIR_COMMAND}${deferral}` };
     if (building.length) return { name: 'persistence_request_indexes', status: 'warn', details,
       message: `Still building: ${building.map(index => `${index.name} (${index.progress?.phase ?? 'building'}${index.progress?.blocks_total
-        ? `, ${index.progress.blocks_done}/${index.progress.blocks_total} blocks` : ''})`).join('; ')}. It is safe to leave running; rerun gbrain doctor to follow it.` };
-    return { name: 'persistence_request_indexes', status: 'ok', message: 'Managed sync request indexes are valid.', details };
+        ? `, ${index.progress.blocks_done}/${index.progress.blocks_total} blocks` : ''})`).join('; ')}. It is safe to leave running; rerun gbrain doctor to follow it.${deferral}` };
+    if (postprocess.length) return { name: 'persistence_request_indexes', status: 'warn', details,
+      message: `Request-table indexes are valid, including ${PERSISTENCE_REQUEST_ID_INDEX.name}, so the timeout is not a missing index.${deferral} `
+        + 'The deferred outputs finish without another synthesis call on the first pass whose read completes; compare the elapsed time with the session statement_timeout '
+        + '(doctor persistence_session_timeouts).' };
+    return { name: 'persistence_request_indexes', status: 'ok', message: 'Request-table indexes are valid.', details };
   } catch (error) {
     return { name: 'persistence_request_indexes', status: 'warn',
       message: `Request indexes could not be inspected: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
@@ -83,7 +101,7 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
     const soon = scopes.filter(scope => scope.days_to_exhaustion !== null && scope.days_to_exhaustion < warnDays);
     // Every principal shares one brain-wide key, so each key gets the largest value any scope needs.
     const needed = new Map<string, number>();
-    const forecast = soon.length ? await readCapacityForecast(engine, { limits }).catch(() => null) : null;
+    const forecast = soon.length ? await doctorCapacityForecast(engine, { limits }).catch(forecastOrNull) : null;
     for (const scope of soon) {
       const predicted = forecast?.rows.find(row => row.scope === scope.scope && row.resource === 'lifetime_ids');
       const value = predicted && predicted.per_day_7d > 0 ? predicted.recommended_limit
@@ -191,7 +209,9 @@ export async function sessionTimeoutsCheck(engine: BrainEngine): Promise<Check> 
       message: configured === null ? 'No session statement_timeout is configured (GBRAIN_STATEMENT_TIMEOUT=0).' : 'PGLite has no session to time out.' };
   }
   try {
-    const [row] = await engine.executeRaw<{ statement_timeout: string }>('SHOW statement_timeout');
+    // #6803: read outside the doctor entry's statement deadline, whose transaction-local statement_timeout would
+    // otherwise be what SHOW reports (a pooler's 0 would read as applied). SHOW touches no table.
+    const [row] = await withStatementDeadline(null, () => engine.executeRaw<{ statement_timeout: string }>('SHOW statement_timeout'));
     const applied = row?.statement_timeout ?? null;
     // #6278: the live stall ran through a transaction-mode pooler (Supavisor :6543), which can also leave a cancelled
     // round-trip incomplete (backend in ClientRead). The engine settles those client-side; the pooler mode is still worth naming.

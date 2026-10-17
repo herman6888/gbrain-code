@@ -33,6 +33,24 @@ export async function recordRenameAlias(
 }
 
 /**
+ * #6865: records the slug a removed stray frontmatter `slug:` line declared as an alias of the page its path decides,
+ * inside the caller's write (the content-repair publication). Only while no live page has that slug, and never over an
+ * alias someone already set. A brain whose schema predates slug_aliases skips it inside a savepoint.
+ */
+export async function recordSlugLineAlias(tx: Pick<BrainEngine, 'transaction'>, sourceId: string, alias: string, canonical: string): Promise<void> {
+  if (!alias || alias === canonical) return;
+  try {
+    await tx.transaction(async savepoint => {
+      await savepoint.executeRaw(`INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug, notes)
+        SELECT $1::text, $2::text, $3::text, 'frontmatter_slug_line' WHERE NOT EXISTS (SELECT 1 FROM pages WHERE source_id=$1::text AND slug=$2::text AND deleted_at IS NULL)
+        ON CONFLICT (source_id, alias_slug) DO NOTHING`, [sourceId, alias, canonical]);
+    });
+  } catch (error) {
+    if (!isMissingSchemaObject(error, 'table', 'slug_aliases')) throw error;
+  }
+}
+
+/**
  * Move the slug-keyed rows that belong to a renamed page (#5431): facts about
  * it (`entity_slug`), facts read from its `## Facts` fence
  * (`source_markdown_slug`), its free-text search aliases (`page_aliases`), and

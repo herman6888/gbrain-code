@@ -75,6 +75,8 @@ import { CONVERSATION_EXTRACTOR_VERSION, NON_EXTRACTABLE_AUDIT_SOURCE, TERMINAL_
 import { ALLOWED_TYPES, pageTypesForAllowed, type AllowedType } from './conversation-types.ts';
 import { withWriteTrust } from '../persistence/context.ts';
 import { conversationDerivation } from '../persistence/derived-facts.ts';
+import { RELINKED_DERIVED_ROW, inheritRelinkedEntities } from './conversation-relink-carry.ts';
+import { recordReextractMemo } from './conversation-memo.ts';
 import { recordTaintEdges } from '../trust/taint.ts';
 import { applyGateDecision, derivedGateConfig, derivedGateInput } from '../trust/derived-gate.ts';
 import { decideFactWrite, recordFlaggedRow } from '../write-gate-store.ts';
@@ -406,6 +408,7 @@ export async function replaceConversationFacts(tx: BrainEngine, sourceId: string
   rows: Array<Omit<ConversationFactRow, 'row_num' | 'source_markdown_slug'>>): Promise<{ deleted: number; inserted: number; ids: number[] }> {
   const deleted = await clearConversationFacts(tx, sourceId, slug);
   if (!rows.length) return { deleted, inserted: 0, ids: [] };
+  rows = await inheritRelinkedEntities(tx, sourceId, slug, rows);
   const [top] = await tx.executeRaw<{ n: number | string | null }>(
     'SELECT max(row_num) AS n FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [sourceId, slug]);
   const start = top?.n == null ? 0 : Number(top.n) + 1;
@@ -425,18 +428,23 @@ export const LABEL_RETIRED_MARKER = 'retired: conversation-labels';
  * history other records depend on: a row an open loop (`open_loops.fact_id`,
  * no FK) or another fact's `superseded_by` references is expired, never
  * deleted, and rows `gbrain repair conversation-labels` retired stay expired.
- * Every other extractor row of the page is deleted. Returns the rows removed
- * from the active batch.
+ * A row `gbrain facts relink --conversation` linked is expired too, so the
+ * replacement inherits its entity (conversation-relink-carry.ts); the previous
+ * clear's expired relinked rows go first. Every other extractor row of the
+ * page is deleted. Returns the rows removed from the active batch.
  */
 export async function clearConversationFacts(db: BrainEngine, sourceId: string, slug: string): Promise<number> {
   const page = `f.source_id=$1 AND f.source_markdown_slug=$2 AND f.source LIKE '${CONVERSATION_FACTS_SOURCE_PREFIX}%'`;
   const referenced = 'EXISTS (SELECT 1 FROM open_loops o WHERE o.fact_id=f.id) OR EXISTS (SELECT 1 FROM facts g WHERE g.superseded_by=f.id)';
+  await db.executeRaw(`DELETE FROM facts f WHERE ${page} AND f.expired_at IS NOT NULL AND ${RELINKED_DERIVED_ROW} AND NOT (${referenced})`, [sourceId, slug]);
+  const [relinked] = await db.executeRaw<{ count: string }>(`WITH up AS (UPDATE facts f SET expired_at=now()
+    WHERE ${page} AND f.expired_at IS NULL AND ${RELINKED_DERIVED_ROW} RETURNING 1) SELECT COUNT(*)::text AS count FROM up`, [sourceId, slug]);
   const [expired] = await db.executeRaw<{ count: string }>(`WITH up AS (UPDATE facts f SET expired_at=now()
     WHERE ${page} AND f.expired_at IS NULL AND (${referenced}) RETURNING 1) SELECT COUNT(*)::text AS count FROM up`, [sourceId, slug]);
   const [deleted] = await db.executeRaw<{ count: string }>(`WITH del AS (DELETE FROM facts f
-    WHERE ${page} AND NOT (${referenced}) AND COALESCE(f.context,'') NOT LIKE '%${LABEL_RETIRED_MARKER}%' RETURNING 1)
+    WHERE ${page} AND NOT (${referenced}) AND COALESCE(f.context,'') NOT LIKE '%${LABEL_RETIRED_MARKER}%' AND NOT (${RELINKED_DERIVED_ROW}) RETURNING 1)
     SELECT COUNT(*)::text AS count FROM del`, [sourceId, slug]);
-  return Number(expired?.count ?? 0) + Number(deleted?.count ?? 0);
+  return Number(relinked?.count ?? 0) + Number(expired?.count ?? 0) + Number(deleted?.count ?? 0);
 }
 
 
@@ -490,6 +498,7 @@ async function applyEntry(tx: BrainEngine, row: WriteRequest, entry: Conversatio
     if (flags[i] && ids.length === kept.length) await recordFlaggedRow(tx, flags[i]!, { table: 'facts', id, sourceId: row.source_id });
   }
   const outcome = entry.rows.find(fact => OUTCOME_SOURCES.has(fact.source));
+  if (outcome?.source === TERMINAL_AUDIT_SOURCE) await recordReextractMemo(tx, row.source_id, entry.slug); // #6764
   return { ...base, status: 'committed', deleted, facts_inserted: kept.filter(fact => !OUTCOME_SOURCES.has(fact.source)).length,
     page_outcome: outcome ? (outcome.source === TERMINAL_AUDIT_SOURCE ? 'complete' : 'non_extractable') : null, newest_end: entry.newest_end,
     vectors_dropped: vectors ? 0 : entry.rows.filter(fact => fact.embedding).length };

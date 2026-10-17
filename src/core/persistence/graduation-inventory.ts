@@ -173,6 +173,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('synthesis_evidence', 'user_data', 'Synthesis citations.'),
     carry('tags', 'user_data', 'Page tags.'),
     carry('take_domain_assignments', 'user_data', 'Take domain assignments.'),
+    carry('take_horizons', 'user_data', 'Forecast horizons per take, owner-set or from the stated-horizon scan.'),
     carry('take_grade_cache', 'operational', 'Paid take grading cache; rebuilding spends money.'),
     carry('take_nudge_log', 'operational', 'Take nudge log.'),
     carry('take_proposals', 'user_data', 'Take proposals and their status.'),

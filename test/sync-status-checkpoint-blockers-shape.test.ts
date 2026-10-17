@@ -10,6 +10,9 @@
  * (that receipt, marked `recovery`). `cursors` stays an array in each.
  * Fails when: the field is left out for an absent, unfinished or finished cursor (master before this change
  * omitted it in all three).
+ * #6712 PR 2 (L5): the blocker list is a heavy read a plain status skips; the array stays (empty) and
+ * `checkpoint_blockers_read` says `not_read` with the --detail command, which lists the receipt. The fourth test pinned
+ * the list on a plain status; it now asserts both reads.
  * PGLite in-memory; no production seam.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
@@ -58,11 +61,11 @@ beforeEach(async () => {
 });
 
 /** The JSON document `gbrain sync status --source <id> --json` prints. */
-async function statusJson(): Promise<Record<string, unknown>> {
+async function statusJson(...extra: string[]): Promise<Record<string, unknown>> {
   const lines: string[] = [];
   const log = console.log;
   console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
-  try { await withEnv({ GBRAIN_SOURCE: undefined, GBRAIN_HOME: home }, () => runSyncStatus(engine, ['--source', SOURCE, '--json'])); } finally { console.log = log; }
+  try { await withEnv({ GBRAIN_SOURCE: undefined, GBRAIN_HOME: home }, () => runSyncStatus(engine, ['--source', SOURCE, '--json', ...extra])); } finally { console.log = log; }
   return JSON.parse(lines.join('\n')) as Record<string, unknown>;
 }
 async function cursor(header: Record<string, unknown>): Promise<string> {
@@ -110,9 +113,13 @@ describe('sync status --json checkpoint_blockers is always an array', () => {
     await engine.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-sync',$1,$2::text::jsonb)`, [`fp-${runId}`, JSON.stringify([{
       runId, sourceId: SOURCE, incarnation, index: 3, total: 3, target: 'a'.repeat(40), binding: { worktree_id: worktreeId },
       pending: { requestId: randomUUID(), intent: { kind: 'managed_sync_checkpoint' } } }])]);
-    const status = await statusJson();
+    const plain = await statusJson();
+    expect(plain.checkpoint_blockers).toEqual([]);
+    expect(plain.checkpoint_blockers_read).toMatchObject({ status: 'not_read', fix: { next: 'run', argv: ['gbrain', 'sync', 'status', '--source', SOURCE, '--detail', '--json'] } });
+    const status = await statusJson('--detail');
     expect(status.cursor).toMatchObject({ index: 3, total: 3, done: false });
     expect(status.checkpoint_blockers).toEqual([expect.objectContaining({ request_id: blocker, slug: 'notes/two', recovery: true, knock_on: false })]);
+    expect(status.checkpoint_blockers_read).toEqual({ status: 'read' });
     expect(Array.isArray(status.cursors)).toBe(true);
   });
 });

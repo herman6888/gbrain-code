@@ -1,17 +1,14 @@
 /**
  * #6423: the step this process's managed-sync pass is in, process-local. A pass that admits nothing (a transaction-mode
  * pooler that never answers a pipelined waiver run) leaves no claim on any request for the drain's head probe to read, so
- * the in-pass governor in `sync-drain.ts` names this step and the last statement label on its `no_admission` stop.
- * #6696 C4: `finish` is the tail after the run's checkpoint committed (statistics, link extraction); it admits nothing by
- * design, so the governor gives it `FINISH_BUDGET_MS` instead of reading it as `no_admission`.
+ * the in-pass governor in `sync-drain.ts` names this step and the last statement label on its `no_progress` stop, and a
+ * pass it abandoned throws at its next step boundary. #6712 PR 2: the tail after a committed checkpoint (statistics, links)
+ * runs after the lease is released (`sync-tail.ts`), so no step covers it.
  */
 import { sqlLabel } from './claim-phase.ts';
 
-export type DrainStep = 'freeze' | 'waiver_run' | 'admission' | 'await_receipt' | 'finish';
+export type DrainStep = 'freeze' | 'waiver_run' | 'admission' | 'await_receipt';
 export interface DrainStepStamp { step: DrainStep; since: number; last_sql: { label: string; at: number } | null }
-
-/** #6696 C4: the link-extraction budget of the tail after a committed checkpoint; the governor allows it plus `STALL_GRACE_MS`. */
-export const FINISH_BUDGET_MS = 5 * 60_000;
 
 let current: DrainStepStamp | null = null;
 

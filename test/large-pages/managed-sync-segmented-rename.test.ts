@@ -34,7 +34,8 @@ const home = mkdtempSync(join(tmpdir(), 'gbrain-segmented-rename-'));
 const engines: BrainEngine[] = [];
 let closePostgres: (() => Promise<void>) | undefined;
 const env = { GBRAIN_HOME: home, OPENAI_API_KEY: undefined, VOYAGE_API_KEY: undefined, ANTHROPIC_API_KEY: undefined };
-const original = conversationPage(1536 * 1024, { seed: 61 });
+/** #6729: the frontmatter id confirms the edited renames below (an inexact pair whose title changes keeps its identity only on a shared id). */
+const original = conversationPage(1536 * 1024, { seed: 61 }).replace('title: Conversation log\n', 'id: conversation-log-6729\ntitle: Conversation log\n');
 /** Every fourth body line edited: git still pairs the files as a rename, and most segments change. */
 const edited = (text: string) => text.split('\n').map((line, i) => i > 6 && i % 4 === 0 && line ? `${line} edited` : line).join('\n');
 

@@ -227,6 +227,19 @@ describe('sync_start authorization hand-off (serve half)', () => {
       'SELECT principal_id, count(*)::int AS n FROM persistence_requests WHERE source_id=$1 GROUP BY principal_id', [f.id]);
     expect(rows.map(r => r.principal_id)).toEqual([local.id]);
   }), 180_000);
+
+  test('#6712: an older CLI\'s retired field is dropped and its notice reaches that CLI as the first job line', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    const f = await fixture(1);
+    const local = await registerLocalWriter(engine, 'cli');
+    const start = await startDelegatedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, explicitProcessing: ['noEmbed'], timeoutSeconds: 120 }, randomUUID(),
+      { registration: { id: local.id, credential: local.credential, lane: 'cli' } });
+    expect(start.ok).toBe(true);
+    const done = await waitTerminal(start.jobId!);
+    expect(done.state).toBe('done');
+    const first = done.lines?.[0]?.text ?? '';
+    expect(first).toStartWith('[gbrain notice]');
+    expect(first).toContain('`explicitProcessing`');
+  }), 180_000);
 });
 
 describe('maybeDelegateManagedSyncToServe (the Postgres ladder, client half)', () => {

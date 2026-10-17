@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 239891,
-    "stdoutSha256": "80152879f4c0d0b757cb9e8d2c1bc1a5029744a8c9610ce9e55969fd9828b833",
+    "stdoutBytes": 242884,
+    "stdoutSha256": "181e7dd98ce52c544dc1ae81a4035e2024e3b584428401576b24e815c584f9dc",
     "toolNames": [
       "remember",
       "entity",
@@ -298,7 +298,9 @@
         "name": "entity",
         "parameters": {
           "name": "string?",
-          "names": "array?"
+          "names": "array?",
+          "prefer_source_id": "string?",
+          "source_id": "string?"
         },
         "required_scopes": [],
         "schema": {
@@ -313,6 +315,14 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "prefer_source_id": {
+              "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Read only this source. Default: your source first, then every source you can read.",
+              "type": "string"
             }
           },
           "required": [],
@@ -412,6 +422,7 @@
           "include_deleted": "boolean?",
           "include_quarantined": "boolean?",
           "include_timeline_entries": "boolean?",
+          "known_as_of": "string?",
           "lines": "object?",
           "max_bytes": "number?",
           "min_trust": "string?",
@@ -490,6 +501,10 @@
             "include_timeline_entries": {
               "description": "Timeline rows too.",
               "type": "boolean"
+            },
+            "known_as_of": {
+              "description": "Recorded time: the page as this brain had recorded it at this ISO 8601 instant (2026-10-01T12:00:00Z), from the belief ledger. Not as_of, which is valid time (a date).",
+              "type": "string"
             },
             "lines": {
               "additionalProperties": false,
@@ -2491,16 +2506,27 @@
         "mutating": false,
         "name": "get_versions",
         "parameters": {
+          "diff": "boolean?",
           "include_body": "boolean?",
+          "known_as_of": "string?",
           "limit": "number?",
-          "slug": "string"
+          "slug": "string",
+          "source_id": "string?"
         },
         "required_scopes": [],
         "schema": {
           "properties": {
+            "diff": {
+              "description": "With known_as_of: each version also carries a unified diff from the version before it.",
+              "type": "boolean"
+            },
             "include_body": {
               "description": "true adds compiled_truth and timeline to every version. Default false (metadata only).",
               "type": "boolean"
+            },
+            "known_as_of": {
+              "description": "Recorded time: the validity intervals this brain had recorded by this ISO 8601 instant, from the belief ledger. Not as_of, which is valid time (a date).",
+              "type": "string"
             },
             "limit": {
               "description": "Return only the newest N versions (a positive integer). Default 20; MCP callers are capped at 100.",
@@ -2508,6 +2534,10 @@
             },
             "slug": {
               "description": "Slug of the page whose version history to list.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "With known_as_of: the source.",
               "type": "string"
             }
           },
@@ -4407,7 +4437,9 @@
         "name": "takes_scorecard",
         "parameters": {
           "domain_prefix": "string?",
+          "group_by": "string?",
           "holder": "string?",
+          "min_n": "number?",
           "since": "string?",
           "until": "string?"
         },
@@ -4418,9 +4450,21 @@
               "description": "Slug prefix (e.g. companies/) to scope the scorecard",
               "type": "string"
             },
+            "group_by": {
+              "description": "Trusted local CLI only: per-group journal statistics",
+              "enum": [
+                "holder",
+                "source"
+              ],
+              "type": "string"
+            },
             "holder": {
               "description": "Filter to this holder (world|garry|brain|<slug>)",
               "type": "string"
+            },
+            "min_n": {
+              "description": "Trusted local CLI only: groups with fewer resolved predictions are flagged low_n (default 10)",
+              "type": "number"
             },
             "since": {
               "description": "Window start (YYYY-MM-DD)",
@@ -6069,12 +6113,15 @@
           "budget_tokens": "number?",
           "counterparty": "string?",
           "entities": "string?",
+          "entity_refs": "array?",
           "include_private": "boolean?",
           "include_quarantined": "boolean?",
           "intent": "string?",
           "min_trust": "string?",
+          "prefer_source_id": "string?",
           "session_id": "string?",
-          "since": "string?"
+          "since": "string?",
+          "source_id": "string?"
         },
         "required_scopes": [],
         "schema": {
@@ -6090,6 +6137,23 @@
             "entities": {
               "description": "Comma-separated names or slugs (max 8).",
               "type": "string"
+            },
+            "entity_refs": {
+              "description": "Source-qualified entities: [{\"source_id\":\"wiki\",\"slug\":\"people/alice-example\"}].",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "slug": {
+                    "type": "string"
+                  },
+                  "source_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              },
+              "type": "array"
             },
             "include_private": {
               "description": "Local trusted callers only.",
@@ -6119,12 +6183,20 @@
               ],
               "type": "string"
             },
+            "prefer_source_id": {
+              "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
+              "type": "string"
+            },
             "session_id": {
               "description": "Opaque session id.",
               "type": "string"
             },
             "since": {
               "description": "Open-thread events after this ISO time.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Resolve entities in this source only. Default: your source first, then every source you can read.",
               "type": "string"
             }
           },
@@ -6140,6 +6212,7 @@
         "mutating": false,
         "name": "delta",
         "parameters": {
+          "beliefs": "boolean?",
           "budget_tokens": "number?",
           "cursor": "string?",
           "entities": "string?",
@@ -6152,6 +6225,10 @@
         "required_scopes": [],
         "schema": {
           "properties": {
+            "beliefs": {
+              "description": "Add `beliefs`: each belief that changed in the window, before and after, with cause and evidence (belief ledger); entities narrows it.",
+              "type": "boolean"
+            },
             "budget_tokens": {
               "description": "Token budget; pages pack first.",
               "type": "number"

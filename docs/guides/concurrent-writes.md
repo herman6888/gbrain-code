@@ -531,11 +531,11 @@ If its recorded file bytes no longer match, preserve the file and receipt and
 resolve the conflict on the owner; do not delete recovery records.
 
 If a sync cursor was already invalidated, keep its failure visible until the
-owner has checked the canonical content. Then explicitly re-enumerate with the
-same source and processing options:
+owner has checked the canonical content. Then rerun the plain sync with the
+same source and processing options; it retries what the previous run recorded:
 
 ```bash
-gbrain sync --source example-source --no-pull --no-embed --no-extract --retry-failed
+gbrain sync --source example-source --no-pull --no-embed --no-extract
 ```
 
 Use `--no-embed` and `--no-extract` here only if they were the original sync
@@ -955,8 +955,15 @@ Two read-only doctor checks watch the receipt-bytes accounting:
   (brain and every principal) with what the receipts hold
   (`terminal_reservation` per request plus lifecycle receipts) in one
   statement, and reports `persistence.true_up.clamped`, the number of
-  settle-time decrements that were clamped at zero. A positive delta charges
-  capacity no receipt holds; a negative one under-counts. It changes nothing.
+  settle-time decrements that were clamped at zero. Each drifting scope in
+  `details.drift` names its `direction`: `overcharge` (a positive delta) is a
+  bounded charge against write capacity that no receipt holds, so writes are
+  refused a little early and no data is lost; `undercount` (a negative delta)
+  lets writes use capacity the receipts already reserve. `receipts_by_kind`
+  splits the receipt side into `requests` and `topology_changes` (rows and
+  bytes), and `details.incident` is `current` because the comparison is
+  live. It changes nothing, and there is no reconcile repair yet: report a
+  persistent drift with `gbrain doctor --only persistence_counter_drift --json`.
 - `persistence_compaction` reads `persistence.maintenance.last_compaction`,
   the record each resident consumer's compaction pass writes (`at`,
   `host_id`, `compacted`, `freed_bytes`, `skipped_by_reason`), and warns when

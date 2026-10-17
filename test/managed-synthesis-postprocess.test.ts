@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -13,7 +13,11 @@ import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/
 import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { clientRequestUuid } from '../src/core/persistence/preconditions.ts';
-import { journaledPageSlug } from '../src/core/cycle/synthesize-postprocess.ts';
+import { COMMITTED_OUTPUT_REQUESTS_SQL, journaledPageSlug } from '../src/core/cycle/synthesize-postprocess.ts';
+import { POSTPROCESS_PENDING_KEY } from '../src/core/cycle/synthesize-postprocess-deferral.ts';
+import { requestIndexesCheck } from '../src/commands/doctor/checks/persistence-requests.ts';
+import { PERSISTENCE_REQUEST_ID_INDEX } from '../src/core/persistence/schema.ts';
+import { buildIndexOnline } from '../src/core/schema-migrations/helpers.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests, __setDecideTransportForTests } from '../src/core/ai/gateway.ts';
 import { flushDecideWrites } from '../src/core/ai/decide/store.ts';
@@ -736,3 +740,146 @@ test('#6051: a storage error that is not admission contention still fails the ph
       "SELECT 1 FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent->>'kind'='managed_maintenance_page'", [sourceId, slug])).toEqual([]);
   });
 }, 120_000);
+
+/** #6757: the server's statement-timeout error (or a user cancel, which shares SQLSTATE 57014) on the matching read. */
+const STATEMENT_TIMEOUT = () => Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+function failCommittedOutputsRead(engine: BrainEngine, error: () => Error = STATEMENT_TIMEOUT) {
+  let hits = 0;
+  // Unbound: a transaction view inherits the method and must keep running on its own connection.
+  const executeRaw = engine.executeRaw as (this: unknown, ...args: unknown[]) => unknown;
+  const spy = spyOn(engine, 'executeRaw').mockImplementation((async function (this: unknown, sql: string, ...rest: unknown[]) {
+    if (sql === COMMITTED_OUTPUT_REQUESTS_SQL) { hits++; throw error(); }
+    return executeRaw.call(this, sql, ...rest);
+  }) as never);
+  return { hits: () => hits, restore: () => spy.mockRestore() };
+}
+const quietly = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const write = spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
+  try { return await fn(); } finally { write.mockRestore(); }
+};
+
+test('#6757: a committed-outputs read past the statement timeout defers the pass; after the transcript grows and the child rows are pruned, the replay itself runs zero child jobs and verifies the output\'s quotes against the current transcript', async () => {
+  await fixture(async ({ engine, sourceId, root, opts, calls }) => {
+    const timeout = failCommittedOutputsRead(engine);
+    let deferred: Awaited<ReturnType<typeof runPhaseSynthesize>>;
+    try { deferred = await quietly(() => runPhaseSynthesize(engine, opts)); } finally { timeout.restore(); }
+    expect(timeout.hits()).toBe(1);
+    expect(deferred.status, JSON.stringify(deferred.error ?? deferred.summary)).toBe('warn');
+    expect(deferred.details.postprocess_deferred).toMatchObject({ read: 'committed_outputs', outputs: 1, consecutive: 1 });
+    expect(deferred.summary).toContain('postprocessing deferred: the committed-outputs read hit the statement timeout');
+    expect(deferred.details.publish_deferred).toBeUndefined();
+    expect(deferred.details.pages_written).toBe(0);
+    expect(await engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
+    const slug = await outputSlug(engine, sourceId);
+    const unstamped = (await engine.readPageSnapshot(slug, { sourceId }))!.page;
+    expect(unstamped.frontmatter.dream_generated).toBeUndefined();
+    expect(unstamped.compiled_truth).toContain('"an entirely invented');
+
+    // The transcript grows (a new content hash) and `jobs prune` removes the child's rows.
+    appendFileSync(opts.inputFile, 'User: one more line added after the first synthesis.\n');
+    await engine.executeRaw("DELETE FROM subagent_tool_executions WHERE job_id IN (SELECT id FROM minion_jobs WHERE data->>'source_id'=$1)", [sourceId]);
+    await engine.executeRaw("DELETE FROM minion_jobs WHERE data->>'source_id'=$1", [sourceId]);
+    await disposePersistenceConsumer(engine);
+    // A grown transcript is new input: dream may synthesize it again under its new hash. Here it triages below the
+    // threshold so that this pass submits no child of its own, and everything below is the replay of the deferred output.
+    let synthesisCalls = 0;
+    __setChatTransportForTests(async o => {
+      const triage = (o.system ?? '').startsWith('You triage a conversation transcript');
+      if (!triage) synthesisCalls++;
+      const text = triage ? JSON.stringify({ score: 0.1, content_type: 'routine', segments: [], entities: [], reasons: ['routine'] }) : JSON.stringify({ pages: [], skipped: true });
+      return { text, blocks: [{ type: 'text', text }], stopReason: 'end', usage: { input_tokens: 10, output_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0 }, model: o.model!, providerId: 'anthropic' };
+    });
+    const spent = calls();
+    const next = await quietly(() => runPhaseSynthesize(engine, opts));
+    expect(next.status, JSON.stringify(next.error ?? next.summary)).toBe('ok');
+    expect(synthesisCalls).toBe(0);
+    expect(calls()).toBe(spent);
+    expect(next.details.children_submitted ?? 0).toBe(0);
+    expect(await engine.executeRaw("SELECT id FROM minion_jobs WHERE name = 'subagent' AND data->>'source_id'=$1", [sourceId])).toEqual([]);
+    expect(next.details.postprocess_resumed).toEqual([slug]);
+    expect(next.details.written_slugs).toEqual([slug]);
+    const stamped = (await engine.readPageSnapshot(slug, { sourceId }))!.page;
+    expect(stamped.frontmatter.dream_generated).toBe(true);
+    // The grown transcript still lacks the invented quotation, so it fails grounding the way any unfound quote does.
+    expect(stamped.compiled_truth).not.toContain('"an entirely invented');
+    expect(stamped.frontmatter.unverified_claims).toEqual([expect.objectContaining({ reason: 'quote_not_in_source', detail: 'an entirely invented quotation that should lose its marks' })]);
+    expect(stamped.frontmatter.quote_verification).toBeUndefined();
+    expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('dream_generated: true');
+    expect(JSON.parse(await engine.getConfig(POSTPROCESS_PENDING_KEY) ?? '{}')[sourceId]).toBeUndefined();
+  });
+}, 120_000);
+
+test('#6757: a postprocess request read past the statement timeout defers that output, and the next ordinary pass finishes it without a provider call', async () => {
+  await fixture(async ({ engine, sourceId, opts, calls }) => {
+    await interruptAfterChild(engine, sourceId, opts);
+    const slug = await outputSlug(engine, sourceId);
+    const spent = calls();
+    const getWriteRequest = journal.getWriteRequest;
+    let hits = 0;
+    const spy = spyOn(journal, 'getWriteRequest').mockImplementation(async (...args) => {
+      if (!hits++) throw STATEMENT_TIMEOUT();
+      return getWriteRequest(...args);
+    });
+    let deferred: Awaited<ReturnType<typeof runPhaseSynthesize>>;
+    try { deferred = await quietly(() => runPhaseSynthesize(engine, opts)); } finally { spy.mockRestore(); }
+    expect(deferred.status, JSON.stringify(deferred.error ?? deferred.summary)).toBe('warn');
+    expect(deferred.details.postprocess_deferred).toMatchObject({ read: 'postprocess_request', outputs: 1, consecutive: 1 });
+    expect(deferred.details.pages_written).toBe(0);
+    expect(await engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
+    expect((await engine.readPageSnapshot(slug, { sourceId }))!.page.frontmatter.dream_generated).toBeUndefined();
+    await disposePersistenceConsumer(engine);
+    const next = await runPhaseSynthesize(engine, opts);
+    expect(next.status, JSON.stringify(next.error ?? next.summary)).toBe('ok');
+    expect(calls()).toBe(spent);
+    expect(next.details.written_slugs).toEqual([slug]);
+    expect((await engine.readPageSnapshot(slug, { sourceId }))!.page.frontmatter.dream_generated).toBe(true);
+    expect((await engine.readPageSnapshot(slug, { sourceId }))!.page.frontmatter.quote_verification).toBeUndefined();
+    expect(JSON.parse(await engine.getConfig(POSTPROCESS_PENDING_KEY) ?? '{}')[sourceId]).toBeUndefined();
+  });
+}, 120_000);
+
+test('#6757: a user cancel on the committed-outputs read (SQLSTATE 57014, not a statement timeout) still fails the phase and defers nothing', async () => {
+  await fixture(async ({ engine, sourceId, opts }) => {
+    const cancel = failCommittedOutputsRead(engine, () => Object.assign(new Error('canceling statement due to user request'), { code: '57014' }));
+    let failed: Awaited<ReturnType<typeof runPhaseSynthesize>>;
+    try { failed = await runPhaseSynthesize(engine, opts); } finally { cancel.restore(); }
+    expect(cancel.hits()).toBe(1);
+    expect(failed.status).toBe('fail');
+    expect(failed.error?.code).toBe('SYNTH_PHASE_FAIL');
+    expect(JSON.parse(await engine.getConfig(POSTPROCESS_PENDING_KEY) ?? '{}')[sourceId]).toBeUndefined();
+  });
+}, 120_000);
+
+test('#6757: three deferred passes in a row put a line on doctor persistence_request_indexes; it names the rebuild only when the index is missing, and clears once a pass completes', async () => {
+  await fixture(async ({ engine, sourceId, opts, calls }) => {
+    const spent: number[] = [];
+    for (let pass = 1; pass <= 3; pass++) {
+      const timeout = failCommittedOutputsRead(engine);
+      let deferred: Awaited<ReturnType<typeof runPhaseSynthesize>>;
+      try { deferred = await quietly(() => runPhaseSynthesize(engine, opts)); } finally { timeout.restore(); }
+      expect(deferred.details.postprocess_deferred).toMatchObject({ read: 'committed_outputs', consecutive: pass });
+      await disposePersistenceConsumer(engine);
+      spent.push(calls());
+      if (pass === 2) expect((await requestIndexesCheck(engine)).status).toBe('ok');
+    }
+    expect(new Set(spent).size).toBe(1);
+    const valid = await requestIndexesCheck(engine);
+    expect(valid.status).toBe('warn');
+    expect(valid.message).toContain(`3 passes in a row on source ${sourceId}`);
+    expect(valid.message).toContain('the committed-outputs read');
+    expect(valid.message).toContain('1 output(s) pending');
+    expect(valid.message).not.toContain('gbrain repair request-indexes');
+    expect(valid.details).toMatchObject({ count: 0, postprocess_deferred: [expect.objectContaining({ source_id: sourceId, consecutive_passes: 3, read: 'committed_outputs', pending_outputs: 1 })] });
+    await engine.executeRaw(`DROP INDEX ${PERSISTENCE_REQUEST_ID_INDEX.name}`);
+    try {
+      const missing = await requestIndexesCheck(engine);
+      expect(missing.message).toContain(`${PERSISTENCE_REQUEST_ID_INDEX.name} is missing`);
+      expect(missing.message).toContain('gbrain repair request-indexes');
+      expect(missing.message).toContain(`3 passes in a row on source ${sourceId}`);
+    } finally { await buildIndexOnline(engine, 0, PERSISTENCE_REQUEST_ID_INDEX); }
+    const next = await runPhaseSynthesize(engine, opts);
+    expect(next.status, JSON.stringify(next.error ?? next.summary)).toBe('ok');
+    expect(calls()).toBe(spent[0]);
+    expect(await requestIndexesCheck(engine)).toMatchObject({ status: 'ok', message: 'Request-table indexes are valid.' });
+  });
+}, 180_000);

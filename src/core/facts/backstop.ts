@@ -117,6 +117,13 @@ export interface FactsBackstopCtx {
   notabilityFilter?: FactNotabilityFilter;
   /** Abort signal for shutdown propagation. */
   abortSignal?: AbortSignal;
+  /**
+   * #6778: the durable job's deadline (MinionJobContext.deadlineAtMs). A managed
+   * facts publish waits for its accepted write up to the job-bounded
+   * MaintenanceWriteWait (persistence/maintenance-wait.ts); without a job the
+   * wait is the 30 s base.
+   */
+  deadlineAtMs?: number | null;
   /** Mirrors OperationContext.remote for trust-aware logging paths. */
   remote?: boolean;
   /** Optional entity hints (extract_facts MCP op forwards these). */

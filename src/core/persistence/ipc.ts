@@ -5,6 +5,7 @@ import { isAbsolute } from 'node:path';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
+import type { ProjectionBacklog } from '../page-state/projections.ts';
 import { resolveSocketPathForConfig, socketHasLiveListener } from '../context/resolve-ipc.ts';
 import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt } from './types.ts';
 import { isPersistenceAdminExtension, isPersistenceAdminOperation, PERSISTENCE_ADMIN_EXTENSIONS, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminExtension, type PersistenceAdminOperation } from './admin-contract.ts';
@@ -82,12 +83,15 @@ export interface PersistenceIpcAdminRequest {
   registration: PersistenceIpcRegistration;
 }
 
-/** #5401: the resident's queued text-projection backlog. Counts only, never identifiers. */
-export interface PersistenceProjectionStatus {
-  pending: number;
-  failed: number;
-  oldest_age_seconds: number | null;
-}
+/**
+ * #5401: the resident's queued text-projection backlog. Counts only, never
+ * identifiers. #6803: `pending` and `failed` keep their meaning (rows the
+ * resident drains); the class counts are optional, so an older doctor reading
+ * a new reply sees an unchanged `pending` and a new doctor reading an old one
+ * knows the resident predates them.
+ */
+export type PersistenceProjectionStatus = ProjectionBacklog;
+const PROJECTION_CLASS_KEYS = ['sealable', 'sealable_with_visual', 'reimport', 'ocr_required', 'protected', 'archived'] as const;
 
 export interface PersistenceIpcProvider {
   brainId: string;
@@ -414,7 +418,9 @@ export async function requestPersistenceProjectionStatus(socketPath: string, tim
   const value = await exchange(socketPath, { version: 1, kind: 'projection_status' }, timeoutMs);
   if (!record(value) || !count(value.pending) || !count(value.failed)
     || !(value.oldest_age_seconds === null || count(value.oldest_age_seconds))) throw new PersistenceIpcTransportError(false);
-  return { pending: value.pending, failed: value.failed, oldest_age_seconds: value.oldest_age_seconds };
+  const classes = Object.fromEntries(PROJECTION_CLASS_KEYS.flatMap(key => count(value[key]) ? [[key, value[key]]] : []));
+  return { pending: value.pending, failed: value.failed, oldest_age_seconds: value.oldest_age_seconds, ...classes,
+    ...(typeof value.as_of === 'string' ? { as_of: value.as_of } : {}) };
 }
 
 export async function requestPersistenceOperation(socketPath: string, request: PersistenceIpcRequest, timeoutMs = 30_000): Promise<unknown> {

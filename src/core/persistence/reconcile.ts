@@ -13,7 +13,7 @@ import { assertPersistenceAccepting, waitForWrite, writeResponse } from './servi
 import { digest, requireUuid, sha256, stableJson } from './digest.ts';
 import { mergeReconcile, reconcileCanonical, reconcileDecisions, strictReconcileKeys } from './reconcile-merge.ts';
 import { additiveDecisions, assertAutoDecisions, classifyDrift, type AutoDecision, type DriftClassification } from './reconcile-additive.ts';
-import { assertReconcilePins, readReconcileState, reconcilePreviewAdopts, staleReconcile, validateReconcileArtifact, type ReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
+import { assertReconcilePins, readReconcileState, reconcilePreviewAdopts, reconcileReadOptions, staleReconcile, validateReconcileArtifact, type ReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
 import { prepareReconcileResult } from './reconcile-prepare.ts';
 import { assertReconcileOutputPath, assertReconcileSize, manageReconcileBackups, retainReconcileBackup } from './reconcile-backup.ts';
 import type { LocalGrant } from './identity.ts';
@@ -171,7 +171,7 @@ export async function runReconcileApply(engine: BrainEngine, params: Record<stri
   try {
     assertPersistenceAccepting(engine);
     await assertReconcileSize(engine, artifact);
-    const adopt = { adoptSlugPath: reconcilePreviewAdopts(artifact) };
+    const adopt = reconcileReadOptions(artifact);
     const state = await readReconcileState(engine, sourceId, slug, artifact.preconditions.assessment_at, adopt);
     assertPreimages(artifact, state);
     assertAutoDecisions(artifact.auto_decisions ?? [], state.file, reconcileCanonical(state.snapshot.page, state.snapshot.tags), artifact.decisions);

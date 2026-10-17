@@ -4,20 +4,29 @@
  * `--tier ops|standard|deep` selects which registry entries run (see
  * `DoctorTier` in ./context.ts); `--budget-ms <n>` is one absolute end-to-end
  * deadline that starts before the CLI connects (default 4000 for `ops`, none
- * for the other tiers). Every entry also has its own budget
- * (`doctor.entry_budget_ms`, default 15000; the remaining overall time when
- * that is shorter).
+ * for the other tiers; `--budget-ms 0`: none). A plain non-interactive CLI
+ * `gbrain doctor --json` caps its check run at `doctor.default_budget_ms`
+ * (./default-budget.ts), started after connect and migrations. Every entry also
+ * has its own budget (`doctor.entry_budget_ms`, default 15000; the remaining
+ * overall time when that is shorter; under `--only` with an explicit
+ * `--budget-ms`, the overall budget).
  *
  * An entry past its budget reports each check it emits with the shared unknown
  * convention: `status: 'warn'`, `details.health: 'unknown'`,
- * `details.reason: 'budget'`, `details.exact: false`, `elapsed_ms`. Under
- * `--tier ops` the entry reads through `deadlineEngine`, whose raw statements
- * carry the absolute deadline to the server (a transaction-local
+ * `details.reason: 'budget'`, `details.limit` (which budget), `details.exact:
+ * false`, `elapsed_ms`. On every tier the entry reads through the run's
+ * deadline-bound engine (src/core/statement-deadline.ts) under its own deadline:
+ * its raw statements carry that deadline to the server (a transaction-local
  * `statement_timeout` recomputed after the pool wait, and an abort of the pool
- * wait itself at the deadline), so no doctor backend outlives the report.
+ * wait itself), a statement after it is never sent, and a cancelled statement
+ * marks the entry expired even when the check caught the error, so no doctor
+ * backend outlives its entry and the next entry starts with a fresh deadline.
+ * PGLite gets only the refusal before each statement: one already running
+ * cannot be pre-empted.
  */
-import type { BrainEngine } from '../../core/engine.ts';
+import { AGENT_TOOL_LIMIT_MS } from '../../core/agent-output.ts';
 import { opError } from '../../core/ops/contract.ts';
+import { StatementDeadlineError } from '../../core/statement-deadline.ts';
 import type { Check, DoctorReport } from '../doctor.ts';
 import { agentFix } from './check-fix.ts';
 import type { DoctorTier } from './context.ts';
@@ -29,18 +38,27 @@ export const OPS_BUDGET_MS_DEFAULT = 4000;
 export const ENTRY_BUDGET_KEY = 'doctor.entry_budget_ms';
 export const ENTRY_BUDGET_MS_DEFAULT = 15_000;
 
-/** The deadline of one doctor run: `deadlineAt` is absolute epoch ms, null without an overall budget. */
+/**
+ * The deadline of one doctor run: `deadlineAt` is absolute epoch ms, null without an overall budget.
+ * `explicit`: `--budget-ms` was given. `deferredBudgetMs`: the non-interactive default, started when the
+ * check run starts (`startDeferredDeadline`), so connect and migrations stay outside it.
+ */
 export interface DoctorDeadline {
   startedAt: number;
   budgetMs: number | null;
   deadlineAt: number | null;
+  explicit?: boolean;
+  deferredBudgetMs?: number;
+  /** The stderr line the deferred default prints when the check run starts (a run refused before it prints nothing). */
+  deferredNotice?: string;
+  nonInteractiveDefault?: boolean;
 }
 
 /** Thrown (and caught by the runner) when a read starts after the deadline passed. */
-export class DoctorBudgetError extends Error {
-  readonly code = 'doctor_budget';
-  constructor(readonly elapsedMs: number) {
-    super(`The doctor budget ran out after ${elapsedMs} ms.`);
+export class DoctorBudgetError extends StatementDeadlineError {
+  override readonly code = 'doctor_budget';
+  constructor(elapsedMs: number) {
+    super(elapsedMs, `The doctor budget ran out after ${elapsedMs} ms.`);
     this.name = 'DoctorBudgetError';
   }
 }
@@ -63,21 +81,38 @@ export function parseDoctorTier(args: readonly string[]): DoctorTier {
       why: 'The ops tier answers the operational questions (capacity, failures, embedding, sync, compaction, serve build) in seconds.' } });
 }
 
-/** `--budget-ms <n>` (a positive integer), else the tier default. */
+/** `--budget-ms <n>` (a non-negative integer; 0: no overall budget), else the tier default. */
 export function parseBudgetMs(args: readonly string[], tier: DoctorTier): number | null {
   const raw = flagValue(args, '--budget-ms');
   if (raw === undefined) return tier === 'ops' ? OPS_BUDGET_MS_DEFAULT : null;
   const n = Number(raw);
-  if (!Number.isSafeInteger(n) || n < 1) {
-    throw opError('invalid_params', `--budget-ms must be a positive integer number of milliseconds (got ${raw}).`, 'Example: --budget-ms 4000.');
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw opError('invalid_params', `--budget-ms must be a whole number of milliseconds, 0 for no overall budget (got ${raw}).`, 'Example: --budget-ms 4000.');
   }
-  return n;
+  return n === 0 ? null : n;
 }
 
 /** The deadline of a run starting now (call it before connecting). */
 export function startDoctorDeadline(args: readonly string[], now = Date.now()): DoctorDeadline {
   const budgetMs = parseBudgetMs(args, parseDoctorTier(args));
-  return { startedAt: now, budgetMs, deadlineAt: budgetMs === null ? null : now + budgetMs };
+  return { startedAt: now, budgetMs, deadlineAt: budgetMs === null ? null : now + budgetMs, explicit: flagValue(args, '--budget-ms') !== undefined };
+}
+
+/** The non-interactive default starts with the check run (after connect and migrations), and says so then. */
+export function startDeferredDeadline(deadline: DoctorDeadline | undefined, now = Date.now()): void {
+  if (!deadline || deadline.deferredBudgetMs === undefined || deadline.deadlineAt !== null) return;
+  Object.assign(deadline, { startedAt: now, budgetMs: deadline.deferredBudgetMs, deadlineAt: now + deadline.deferredBudgetMs, nonInteractiveDefault: true });
+  if (deadline.deferredNotice) process.stderr.write(deadline.deferredNotice);
+  delete deadline.deferredBudgetMs;
+  delete deadline.deferredNotice;
+}
+
+/** Time a scan keeps before its entry's deadline to report what it read. */
+export const SCAN_REPORT_RESERVE_MS = 250;
+
+/** #6803 C3: a scan's wall-clock end: its own timeout, or its entry's (and so the run's) deadline less the report reserve when sooner. */
+export function scanDeadline(ctx: { entryDeadlineAt?: number }, ownTimeoutMs: number, now = Date.now()): number {
+  return Math.min(now + ownTimeoutMs, (ctx.entryDeadlineAt ?? Infinity) - SCAN_REPORT_RESERVE_MS);
 }
 
 /** Whether a registry entry runs at `tier` (`standard` includes `ops`; `deep` includes both). */
@@ -86,28 +121,6 @@ export function entryRunsAt(entryTier: DoctorTier | undefined, tier: DoctorTier)
   if (tier === 'ops') return own === 'ops';
   if (tier === 'standard') return own !== 'deep';
   return true;
-}
-
-/**
- * The engine an ops entry reads through: every raw statement carries the
- * absolute deadline (server-side bound recomputed after the pool wait; the pool
- * wait aborts at the deadline). A statement that would start after the deadline
- * is not sent. PGLite has one in-process connection and no other session to wait
- * on, so it is returned as it is.
- */
-export function deadlineEngine(engine: BrainEngine, deadline: DoctorDeadline): BrainEngine {
-  const deadlineAt = deadline.deadlineAt;
-  if (deadlineAt === null || engine.kind !== 'postgres') return engine;
-  return new Proxy(engine, { get(target, key) {
-    if (key === 'executeRaw') return async (sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number }) => {
-      const left = deadlineAt - Date.now();
-      if (left <= 0) throw new DoctorBudgetError(Date.now() - deadline.startedAt);
-      const signal = opts?.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(left)]) : AbortSignal.timeout(left);
-      return target.executeRaw(sql, params, { signal, timeoutMs: Math.min(left, opts?.timeoutMs ?? left), deadlineAt });
-    };
-    const value = Reflect.get(target, key, target);
-    return typeof value === 'function' ? value.bind(target) : value;
-  } });
 }
 
 const EXPIRED: unique symbol = Symbol('doctor_budget_expired');
@@ -130,13 +143,33 @@ export function budgetExpired(value: unknown): value is BudgetExpired {
   return value === EXPIRED;
 }
 
-/** One check an entry could not finish within its budget, in the shared unknown convention. */
-export function budgetUnknownCheck(name: string, elapsedMs: number, budgetMs: number): Check {
+/** Which budget stopped an entry: its own (`doctor.entry_budget_ms`) or the run's overall deadline. */
+export type BudgetLimit = 'entry' | 'overall';
+
+/** A rerun alone gets this many times the budget it ran out of (the time it needs is unknown: the budget cut it off). */
+const RERUN_BUDGET_FACTOR = 10;
+
+/** Headroom under AGENT_TOOL_LIMIT_MS for the process start and connect around a rerun. */
+const AGENT_RERUN_HEADROOM_MS = 10_000;
+
+/**
+ * One check an entry could not finish within its budget, in the shared unknown convention. The fix reruns the
+ * check alone with `--budget-ms N` (which `--only` makes its entry budget), N ten times the budget it ran out of:
+ * the agent's while N fits an agent tool call (AGENT_TOOL_LIMIT_MS), else the user's to run in a terminal.
+ */
+export function budgetUnknownCheck(name: string, elapsedMs: number, budgetMs: number, limit: BudgetLimit = 'entry'): Check {
+  const agentCap = AGENT_TOOL_LIMIT_MS - AGENT_RERUN_HEADROOM_MS;
+  const wanted = Math.ceil(Math.max(elapsedMs, budgetMs, 1) * RERUN_BUDGET_FACTOR / 1000) * 1000;
+  const n = wanted <= agentCap || elapsedMs >= agentCap ? wanted : agentCap;
+  const argv = ['gbrain', 'doctor', '--only', name, '--budget-ms', String(n), '--json'];
+  const which = limit === 'overall' ? `the run's overall budget (${budgetMs} ms: --budget-ms or doctor.default_budget_ms)` : `its per-check budget (${budgetMs} ms, doctor.entry_budget_ms)`;
+  const why = `Runs only this check with a ${n} ms budget, above the ${elapsedMs} ms it already took; read-only.`;
   return {
     name, status: 'warn', elapsed_ms: elapsedMs,
-    message: `Not finished within the doctor budget (${budgetMs} ms). Health is unknown, not clear; rerun this check alone: gbrain doctor --only ${name} --json`,
-    details: { health: 'unknown', reason: 'budget', exact: false, elapsed_ms: elapsedMs, budget_ms: budgetMs },
-    fix: agentFix(['gbrain', 'doctor', '--only', name, '--json'], 'Runs only this check, without the deadline of a full run; read-only.', name),
+    message: `Not finished within ${which}. Health is unknown, not clear; rerun this check alone: ${argv.join(' ')}`,
+    details: { health: 'unknown', reason: 'budget', limit, exact: false, elapsed_ms: elapsedMs, budget_ms: budgetMs, rerun_budget_ms: n },
+    fix: n <= agentCap ? agentFix(argv, why, name)
+      : { argv, consent: [], actor: 'user', requires_exclusive: false, why: `${why} It can run longer than an agent tool call, so run it in a terminal.` },
   };
 }
 
@@ -162,8 +195,8 @@ export function tierFields(checks: Check[], run: DoctorRunSummary): Pick<DoctorR
   return { tier: run.tier, complete: unknown.length === 0, unknown_sections: unknown, elapsed_ms: Date.now() - run.startedAt, budget_ms: run.budgetMs };
 }
 
-/** The run summary a report carries: only when the caller chose a tier or a budget, so default output keeps its shape. */
+/** The run summary a report carries: when the caller chose a tier or a budget, or the non-interactive default capped the run. */
 export function doctorRunSummary(args: readonly string[], deadline: DoctorDeadline): DoctorRunSummary | undefined {
-  if (!args.some((a) => a === '--tier' || a.startsWith('--tier=') || a === '--budget-ms' || a.startsWith('--budget-ms='))) return undefined;
+  if (!deadline.nonInteractiveDefault && !args.some((a) => a === '--tier' || a.startsWith('--tier=') || a === '--budget-ms' || a.startsWith('--budget-ms='))) return undefined;
   return { tier: parseDoctorTier(args), startedAt: deadline.startedAt, budgetMs: deadline.budgetMs };
 }

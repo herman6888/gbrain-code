@@ -8,7 +8,7 @@ import { opError, type OperationError } from '../core/ops/contract.ts';
 import { writeCliError } from '../cli/cli-error.ts';
 import { VERSION } from '../version.ts';
 import type { InteractiveProbe } from '../core/interaction.ts';
-import { forwardProgressPast, migrationLedgerSummary } from '../core/migration-ledger.ts';
+import { forwardProgressPast, migrationLedgerSummary, wedgedLedgerHint } from '../core/migration-ledger.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
 import { MIGRATIONS_RUNNING_EXIT_CODE, readMigrationLockHolder } from '../core/migration-orchestration-lock.ts';
 import { loadConfig } from '../core/config.ts';
@@ -412,7 +412,7 @@ export async function describeMigrationFailure(error: unknown, newVersion: strin
   const ledger = newVersion ? loadCompletedMigrations() : [];
   const wedged = newVersion ? migrationLedgerSummary(newVersion).wedged.filter(v => forwardProgressPast(v, ledger) === null) : [];
   if (wedged.length > 0) {
-    return `Migrations: wedged (${wedged.map(v => `v${v}`).join(', ')} ended partial 3+ times in a row). Fix the cause in ~/.gbrain/upgrade-errors.jsonl, then run: `
+    return `Migrations: wedged (${wedged.map(v => `v${v}`).join(', ')} ended partial 3+ times in a row). Fix the cause recorded in ${wedgedLedgerHint()}, then run: `
       + `${wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ')} && gbrain apply-migrations --yes`;
   }
   return 'Migrations: failed. Run: gbrain apply-migrations --yes';
@@ -834,6 +834,7 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         await (await import('../core/feedback/upgrade-notice.ts')).printRetrievalFeedbackUpgradeNotice(engine);
         // Entity mention index: [AGENT] catch-up line while pages are due (best-effort).
         await (await import('../core/mentions/upgrade-notice.ts')).printMentionIndexUpgradeNotice(engine);
+        await (await import('../core/page-state/projection-upgrade-notice.ts')).printProjectionUpgradeNotice(engine); // #6803 image projections: read-only [AGENT] drain preview
         // Large pages: re-index pages an older gbrain stored chunkless for size (keyless-safe, time-boxed, resumable).
         await (await import('../core/oversized-backfill.ts')).printOversizedBackfillUpgradeNotice(engine);
 

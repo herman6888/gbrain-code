@@ -43,13 +43,14 @@ async function receiptFor(slug: string, patch: { state: string; error_code: stri
   return withVerifiedLocalRegistration(engine, owner, () => op.handler(context(), { request_id: requestId })) as Promise<Record<string, any>>;
 }
 
-test('a drift refusal returns the computed suggestion and the reconcile preview as its structured fix', async () => {
+test('a drift refusal returns the computed suggestion and the scoped file-drift preview as its structured fix', async () => {
   const receipt = await receiptFor('notes/drifted', { state: 'conflict', error_code: 'source_changed', error_message: 'The canonical file contains an uncoordinated local edit.' });
   expect(receipt.write_error).toBe('source_changed');
   expect(receipt.write_error_reason).toBe('file_database_drift');
   expect(receipt.suggestion).toContain('gbrain sources reconcile <source> <slug>');
   expect(receipt.diagnosis).toMatchObject({ category: 'file_conflict', class: 'page', safe_actions: ['reconcile'], needs_human: true });
-  expect(receipt.diagnosis.fix.argv).toEqual(['gbrain', 'sources', 'reconcile', SOURCE, 'notes/drifted', '--preview']);
+  // #6712 PR 2 (L4): the scoped file-drift preview is the drift exit.
+  expect(receipt.diagnosis.fix.argv).toEqual(['gbrain', 'repair', 'file-drift', '--source', SOURCE, '--slug', 'notes/drifted', '--prefer', 'database']);
   expect(receipt.diagnosis.fix.next).toBe('run');
   expect(receipt.diagnosis.fix.verify.argv.slice(0, 5)).toEqual(['gbrain', 'sources', 'writer', 'failures', SOURCE]);
 });

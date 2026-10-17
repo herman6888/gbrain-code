@@ -453,9 +453,8 @@ test('breaker: five consecutive stalled entries with no commit between stop the 
   expect(await s.holds()).toEqual([]);
 }), 240_000);
 
-test('breaker: the count rule trips above sync.hold_escalate_count (greater than), and a committed page resets the consecutive streak', () => each(async engine => {
-  await engine.setConfig('sync.hold_escalate_count', '2');
-  try {
+test('breaker: the count rule trips above GBRAIN_SYNC_HOLD_ESCALATE_COUNT (greater than), and a committed page resets the consecutive streak', () => each(async engine => {
+  await withEnv({ GBRAIN_SYNC_HOLD_ESCALATE_COUNT: '2' }, async () => {
     const files: Record<string, string> = {};
     for (let i = 0; i < 4; i++) files[`notes/s${i}.md`] = note(`S${i}`);
     const s = await source(engine, files);
@@ -463,7 +462,7 @@ test('breaker: the count rule trips above sync.hold_escalate_count (greater than
     const tripped = await s.sync();
     expect(tripped).toMatchObject({ status: 'blocked_by_failures', breaker: { rule: 'count', stalled: 3, consecutive: 3 } });
     expect(await s.holds()).toHaveLength(2);
-  } finally { await engine.unsetConfig('sync.hold_escalate_count'); }
+  });
   // Streak: four stalled, one committed, four stalled: eight holds and no trip.
   const files: Record<string, string> = { 'notes/m-ok.md': note('Ok') };
   for (let i = 0; i < 4; i++) { files[`notes/a${i}.md`] = note(`A${i}`); files[`notes/z${i}.md`] = note(`Z${i}`); }

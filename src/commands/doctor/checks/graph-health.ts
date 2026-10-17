@@ -335,6 +335,7 @@ export const timelineHistoryEntry: DoctorEntry = {
     'frontmatter_hook',
     'orphan_persistence_bindings',
     'foreign_ownership_marker',
+    'coordination_lock_location',
     'unbound_source',
     'writer_version',
     'self_capture',

@@ -418,6 +418,9 @@
       "take_domain_assignments.take_domain_assignments_take_id_fkey": "f FOREIGN KEY (take_id) REFERENCES takes(id) ON DELETE CASCADE",
       "take_grade_cache.take_grade_cache_pkey": "p PRIMARY KEY (take_id, prompt_version, judge_model_id, evidence_signature)",
       "take_grade_cache.take_grade_cache_verdict_check": "c CHECK ((verdict = ANY (ARRAY['correct'::text, 'incorrect'::text, 'partial'::text, 'unresolvable'::text])))",
+      "take_horizons.take_horizons_basis_check": "c CHECK ((basis = ANY (ARRAY['stated'::text, 'stated_relative'::text, 'owner'::text])))",
+      "take_horizons.take_horizons_pkey": "p PRIMARY KEY (take_id)",
+      "take_horizons.take_horizons_take_id_fkey": "f FOREIGN KEY (take_id) REFERENCES takes(id) ON DELETE CASCADE",
       "take_nudge_log.take_nudge_log_pkey": "p PRIMARY KEY (id)",
       "take_nudge_log.take_nudge_log_proposal_id_fkey": "f FOREIGN KEY (proposal_id) REFERENCES take_proposals(id) ON DELETE CASCADE",
       "take_nudge_log.take_nudge_log_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
@@ -919,6 +922,9 @@
       "take_grade_cache": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "take_horizons": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "take_nudge_log": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -1286,6 +1292,7 @@
       "persistence_requests_principal": "CREATE INDEX persistence_requests_principal ON public.persistence_requests USING btree (principal_kind, principal_id, sequence DESC)",
       "persistence_requests_principal_kind_principal_id_request_id_key": "CREATE UNIQUE INDEX persistence_requests_principal_kind_principal_id_request_id_key ON public.persistence_requests USING btree (principal_kind, principal_id, request_id)",
       "persistence_requests_recovery": "CREATE INDEX persistence_requests_recovery ON public.persistence_requests USING btree (worktree_id, sequence) WHERE (recovery IS NOT NULL)",
+      "persistence_requests_request_id": "CREATE INDEX persistence_requests_request_id ON public.persistence_requests USING btree (source_id, request_id)",
       "persistence_requests_sequence_key": "CREATE UNIQUE INDEX persistence_requests_sequence_key ON public.persistence_requests USING btree (sequence)",
       "persistence_requests_slug_intent": "CREATE INDEX persistence_requests_slug_intent ON public.persistence_requests USING btree (source_id, slug, sequence) WHERE ((intent IS NOT NULL) AND (NOT compacted))",
       "persistence_requests_sync_run_committed": "CREATE INDEX persistence_requests_sync_run_committed ON public.persistence_requests USING btree (source_id, ((intent ->> 'runId'::text)), ((intent ->> 'index'::text))) WHERE ((state = 'committed'::text) AND (intent ? 'runId'::text))",
@@ -1359,6 +1366,8 @@
       "take_grade_cache_applied_idx": "CREATE INDEX take_grade_cache_applied_idx ON public.take_grade_cache USING btree (take_id, applied)",
       "take_grade_cache_pkey": "CREATE UNIQUE INDEX take_grade_cache_pkey ON public.take_grade_cache USING btree (take_id, prompt_version, judge_model_id, evidence_signature)",
       "take_grade_cache_wave_idx": "CREATE INDEX take_grade_cache_wave_idx ON public.take_grade_cache USING btree (wave_version, graded_at DESC)",
+      "take_horizons_date_idx": "CREATE INDEX take_horizons_date_idx ON public.take_horizons USING btree (horizon_date)",
+      "take_horizons_pkey": "CREATE UNIQUE INDEX take_horizons_pkey ON public.take_horizons USING btree (take_id)",
       "take_nudge_log_pkey": "CREATE UNIQUE INDEX take_nudge_log_pkey ON public.take_nudge_log USING btree (id)",
       "take_nudge_log_proposal_cooldown_idx": "CREATE INDEX take_nudge_log_proposal_cooldown_idx ON public.take_nudge_log USING btree (proposal_id, nudge_pattern, fired_at DESC) WHERE (proposal_id IS NOT NULL)",
       "take_nudge_log_take_cooldown_idx": "CREATE INDEX take_nudge_log_take_cooldown_idx ON public.take_nudge_log USING btree (take_id, nudge_pattern, fired_at DESC) WHERE (take_id IS NOT NULL)",
@@ -3666,6 +3675,16 @@
           "8 confidence real/float4 NOT NULL",
           "9 applied boolean/bool NOT NULL DEFAULT false",
           "10 cost_usd numeric/numeric NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "take_horizons": {
+        "columns": [
+          "1 take_id bigint/int8 NOT NULL",
+          "2 claim_sha256 text/text NOT NULL",
+          "3 horizon_date date/date NOT NULL",
+          "4 basis text/text NOT NULL",
+          "5 set_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },

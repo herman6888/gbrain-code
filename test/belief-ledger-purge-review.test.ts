@@ -66,11 +66,13 @@ async function collect<T>(run: (report: (value: T) => void) => Promise<void>): P
 /**
  * Edits a canonical file the way a user does (write, git commit) and runs the managed sync to completion. The deadline sits
  * well inside the test timeout, so a blocked drain ends as a reported stop and the brain tears down; it never outlives the test.
+ * `governMs` sets how often the drain's governor looks and how long it confirms a blocker (5 s by default).
  */
-async function editAndSync(b: BeliefBrain, slug: string, content: string, deadlineMs = 90_000) {
+async function editAndSync(b: BeliefBrain, slug: string, content: string, deadlineMs = 90_000, governMs?: number) {
   writeFileSync(join(b.root, `${slug}.md`), content);
   git(b.root, 'add', '-A'); git(b.root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'edit');
-  const result = await performSync(b.engine, { sourceId: b.sourceId, noPull: true, noEmbed: true, noExtract: true, drain: true, deadlineAtMs: Date.now() + deadlineMs } as never);
+  const result = await performSync(b.engine, { sourceId: b.sourceId, noPull: true, noEmbed: true, noExtract: true, drain: true, deadlineAtMs: Date.now() + deadlineMs,
+    ...(governMs ? { governMs } : {}) } as never);
   return { outcome: result.drain?.outcome ?? null, stop: result.drain?.stop_reason ?? null };
 }
 
@@ -156,7 +158,10 @@ for (const engineCase of testBackends().map(beliefEngineCase)) {
     }, 240_000);
 
     test('#1 (CI stall): a canonical edit that lands inside the purge mirror\'s reserve-to-verify window leaves its recovery record blocking the root, so the next sync cannot finish', async () => {
-      const r = await collect<Record<string, unknown>>(report => brain(async b => {
+      // The next sync stops as `blocked` / `drain_stalled` once its governor has read the blocker (only the user clears it) on two
+      // ticks, and as `resumable` / `deadline` if its deadline comes first; either way it ends inside the test. The 20 s deadline stops
+      // the drain at about 10 s, where the default 5 s governor confirms too, so each case sets the governor's tick.
+      const run = (governMs: number) => collect<Record<string, unknown>>(report => brain(async b => {
         const slug = 'companies/acme-example';
         const edited = beliefPage({ facts: [{ claim: 'Acme sells widgets', context: 'sync rewrote it' }] });
         git(b.root, 'init', '-q');
@@ -175,14 +180,18 @@ for (const engineCase of testBackends().map(beliefEngineCase)) {
           writeFileSync(join(b.root, `${slug}.md`), edited);
         } finally { for (const release of held) release(); }
         await waitFor(async () => (await mirrorEffects(b)).some(e => e.error_code === 'unexpected_file_bytes'), { timeoutMs: 30_000, intervalMs: 50, label: 'mirror refused the edited bytes' });
-        const raced = await editAndSync(b, slug, edited, 20_000);
+        const raced = await editAndSync(b, slug, edited, 20_000, governMs);
         const queued = (await b.engine.executeRaw<{ id: string }>("SELECT id::text AS id FROM persistence_requests WHERE source_id = $1 AND state = 'queued'", [b.sourceId])).map(row => row.id);
         const blocked = [...(await readHeadBlockers(b.engine, queued, localHostId())).values()].map(read => read.status === 'blocked' ? read.blocker.predicate : read.status);
         report({ first, mirror: (await mirrorEffects(b)).map(e => ({ recovering: e.recovering, error_code: e.error_code })), raced, blocked });
       }));
       // The CI signature: `0/1 processed · stalled on queued · blocked_by=effect_recovery(1)` until the test timed out.
-      expect(r).toEqual({ first: { outcome: 'synced', stop: null }, mirror: [{ recovering: true, error_code: 'unexpected_file_bytes' }], raced: { outcome: 'resumable', stop: 'deadline' },
+      const expected = (raced: Record<string, unknown>) => ({ first: { outcome: 'synced', stop: null }, mirror: [{ recovering: true, error_code: 'unexpected_file_bytes' }], raced,
         blocked: ['effect_recovery'] });
+      // The governor confirms at about 1 s, long before the deadline.
+      expect(await run(500)).toEqual(expected({ outcome: 'blocked', stop: 'drain_stalled' }));
+      // Forced probe: a governor that would confirm only after a minute leaves the stop to the deadline.
+      expect(await run(60_000)).toEqual(expected({ outcome: 'resumable', stop: 'deadline' }));
     }, 240_000);
 
     test('#43/#5: every redaction release appends one redaction.released in the publication released_by names, also when the confirm leaves the tier unchanged', async () => {

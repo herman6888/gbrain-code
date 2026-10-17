@@ -393,11 +393,11 @@
     "traversePathsDetailed#out+sourceId+linkType": {},
     "updatePageContextualRetrievalState#default": {},
     "updateSlug#moved": {
-      "raw": 10,
+      "raw": 11,
       "tx": 1
     },
     "updateSlug#noop": {
-      "raw": 1,
+      "raw": 2,
       "tx": 1
     },
     "updateSourceConfig#default": {},

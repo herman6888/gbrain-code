@@ -40,7 +40,7 @@ const PACK = { '--pack': null } as const;
 
 export const STRICT_SUBCOMMANDS: Readonly<Record<string, StrictSpec>> = {
   'pages purge-deleted': {
-    flags: ['--dry-run', '--json', '--yes'],
+    flags: ['--dry-run', '--json', '--yes', '--retry-parked'],
     values: { '--older-than': { re: OLDER_THAN_RE, shape: 'hours (72 or 72h) or days (3d)' } },
     maxPositionals: 0,
     fix: { argv: ['pages', 'purge-deleted', '--dry-run', '--json'], why: 'Lists the soft-deleted pages a brain-wide purge would remove; changes nothing.' },

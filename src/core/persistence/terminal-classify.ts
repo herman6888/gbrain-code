@@ -24,6 +24,7 @@ import { compareVersions } from '../migration-ledger.ts';
 import { classifySyncFault, SYNC_FAULT_TABLE, type SyncFaultClass, type SyncSafeAction } from './sync-fault-class.ts';
 import { isSyncKnockOn, knockOnRoot, SYNC_CURSOR_FENCE_ORIGIN, SYNC_KNOCK_ON_ORIGIN, cursorFenceCause, syncKnockOnSql } from './sync-knock-on.ts';
 import { writeFailureDiagnostic } from './verb-errors.ts';
+import { publicCategory, type PublicCategory } from './public-category.ts';
 
 export type TerminalCategory =
   | 'recovery_pending' | 'recovery_blocked'
@@ -56,6 +57,8 @@ export interface TerminalInput {
 
 export interface TerminalVerdict {
   category: TerminalCategory;
+  /** #6712 PR 2: the closed public vocabulary beside `category` (`public-category.ts`); total. */
+  public_category: PublicCategory;
   /** The code the verdict is keyed on: the row's `error_code`, or the refinement its origin names. */
   code: string;
   origin: string | null;
@@ -102,12 +105,22 @@ export function terminalVerifyArgv(sourceId: string): string[] { return failures
 export function terminalInspectArgv(requestId: string): string[] { return ['gbrain', 'write-request', requestId, '--json']; }
 
 function syncRetry(sourceId: string, why: string): Action {
-  return { argv: ['gbrain', 'sync', '--source', sourceId, '--no-pull', '--retry-failed', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why,
+  return { argv: ['gbrain', 'sync', '--source', sourceId, '--no-pull', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why,
     verify: { argv: ['gbrain', 'sync', 'status', '--source', sourceId, '--json'] }, docs: 'docs/guides/sync-unblock-runbook.md' };
 }
 function inspect(sourceId: string, why: string, userMessage?: string): Action {
   return { argv: statusArgv(sourceId), consent: [], actor: userMessage ? 'host_admin' : 'agent', requires_exclusive: false, why,
     ...(userMessage ? { user_message: userMessage } : {}), verify: { argv: failuresArgv(sourceId) }, docs: 'docs/guides/troubleshooting.md#terminal-write-failures' };
+}
+
+/**
+ * #6712 PR 2 (L4): the file-drift preview over every page still drifted since `since` (a concrete instant, never an age),
+ * the fix of a group of drift conflicts on several pages; a single page keeps its `--slug` preview.
+ */
+export function driftSinceAction(sourceId: string, since: string): Action {
+  return { argv: ['gbrain', 'repair', 'file-drift', '--source', sourceId, '--all-drifted', '--since', since, '--prefer', 'database'], consent: [], actor: 'agent', requires_exclusive: false,
+    why: `Previews keeping the database copy of every page still drifted since ${since} and writes nothing (it refuses a mix of drift classes and names --class for each); --prefer file previews importing the files instead. Decide with the user, then apply with the printed plan hash.`,
+    verify: { argv: failuresArgv(sourceId) }, docs: 'docs/guides/write-refusals.md#file_database_drift' };
 }
 
 function build(input: TerminalInput): string | null {
@@ -120,7 +133,7 @@ function stringField(detail: Record<string, unknown> | null | undefined, key: st
   return typeof value === 'string' ? value : null;
 }
 
-type Partial_ = Omit<TerminalVerdict, 'defect' | 'fixed_in' | 'historical' | 'escalate'> & { escalate?: string };
+type Partial_ = Omit<TerminalVerdict, 'defect' | 'fixed_in' | 'historical' | 'escalate' | 'public_category'> & { escalate?: string };
 
 /** The read-time verdict for one terminal receipt that did not commit; null for a committed receipt with no recovery record. */
 export function classifyTerminal(input: TerminalInput): TerminalVerdict | null {
@@ -129,7 +142,7 @@ export function classifyTerminal(input: TerminalInput): TerminalVerdict | null {
   const fixedIn = (TERMINAL_FIXED_IN as Partial<Record<TerminalCategory, string>>)[verdict.category] ?? null;
   const ran = build(input);
   const historical = fixedIn !== null && (verdict.category === 'legacy_publication_refusal' || (ran !== null && compareVersions(ran, fixedIn) < 0));
-  return { ...verdict, escalate: verdict.escalate ?? escalateOf(verdict.code), defect: DEFECTS.has(verdict.category), fixed_in: fixedIn, historical };
+  return { ...verdict, public_category: publicCategory(verdict), escalate: verdict.escalate ?? escalateOf(verdict.code), defect: DEFECTS.has(verdict.category), fixed_in: fixedIn, historical };
 }
 
 function fromTable(category: TerminalCategory, code: string, origin: string | null, action: Action, detail?: string | null, message?: string | null): Partial_ {
@@ -230,22 +243,25 @@ function route(input: TerminalInput): Partial_ {
   if (code === 'source_changed') {
     const known = stringField(detail, 'reason') ?? (input.error_message ? writeFailureDiagnostic(code, input.error_message).reason : null);
     if (!known || known === 'source_changed') return diagnosis(input, code, origin, `The write was refused source_changed with no recorded cause${input.compacted ? ' (its receipt was compacted)' : ''}.`);
+    // #6712 PR 2 (L4): the recorded reason picks the exit; the verdict text is the fault table's row for it.
+    const row = (key: string) => { const v = classifySyncFault({ code, detail: key }); return { class: v.class, safe_actions: v.safe_actions, needs_human: v.needs_human, human_reason: v.human_reason, escalate: escalateOf(key) }; };
     if (known === 'file_database_drift' || known === 'canonical_path_occupied' || known === 'unbound_source') {
-      return { category: 'file_conflict', code, origin: origin ?? known, class: 'page', safe_actions: ['reconcile'], needs_human: true,
-        human_reason: 'The page\'s Git file and its database copy differ; a person chooses which version wins.', escalate: 'always: the file and the database page diverge',
-        action: { argv: ['gbrain', 'sources', 'reconcile', source, input.slug, '--preview'], consent: [], actor: 'agent', requires_exclusive: false,
-          why: 'Previews both versions of the page and writes nothing; apply the resolved preview, then resubmit the write with a new request id.',
+      return { category: 'file_conflict', code, origin: origin ?? known, ...row('file_database_drift'),
+        action: { argv: ['gbrain', 'repair', 'file-drift', '--source', source, '--slug', input.slug, '--prefer', 'database'], consent: [], actor: 'agent', requires_exclusive: false,
+          why: `Previews keeping the database copy of ${input.slug} and rewriting its file, and writes nothing; --prefer file previews importing the file instead. Decide with the user, apply with the printed plan hash, then resubmit the write with a new request id.`,
           verify: { argv: failuresArgv(source) }, docs: 'docs/guides/write-refusals.md#file_database_drift' } };
     }
     if (known === 'canonical_file_missing') {
-      return { category: 'canonical_file_missing', code, origin: origin ?? known, class: 'page', safe_actions: ['repair'], needs_human: true,
-        human_reason: 'The page\'s canonical file is gone but the database page is still live (a ghost page); a person chooses to restore the file or remove the page.',
-        escalate: 'always: no sync can import a file that is not there',
+      return { category: 'canonical_file_missing', code, origin: origin ?? known, ...row('canonical_file_missing'),
         action: { argv: ['gbrain', 'repair', 'ghost-pages', '--source', source], consent: [], actor: 'agent', requires_exclusive: false,
           why: 'Previews the live pages whose canonical file is missing and writes nothing; apply only after the user agrees, or restore the file and sync.',
           verify: { argv: failuresArgv(source) }, docs: 'docs/guides/write-refusals.md#canonical_file_missing' } };
     }
-    if (known === 'source_binding_changed' || known === 'unsafe_file_target') return diagnosis(input, code, known, `The write was refused source_changed (${known}).`);
+    if (known === 'source_binding_changed' || known === 'unsafe_file_target') {
+      const v = row(known);
+      return { category: 'diagnosis_required', code, origin: known, ...v,
+        action: inspect(source, `The write was refused source_changed (${known}). Writer status shows the source binding and its checkout, read-only.`, v.human_reason) };
+    }
     return fromTable('sync_fault', code, origin ?? known, syncRetry(source, `The file changed under the write (${known}); a sync imports the current bytes.`), known === 'pinned_git_worktree_conflict' ? known : 'source_changed');
   }
   // #6834: a checkpoint or fact-batch completion receipt names a bookkeeping slug, never a page; reading it finds nothing.
@@ -345,4 +361,16 @@ export function dispositionOf(later: { state: string; same_intent: boolean } | n
   if (later.same_intent && later.state === 'committed') return 'already_written';
   if (later.same_intent) return 'duplicate';
   return 'superseded';
+}
+
+/**
+ * #6712 PR 2 (L5): the verdict of a fault recorded without its receipt at hand (a hold, a managed-sync failure row, a run
+ * stop), read as the failed receipt it stands for, so `last_error`, holds and doctor's `sync_failures` render the same
+ * `category` / `public_category` as the receipt itself.
+ */
+export function classifyRecordedFault(input: { source_id: string; code: string; slug?: string | null; request_id?: string | null;
+  error_detail?: Record<string, unknown> | null; message?: string | null }): TerminalVerdict {
+  return classifyTerminal({ source_id: input.source_id, slug: input.slug ?? '', operation: 'submit_job', state: 'failed', error_code: input.code,
+    error_detail: input.error_detail ?? null, recovery: null, blocked_reason: null, compacted: false, error_message: input.message ?? null,
+    ...(input.request_id ? { request_id: input.request_id } : {}) })!;
 }

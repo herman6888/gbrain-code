@@ -7,7 +7,10 @@
  * a non-committed page receipt of the run with no committed sibling at the
  * same index). Each probe is served by an index: `persistence_requests_recovery`,
  * `persistence_requests_sync_run_open` and, for the sibling lookup,
- * `persistence_requests_sync_run_committed`. A statement timeout of this one
+ * `persistence_requests_sync_run_committed`. #6735: the sibling lookup is a
+ * `LATERAL ... LIMIT 1` probe keyed on (source, run, index), which the planner
+ * cannot flatten into an anti-join over a materialized scan of every committed
+ * receipt of the run, so its cost is linear in the run's non-committed receipts. A statement timeout of this one
  * statement is a deterministic failure on a large request table, not
  * contention, so it becomes the terminal typed code instead of being released
  * as `database_contention` and retried ahead of every other write.
@@ -18,7 +21,7 @@
  * `gbrain write-request` / MCP `get_write_request`.
  */
 import type { BrainEngine } from '../engine.ts';
-import { opError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
 import { PERSISTENCE_REQUEST_ONLINE_INDEXES, PERSISTENCE_SYNC_RUN_INDEXES } from './schema.ts';
 import { docsAnchor } from './connector-errors.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
@@ -35,20 +38,22 @@ const SYNC_PAGE_KINDS = "r.intent->>'kind' IN ('managed_sync_import','managed_sy
  * #6712 retired the knock-on exemption ($6): no page is cancelled for another page's failure any more, and the cursor
  * converts a legacy knock-on it meets in place (sync-run.ts `refreezeInPlace`).
  */
-export const INCOMPLETE_SYNC_RECEIPT_SQL = `(SELECT r.request_id::text AS request_id FROM persistence_requests r
-    WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL LIMIT 1)
+const incompleteSyncReceiptSql = (limit: number) => `(SELECT r.request_id::text AS request_id FROM persistence_requests r
+    WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL LIMIT ${limit})
   UNION ALL (SELECT r.request_id::text FROM persistence_requests r
     WHERE r.worktree_id=$1::uuid AND r.intent->>'runId'=$2 AND r.state<>'committed' AND ${SYNC_PAGE_KINDS}
-      AND r.state IN ('queued','running','recovering') LIMIT 1)
+      AND r.state IN ('queued','running','recovering') LIMIT ${limit})
   UNION ALL (SELECT r.request_id::text FROM persistence_requests r
-    WHERE r.worktree_id=$1::uuid AND r.intent->>'runId'=$2 AND r.state<>'committed' AND ${SYNC_PAGE_KINDS}
-      AND NOT EXISTS (SELECT 1 FROM persistence_requests committed WHERE committed.source_id=r.source_id
+    LEFT JOIN LATERAL (SELECT true AS found FROM persistence_requests committed WHERE committed.source_id=r.source_id
         AND committed.intent->>'runId'=$2 AND committed.intent->>'index'=r.intent->>'index'
-        AND committed.state='committed' AND committed.intent ? 'runId')
+        AND committed.state='committed' AND committed.intent ? 'runId' LIMIT 1) sibling ON true
+    WHERE r.worktree_id=$1::uuid AND r.intent->>'runId'=$2 AND r.state<>'committed' AND ${SYNC_PAGE_KINDS}
+      AND sibling.found IS NULL
       AND NOT (r.request_id::text=ANY($3::text[]))
       AND NOT (r.state IN ('failed','cancelled','conflict') AND r.recovery IS NULL
-        AND EXISTS (SELECT 1 FROM unnest($4::int[], $5::int[]) AS settled(lo, hi) WHERE (r.intent->>'index')::int BETWEEN settled.lo AND settled.hi)) LIMIT 1)
-  LIMIT 1`;
+        AND EXISTS (SELECT 1 FROM unnest($4::int[], $5::int[]) AS settled(lo, hi) WHERE (r.intent->>'index')::int BETWEEN settled.lo AND settled.hi)) LIMIT ${limit})
+  LIMIT ${limit}`;
+export const INCOMPLETE_SYNC_RECEIPT_SQL = incompleteSyncReceiptSql(1);
 
 /** #6643: the index ranges a cursor passed without a commit, and the index it began recording them at. */
 export interface SyncSettledIndexes { from: number; ranges: Array<[number, number]> }
@@ -77,6 +82,17 @@ export async function findIncompleteSyncReceipt(tx: Pick<BrainEngine, 'executeRa
 }
 
 /**
+ * #6735: `findIncompleteSyncReceipt` as a resume asks it, outside the coordinator: a timeout reads as no known blocker,
+ * so the revived checkpoint is validated again inside its own publication instead of the manifest being rediscovered.
+ */
+export async function probeCheckpointBlocker(...args: Parameters<typeof findIncompleteSyncReceipt>): Promise<string | null> {
+  return findIncompleteSyncReceipt(...args).catch(error => {
+    if (error instanceof OperationError && error.code === CHECKPOINT_VALIDATION_TIMEOUT) return null;
+    throw error;
+  });
+}
+
+/**
  * #6643: every receipt (up to 20) that would block the run's checkpoint now, with what `sync status` needs to tell a
  * knock-on from a root; read-only. The checkpoint itself names only the first (`findIncompleteSyncReceipt`).
  */
@@ -84,7 +100,7 @@ export async function listIncompleteSyncReceipts(engine: Pick<BrainEngine, 'exec
   settled: SyncSettledIndexes | null = null): Promise<Array<{ request_id: string; slug: string; state: string; code: string | null; index: number | null; recovery: boolean }>> {
   const ranges = settled?.ranges ?? [];
   return engine.executeRaw(`SELECT r.request_id::text AS request_id, r.slug, r.state, r.error_code AS code, (r.intent->>'index')::int AS index, r.recovery IS NOT NULL AS recovery
-      FROM persistence_requests r WHERE r.request_id::text IN (SELECT request_id FROM (${INCOMPLETE_SYNC_RECEIPT_SQL.replaceAll('LIMIT 1', 'LIMIT 20')}) blockers) ORDER BY r.sequence LIMIT 20`,
+      FROM persistence_requests r WHERE r.request_id::text IN (SELECT request_id FROM (${incompleteSyncReceiptSql(20)}) blockers) ORDER BY r.sequence LIMIT 20`,
     [worktreeId, runId, superseded, ranges.map(range => range[0]), ranges.map(range => range[1])]);
 }
 
@@ -128,9 +144,12 @@ export async function readRequestIndexStates(engine: Pick<BrainEngine, 'executeR
 
 const shellWord = (value: string) => /^[\w./@:=+-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
 
-/** The exact retry for the failed checkpoint: same source and cursor-selecting options, plus the recorded processing flags. */
+/**
+ * The exact retry for the failed run: the same source and discovery options, plus the recorded processing flags. #6712
+ * PR 3 (L7): a plain sync retries a recorded failure by itself, so the command carries no retry flag.
+ */
 export function checkpointRetryCommand(input: { sourceId: string; processingOptions?: Partial<SyncProcessingOptions> | null; syncOptions?: SyncCursorOptions | null; repoPath?: string | null }): string {
-  const base = `gbrain sync --source ${shellWord(input.sourceId)} --no-pull --retry-failed`;
+  const base = `gbrain sync --source ${shellWord(input.sourceId)} --no-pull`;
   // A compacted receipt (intent cleared) or a checkpoint admitted before the options were recorded
   // cannot name its cursor; never print assumed defaults for it.
   if (!input.syncOptions) return `${base} with the same options as the failed run (this receipt no longer records them)`;

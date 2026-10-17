@@ -107,10 +107,12 @@ interface CliCommandBase {
   /**
    * A1: the command's target source resolves through the ambient chain
    * (`--source` → GBRAIN_SOURCE → .gbrain-source → …), so a fix naming it
-   * carries `--source <id>` (src/core/fix-routing.ts). Requires consumption
-   * evidence in the generated registry (test/fix-routing.test.ts).
+   * carries `--source <id>` (src/core/fix-routing.ts). `'--source-id'` names that
+   * flag instead for a command whose `--source` is a mode selector (extract:
+   * fs|db). Requires consumption evidence in the generated registry
+   * (test/fix-routing.test.ts).
    */
-  routes_source?: true;
+  routes_source?: true | '--source-id';
   /** D3: lazy curated help module. */
   help?: () => Promise<{ help: CliHelpSpec }>;
 }
@@ -304,7 +306,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'sync', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, json: 'document', routes_source: true, load: () => import('./commands/sync.ts') },
   // selfHelp: #3834: extract ships detailed help for its mode-specific flags. Keep the generic
   // CLI-only stub from hiding that contract.
-  { name: 'extract', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: true, load: () => import('./commands/extract.ts') },
+  { name: 'extract', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: '--source-id', load: () => import('./commands/extract.ts') },
   // selfHelp: v0.41.11.0 — extract-conversation-facts ships its own detailed HELP describing segment
   // splitting + checkpointing + budget caps + the unified types config story. Route around the
   // generic short-circuit.
@@ -395,7 +397,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'quarantine', phase: 'post-connect', thinClient: 'route-then-refuse', selfHelp: true, load: () => import('./commands/quarantine.ts') },
   // #5575: memory trust. Observational startup: `trust backfill --dry-run` runs with no migrations and no writes.
   // W1 belief ledger coverage: enable, disable, status, reconcile, backfill (docs/designs/BELIEF_LEDGER.md section 7).
-  { name: 'beliefs', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, json: 'document', routes_source: true, load: () => import('./commands/beliefs.ts') },
+  { name: 'beliefs', phase: 'post-connect', thinClient: 'route-then-refuse', selfHelp: true, json: 'document', routes_source: true, load: () => import('./commands/beliefs.ts') },
   { name: 'trust', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, json: 'document', skipStartupHooks: true, startup: 'observational', load: () => import('./commands/trust.ts') },
   // selfHelp: v0.43 (#2095): watch ships WATCH_HELP (flags + the stdin-turn protocol).
   // thin client: v0.43 (#2095): watch streams against a LOCAL engine; thin clients get the

@@ -14,6 +14,9 @@
     ],
     "src/core/operations*.ts": [
       "test/cli-goldens.test.ts"
+    ],
+    "scripts/pregate-remote-gate.sh": [
+      "test/scripts/pregate-remote-gate.test.ts"
     ]
   },
   "guards": [
@@ -72,5 +75,6 @@
       "**/usage.jsonl.gz"
     ],
     "visibility": "public"
-  }
+  },
+  "remote_gate": "bash scripts/pregate-remote-gate.sh"
 }

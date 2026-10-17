@@ -221,12 +221,21 @@ const entity: Operation = {
   params: {
     name: { type: 'string', description: 'Name, alias or slug.' },
     names: { type: 'array', items: { type: 'string' }, description: 'Or up to 50 names/codes at once: compact rows.' },
+    source_id: { type: 'string', description: 'Read only this source. Default: your source first, then every source you can read.', fullSurfaceOnly: true },
+    prefer_source_id: { type: 'string', description: 'Source to try first (thin clients send .gbrain-source here); never narrows.', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
   annotations: { title: 'entity (card lookup, zero LLM)', readOnlyHint: true },
   handler: async (ctx, p) => {
     const { verbError } = await import('./operations.ts');
+    // #6723: resolve across the caller's readable sources (home first) unless source_id pins one.
+    const { ambientMissNotice, entitySources } = await import('./verbs/entity-source.ts');
+    const walk = await entitySources(ctx, p, 'entity');
+    const ambientMiss = (misses: Array<{ name: string; foundIn?: string }>) => {
+      const notice = ambientMissNotice('entity', walk, misses.filter(m => m.foundIn !== walk.ambient?.sourceId));
+      if (notice) ctx.emitNotice?.(notice);
+    };
     if (p.names !== undefined) {
       const { ENTITY_NAMES_MAX, lookupEntityNames } = await import('./verbs/entity-names.ts');
       const names = Array.isArray(p.names) ? p.names.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : [];
@@ -235,8 +244,9 @@ const entity: Operation = {
           `Pass either name: "Alice Example" for one full card, or names: ["Alice Example", "WGCO"] (up to ${ENTITY_NAMES_MAX}) for compact rows.`);
       }
       const t0 = Date.now();
-      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false, surfaceCeiling: ctx.surfaceCeiling,
+      const out = await lookupEntityNames(ctx.engine, walk.home, names, { remote: ctx.remote !== false, sources: walk.sources, surfaceCeiling: ctx.surfaceCeiling,
         emitNotice: n => ctx.emitNotice?.(n) });
+      ambientMiss(out.results.map(r => ({ name: r.name, ...(r.found ? { foundIn: r.source_id } : {}) })));
       return { protocol_version: 1, latency_ms: Date.now() - t0, ...out };
     }
     const name = typeof p.name === 'string' ? p.name.trim() : '';
@@ -249,8 +259,8 @@ const entity: Operation = {
     }
     const t0 = Date.now();
     const { buildEntityCard } = await import('./verbs/entity-card.ts');
-    const result = await buildEntityCard(ctx.engine, ctx.sourceId ?? 'default', name, {
-      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling,
+    const result = await buildEntityCard(ctx.engine, walk.home, name, {
+      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling, sources: walk.sources,
       omitQuarantined: ctx.remote !== false, // #5575: like get_page, a remote reader never gets a quarantined page's card
       emitNotice: n => ctx.emitNotice?.(n),
     });
@@ -260,6 +270,7 @@ const entity: Operation = {
       const notice = mentionCoverageNotice(coverage, result.card?.entity.type);
       if (notice) ctx.emitNotice?.(notice);
     }
+    ambientMiss([{ name, ...(result.source_id ? { foundIn: result.source_id } : {}) }]);
     if (result.card?.identity_siblings?.capped) {
       const { siblingsCappedNotice } = await import('./verbs/entity-card-identity.ts');
       ctx.emitNotice?.(siblingsCappedNotice(result.card.entity.slug));
@@ -659,7 +670,11 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           entity: {
             type: 'object',
             required: ['slug', 'title', 'type'],
-            properties: { slug: { type: 'string' }, title: { type: 'string' }, type: { type: ['string', 'null'] } },
+            properties: {
+              slug: { type: 'string' }, title: { type: 'string' }, type: { type: ['string', 'null'] },
+              // #6723 — ADDITIVE OPTIONAL: (source_id, slug) is the entity's identity.
+              source_id: { type: 'string' },
+            },
           },
           aka: { type: 'array', items: { type: 'string' } },
           summary: { type: 'string' },
@@ -744,6 +759,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             slug: { type: 'string' },
             title: { type: 'string' },
             create_safety: { type: 'string', enum: CREATE_SAFETY_ENUM },
+            source_id: { type: 'string' },
           },
         },
       },
@@ -831,6 +847,8 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           required: ['slug', 'title', 'summary', 'open_threads'],
           properties: {
             slug: { type: 'string' },
+            // #6723 — ADDITIVE OPTIONAL: the card page's source; (source_id, slug) is the entity's identity.
+            source_id: { type: 'string' },
             title: { type: 'string' },
             type: { type: ['string', 'null'] },
             summary: { type: 'string' },
@@ -913,6 +931,29 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             confidence: { type: 'number' },
             fact_id: { type: 'string', description: 'Opaque protocol id — the value forget accepts.' },
             provenance: { type: ['string', 'null'], description: 'The stored source attribution (remember --provenance).' },
+          },
+        },
+      },
+      // #6724 — ADDITIVE OPTIONAL: the packed entities' own facts, keyed to their card's (source_id, slug); `facts` stays hot memory.
+      entity_facts: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['source_id', 'slug', 'fact_id', 'fact', 'kind'],
+          properties: {
+            source_id: { type: 'string' },
+            slug: { type: 'string', description: 'The card this fact is about.' },
+            fact_id: { type: 'string', description: 'Opaque protocol id — the value forget accepts.' },
+            fact: { type: 'string' },
+            kind: { type: 'string' },
+            entity_slug: { type: ['string', 'null'] },
+            valid_from: { type: 'string' },
+            context: { type: ['string', 'null'] },
+            confidence: { type: 'number' },
+            attributed_to: { type: ['string', 'null'] },
+            provenance: { type: ['string', 'null'], description: 'The stored source attribution (remember --provenance).' },
+            trust_tier: { type: 'string' },
+            origin: { type: 'string' },
           },
         },
       },

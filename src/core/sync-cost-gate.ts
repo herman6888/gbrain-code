@@ -38,6 +38,7 @@ import {
   type EmbedBackfillWorkerSurface,
 } from './minions/embed-backfill-admission.ts';
 import { git, hasOriginRemote, isDetachedHead, unique } from './sync-git.ts';
+import { readManagedMode } from './persistence/managed-mode.ts';
 
 /**
  * Walk ONE source's working tree and sum tokens for every syncable file.
@@ -202,6 +203,9 @@ export interface InlineEstimate {
  *   2. chunker drift (stored !== current)     → full-tree CEILING (a drift forces
  *        performFullSync → full re-chunk → full re-embed; a delta would
  *        underestimate by the whole corpus). kind: ceiling_chunker_drift
+ *        #6858: skipped when `chunkerDriftWalks` is false. A managed incremental
+ *        sync imports only the delta and keeps the stamp (sync-prepare.ts), so
+ *        the drift never walks the tree there and the delta rung prices it.
  *        A drift in a language's grammar revision alone (`GRAMMAR_REVISIONS`,
  *        CHUNKER_VERSION unchanged) prices only that language's files: the
  *        walk re-imports nothing else. kind: ceiling_grammar_drift
@@ -228,7 +232,7 @@ export function estimateInlineNewTokens(
     chunker_version: string | null;
   }>,
   currentChunkerVersion: string,
-  opts: { forceFullTree?: boolean } = {},
+  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean } = {},
 ): InlineEstimate {
   let tokens = 0;
   let changedSources = 0;
@@ -262,7 +266,7 @@ export function estimateInlineNewTokens(
     // Rung 2: chunker drift forces a full re-chunk → full re-embed. CEILING.
     // A drift in grammar revisions alone re-chunks only those languages' files:
     // the walk compares hashes and every other file's hash is unchanged.
-    if (src.chunker_version !== currentChunkerVersion) {
+    if (opts.chunkerDriftWalks !== false && src.chunker_version !== currentChunkerVersion) {
       const languages = grammarOnlyDrift(src.chunker_version, currentChunkerVersion);
       if (languages) {
         tokens += estimateLanguageTokens(localPath, strategy, languages).tokens;
@@ -546,6 +550,7 @@ export async function runInlineCostGate(
   // ── Inline path ───────────────────────────────────────────────
   const inline = estimateInlineNewTokens(sources, chunkerStamp(), {
     forceFullTree: ctx.includeGitignored === true,
+    chunkerDriftWalks: full === true || !(await readManagedMode(engine).catch(() => false)),
   });
   // D7A: `--full` runs `performFullSync` → `runEmbedCore({stale:true})`, which
   // sweeps the pre-existing stale backlog INLINE on top of the delta. Price it.

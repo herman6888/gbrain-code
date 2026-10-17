@@ -15,12 +15,17 @@
  * attempt and pause together, so a slow download that keeps printing progress
  * runs to the budget instead of being restarted from zero, and no retry starts
  * without time left for it. A failure that is not a stall is retried once too
- * and then reported with the command's exit code. No dependency: it runs
- * before they are installed.
+ * and then reported with the command's exit code. A bound that fires after
+ * the command already exited is not a stall: on a loaded runner this process
+ * can be descheduled past the bound while its child finishes, and its exit
+ * event then queues behind the expired timer, so on Linux the timer reads the
+ * child's /proc state first and leaves a zombie or reaped child to that exit
+ * event. No dependency: it runs before they are installed.
  *
  * Usage: bun scripts/ci-bounded-run.ts (--attempt-s <n> | --total-s <n>) [--idle-s <n>] [--retry-s <n>] [--hint <text>] -- <command> [args...]
  */
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 export interface BoundedRun {
   argv: string[];
@@ -50,8 +55,17 @@ function attempt(run: BoundedRun, boundMs: number, budgetBound: boolean): Promis
     try { if (grouped && child.pid) process.kill(-child.pid, name); else child.kill(name); } catch { /* the group is gone */ }
   };
   let ending: Ending = 'exit', kill: ReturnType<typeof setTimeout> | undefined, idle: ReturnType<typeof setTimeout> | undefined;
+  const exited = () => {
+    if (process.platform !== 'linux') return false;
+    try {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
+      return ['Z', 'X'].includes(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]!);
+    } catch {
+      return true;
+    }
+  };
   const end = (why: Ending) => {
-    if (ending !== 'exit') return;
+    if (ending !== 'exit' || exited()) return;
     ending = why;
     signal('SIGTERM');
     kill = setTimeout(() => signal('SIGKILL'), (run.graceSeconds ?? 10) * 1000);

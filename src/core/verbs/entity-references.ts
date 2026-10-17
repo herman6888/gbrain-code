@@ -53,7 +53,7 @@ export interface RecordGroupView {
 /** What a row gains: absent fields are switched off by config. */
 export interface RowReferences {
   referenced_by_count?: number;
-  next?: { tool: 'entity'; arguments: { name: string } };
+  next?: { tool: 'entity'; arguments: { name: string; source_id?: string } };
   records?: RecordGroupView[];
   /** The count and records could not be read in time (or failed); not "no references". */
   references_unavailable?: ReferencesUnavailable;
@@ -161,13 +161,29 @@ export interface PackCardReferences extends RowReferences {
  * records of each card's page and its identity siblings, side by side, in one
  * batched read. Nothing is read unless record types are enrolled.
  */
-export async function readPackReferences(engine: BrainEngine, sourceId: string, cards: Array<{ entity: { slug: string; title: string } }>,
+export async function readPackReferences(engine: BrainEngine, sourceId: string, cards: Array<{ entity: { slug: string; title: string; source_id?: string } }>,
   req: Omit<ReferencesRequest, 'surface' | 'excludePrivate'>): Promise<{ bySlug: Map<string, PackCardReferences>; notice: Notice | null }> {
   const bySlug = new Map<string, PackCardReferences>();
   const config = req.config ?? await readEntityReferencesConfig(engine);
   if (!cards.length || !referencesWanted(config, 'pack')) return { bySlug, notice: null };
   const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
   const excludePrivate = await resolveExcludePrivatePages(engine, req.remote ? undefined : false);
+  // #6723: each card reads its own source (one batch per source); the map is keyed `<source_id>:<slug>`.
+  const bySource = new Map<string, typeof cards>();
+  for (const c of cards) bySource.set(c.entity.source_id ?? sourceId, [...(bySource.get(c.entity.source_id ?? sourceId) ?? []), c]);
+  let notice: Notice | null = null;
+  for (const [src, group] of bySource) {
+    const part = await readSourcePackReferences(engine, src, group, { ...req, excludePrivate, config });
+    for (const [slug, refs] of part.bySlug) bySlug.set(`${src}:${slug}`, refs);
+    notice ??= part.notice;
+  }
+  return { bySlug, notice };
+}
+
+async function readSourcePackReferences(engine: BrainEngine, sourceId: string, cards: Array<{ entity: { slug: string; title: string } }>,
+  req: Omit<ReferencesRequest, 'surface'> & { config: EntityReferencesConfig }): Promise<{ bySlug: Map<string, PackCardReferences>; notice: Notice | null }> {
+  const bySlug = new Map<string, PackCardReferences>();
+  const { excludePrivate, config } = req;
   const { readIdentitySiblings } = await import('../mentions/siblings.ts');
   const siblings = await Promise.all(cards.map(c => readIdentitySiblings(engine, sourceId, c.entity, { excludePrivate, excludeQuarantined: true })));
   const targets: RecordTarget[] = [];

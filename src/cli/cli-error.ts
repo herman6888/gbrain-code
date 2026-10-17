@@ -38,6 +38,10 @@ export interface CliErrorWriteOpts {
    * (line-reading consumers of the old shape keep working).
    */
   legacy?: Record<string, unknown>;
+  /** Fields the document carries after the envelope's own (a refused dry run's `convergence` receipt). */
+  extra?: Record<string, unknown>;
+  /** Where the document goes instead of fd 1 (a command's own JSON document writer). */
+  emit?: (doc: string) => void;
 }
 
 /** The command word of an argv (first token that is not a flag), for E11 records. */
@@ -56,8 +60,9 @@ export function writeCliError(e: unknown, command: string, opts: CliErrorWriteOp
     noteRenderedErrorCode(env.code);
     // An NDJSON stream ends a failure with one `{status:"error", …envelope}` line (D2).
     const legacy = opts.legacy ?? (jsonGuardActive() === 'ndjson' ? { status: 'error' } : undefined);
-    const doc = legacy ? `${JSON.stringify({ ...legacy, ...withoutUndefined(env), ...legacy })}\n` : r.stdout;
-    void writeStdoutFinal(doc).catch(() => { /* fd 1 gone */ });
+    const doc = legacy || opts.extra ? `${JSON.stringify({ ...legacy, ...withoutUndefined(env), ...legacy, ...opts.extra })}\n` : r.stdout;
+    if (opts.emit) opts.emit(doc);
+    else void writeStdoutFinal(doc).catch(() => { /* fd 1 gone */ });
     // stderr stays the human channel under --json (same TTY order as renderCliError).
     stderr = [`Error [${env.code}]: ${env.message}`, `Fix: ${env.fix?.command ?? env.suggestion}`,
       ...(env.why ? [`Why: ${env.why}`] : [])].join('\n') + '\n';

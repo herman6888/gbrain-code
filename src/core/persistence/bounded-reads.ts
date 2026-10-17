@@ -38,11 +38,16 @@ import { registerEngineView, viewedEngine } from './switches.ts';
 /** The SQLSTATEs a bounded read ends with when its server-side bound passes. */
 const DEADLINE_SQLSTATES = new Set(['57014', '55P03']);
 
-/** The error a bounded read rejects with at its bound; `code` is what `preparationAbortReason` reads. */
+/**
+ * The error a bounded read rejects with at its bound; `code` is what `preparationAbortReason` reads. `sqlstate` is
+ * null when the read was refused before it was sent because the budget had already run out.
+ */
 export class PreparationDeadlineError extends Error {
   readonly code = 'preparation_deadline';
-  constructor(readonly step: string | null, readonly sqlstate: string, cause: unknown) {
-    super(`The preparation read${step ? ` at step ${step}` : ''} did not finish within its budget (the server ended it, SQLSTATE ${sqlstate}).`, { cause });
+  constructor(readonly step: string | null, readonly sqlstate: string | null, cause?: unknown) {
+    super(sqlstate
+      ? `The preparation read${step ? ` at step ${step}` : ''} did not finish within its budget (the server ended it, SQLSTATE ${sqlstate}).`
+      : `The preparation read${step ? ` at step ${step}` : ''} was not sent: its budget had already run out.`, { cause });
     this.name = 'PreparationDeadlineError';
   }
 }
@@ -67,6 +72,11 @@ export function boundedReads(engine: BrainEngine, clock: ClaimPhaseClock | undef
     if (key === 'executeRaw') return async (sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number }) => {
       recordClaimSql(clock, sql);
       if (opts?.signal) return target.executeRaw(sql, params, opts);
+      // A read issued past the deadline is refused here: sent with the 1 ms floor, a fast one would finish and the deadline would go unseen.
+      if (Date.now() >= deadlineAt) {
+        if (clock!.signal?.aborted) throw clock!.signal.reason;
+        throw new PreparationDeadlineError(clock!.step, null);
+      }
       try {
         // The clock's signal ends only the wait for a free connection (a saturated pool); the statement itself ends at the bound.
         return await target.executeRaw(sql, params, { ...opts, timeoutMs: Math.max(1, deadlineAt - Date.now()), ...(clock!.signal ? { signal: clock!.signal } : {}) });

@@ -50,6 +50,7 @@ import { operations, type OperationContext } from '../src/core/operations.ts';
 import { cliRenderContext, renderAction, type Action } from '../src/core/agent-output.ts';
 import { fenceMessage } from '../src/core/fence-repair/reasons.ts';
 import { RECOVERY_VERSION } from '../src/core/markdown.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 type HoldInput = Omit<GitHoldRecord, 'version' | 'held_at' | 'updated_at'>;
 
@@ -124,18 +125,17 @@ describe('sources status and retry-held on Git sources', () => {
     expect(text).not.toContain('other-git');
   });
 
-  test('sources status lists at most sync.hold_cap holds per source, limited in SQL, with the outstanding count from the summary row', async () => {
+  test('sources status lists at most GBRAIN_SYNC_HOLD_CAP holds per source, limited in SQL, with the outstanding count from the summary row', async () => {
     const listing = await readGitHoldListing(engine, ['notes-git', 'other-git', 'default'], 1);
     expect(listing.map(source => [source.sourceId, source.count, source.holds.map(record => record.path)])).toEqual([
       ['notes-git', 2, ['notes/huge.md']], ['other-git', 1, ['other/a.md']]]);
-    await engine.setConfig('sync.hold_cap', '1');
-    try {
+    await withEnv({ GBRAIN_SYNC_HOLD_CAP: '1' }, async () => {
       const doc = JSON.parse(await captured(() => runSources(engine, ['status', 'notes-git', '--json'])));
       expect(doc.sources[0].git_holds).toMatchObject({ count: 2, truncated: true });
       expect(doc.sources[0].git_holds.items.map((item: { path: string }) => item.path)).toEqual(['notes/huge.md']);
       const text = await captured(() => runSources(engine, ['status', 'notes-git']));
       expect(text).toContain('notes-git: 2 held file(s)');
-    } finally { await engine.unsetConfig('sync.hold_cap'); }
+    });
   });
 
   test('sources status <unknown id> refuses with not_found and the list command', async () => {

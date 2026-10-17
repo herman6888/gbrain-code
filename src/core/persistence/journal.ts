@@ -12,13 +12,16 @@ import { journalLimitKey, oneYearCapacity, readJournalLimits, readReceiptRetenti
 import { outstandingCapacityDetail, retryWriteAdmission } from './admission-retry.ts';
 import { PreadmitBrainChanged } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
-import { backgroundPaused, readBackgroundPauseShare, resolveAdmissionOrigin, type AdmissionOrigin } from './admission-origin.ts';
+import { backgroundPaused, backgroundWorktreeInactive, declaredBackground, readBackgroundPauseShare, resolveAdmissionOrigin, type AdmissionOrigin } from './admission-origin.ts';
 import { EFFECT_BYTES_SQL, RECEIPT_RESERVATION_FLOOR, receiptReservation, retainedReceiptBytes, TRUE_UP_CLAMP_SQL } from './receipt-bytes.ts';
 import { writeHealth, type WriteHealthFacts } from './health.ts';
+import { assertBackgroundOwner } from './owner-verification.ts';
 import { writerStamp } from './writer-versions.ts';
 import { intentCarriesContent, intentCarriesPurgedContent, PURGE_PRESENCE_COLUMNS } from './purged-intent.ts';
-import { claimOwner, claimPhaseStamp, startClaimPhase } from './claim-phase.ts';
-import { consumerIdentity } from './consumer-heartbeat.ts';
+import { hostname } from 'node:os';
+import { claimOwner, claimOwnerKind, claimPhaseStamp, startClaimPhase } from './claim-phase.ts';
+import { consumerIdentity, RESIDENT_CONSUMER_KINDS } from './consumer-heartbeat.ts';
+import { classifyHolderLiveness, syncLockId } from '../db-lock.ts';
 import { publicFailureDetail } from './publication-failure.ts';
 import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
@@ -168,6 +171,21 @@ export async function assertWriteHeadroom(engine: SqlEngine, principal: Principa
     }
   }
 }
+/**
+ * #6884: how many more requests `principal` can have outstanding before the tighter of its own and the brain's
+ * outstanding caps, each taken at `share` (a background run stops at the pause line), with that cap's counts.
+ */
+export async function readOutstandingRoom(engine: SqlEngine, principal: Principal, share = 1): Promise<{ room: number; scope: 'brain' | 'principal'; used: number; limit: number }> {
+  const limits = await readJournalLimits(engine);
+  const rows = await engine.executeRaw<{ key: string; outstanding_count: number | string }>('SELECT key,outstanding_count FROM persistence_counters WHERE key=ANY($1::text[])',
+    [['brain', principalKey(principal)]]);
+  const room = (scope: 'brain' | 'principal', key: string, cap: number) => {
+    const used = Number(rows.find(row => row.key === key)?.outstanding_count ?? 0), limit = Math.floor(cap * share);
+    return { room: limit - used, scope, used, limit };
+  };
+  const brain = room('brain', 'brain', limits.brainOutstanding), own = room('principal', principalKey(principal), limits.principalOutstanding);
+  return brain.room < own.room ? brain : own;
+}
 /** Creates and locks the counter rows in key order: two statements for any number of keys (#5984 round-trip diet). */
 /** Creates missing counter rows; takes no lock on existing ones. Keys sorted. */
 export const ENSURE_COUNTERS_SQL = 'INSERT INTO persistence_counters(key) SELECT k FROM unnest($1::text[]) WITH ORDINALITY AS u(k,n) ORDER BY n ON CONFLICT DO NOTHING';
@@ -242,6 +260,8 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
   if (!Number.isSafeInteger(terminalBytes) || terminalBytes < 1024) throw new TypeError('Invalid terminal receipt reservation.');
   const stamp = writerStamp();
   const origin = resolveAdmissionOrigin(input.origin);
+  // #6741 C: a declared background producer is refused before any receipt when the source's owner fails its verification.
+  if (input.worktreeId && declaredBackground(input.origin)) await assertBackgroundOwner(engine, input.sourceId, ownerStatusFix);
   return { requestId, apply: async (tx: BrainEngine): Promise<WriteRequest> => {
     await declarePersistenceProtocol(tx);
     // The guards are sent together in lock order (worktree, source, writer, counters) and judged in
@@ -322,6 +342,7 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
   const items = inputs.map(input => ({ input, requestId: requireUuid(input.requestId ?? randomUUID()), fingerprint: intentDigest(input),
     bytes: jsonBytes(input.intent) + jsonBytes(input.authority), terminalBytes: Math.max(input.terminalReservation ?? 0, receiptReservation(input)) }));
   assertMutationProtocol({ target_kind: 'page', protocol_version: 1 });
+  if (first.worktreeId && declaredBackground(first.origin)) await assertBackgroundOwner(tx, first.sourceId, ownerStatusFix);
   const ids = items.map(item => item.requestId);
   // #5984: the checks are independent reads and share locks, so they go out back to back in the order they always
   // had (protocol, graduation, worktree, source, writer, counters); a failure is raised in that order.
@@ -510,17 +531,19 @@ export async function chargePreparationAttempt(engine: SqlEngine, row: WriteRequ
  */
 async function assertWorktreeAdmission(tx: BrainEngine, input: WriteAdmission): Promise<void> {
   // Sent together: the server takes the share lock before it reads the fence and the binding.
-  const [, [state]] = await pipelined(tx, [
-    () => tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [input.worktreeId]),
+  const [[worktree], [state]] = await pipelined(tx, [
+    () => tx.executeRaw<{ state: string }>('SELECT state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [input.worktreeId]),
     () => tx.executeRaw<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>(`SELECT
       (SELECT row_to_json(f) FROM (SELECT id,state,source_ids FROM persistence_worktree_refreshes
         WHERE worktree_id=$3::uuid AND state IN ${ACTIVE_REFRESH_STATES_SQL} LIMIT 1) f) AS refresh,
       EXISTS (SELECT 1 FROM persistence_source_bindings WHERE source_id=$1
         AND source_incarnation=$2::uuid AND worktree_id=$3::uuid AND topology_generation=$4) AS bound`,
     [input.sourceId, input.sourceIncarnation, input.worktreeId, input.topologyGeneration]),
-  ]) as [unknown, Array<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>];
+  ]) as [Array<{ state: string }>, Array<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>];
   const refresh = typeof state?.refresh === 'string' ? JSON.parse(state.refresh) as { id: string; state: string; source_ids: string[] } : state?.refresh ?? null;
   if (refresh) await assertWorktreeNotRefreshing(tx, input, refresh);
+  // #6741 C: a background producer never takes a permanent request id against a worktree in recovery (a draining owner still replays).
+  if (worktree?.state === 'recovering' && resolveAdmissionOrigin(input.origin) === 'background') throw backgroundWorktreeInactive(input.sourceId, worktree.state, ownerStatusFix(input.sourceId));
   if (!state?.bound) throw opError('source_changed', 'The source binding changed during admission.',
     `Source ${input.sourceId}'s worktree binding changed (a claim, transfer or lifecycle change) while this write was being admitted, so nothing was accepted. Check the owner with the command in fix, then submit the write again; reusing the same request_id is safe because nothing was recorded.`,
     { fix: ownerStatusFix(input.sourceId) });
@@ -624,29 +647,75 @@ export async function hasClaimableWrite(engine: SqlEngine, hostId: string, exclu
  * `fifoRoots` (#5984 Phase 4.5) are roots where this consumer owes the sync side a turn: a foreground write it
  * claimed ahead of a queued sync row (`passed_sync`) committed since it last claimed a sync row, so there the claim is plain FIFO.
  */
+/**
+ * #6712 PR 2 (Garry, 2026-10-16, via GBRA-40): while a source's drain lease is live, only the lease holder publishes that
+ * source's managed-sync requests. A non-resident consumer (a short-lived command such as `put` or `remember`, waiting on its
+ * own write) ranks a sync row whose source's lease another process holds after every other row and claims it only when that
+ * holder is provably dead (a killed same-host sync whose TTL has not lapsed yet), so it never publishes a live drainer's pages
+ * or breaks up its lane groups. With no live lease nothing changes: a crashed drainer's rows still drain through any consumer.
+ * The holder is read only when the head row is a sync row, so a foreground write's claim costs no extra statement.
+ */
+const LEASE_HELD = `EXISTS (SELECT 1 FROM gbrain_cycle_locks l WHERE ${SYNC_KIND('r')} AND l.id=$7::text||r.source_id
+  AND l.ttl_expires_at>now() AND NOT (l.holder_pid=$8::integer AND l.holder_host IS NOT DISTINCT FROM $9::text))`;
+/**
+ * #5984 Phase 4.5: the worktrees (`f.worktree_id`) where a foreground write that may go first waits, so no new sync head
+ * is claimed there: one queued or recovering, or claimed by another process (claim owner nonce other than `nonce`) that
+ * has not begun to publish (it cannot publish while this process's sync group holds the worktree, so it releases the claim
+ * and this process takes it), and not waiting on an earlier sync row that names its page. A non-sync request committed on
+ * the worktree after sequence `seen` (the newest sequence when this process last claimed a sync head there) earns the sync
+ * side one head, so a stream of writes cannot starve it. Uncorrelated with the candidate row, so a claim reads it once.
+ * The FIFO claim holds back only sync rows the write would pass (sequence below it): an earlier unfinished write is the
+ * head-of-root rules' business, and one stalled in another process must not stop the sync behind it.
+ */
+const FOREGROUND_WAITING_ON = (nonce: string, seen: string, worktree = 'TRUE') => `SELECT f.worktree_id, f.sequence FROM persistence_requests f
+    WHERE ${worktree} AND f.state IN ('queued','running','recovering') AND (f.state<>'running' OR (NOT f.publication_started
+      AND f.claim_phase->'owner'->>'nonce' IS DISTINCT FROM ${nonce}))
+    AND f.recovery IS NULL AND NOT ${SYNC_KIND('f')}
+    AND NOT EXISTS (SELECT 1 FROM persistence_requests named WHERE named.worktree_id=f.worktree_id AND named.sequence<f.sequence
+      AND named.state IN ('queued','running','recovering') AND ${SYNC_KIND('named')} AND ${NAMES_PAGE('named', 'f')})
+    AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE c.sequence>COALESCE(${seen},0) AND c.worktree_id=f.worktree_id
+      AND c.state='committed' AND NOT ${SYNC_KIND('c')})`;
+
+/**
+ * `syncSeen` maps a worktree id to the newest request sequence when this process last claimed a sync head there: a
+ * sync row is not claimed while a foreground write that may go first waits on its worktree (`FOREGROUND_WAITING`), so
+ * a write its own process is claiming (its row skipped as locked) or has claimed is not overtaken. A claimed sync row
+ * returns `seen_sequence`.
+ */
 export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseMs = 30_000, excludeRoots: string[] = [], fifoRoots: string[] = [],
-  laneRoots: string[] = []): Promise<(WriteRequest & { passed_sync?: boolean }) | null> {
+  laneRoots: string[] = [], syncSeen: Record<string, string> = {}): Promise<(WriteRequest & { passed_sync?: boolean; seen_sequence?: string | null }) | null> {
   const first = `(${foregroundPrioritySql()}) AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($3::text[]))`;
+  const holderOnly = !RESIDENT_CONSUMER_KINDS.includes(claimOwnerKind());
   return engine.transactionDirect(async tx => {
     // The protocol declaration and the FIFO head read are sent together.
     const [, [row]] = await pipelined(tx, [
       () => declarePersistenceProtocol(tx),
-      () => tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
+      () => tx.executeRaw<WriteRequest>(`WITH waiting AS MATERIALIZED (SELECT f.worktree_id, max(f.sequence) AS last
+        FROM (${FOREGROUND_WAITING_ON('$5::text', "($6::text::jsonb->>f.worktree_id::text)::bigint")}) f GROUP BY f.worktree_id)
+      SELECT r.* FROM persistence_requests r
       LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
       WHERE ${claimableWriteSql(`(${first})`, '$4::text[]')}
         -- On a root whose lane groups run in this process only a foreground write is claimed (beside them).
         AND NOT (r.worktree_id::text=ANY($4::text[]) AND (${SYNC_KIND('r')} OR NOT (${first})))
-      ORDER BY ${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots, fifoRoots, laneRoots]),
+        AND NOT (${SYNC_KIND('r')} AND ${first} AND EXISTS (SELECT 1 FROM waiting g WHERE g.worktree_id=r.worktree_id AND g.last>r.sequence))
+      ORDER BY ${holderOnly ? `${LEASE_HELD}, ` : ''}${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`,
+      [hostId, excludeRoots, fifoRoots, laneRoots, consumerIdentity().nonce, JSON.stringify(syncSeen), ...(holderOnly ? [syncLockId(''), process.pid, hostname()] : [])]),
     ]) as [unknown, WriteRequest[]];
     if (!row) return null;
+    if (holderOnly && String(row.intent?.kind ?? '').startsWith('managed_sync_')) {
+      const [lease] = await tx.executeRaw<{ holder_pid: number; holder_host: string | null }>(`SELECT holder_pid, holder_host FROM gbrain_cycle_locks
+        WHERE id=$1::text AND ttl_expires_at>now() AND NOT (holder_pid=$2::integer AND holder_host IS NOT DISTINCT FROM $3::text)`, [syncLockId(row.source_id), process.pid, hostname()]);
+      if (lease && classifyHolderLiveness(lease.holder_pid, lease.holder_host ?? '', 0, { graceMs: 0 }) !== 'dead_eligible') return null;
+    }
     // `passed_sync`: the claimed row went ahead of a queued sync row of its root.
     // #6278: the claim stamps its own `preparing` phase, so a kill before the first renewal is charged like any other.
     const token = randomUUID();
-    const [claimed] = await tx.executeRaw<WriteRequest & { passed_sync: boolean }>(`UPDATE persistence_requests SET state='running',
+    const [claimed] = await tx.executeRaw<WriteRequest & { passed_sync: boolean; seen_sequence: string | null }>(`UPDATE persistence_requests SET state='running',
       execution_token=$2::uuid,claim_expires_at=now()+($3::double precision*interval '1 millisecond'),
       updated_at=now(),blocked_reason=NULL,claim_phase=$4::text::jsonb WHERE id=$1::uuid RETURNING *,EXISTS (SELECT 1 FROM persistence_requests earlier
         WHERE earlier.worktree_id=persistence_requests.worktree_id AND earlier.sequence<persistence_requests.sequence
-        AND earlier.state='queued' AND ${SYNC_KIND('earlier')}) AS passed_sync`,
+        AND earlier.state='queued' AND ${SYNC_KIND('earlier')}) AS passed_sync,
+        CASE WHEN ${SYNC_KIND('persistence_requests')} THEN (SELECT max(sequence) FROM persistence_requests)::text END AS seen_sequence`,
     [row.id, token, leaseMs, claimPhaseStamp(startClaimPhase(), token)]);
     return claimed ? { ...claimed, previous_claim_phase: row.claim_phase } : null;
   });
@@ -679,19 +748,9 @@ export async function claimNextLaneHead(engine: BrainEngine, hostId: string, wor
         AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier WHERE earlier.worktree_id=r.worktree_id AND earlier.sequence<r.sequence
           AND (earlier.state IN ('queued','recovering') OR (earlier.state='running' AND COALESCE(earlier.intent->>'lane','')<>$3)))
-        -- #5984 Phase 4.5: no new lane head while a foreground write that may go first waits to be claimed (a claimed
-        -- one publishes beside the lanes), except one head after each foreground commit since this run's last head
-        -- claim, so a stream of writes cannot starve the drain. A write another process claimed but has not begun to
-        -- publish still waits: it cannot publish while this process's lanes hold the worktree, so it releases the claim
-        -- and this process takes it.
-        AND NOT ((${foregroundPrioritySql()}) AND EXISTS (SELECT 1 FROM persistence_requests f WHERE f.worktree_id=r.worktree_id
-            AND (f.state IN ('queued','recovering') OR (f.state='running' AND NOT f.publication_started
-              AND f.claim_phase->'owner'->>'nonce' IS DISTINCT FROM $5::text))
-            AND f.recovery IS NULL AND NOT ${SYNC_KIND('f')}
-            AND NOT EXISTS (SELECT 1 FROM persistence_requests named WHERE named.worktree_id=f.worktree_id AND named.sequence<f.sequence
-              AND named.state IN ('queued','running','recovering') AND ${SYNC_KIND('named')} AND ${NAMES_PAGE('named', 'f')}))
-          AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE c.sequence>COALESCE($4::bigint,0) AND c.worktree_id=r.worktree_id
-            AND c.state='committed' AND NOT ${SYNC_KIND('c')}))
+        -- #5984 Phase 4.5: no new lane head while a foreground write that may go first waits (a claimed one publishes
+        -- beside the lanes), except one head after each foreground commit since this run's last head claim.
+        AND NOT ((${foregroundPrioritySql()}) AND r.worktree_id IN (SELECT f.worktree_id FROM (${FOREGROUND_WAITING_ON('$5::text', '$4::bigint', 'f.worktree_id=$2::uuid')}) f))
       ORDER BY r.sequence LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, worktreeId, run, seenSequence, consumerIdentity().nonce]);
     if (!row) return null;
     const token = randomUUID();
@@ -928,6 +987,14 @@ export async function markRecovering(engine: SqlEngine, row: WriteRequest, reaso
 }
 const PERSISTENCE_QUEUE_TABLES = ['persistence_requests', 'persistence_effects', 'persistence_counters', 'page_projection_jobs', 'page_write_guards'];
 /**
+ * Lets timers and I/O run between PGLite statement chains. Every PGLite statement runs synchronously and resolves as a
+ * microtask, so a chain of them never returns to the event loop on its own and holds every request until it ends. It
+ * resumes from the timer queue: a check-phase resume (setImmediate) runs the next chain before timers that came due
+ * during the last one, so two chains back to back held a waiting request through both.
+ */
+export const yieldToEventLoop = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+/**
  * PGLite has no autovacuum. The resident owner reclaims queue churn and keeps
  * planner statistics current, so receipt lookups keep using the request-id
  * index and claims do not walk dead queue entries. A queue table is vacuumed
@@ -943,7 +1010,10 @@ export async function vacuumPersistenceQueues(engine: BrainEngine): Promise<numb
     `SELECT c.relname FROM pg_class c WHERE c.relname = ANY($1::text[]) AND c.relkind = 'r' AND c.relnamespace = 'public'::regnamespace
        AND pg_relation_size(c.oid) / current_setting('block_size')::int > c.relpages * 1.1 + 8`, [PERSISTENCE_QUEUE_TABLES]);
   const tables = PERSISTENCE_QUEUE_TABLES.filter(table => grown.some(row => row.relname === table));
-  if (tables.length) await engine.executeRaw(`VACUUM (ANALYZE) ${tables.join(', ')}`);
+  for (const table of tables) {
+    await yieldToEventLoop();
+    await engine.executeRaw(`VACUUM (ANALYZE) ${table}`);
+  }
   const [requests] = await engine.executeRaw<{ rows: number }>("SELECT GREATEST(reltuples,0)::float8 AS rows FROM pg_class WHERE oid='persistence_requests'::regclass");
   return Number(requests?.rows ?? 0);
 }

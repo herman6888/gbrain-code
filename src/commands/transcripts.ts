@@ -335,6 +335,7 @@ export function fmtSummary(r: TranscriptsIngestResult): string {
   );
   if (r.redactions > 0) lines.push(`redactions: ${r.redactions} secrets/patterns redacted before write`);
   if (r.imperatives > 0) lines.push(`flagged: ${r.imperatives} agent-directed imperative(s) noted in frontmatter`);
+  if (r.subagentRollouts > 0) lines.push(`${r.subagentRollouts} sub-agent rollouts (no user turns by design)`);
   if (r.driftFiles > 0) {
     const userless = r.files.filter((f) => f.userTurnsMissing).length;
     const zero = r.driftFiles - userless;

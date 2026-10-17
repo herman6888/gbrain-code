@@ -22,7 +22,7 @@ import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { readSyncStatus } from '../src/core/persistence/sync-status.ts';
 import { classifySyncFault } from '../src/core/persistence/sync-fault-class.ts';
 import { managedSyncRetryCommand, readManagedSyncFailures, recordManagedSyncFailure } from '../src/core/persistence/sync-failures.ts';
-import { claimedHeadOrder, laneFaultBlockedReason, laneFaultCancelMessage, laneFaultInMessage, laneFaultOf, WINDOW_CANCEL_MESSAGE } from '../src/core/persistence/sync-window.ts';
+import { claimedHeadOrder, laneFaultBlockedReason, laneFaultCancelMessage, laneFaultInMessage, WINDOW_CANCEL_MESSAGE } from '../src/core/persistence/sync-window.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, claimNextWrite, getWriteRequestById } from '../src/core/persistence/journal.ts';
 import { localHostId, registerLocalWriter } from '../src/core/persistence/identity.ts';
@@ -127,8 +127,6 @@ test('#6712: a head whose window predecessor was never admitted publishes on its
 
 test('#6402 residual (P4.3) / #6712: a lane group released after a lock timeout keeps the fault on its rows and publishes after a failed predecessor', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   expect(laneFaultBlockedReason('lock_timeout')).toBe('lane_lock_timeout');
-  expect(laneFaultOf('lane_statement_timeout')).toBe('statement_timeout');
-  expect(laneFaultOf('group_member_waiting')).toBeNull();
   await registerLocalWriter(engine, 'cli');
   const f = await fixture({ 'seed.md': note('Seed.') });
   const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1', [f.id]);

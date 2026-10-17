@@ -25,8 +25,8 @@ import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, probeWorktreeWriter, type WorktreeBinding } from './ownership.ts';
 import { authorizeFactsBackstop } from './effect-facts.ts';
 import { admitWriteInTransaction, getWriteRequest, getWriteRequestById, receiptFor } from './journal.ts';
-import { assertPersistenceAccepting, persistenceConsumerConfig, waitForWrite, writeResponse } from './service.ts';
-import { maintenancePublishWaitMs } from './maintenance-wait.ts';
+import { assertPersistenceAccepting, awaitWrite, persistenceConsumerConfig, writeResponse } from './service.ts';
+import { MaintenanceWriteWait } from './maintenance-wait.ts';
 import { digest, requireUuid, sha256 } from './digest.ts';
 import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
@@ -83,6 +83,13 @@ export interface ManagedFactsSession {
   /** #6091: set when the facts come from an ambient capture lane. */
   captureSource?: string;
   derivation?: DerivationDeclaration;
+  /**
+   * #6778: the publish wait, one budget per session: 30 s bounded by the job's deadline
+   * (FactsBackstopCtx.deadlineAtMs), zero for later publishes once one is still pending.
+   */
+  wait: MaintenanceWriteWait;
+  /** The job's abort signal: a cancelled job stops waiting at once and its write stays pending. */
+  signal?: AbortSignal;
 }
 
 /** #6048: follow-up batches one input-keyed extraction may admit for file-check refusals. */
@@ -274,6 +281,7 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
     fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
     inputKeyed: seed === inputDigest,
+    wait: new MaintenanceWriteWait(ctx.deadlineAtMs ?? null), ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
     ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) };
   const prior = await getWriteRequest(engine, authority.principal, session.completionRequestId);
@@ -288,7 +296,7 @@ async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSes
       `Request ${row.request_id} in source ${row.source_id} was accepted for different extraction input, so this extraction was not merged into it. Give this extraction a new request_id; read the receipt to see the original.`,
       { fix: receiptFix(row.request_id) });
     await authorizeStoredRequest(engine, row);
-    const finished = await waitForWrite(engine, row, session.config, maintenancePublishWaitMs());
+    const finished = session.wait.observe((await awaitWrite(engine, row, session.config, { waitMs: session.wait.ms(), signal: session.signal })).row);
     writeResponse(finished);
     result.write_requests.push(receiptFor(finished));
     if ((row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_entity') {

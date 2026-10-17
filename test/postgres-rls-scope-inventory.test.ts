@@ -148,6 +148,7 @@ async function observe(cases: SqlCase[]): Promise<Record<string, RuntimeObservat
 const SCOPED_THROUGH_NON_THIS_CALLEE: Record<string, string> = {
   putPage: 'expectedRevision variant calls tx.readPageSnapshot on the transaction clone',
   createVersion: 'page-state/versions.ts createPageVersion calls tx.readPageSnapshot',
+  updateSlug: 'engine-sql/pages.ts updateSlug versions the page first through tx.readPageSnapshot (belief ledger W2 rename preimage)',
   replaceDerivedLinks: 'derived-links.ts replaceDerivedLinks reads the origin via readPageSnapshot',
   replaceDerivedLinksBatch: 'derived-links.ts replaceDerivedLinksBatch reads the origins via tx.readPageSnapshotsBatch',
 };

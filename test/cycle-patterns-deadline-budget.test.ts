@@ -140,8 +140,8 @@ describe('deadline plumbing wiring (structural)', () => {
 
   test('cycle handlers and explicit atom retries thread the job deadline into their work', () => {
     const matches = jobsSrc.match(/deadlineAtMs: job\.deadlineAtMs/g) ?? [];
-    // Three runCycle paths plus the explicit managed-atom retry (#6622).
-    expect(matches.length).toBe(4);
+    // Three runCycle paths, the explicit managed-atom retry (#6622) and the facts-absorb publish wait (#6778).
+    expect(matches.length).toBe(5);
   });
 
   test('runCycle forwards deadlineAtMs to the patterns phase', () => {

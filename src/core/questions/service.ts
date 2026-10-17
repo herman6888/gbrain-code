@@ -256,13 +256,15 @@ export interface PinnedForPack {
  * sentences are withheld and counted. Owner-capable callers only; anyone else
  * gets nothing (and no hint that pins exist).
  */
-export async function pinnedAnswersForPack(ctx: OperationContext, entitySlugs: string[]): Promise<PinnedForPack | null> {
-  if (entitySlugs.length === 0) return null;
+/** Published pins scoped to the pack's accepted entities, matched on the pin's source and `scope_entity` (#6723). */
+export async function pinnedAnswersForPack(ctx: OperationContext, entities: Array<{ source_id: string; slug: string }>): Promise<PinnedForPack | null> {
+  if (entities.length === 0) return null;
   let access: CallerAccess;
   try { access = await requireOwnerCapable(ctx, 'context_pack', ['gbrain', 'questions', 'list']); } catch { return null; }
   const sources = access.readableSources ?? [defaultSource(ctx)];
   const pins = (await listPins(ctx.engine, { sourceIds: sources, states: ['active'] }))
-    .filter(pin => pin.publish_mode === 'publish' && pin.answer_revision > 0 && pin.scope_entity && entitySlugs.includes(pin.scope_entity));
+    .filter(pin => pin.publish_mode === 'publish' && pin.answer_revision > 0 && pin.scope_entity
+      && entities.some(e => e.source_id === pin.source_id && e.slug === pin.scope_entity));
   if (pins.length === 0) return null;
   const pinned: NonNullable<PinnedForPack['pinned_questions']> = [];
   let withheld = 0;

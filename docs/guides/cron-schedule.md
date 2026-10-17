@@ -138,8 +138,13 @@ per-transcript synthesis subagents. The dials:
 - `dream.triage.threshold` (default 0.5) — the score bar, and the first of the
   two ways a transcript passes the gate (the verified-segment rescue below is
   the second). Scores are cached, so retuning it re-gates instantly with
-  **zero** new LLM calls. Raise it if too much routine content synthesizes;
-  lower it if real signal is being skipped.
+  **zero** new LLM calls. Lower it if real signal is being skipped. Raising it
+  alone may not cut volume (#6753): the rescue band below is
+  `[rescue_floor, threshold)`, so it widens with the threshold, and
+  transcripts that stop passing directly can still pass through the rescue.
+  To cut volume, raise `dream.triage.rescue_floor` or
+  `dream.triage.rescue_min_segments` along with it (`0` turns the rescue
+  off), and compare `details.triage.rescue_fired` before and after.
 - `models.dream.triage` — the triage model (default: utility tier / Haiku).
 - `dream.triage.max_chars` (default 24000, floor 1000) — per-transcript
   sample window (head/middle/tail) sent to the judge. Not part of cache
@@ -175,6 +180,13 @@ per-transcript synthesis subagents. The dials:
   still apply; a value that is not a JSON array is ignored with one stderr
   line and the phase scans every type. Note that a page with no `type` has
   no type to match, so it is excluded whenever the list is set.
+  A page whose reply is a complete empty array (`[]`, even with an
+  explanation after it) gets a "no gradeable claims" tombstone and is not
+  sent again while its content is unchanged; a reply that is truncated,
+  prose only, or empty and then followed by takes is retried next cycle.
+  There is no per-page force flag: the tombstone is keyed by a hash of the
+  page body, so any edit to the body re-extracts the page on the next cycle,
+  and that is the only way to send one tombstoned page again.
 - `dream.synthesize.attribution_rules` and `dream.propose_takes.attribution_rules`
   (default off) — extra prompt rules from #5425: keep who proposed what and
   later corrections explicit; an assistant-authored judgment is not the

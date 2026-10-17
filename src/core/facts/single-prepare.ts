@@ -134,6 +134,12 @@ export async function decideSingleFact(engine: BrainEngine, sourceId: string, in
   return { status: 'inserted', candidate: null };
 }
 
+/** #6764: a conversation-derived fact changes when its page is re-extracted (forget + remember would only withdraw it). */
+function replacesDerivedSuggestion(sourceId: string, slug: string): string {
+  const base = `gbrain extract-conversation-facts --source-id ${sourceId} --slugs ${slug} --force`;
+  return `Re-extract the conversation page to change its facts: preview with ${base} --dry-run, then run ${base} --max-cost-usd <n> (paid).`;
+}
+
 /**
  * `remember.replaces`: the caller names the fact the new one replaces. Checked,
  * zero-model: the target must be an active fact in this source with the same
@@ -172,8 +178,9 @@ export async function decideReplacement(engine: BrainEngine, sourceId: string, i
       'Pass the same entity as the fact being replaced, or forget the old fact and remember the new one separately.');
   }
   if (candidate.source_markdown_slug && candidate.source_markdown_slug !== opts.pageSlug) {
-    throw verbError('invalid_params', `replaces_cross_page: fact #${targetId} lives on page ${candidate.source_markdown_slug}.`,
-      'Forget the old fact, then remember the new one.');
+    const derived = String(candidate.source ?? '').startsWith('cli:extract-conversation-facts');
+    throw verbError('invalid_params', `replaces_cross_page: fact #${targetId} lives on page ${candidate.source_markdown_slug}${derived ? ', extracted from that conversation page' : ''}.`,
+      derived ? replacesDerivedSuggestion(sourceId, candidate.source_markdown_slug) : 'Forget the old fact, then remember the new one.');
   }
   const exact = await decideSingleFact(engine, sourceId, input, null, undefined, undefined, { excludePrivate: opts.excludePrivate });
   if (exact.status === 'duplicate') {

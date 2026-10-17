@@ -15,9 +15,13 @@ import { getFtsLanguage, pageSearchVectorSql } from '../fts-language.ts';
 import { getEmbeddingModel } from '../ai/gateway.ts';
 import { jsonRowBatches } from '../batch-rows.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
-import { belowSafeChunkFence, movableChunkSql } from '../search/safe-chunks.ts';
+import { belowSafeChunkFence, chunkGenerationFilter, movableChunkSql } from '../search/safe-chunks.ts';
 import { buildSegmentedProjection } from '../page-body/projection.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
+import type { PageReadScope } from '../types.ts';
+import { projectionClassSql, sealableImageSql } from './projection-class.ts';
+import { advanceProjectionCursor, ineligibleKey, rememberIneligible, residentWindowCtes, type ProjectionScanCursor } from './projection-window.ts';
 import { acceptedEmbeddingInputHashes, embeddingInputHash, plainEmbeddingTier, synopsisBodyHash,
   type EmbeddingInputContext, type EmbeddingTier } from '../embedding-input-hash.ts';
 
@@ -393,18 +397,32 @@ export async function preparePageProjection(prepared: ProjectionSnapshot) {
     const code = await prepareCodeChunks(page, path);
     return { chunks: code.chunks, code };
   }
-  if (prepared.pageKind !== 'markdown') throw new Error('This page kind requires its source importer.');
+  if (prepared.pageKind !== 'markdown') throw new Error('This page kind requires its source importer (images: see `gbrain doctor --only text_projection_readiness --json`).');
   return { chunks: await prepareMarkdownChunks(page, prepared.maxChunkTokens, prepared.fenceOverlay), code: undefined };
 }
 
-// The job queue is usually empty or small while pages grows without bound, so
-// these reads walk jobs and probe sources/pages per job. The OFFSET 0 fences
-// keep the planner from turning the probes back into a scan of pages; PGLite
-// has no autovacuum to give it accurate queue statistics.
-const PROJECTION_JOB_PROBES = `CROSS JOIN LATERAL (SELECT s.id FROM sources s
+// These reads walk jobs and probe sources/pages per job; the OFFSET 0 fences
+// keep the planner from turning the probes back into a scan of pages (PGLite
+// has no autovacuum to give it accurate queue statistics); a probe fetches its
+// page by the unique key alone and filters above that fence, since a
+// `deleted_at` filter beside the key lets a statistics-less planner probe
+// through pages_dedup_idx, a scan of the whole source per job. A queue can hold
+// rows no inline rebuild takes (v153 queued 93K image pages on one brain), so
+// only the explicit drain walks it whole, oldest first; the resident reads a
+// bounded window (page-state/projection-window.ts).
+/**
+ * The page probe of a queue walk. `media` also admits `sealable` image rows
+ * (projection-class.ts), for the explicit drain and its preview only: the
+ * resident, embed paths and `gbrain migrate` never pass it.
+ */
+export function projectionJobProbes(opts: { media?: boolean } = {}): string {
+  const inline = "p.page_kind IN ('markdown','code') AND p.body_storage IS DISTINCT FROM 'segmented'";
+  return `CROSS JOIN LATERAL (SELECT s.id FROM sources s
       WHERE s.incarnation=j.source_incarnation AND NOT s.archived OFFSET 0) s
-    CROSS JOIN LATERAL (SELECT p.page_kind FROM pages p WHERE p.source_id=s.id AND p.slug=j.slug
-      AND p.deleted_at IS NULL AND p.page_kind IN ('markdown','code') AND p.body_storage IS DISTINCT FROM 'segmented' OFFSET 0) p`;
+    CROSS JOIN LATERAL (SELECT p.page_kind FROM pages p WHERE p.id=(SELECT k.id FROM pages k WHERE k.source_id=s.id AND k.slug=j.slug)
+      AND p.deleted_at IS NULL AND ${opts.media ? `((${inline}) OR ${sealableImageSql('p')})` : inline} OFFSET 0) p`;
+}
+const PROJECTION_JOB_PROBES = projectionJobProbes();
 
 /**
  * Rebuilds between statistics refreshes, per engine. Like autovacuum's analyze
@@ -412,6 +430,29 @@ const PROJECTION_JOB_PROBES = `CROSS JOIN LATERAL (SELECT s.id FROM sources s
  * process's first drained rebuild always refreshes.
  */
 const statisticsDebt = new WeakMap<BrainEngine, { rebuilt: number; rows: number | null }>();
+const statisticsRefreshes = new WeakMap<BrainEngine, number>();
+
+/** #6803: how many times this process refreshed the projection statistics of `engine` (the drain reports a change). */
+export function projectionStatisticsRefreshes(engine: BrainEngine): number {
+  return statisticsRefreshes.get(engine) ?? 0;
+}
+
+/**
+ * Count `rebuilt` pages (rebuilt or sealed) toward the statistics debt; once
+ * it is due and `drained()` finds no drainable row left, refresh.
+ */
+export async function noteProjectionRebuilds(engine: BrainEngine, rebuilt: number, drained: () => Promise<boolean>): Promise<void> {
+  if (rebuilt <= 0) return;
+  const debt = statisticsDebt.get(engine);
+  const owed = { rebuilt: (debt?.rebuilt ?? 0) + rebuilt, rows: debt?.rows ?? null };
+  statisticsDebt.set(engine, owed);
+  if (owed.rows !== null && owed.rebuilt < 50 + owed.rows * 0.1) return;
+  if (!await drained()) return;
+  await refreshProjectionStatistics(engine);
+  const [pages] = await engine.executeRaw<{ rows: number }>("SELECT GREATEST(reltuples,0)::float8 AS rows FROM pg_class WHERE oid='pages'::regclass");
+  statisticsDebt.set(engine, { rebuilt: 0, rows: Number(pages?.rows ?? 0) });
+  statisticsRefreshes.set(engine, projectionStatisticsRefreshes(engine) + 1);
+}
 
 /**
  * #5401: a failed rebuild waits this long before the resident retries it. One
@@ -449,31 +490,131 @@ export interface ProjectionRebuildOptions {
    * `superseded` no-op.
    */
   onHeal?: (heal: { kind: 'removed' | 'deferred'; source_id: string; slug: string }) => void;
+  /**
+   * #6803: the resident's bounded selection (projection-window.ts) from this
+   * cursor instead of a walk of the whole queue. Only `retryCooldown` applies with it.
+   */
+  window?: ProjectionScanCursor;
+  /** #6803: a media drain seals images next, so the statistics refresh also waits for its `sealable` rows. */
+  media?: boolean;
+  /**
+   * #6803, the drain's walk position: only rows after `walk.after`, which
+   * each call advances to the last row it attempted. Every row before it was
+   * attempted or is not an inline row, so 93K queued images are walked once
+   * per run instead of once per batch. Ignored with `window`.
+   */
+  walk?: { after?: QueueKey };
 }
 
-/** Live Markdown and code rows a rebuild can take, and how many of them last failed. */
-export async function projectionBacklog(engine: Pick<BrainEngine, 'executeRaw'>): Promise<{ pending: number; failed: number; oldest_age_seconds: number | null }> {
-  const [row] = await engine.executeRaw<{ pending: number; failed: number; oldest: number | null }>(`SELECT COUNT(*)::int AS pending,
-      COUNT(*) FILTER (WHERE j.reason='rebuild_failed')::int AS failed,
-      EXTRACT(EPOCH FROM now()-MIN(j.updated_at))::float8 AS oldest
-    FROM page_projection_jobs j ${PROJECTION_JOB_PROBES}`);
-  const oldest = row?.oldest === null || row?.oldest === undefined ? null : Math.max(0, Math.floor(Number(row.oldest)));
-  return { pending: Number(row?.pending ?? 0), failed: Number(row?.failed ?? 0), oldest_age_seconds: oldest };
+/** A queue row's position in the walk order (updated_at as text, so microseconds survive). */
+export type QueueKey = { updated_at: string; source_incarnation: string; slug: string };
+type QueuedJob = { source_id: string; source_incarnation: string; slug: string; revision: string; page_kind: string; updated_at?: string };
+type WindowKey = { source_incarnation: string; slug: string };
+
+/**
+ * #6803: the resident's selection: at most RESIDENT_PROBE_BUDGET queue rows
+ * (the recency lane, then the window in key order), each probed by primary
+ * key; rows of a kind the resident never builds go to the negative cache.
+ */
+async function selectWindowJobs(engine: BrainEngine, cursor: ProjectionScanCursor, retryCooldown: boolean):
+  Promise<{ jobs: Array<QueuedJob & { ord: number }>; window: WindowKey[]; highWater: string | null }> {
+  const params: unknown[] = [];
+  const ctes = residentWindowCtes(cursor, params, retryCooldown ? PROJECTION_RETRY_READY_SQL : 'TRUE');
+  const rows = await engine.executeRaw<WindowKey & { lane: string | null; ord: number; revision: string; high_water: string | null }>(`WITH ${ctes}
+    SELECT r.lane,r.ord,r.source_incarnation::text AS source_incarnation,r.slug,r.revision::text AS revision,h.at AS high_water
+    FROM high_water h LEFT JOIN (SELECT source_incarnation,slug,revision,updated_at,lane,ord FROM recent
+      UNION ALL SELECT source_incarnation,slug,revision,updated_at,lane,ord FROM win) r ON true
+    ORDER BY r.lane,r.ord`, params);
+  const window = rows.filter(row => row.lane === 'window').sort((a, b) => Number(a.ord) - Number(b.ord));
+  const seen = new Set<string>();
+  const candidates = [...rows.filter(row => row.lane === 'recent'), ...window].filter(row => {
+    const key = ineligibleKey(row);
+    if (seen.has(key) || cursor.ineligible.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const probed = candidates.length ? await engine.executeRaw<{ i: number; source_id: string | null; archived: boolean | null; page_kind: string | null; body_storage: string | null }>(
+    `SELECT k.i,s.id AS source_id,s.archived,p.page_kind,p.body_storage
+      FROM jsonb_to_recordset($1::text::jsonb) AS k(i int, source_incarnation uuid, slug text)
+      LEFT JOIN LATERAL (SELECT s.id,s.archived FROM sources s WHERE s.incarnation=k.source_incarnation OFFSET 0) s ON true
+      LEFT JOIN LATERAL (SELECT p.page_kind,p.body_storage FROM (SELECT p.id FROM pages p WHERE p.source_id=s.id AND p.slug=k.slug OFFSET 0) q
+        JOIN pages p ON p.id=q.id WHERE p.deleted_at IS NULL) p ON true`,
+    [JSON.stringify(candidates.map((row, i) => ({ i, source_incarnation: row.source_incarnation, slug: row.slug })))]) : [];
+  const jobs: Array<QueuedJob & { ord: number }> = [];
+  for (const probe of probed.sort((a, b) => Number(a.i) - Number(b.i))) {
+    const row = candidates[Number(probe.i)]!;
+    if (probe.page_kind && probe.page_kind !== 'markdown' && probe.page_kind !== 'code') { rememberIneligible(cursor, row); continue; }
+    if (!probe.source_id || probe.archived || !probe.page_kind || probe.body_storage === 'segmented') continue;
+    jobs.push({ source_id: probe.source_id, source_incarnation: row.source_incarnation, slug: row.slug, revision: row.revision,
+      page_kind: probe.page_kind, ord: row.lane === 'window' ? Number(row.ord) : 0 });
+  }
+  return { jobs, window, highWater: rows[0]?.high_water ?? null };
 }
 
 /**
- * #6803: the read-only preview of `gbrain projections drain`: the queued
- * Markdown and code rows a drain would try, in the order it tries them (at most `limit`),
- * with each row's queue reason, so a row that last failed (`rebuild_failed`)
- * is named before anything is rebuilt.
+ * #6803: the queue by class (projection-class.ts). `pending` keeps its meaning,
+ * the rows the resident drains (Markdown, code, segmented), and `failed` the
+ * ones among them that last failed; the other keys are optional on the wire
+ * (an older resident's `projection_status` omits them). `oldest_age_seconds`
+ * covers every class that needs work (not `protected` or `archived`).
+ */
+export interface ProjectionBacklog {
+  pending: number;
+  failed: number;
+  oldest_age_seconds: number | null;
+  sealable?: number;
+  /** Sealable rows whose chunk carries a visual vector: image search ranks them once sealed. */
+  sealable_with_visual?: number;
+  reimport?: number;
+  /** Reimport rows of distrusted provenance (chunker_version < 0): the importer seals them only after a successful fresh OCR pass. */
+  ocr_required?: number;
+  protected?: number;
+  archived?: number;
+  /** Database time of the count. */
+  as_of?: string;
+}
+
+/** Every class of the queue in one aggregate; `scope` narrows to the pages a caller may read. */
+export async function projectionBacklog(engine: Pick<BrainEngine, 'executeRaw'>, scope: PageReadScope = {}): Promise<Required<ProjectionBacklog>> {
+  const params: unknown[] = [];
+  const read = pageReadFilter('p', scope, params);
+  const [row] = await engine.executeRaw<Record<'pending' | 'failed' | 'sealable' | 'sealable_with_visual' | 'reimport' | 'ocr_required' | 'protected' | 'archived', number>
+    & { oldest: number | null; as_of: string }>(`SELECT COUNT(*) FILTER (WHERE k.cls='text')::int AS pending,
+      COUNT(*) FILTER (WHERE k.cls='text' AND j.reason='rebuild_failed')::int AS failed,
+      COUNT(*) FILTER (WHERE k.cls='sealable')::int AS sealable,
+      COUNT(*) FILTER (WHERE k.cls='sealable' AND EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=p.id AND c.embedding_image IS NOT NULL
+        AND ${chunkGenerationFilter('p', 'c')}))::int AS sealable_with_visual,
+      COUNT(*) FILTER (WHERE k.cls='reimport')::int AS reimport,
+      COUNT(*) FILTER (WHERE k.cls='reimport' AND p.chunker_version < 0)::int AS ocr_required,
+      COUNT(*) FILTER (WHERE k.cls='protected')::int AS protected,
+      COUNT(*) FILTER (WHERE k.cls='archived')::int AS archived,
+      EXTRACT(EPOCH FROM now()-MIN(j.updated_at) FILTER (WHERE k.cls IN ('text','sealable','reimport')))::float8 AS oldest,
+      now()::text AS as_of
+    FROM page_projection_jobs j JOIN sources s ON s.incarnation=j.source_incarnation
+    JOIN pages p ON p.source_id=s.id AND p.slug=j.slug AND p.deleted_at IS NULL
+    CROSS JOIN LATERAL (SELECT ${projectionClassSql('p', 's')} AS cls) k
+    WHERE ${read}`, params);
+  const oldest = row?.oldest === null || row?.oldest === undefined ? null : Math.max(0, Math.floor(Number(row.oldest)));
+  const n = (key: 'pending' | 'failed' | 'sealable' | 'sealable_with_visual' | 'reimport' | 'ocr_required' | 'protected' | 'archived') => Number(row?.[key] ?? 0);
+  return { pending: n('pending'), failed: n('failed'), oldest_age_seconds: oldest, sealable: n('sealable'), sealable_with_visual: n('sealable_with_visual'),
+    reimport: n('reimport'), ocr_required: n('ocr_required'), protected: n('protected'), archived: n('archived'), as_of: String(row?.as_of ?? '') };
+}
+
+/**
+ * #6803: the read-only preview of `gbrain projections drain`: every class
+ * count (`pending` Markdown/code rows it rebuilds, `sealable` images it seals,
+ * and the `reimport`, `protected` and `archived` rows it leaves), then the rows
+ * it would take, oldest first (at most `limit`), with each row's page kind and
+ * queue reason, so a row that last failed (`rebuild_failed`) is named before
+ * anything is rebuilt.
  */
 export async function previewProjectionDrain(engine: Pick<BrainEngine, 'executeRaw'>, limit = 50):
-  Promise<{ pending: number; failed: number; rows: Array<{ source_id: string; slug: string; reason: string; updated_at: string }> }> {
+  Promise<Required<ProjectionBacklog> & { rows: Array<{ source_id: string; slug: string; page_kind: string; reason: string; updated_at: string }> }> {
   const backlog = await projectionBacklog(engine);
-  const rows = await engine.executeRaw<{ source_id: string; slug: string; reason: string; updated_at: string }>(`SELECT s.id AS source_id,j.slug,j.reason,j.updated_at::text AS updated_at
-    FROM page_projection_jobs j ${PROJECTION_JOB_PROBES}
+  const rows = await engine.executeRaw<{ source_id: string; slug: string; page_kind: string; reason: string; updated_at: string }>(`SELECT s.id AS source_id,j.slug,p.page_kind,j.reason,j.updated_at::text AS updated_at
+    FROM page_projection_jobs j ${projectionJobProbes({ media: true })}
     ORDER BY j.updated_at,j.source_incarnation,j.slug LIMIT $1`, [Math.max(1, limit)]);
-  return { pending: backlog.pending, failed: backlog.failed, rows };
+  return { ...backlog, rows };
 }
 
 /**
@@ -499,8 +640,14 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
   if (opts.notAfter !== undefined) { params.push(opts.notAfter); filters.push(`j.updated_at<=$${params.length}::text::timestamptz`); }
   if (opts.reasons) { params.push(opts.reasons); filters.push(`j.reason=ANY($${params.length}::text[])`); }
   if (opts.pages) { params.push(opts.pages.slugs); filters.push(`j.slug=ANY($${params.length}::text[])`); }
+  const after = opts.window ? undefined : opts.walk?.after;
+  if (after) {
+    params.push(after.updated_at, after.source_incarnation, after.slug);
+    filters.push(`(j.updated_at,j.source_incarnation,j.slug)>($${params.length - 2}::text::timestamptz,$${params.length - 1}::uuid,$${params.length})`);
+  }
   const sourceFilter = opts.pages ? `WHERE s.id=$${params.push(opts.pages.sourceId)}` : '';
-  const jobs = await engine.executeRaw<{ source_id: string; source_incarnation: string; slug: string; revision: string; page_kind: string }>(`SELECT s.id AS source_id,j.source_incarnation,j.slug,j.revision,p.page_kind
+  const selected = opts.window ? await selectWindowJobs(engine, opts.window, opts.retryCooldown === true) : null;
+  const jobs = selected ? selected.jobs.slice(0, Number(params[0])) : await engine.executeRaw<QueuedJob>(`SELECT s.id AS source_id,j.source_incarnation,j.slug,j.revision,p.page_kind,j.updated_at::text AS updated_at
     FROM (SELECT source_incarnation,slug,revision,updated_at FROM page_projection_jobs j
       ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
       ORDER BY updated_at,source_incarnation,slug OFFSET 0) j
@@ -508,8 +655,10 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
     ORDER BY j.updated_at,j.source_incarnation,j.slug LIMIT $1`, params);
   let rebuilt = 0;
   let superseded = 0;
+  let attempted = 0;
   for (const [index, job] of jobs.entries()) {
     if (opts.deadlineMs !== undefined && index > 0 && now() - startedAt >= opts.deadlineMs) break;
+    attempted = index + 1;
     const observed = [job.source_incarnation, job.slug, job.revision];
     try {
       const prepared = await engine.transaction(async tx => {
@@ -564,19 +713,20 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
       opts.onFailure?.({ source_id: job.source_id, slug: job.slug, reason: `revision_conflict: ${error.message.split('\n')[0].slice(0, 280)}` });
     }
   }
-  if (rebuilt > 0) {
-    const debt = statisticsDebt.get(engine);
-    const owed = { rebuilt: (debt?.rebuilt ?? 0) + rebuilt, rows: debt?.rows ?? null };
-    statisticsDebt.set(engine, owed);
-    if (owed.rows !== null && owed.rebuilt < 50 + owed.rows * 0.1) return { rebuilt, superseded };
-    const remaining = await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j
-      ${PROJECTION_JOB_PROBES}
-      WHERE j.reason<>'rebuild_failed' LIMIT 1`);
-    if (!remaining.length) {
-      await refreshProjectionStatistics(engine);
-      const [pages] = await engine.executeRaw<{ rows: number }>("SELECT GREATEST(reltuples,0)::float8 AS rows FROM pg_class WHERE oid='pages'::regclass");
-      statisticsDebt.set(engine, { rebuilt: 0, rows: Number(pages?.rows ?? 0) });
-    }
+  if (selected && opts.window) {
+    // The window is finished up to its first eligible row this call did not reach.
+    const unreached = selected.jobs.slice(attempted).find(job => job.ord > 0);
+    const last = unreached ? selected.window[unreached.ord - 2] : selected.window.at(-1);
+    advanceProjectionCursor(opts.window, last, selected.highWater);
+  }
+  // The resident's statistics probe stays inside its window: what it selected and did not rebuild.
+  await noteProjectionRebuilds(engine, rebuilt, async () => selected ? selected.jobs.length <= rebuilt
+    : !(await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j
+      ${projectionJobProbes({ media: opts.media })}
+      WHERE j.reason<>'rebuild_failed' LIMIT 1`)).length);
+  const last = jobs[attempted - 1];
+  if (opts.walk && !selected && last?.updated_at !== undefined) {
+    opts.walk.after = { updated_at: last.updated_at, source_incarnation: last.source_incarnation, slug: last.slug };
   }
   return { rebuilt, superseded };
 }
@@ -588,23 +738,47 @@ export interface ProjectionDrainResult {
   rebuilt: number;
   superseded: number;
   failed: ProjectionRebuildFailure[];
+  /** Markdown/code rows still queued (`pending`). */
   remaining: number;
+  /** The run stopped at its `limit` while rows it could take remain. */
   limited: boolean;
+  /** #6803, media drains only: `sealable` images sealed. */
+  sealed?: number;
+  sealed_with_visual?: number;
+  sealed_text_only?: number;
+  /** Media drains only: this run refreshed the projection planner statistics (full ANALYZE on PGLite). */
+  statistics_refreshed?: boolean;
+  /** Media drains only: every class of the queue after the run. */
+  remaining_by_class?: Required<ProjectionBacklog>;
 }
 
-export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[] } = {}): Promise<ProjectionDrainResult> {
+/**
+ * `media` (the explicit `gbrain projections drain` only) also seals the
+ * `sealable` images after the Markdown and code rows (image-seal.ts).
+ * Queued Markdown/code rows refresh stale planner statistics first: every
+ * rebuild reads and writes its page by key, and without statistics (PGLite
+ * after v153's activation) each of those statements scans pages, so 2,000
+ * notes beside 93K queued images rebuilt at 14 pages/s instead of 150.
+ */
+export async function drainProjections(engine: BrainEngine, opts: { limit?: number; progress?: ProgressReporter; reasons?: readonly string[]; media?: boolean } = {}): Promise<ProjectionDrainResult> {
   const [{ runStart }] = await engine.executeRaw<{ runStart: string }>('SELECT now()::text AS "runStart"');
   // PGLite's clock can be coarse: wait until it passes the run start, so a page
   // that fails in this run is stamped after it and is not tried again.
   while (!(await engine.executeRaw<{ passed: boolean }>('SELECT now()>$1::text::timestamptz AS passed', [runStart]))[0]?.passed) {
     await new Promise(resolve => setTimeout(resolve, 1));
   }
-  const total = (await projectionBacklog(engine)).pending;
+  const before = await projectionBacklog(engine);
+  const total = before.pending + (opts.media ? before.sealable : 0);
   opts.progress?.start('projections.drain', opts.limit === undefined ? total : Math.min(total, opts.limit));
+  const refreshes = projectionStatisticsRefreshes(engine);
+  if (before.pending > 0) await refreshProjectionStatistics(engine, total);
   const failed: ProjectionRebuildFailure[] = [];
+  const probes = projectionJobProbes({ media: opts.media });
   let rebuilt = 0;
   let superseded = 0;
   let tried = 0;
+  let seal = { sealed: 0, sealed_with_visual: 0, sealed_text_only: 0 };
+  const walk: { after?: QueueKey } = {};
   try {
     // Continue while a batch rebuilt, removed, failed or durably deferred a
     // row; stop on a no-op batch. A bare `superseded` row (another worker
@@ -613,7 +787,7 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       let healed = 0;
       let failedNow = 0;
       const batch = await rebuildPendingPageProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
-        { notAfter: runStart, reasons: opts.reasons, onHeal: () => { healed++; },
+        { notAfter: runStart, reasons: opts.reasons, media: opts.media, walk, onHeal: () => { healed++; },
           onFailure: failure => { failed.push(failure); if (!failure.reason.startsWith('revision_conflict:')) failedNow++; } });
       rebuilt += batch.rebuilt;
       superseded += batch.superseded;
@@ -622,10 +796,21 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       tried += progressed;
       opts.progress?.tick(progressed, `${rebuilt} rebuilt, ${failed.length} failed`);
     }
+    if (opts.media && (opts.limit === undefined || tried < opts.limit)) {
+      const { sealImageProjections } = await import('./image-seal.ts');
+      seal = await sealImageProjections(engine, { limit: opts.limit === undefined ? undefined : opts.limit - tried, notAfter: runStart });
+      tried += seal.sealed;
+      opts.progress?.tick(seal.sealed, `${seal.sealed} images sealed`);
+      await noteProjectionRebuilds(engine, seal.sealed, async () => !(await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j ${probes}
+        WHERE j.reason<>'rebuild_failed' LIMIT 1`)).length);
+    }
   } finally {
     opts.progress?.finish();
   }
-  const remaining = (await projectionBacklog(engine)).pending;
-  return { rebuilt, superseded, failed, remaining, limited: opts.limit !== undefined && tried >= opts.limit && remaining > 0 };
+  const after = await projectionBacklog(engine);
+  const more = opts.limit !== undefined && tried >= opts.limit
+    && (await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j ${probes} LIMIT 1`)).length > 0;
+  const result: ProjectionDrainResult = { rebuilt, superseded, failed, remaining: after.pending, limited: more };
+  return opts.media ? { ...result, ...seal, statistics_refreshed: projectionStatisticsRefreshes(engine) > refreshes, remaining_by_class: after } : result;
 }
 

@@ -22,6 +22,18 @@ anything.
 gbrain config set dream.patterns.subagent_timeout_ms 2400000
 ```
 
+## Updating an existing pattern page
+
+Since #5385 a `put_page` of a page that already exists must send the page's
+`revision` as `expected_revision`, or it is refused `revision_required`. The
+child's prompt says so (#6779): it keeps an existing page's slug, skips the
+page when its cited evidence already covers the pattern, and otherwise reads
+it with `get_page` and writes the merged page back with that revision. If the
+child still sends no revision, the refusal it gets names the page's current
+revision, so it can merge and resend instead of failing the phase with
+`PATTERNS_CHILD_DEAD`. Only the subagent tool path adds the revision; MCP and
+CLI callers get the refusal and its `get_page` fix as before.
+
 ## Timeline appends
 
 A patterns child often updates an existing pattern page by appending a dated
@@ -86,8 +98,8 @@ The child's `get_page` output is budgeted at
 `dream.patterns.child_read_budget_kb` (default 200 KB). The bytes it has read
 are counted from the job's own tool-execution ledger, so a resumed job keeps
 what it already spent. Past the budget a read returns a short summary
-(`truncated: true`, `code: read_budget_exhausted`, the slug, title, type and an
-excerpt of up to 400 bytes of the rendered page) instead of the page. Writes still work, and
+(`truncated: true`, `code: read_budget_exhausted`, the slug, title, type, the
+page's `revision` and an excerpt of up to 400 bytes of the rendered page) instead of the page. Writes still work, and
 the summary tells the child to append with `add_timeline_entry` instead of
 rewriting a page it has not read in full. Reads are sized by the bytes of the
 result, never by reading the body, so a segmented page is sized like any

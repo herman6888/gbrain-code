@@ -78,7 +78,9 @@ describe('#6696 B1 doctor tiers', () => {
     expect(parseBudgetMs(['--tier', 'ops'], 'ops')).toBe(OPS_BUDGET_MS_DEFAULT);
     expect(parseBudgetMs([], 'standard')).toBeNull();
     expect(parseBudgetMs(['--budget-ms', '900'], 'standard')).toBe(900);
-    expect(() => parseBudgetMs(['--budget-ms', '0'], 'ops')).toThrow(/positive integer/);
+    expect(parseBudgetMs(['--budget-ms', '0'], 'ops')).toBeNull();
+    expect(() => parseBudgetMs(['--budget-ms', '-1'], 'ops')).toThrow(/whole number of milliseconds/);
+    expect(() => parseBudgetMs(['--budget-ms', '1.5'], 'ops')).toThrow(/whole number of milliseconds/);
   });
 
   test('--tier ops on a 2,000-page PGLite brain: only ops sections, no page aggregates, complete, PGLite skips are not_applicable info', async () => {

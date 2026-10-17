@@ -197,17 +197,30 @@ async function runFactsExtraction(ctx: DoctorContext): Promise<Check[]> {
       source_id: string;
       reason: string;
       n: string | number;
+      newest: string | Date;
     }>(
       `SELECT
          source_id,
          split_part(summary, ':', 1) AS reason,
-         COUNT(*)::text AS n
+         COUNT(*)::text AS n,
+         MAX(created_at) AS newest
        FROM ingest_log
        WHERE source_type = 'facts:absorb'
          AND created_at >= now() - INTERVAL '24 hours'
        GROUP BY source_id, split_part(summary, ':', 1)
        ORDER BY source_id, COUNT(*) DESC`,
     );
+    // #6778: an accepted write still committing and a retry after writer contention before admission are not
+    // failures, so they never count toward the threshold; contention that persists warns on its own.
+    const { WRITE_PENDING_ACCEPTED, WRITE_DEFERRED_UNADMITTED } = await import('../../../core/facts/absorb-log.ts');
+    const notFailures = [WRITE_PENDING_ACCEPTED, WRITE_DEFERRED_UNADMITTED];
+    // #6761: the incident count is history (a rolling window); the facts-absorb jobs still dead are the current state.
+    const failures = rows.filter(r => !notFailures.includes(r.reason));
+    const incidents = failures.reduce((sum, r) => sum + (Number(r.n) || 0), 0);
+    const agesOutAt = incidents ? new Date(Math.max(...failures.map(r => new Date(r.newest).getTime())) + 24 * 3600_000).toISOString() : null;
+    const dead = await factsAbsorbJobsStillDead(engine);
+    const deadSentence = dead.total === 0 ? '' : `${dead.total} job${dead.total === 1 ? '' : 's'} still dead (${dead.jobs.map(j => `job ${j.id} for ${j.slug ?? 'an unknown page'}`).join(', ')}): ` +
+      `fix the cause in its error (\`gbrain jobs get <id>\`), then ${dead.jobs.map(j => `\`gbrain jobs retry ${j.id}\``).join(', ')}.`;
 
     if (rows.length === 0) {
       // Zero failure rows is only "healthy" when extraction is actually
@@ -257,7 +270,7 @@ async function runFactsExtraction(ctx: DoctorContext): Promise<Check[]> {
       for (const r of rows) {
         const n = typeof r.n === 'number' ? r.n : parseInt(r.n, 10);
         if (!Number.isFinite(n)) continue;
-        if (n >= threshold) anyOverThreshold = true;
+        if (n >= threshold && !notFailures.includes(r.reason)) anyOverThreshold = true;
         if (!bySource.has(r.source_id)) bySource.set(r.source_id, []);
         bySource.get(r.source_id)!.push({ reason: r.reason, n });
       }
@@ -266,18 +279,48 @@ async function runFactsExtraction(ctx: DoctorContext): Promise<Check[]> {
           `${sid}: ${reasons.map(x => `${x.n} ${x.reason}`).join(', ')}`,
         )
         .join(' | ');
+      const reasons = new Set(rows.map(r => r.reason));
+      const notes = [
+        reasons.has(WRITE_PENDING_ACCEPTED) ? `${WRITE_PENDING_ACCEPTED} rows are accepted facts writes still committing when the job stopped waiting; they are not failures.` : '',
+        reasons.has(WRITE_DEFERRED_UNADMITTED) ? `${WRITE_DEFERRED_UNADMITTED} rows found the canonical writer busy before anything was admitted; the job retries.` : '',
+      ].filter(Boolean).join(' ');
+      const contention = reasons.has(WRITE_DEFERRED_UNADMITTED) ? await persistentWriterContention(engine, WRITE_DEFERRED_UNADMITTED) : [];
+      const contended = contention.map(c =>
+        `source ${c.source_id}: ${c.n} facts write(s) deferred before admission with no later completed facts-absorb job, oldest ${new Date(c.oldest).toISOString()}`).join('; ');
       checks.push({
         name: 'facts_extraction_health',
-        status: anyOverThreshold ? 'warn' : 'ok',
-        message: anyOverThreshold
-          ? `Facts:absorb failures over the threshold (${threshold}) in the last 24h: ${summary}. ` +
-            `Run \`gbrain recall --since 24h --json\` to inspect what landed; ` +
-            `tune the gate via \`gbrain config set facts.absorb_warn_threshold N\`.`
-          : `Facts:absorb activity in last 24h (under threshold ${threshold}): ${summary}.`,
+        status: anyOverThreshold || contention.length ? 'warn' : 'ok',
+        message: [
+          anyOverThreshold
+            ? `Facts:absorb failures over the threshold (${threshold}) in the last 24h: ${summary}. ` +
+              `${incidents} incident${incidents === 1 ? '' : 's'} in 24 h (rolling, ages out at ${agesOutAt})` +
+              (dead.total ? '.' : '; 0 jobs still dead. No facts-absorb job is unresolved, so these are past attempts: nothing needs retrying, and the warning clears as they age out.')
+            : `Facts:absorb activity in last 24h (under threshold ${threshold}): ${summary}.`,
+          notes,
+          contended ? `Writer contention persists (${contended}). Check the canonical writer with \`gbrain sources writer status --source ${contention[0].source_id} --json\`.` : '',
+        ].filter(Boolean).join(' '),
+        ...(contention.length ? {
+          details: { persistent_writer_contention: contention.map(c => ({ source_id: c.source_id, deferred: c.n, oldest: new Date(c.oldest).toISOString() })) },
+          fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', contention[0].source_id, '--json'],
+            `Read-only: names source ${contention[0].source_id}'s canonical owner, the write holding it and every write waiting behind it, so the contention can be traced to its holder.`,
+            'facts_extraction_health'),
+        } : {}),
       });
     }
-    const note = await conversationPipelineNote(engine);
     const check = checks[checks.length - 1];
+    if (check && (rows.length > 0 || dead.total > 0)) {
+      if (deadSentence) check.message = `${check.message} ${deadSentence}`;
+      check.details = { ...(check.details ?? {}),
+        facts_absorb: { incidents_24h: incidents, ages_out_at: agesOutAt, jobs_still_dead: dead.total, dead_jobs: dead.jobs } };
+      const newestDead = dead.jobs[0];
+      if (newestDead && !check.fix) {
+        check.fix = agentFix(['gbrain', 'jobs', 'retry', String(newestDead.id)],
+          `Re-queues dead facts-absorb job ${newestDead.id}, which extracts ${newestDead.slug ?? 'its page'} again with a paid model call. Fix the cause in the job's error first (gbrain jobs get ${newestDead.id}).`,
+          'facts_extraction_health', { consent: ['paid'], mcp: { tool: 'retry_job', arguments: { id: newestDead.id } },
+            user_message: `Facts extraction for ${newestDead.slug ?? 'a page'} failed and its job is dead. Retrying job ${newestDead.id} makes one paid model call. Should I retry it?` });
+      }
+    }
+    const note = await conversationPipelineNote(engine);
     if (note && check) {
       check.message = `${check.message} ${note.message}`;
       check.details = { ...(check.details ?? {}), conversation_pipeline: note.details };
@@ -304,6 +347,59 @@ async function runFactsExtraction(ctx: DoctorContext): Promise<Check[]> {
     }
   }
   return checks;
+}
+
+/**
+ * #6761: facts-absorb jobs that went dead or failed in the last 24 h and are still in that state, newest first (at
+ * most 5 listed): a job a later facts-absorb job for the same page (source and slug: the backstop queue path sets no
+ * `page_id`) completed after is not counted.
+ */
+async function factsAbsorbJobsStillDead(engine: ReturnType<typeof connectedEngine>) {
+  try {
+    const rows = await engine.executeRaw<{ id: number; slug: string | null; source_id: string; status: string; total: string | number }>(
+      `SELECT j.id, j.data->>'slug' AS slug, COALESCE(j.data->>'sourceId', 'default') AS source_id, j.status, COUNT(*) OVER () AS total
+         FROM minion_jobs j
+        WHERE j.name = 'facts-absorb' AND j.status IN ('dead', 'failed')
+          AND COALESCE(j.finished_at, j.updated_at) >= now() - INTERVAL '24 hours'
+          AND NOT EXISTS (
+            SELECT 1 FROM minion_jobs k
+             WHERE k.name = 'facts-absorb' AND k.status = 'completed' AND k.id > j.id
+               AND k.data->>'slug' = j.data->>'slug' AND COALESCE(k.data->>'sourceId', 'default') = COALESCE(j.data->>'sourceId', 'default'))
+        ORDER BY j.id DESC
+        LIMIT 5`,
+    );
+    return { total: Number(rows[0]?.total ?? 0), jobs: rows.map(({ total: _total, ...job }) => ({ ...job, id: Number(job.id) })) };
+  } catch (err) {
+    if (isMissingSchemaObject(err, 'table', 'minion_jobs')) return { total: 0, jobs: [] };
+    throw err;
+  }
+}
+
+/**
+ * #6778: per source, the facts writes deferred before admission (writer_lock_unavailable) in the last 24 h that no
+ * facts-absorb job for the same page completed after, when they persist: more than 10, or the oldest over an hour old.
+ */
+async function persistentWriterContention(engine: ReturnType<typeof connectedEngine>, reason: string) {
+  try {
+    return await engine.executeRaw<{ source_id: string; n: number; oldest: string | Date }>(
+      `SELECT l.source_id, COUNT(*)::int AS n, MIN(l.created_at) AS oldest
+         FROM ingest_log l
+        WHERE l.source_type = 'facts:absorb'
+          AND l.created_at >= now() - INTERVAL '24 hours'
+          AND split_part(l.summary, ':', 1) = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM minion_jobs j
+             WHERE j.name = 'facts-absorb' AND j.status = 'completed' AND j.finished_at >= l.created_at
+               AND j.data->>'slug' = l.source_ref AND COALESCE(j.data->>'sourceId', 'default') = l.source_id)
+        GROUP BY l.source_id
+       HAVING COUNT(*) > 10 OR MIN(l.created_at) < now() - INTERVAL '1 hour'
+        ORDER BY l.source_id`,
+      [reason],
+    );
+  } catch (err) {
+    if (isMissingSchemaObject(err, 'table', 'minion_jobs')) return [];
+    throw err;
+  }
 }
 
 /**

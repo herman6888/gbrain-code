@@ -741,6 +741,7 @@
         "comparableFrontmatter",
         "contentSizeHold",
         "embeddedTitleLineValue",
+        "explicitMarkdownTitle",
         "findTimelineSplitIndex",
         "frontmatterBodyOffset",
         "frontmatterHoldMessageWithoutKeys",

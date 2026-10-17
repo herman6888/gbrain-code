@@ -82,6 +82,7 @@ export async function assertLegacyEngineMigration(engine: SqlEngine, migration: 
     const [row] = await engine.executeRaw<{ present: boolean }>(`SELECT EXISTS(SELECT 1 FROM ${table}) AS present`);
     if (row?.present) held.push(table);
   }
+  if (!held.length && migration.side === 'source') await assertNoPageHistory(engine, migration);
   if (!held.length) return;
   const ledger = held.includes('belief_events') ? ' The belief ledger (belief_events) is recorded history no Markdown rebuild can recover.' : '';
   const why = `The ${migration.side === 'source' ? 'brain' : 'target datastore'} has rows in ${held.join(', ')}, and the engine copier cannot carry request IDs, withdrawals, canonical ownership or the belief ledger.${ledger}`;
@@ -90,6 +91,22 @@ export async function assertLegacyEngineMigration(engine: SqlEngine, migration: 
     migration.side === 'target' ? 'Choose an empty target database; the source brain is unchanged.'
       : 'Keep this datastore; nothing changed. Ask the user how to proceed.',
     { why, reason: 'persistence_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
+}
+
+/**
+ * The legacy copier re-creates pages with new ids and copies no page versions, so a brain with versions would arrive
+ * without its page history. It refuses instead and names how many versions it would discard; graduation carries them.
+ */
+async function assertNoPageHistory(engine: SqlEngine, migration: EngineMigrationSide): Promise<void> {
+  const [row] = await engine.executeRaw<{ n: number | null }>(
+    "SELECT CASE WHEN to_regclass('page_versions') IS NULL THEN 0 ELSE (SELECT count(*)::int FROM page_versions) END AS n");
+  const versions = Number(row?.n ?? 0);
+  if (!versions) return;
+  const why = `The brain has ${versions} page version${versions === 1 ? '' : 's'} (the history get_versions and page-at-time reads), and the engine copier re-creates pages without them, so the copy would discard all ${versions}.`;
+  throw opError('writer_coordinator_required',
+    `Engine migration would discard ${versions} page version${versions === 1 ? '' : 's'}.`,
+    'Keep this datastore; nothing changed. Ask the user how to proceed.',
+    { why, reason: 'page_history', docs: ENGINE_MIGRATION_DOCS, fix: engineMigrationFix(migration, why) });
 }
 
 /** Legacy reinit may rename only after acquiring the stable sibling kernel lock. */

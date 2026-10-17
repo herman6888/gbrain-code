@@ -103,6 +103,7 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // 2026-10-05T03: typed relation lines (core/line-grammar.ts) state their link's type; a per-edge verb that
 // belongs to another link in the window no longer types this one; "joined [X] as <role>" reads as works_at.
 // 2026-10-08: held-out-confirmed Q2 units U1, U3, U4 (core/link-typing-units.ts). Re-extract so pages pick these up.
+// A bump needs its entry in EXTRACTOR_BUMP_NOTES (link-extraction-watermark.ts), copied into the CHANGELOG at ship.
 export const LINK_EXTRACTOR_VERSION_TS = '2026-10-08T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────

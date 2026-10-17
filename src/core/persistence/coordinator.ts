@@ -26,12 +26,13 @@ import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import { timePublicationStep } from './publication-timing.ts';
 import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
 import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, upgradeRecoveryStaging } from './staging.ts';
-import { bindPublicationTimeouts, publicationTransaction } from './publication-deadline.ts';
+import { declarePublication, publicationTransaction } from './publication-deadline.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
@@ -364,8 +365,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       await hooks.boundary?.('prepared', row);
     }
     const done = await publicationTransaction(engine, async tx => {
-      await bindPublicationTimeouts(tx);
-      await declareDurablePersistence(tx);
+      await declarePublication(tx);
       const liveBinding = await guardOwnership(tx, row, hostId);
       if (prepared.sourceExclusive && !prepared.exclusiveSources?.length) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
       if (prepared.exclusiveSources?.length) await lockCoreSources(tx, prepared.sourceExclusive ? [row.source_id, ...prepared.exclusiveSources] : prepared.exclusiveSources);
@@ -425,7 +425,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       }
       prepared.postimage = undefined;
       // W1 finalization contract (docs/designs/BELIEF_LEDGER.md 5.1): the ledger append is the last canonical write before the receipt.
-      const apply = () => prepared.apply(tx, snapshot);
+      const apply = () => timePublicationStep('apply', row.slug, () => prepared.apply(tx, snapshot));
       const outcome = await withCoordinatedWrite(tx, [row.source_id], skill ? apply
         : () => withBeliefBatch(tx, publicationBeliefOptions(row, prepared.additionalPageKeys, beliefReport), apply), publicationAttribution(row, prepared.trust));
       if (!skill) await classifyUnboundPage(tx, row);
@@ -433,7 +433,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
       await recordPublicationFenceTrend(tx, row, outcome);
-      await queuePublicationEffects(tx, row, final, outcome, prepared);
+      await timePublicationStep('effects', row.slug, () => queuePublicationEffects(tx, row, final, outcome, prepared));
       await hooks.boundary?.('before_commit', row);
       const committed = await completeWrite(tx, current, 'committed', outcome, undefined, current);
       transactionBodyCompleted = true;

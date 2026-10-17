@@ -29,6 +29,7 @@ triggers:
   - "consolidate yesterday's conversations"
 tools:
   - get_health
+  - get_brain_health
   - get_page
   - put_page
   - list_pages
@@ -109,7 +110,7 @@ Use the per-dimension walk below (Phase 2 onward) when:
 
 ### Manual path
 
-1. **Run health check.** Check gbrain health to get the dashboard.
+1. **Run health check.** Check gbrain health (`get_health`) to get the dashboard. `get_health` needs admin scope; without it, call `get_brain_health` (read scope), which returns bands only (write capacity, write failures, ghost pages, unsearchable chunks), and skip the dimensions it cannot answer: stale pages, orphan pages, dead links, embed coverage, link and timeline counts and the brain score. Name the skipped dimensions in the report and ask for an admin token, or for `gbrain doctor --json` on the brain host, to cover them.
 2. **Check each dimension:**
 
 ### Stale pages
@@ -257,10 +258,14 @@ so re-running on the same content is a no-op. `dream.synthesize.exclude_patterns
 Each entry is auto-wrapped as a word-boundary regex (e.g. `medical` matches
 "medical advice" but NOT "comedical"). Power users may pass full regex.
 
-**Cooldown:** the cycle's spend cap. `dream.synthesize.cooldown_hours` (default
-12) means at most ~2 synthesize runs per day under autopilot. The completion
-timestamp is stored in `dream.synthesize.last_completion_ts` and is written
-ONLY on successful runs (not on skipped/failed). Explicit `--input` /
+**Cooldown:** `dream.synthesize.cooldown_hours` (default 12) skips synthesize
+for that long after a fully drained pass. The completion timestamp is stored
+in `dream.synthesize.last_completion_ts` and is written only when every child
+completed and nothing was deferred (synthesis budget, triage time budget or
+publish pending), never on skipped or failed runs. So under a standing
+backlog the cooldown never applies and synthesize runs every cycle until the
+backlog drains (#6753); it is not a cap of ~2 runs a day. To cap spend, use
+`dream.synthesize.max_submissions_per_source_per_day`. Explicit `--input` /
 `--date` / `--from` / `--to` invocations bypass cooldown.
 
 **`--dry-run` semantics:** runs the scored triage pass (judges + caches
@@ -574,7 +579,8 @@ The maintenance report follows this structure:
 
 ## Tools Used
 
-- Check gbrain health (get_health)
+- Check gbrain health (get_health; admin scope)
+- Check banded brain health without admin scope (get_brain_health)
 - List pages in gbrain with filters (list_pages)
 - Read a page from gbrain (get_page)
 - Check backlinks in gbrain (get_backlinks)

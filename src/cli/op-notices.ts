@@ -20,8 +20,8 @@ export function captureOpNotice(n: Notice): void {
 
 /** #6696 (A4): a local write's output carries the capacity notices (60 s snapshot, hourly per scope); a failed read adds none. */
 export async function captureCapacityNotices(engine: import('../core/engine.ts').BrainEngine): Promise<void> {
-  const { capacityNotices } = await import('../core/persistence/capacity-snapshot.ts');
-  for (const notice of await capacityNotices(engine).catch(() => [])) pending.push(notice);
+  const { capacityNotices, CAPACITY_READ_WAIT_MS } = await import('../core/persistence/capacity-snapshot.ts');
+  for (const notice of await capacityNotices(engine, { throttle: true, deadlineAt: Date.now() + CAPACITY_READ_WAIT_MS }).catch(() => [])) pending.push(notice);
 }
 
 /** Drain the captured notices into the result (`--json` objects) and/or a stderr string. */

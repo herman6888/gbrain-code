@@ -19,7 +19,7 @@ const SAMPLE_PATHS = 5;
  * host-only, so paths never reach a remote caller), and each source's next
  * step from the hold router (D6: the frontmatter repair preview, the fence
  * repair preview, or both); fails once a source carries more holds than
- * `sync.hold_escalate_count`, the same count rule that escalates a sync result.
+ * `GBRAIN_SYNC_HOLD_ESCALATE_COUNT`, the same count rule that escalates a sync result.
  * Unsupported-image holds (#5493) are listed but never escalate. With fence
  * holds, details carry `fences` and `auto_repair` (whether the maintenance run
  * repairs them by itself), which the post-upgrade banner reads.
@@ -56,7 +56,7 @@ export async function gitHeldFilesCheck(engine: BrainEngine, sourceIds?: string[
     return {
       name: 'git_held_files', status: escalated.length ? 'fail' : 'warn', details,
       message: `${held} file(s) in Git sources are held and not imported; the rest of each sync continues. ${lines.join('; ')}. `
-        + (escalated.length ? `Escalated: ${escalated.map(source => source.source_id).join(', ')} hold more than ${policy.escalateCount} files (sync.hold_escalate_count), so ${stalled * 2 > held
+        + (escalated.length ? `Escalated: ${escalated.map(source => source.source_id).join(', ')} hold more than ${policy.escalateCount} files (GBRAIN_SYNC_HOLD_ESCALATE_COUNT), so ${stalled * 2 > held
           ? 'the write owner (not the files) is the likely cause; inspect it with writer status' : 'a generator or an upgrade is likely writing or reading them wrong; fix the cause'} first. ` : '')
         + 'A page whose newer file is held is read-only for put_page until the file is repaired, so do not retry a refused write. '
         + `Inspect with ${sources.map(source => source.status).join('; ')}; `

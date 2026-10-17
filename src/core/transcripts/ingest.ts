@@ -33,6 +33,7 @@ import { importFromContent } from '../import-file.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { unchangedPutPage } from '../persistence/put-page-screen.ts';
 import { canonicalJson } from '../remediation-step.ts';
 import type { FileDiagnostics, TranscriptAdapter, TranscriptFormat } from './types.ts';
 import { detectAdapter } from './detect.ts';
@@ -115,6 +116,8 @@ export interface IngestFileOutcome {
   drift: boolean;
   /** E-N4: assistant turns parsed with zero user turns (counted in driftFiles). */
   userTurnsMissing?: boolean;
+  /** #6741: a Codex sub-agent rollout with no user turn by design (counted in subagentRollouts, not drift). */
+  subagentRollout?: boolean;
   /** Adapter degraded to a bounded read (e.g. codex head+tail) — part of the file was never scanned. */
   truncated: boolean;
   error?: string;
@@ -133,6 +136,8 @@ export interface TranscriptsIngestResult {
   imperatives: number;
   partsDeleted: number;
   driftFiles: number;
+  /** #6741: Codex sub-agent rollouts with no user turns by design; understood, so they keep the scan clean. */
+  subagentRollouts: number;
   /** Files whose adapter reported a truncated (partially-unscanned) read. */
   truncatedFiles: number;
   erroredFiles: number;
@@ -188,6 +193,7 @@ export async function runTranscriptsIngest(
     imperatives: 0,
     partsDeleted: 0,
     driftFiles: 0,
+    subagentRollouts: 0,
     truncatedFiles: 0,
     erroredFiles: 0,
     slugsTouched: [],
@@ -473,7 +479,9 @@ export async function runTranscriptsIngest(
  * submitted as a `put_page` write request: the same importer runs behind the
  * coordinator, naming the current revision so a replacement is never a blind
  * overwrite (no revision means create-only). Embedding is deferred there, as
- * for every coordinated page write.
+ * for every coordinated page write. #6741 B: a part whose publication would
+ * change nothing takes no admission (put-page-screen.ts), so an unchanged
+ * re-ingest burns no permanent request id.
  */
 async function submitTranscriptPart(
   ctx: OperationContext,
@@ -483,21 +491,24 @@ async function submitTranscriptPart(
   provenance: { source_kind: string; source_uri: string; ingested_via: string },
 ): Promise<{ slug: string; status: 'imported' | 'skipped' | 'error' }> {
   const snapshot = await engine.readPageSnapshot(part.slug, { sourceId, includeDeleted: true });
-  const receipt = await submitPageMutation(ctx, {
-    operation: 'put_page',
-    params: { slug: part.slug, content: part.content, source_id: sourceId, ...provenance,
-      ...(snapshot?.revision ? { expected_revision: snapshot.revision } : {}) },
-  });
+  const params = { slug: part.slug, content: part.content, source_id: sourceId, ...provenance,
+    ...(snapshot?.revision ? { expected_revision: snapshot.revision } : {}) };
+  if (await unchangedPutPage(ctx, params, snapshot)) return { slug: part.slug, status: 'skipped' };
+  const receipt = await submitPageMutation(ctx, { operation: 'put_page', params });
   const slug = typeof receipt.slug === 'string' && receipt.slug ? receipt.slug : part.slug;
   if (receipt.state !== 'committed') return { slug, status: 'error' };
   return { slug, status: receipt.noop === true || receipt.status === 'skipped' ? 'skipped' : 'imported' };
 }
 
-/** A stale higher-numbered part on a managed brain: a revision-bound `delete_page` write request (soft delete, recoverable). */
+/**
+ * A stale higher-numbered part on a managed brain: a revision-bound `delete_page` write request (soft delete, recoverable).
+ * #6741 C: an internal reconciliation, so it is admitted as background work: against a worktree in recovery it is
+ * refused before any receipt (admission-origin.ts) and the session errors, instead of each run taking a new request id.
+ */
 async function deleteStaleTranscriptPart(ctx: OperationContext, engine: BrainEngine, sourceId: string, slug: string): Promise<void> {
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return;
-  const receipt = await submitPageMutation(ctx, { operation: 'delete_page', params: { slug, source_id: sourceId, expected_revision: snapshot.revision, request_id: randomUUID() } });
+  const receipt = await submitPageMutation({ ...ctx, admissionOrigin: 'background' }, { operation: 'delete_page', params: { slug, source_id: sourceId, expected_revision: snapshot.revision, request_id: randomUUID() } });
   if (receipt.state !== 'committed') {
     throw new Error(`stale part ${slug} was not deleted: the coordinator returned ${String(receipt.state)}${receipt.error_code ? ` (${String(receipt.error_code)})` : ''}`);
   }
@@ -557,6 +568,10 @@ function applyFileDiagnostics(diag: FileDiagnostics, fileOutcome: IngestFileOutc
     fileOutcome.userTurnsMissing = true;
     result.driftFiles++;
     result.cleanScan = false;
+  }
+  if (diag.subagentRollout) {
+    fileOutcome.subagentRollout = true;
+    result.subagentRollouts++;
   }
   if (diag.skippedLines > 0) {
     // Malformed lines can be DROPPED RECORDS (an actively-appended

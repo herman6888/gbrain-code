@@ -390,7 +390,7 @@ rewrites it on the next import. No command is needed.
 files, for example `~/vault/notes/people/alice-example.md` and
 `~/vault/notes/notes/people/alice-example.md`, sync refuses instead of
 guessing. Rename or move one of the two files, commit, then run
-`gbrain sync --source vault-notes --no-pull --retry-failed`. The other
+`gbrain sync --source vault-notes --no-pull`. The other
 refusal reasons are listed in [write refusal reasons](write-refusals.md).
 
 ## Citation format for agents

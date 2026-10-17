@@ -454,7 +454,11 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
         claim_period=r.claim_period,attributed_to=r.attributed_to
       FROM jsonb_to_recordset($3::text::jsonb) AS r(row_num integer,kind text,notability text,context text,valid_from text,valid_until text,
         expired_at text,source text,confidence real,claim_metric text,claim_value double precision,claim_unit text,claim_period text,attributed_to text)
-      WHERE f.source_id=$1 AND f.source_markdown_slug=$2 AND f.row_num=r.row_num`, [sourceId, slug, fieldRows]) : Promise.resolve([]);
+      WHERE f.source_id=$1 AND f.source_markdown_slug=$2 AND f.row_num=r.row_num
+        AND (f.kind,f.notability,f.context,f.valid_from,f.valid_until,f.expired_at,f.source,f.confidence,f.claim_metric,f.claim_value,f.claim_unit,
+          f.claim_period,f.attributed_to) IS DISTINCT FROM (r.kind,r.notability,r.context,COALESCE(r.valid_from::timestamptz,f.valid_from),
+          r.valid_until::timestamptz,r.expired_at::timestamptz,r.source,r.confidence,r.claim_metric,r.claim_value,r.claim_unit,r.claim_period,r.attributed_to)`,
+      [sourceId, slug, fieldRows]) : Promise.resolve([]);
     const checkTakes = () => refuseCollisions(tx, id);
     const dropTakes = () => tx.executeRaw('DELETE FROM takes WHERE page_id=$1 AND row_num=ANY($2::integer[])', [id, takeRowsGone.filter(n => !heldRowNums.has(n))]);
     // A fence row's resolution cells are written as Markdown says, so a revert to a version that carries them restores
@@ -477,7 +481,9 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
         resolved_by=r.resolved_by
       FROM jsonb_to_recordset($2::text::jsonb) AS r(row_num integer,resolved_at text,resolved_quality text,resolved_outcome boolean,
         resolved_source text,resolved_value real,resolved_unit text,resolved_by text)
-      WHERE k.page_id=$1 AND k.row_num=r.row_num`, [id, resolutions]) : Promise.resolve([]);
+      WHERE k.page_id=$1 AND k.row_num=r.row_num AND (k.resolved_at,k.resolved_quality,k.resolved_outcome,k.resolved_source,k.resolved_value,k.resolved_unit,
+        k.resolved_by) IS DISTINCT FROM (r.resolved_at::timestamptz,r.resolved_quality,r.resolved_outcome,r.resolved_source,r.resolved_value,r.resolved_unit,
+        r.resolved_by)`, [id, resolutions]) : Promise.resolve([]);
     // Event-page references have a different canonical origin and remain intact;
     // new rows carry their Markdown detail on insert, pinned rows refresh only from their preimage.
     const timelineRows = [

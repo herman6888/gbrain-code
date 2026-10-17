@@ -53,7 +53,7 @@ link it here rather than raising the cap.
 | [Managed sync and persistence stalls](key-files/persistence-stalls.md) | preparation budgets, `claim-phase.ts`, `consumer.ts`, `group-publish.ts`, `diagnostics.ts`, `worktree-manifest.ts` |
 | [Managed sync bookkeeping](key-files/managed-sync-bookkeeping.md) | `sync-failures.ts`, `managed-sync-orphans.ts`, `sync-checkpoint-replaced.ts` |
 | [Core Search (1/2)](key-files/core-search-1.md) | `src/core/search/` through `src/core/search/read-policy-sql.ts` |
-| [Core Search (2/2)](key-files/core-search-2.md) | `search/rerank.ts` through `search/vector-pool.ts`, the relational arm and multi-hop chain modules, `hub-dampening.ts`, `crag.ts` |
+| [Core Search (2/2)](key-files/core-search-2.md) | `search/rerank.ts` through `search/vector-pool.ts`, the relational arm and multi-hop chain modules, `hub-dampening.ts`, `crag.ts`; [CJK keyword](key-files/core-search-cjk.md) |
 | [Core Services (1/3)](key-files/core-services-1.md) | `src/core/advisor/*.ts` through `src/core/connectors/` |
 | [Core Services (1/3, continued)](key-files/core-services-1-continued.md) | `src/core/context/` through `src/core/context/ipc-path.ts` |
 | [Core Services (2/3)](key-files/core-services-2.md) | `src/core/conversation-parser/` through `src/core/ops/sources.ts`, except `src/core/persistence/` |
@@ -77,12 +77,12 @@ link it here rather than raising the cap.
 | [Skills](key-files/skills.md) | `src/core/audit-skill-brain-first.ts` through `src/core/skills-integrity.ts` |
 | [Tooling And Tests](key-files/tooling-and-tests.md) | `.github/workflows/test.yml` through `test/remote-privacy-sweep.test.ts` |
 | [CI Health And Test Guards](key-files/ci-health-and-test-guards.md) | `nightly-watch.yml` through `check-image-decoders-embedded.sh`, contributor audit, fix-wave gate |
-| [BrainBench — in a sibling repo](key-files/brainbench.md) | Cross-file subsystem contract |
-| [Hindsight calibration](key-files/hindsight.md) | Cross-file subsystem contract |
-| [Schema packs: mutation surface](key-files/schema-mutation.md) | Cross-file subsystem contract |
-| [Agent bootstrap cluster (the paste-in desktop-agent install)](key-files/agent-bootstrap.md) | Cross-file subsystem contract |
+| [BrainBench — in a sibling repo](key-files/brainbench.md) | Cross-file contract |
+| [Hindsight calibration](key-files/hindsight.md) | Cross-file contract |
+| [Schema packs: mutation surface](key-files/schema-mutation.md) | Cross-file contract |
+| [Agent bootstrap cluster (the paste-in desktop-agent install)](key-files/agent-bootstrap.md) | Cross-file contract |
 | [Agent Bootstrap (continued)](key-files/agent-bootstrap-continued.md) | Remaining cross-file entries |
-| [Google connector + open-loop engine](key-files/google-and-loops.md) | Cross-file subsystem contract |
+| [Google connector + open-loop engine](key-files/google-and-loops.md) | Cross-file contract |
 | [Google And Loops (continued)](key-files/google-and-loops-continued.md) | Remaining cross-file entries |
 | [Open loops](key-files/open-loops-engine.md) | detect, extract, store |
 | [Always-loaded core memory](key-files/core-memory.md) | Core tier, write-path guard and lock order, delivery lanes, pressure notice |

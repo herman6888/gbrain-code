@@ -20,7 +20,7 @@ const CHOICE_TEXT: Record<KeepChoice, string> = {
   prior: 'discard the edit: write the recorded prior bytes back (unlink the file when the prior was a create); the owner then finishes the recovery by its own rule, '
     + 'so a request with no recorded failure is requeued and its write publishes again, and one with a failure ends with it',
   disk: 'keep the edit and abandon the write: the request ends conflict (source_changed), or with the failure it already recorded, and its recovery record is '
-    + 'cleared; the database page keeps the content before the write, so reconcile the page afterwards',
+    + 'cleared; the database page keeps the content before the write, so reconcile the page afterwards (a managed sync import is retried by the next sync instead)',
 };
 
 function item(recovery: StuckRecovery, index: number, hash: string, keep: KeepChoice): RecoveryItem {

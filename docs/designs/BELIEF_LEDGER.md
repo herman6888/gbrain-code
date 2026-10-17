@@ -118,9 +118,11 @@ Two lifetimes scope every key:
   side table `belief_page_lifetimes (source_id, source_incarnation, slug,
   page_lifetime, started_at, ended_at)`. It is not derived from
   `knowledge_revision`, which changes on every write (`src/schema.sql:1862`)
-  and whose first value is not recoverable once versions are pruned. A delete
-  then recreate of a slug starts a new lifetime. A rename keeps the lifetime
-  and records the new slug. Subjects with no page (database-only facts whose
+  and whose first value is not recoverable once versions are pruned. A soft
+  delete keeps the lifetime: a later write to the slug restores the same page
+  row and appends `page.restored` on it. Only a page removed outright (purge,
+  retention cleanup) and then written again at the slug starts a new
+  lifetime. A rename keeps the lifetime and records the new slug. Subjects with no page (database-only facts whose
   `entity_slug` names no page) have a NULL `page_lifetime` and are scoped by
   source lifetime and subject slug alone.
 
@@ -1105,10 +1107,55 @@ machine, median of 2 runs, after section 13 item 16:
 | `beliefs enable` baseline | 1.2 s (1.2 ms/page) | 1.8 s (1.8 ms/page) |
 | `beliefs backfill`, 2 prior versions per page | 9.7 s (25,040 events) | 7.3 s |
 
-Cheaper options, none in W1: skip the post-read of tables a publication did
-not write (projections would report what they touched), keep each stream's
-subject snapshot on its lifetime row so the pre read is a key lookup, or
-force generic plans for the state read on Postgres (about 0.8 ms).
+**After the write-overhead pass** (section 13, items 17 to 20). Measured on
+the 4-core bench machine with the same `submitPageMutation` bench, master
+(v0.60.265.0) against the branch, interleaved, 3 rounds of 15 runs per cell
+(median of the round medians):
+
+| Cell | `put_page` ms | Ledger ms in the transaction | Ledger share |
+|---|---|---|---|
+| PGLite typical edit | 62 → 57 | 3.8–3.9 → 3.7–3.8 | 6.1% → 6.4–6.6% |
+| PGLite large edit | 380–385 → 206–210 | 14.6 → 14.0 | 3.8% → 6.7–6.8% |
+| Postgres typical edit | 47.5 → 44.4 | 4.5–4.6 → 3.8–3.9 | 9.7% → 8.6–8.7% |
+| Postgres large edit | 229–231 → 208–223 | 25.5–28.2 → 23.4–23.6 | 12.2–12.3% → 10.4–11.3% |
+
+The large PGLite share rose because `put_page` lost 45% of its time (the
+projections no longer rewrite 225 identical rows), not because the ledger
+grew. A typical Postgres edit now spends about 1.25 ms on the pre read,
+0.9 ms on the post read, 0.35 ms on lifetimes, 0.3 ms keying, 0.2 ms
+diffing, 0.4 ms on the append and 0.4 ms on the commit mark. Large-edit
+Postgres medians move by ±3 ms between identical rounds.
+
+Managed sync, create, 1000 typical pages plus 20 people, 5 interleaved reps
+per arm on Postgres: off 17.18 s median (16.66–18.99), on 19.37 s median
+(18.47–21.76), +12.7%, 7.2 ms per page in the transaction. On PGLite, 2 reps
+per arm: 39.4 → 43.6 s, +10.8%. Creates gain nothing from items 17 and 19: a
+create writes every table and reads every claim for the first time. The
+earlier +24% (lane 32) and +35% (one noisy rep of two) came from too few
+reps to quote.
+
+**After the keying pass** (section 13, item 21), the same bench, master
+(09943580e) against the branch, 3 interleaved rounds of 15 runs per cell
+(ranges of the round medians):
+
+| Cell | Ledger ms, master → branch | Ledger share, master → branch |
+|---|---|---|
+| PGLite typical edit | 4.1–5.4 → 4.2–5.0 | 6.1–6.7% → 6.0–6.7% |
+| PGLite large edit | 17.5–20.6 → 14.3–16.1 | 3.9–4.3% → 5.6–6.4% |
+| Postgres typical edit | 5.2–7.3 → 4.4–6.2 | 9.5–10.7% → 7.9–8.5% |
+| Postgres large edit | 20.1–24.4 → 14.7–18.2 | 10.3–11.3% → 8.4–9.3% |
+
+Master here lacks items 17 to 21, so the PGLite large share again rises
+because `put_page` lost about 45% of its time. Large Postgres edits now meet
+the 10% target; typical edits do not meet 5% on either engine, and creates
+were not measured again.
+
+**Targets for turning recording on by default:** typical edit ≤5%, large
+edit ≤10% and managed-sync create ≤10% of the write's time, ledger on
+against off. After this pass W1 meets none of them on Postgres (typical
+8.6–8.7%, large 10.4–11.3%, create +12.7%) and only the large-edit one on
+PGLite (typical 6.4–6.6%, large 6.7–6.8%, create +10.8%), so recording stays
+opt-in per source (`gbrain beliefs enable`).
 
 **Storage** (section 12, question 7, decided). A second free bench inserted
 the creation events of 2,000 typical pages into a PGLite table with the full
@@ -1186,7 +1233,7 @@ W2's interval tests map onto these directly:
 | Before, at and after creation and each of two edits | (1) |
 | Stalled transaction straddling T, including one that commits after ceiling plus grace | (2) |
 | Rolled-back write | No event, because the append is in the rolled-back transaction |
-| Delete then recreate | A new page lifetime |
+| Soft delete then write; purge then write | `page.restored` on the same lifetime; a new page lifetime |
 | Version-id tie | Per-page `id` order under the page lock |
 | Create, forget, materialize, edit | (1), the added preimages |
 
@@ -1502,3 +1549,229 @@ Garry accepted those answers. Questions 5, 6, 7 and 8 are decided.
     and 2000 pages on PGLite). The read now sets `force_generic_plan` for
     that one statement, transaction-local, and restores the previous value;
     the cost stays about 0.6 ms per page at every size.
+17. **Projections skip identical rewrites; the post read reuses untouched
+    tables.** The fence fact-field update, the take upsert and the take
+    resolution update write only rows whose values change, so a prose edit
+    rewrites no fact or take row and `takes.updated_at` moves only when the
+    take changes. Nothing reads a rewrite that changes no value: write
+    attribution and the trust tier already move only on a value change, and
+    every `updated_at` cursor and freshness reader is on `pages`. The post
+    read compares the transaction's `pg_stat_get_xact_tuples_*` counters for
+    facts, takes, links and link transitions with the pre read's and reuses
+    the pre read's rows for every table the transaction did not write, while
+    the stream pages are the same pages at the same slugs (fact entity pages
+    and link endpoints are read fresh). With `track_counts` off it reads
+    everything. A missed write would surface as drift in doctor
+    `belief_ledger_coverage`, which a forced probe shows.
+18. **Fewer statements per batch.** The source read that opens a batch also
+    reads the managed mode and switches to generic plans for the pre read;
+    each state read restores the plan mode inside its own statement. When
+    the post read reused a table's rows, the post side reuses the pre side's
+    fact and take subjects (take visibility from the post side) instead of
+    keying them again.
+19. **Process-local fingerprint cache.** Each stream read hashes claim texts
+    (SHA-256, in SQL) and fingerprints only those whose hash the process has
+    not fingerprinted before; `gbrain_fact_fingerprint` costs about 27 µs per
+    claim on Postgres, the SHA-256 under 1 µs. The cache maps text hash to
+    fingerprint only, never claim text, and is bounded (20,000 fingerprints,
+    2,000 streams, oldest out first). A forced probe compares cached and SQL
+    fingerprints for random claims with case, Unicode, punctuation and
+    whitespace edge cases on both engines, because a divergence would break
+    purge matching. One-shot CLI processes start cold and pay the full read.
+20. **Declined: a subject snapshot cache on the lifetime row** (the "cheaper
+    option" section 9 listed). After items 17 to 19 a typical Postgres edit
+    costs about 3.8 ms of a 44–50 ms write. Removing the pre read entirely
+    would leave about 2.6–2.8 ms (5.5–6%); a real cache also needs a
+    validity check and a write per batch, so about 6–7%, still above the 5%
+    target, for a migration plus invalidation on purge, redaction and
+    unmanaged writers. Not built.
+21. **Keying without re-sorting.** `canonicalJson` sorts an object's keys
+    only when they are not already in order and caches the quoted form of
+    key names (at most 4,096); fact and take values are built with their
+    keys in canonical order; the state hash computes each subject's sort key
+    once. The bytes are unchanged, so every stored value, claim and state
+    hash stays valid: test/belief-ledger-canonical-json.test.ts holds the
+    serializer and the state hash to the original implementation on a
+    seeded corpus and every edge case, and broken variants fail it.
+
+## 14. W2's first slice as built: page-at-time
+
+1. **Surface.** Page-at-time is a parameter, not a new op: `get_page
+   {known_as_of}` and `get_versions {known_as_of, diff, source_id}`, full
+   surface only, so the served starter schema is unchanged. `known_as_of` is
+   recorded time, an ISO 8601 instant with a zone; a bare date refuses
+   `clock_mismatch` (`date_for_instant`) instead of being read as midnight,
+   because a date is the valid-time clock (`as_of` on `get_links`). The
+   catalogue gains `clock_mismatch` and `known_as_of_unproven` (retryable);
+   `coverage_from` names `not_recorded`, `backfill_only` or
+   `backfill_incomplete`, and backfilled history never answers a
+   recorded-time read, because it has source times only. Every answer carries
+   `certified` and `uncertified_reason`.
+2. **Bodies pair by revision, in order.** Several intervals can share a
+   revision: a withdrawal's materialization is a view change at the same
+   revision. So the closed intervals of one revision pair with that
+   revision's versions in id order, newest with newest, and the open head
+   reads the live page while it is still at that revision. A body no version
+   holds is returned as `body: unavailable` with `body_reason` (`purged`,
+   `expired`, `hard_deleted`, `pruned` for a large or segmented page,
+   `version_missing`), never taken from a neighbour.
+3. **Correction to section 10, item 1: a rename also left no preimage.** The
+   page revision trigger advances the revision on a slug change, and
+   `updateSlug` (the cheap sync rename, the frontmatter slug repair, the held
+   file and import moves, managed sync's rename) wrote no version, so after a
+   rename no version held the body from before it. `updateSlug` now versions
+   the page first, in the same transaction. A publication that changes the
+   revision twice in one transaction (a rename then an edit) records the
+   pre-transaction revision as `revision_before`, and that revision now has
+   its version too. A BEHAVIOR_CHANGES row discloses the extra version.
+4. **Correction to sections 3 and 10: a soft delete keeps the lifetime.** A
+   write to a soft-deleted slug restores the same page row and appends
+   `page.restored` on the same lifetime (`ledger.ts`); only a page removed
+   outright (purge, retention cleanup) and written again starts a new
+   lifetime. W1's code and probes already behaved this way; only the text was
+   wrong.
+5. **Purged lifetimes collapse.** Section 6.5 sets `value` to NULL on every
+   event under a purged key, page events included, so a purged lifetime's
+   events no longer carry revisions. Its intervals split only where its slug
+   or deleted state changed (the event type and row still say), and every
+   body is `purged`. A local caller reading an instant before the purge gets
+   that interval with no body; a remote caller gets `page_not_found`, because
+   the page row is gone and the remote rule fails closed. A probe un-redacting
+   the revisions makes the lifetime split again, and `purge_fact` probes show
+   no historical body or diff returns the purged claim to either caller.
+6. **Proof of commit is the same lifetime, and backfill never proves.** An
+   unmarked event counts at `T` only when a later event of the same page
+   lifetime, not of origin `backfill`, was recorded by `T`. That is
+   stricter than `beliefEventVisibility`, which also accepts a later
+   backfill row, so a read can refuse `known_as_of_unproven` where the W1
+   helper says visible; it never answers where the helper says unproven.
+7. **The stalled-transaction cell runs on commit marks.** The read depends
+   only on marks and recorded times, so the cell deletes and re-adds a mark
+   (and stamps one at `recorded_at` as its forced probe) rather than holding
+   a transaction past ceiling plus grace; W1's probe 13 holds a real one.
+8. **The preimage invariant, enforced.** Every publication that moves a
+   page's knowledge revision leaves a `page_versions` row of the revision it
+   started from (`revision_before`), written in the same transaction before
+   the write that advances it. Revisions a transaction only passes through
+   (a rename then an edit in one publication) are never a ledger state, since
+   events record only the publication's start and end, so they need no
+   version. Large and segmented pages are exempt, because their versions are
+   pruned on their own policy and page-at-time discloses those bodies as
+   `pruned`. Enforcement has two parts:
+   - **In tests**, `finalizeBeliefEvents` checks every stream whose
+     revision moved and fails the transaction when no version of
+     `revision_before` exists (`preimages.ts`, `missingPreimages`), so a
+     writer that breaks the rule fails its own tests. It runs only under
+     `NODE_ENV=test` (`GBRAIN_BELIEF_PREIMAGE_CHECK=0` turns it off for a
+     probe that breaks the rule on purpose): in production it would add one
+     indexed lookup per revision-moving publication to the write path the
+     W1 overhead work is cutting.
+   - **In production**, doctor `belief_ledger_coverage` lists page events
+     from `live` or `unmanaged` publications whose `revision_before` no
+     version of the live page holds (`preimageGaps`: last 30 days, complete
+     under `--tier deep`) and warns, naming the slugs and events. The body
+     is not recoverable; the finding names the writer to fix.
+
+   Turning the check on found a second writer that broke the rule:
+   `purge_fact` rewrote each affected page body (dropping the purged fence
+   row) with no version. It now versions each page before the rewrite, and
+   its version redaction pass then redacts that version like every other
+   one, so the interval before a purge reads the body as it stood, minus the
+   purged claim.
+
+## 15. W4 as built: the weekly change diff
+
+1. **Surface.** One reader, two doors. `delta {beliefs: true}` (full surface
+   only, so the served starter schema is unchanged) adds `beliefs` for the
+   same window as the rest of the wake, and `gbrain beliefs changes
+   [<entity>...] [--since 7d]` prints it from the CLI. Both call
+   `beliefChanges` (`src/core/belief/changes.ts`). On a thin client the CLI
+   calls the host's `delta`, so it lists what a remote caller may see.
+   `entities` (the CLI's positionals) keeps changes whose stream page, fact
+   subject or entity, or link end is one of the named slugs.
+2. **One entry per belief that ended the window different.** Events are read
+   from `readBeliefHistory` between `since` (exclusive) and `until`
+   (inclusive), grouped by subject key, and compared end to end: `before` is
+   the subject's newest event at or before `since`, `after` its newest event
+   in the window. An edit and its revert, or an assert and its retraction,
+   report nothing. Each entry carries `kind` (`page`, `fact`, `take`,
+   `link`, `link_transition`), `change` (`added`, `removed`, `changed`;
+   page events add `deleted`, `restored`, `renamed`), a readable `subject`,
+   `before`, `after`, `cause` (the event type, the op, and any request,
+   replacement, proposal or purge pointer the event recorded), `evidence`
+   (event id, recorded time, slug, fence row) and the event's `trust_tier`.
+   Subjects net on hashes (the first event's prior hash against the last
+   one's value hash). Page events net per lifetime: a delete and its restore,
+   or a rename and its revert, report nothing, and so does a page created and
+   gone again inside the window, together with its beliefs. A page renamed
+   inside the window is reported under its final slug, and so are the beliefs
+   it moved (their evidence keeps the slug each event was recorded on). A purge,
+   expiry, merge or hard delete is one `removed` page entry.
+3. **A subject with no earlier event.** Section 4 records a page's creation
+   as one snapshot event, so a fact or take first edited inside the window may
+   have no event before `since`. Its `before` is read from the page body as
+   recorded at `since` (page-at-time, section 14). When no body answers (a
+   pruned, purged or segmented body, or no version), `before` is null and
+   `before_known` is false: the value is disclosed as unknown, never guessed.
+   A page created inside the window is one `added` page entry plus one
+   `added` entry per fence fact and take of its creation body; links that
+   came with it are counted on the page entry (for local callers only: the
+   counts include beliefs a remote caller may not read).
+4. **Upper bounds.** A relationship end that only the nightly check inferred
+   (a transition whose producer is `dream`) is flagged `upper_bound: true` and
+   rendered `end by <date>`: the relationship ended on or before that date
+   (section 16).
+5. **What is never a change.** Backfill and baseline events are skipped:
+   backfill carries source times, and a baseline is the state a coverage run
+   found. A window that starts before the source's coverage sets
+   `coverage_from`, because earlier changes are unknown rather than absent; a
+   source with no coverage at all returns `not_recorded: true`.
+6. **Remote callers.** `delta` passes `remote: !include_private`. The history
+   reader's rule applies (events world-visible when recorded, on a page
+   visible now, failing closed; takes of the holders the caller may read), and
+   a body read for `before` or a creation is used only where `remoteMayRead`
+   passes that interval, only for world fence rows, and never for a claim made
+   private later or a key a purge hid. A remote history page is filtered after
+   its SQL `LIMIT`, so reads page on the rows each page scanned, never on the
+   rows it returned. A take removal carries no value, so its holder is the
+   key's newest earlier value's; a take that came with its page's creation and
+   was removed later has no earlier event, so a remote caller does not see the
+   removal.
+7. **Budget.** Under `budget_tokens`, belief lines pack into what pages,
+   facts and threads leave; a dropped line sets `truncated`. Without a
+   budget the list is capped at 200 entries, and a window with more than
+   50,000 events the caller may read stops reading and sets `truncated`
+   (events it may not read never count, so they cannot change the answer).
+8. **Measured at $0.** Four seeded synthetic weeks (37 gold changes) give
+   set-F1 1.0 with exact before and after values on PGLite and Postgres
+   (`test/belief-ledger-weekly-probes.test.ts`). The cited diff costs 258,
+   233, 215 and 273 tokens against 227, 182, 307 and 281 for the plain list
+   of changed pages, so the cited answer costs about the same as the list it
+   replaces while naming each claim, its old value and its evidence.
+
+## 16. W5 as built: the time-model fixes
+
+1. **Inferred ends are upper bounds.** `RelationshipState.lastEndUpperBound`
+   (`link-validity.ts`) is true when every transition behind the last end has
+   producer `dream`: the nightly contradiction check closed the stint on the
+   day it noticed, so the true end is on or before that date. The relationship
+   note renders `ended: works_at acme-example (by 2025-03-01)`.
+2. **An explicit end replaces the inferred one.** An explicit end of the same
+   stint, earlier or later than the inferred closure, replaces it
+   (`withoutOverriddenInferredEnds`), so a late correction from the page is
+   the end the reader sees.
+3. **Correction to the plan: page versions are not copied between engines.**
+   `gbrain migrate --to <engine>` on a source brain that holds page versions and
+   no journal tables refuses `writer_coordinator_required` (reason
+   `page_history`, "Engine migration would discard N page versions.")
+   instead of copying them. The legacy copier re-creates pages with new ids,
+   so carrying versions would mean re-keying every version to its new page;
+   graduation to a managed brain already carries them
+   (`persistence/graduation-copy.ts`), so the plan's copy step is replaced by
+   the refusal, which names how many versions the copy would have discarded.
+4. **Dropped from the plan.** The `since_supplied` probe passes on master, so
+   no fix shipped for it; the probe stays as a regression pin
+   (`test/belief-ledger-w5-time-model.test.ts`).
+5. **E2 moves to a custodian.** The rerun of the P1 E2 late-closure eval runs
+   on held-out text in owner custody, preregistered in gbrain-evals before any
+   run; nothing in this repository reads the held-out set.

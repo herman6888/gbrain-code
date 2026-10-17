@@ -267,14 +267,16 @@ test('a page edited in the database after the manifest froze is held concurrent_
     expect(resumed.held![0]!.fix.argv).toEqual(['gbrain', 'sources', 'reconcile', f.id, 'b', '--preview']);
     expect(await readGitHold(engine, f.id, source.incarnation, 'c.md')).toBeNull();
     expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
-    // A page deleted in the database after the freeze holds the same way; the page stays deleted.
+    // A page deleted in the database after the freeze holds the same way; the page stays deleted. #6712: b still holds its
+    // database-only edit, so the next committed edit of b.md is held file_drift instead of overwriting it.
     for (const name of ['a', 'b', 'c', 'd']) writeFileSync(join(f.root, `${name}.md`), note(`${name} three.`));
     const pin3 = commit(f.root, 'version three');
     await interruptedAfter(engine, f.opts, 1);
     await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.softDeletePage('d', { sourceId: f.id }), TEST_WRITE_ATTRIBUTION));
     const third = await performManagedSync(engine, f.opts);
     expect(third).toMatchObject({ status: 'synced', toCommit: pin3 });
-    expect(third.held?.map(hold => [hold.path, hold.code])).toEqual([['d.md', 'concurrent_write']]);
+    expect(third.held?.map(hold => [hold.path, hold.code])).toEqual([['b.md', 'file_drift'], ['d.md', 'concurrent_write']]);
+    expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toBe('Beta, edited straight in the database.');
     expect(await engine.getPage('d', { sourceId: f.id })).toBeNull();
   }
 }), 120_000);

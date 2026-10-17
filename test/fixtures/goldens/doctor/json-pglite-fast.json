@@ -10,6 +10,7 @@
     "exit_code": 0,
     "report": {
       "brain_checks_score": 100,
+      "budget_ms": "<volatile>",
       "category_scores": {
         "brain": 100,
         "meta": 100,
@@ -377,10 +378,13 @@
           "status": "warn"
         }
       ],
+      "complete": true,
       "db_url_source": "config-file-path",
+      "elapsed_ms": "<volatile>",
       "health_score": 90,
       "schema_version": 2,
       "status": "warnings",
+      "tier": "standard",
       "top_issues": [
         {
           "action": {
@@ -423,9 +427,12 @@
       ],
       "unknown_scores": [
         "brain"
-      ]
+      ],
+      "unknown_sections": []
     },
-    "stderr": [],
+    "stderr": [
+      "[gbrain doctor] non-interactive run: the check run (not connect or migrations) is capped at 90000 ms (doctor.default_budget_ms); checks past it report health unknown. Off for one run: --budget-ms 0; off for good: gbrain config set doctor.default_budget_ms 0. On PGLite a statement already running cannot be stopped, so a check can finish late."
+    ],
     "stdout": "<json>"
   },
   "normalizer": "doctor-json-v1"

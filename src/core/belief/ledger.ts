@@ -15,12 +15,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import { assertHeldPageKeys } from '../page-state/guards.ts';
-import { readManagedMode } from '../persistence/managed-mode.ts';
+import { MANAGED_MODE_ROWS_JSON_SQL, managedModeFromRows } from '../persistence/managed-mode.ts';
 import { COVERAGE_KEY, heldKey, lifetimeRef, pageKey, sha256Hex, canonicalJson, factKeySubject, slugRef } from './keys.ts';
 import { readBeliefState, readFactsById, type RawPage, type RawState } from './state.ts';
 import { keyedSubjects, keyFact, pageNeeds, type KeyContext, type Subject } from './subjects.ts';
 import { endLifetime, mintLifetime, readOpenLifetimes, renameLifetime, resolveLifetimes } from './lifetimes.ts';
 import { appendBeliefEvents, redactionReleasedDraft, type BeliefEventDraft, type BeliefOrigin, type RedactionRelease } from './append.ts';
+import { missingPreimages, preimageInvariantEnforced } from './preimages.ts';
 
 export type BeliefNote =
   | { kind: 'contested'; table: string; rowId: number; proposalId: number; guard: string }
@@ -83,27 +84,40 @@ export function beliefBatchCovers(sourceId: string, slugs: readonly string[]): b
 /** True inside any belief batch: a nested writer's own publication commits with the enclosing transaction, not before it. */
 export const insideBeliefBatch = (): boolean => !!store.getStore();
 
-/** Coverage and purge probes for one source, in one read. `coverage` is the newest coverage event other than `coverage.restored`. */
-export async function readLedgerSource(tx: Pick<BrainEngine, 'executeRaw'>, sourceId: string): Promise<{ incarnation: string; purgeEpoch: number; coverage: string | null; purgesPossible: boolean } | null> {
-  const [row] = await tx.executeRaw<Record<string, unknown>>(`SELECT s.incarnation::text AS incarnation, s.purge_epoch,
+/**
+ * Coverage and purge probes for one source, in one read. `coverage` is the newest coverage event other than `coverage.restored`.
+ * `batch` (a batch beginning) also reads the managed mode and, when coverage is active, switches the transaction to
+ * generic plans for the state read that follows, returning the mode to restore (`readBeliefState`'s `planModePrev`).
+ */
+export async function readLedgerSource(tx: Pick<BrainEngine, 'executeRaw'>, sourceId: string, opts: { batch?: boolean } = {}): Promise<{ incarnation: string; purgeEpoch: number;
+  coverage: string | null; purgesPossible: boolean; managedRows?: Array<{ enabled: unknown }>; planModePrev?: string } | null> {
+  const [row] = await tx.executeRaw<Record<string, unknown>>(`${opts.batch ? `SELECT q.*, ${MANAGED_MODE_ROWS_JSON_SQL} AS managed_rows, current_setting('plan_cache_mode') AS plan_mode_prev,
+      set_config('plan_cache_mode', CASE WHEN q.coverage IS NOT NULL AND q.coverage <> 'coverage.stopped' THEN 'force_generic_plan'
+        ELSE current_setting('plan_cache_mode') END, true) FROM (` : ''}SELECT s.incarnation::text AS incarnation, s.purge_epoch,
       (SELECT e.event_type FROM belief_events e WHERE e.source_id = s.id AND e.subject_kind = 'coverage' AND e.subject_key = $2
         AND e.source_incarnation = s.incarnation AND e.event_type <> 'coverage.restored' ORDER BY e.id DESC LIMIT 1) AS coverage,
       (s.purge_epoch > 0 OR EXISTS (SELECT 1 FROM fact_purges WHERE source_id = s.id) OR EXISTS (SELECT 1 FROM take_purges WHERE source_id = s.id)
         OR EXISTS (SELECT 1 FROM page_purges WHERE source_id = s.id)) AS purges
-    FROM sources s WHERE s.id = $1`, [sourceId, COVERAGE_KEY]);
+    FROM sources s WHERE s.id = $1${opts.batch ? ') q' : ''}`, [sourceId, COVERAGE_KEY]);
   if (!row) return null;
   return { incarnation: String(row.incarnation), purgeEpoch: Number(row.purge_epoch), coverage: (row.coverage as string | null) ?? null,
-    purgesPossible: row.purges === true };
+    purgesPossible: row.purges === true,
+    ...(opts.batch ? { managedRows: row.managed_rows as Array<{ enabled: unknown }>, planModePrev: String(row.plan_mode_prev) } : {}) };
 }
 
 export const coverageActive = (coverage: string | null) => coverage != null && coverage !== 'coverage.stopped';
 
 async function beginBeliefBatch(tx: BrainEngine, opts: BeliefBatchOptions): Promise<Batch | null> {
-  const source = await readLedgerSource(tx, opts.sourceId);
+  const source = await readLedgerSource(tx, opts.sourceId, { batch: true });
   if (!source || !coverageActive(source.coverage)) return null;
-  assertHeldPageKeys(tx, opts.slugs.map(slug => ({ sourceId: opts.sourceId, slug })));
-  const pre = await readBeliefState(tx, opts.sourceId, opts.slugs);
-  return { opts, publicationId: opts.publicationId ?? randomUUID(), incarnation: source.incarnation, managed: await readManagedMode(tx),
+  try {
+    assertHeldPageKeys(tx, opts.slugs.map(slug => ({ sourceId: opts.sourceId, slug })));
+  } catch (error) {
+    await tx.executeRaw(`SELECT set_config('plan_cache_mode', $1, true)`, [source.planModePrev]);
+    throw error;
+  }
+  const pre = await readBeliefState(tx, opts.sourceId, opts.slugs, [], undefined, source.planModePrev);
+  return { opts, publicationId: opts.publicationId ?? randomUUID(), incarnation: source.incarnation, managed: managedModeFromRows(source.managedRows!).enabled,
     purgesPossible: source.purgesPossible, pre, notes: [] };
 }
 
@@ -188,7 +202,8 @@ function stateHashOf(page: RawPage | null, lifetime: string | null, subjects: Su
   const live = page && !page.deleted;
   return sha256Hex(canonicalJson({
     page: page ? { lifetime, deleted: page.deleted, revision: page.revision, visible: page.visible, tier: page.tier } : null,
-    subjects: subjects.filter(s => live || s.dbOnly).map(s => [s.kind, s.key, s.vhash, s.tier]).sort((a, b) => (a.join('\u0000') < b.join('\u0000') ? -1 : 1)),
+    subjects: subjects.filter(s => live || s.dbOnly).map(s => { const row = [s.kind, s.key, s.vhash, s.tier]; return { row, order: row.join('\u0000') }; })
+      .sort((a, b) => (a.order < b.order ? -1 : a.order > b.order ? 1 : 0)).map(s => s.row),
   }));
 }
 
@@ -374,7 +389,7 @@ export async function finalizeBeliefEvents(tx: BrainEngine, batch: Batch): Promi
   const ctx = (side: 'pre' | 'post'): KeyContext => ({ incarnation: batch.incarnation, lifetimes,
     pagesBySlug: new Map(streams.flatMap(s => { const p = side === 'pre' ? s.pre : s.post; return p ? [[p.slug, p] as const] : []; })) });
   const preSubjects = keyedSubjects(ctx('pre'), pre, visibilityIn(pre));
-  const postSubjects = keyedSubjects(ctx('post'), post, visibilityIn(post));
+  const postSubjects = keyedSubjects(ctx('post'), post, visibilityIn(post), { state: pre, subjects: preSubjects });
   const postPageAt = (slug: string) => streams.find(s => s.post?.slug === slug)?.post ?? null;
   const lifetimeAt = (slug: string) => { const page = postPageAt(slug); return page ? lifetimes.get(page.id) ?? null : null; };
   const subjectsByStream = new Map<string, Subject[]>();
@@ -432,6 +447,14 @@ export async function finalizeBeliefEvents(tx: BrainEngine, batch: Batch): Promi
       const s = postSubjects.find(x => x.kind === (note.table === 'facts' ? 'fact' : 'take') && x.rowIds.includes(note.rowId));
       if (s) drafts.push(redactionReleasedDraft({ sourceId: opts.sourceId, incarnation: batch.incarnation, lifetime: lifetimeAt(s.stream), slug: s.stream, stream: s.stream,
         subjectKind: s.kind as BeliefEventDraft['subjectKind'], subjectKey: s.key, trustTier: s.tier, visibility: s.visibility, stateHash: streamHash(s.stream) }, note.releases, batch.publicationId));
+    }
+  }
+  if (preimageInvariantEnforced()) {
+    const needs = streams.flatMap(s => s.pre && s.post && s.pre.id === s.post.id && s.pre.revision !== s.post.revision && !s.pre.large && !s.post.large
+      ? [{ pageId: s.post.id, slug: s.pre.slug, revision: s.pre.revision }] : []);
+    const missing = await missingPreimages(tx, needs);
+    if (missing.length) {
+      throw new Error(`belief preimage invariant: ${missing.map(m => `${m.slug} moved off revision ${m.revision} with no page_versions row for it`).join('; ')} (op ${opts.op}; BELIEF_LEDGER.md section 14 item 8)`);
     }
   }
   return appendBeliefEvents(tx, drafts, { publicationId: batch.publicationId, origin: opts.origin ?? (batch.managed ? 'live' : 'unmanaged'),

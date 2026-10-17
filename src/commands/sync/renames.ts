@@ -13,6 +13,7 @@ import { maintenanceTransaction } from '../../core/persistence/attribution.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { movePageIdReferences, moveSlugBindings, recordRenameAlias } from '../../core/page-state/rename-alias.ts';
 import { renamePageOntoSlug } from './rename-collision.ts';
+import { workingTreeIdentityHead } from '../../core/sync-rename-identity.ts';
 import {
   resolveSlugsForRemovedPaths,
   refusedRemovedPathMessage,
@@ -189,8 +190,8 @@ export async function runRenamesPhase(
 
 
     const ctx: RenameContext = { renameOpts, slugLiveness, renameOldSlugs, fromSlugByPath, renameSentinelAlreadyOpen, noEmbed };
-    for (const { from, to } of renamesToDo) {
-      const aborted = await applyRename(run, plan, ctx, progress, from, to);
+    for (const { from, to, identityHead } of renamesToDo) {
+      const aborted = await applyRename(run, plan, ctx, progress, from, to, identityHead);
       if (aborted) return aborted;
     }
     progress.finish();
@@ -206,6 +207,7 @@ async function applyRename(
   progress: SyncProgress,
   from: string,
   to: string,
+  identityHead?: string,
 ): Promise<SyncResult | undefined> {
   const { engine, failedFiles, succeededPaths, pagesAffected, deletedSlugs } = run;
   const { opts, gitContextRoot, syncImportRoot, syncActivePack, holds } = plan;
@@ -236,6 +238,14 @@ async function applyRename(
   const newSlug = resolveSlugForPath(to);
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `to` is a git-diff rename path; the joined path is read only after the same isPathSafe(filePath, gitContextRoot) realpath containment check the import below applies
   const filePath = join(syncImportRoot, to);
+  // #6729: a dirty-tree rename keeps its page only for the bytes its verdict read; a file edited since then is left
+  // for the next sync to re-check, and nothing moves.
+  if (identityHead !== undefined && workingTreeIdentityHead(syncImportRoot, to) !== identityHead) {
+    failedFiles.push({ path: to, error: `${to} changed after sync confirmed it keeps the page of ${from}; nothing moved. Run gbrain sync again to re-check it.` });
+    serr(`  [sync] rename ${sanitizePathForDisplay(from)} -> ${sanitizePathForDisplay(to)}: the file changed after its identity was confirmed; nothing moved, the next sync re-checks it.`);
+    progress.tick(1, newSlug);
+    return undefined;
+  }
   // #5988 (E13): a destination the import would refuse is screened before the
   // old page's slug or origin moves; it is held and the old page stays whole.
   if (isPathSafe(filePath, gitContextRoot) && await holdRenameDestination(engine, holds, { from, to, filePath, oldSlug, activePack: syncActivePack })) {

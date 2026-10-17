@@ -584,7 +584,11 @@ erasure of source material, history, or backups.
 
 Managed removal disables local following and attempts owned-file cleanup even
 when offline or already revoked. `remote_membership_pending: true` means the
-host has not acknowledged leave; retry remote cleanup when possible. Do not
+host has not acknowledged leave; retry remote cleanup when possible. A
+bootstrap-managed enrollment whose credential is already revoked cannot leave
+remotely; `gbrain bootstrap harness` finishes its local cleanup and records it
+as left with reason `credential_revoked`, because a revoked principal's
+membership is inert ([cleanup pending](bootstrap.md#cleanup-pending)). Do not
 claim a server-side departure from successful local deletion, or delete edited
 files to make the status look complete.
 

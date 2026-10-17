@@ -10,7 +10,8 @@ import { OperationError, opError, type OpErrorOpts } from '../ops/contract.ts';
 import type { Action } from '../agent-output.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { RegistryCode } from '../error-registry.ts';
-import { ownerGateInput, ownerImportTrust } from '../trust/channel.ts';
+import { ownerGateInput, ownerImportTrust, ownerPageTrust } from '../trust/channel.ts';
+import { matchTrustAllowRule, type TrustAllowRule } from '../trust/allow-rules.ts';
 import { importFromContent, importCodeFile, verifyPageReadable } from '../import-file.ts';
 import { screenImportContent, screenNormalized, type ContentRefusal, type ImportScreenResult, type ImportSanityConfig } from '../import-screen.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
@@ -25,6 +26,7 @@ import { abortSegmentedStaging, materializedSnapshot, sealSegmentedPage } from '
 import { fenceBody, withoutBody } from '../page-body/page-shape.ts';
 import { pipelined, transactionMemo } from '../page-state/transactions.ts';
 import { prepareCanonicalProjections } from './canonical-projections.ts';
+import { withoutSafetyAssessments } from './reconcile-safety.ts';
 import { digest, sha256 } from './digest.ts';
 import { preserveProtectedTakes } from './protected-takes.ts';
 import { getWorktreeBinding } from './ownership.ts';
@@ -44,6 +46,7 @@ import { isUnboundSourcePage, UNBOUND_COLLISION_MESSAGE } from './unbound-source
 import { checkpointRetryCommand, findIncompleteSyncReceipt, type SyncSettledIndexes } from './checkpoint-validation.ts';
 import { CURSOR_CHANGED_REFUSAL_MESSAGE, SYNC_CURSOR_FENCE_ORIGIN } from './sync-knock-on.ts';
 import { checkpointCursorReplaced } from './sync-checkpoint-replaced.ts';
+import { recordSyncTail } from './sync-tail-record.ts';
 import { frontmatterSlugConflictMessage } from './verb-errors.ts';
 import { chunkerStamp } from '../chunkers/code.ts';
 import { clearGitHold, countGitHolds, recordSyncImportProvenance, syncDiskProvenance, syncImportParser, syncImportParserFor, type SyncImportProvenanceBase } from './sync-holds.ts';
@@ -167,7 +170,7 @@ function syncPublicationRefusal(code: RegistryCode, message: string, row: WriteR
 
 /**
  * #6643: the refusal of a request whose run another run replaced: not a failure of its page. Its next step is the
- * status read, never a `--retry-failed` rerun: the replacing run covers the page.
+ * status read, never a retry: the replacing run covers the page.
  */
 function supersededRefusal(message: string, row: WriteRequest, cause: string): OperationError {
   const status = ['gbrain', 'sync', 'status', '--source', row.source_id, '--json'];
@@ -233,6 +236,13 @@ export interface SyncImportScreenInput {
   normalize?: boolean;
   /** #5575: page purge tombstones of the source; a matching file is held as `purged_content`. */
   purgedPages?: ReadonlyMap<string, string>;
+  /**
+   * #6712 PR 2: the source's config and trust allow rules. With them the screen applies the write gate as preparation
+   * does (the tier is the source default lowered by the file's trust markers; an owner allow rule for the source and the
+   * file's path admits it), so a file `write_gate.external_mode=reject` refuses is held as `write_gate_rejected` instead
+   * of failing its receipt and blocking the run.
+   */
+  writeGateSource?: { sourceId: string; config: Record<string, unknown> | null; allowRules: readonly TrustAllowRule[] };
 }
 
 /**
@@ -255,12 +265,17 @@ export function screenSyncImport(input: SyncImportScreenInput): { screen: Import
   // refusal, so a file already repaired and published is never refused for its pinned bytes.
   // The checkpoint may advance past the pinned commit's bytes because the working tree wins, as for any local edit.
   const newerWorkingTree = !input.companyApproval && !!base && !input.lineEndingOnly && input.rawHash !== sha256(content) && !sameCanonicalImport(base, parsedInput);
+  const gateSource = input.writeGateSource;
+  const gateTrust = gateSource ? ownerPageTrust({ frontmatter: parsedInput.frontmatter, sourceConfig: gateSource.config, channel: 'managed_sync_import', sourceUri: sourcePath }) : null;
   const screen = screenImportContent({ content, path: `${slug}.md`, activePack, expectedSlug: resolveSlugForPath(sourcePath), fences: 'coordinated',
     ...(input.normalize === false ? { normalize: false } : {}),
     slugExempt: declared => snapshot?.page.source_path != null && syncOriginPath(snapshot.page.source_path) === syncOriginPath(sourcePath) && declared === snapshot.page.slug,
     slugConflictMessage: (found, expected) => frontmatterSlugConflictMessage(sourcePath, found, expected),
     ...(input.sanity ? { sanity: input.sanity } : {}),
     ...(input.purgedPages ? { purgedPages: input.purgedPages } : {}),
+    ...(gateSource ? { writeGate: { tier: gateTrust!.tier, origin: { channel: gateTrust!.origin?.channel ?? null, source_uri: gateTrust!.origin?.source_uri ?? null } },
+      gateAllowed: gate => !gate.detectorError
+        && !!matchTrustAllowRule(gateSource.allowRules, { sourceId: gateSource.sourceId, sourceUri: gateTrust!.origin?.source_uri ?? null, families: gate.families as never }) } : {}),
     ...(newerWorkingTree ? { published: () => {
       const working = input.renamed ? null : readSyncFile(input.root, input.path);
       return !!working && sha256(working) === input.rawHash && sameCanonicalImport(base!, parseMarkdown(working.toString('utf8'), `${slug}.md`, { activePack }));
@@ -468,6 +483,8 @@ async function applyManagedSyncCheckpoint(tx: BrainEngine, row: WriteRequest, p:
   // #5566: a full walk re-chunked every stale page, so acknowledge the chunker version as the legacy gate does.
   if (settled && (p.from === null || p.syncOptions?.full === true)) await tx.executeRaw('UPDATE sources SET chunker_version=$2 WHERE id=$1', [row.source_id, chunkerStamp()]);
   await tx.executeRaw("UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,done}','true'::jsonb),updated_at=now() WHERE op='managed-sync' AND fingerprint=$1", [p.cursorKey]);
+  // #6712 PR 2 (L5): the tail (statistics, links) runs after the lease is released; it is owed from this commit on.
+  await recordSyncTail(tx, row.source_id, p.cursorKey, p.runId);
   for (const path of p.releasedHolds ?? []) await releaseHold(tx, path);
   return { status: 'synced', source_id: row.source_id, committed_pages: p.total };
 }
@@ -487,7 +504,9 @@ function canonicalWritebackNeeded(row: WriteRequest, p: SyncIntent, pinned: stri
 }
 
 /** A managed-sync preparation; a Markdown import also carries the provenance its publication records, which a no-op waiver records instead. */
-export type SyncPreparedMutation = PreparedMutation & { importProvenance?: SyncImportProvenanceBase };
+export type SyncPreparedMutation = PreparedMutation & { importProvenance?: SyncImportProvenanceBase;
+  /** The import leaves the page as it is (only a canonical writeback of the file may remain); #6712 drift baseline check in sync-run.ts. */
+  pageUnchanged?: boolean };
 
 export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock?: ClaimPhaseClock,
   screening?: { unsaved: true }): Promise<SyncPreparedMutation> {
@@ -509,7 +528,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   if (p.kind !== 'managed_sync_delete' && (!p.processingOptions ||
       ['noEmbed', 'noExtract', 'noSchemaPack'].some(key => typeof p.processingOptions?.[key as keyof SyncProcessingOptions] !== 'boolean'))) {
     throw new OperationError('invalid_params', 'The legacy sync request has no durable processing options.',
-      'Inspect this unchanged request, then use --retry-failed with explicit sync options to rediscover. Unknown embedding and schema consent cannot be inferred from a retry.');
+      'Inspect this unchanged request, then rerun the sync with explicit sync options: it retries the recorded failure by rediscovering. Unknown embedding and schema consent cannot be inferred from a retry.');
   }
   enterClaimStep(clock, 'authority', undefined, 'db');
   await validateSyncAuthority(engine, p.syncAuthority, row.slug);
@@ -677,7 +696,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   const renderedPage = { ...(base ? withoutBody(base.page) : { id: 0, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }), ...ready.parsedPage } as Page;
   if (renamed && parsedInput.typeExplicit !== true) renderedPage.type = parsedInput.type;
   const canonical = (page: Pick<typeof parsed, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>, tags: string[]) => ({ type: page.type, title: page.title, body: page.compiled_truth,
-    timeline: page.timeline ?? '', frontmatter: page.frontmatter, tags: [...new Set(tags)].sort() });
+    timeline: page.timeline ?? '', frontmatter: withoutSafetyAssessments(page.frontmatter), tags: [...new Set(tags)].sort() });
   // A move re-infers an implicit type from the new location, as a fresh import there would.
   const renamedType = renamed && parsedInput.typeExplicit !== true ? parsedInput.type : undefined;
   const overlay = digest(canonical(parsed, parsed.tags)) !== digest(canonical({ ...ready.parsedPage, type: renamedType ?? ready.parsedPage.type }, tags));
@@ -698,6 +717,7 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   const preparedImport: SyncPreparedMutation = { observedRevision: snapshot?.revision ?? null, trust: await ownerImportTrust(engine, row, ready.parsedPage.frontmatter, p.sourcePath), importProvenance,
     // Tells the #5470 screen the content is unchanged; publication still queues its effects.
     contentUnchanged: ready.noop && !moved && !writeback,
+    pageUnchanged: ready.noop && !moved,
     ...(renamed ? { additionalPageKeys: [{ sourceId: row.source_id, slug: renamed.slug }] } : {}),
     validate: async tx => { await validate(tx); await ready.validate(tx); },
     deferEmbedding: p.processingOptions?.noEmbed || p.embedDeferred === true,

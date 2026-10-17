@@ -156,7 +156,7 @@ check('interrupted options survive resume and changed-option retries cannot rewr
   expect(await engine.executeRaw('SELECT id,intent FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY id', [original.map(row => row.id)])).toEqual(original);
 });
 
-check('unknown legacy import consent fails under its original request and explicit retry rediscovery is required', async engine => {
+check('unknown legacy import consent fails under its original request and the next plain sync rediscovers', async engine => {
   const f = await fixture(engine);
   expect(await interruptAfterSyncDiscovery(engine, f.opts)).toMatchObject({ status: 'partial' });
   const c = await cursor(engine, f.id), requestId = randomUUID();
@@ -176,10 +176,10 @@ check('unknown legacy import consent fails under its original request and explic
   const failed = (await getWriteRequest(engine, admission.principal, requestId))!;
   expect(failed.intent).toEqual(intent);
   expect((await admitWrite(engine, admission)).id).toBe(failed.id);
-  expect((await performManagedSync(engine, f.opts)).managedWrite?.write_request).toEqual(blocked.managedWrite?.write_request);
   expect(await engine.getPage(admission.slug, { sourceId: f.id })).toBeNull();
   expect(await engine.executeRaw('SELECT id FROM persistence_effects WHERE source_id=$1', [f.id])).toEqual([]);
-  expect(await performManagedSync(engine, { ...f.opts, retryFailed: true })).toMatchObject({ status: 'first_sync', added: 1 });
+  // #6712 PR 3 (L7): the next plain sync rediscovers from HEAD (no --retry-failed); the refused request keeps its intent.
+  expect(await performManagedSync(engine, f.opts)).toMatchObject({ status: 'first_sync', added: 1 });
   expect((await getWriteRequest(engine, admission.principal, requestId))?.intent).toEqual(intent);
   expect((await cursor(engine, f.id)).value.runId).not.toBe(c.value.runId);
 });

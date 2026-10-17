@@ -124,7 +124,7 @@ test('#6712: a failing member is attributed to its own page; the members before 
 
 test('a held file ends the group before it: it is held without a request and every other page commits (#5988)', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   if (!engine) return;
-  const f = await fixture(engine, notes(10, i => i === 3 ? '---\ntitle: Conflict\nslug: notes/other\n---\nA conflicting identity must not be imported.\n' : null));
+  const f = await fixture(engine, notes(10, i => i === 3 ? '---\ntitle: Conflict\nslug: notes/n1\n---\nA conflicting identity must not be imported.\n' : null));
   const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true });
   expect(result.drain).toMatchObject({ outcome: 'synced' });
   expect(result).toMatchObject({ holds_outstanding: 1 });

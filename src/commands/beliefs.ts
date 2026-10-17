@@ -18,13 +18,19 @@ import { readLedgerSource } from '../core/belief/ledger.ts';
 import { readManagedMode } from '../core/persistence/managed-mode.ts';
 import { resolveSourceId, SourceTargetError } from '../core/source-resolver.ts';
 import { replayPurgesCli } from './beliefs-replay-purges.ts';
+import { beliefChanges, renderBeliefChanges } from '../core/belief/changes.ts';
+import { parseSince } from '../core/since.ts';
 
 export const BELIEFS_USAGE = [
-  'Usage: gbrain beliefs <enable|disable|status|reconcile|backfill|replay-purges> [--source <id>] [--json]',
+  'Usage: gbrain beliefs <enable|disable|status|changes|reconcile|backfill|replay-purges> [--source <id>] [--json]',
   '  enable     Start recording the belief ledger on a source: baselines every page (resumable) and sets the watermark.',
   '             Only a managed source\'s coverage is certified; an unmanaged source is recorded but uncertified.',
   '  disable    Stop recording (appends coverage.stopped); enabling again starts a new interval with a new baseline.',
   '  status     Coverage intervals per source: watermark, certified or uncertified, baseline progress, restore gaps, drift.',
+  '  changes [<entity>...] [--since 7d]',
+  '             Each belief that changed in the window (default the last 7 days), before and after, with the event that caused it.',
+  '             An inferred relationship end is marked as an upper bound. On a thin client this runs through the host\'s delta',
+  '             and lists what a remote caller may see: world beliefs on pages visible now.',
   '  reconcile  Appends reconcile events for slugs whose state drifted from their newest event, and fills missing commit marks.',
   '             A drifted slug\'s interval stays uncertified on a managed source.',
   '  backfill   Seeds best-effort history before the coverage start from retained page versions (never certified).',
@@ -33,7 +39,24 @@ export const BELIEFS_USAGE = [
   '  --source <id>  The source (default: every covered source for status and reconcile; the resolved source, as for other commands, for the rest).',
 ].join('\n');
 
-const SUBCOMMANDS = ['enable', 'disable', 'status', 'reconcile', 'backfill', 'replay-purges'] as const;
+const SUBCOMMANDS = ['enable', 'disable', 'status', 'changes', 'reconcile', 'backfill', 'replay-purges'] as const;
+
+/** `beliefs changes` arguments: the entity slugs and the window start, shared with the thin-client route. */
+export function beliefsChangesArgs(args: string[], now = Date.now()): { entities: string[]; since: string } {
+  const entities: string[] = [];
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--since' || args[i] === '--source') i++;
+    else if (!args[i]!.startsWith('-')) entities.push(args[i]!);
+  }
+  const at = args.indexOf('--since');
+  const raw = at >= 0 ? args[at + 1] : args.find(a => a.startsWith('--since='))?.slice('--since='.length);
+  if ((at >= 0 || raw !== undefined) && (!raw || raw.startsWith('-'))) throw opError('invalid_params', '--since needs a value.', 'Pass a relative age (7d, 24h) or an ISO date (2026-10-01).');
+  try {
+    return { entities, since: parseSince(raw ?? '7d', '--since', now)! };
+  } catch (error) {
+    throw opError('invalid_params', (error as Error).message, 'Pass a relative age (7d, 24h) or an ISO date (2026-10-01).');
+  }
+}
 
 function sourceArg(args: string[]): string | undefined {
   const at = args.indexOf('--source');
@@ -70,7 +93,7 @@ export async function runBeliefs(engine: BrainEngine, args: string[]): Promise<v
   if (args.includes('--help') || args.includes('-h') || !sub) { console.log(BELIEFS_USAGE); return; }
   try {
     if (!(SUBCOMMANDS as readonly string[]).includes(sub)) {
-      throw opError('invalid_params', `Unknown beliefs subcommand '${sub}'.`, 'gbrain beliefs --help lists enable, disable, status, reconcile, backfill and replay-purges.');
+      throw opError('invalid_params', `Unknown beliefs subcommand '${sub}'.`, 'gbrain beliefs --help lists enable, disable, status, changes, reconcile, backfill and replay-purges.');
     }
     const named = sourceArg(args);
     if (named !== undefined && !await readLedgerSource(engine, named)) throw unknownSource(named);
@@ -98,6 +121,12 @@ export async function runBeliefs(engine: BrainEngine, args: string[]): Promise<v
       const incomplete = result.pages.filter(p => !p.complete);
       await report(args, result, `Backfilled ${result.events} event(s) before ${result.since} across ${result.pages.length} page(s) of ${sourceId} (best effort, never certified)`
         + `${incomplete.length ? `; ${incomplete.length} page(s) incomplete (${[...new Set(incomplete.flatMap(p => p.reasons))].join(', ')})` : ''}.`);
+      return;
+    }
+    if (sub === 'changes') {
+      const { entities, since } = beliefsChangesArgs(args);
+      const changes = await beliefChanges(engine, { sourceId: await target(), since, until: new Date().toISOString(), remote: false, entities });
+      await report(args, changes, renderBeliefChanges(changes));
       return;
     }
     if (sub === 'replay-purges') {

@@ -360,6 +360,8 @@ The legacy copier handles every other direction: `gbrain migrate --to pglite`, P
 | A Postgres brain moving to PGLite | `report` | The brain stays on Postgres; moving down would drop its history. |
 | A target that already holds persistence history | `tell_user_to_run` | Rerun with an empty database the user provides (`--path` for a PGLite target). |
 
+A brain with page versions but no write history gets the same refusal with `reason: page_history` and the number of versions in the message: the legacy copier re-creates pages without their versions, so the copy would discard them. Graduation (PGLite to Postgres) carries them.
+
 On Windows, a PGLite brain with history gets `graduation_unsupported_platform` instead: it stays on PGLite and is shared with `gbrain mcp expose`.
 
 <a id="graduation-writer-held"></a>**Graduation refused: the brain is held (`graduation_source_writer_held`).** Graduation needs the PGLite kernel lock. A live stdio `gbrain serve` hands the brain over through the intent marker `<path>.gbrain-graduation.json` and exits; autopilot pauses. When another holder (an HTTP serve, a daemon, another command) does not release the brain within 30 seconds, the run refuses and names it with its pid and transport (`fix.next: tell_user_to_run`). The user stops that process, then the agent reruns the same `gbrain migrate` command. Verify with the read-only `gbrain migrate --status --json`. Nothing has changed in either datastore.

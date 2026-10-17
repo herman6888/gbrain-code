@@ -47,6 +47,7 @@ export const SNAPSHOT_DYNAMIC_IMPORTS_NOT_HASHED: Readonly<Record<string, string
   'verbs/entity-card.ts': 'verbs.ts request-time verb handlers',
   'verbs/entity-card-identity.ts': 'verbs.ts request-time verb handlers (identity siblings notice)',
   'verbs/entity-names.ts': 'verbs.ts request-time verb handlers (entity names[] compact rows)',
+  'verbs/entity-source.ts': 'verbs.ts request-time verb handlers (entity source walk, #6723)',
   'mentions/coverage.ts': 'verbs.ts request-time verb handlers (entity coverage notice)',
   'think/index.ts': 'verbs.ts request-time verb handlers',
   'search/query-prefix.ts': 'verbs.ts request-time verb handlers (synthesize question embed, #3783)',

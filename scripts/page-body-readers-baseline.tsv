@@ -72,6 +72,7 @@ src/core/attendance-repair.ts	prepareOrigin	field	META
 src/core/attendance-repair.ts	readOrigin	sql	META	
 src/core/belief/backfill.ts	preparePage	field	STREAM	the backfill parses inline version and page bodies; a segmented page or version is skipped (summary reasons large_page_versions_pruned, segmented_version_body)
 src/core/belief/backfill.ts	preparePage	sql	STREAM	the backfill parses inline version and page bodies; a segmented page or version is skipped (summary reasons large_page_versions_pruned, segmented_version_body)
+src/core/belief/changes.ts	subjectsOf	field	STREAM	weekly change diff: reads fence subjects from a page-at-time interval body; a segmented or unavailable interval answers null (before_known false), never a body string; inline bodies only
 src/core/belief/purge.ts	pagePurgeClaims	field	STREAM	segmented version: NULL body parses no fence claims; the live rows' and the lifetimes' event claims still cover it
 src/core/belief/purge.ts	pagePurgeClaims	sql	STREAM	segmented version: NULL body parses no fence claims; the live rows' and the lifetimes' event claims still cover it
 src/core/belief/purge.ts	registerVersionCarriers	field	STREAM	segmented version: NULL body registers no carriers; the backfill skips the same version (segmented_version_body), so nothing it appends can copy one
@@ -395,6 +396,9 @@ src/core/persistence/memory-mutations.ts	planRememberTarget	call:serializePageTo
 src/core/persistence/memory-mutations.ts	planRememberTarget	field	STREAM	
 src/core/persistence/memory-prepare.ts	prepareMemoryMutation	call:serializePageToMarkdown	SEGW	assertInlineBody first
 src/core/persistence/memory-prepare.ts	prepareMemoryMutation	field	SEGW	assertInlineBody before the fence write
+src/core/persistence/overwritten-edits.ts	CONTENT_COLUMNS	sql	STREAM	selects body_storage beside the inline body columns; a segmented version or page has NULL bodies and its overwrite is reported unknown (reason segmented), never compared or restored
+src/core/persistence/overwritten-edits.ts	overwriteContent	field	STREAM	returns null for a segmented row (body_storage segmented or NULL compiled_truth); the scan reports that overwrite unknown (reason segmented)
+src/core/persistence/overwritten-edits.ts	overwriteDigest	field	STREAM	inline content only: called on overwriteContent results, which are null for a segmented row
 src/core/persistence/page-advisories.ts	lineGrammarAdvisory	field	STREAM	
 src/core/persistence/page-advisories.ts	preparePageAdvisories	field	STREAM	
 src/core/persistence/page-edit.ts	pageSegments	call:serializePageToMarkdown	SEGW	
@@ -464,6 +468,10 @@ src/core/repair/fences.ts	fencesRepair	field	STREAM
 src/core/repair/frontmatter.ts	analyzeFile	field	LEAD	
 src/core/repair/frontmatter.ts	pagesByOrigin	sql	LEAD	
 src/core/repair/orphan-children.ts	PROBE_SQL	sql	META	
+src/core/repair/overwritten-edits.ts	previewEdit	call:serializePageToMarkdown	SEGW	only high-confidence edits (live page and version both inline at scan time) are previewed; a page whose revision moved since the scan is skipped before it is serialized
+src/core/repair/overwritten-edits.ts	versionMarkdown	call:serializePageToMarkdown	SEGW	inline versions only: a segmented version has no lost_digest and is never previewed; the restore goes through revert_version, which refuses a segmented page or version
+src/core/repair/overwritten-edits.ts	versionMarkdown	field	SEGW	inline versions only: overwriteContent returns null for a segmented version, which answers version_changed
+src/core/repair/overwritten-edits.ts	versionMarkdown	sql	SEGW	selects body_storage; a segmented version answers version_changed
 src/core/repair/safe-chunks.ts	safeChunksRepair	sql	META	
 src/core/repair/slug-conflicts.ts	pageContent	call:serializePageToMarkdown	SEGW	
 src/core/repair/split-facts.ts	mergeOne	call:serializePageToMarkdown	SEGW	
@@ -559,3 +567,10 @@ src/eval/longmemeval/call-plan.ts	planPages	field	INLINE
 src/core/page-body/segmenter.ts	Segmenter.blocked	field	NONE	not the page body: st.timeline is the segmenter's timeline-run parser state
 src/core/page-body/segmenter.ts	Segmenter.line	field	NONE	not the page body: st.timeline is the segmenter's timeline-run parser state
 src/core/page-body/segmenter.ts	Segmenter.piece	field	NONE	not the page body: st.timeline is the segmenter's timeline-run parser state
+src/core/belief/page-at-time.ts	withBodies	sql	STREAM	known_as_of read: a segmented version or page returns body segmented with body_ref (window read via get_page version_id), never a body string; inline bodies only
+src/core/belief/page-at-time.ts	withBodies	field	STREAM	known_as_of read: a segmented version or page returns body segmented with body_ref (window read via get_page version_id), never a body string; inline bodies only
+src/core/belief/page-at-time.ts	livePage	sql	STREAM	known_as_of read: a segmented version or page returns body segmented with body_ref (window read via get_page version_id), never a body string; inline bodies only
+src/core/belief/page-at-time.ts	livePage	field	STREAM	known_as_of read: a segmented version or page returns body segmented with body_ref (window read via get_page version_id), never a body string; inline bodies only
+src/core/ops/known-as-of.ts	intervalView	field	STREAM	known_as_of read: a segmented version or page returns body segmented with body_ref (window read via get_page version_id), never a body string; inline bodies only
+src/core/ops/known-as-of.ts	getVersionsKnownAsOf	field	STREAM	known_as_of read: a segmented version or page returns body segmented with body_ref (window read via get_page version_id), never a body string; inline bodies only
+src/core/belief/preimages.ts	preimageGaps	sql	META	size only (octet_length) to exempt large pages; segmented pages and versions are excluded by body_storage

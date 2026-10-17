@@ -47,6 +47,7 @@ import { carriesClaimSql, claimNeedles, purgeCompletion, verifyFactPurge, type P
 import { noteBelief, withBeliefBatch } from '../belief/ledger.ts';
 import { markBeliefCommits } from '../belief/append.ts';
 import { appendPurgeCommitted, appendPurgeIntent } from '../belief/purge-mirror.ts';
+import { createPageVersion } from '../page-state/versions.ts';
 import { appendDerivedHidden, bumpPurgeEpoch, derivedBeliefTargets, derivedStreamSlugs, redactCarryingFields, redactPurgedKeys, registerLiveCarriers, registerVersionCarriers, sourceHasBeliefEvents,
   type LedgerPurgeReport } from '../belief/purge.ts';
 
@@ -173,7 +174,10 @@ async function assertNoPendingPublication(tx: BrainEngine, sourceId: string, pag
       why: 'Shows the source\'s pending and recovering writes, read-only.' } });
 }
 
-/** Drop purged rows from each affected page's stored body; returns the slugs rewritten. */
+/**
+ * Drop purged rows from each affected page's stored body; returns the slugs rewritten. Each page is versioned first
+ * (the rewrite advances its revision), and `redactPageVersions` then redacts that version like every other one.
+ */
 export async function rewritePageBodies(tx: BrainEngine, sourceId: string, pages: PurgePlan['pages']): Promise<string[]> {
   if (!pages.length) return [];
   const rows = await tx.executeRaw<Record<string, unknown>>(`SELECT p.*,COALESCE((SELECT jsonb_agg(t.tag ORDER BY t.tag) FROM tags t WHERE t.page_id=p.id),'[]'::jsonb) AS purge_tags
@@ -185,6 +189,8 @@ export async function rewritePageBodies(tx: BrainEngine, sourceId: string, pages
     const compiled = await dropPurgedFenceRows(tx, sourceId, page.compiled_truth, page.slug);
     const timeline = await dropPurgedFenceRows(tx, sourceId, page.timeline ?? '', page.slug);
     if (compiled === page.compiled_truth && timeline === (page.timeline ?? '')) continue;
+    const preimage = await tx.readPageSnapshot(page.slug, { sourceId, includeDeleted: true });
+    if (preimage) await createPageVersion(tx, page.slug, sourceId, preimage);
     const hash = contentHash({ ...page, compiled_truth: compiled, timeline, tags: row.purge_tags as string[] });
     // #5575 ENG-1: dropping a fence row is a gbrain-managed fence edit, not authorship: the page keeps its tier and origin.
     await withPageTierKept(tx, { sourceId, slug: page.slug }, () => tx.executeRaw(`UPDATE pages SET compiled_truth=$3,timeline=$4,content_hash=$5,updated_at=now(),text_projection_revision=NULL,embedding_signature=NULL

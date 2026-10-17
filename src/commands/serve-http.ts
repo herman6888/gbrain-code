@@ -913,7 +913,11 @@ ${bootstrapFromEnv
   // #6317 (B4): one notice when a managed source's sync data stops moving (reader in persistence/sync-movement.ts).
   const { startMovementWatch } = await import('../core/persistence/sync-movement.ts');
   const movementWatch = startMovementWatch(engine, { log: (line) => console.error(line) });
+  // #6858 ask 6: on-commit sync of this host's managed checkouts while `sync.on_commit` is on (serve-head-watcher.ts).
+  const { startServeHeadWatcher } = await import('../core/serve-head-watcher.ts');
+  const headWatcher = startServeHeadWatcher(engine, { log: (line) => console.error(line) });
   const deregisterEngineCleanup = registerCleanup('pglite-engine-disconnect', async () => {
+    await headWatcher.stop();
     movementWatch.stop();
     await factsDrain.stop();
     await engine.disconnect();
@@ -921,6 +925,7 @@ ${bootstrapFromEnv
   try {
     await waitForHttpServerLifecycle(httpServer);
   } finally {
+    await headWatcher.stop();
     movementWatch.stop();
     await factsDrain.stop();
     // Close the IPC listener + reap the socket file on orderly shutdown

@@ -195,7 +195,8 @@ test('the checkpoint waits on every receipt the cursor did not settle, a legacy 
   } finally { await clearConfig(); }
 }), 120_000);
 
-for (const retryFailed of [false, true]) test(`#6712: a checkpoint a legacy knock-on still blocks ${retryFailed ? 'is rediscovered by the --retry-failed repro command and finishes' : 'stays blocked under the plain sync, naming the knock-on'}`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+// #6712 PR 3 (L7): --retry-failed is a deprecated alias of the plain sync, so both rediscover the run and finish.
+for (const retryFailed of [false, true]) test(`#6712: a checkpoint a legacy knock-on still blocks is rediscovered by the next ${retryFailed ? '--retry-failed (plain sync alias)' : 'plain'} sync and finishes`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
   try {
     const f = await stoppedRun();
     // The pre-#6643 shape: the cursor passed the stopped page (no settled ranges recorded) and froze its checkpoint.
@@ -210,11 +211,6 @@ for (const retryFailed of [false, true]) test(`#6712: a checkpoint a legacy knoc
     await asKnockOn(f.stopped, WINDOW_CANCEL_MESSAGE, null);
     expect((await readSyncStatus(engine, f.id)).checkpoint_blockers).toEqual([expect.objectContaining({ request_id: f.stopped, slug: 'b', knock_on: true })]);
     const resumed = await performManagedSync(engine, { ...f.opts, retryFailed });
-    if (!retryFailed) {
-      expect(resumed.status).toBe('blocked_by_failures');
-      expect((await readSyncStatus(engine, f.id)).cursor?.done).not.toBe(true);
-      return;
-    }
     expect(resumed.status).not.toBe('blocked_by_failures');
     expect((await readSyncStatus(engine, f.id)).cursor).toMatchObject({ done: true });
     const [source] = await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]);

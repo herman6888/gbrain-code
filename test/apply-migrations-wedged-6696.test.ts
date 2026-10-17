@@ -11,7 +11,7 @@
  * subprocess; process.env is never mutated).
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -32,7 +32,7 @@ async function cli(args: string[]): Promise<{ exitCode: number; stdout: string; 
 }
 
 beforeAll(async () => {
-  home = mkdtempSync(join(tmpdir(), 'gbrain-wedged-6696-'));
+  home = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-wedged-6696-')));
   expect((await cli(['init', '--pglite', '--no-embedding', '--json'])).exitCode).toBe(0);
   expect((await cli(['apply-migrations', '--yes', '--no-autopilot-install'])).exitCode).toBe(0);
   base = readFileSync(ledgerPath(), 'utf8').split('\n').filter(line => line.trim());
@@ -58,7 +58,30 @@ describe('apply-migrations with a wedged migration (#6696 C5)', () => {
     expect(envelope.message).toContain(`v${WEDGED}`);
     expect(envelope.fix).toMatchObject({ next: 'ask_user', argv: ['gbrain', 'apply-migrations', '--force-retry', WEDGED],
       verify: { argv: ['gbrain', 'apply-migrations', '--list', '--json'] } });
+    // #6755: the advice names the ledger that records the failing phases, not upgrade-errors.jsonl.
+    for (const text of [envelope.suggestion, envelope.fix.user_message, run.stderr]) {
+      expect(text).toContain(ledgerPath());
+      expect(text).toContain('phases[].detail, if present');
+      expect(text).not.toContain('upgrade-errors.jsonl');
+    }
   }, 120_000);
+
+  test('upgrade names the completion ledger for a wedged migration (#6755)', async () => {
+    wedge(WEDGED);
+    const proc = Bun.spawn([process.execPath, '-e', `
+      import { describeMigrationFailure } from './src/commands/upgrade.ts';
+      import { CODES } from './src/core/error-registry.ts';
+      console.log(await describeMigrationFailure({}, '${WEDGED}'));
+      console.log(CODES.migrations_pending.suggestion);
+    `], { cwd: REPO, env: { ...process.env, HOME: home, GBRAIN_HOME: home }, stdout: 'pipe', stderr: 'pipe' });
+    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect(code, stderr).toBe(0);
+    expect(stdout).toContain(ledgerPath());
+    expect(stdout).toContain('phases[].detail, if present');
+    expect(stdout).toContain(`gbrain apply-migrations --force-retry ${WEDGED}`);
+    expect(stdout).toContain('migrations/completed.jsonl (phases[].detail, if present');
+    expect(stdout).not.toContain('upgrade-errors.jsonl');
+  }, 30_000);
 
   test('--list --json lists the wedged migration with its fix; the human --list does not say up to date', async () => {
     wedge(WEDGED);
@@ -71,6 +94,8 @@ describe('apply-migrations with a wedged migration (#6696 C5)', () => {
     const human = await cli(['apply-migrations', '--list']);
     expect(human.stdout).not.toContain('All migrations up to date');
     expect(human.stdout).toContain(`gbrain apply-migrations --force-retry ${WEDGED}`);
+    expect(human.stdout).toContain(ledgerPath());
+    expect(human.stdout).not.toContain('upgrade-errors.jsonl');
   }, 120_000);
 
   test('a wedge a newer migration ran past is history: the run succeeds and --list --json names no wedged fix', async () => {

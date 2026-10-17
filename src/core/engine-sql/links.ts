@@ -94,6 +94,63 @@ export async function addLink(
   }
 
 
+/** One code path a markdown page cites (`src/core/sync.ts:42`), with the slug of its code page. */
+export interface CodeReference { codeSlug: string; path: string; line?: number }
+
+/**
+ * The doc↔impl edges for every code path one markdown page cites, in one
+ * statement (#6712 L6; the import paths wrote two savepointed addLink calls per
+ * reference). Each reference writes what the addLink pair wrote: page→code
+ * `documents` (context `cited at <path>:<line>`, or the path) and code→page
+ * `documented_by` (context the path), both `markdown` edges whose origin is the
+ * page, field `compiled_truth`. Endpoints resolve source-qualified in the
+ * page's source under FOR KEY SHARE in the same statement snapshot; an edge
+ * whose endpoint is missing is skipped alone (a code page not imported yet);
+ * an existing edge takes the new context and origin_field; a repeated edge
+ * keeps its last occurrence, as sequential upserts would. Returns the edges
+ * written (inserted or updated).
+ */
+export async function addCodeReferenceLinks(exec: Pick<SqlExecutor, 'executeRaw'>, slug: string, sourceId: string, refs: CodeReference[]): Promise<number> {
+  const edges = new Map<string, { from_slug: string; to_slug: string; link_type: string; context: string }>();
+  for (const ref of refs) {
+    for (const [from, to, linkType, context] of [
+      [slug, ref.codeSlug, 'documents', ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path],
+      [ref.codeSlug, slug, 'documented_by', ref.path],
+    ] as const) {
+      const key = JSON.stringify([from, to, linkType]);
+      edges.delete(key);
+      edges.set(key, { from_slug: from, to_slug: to, link_type: linkType, context: sanitizeForJsonb(context) });
+    }
+  }
+  if (!edges.size) return 0;
+  const rows = [...edges.values()].map((edge, ord) => ({ ...edge, ord }));
+  const written = await executeRawJsonb<RelationshipKey>(exec,
+    `WITH v AS (
+       SELECT * FROM jsonb_to_recordset(($3::jsonb)->'rows') AS v(ord int, from_slug text, to_slug text, link_type text, context text)
+     ), endpoints AS (
+       SELECT p.id, p.slug FROM pages p
+       WHERE p.source_id = $1 AND p.slug IN (SELECT from_slug FROM v UNION SELECT to_slug FROM v)
+       ORDER BY p.id
+       FOR KEY SHARE
+     )
+     INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+     SELECT f.id, t.id, v.link_type, v.context, 'markdown', o.id, 'compiled_truth'
+     FROM v
+     JOIN endpoints f ON f.slug = v.from_slug
+     JOIN endpoints t ON t.slug = v.to_slug
+     LEFT JOIN endpoints o ON o.slug = $2::text
+     ORDER BY v.ord
+     ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
+       context = EXCLUDED.context,
+       origin_field = EXCLUDED.origin_field
+     RETURNING from_page_id, to_page_id, link_type`,
+    [sourceId, slug],
+    [{ rows }],
+  );
+  await refreshRelationships(exec, written);
+  return written.length;
+}
+
 export async function addLinksBatch(exec: SqlExecutor, links: LinkBatchInput[]): Promise<number> {
     // #1861: pass the batch as one JSONB document via jsonb_to_recordset instead
     // of N parallel unnest(${arr}::text[]). The old text[] array-literal path

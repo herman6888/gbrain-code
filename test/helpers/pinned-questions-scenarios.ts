@@ -262,7 +262,7 @@ export function registerPinnedQuestionSuite(label: string, getEngine: () => Brai
         expect(notices).toMatchObject([{ code: 'pinned_answer_stale', kind: 'degraded' }]);
         expect(sentence(after, c.needle)).toMatchObject({ stale: true, reasons: [c.reason] });
         expect(after.fix?.mcp?.tool).toBe('questions_refresh');
-        const pack = await (await import('../../src/core/questions/service.ts')).pinnedAnswersForPack(localCtx(engine, s.sourceId), [ENTITY]);
+        const pack = await (await import('../../src/core/questions/service.ts')).pinnedAnswersForPack(localCtx(engine, s.sourceId), [{ source_id: s.sourceId, slug: ENTITY }]);
         expect(pack?.withheld?.stale_sentences).toBe(after.sentences.stale);
         expect(JSON.stringify(pack?.pinned_questions ?? [])).not.toContain(before!.text);
       }, 30_000);

@@ -46,6 +46,28 @@ describe('persistence counter drift and compaction health', () => {
     expect(drift.message).toContain('(+5000)');
   }), 60_000);
 
+  test('#6759: a positive delta is a bounded overcharge with a per-scope receipt breakdown; a negative one under-counts', run(async engine => {
+    const requests = await requestFixture(engine);
+    await requests.admit('one'); await requests.admit('two');
+    await engine.transaction(async tx => {
+      await declarePersistenceProtocol(tx);
+      await tx.executeRaw("UPDATE persistence_counters SET terminal_bytes=terminal_bytes+983040 WHERE key='brain'");
+      await tx.executeRaw("UPDATE persistence_counters SET terminal_bytes=terminal_bytes-100 WHERE key LIKE 'principal:%'");
+    });
+    const drift = await checkPersistenceCounterDrift(engine);
+    expect(drift.status).toBe('warn');
+    const details = drift.details as { drift: Array<Record<string, unknown>>; incident: unknown };
+    expect(details.incident).toEqual({ scope: 'current', since: null });
+    const brain = details.drift.find(d => d.scope === 'brain')!;
+    const principal = details.drift.find(d => String(d.scope).startsWith('principal:'))!;
+    expect(brain).toMatchObject({ direction: 'overcharge', receipts_by_kind: { requests: { rows: 2 }, topology_changes: { rows: 0, bytes: 0 } } });
+    expect((brain.receipts_by_kind as { requests: { bytes: number } }).requests.bytes).toBe(brain.receipts as number);
+    expect(principal).toMatchObject({ direction: 'undercount', delta: -100, receipts_by_kind: { requests: { rows: 2 } } });
+    expect(drift.message).toContain('bounded overcharge of 983040 bytes');
+    expect(drift.message).toContain('no data is lost');
+    expect(drift.message).toContain('under-counts by 100 bytes');
+  }), 60_000);
+
   test('a consumer up past the window with no pass warns; a pass records what it freed and clears it; a stale record warns again', run(async engine => {
     const requests = await requestFixture(engine);
     const old = await requests.admit('old');

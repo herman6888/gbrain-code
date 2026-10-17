@@ -179,6 +179,19 @@ for (const backend of testBackends()) {
     }, { databaseUrl });
   }, 120_000);
 
+  test(`${backend}: a completed managed extraction remembers the paid attempt for the page's current content (#6764)`, async () => {
+    await managedBrain(async brain => {
+      const { engine } = brain;
+      await putPage(brain, transcript());
+      expect(await extract(engine, { n: 0 })).toMatchObject({ pages_processed: 1, pages_failed: 0 });
+      const [outcome] = (await extractorRows(engine)).filter(r => r.fact === 'EXTRACTION_COMPLETE');
+      const memos = await engine.executeRaw<{ fact_id: number | string; tier: string; target_slug: string; current: boolean }>(
+        `SELECT a.fact_id, a.tier, a.target_slug, a.reason = p.content_hash AS current FROM fact_relink_attempts a
+           JOIN pages p ON p.source_id = a.source_id AND p.slug = a.target_slug WHERE a.source_id = 'default'`);
+      expect(memos.map(m => ({ ...m, fact_id: Number(m.fact_id) }))).toEqual([{ fact_id: Number(outcome!.id), tier: 'paid_reextract', target_slug: SLUG, current: true }]);
+    }, { databaseUrl });
+  }, 120_000);
+
   test(`${backend}: a crash after admission replays the stored batch with zero model calls`, async () => {
     await managedBrain(async brain => {
       const { engine } = brain;

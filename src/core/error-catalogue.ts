@@ -32,6 +32,11 @@ export interface CatalogueEntry {
 }
 
 export const ERROR_CATALOGUE = {
+  // W2 page-at-time: recorded-time reads (`known_as_of`).
+  coverage_from: { code: 'coverage_from', docs: 'docs/guides/repair.md#coverage-from' },
+  coverage_gap: { code: 'coverage_gap', docs: 'docs/guides/repair.md#coverage-gap' },
+  clock_mismatch: { code: 'clock_mismatch', docs: 'docs/guides/repair.md#clock-mismatch' },
+  known_as_of_unproven: { code: 'known_as_of_unproven', docs: 'docs/guides/repair.md#known-as-of-unproven' },
   legacy_jobs_active: { code: 'legacy_jobs_active', docs: 'docs/guides/repair.md#legacy-jobs-active' },
   // D4 / D2 notice codes (agent-output Notice through the notice ledger).
   grant_blocked_operations: { code: 'grant_blocked_operations', docs: 'docs/guides/repair.md#grant-blocked-operations' },

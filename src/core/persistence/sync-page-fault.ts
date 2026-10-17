@@ -38,6 +38,7 @@ import type { SyncIntent } from './sync-prepare.ts';
 import type { HeldEntry } from './sync-screen.ts';
 import type { GitHoldMeta, GitHoldRecord } from './sync-holds.ts';
 import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
+import { KEEP_DISK_ABANDONED_PREFIX } from './verb-errors.ts';
 
 export { HOLD_ATTEMPTS_NEEDS_HUMAN } from './sync-fault-class.ts';
 
@@ -210,10 +211,14 @@ export function pinnedWorktreeConflict(done: Pick<WriteRequest, 'state' | 'error
     && ['Newer working-tree bytes and the current page disagree with this pinned Git import.', 'Newer code file bytes disagree with the pinned import.', CANONICAL_WRITEBACK_CONFLICT].includes(done.error_message ?? '');
 }
 
-/** The receipt of an import whose file bytes changed between admission and publication (`raw_file_changed` in verb-errors.ts). */
+/**
+ * The receipt of an import whose file bytes changed between admission and publication (`raw_file_changed` in verb-errors.ts),
+ * or (#6858) whose stuck publication `gbrain repair stuck-recovery --keep disk` abandoned, keeping the file as edited on disk.
+ */
 export function fileChangedAfterAdmission(done: Pick<WriteRequest, 'state' | 'error_code' | 'error_message'>): boolean {
   return done.state !== 'committed' && done.error_code === 'source_changed'
-    && ['The imported file changed after sync admission.', 'The canonical file changed after preparation.', 'The canonical file changed during preparation.'].includes(done.error_message ?? '');
+    && (['The imported file changed after sync admission.', 'The canonical file changed after preparation.', 'The canonical file changed during preparation.'].includes(done.error_message ?? '')
+      || (done.error_message ?? '').startsWith(KEEP_DISK_ABANDONED_PREFIX));
 }
 
 /** A `revision_conflict` receipt whose page really moved (its live revision differs from the frozen one); run-level conflicts stay blocking. */

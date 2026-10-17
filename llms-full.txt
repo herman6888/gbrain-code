@@ -1947,12 +1947,14 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   other agents commit while `gbrain sync` drains thousands of pages): a page
   that moves under the run is held (`concurrent_write`, `worktree_dirty`), a
   dropped connection is retried, and a relaunch resumes the frozen manifest.
-  The operator loop is `gbrain sync status --source <id> --json` (cursor,
-  `committed_last_10m`, each hold and the last error with `class` /
-  `safe_actions` / `needs_human`), then, when nothing moved and
+  The operator loop is `gbrain sync status --source <id> --json` (`state`
+  and `reason`, cursor, `committed_last_10m`, each hold and the last error
+  with `class` / `safe_actions` / `needs_human`), then, when nothing moved and
   `needs_human` is false, `gbrain sync unblock --source <id> --apply` and
   the sync it prints; when `needs_human` is true, relay `next.user_message`
-  with the slug. Decision table:
+  with the slug. A plain status skips its heavy reads: a `*_read` field with
+  `status: not_read` means that field was not read (never "none"); run its
+  `fix` (`--detail`) when you need it. Decision table:
   [`docs/guides/sync-unblock-runbook.md`](./docs/guides/sync-unblock-runbook.md).
 - **Writes that ended without committing** (doctor
   `persistence_terminal_failures`, `terminal write failures` in
@@ -3995,7 +3997,8 @@ interface RenderedAction {
 `verify.argv`, `then`) names the brain and source the failing call acted on:
 `--brain <id>` for commands that open a brain, `--source <id>` for commands that
 resolve their source through the ambient chain (shared ops, and CLI commands the
-command table marks `routes_source`). gbrain appends them when it renders the
+command table marks `routes_source`; `gbrain extract`, whose `--source` is the
+fs|db mode, gets `--source-id <id>`). gbrain appends them when it renders the
 fix, before any bare `--`, and keeps flags the fix already carries. So you can
 run the fix later from another directory, or under a different `GBRAIN_BRAIN_ID`,
 `GBRAIN_SOURCE`, `.gbrain-mount` or `.gbrain-source`, and it still acts on the
@@ -4030,6 +4033,8 @@ per-token price), obtain each value as `how` describes and substitute it for
 | `user` | the user, in their own terminal or app (for example a credential prompt, or a CLI-only fix while you are on stdio MCP) |
 | `host_admin` | the operator of the brain host (a remote brain over HTTP, scope grants, server restarts). Never authorizable from MCP |
 | `provider` | an outside service you wait on (rate limits, outages) |
+
+A fix expected to run past 120 s (`AGENT_TOOL_LIMIT_MS`) is never `agent`; it renders `tell_user_to_run`.
 
 ### The `next` decision table
 
@@ -4365,6 +4370,7 @@ that work in this conversation.
 | 10 | write accepted, still pending | poll the receipt (`gbrain write-request -- <id>`) |
 | 11 | partial, resumable budget stop | run `resume_command` |
 | 13 | `pending_verify`: a harness wired, verification waits for the serve | start the serve, then run `fix.command` |
+| 14 | `bootstrap_cleanup_pending`: a harness is wired; old shared-skills enrollments or token ids still await cleanup | follow `fix.next` (re-run, or relay the owner's revoke step), then re-run |
 | 75 | another runner holds the migration lock | wait, then retry |
 | 124 | the command's deadline elapsed | inspect what is still running |
 | 130 | interrupted | ask the user whether to re-run |
@@ -5639,6 +5645,8 @@ The legacy copier handles every other direction: `gbrain migrate --to pglite`, P
 | A Postgres brain moving to PGLite | `report` | The brain stays on Postgres; moving down would drop its history. |
 | A target that already holds persistence history | `tell_user_to_run` | Rerun with an empty database the user provides (`--path` for a PGLite target). |
 
+A brain with page versions but no write history gets the same refusal with `reason: page_history` and the number of versions in the message: the legacy copier re-creates pages without their versions, so the copy would discard them. Graduation (PGLite to Postgres) carries them.
+
 On Windows, a PGLite brain with history gets `graduation_unsupported_platform` instead: it stays on PGLite and is shared with `gbrain mcp expose`.
 
 <a id="graduation-writer-held"></a>**Graduation refused: the brain is held (`graduation_source_writer_held`).** Graduation needs the PGLite kernel lock. A live stdio `gbrain serve` hands the brain over through the intent marker `<path>.gbrain-graduation.json` and exits; autopilot pauses. When another holder (an HTTP serve, a daemon, another command) does not release the brain within 30 seconds, the run refuses and names it with its pid and transport (`fix.next: tell_user_to_run`). The user stops that process, then the agent reruns the same `gbrain migrate` command. Verify with the read-only `gbrain migrate --status --json`. Nothing has changed in either datastore.
@@ -6657,7 +6665,7 @@ and failure report; if one page fails, the pages before it commit, that page is
 reported, and the pages after it are cancelled and re-frozen once it is fixed.
 The first group is one or two pages; later groups hold about 5 s of measured
 apply time with lanes (2 s while foreground writes are recent), else
-`sync.bulk_max_txn_ms` (default 15 s).
+`GBRAIN_SYNC_BULK_MAX_TXN_MS` (default 15 s).
 
 Up to 16 groups publish at once in **lanes**, each on its own connection
 (`--lanes N`, `--no-lanes`, `sync.lanes` or `GBRAIN_SYNC_LANES`), capped by the
@@ -6665,13 +6673,13 @@ pool: the default pool of 10 runs 6, `GBRAIN_POOL_SIZE=20` runs 16. Lanes apply 
 sees a later page without the earlier ones. While lanes publish, the drain keeps
 freezing and admitting the next groups. A page write goes ahead of
 queued groups that do not name its page (lanes finish their groups, then one
-group runs between writes); `sync.foreground_priority false` restores FIFO. Groups after a failed page are cancelled ("An earlier
+group runs between writes); the rollback key `sync.foreground_priority false` restores FIFO (see [config keys](#sync-config-keys)). Groups after a failed page are cancelled ("An earlier
 page of the same sync did not commit") and re-frozen once it is fixed. A lock or statement timeout in a lane costs one lane for
 the rest of the run.
 
 A lane drain ends with a `[sync] lanes:` line naming what limited it and what
 setting, if any, raises it. Turn bulk off with
-`--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
+`--no-bulk` or `GBRAIN_SYNC_BULK=0` (the rollback key `sync.bulk false` still works; see [config keys](#sync-config-keys)). The
 final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
 `largest_group`, `admitted_ahead`, and `lanes`: `maximum`, `configured`,
 `effective`, `reason` when fewer, `step_down`, `overlapped_groups`,
@@ -6717,8 +6725,35 @@ Timing knobs the drain uses:
 | `preparation_deadlines` write switch (`persistence.preparation_deadlines`, `GBRAIN_PREPARATION_DEADLINES`) | Kill switch for the four keys above and the attempt counter. `remember`, `put_page` and `edit_page` keep their own 30 s budget either way. | on | `gbrain config set persistence.preparation_deadlines false` (or `GBRAIN_PREPARATION_DEADLINES=0`) restores the previous behaviour exactly: no deadline on sync or maintenance writes, no counter, no `preparation_stalled` holds. A running `serve` picks the change up within 5 seconds. |
 | Page write wait | One page's (or group's) publication before the drain re-checks. | 30 s inside a drain (5 s, checkpoint 8 s, for a single pass) | The drain re-enters; this is not a stop. |
 | `sync` job deadline | A managed `sync` Minions job's drain: its `timeout_ms` (autopilot stamps `max(2 × --interval, 300 s)`), or the queue's wall-clock limit for a job without one, capped at an hour, less a 60 s reserve. `sync.job_drain=false` (or job data `drain: false`) keeps the single pass. | per job | Stops as `resumable` / `deadline`; on a worker-backed brain a stop that is safe to repeat queues one follow-up job (`continuation_job_id`). |
-| `sync.bulk_max_txn_ms` / `GBRAIN_SYNC_BULK_MAX_TXN_MS` | Target time per bulk group; sizes the next group from the last one's time per page. | 15000 | A smaller next group. |
+| `GBRAIN_SYNC_BULK_MAX_TXN_MS` (was `sync.bulk_max_txn_ms`, retired in 0.60.266.0) | Target time per bulk group; sizes the next group from the last one's time per page. | 15000 | A smaller next group. |
 | `sync.bulk_size` / `GBRAIN_SYNC_BULK_SIZE` | Largest bulk group. | 16 | — |
+
+### Sync config keys
+
+`gbrain config` keeps three kinds of `sync.*` keys (`src/core/sync-config-keys.ts`):
+
+- **Tunables** you set and keep: `sync.bulk_size`, `sync.lanes`, `sync.exclude`, `sync.include_hidden`,
+  `sync.include_working_tree`, `sync.holds`, `sync.write_through`, `sync.cost_gate_min_usd`, `sync.on_commit`,
+  `sync.freshness_target_seconds` ([on-commit sync](on-commit-sync.md)).
+- **Rollback keys**, the way back a notice or migration promised: `sync.job_drain`, `sync.foreground_priority`,
+  `sync.federated_v2`, `sync.waive_batch`, `sync.bulk`. Each one set to `false` restores the earlier behavior, and
+  stays honored until at least 2027-01-14 (`CONFIG_ROLLBACK_WINDOWS` in `src/core/wire-skew.ts`). They are not
+  tunables: `config set` says so, and no help text or printed fix recommends them.
+- **Retired keys**, no longer read since 0.60.266.0, each with an environment variable for the process that syncs
+  (the serve when it runs the catch-up, the cron line or the shell):
+
+| Retired key | Replacement | Default |
+|---|---|---|
+| `sync.bulk_max_txn_ms` | `GBRAIN_SYNC_BULK_MAX_TXN_MS` | 15000 |
+| `sync.hold_cap` | `GBRAIN_SYNC_HOLD_CAP` | 500 |
+| `sync.hold_escalate_count` | `GBRAIN_SYNC_HOLD_ESCALATE_COUNT` | 50 |
+| `sync.hold_escalate_pct` | `GBRAIN_SYNC_HOLD_ESCALATE_PCT` | 5 |
+| `sync.parser_regression` | `GBRAIN_SYNC_PARSER_REGRESSION` | stop |
+| `sync.knock_on_refreeze_limit`, `sync.knock_on_run_limit` | none (removed with the knock-on re-freeze in 0.60.255.0) | — |
+
+`gbrain config set` of a retired key warns, names the variable and writes nothing. `gbrain config get <key>` prints
+the value a sync runs with for a retired or rollback key and, on stderr, where it comes from. `gbrain doctor`
+(`sync_config_keys`) reports a retired key still stored on the brain as unapplied.
 
 ### One consumer per host
 
@@ -6915,6 +6950,57 @@ and refuses `revision_conflict` if that page changed after the sync admitted
 it; the Git projection is the sync's own commit. Keep `frontmatter.id` as it
 is; a changed id is a different page.
 
+Git reports a move that also changed the file as a similarity guess (`R087`),
+and two template-shaped files moved in one commit can be paired the wrong way
+round (#6729). So sync keeps the page identity across an inexact rename only
+when the files confirm it: both carry the same `frontmatter.id` and no other
+file or page shares it, or neither carries an id and they share a `slug:` line
+or title that no other file in the source uses. The title is the one the page
+row gets: the frontmatter `title:`, else the body's first `# Heading` (never
+the filename), and the old side counts as the title the brain stores for that
+page now. An exact move (`R100`) needs no signal. Any other pair is imported as a delete plus an add: the new file
+starts a fresh page, and the old page keeps its facts, links and aliases on
+its soft-deleted slug. The sync report prints each such pair, `gbrain sync
+status --source <id> --json` lists it under `identity_downgrades`, doctor
+`rename_identity_downgrades` names it, and the purge leaves the old page alone
+until the pair gets a disposition; there is no time limit, so a pair can still
+be repaired later. Each pair names its remedy, `gbrain repair rename-identity
+--source <id> --slug <new-slug>`: preview it, and after the user agrees apply it
+to carry the old page's identity (history, links, facts) onto the new page, or
+add `--close` to release the hold without carrying it. On a managed source only
+`--close` is available (`managed_remedy_unavailable`). See
+[rename identity](repair.md#rename-identity). Restoring the old page also
+settles the pair: run
+`gbrain restore <old-slug> --source-id <id> --force` (it then lives beside the
+new page; where the old file cannot be re-created the restore names
+`--detach`). An unbound classic source on Postgres refuses page writes outside
+its checkout, so the report and doctor do not offer the restore there. To move and rewrite a page so it keeps its identity, give it a
+stable id or move, commit and sync first, then edit:
+
+```yaml
+---
+id: roadmap-2026
+title: Roadmap
+---
+```
+
+Two rules decide by `frontmatter.id`. A pair Git reports as a rename (`R<n>`)
+whose two files carry the same id, held by no other file in the range and no
+other live page, is a rename. A new file and a deleted file that Git did not
+pair are a rename only when they share such an id and also show continuity:
+the same file name, the same title, or the same bytes. So a note moved to
+another folder and rewritten keeps its page, while a new note that reuses a
+deleted note's template id starts a fresh page, even when no live page holds
+that id.
+
+With `--working-tree`, the decision reads the files on disk and holds only for
+the bytes it read. A renamed file edited before its page moves keeps nothing:
+classic sync fails that file and the next sync decides again, and a managed
+sync refuses `source_changed` and names
+`gbrain sync --no-pull --working-tree --source <id>`. A managed sync refuses `page_identity_changed`
+(`rename_identity_conflict`) when a file would take over a page whose
+`frontmatter.id` differs from the file's own.
+
 `put_page` at a new slug is not a rename. A content-only write cannot prove the
 old file is gone, so a create-only `put_page` whose `frontmatter.id` and
 content match an existing page resolves to that page (`duplicate`: the receipt
@@ -7027,14 +7113,17 @@ vars — incident-time escape hatches, not everyday knobs.
    sync only, `gbrain sync --skip-failed` acknowledges a known-bad set.
    **Managed sync never acknowledges or auto-skips failed cursors.** Its
    durable failed receipt remains immutable on ordinary replay. Correct the
-   cause, inspect local `gbrain doctor`, then explicitly retry an idle
-   ordinary-source cursor with the same full/working-tree/filter options:
+   cause, inspect local `gbrain doctor`, then rerun the plain
+   sync for that source with the same full/working-tree/filter options; it
+   retries what the previous invocation recorded:
 
    ```bash
-   gbrain sync --source <source-id> --no-pull --retry-failed
+   gbrain sync --source <source-id> --no-pull
    ```
 
-   This retries with fresh admission; do not add `--skip-failed`. A successful
+   This retries with fresh admission; do not add `--skip-failed`
+   (`--retry-failed` is a deprecated alias of the plain sync on a managed
+   brain). A successful
    full run does not clear a separate failed incremental cursor. Doctor reports
    the remaining run; CLI blocked results exit nonzero and local diagnostics
    include source/path/code/request/run/target. Counts are cumulative for the
@@ -7241,10 +7330,19 @@ moving again; ask me only about the ones gbrain will not decide by itself."*
    host runs an older gbrain build than this checkout; restart them with the
    command it prints before anything else, and stop until it reads ok
    ([serve build drift](troubleshooting.md#serve-build-drift)).
-1. Read `status`. `cursor` is where the run stands (`index/total`, the
-   `pinned_target` commit, `last_advance_at`); `committed_last_10m` is the
-   signal that data is moving (a live process with a flat cursor is not
-   progress). `holds` and `last_error` each carry the triple below.
+1. Read `status`. `state` (`synced` | `resumable` | `blocked`) and `reason`
+   say where the source stands; `cursor` is where the run stands
+   (`index/total`, the `pinned_target` commit, `last_advance_at`);
+   `committed_last_10m` is the signal that data is moving (a live process with
+   a flat cursor is not progress). `holds` and `last_error` each carry the
+   triple below, plus `category` and `public_category`. `oldest_blocker` and
+   `recovery` are bounded live probes that need no cursor; when one times out
+   the state is `resumable` / `status_unknown`, never `synced`. A plain status
+   skips the heavy reads (the terminal-failure summary, the checkpoint blocker
+   list, the live cursor list): their fields keep their types, and
+   `terminal_failures_read`, `checkpoint_blockers_read` and `cursors_read` say
+   `not_read` with the `--detail` command as `fix`. Never read a `not_read`
+   field as "none"; run the fix when the step needs it.
 2. If `needs_human` is false and nothing committed in the last ten minutes,
    run `unblock --apply`: it performs the safe action for every hold that has
    one, refuses the rest by name, and prints the sync to run. For a content
@@ -7259,7 +7357,7 @@ moving again; ask me only about the ones gbrain will not decide by itself."*
    refuses every repair-class hold instead, as releases before #6377 did.
 3. Run that sync. It re-screens the scheduled files, imports each one that now
    passes and holds again what still fails; the rest of the source is never
-   blocked. With `--retry-failed` a cursor an older release left blocked on a
+   blocked. A cursor an older release left blocked on a
    page fault converts in place (same run, no rediscovery).
 4. If `needs_human` is true, stop looping and page a person with the slug and
    `human_reason` from `status` (`next.user_message` is written for relay).
@@ -7287,9 +7385,18 @@ Every hold and error has three fields, from one table
   `reconcile` previews two diverged versions; `upgrade` installs a newer gbrain;
   `none` waits for a person.
 - `needs_human`: a person has to choose or act before it clears;
-  `human_reason` says what. A page held three times with the same code
-  (`attempts`) is `needs_human` whatever its code says: it keeps moving under
-  the sync. A repair-class hold is `needs_human` when its stored repair state
+  `human_reason` says what. A page whose safe action failed three times with
+  the same code (`attempts`: a re-hold, or a failed `unblock --apply` or
+  repair) over at least 24 hours since it was first held is `needs_human`
+  whatever its code says, and `human_reason` ends with both numbers. Two holds
+  never escalate this way: a `worktree_dirty` file whose uncommitted bytes
+  changed in the last 24 hours (someone is still editing it) and a
+  `managed_image_sync_unsupported` image (held by design until multimodal
+  embedding is on or the image is excluded). Status and unblock re-read a
+  `worktree_dirty` file before calling its edit abandoned, so new bytes hand
+  it back to the agent. An abandoned edit's fix is `sync unblock --apply`
+  behind `next: ask_user`: the person commits or restores the file, then
+  unblock finds it clean and schedules it. A repair-class hold is `needs_human` when its stored repair state
   says so: a fence hold the lane marked `manual` (a manual-only reason, a gate
   rejection, a model answer the run does not retry) or `paid` (spend only the
   user raises), and a slug-conflict hold the lane decided a person must settle
@@ -7301,22 +7408,31 @@ Every hold and error has three fields, from one table
 <!-- sync-fault-table:begin (pinned by test/sync-runbook-table.test.ts) -->
 | Code | Class | Safe actions | Needs human | Escalate when |
 |---|---|---|---|---|
-| `worktree_dirty` | page | retry_when_clean | no | held 3 times: the file keeps changing without being committed |
+| `worktree_dirty` | page | retry_when_clean | no | 3 failed attempts over 24 h with no edit in the last 24 h: the uncommitted edit is abandoned |
 | `concurrent_write` | page | reconcile | yes | always: the file and the database page diverge |
 | `file_drift` | page | reconcile | yes | always: the page changed in the database since its file was last imported |
-| `preparation_stalled` | page | retry, upgrade | no | held 3 times, or writer status names a step that never finishes |
+| `preparation_stalled` | page | retry, upgrade | no | 3 failed attempts over 24 h, or writer status names a step that never finishes |
 | `invalid_fence` | page | repair | no | the fence repair preview offers no plan (a manual reason) |
 | `invalid_frontmatter` | page | repair | no | the repair preview needs an interpretation (--include-ambiguous) |
-| `frontmatter_slug_conflict` | page | repair | no | the repair preview needs an interpretation |
+| `frontmatter_slug_conflict` | page | repair | no | the lane recorded why it could not decide |
 | `rename_held` | page | repair | no | the repair preview needs an interpretation |
 | `file_too_large` | page | none | yes | always |
 | `content_rejected` | page | none | yes | always |
 | `parser_regression` | page | upgrade | yes | always: a gbrain bug |
 | `managed_image_sync_unsupported` | page | none | no | never: images stay held while multimodal embedding is off |
+| `purged_content` | page | none | yes | always: only the owner clears a purge tombstone |
+| `write_gate_rejected` | page | none | yes | always: write_gate.external_mode=reject is the user's setting |
+| `legacy_slug_conflict` | page | none | yes | always: only a person decides which legacy page the file takes over |
 | `revision_conflict` | page | retry | no | the same path fails again after a rerun |
 | `page_identity_changed` | page | retry | no | the same path fails again after a rerun |
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
 | `source_changed` | page | retry | no | the same path fails again after a rerun |
+| `pending_import` | page | retry | no | the same path refuses again after a sync imported its file |
+| `raw_file_changed` | page | retry | no | the same path fails again after a rerun re-freezes it |
+| `file_database_drift` | page | reconcile | yes | always: the file and the database page diverge |
+| `canonical_file_missing` | page | repair | yes | always: no sync can import a file that is not there |
+| `source_binding_changed` | systemic | none | yes | always: the source or its checkout binding moved |
+| `unsafe_file_target` | systemic | none | yes | always: the file target resolves outside its source |
 | `cancelled` | page | retry | no | the same group is cancelled again after a rerun |
 | `knock_on` | page | retry | no | never: superseded; an older gbrain cancelled this page for another page's failure and a plain sync re-freezes it |
 | `run_replaced` | page | retry | no | never: another run of the source superseded this one and covers its pages |
@@ -7362,7 +7478,8 @@ earlier one is held. A file that changed after its request was admitted
 (`source_changed`) is retried after the manifest's last entry, at most three
 times, then held `worktree_dirty`. A transport fault re-freezes the entry in
 place; a systemic stop is re-frozen in place by the next plain sync, at most
-three times in a row before the failure stays recorded for `--retry-failed`.
+three times in a row, and once that bound is spent the next plain sync
+resets it and tries again.
 
 A `knock_on` or `knock_on_exhausted` error was written by an older gbrain
 (a page cancelled only because another page of its sync did not commit, or
@@ -7375,7 +7492,7 @@ the extra drain and reports it); an older build's `window_dropped` reads as
 a knock-on. A checkpoint refused by a receipt at an index the cursor passed
 without a commit is re-assessed on every resume and commits without
 rediscovering the manifest; one a receipt still blocks is rediscovered by
-`--retry-failed`.
+the next plain sync.
 
 An unknown code is systemic and human: `gbrain errors <code>` explains it
 offline, `gbrain doctor --json` says what the brain thinks.
@@ -7401,7 +7518,8 @@ it and kept going; the receipt lists the hold (`held`, `held_count`) and
   `gbrain sources writer status --source <id> --json` names the step.
   `unblock --apply` schedules the re-screen.
 - `invalid_fence` and `frontmatter_slug_conflict`: the content-repair lane
-  clears them. `unblock --apply` runs it on the held paths now; the maintenance
+  clears them. Managed sync drops a `slug:` line naming no page or file
+  (#6865). `unblock --apply` runs it on the held paths now; the maintenance
   run's `fence_repair` and `content_repair` phases run it by themselves;
   `gbrain repair content --source <id>` previews it. A hold the lane will not
   decide is `needs_human` with the paragraph in `human_reason`
@@ -7411,7 +7529,7 @@ it and kept going; the receipt lists the hold (`held`, `held_count`) and
   run ([held files](write-refusals.md#held-files-and-content-refusals)).
 - `revision_conflict`, `page_identity_changed`, `pinned_git_worktree_conflict`
   as a `last_error` come from a run on an older release; this release holds
-  them. Rerun with `--retry-failed`: the stopped entry converts in place, the
+  them. Rerun the plain sync: the stopped entry converts in place, the
   manifest is not re-frozen. A `revision_conflict` or `cancelled` error with
   `detail: knock_on` needs no flag: the next plain sync re-freezes the entry
   (act on `root_cause` instead).
@@ -7438,8 +7556,11 @@ repair: a source in a subdirectory of its repository pins one
 Ask the user which mode the source keeps. Restoring the pin to the run's mode
 lets the next plain `gbrain sync --no-pull --source <id>` finish (the refused
 checkpoint is retried by itself); keeping the new pin takes
-`gbrain sync --no-pull --source <id> --retry-failed`, and the pages the refused
-run wrote keep their old slugs beside the new ones. A source rooted at its
+`gbrain repair managed-sync-orphans --source <id>` (it lists the cursor as
+`slug_mode_refused`; preview, then `--apply --expect <hash>`), after which the
+next sync discovers the source again under the kept pin. No sync retries that
+checkpoint by itself. The pages the refused run wrote keep their old slugs
+beside the new ones. A source rooted at its
 repository root never gets this code: both modes give it the same slugs, and
 a checkpoint an older release refused there as `revision_conflict` finishes on
 the next plain sync.
@@ -7448,10 +7569,10 @@ the next plain sync.
 
 The frozen manifest always lived in the cursor (`op_checkpoints`, op
 `managed-sync`). What threw it away was the failure ledger: every run death
-wrote a row, and `--retry-failed` read the row and rediscovered from index 0
+wrote a row, and the retry read the row and rediscovered from index 0
 (eight to twelve minutes of silence on a 14k-entry source). Page faults are
-now holds and connection faults are not recorded, so a relaunch, with or
-without `--retry-failed`, finds the cursor and resumes it. Only a systemic
+now holds and connection faults are not recorded, so a relaunch finds
+the cursor and resumes it. Only a systemic
 failure still writes a ledger row.
 
 When HEAD moved past the pinned target while the run drained, the drain takes
@@ -7471,6 +7592,35 @@ That is not a page fault and no rerun clears it: preview
 apply with the printed `--apply --expect <hash>` once the user agrees. A cursor
 with a live pending request is kept; the loop above owns it
 ([repair guide](repair.md#managed-sync-orphans)).
+
+## Soak counters
+
+`gbrain doctor --json` reports `sync_soak_counters` (info, never a warning):
+how often a person or an agent had to step in, per UTC day for the last seven
+days, so a soak can show that sync keeps moving on its own.
+
+- `interventions`: `sync_non_plain` (a `gbrain sync` with a recovery flag such
+  as the deprecated `--retry-failed`, `--full`, `--break-lock` or `--skip-failed`; the plain
+  scheduler flags `--all`, `--no-pull`, `--hard-deadline`, `--no-embed`,
+  `--no-lanes`, `--no-bulk` and `--json` do not count), `repair_apply` (a
+  `gbrain repair … --apply` of any kind but file-drift), `unblock_apply`,
+  `retry_held` (a `gbrain sources retry-held` without `--dry-run`) and
+  `needs_human` (a hold that turned `needs_human`, counted once, by the first
+  sync that sees it).
+- `content_decisions`: `file_drift_apply` (a `gbrain repair file-drift
+  --apply`) and `file_drift_hold` (a `file_drift` hold a sync found). These
+  are choices about which version of a page wins, not interventions; a
+  `keep_db` prefix reconciles with no decision and counts in neither line.
+
+Each line has one count per kind and a `total`; `by_day` lists both line
+totals for each day that recorded anything. Fields are only ever added.
+
+## Dry-run convergence classes
+
+`sync --dry-run --json` adds a read-only `convergence` receipt. Class actions:
+- `none`: settled.
+- `owner`: sync finishes it.
+- `repair`: a person decides.
 
 ## See also
 
@@ -7625,8 +7775,13 @@ per-transcript synthesis subagents. The dials:
 - `dream.triage.threshold` (default 0.5) — the score bar, and the first of the
   two ways a transcript passes the gate (the verified-segment rescue below is
   the second). Scores are cached, so retuning it re-gates instantly with
-  **zero** new LLM calls. Raise it if too much routine content synthesizes;
-  lower it if real signal is being skipped.
+  **zero** new LLM calls. Lower it if real signal is being skipped. Raising it
+  alone may not cut volume (#6753): the rescue band below is
+  `[rescue_floor, threshold)`, so it widens with the threshold, and
+  transcripts that stop passing directly can still pass through the rescue.
+  To cut volume, raise `dream.triage.rescue_floor` or
+  `dream.triage.rescue_min_segments` along with it (`0` turns the rescue
+  off), and compare `details.triage.rescue_fired` before and after.
 - `models.dream.triage` — the triage model (default: utility tier / Haiku).
 - `dream.triage.max_chars` (default 24000, floor 1000) — per-transcript
   sample window (head/middle/tail) sent to the judge. Not part of cache
@@ -7662,6 +7817,13 @@ per-transcript synthesis subagents. The dials:
   still apply; a value that is not a JSON array is ignored with one stderr
   line and the phase scans every type. Note that a page with no `type` has
   no type to match, so it is excluded whenever the list is set.
+  A page whose reply is a complete empty array (`[]`, even with an
+  explanation after it) gets a "no gradeable claims" tombstone and is not
+  sent again while its content is unchanged; a reply that is truncated,
+  prose only, or empty and then followed by takes is retried next cycle.
+  There is no per-page force flag: the tombstone is keyed by a hash of the
+  page body, so any edit to the body re-extracts the page on the next cycle,
+  and that is the only way to send one tombstoned page again.
 - `dream.synthesize.attribution_rules` and `dream.propose_takes.attribution_rules`
   (default off) — extra prompt rules from #5425: keep who proposed what and
   later corrections explicit; an assistant-authored judgment is not the
@@ -9455,6 +9617,32 @@ verbatim name-like lines from the remote-sanitized body, 600 characters per
 page and 1,200 per card, `identity_excerpt_omitted[]`); `alias_guidance`
 (`{ text, requires_surface? }`). `recent_facts[]` (`{ id, fact, kind, valid_from, entity_slug? }`, the 5 newest active saved facts, also those saved under an identity sibling or the bare subject slug, which carry that `entity_slug`); `active_fact_count` and `recall {entity}` cover the same slugs.
 
+#### entity source resolution and `source_id` (additive)
+
+Without `source_id`, `name` and each of `names` resolve across every source
+the caller can read: the home source first (the connection's source, or the
+ambient GBRAIN_SOURCE / .gbrain-source binding), then the other readable
+sources sorted by id, so one brain always resolves a name the same way. The
+first source with a hit owns the card, and every read behind it (aliases,
+facts, edges, references, identity) uses that source; sources outside the
+caller's grant are never read and look like a miss. A remote `__all__` names
+no source and still resolves nothing.
+
+`source_id` (one readable source) pins the lookup. A pin outside the grant,
+for a removed source or with a malformed id is refused with recall's selector
+errors: `scope_denied`, `not_found`, `invalid_params`. `prefer_source_id`
+reorders the walk without narrowing it (thin clients send their
+.gbrain-source there). When the ambient binding's source has no match, a
+`source_binding_narrowed` notice names where each name resolved.
+The starter MCP tool list does not advertise `source_id`, `prefer_source_id`
+or `context_pack`'s `entity_refs` (it keeps the list inside its size budget);
+the full surface does, and every surface accepts them.
+
+Every card carries `card.entity.source_id`, every `names` row `source_id`,
+and each suggestion its `source_id`: `(source_id, slug)` is the entity's
+identity, and two pages sharing a slug in two sources are two entities. A
+row's `next` names `source_id` when the page is outside the home source.
+
 #### entity open_threads loop backing (additive)
 
 On brains running the open-loop engine, `open_threads` entries may
@@ -9475,7 +9663,10 @@ pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
 
 All five are absent on threads not backed by a loop row and on servers that
 do not implement them; a server that omits them still certifies. Same propagation to the
-per-entity cards and top-level `open_threads` of `context_pack`.
+per-entity cards and top-level `open_threads` of `context_pack`. Loop rows carry
+no visibility or source grant of their own, so only the trusted local caller's
+cards derive threads from them (`entity`, and `context_pack` / `delta` with
+`include_private`); a remote caller's card has no loop-backed entries.
 - `edges`: top ~10 typed edges, mentions excluded, out-edges first, live relationships first. Additive fields: `status` (`live`, `ended`, `ended_unknown_date`, `event`, …), `since` / `until` (latest stint). `relationship_note` (additive) summarizes current and ended relationships and flags a summary that still names an ended one ([temporal edges](../guides/temporal-edges.md)).
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
   on a 20K-page corpus. 200K validation recipe below.
@@ -9791,14 +9982,43 @@ synced to a cloud model). `include_private` widens ALL arms in
 lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
-Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
+Response: `{ protocol_version, entities, cards[], open_threads[], facts[], entity_facts[], text,
 degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld?, brief? }`. `text` is the
 envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
 
-`entities` scopes cards and threads, not the hot facts (the session's recent
+`entities` scopes cards, threads and `entity_facts`, not the hot facts (the session's recent
 memory), so other facts can appear; `recall` with `entity` reads one entity
 strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
 and `provenance` (the stored source), never rendered into `text`.
+
+#### context_pack sources: `source_id`, `entity_refs` (additive)
+
+`entities` resolve like `entity` names: across the caller's readable sources,
+home first then by id, unless `source_id` pins one (same selector errors;
+`prefer_source_id` reorders only). `entity_refs`
+(`[{"source_id": "wiki", "slug": "people/alice-example"}]`, inside the same cap
+of 8 after `entities`) packs source-qualified entities, each read only in its
+own source and checked like a pin. Every card carries `source_id`; a card
+from outside the home source renders as `slug` (source <id>) in `text`, and
+its newer-mention continuation names the source. Each card's activation
+verdict, newer mentions, records and `page_status` come from its own source,
+never from a same-slug page in another source, and cards are deduplicated by
+`(source_id, slug)`. `pinned_questions` carries a published pin only when its
+source and `scope_entity` match an accepted card's `(source_id, slug)`.
+
+#### context_pack entity_facts (additive)
+
+`entity_facts[]` holds the packed entities' own facts: up to 5 per card, newest
+first, read in the card's own source with the card's visibility (world-only
+unless a trusted-local caller passed `include_private`) and eligibility. Each
+row is `{ source_id, slug, fact_id, fact, kind, entity_slug, valid_from?,
+context, confidence, attributed_to, provenance, trust_tier?, origin? }`, where
+`(source_id, slug)` names the card. `facts[]` is unchanged hot memory, so a
+fact can appear in both arrays. `text` renders entity facts under `## Entity
+facts (about the standing entities)` before hot memory, and a fact in both
+renders once, there. Under `budget_tokens` entity facts pack after cards and
+before hot facts, leave with a dropped card (counted in `dropped_count`), and
+a hot fact already shown as an entity fact costs nothing.
 
 #### context_pack records (additive)
 
@@ -9875,7 +10095,7 @@ timeline entry's event page) follows the same page rule, and facts and takes
 fence rows never count as an edit. The same assembler serves
 the off-by-default hook push ([push context](../guides/push-context.md)).
 
-### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
+### delta(since?, since_slug?, cursor?, entities?, budget_tokens?, session_id?, include_private?, beliefs?) — read, zero LLM
 
 "What changed since T" for heartbeats — pages updated after
 the cursor (oldest first) + facts recorded after the cursor + open-thread
@@ -9946,6 +10166,32 @@ are still returned and `budget_used` (the token estimate of `text`) reports the
 real rendered size, which then exceeds the budget. `since` is always
 normalized ISO (never the raw input string). Replay recipe:
 [ambient recall guide](../guides/ambient-recall.md#replay-after-a-degraded-wake).
+
+**Belief changes (`beliefs: true`, full surface only).** Adds `beliefs`: each
+belief that ended the window different from how it started, read from the
+belief ledger for the same window as the wake (`since` to the wake's horizon).
+`{ source_id, since, until, coverage_from, changes[], truncated, not_recorded? }`;
+each change is `{ kind, slug, change, subject, before, after, before_known,
+upper_bound?, cause, evidence: { event_id, recorded_at, slug, row? }, trust_tier }`.
+An edit and its revert in the window report nothing. `before_known: false`
+means the earlier value is unknown (no body answers at `since`), never that
+it was empty; `upper_bound: true` marks a relationship end the nightly check
+inferred, so it ended on or before that date. `coverage_from` is set when the
+ledger starts after `since` (earlier changes are unknown, not absent), and
+`not_recorded` when the source has no ledger coverage. `entities` narrows the
+list to changes on or about the named slugs. A caller without
+`include_private` (every remote caller) gets the world view: events that were
+world-visible when recorded, on pages visible now, and takes of the holders
+the caller may read (the takes surfaces' allow-list, `world` by default).
+Under `budget_tokens` the belief lines pack into what pages, facts and threads
+leave, and `truncated` reports a cut; `text` gains a
+`## Belief changes since <since>` section. The diff is a read of the window,
+not a cursor arm: it does not set `has_more` or hold a `session_id` cursor,
+so lines a cut dropped are not delivered on the next wake; read them with an
+explicit `since` (or `gbrain beliefs changes`). `min_trust` does not filter
+it; each change carries its `trust_tier`. The
+CLI twin is `gbrain beliefs changes [<entity>...] [--since 7d]`. Design:
+[BELIEF_LEDGER.md section 15](../designs/BELIEF_LEDGER.md#15-w4-as-built-the-weekly-change-diff).
 
 ## Latency classes (per verb)
 
@@ -10484,6 +10730,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | `remember` or `put_page` refused `source_changed` "The canonical file contains an uncoordinated local edit" on many pages nobody edited, or doctor `lost_caller_writes` warns | upgrade to v0.60.157.0 or later (a database-only v0.13.1 `validate: false` stamp was read as a file edit, #6429); then `gbrain repair failed-writes --source <id>` previews the refused writes and prints the apply command ([failed writes](repair.md#failed-writes)) | agent; the apply after the user agrees | none to preview | `gbrain doctor --only lost_caller_writes --json` is ok |
 | A write (`add_timeline_entry`, `put_page`, `remember`, any `mutating` tool) refused `invalid_params` "unknown parameter … write operations always reject unknown parameters; nothing was written" | the call named a parameter the tool does not declare (for example `content` instead of `detail`); the `suggestion` names the submitted key and the declared one; resend with the declared name. Reads keep the `mcp.strict_params` warn grace period | agent | none | the resent call returns no `invalid_params` and no `unknown_param` warning |
 | Facts extraction or embedding reports `(cause=AIConfigError model_not_found)` or `gbrain models doctor` says `model_not_found` while the key is valid | the provider refused the model, not the key (a 404, or a 403 "project does not have access to model"): the fix text names the config key that selected the model when the gateway knows it ("Selected via models.tier.reasoning. Fix: gbrain config set …"; an env var or config.json pin says what to clear); otherwise check the model id with `gbrain models`, enable the model for the project in the provider console or set another model (`gbrain config set models.facts <provider:model>`) | user (provider console); agent for the config change, after the user agrees | none | `gbrain models doctor` reports the model `ok` |
+| Doctor `links_extraction_lag` or sync says "N page(s) have un-extracted edges" | `gbrain extract --stale --dry-run --json`, then on the host `gbrain extract --stale --catch-up [--source-id <id>]` | user above 120 s, else agent | none | dry run: `actionable: 0` |
 | A gbrain call failed with a code you don't recognize | follow `fix.next` ([protocol](../protocol/AGENT_OPERATOR_v1.md)); `gbrain errors <code>` | agent | as the fix's `consent` | the fix's `verify` |
 | A graph read omits a relationship you know existed, or says someone still works somewhere they left | the default read returns relationships true today: repeat with `status: "all"` or `as_of`; to record an end, add a dated timeline line (`Ended works_at [[companies/x]]`) or `add_link ... valid_until` ([temporal edges](temporal-edges.md)) | agent | none | `gbrain doctor --only edge_validity --json` |
 | A command exited 3 (`confirmation_required`) | relay `user_message`; run `fix.command` only after the user agrees | agent, after the user agrees | the payload's `effects` | the fix's `verify` |
@@ -10505,6 +10752,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | [Managed catch-up stuck, or `Held <path>: preparation_stalled`, or the drain stopped `preparation_abandoned` / `preparation_systemic` / `write_capacity`](#catch-up-stuck) | `gbrain sources writer status --source <id> --json` (what the stuck write was doing: step, `waiting_on`, owner, version), fix what it names or upgrade the owner, then `gbrain sources retry-held <id>` and the same sync with its options | agent; a restart or upgrade of the owner after the user agrees | none to inspect; `persistent_install` when the fix restarts a service | `gbrain sources status <id> --json`, then `gbrain doctor --only git_held_files,persistence_write_stall --json` |
 | [The catch-up is parked: `data_moving: false`, doctor `managed_sync_not_moving`, or `gbrain sources writer movement` exited 1](#managed-sync-not-moving) | `gbrain sources status <id> --json` prints the exact writer-status command; run it: `gbrain sources writer status --source <id> --json` ends each running claim in a `claim.next` (`claim_running`: rerun after `retry_after_ms`; `claim_overdue`: `tell_user_to_run`, restart the named owner pid) | agent; the restart after the user agrees | none to inspect; `persistent_install` when the fix restarts a service | `gbrain sources writer movement <id>` (exit 0 when the data moves again), then `gbrain doctor --only managed_sync_not_moving --json` |
 | [The drain stopped `drain_stalled` with `cause: owner_wedged_here`](#managed-sync-not-moving) | before the ceiling: wait `retry_after_ms`, then rerun `next.command` (`safe_to_loop` is true); past it: restart the owner process the stop names (`gbrain serve`, the jobs worker or autopilot), then `gbrain sources retry-held <id>` and the same sync | agent; the restart after the user agrees | none to inspect; `persistent_install` when the fix restarts a service | `gbrain sources writer status --source <id> --json` (the claim is gone or publishing), then `gbrain sources writer movement <id>` |
+| [A managed sync run is blocked: doctor `managed_sync_blocked`, a freshness `sync` job ended `dead`, or get_brain_health `sync_blocked` is not `none`](#managed-sync-blocked) | `gbrain sync status --source <id> --json` names the page the run stopped on, its fault class and its exit (a hold to reconcile, a repair to preview, or the resume command); `gbrain jobs get <id> --json` shows the same `next` in the dead job's progress | agent; a reconcile or repair apply after the user agrees | the step's own consent | `gbrain doctor --only managed_sync_blocked --json` is ok, and the next freshness job ends `completed` |
 | [Doctor warns `two_consumers_on_host`](#two-consumers-on-host) | `gbrain sources writer status --json` lists the consumers alive on this host (`host.consumers`: pid, kind, mode, age); let the shorter-lived one finish (a `gbrain sync` run ends on its own) or restart it so it defers to the resident one | agent; a restart after the user agrees | none to inspect | `gbrain doctor --only two_consumers_on_host --json` |
 | [Doctor warns `consumers_without_heartbeat`](#consumers-without-heartbeat) | upgrade and restart the process whose pid and kind the check names (it predates the heartbeat table and never defers) | brain host, after the user agrees | `persistent_install` when it rewrites services | `gbrain doctor --only consumers_without_heartbeat --json` |
 | [Doctor warns `serve_build_drift`: serve is running an older build than this checkout](#serve-build-drift) | restart serve with the command the check prints (`systemctl --user restart gbrain-serve.service`, `launchctl kickstart -k gui/<uid>/com.gbrain.serve`, or stop the named pid and start it again), then restart each other listed worker | brain host, after the user agrees | none | `gbrain doctor --only serve_build_drift --json` is ok |
@@ -10513,20 +10761,22 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | [`owner_unavailable`, reason `transfer_in_progress` or `clone_in_progress`](#owner-unavailable) | wait 30 s and retry the same step; the worktree is draining for a writer transfer or recovering from a topology clone | agent | none | `gbrain sources writer status --source <id> --json` shows state `active` |
 | [A page write refused `owner_unavailable`, detail `unbound_source`, on a classic Postgres brain](write-refusals.md#unbound-sources-on-postgres) | don't retry; write the page as `<slug>.md` in the source's checkout, commit it, and run `gbrain sync --source <id>` (a remote agent gives those steps to the user); database-only pages or managed mode are the user's choice | agent, after the user agrees (remote: user) | none | `gbrain get <slug> --source <id>` |
 | [`owner_unavailable`, reason `binding_missing`, `incarnation_changed`, `local_path_missing` or `coordination_path_missing`](#owner-unavailable) | `gbrain sources writer status --source <id> --json`; the registration is missing or outdated and re-binding or re-registering the checkout is the host administrator's decision | brain host | none | the same status read shows an active binding for this host |
+| Background work (autopilot, jobs, connector syncs) refused `owner_unavailable` "Background writes to source <id> are paused: its canonical owner could not be verified" or "its worktree is recovering" | run the fix, `gbrain sources writer status --source <id> --json`, which names what the source waits on; a deleted owner marker (`.gbrain-owner.json`) is repaired by a writer self-transfer, the user's decision. Nothing was submitted and no request id was used; interactive writes are unaffected | agent; the self-transfer after the user agrees | none to inspect | the same status read shows an active binding; the next background run admits |
+| Doctor warns `purge_parked_pages` | fix the cause each page's last error names, preview `gbrain pages purge-deleted --retry-parked --dry-run --json`, then with the user's agreement run `gbrain pages purge-deleted --retry-parked --yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only purge_parked_pages --json` |
 | [`gbrain repair fences` skipped a file `sync_in_progress` while a sync runs](repair.md#fence-repair-during-a-sync) | nothing: a write in flight or the running sync's frozen manifest still names that file; every other candidate repairs now and the next run picks this one up (`gbrain sync --source <id> --no-pull` finishes the sync) | agent | none | `gbrain doctor --only fence_integrity --json` |
 | [A Google or GitHub item is held (`connector_held_items`)](#held-connector-items) | `gbrain sources status <id>`, fix the cause, then `gbrain sources retry-held <id>` and `gbrain sync --source <id>` | agent, after the user agrees | `egress` (fetches from the provider again) | `gbrain doctor --only connector_held_items --json` |
 | `gbrain google status` exits 1 naming `calendar_unreadable`, doctor warns `google_calendar_readable`, or the sync log prints `[google] calendar_unreadable` (calendar pages stop arriving) | `gbrain google calendars --account <email>` lists the calendars the account can read; then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` ([unreadable calendar](google-connect.md#unreadable-calendar)) | agent, after the user agrees which calendar | none (on a managed brain whose source also syncs Gmail or Contacts, the change re-reads their history: `confirmation_required`, re-run with `--yes` after the user agrees) | `gbrain doctor --only google_calendar_readable --json` is ok |
 | `gbrain waiting` lists bank, payment or shipping alerts as people waiting on you | upgrade (#5012: mail with `Precedence: bulk/list/junk`, a `List-Id` or a no-reply `Reply-To` opens no reply-owed loop); for loops opened before the upgrade, `gbrain waiting` prints `gbrain loops drop sender <email> --source <id> --dry-run` per sender; preview, then run it without `--dry-run` (cannot be undone), or `gbrain loops mute sender <email>` for a reversible stop ([open loops](open-loops.md#the-surfaces)) | agent, after the user agrees | none to preview | `gbrain waiting --json` no longer lists the sender |
 | [`gbrain migrate --to` refused with `writer_coordinator_required`](../ENGINES.md#engine-migration-refused) | follow the refusal's `fix`: relay its `user_message` (stay on PGLite and share with `gbrain mcp expose`, or leave the brain as it is) | agent, after the user agrees | `persistent_install`, `egress` (for `gbrain mcp expose`) | `gbrain doctor --no-migrate --json` |
 | [A write was refused with a named reason](#write-refused) | the reason's recovery in [write refusal reasons](write-refusals.md) | as the refusal's `fix` | as the refusal's `fix` | the refusal's `verify` |
-| [`gbrain sync` refused `managed_sync_flag_refused`](write-refusals.md#managed_sync_flag_refused) | rerun the same command without the flag `detail` names (`--skip-failed` or `--include-gitignored`); fix a failed file and use `--retry-failed`, or commit an ignored file | agent | none | `gbrain sources status --json` |
-| [`--retry-failed` says failures "belong to a run with different sync options"](#retry-other-options) | run the command printed on each line: `resumable (replay …)` or `resumable (fresh discovery …)` reruns under the failed run's options, `safely orphaned` previews `gbrain repair managed-sync-orphans --source <id>` (apply with its hash), `unresolved` names what has to finish first | agent; the repair apply after the user agrees | the repair retires bookkeeping rows only | `gbrain sync status --source <id> --json` |
-| [Managed sync blocked with `checkpoint_validation_timeout`](#checkpoint-validation-timeout) | `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <id> --no-pull --retry-failed …` | brain host | none | `gbrain doctor --only persistence_request_indexes --json` |
+| [`gbrain sync` refused `managed_sync_flag_refused`](write-refusals.md#managed_sync_flag_refused) | rerun the same command without the flag `detail` names (`--skip-failed` or `--include-gitignored`); fix a failed file and rerun the plain sync (`--retry-failed` is a deprecated alias), or commit an ignored file | agent | none | `gbrain sources status --json` |
+| [Sync with the deprecated `--retry-failed` alias says failures "belong to a run with different sync options"](#retry-other-options) | run the command printed on each line: `resumable (replay …)` or `resumable (fresh discovery …)` reruns under the failed run's options, `safely orphaned` previews `gbrain repair managed-sync-orphans --source <id>` (apply with its hash), `unresolved` names what has to finish first | agent; the repair apply after the user agrees | the repair retires bookkeeping rows only | `gbrain sync status --source <id> --json` |
+| [Managed sync blocked with `checkpoint_validation_timeout`](#checkpoint-validation-timeout) | `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <id> --no-pull …` | brain host | none | `gbrain doctor --only persistence_request_indexes --json` |
 | [Doctor warns `persistence_session_timeouts` (`session_timeouts_not_applied`)](#session-timeouts-not-applied) | `ALTER ROLE <gbrain role> SET statement_timeout = '5min'` on the database, or accept it: preparation reads carry their own bound | brain host | none (a role default; `destructive` only in that it changes a server setting) | `gbrain doctor --only persistence_session_timeouts --json` |
 | `gbrain init` or `gbrain upgrade` stops with `schema_lock_blocked` naming a pid (or, before #5227, sat in `wait_event_type=Lock` with no output) | let the named session finish, or with the user's agreement end it on the database host: `SELECT pg_terminate_backend(<pid>)`; then rerun the same command ([ENGINES.md](../ENGINES.md#schema-lock-blocked)) | brain host, after the user agrees | `destructive` when it ends another session | the rerun completes; `gbrain doctor --json` shows the schema at head |
 | [`queue_capacity`, `persistence_capacity` or `persistence_request_growth`](#write-capacity) | run the printed `gbrain config set persistence.limits.<limit> <value>` | brain host | none | `gbrain doctor --only persistence_capacity,persistence_request_growth --json` |
 | [`dream_paid_loop`, or dream keeps skipping one transcript](#dream-paid-loop) | fix the cause, then `gbrain dream reset-key --list` and `gbrain dream reset-key '<key>'` | agent, after the user agrees | `paid` (the key is retried) | `gbrain doctor --only dream_paid_loop --json` |
-| [A page exists (`gbrain get <slug>` returns it) but search never finds text from it](memory-boundaries.md#large-pages) | find the cause: `gbrain reindex --oversized --dry-run --json` lists pages stored before the upgrade with a size-based `embed_skip` marker (run it without `--dry-run` to keyword-index them, free); a page above an operator-lowered `content_sanity.bytes_block` keeps its marker until the operator raises or unsets it; a page the content-quality gate quarantined as junk shows in `gbrain quarantine list`, and `gbrain quarantine clear <slug>` re-checks it once the user agrees; a file over the 24 MiB page ceiling was never stored ([`file_too_large`](write-refusals.md#file_too_large)). Embedding the re-indexed pages is a separate paid step: `gbrain embed --held --max-usd <N>` | agent for the reindex; the user decides embedding spend, a `bytes_block` change and a quarantine clear | none for the reindex (CPU only); `paid` for `gbrain embed` | `gbrain reindex --oversized --dry-run --json` lists nothing; `gbrain doctor --json`; `gbrain search "<phrase from deep in the page>"` returns the page |
+| [A page exists (`gbrain get <slug>` returns it) but search never finds text from it](memory-boundaries.md#large-pages) | `gbrain reindex --oversized --dry-run --json` lists pages stored before the upgrade with a size-based `embed_skip` marker (without `--dry-run` it keyword-indexes them, free); a page above an operator-lowered `content_sanity.bytes_block` keeps its marker until it is raised; a page the content-quality gate quarantined shows in `gbrain quarantine list` (`gbrain quarantine clear <slug>` re-checks it once the user agrees); a file over the 24 MiB page ceiling was never stored ([`file_too_large`](write-refusals.md#file_too_large)). Its chunks waiting for embedding approval (doctor `partial_embedding`) are a paid step: `gbrain embed --held --dry-run`, then `gbrain embed --held --source <id> --max-usd <N>` as printed | agent for the reindex; the user decides embedding spend, a `bytes_block` change and a quarantine clear | none for the reindex; `paid` for `gbrain embed` | `gbrain reindex --oversized --dry-run --json` lists nothing; `gbrain search "<phrase from deep in the page>"` returns the page |
 | [Search answers look keyword-only on a large Postgres brain](#hybrid-search-returns-only-keyword-hits) | read doctor's `vector_plan`; run the index command it prints | brain host | none | `gbrain doctor --only vector_plan --json` |
 | [Broad keyword queries take about 8 s and come back vector-only (`keyword_arm_failed`, or `skipped_after_timeout` for 10 minutes after a timeout) on a large Postgres brain](#keyword-search-times-out-on-a-large-postgres-brain) | read doctor's `keyword_plan`; narrow with `--source-id`, or raise `search.keyword_statement_timeout_ms` on the brain host and restart the serving process | brain host | none | `gbrain doctor --only keyword_plan --json` |
 | A second `gbrain serve` cannot open the brain | the readiness `harness_wiring` fix: every session shares one `gbrain serve --http` | user | `persistent_install`, `credentials` | `gbrain doctor --only harness_wiring --json` |
@@ -10560,7 +10810,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 1. **While it is stuck.** The progress line prints `stalled <N>s on <step>` instead of an ETA. Run `gbrain sources writer status --source <id> --json`: the blocked request's `claim.stall` names the step (`origin_check`, `knowledge_publication`, …), `waiting_on` (`git`, `fs`, `db`, `pool`, or an honest `unknown`), `step_age_ms`, the budget, and the owner process (kind, pid, gbrain version). An owner whose version predates this release never gives up: upgrade it and restart it (`gbrain serve`, the jobs worker or autopilot; the drain's own process ends with the drain). Otherwise wait out the budget: the write is released, retried once, then held. A release does not always free the root: a preparation that ignores cancellation holds its root barrier until the ceiling, and `writer status --json` ends the claim in a `claim.next` that says so (`claim_running` with `retry_after_ms` to the ceiling, or `claim_overdue` as `tell_user_to_run` naming the owner pid once the ceiling has passed or the owner reads `restart_required`).
 2. **Held files (`preparation_stalled`).** `gbrain sources status <id> --json` lists them with the step each stalled on; no `gbrain repair` applies. After the cause is fixed (or gbrain upgraded), run `gbrain sources retry-held <id>` and then the same sync with the same options, which the hold's `fix` and `retry-held` print, for example `gbrain sync --source <id> --no-pull --no-embed`. If that sync still has a backlog, it finishes the backlog and then re-screens the scheduled files in the same run. Verify with `gbrain sources status <id> --json` (the held count drops) and `gbrain doctor --only git_held_files --json`. A held deletion keeps its page until that retry. A stalled hold also re-screens by itself when the gbrain version changes.
 3. **The drain stopped `preparation_abandoned` (exit 0).** A preparation in the sync's own process was still running past its allowance (its budget plus 30 s) and cannot be cancelled in-process, so the sync exited to end it; `drain.stall.step` says where. Rerun `next.command` (`safe_to_loop` is true): the next pass holds the entry if it stalls again.
-4. **The drain stopped `preparation_systemic` (exit 1).** Too many writes stalled in one run (more than `sync.hold_escalate_count` / `sync.hold_escalate_pct` of the run's screened imports, or five in a row with no page committed between), so the run stopped with one diagnostic instead of holding every file. `breaker` carries the rule, the counts and the last step. Inspect the writer as in step 1, fix the cause, then rerun the same sync: it re-freezes the stopped entry with a fresh request and re-screens the files that run held.
+4. **The drain stopped `preparation_systemic` (exit 1).** Too many writes stalled in one run (more than `GBRAIN_SYNC_HOLD_ESCALATE_COUNT` / `GBRAIN_SYNC_HOLD_ESCALATE_PCT` of the run's screened imports, or five in a row with no page committed between), so the run stopped with one diagnostic instead of holding every file. `breaker` carries the rule, the counts and the last step. Inspect the writer as in step 1, fix the cause, then rerun the same sync: it re-freezes the stopped entry with a fresh request and re-screens the files that run held.
 5. **The drain stopped `write_capacity` (exit 1).** Other writers' requests held the sync writer's outstanding-request cap (`persistence.limits.principal_outstanding`, default 100; on one host the CLI sync shares the `local_cli` principal with fact-fence adoption and `dream`) for the whole 30 s window, so the sync could not admit its next write. It waited and printed `waiting for write capacity (N outstanding of M)` first; nothing failed and the cursor is intact. `gbrain sources writer status --source <id> --json` lists the outstanding requests. Let them finish, or raise the cap (`gbrain config set persistence.limits.principal_outstanding 200`), then rerun the same sync. Reference: [drain stops](write-refusals.md#drain-write-capacity).
 6. **A `put_page`, `remember` or maintenance write finished `preparation_stalled`.** Nothing is held: the receipt names the step. Read the writer as in step 1, then resubmit a foreground write under a new `request_id`; the next maintenance run submits its write again.
 7. **A manual fence defect among the holds** (`invalid_fence`, reason `manual`, or `repeated_marker`) is a different branch: see [held fence files](#held-fence-files). `gbrain sources status` keeps the kinds apart and routes each to its own command.
@@ -10569,9 +10819,9 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="held-connector-items"></a>**A Google or GitHub item is held after repeated failures (doctor `connector_held_items`, `gbrain waiting` says coverage is partial)?** Run `gbrain sources status <id>`, fix the cause, then after the user agrees run `gbrain sources retry-held <id>` and `gbrain sync --source <id>`. See [held items](google-connect.md#held-items).
 
-<a id="retry-other-options"></a>**`--retry-failed` lists failures that "belong to a run with different sync options"?** A managed retry resumes only the cursor its own options select; each other failure gets one line with its class and the command that settles it. `resumable (replay …)`: an unfinished run holds it, and the command resumes that run under its recorded options. `resumable (fresh discovery, not a replay …)`: no run holds it any more; the command starts a new run from HEAD under the failed run's options, which clears the failure when it completes. For a failure recorded before runs kept their options, the options are recovered only when an option set reproduces its cursor key exactly. `safely orphaned`: nothing current can resume it; preview `gbrain repair managed-sync-orphans --source <id>` and apply with the hash it prints. `unresolved`: its options were never recorded and nothing selects it; the line says what has to finish first (a request still in flight, or a current run whose completion lets the orphan repair retire it).
+<a id="retry-other-options"></a>**A sync (or the deprecated `--retry-failed` alias) lists failures that "belong to a run with different sync options"?** A managed retry resumes only the cursor its own options select; each other failure gets one line with its class and the command that settles it. `resumable (replay …)`: an unfinished run holds it, and the command resumes that run under its recorded options. `resumable (fresh discovery, not a replay …)`: no run holds it any more; the command starts a new run from HEAD under the failed run's options, which clears the failure when it completes. For a failure recorded before runs kept their options, the options are recovered only when an option set reproduces its cursor key exactly. `safely orphaned`: nothing current can resume it; preview `gbrain repair managed-sync-orphans --source <id>` and apply with the hash it prints. `unresolved`: its options were never recorded and nothing selects it; the line says what has to finish first (a request still in flight, or a current run whose completion lets the orphan repair retire it).
 
-<a id="checkpoint-validation-timeout"></a>**A managed sync is blocked with `checkpoint_validation_timeout`?** Run the printed commands on the brain host: `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <id> --no-pull --retry-failed …`. Doctor's `persistence_request_growth` warns before lifetime request IDs run out.
+<a id="checkpoint-validation-timeout"></a>**A managed sync is blocked with `checkpoint_validation_timeout`?** Run the printed commands on the brain host: `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <id> --no-pull …`. Doctor's `persistence_request_growth` warns before lifetime request IDs run out.
 
 <a id="pglite-aborted"></a>**PGLite crashes at startup with `RuntimeError: Aborted()` (often right after a macOS upgrade)?** Not a macOS incompatibility — the OS-upgrade reboot killed gbrain mid-write and tore the data dir's WAL. gbrain repairs this automatically on the next command (data preserved, backup kept); if auto-repair is disabled or skipped, run `gbrain pglite-repair --dry-run` to diagnose and `gbrain pglite-repair --yes` to repair in place. Full recovery ladder (repair → rebuild → engine switch) in [`docs/ENGINES.md` — Troubleshooting: startup abort](../ENGINES.md#troubleshooting-startup-abort-runtimeerror-aborted) and [`docs/INSTALL.md`](../INSTALL.md#pglite-crashes-at-startup-runtimeerror-aborted).
 
@@ -10584,6 +10834,8 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 <a id="write-refused"></a>**A save, sync or background effect was refused with a named reason?** Reasons such as `file_database_drift`, `ambiguous_source_path`, `physical_root_device_changed`, `cursor_processing_options_conflict`, `take_row_collision`, `invalid_source_uri`, `queue_capacity` and parked effects (`targets_parked`, doctor `parked_effects`) each come with a recovery step in the error's `suggestion`. [Write refusal reasons](write-refusals.md) explains each one and its recovery. **Say to your agent:** *"My save was refused. Explain the reason and show me the fix before you run it."*
 
 <a id="doctor-residue"></a>**`gbrain doctor` warns `timeline_history`, `derived_visibility`, or unsealed pages under `contextual_retrieval_coverage`?** Preview the fix with `gbrain repair`, then apply one kind at a time with `gbrain repair <kind> --apply` on the brain host. See [repair residual damage](repair.md).
+
+<a id="extract-health-halts"></a>**Doctor warns `extract_health` with "kind(s) with halt rate > 10%" after the cause was already fixed?** The check is a rate over the last 7 days, not a list of open faults: `halt_count` and `round_completed_count` are 7-day sums from the extraction rollup (one row per kind per day), so halts recorded before a fix keep the rate up until their days leave the window. Read each kind's age before acting: `last halt today` (or `1d ago`) means the extractor is still halting, while `last halt 5d ago` on a kind that has run since means the halts are history. `gbrain doctor --only extract_health --json` gives the same per kind in `details.kinds[]`: `halt_rate`, `last_halt_age_days`, `top_halt_reason` and every reason with its count in `halt_reasons`; runs that stopped at an expected budget or deadline cap count in `expected_limit_count`, not as halts. Fix the reason that is still current, then let the window age out: expiry is how a repaired cause clears, and there is no acknowledgement or reset command. A halt with `last_halt_age_days` at 0 after the fix means the cause is not fixed. **Say to your agent:** *"Is extract_health warning about current halts or old ones?"*
 
 **`gbrain doctor` warns `timeline_orphans`?** Timeline rows from an earlier version of a page are still in the database after the dated bullet was edited or deleted. Preview with `gbrain extract timeline --prune-orphans --dry-run`, then remove them with `gbrain extract timeline --prune-orphans` (add `--source-id <id>` to limit it). Rows no page version ever produced, such as enrichment and meeting fan-out, are kept.
 
@@ -10607,7 +10859,9 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="session-timeouts-not-applied"></a>**Doctor warns `persistence_session_timeouts` with `session_timeouts_not_applied`?** gbrain sets `statement_timeout` (`GBRAIN_STATEMENT_TIMEOUT`, default 5min) and `idle_in_transaction_session_timeout` as connection startup parameters, and a transaction-mode pooler (PgBouncer with `ignore_startup_parameters`, Supavisor) drops them: `SHOW statement_timeout` through the configured URL reads `0`, so a statement outside a transaction has no server-side bound and a relation lock held in another session (a migration's `ALTER TABLE pages` queued behind a long transaction, for example) holds it for as long as the lock lasts. Managed write *preparation* reads are not affected since v0.60.108: they run under a transaction-local `statement_timeout` of the write's remaining preparation budget, so a lock-blocked read ends at the budget and the member is released `preparation_deadline` with no statement left on the server (#6278). For every other autocommit statement, set the default on the role instead of the connection: `ALTER ROLE <gbrain role> SET statement_timeout = '5min'` (read-only to check: `gbrain doctor --only persistence_session_timeouts --json`). Setting `GBRAIN_STATEMENT_TIMEOUT` has no effect through such a pooler.
 
-<a id="managed-sync-not-moving"></a>**The catch-up is parked (`sources status --json` says `data_moving: false`, doctor warns `managed_sync_not_moving`, `gbrain sources writer movement` exited 1), or the drain stopped `drain_stalled` with `cause: owner_wedged_here`?** Liveness is not movement: `/health` can be ok, the pid alive and `sync_running: true` while no page has committed for weeks. A managed source is *not moving* when an unfinished `managed-sync` cursor has had neither a committed `managed_sync_*` receipt nor a head step advance for longer than `persistence.preparation_ceiling_ms` (600 s) while a drain or a full consumer is live on the owner host; with nothing live it is `movement_state: parked` (a cursor left between cron runs; informational, not scored). Every surface routes to the same two read-only calls, so the agent reaches the owner, the step and the next action without SQL:
+<a id="managed-sync-blocked"></a>**A managed sync run is blocked (doctor `managed_sync_blocked`, a freshness `sync` job ended `dead`, or get_brain_health reports `sync_blocked`)?** The source's unfinished run stopped on a page request that did not commit and recorded the stop, so it resumes nothing by itself while the other sources keep syncing (#6858: one source stopped for 21 hours while every freshness job reported `completed`). Such a job now ends `dead`: its error names the stop and the run's `next` command, and `gbrain jobs get <id> --json` carries `outcome`, `drain` and `next` in its progress. Doctor warns as soon as a run is blocked and fails once it has been blocked for more than an hour; get_brain_health turns to `attention` past the same hour, with a count band and no source names. Run `gbrain sync status --source <id> --json` (read-only): it names the page, its fault class and its exit. Clear the cause it names and run the step it prints; the next freshness job resumes the run once the cause is gone. A page publication that `gbrain repair stuck-recovery --keep disk` abandoned is not a blocker: the next plain sync retries that page after the rest of its run, imports it when the kept file is committed, and holds it `worktree_dirty` otherwise.
+
+<a id="managed-sync-not-moving"></a>**The catch-up is parked (`sources status --json` says `data_moving: false`, doctor warns `managed_sync_not_moving`, `gbrain sources writer movement` exited 1), or the drain stopped `drain_stalled` with `cause: owner_wedged_here`?** Liveness is not movement: `/health` can be ok, the pid alive and `sync_running: true` while no page has committed for weeks. A managed source is *not moving* when an unfinished `managed-sync` cursor has had neither a committed `managed_sync_*` receipt nor a head step advance for longer than `persistence.preparation_ceiling_ms` (600 s) while a drain or a full consumer is live on the owner host; with nothing live it is `movement_state: parked` (a cursor left between cron runs; informational, not scored). A parked cursor whose write queue still holds admitted requests while no consumer runs and nothing has moved for longer than that ceiling is stranded: nothing will ever drain it, so doctor `managed_sync_not_moving` fails (#6552, #6712 PR 2) and its fix is the resume sync with the cursor's stored options (`gbrain sync --source <id> …`), which consumes the queue itself; `details.stranded` counts such sources. When the sync backlog itself cannot be read, every surface says `movement_state: unknown` (`unknown.reason: backlog_read_failed`) instead of `nothing_pending`: doctor warns with `details.health: unknown`, `sources status` prints a `movement UNKNOWN` line, and `gbrain sources writer movement` exits 1 with code `movement_unknown` (`--warn-only` exits 0); rerun the movement command, and run `gbrain doctor --json` if the read keeps failing. Every surface routes to the same two read-only calls, so the agent reaches the owner, the step and the next action without SQL:
 
 1. `gbrain sources status <id> --json`: `data_moving`, `not_moving_since`, `movement_state` and, beside `data_moving: false`, the exact `gbrain sources writer status --source <id> --json` to run next. Doctor's `managed_sync_not_moving` fix is that same command.
 2. `gbrain sources writer status --source <id> --json`: every running claim ends in one `claim.next` envelope (`code` `claim_running`, `claim_overdue` or `claim_lapsed`). `claim_running` carries `retry_after_ms` and a `run` of the same status command while the owner is inside its allowance (the owner's own budget will cut the write; nothing to do but rerun after the delay), `tell_user_to_run` naming the owner `kind` and pid past the ceiling or when the owner reads `restart_required` (restart that process), `run` the printed resume command for a lapsed claim. `host.consumers` lists the processes on this host holding a consumer (pid, kind, mode `full|waiter_only`, started_at, the pool gauge), so a second consumer is visible in the same call.
@@ -10716,7 +10970,7 @@ A running sync is not one of these: `gbrain repair fences` now runs during a cat
 
 <a id="write-capacity"></a>**Managed writes refused with `queue_capacity`, or doctor warns `persistence_capacity`?** A per-principal or per-brain write-journal limit (`persistence.limits.*`) is full (`queue_capacity`), or doctor sees lifetime request IDs or receipt bytes at 80% or more (`persistence_capacity`). For the cumulative limits (lifetime request IDs and receipt bytes), the warning and the refusal print a `gbrain config set persistence.limits.<limit> <value>` sized for about one more year; run it on the brain host, then retry with the same request ID. For outstanding-request or queued-byte limits, let outstanding writes finish and check `gbrain sources writer status`. Receipt compaction age is `persistence.receipt_retention_days` (default 30). Limits and defaults: [bounded admission and retention](concurrent-writes.md#bounded-admission-and-retention).
 
-<a id="doctor-ops-tier"></a>**`gbrain doctor` is slow on a large brain, or you need to see what is wrong in seconds?** Run `gbrain doctor --tier ops --json`. It runs only the operator sections (write capacity, unresolved write failures, a managed sync cursor that stopped moving, receipt compaction freshness (`persistence_compaction`, see [receipt compaction](repair.md#receipt-compaction)), a serve running an older build, schema-pack consistency, embedding state) under a 4000 ms deadline; `--budget-ms <n>` changes it. A section the deadline cut off is reported as unknown (`details.health: "unknown"`, `reason: "budget"`, `exact: false`), never as clear, and the report says `complete: false` with the section in `unknown_sections`; rerun it alone with `gbrain doctor --only <name> --json`. On PGLite, sections that need a Postgres serve (managed sync, terminal-failure receipts, schema packs) read `not_applicable` and the report stays complete. The default doctor runs the same sections first, bounds every other check by `doctor.entry_budget_ms` (default 15000), and estimates `orphan_ratio` from a sample above `doctor.orphan_ratio.full_scan_max_pages` pages (default 50000); `--tier deep` scans fully. From a thin client, `gbrain doctor --tier ops` (or `--only persistence_capacity`) asks the serve: an admin token gets the ops report, a read token gets the `get_brain_health` bands (capacity and write failures as bands, no raw counts), and a serve that predates the ops tier refuses `doctor_tier_unavailable`: run `gbrain doctor --tier ops --json` on the brain host or upgrade and restart its serve. Agents without a shell call MCP `get_brain_health` (read scope) or `run_doctor` with `tier: "ops"` (admin).
+<a id="doctor-ops-tier"></a>**`gbrain doctor` is slow on a large brain, or you need to see what is wrong in seconds?** Run `gbrain doctor --tier ops --json`: only the operator sections (write capacity, unresolved write failures, a managed sync cursor that stopped moving, [receipt compaction](repair.md#receipt-compaction) freshness, a serve on an older build, schema-pack consistency, embedding state) under a 4000 ms deadline (`--budget-ms <n>`). A section the deadline cut off reads unknown (`details.health: "unknown"`, `reason: "budget"`, `exact: false`), never clear; the report says `complete: false` and lists it in `unknown_sections`; rerun it with `gbrain doctor --only <name> --json`. On PGLite, serve-only sections read `not_applicable` and the report stays complete. The default doctor runs the same sections first and bounds each check and a plain `--json` run ([doctor budgets](repair.md#doctor-budgets)); above `doctor.orphan_ratio.full_scan_max_pages` pages (default 50000) it samples `orphan_ratio`, and `--tier deep` scans fully. From a thin client, `gbrain doctor --tier ops` (or `--only persistence_capacity`) asks the serve: an admin token gets the ops report, a read token the `get_brain_health` bands (no raw counts), and a serve that predates the ops tier refuses `doctor_tier_unavailable` (run it on the brain host, or upgrade and restart the serve). Agents without a shell call MCP `get_brain_health` (read) or `run_doctor` with `tier: "ops"` (admin).
 
 <a id="dream-paid-loop"></a>**Dream keeps skipping one transcript, or doctor warns `dream_paid_loop`?** A dream key died `dream.breaker.max_dead_submissions` times (default 3) in 24 hours and is refused so it stops billing you. Fix the cause, then `gbrain dream reset-key --list` and `gbrain dream reset-key '<key>'`. See [the paid-loop breaker](../operations/spend-controls.md#dream-paid-loop-breaker-dreambreakermax_dead_submissions).
 
@@ -11095,6 +11349,7 @@ the exit code first, then reads the JSON document (`--json`) for the details:
 | 10 | the write was accepted and is still pending | write receipt | poll the receipt (`gbrain write-request -- <id>`); `--accept-pending` maps this to 0 |
 | 11 | partial, resumable budget stop | result with `remaining_*` and `resume_command` | run `resume_command` (it is safe to re-run) |
 | 13 | `pending_verify`: `gbrain bootstrap harness --token` wired a PGLite brain while no serve answered; nothing failed, nothing verified yet | the harness result with `status: "pending_verify"` and `fix` | tell the user to start `gbrain serve --http`, then run `fix.command` with the same token; `bootstrap harness --status` stays partial until it passes ([pending verify](bootstrap.md#pending-verify)) |
+| 14 | `bootstrap_cleanup_pending`: `gbrain bootstrap harness` (or `--status`) wired and verified the harness, but earlier shared-skills enrollments or carried token ids are not cleaned up yet | the harness result with `status: "cleanup_pending"`, a per-id `cleanup` list and `fix` | follow `fix.next`: `run` re-runs the same command; `tell_user_to_run` relays the owner's revoke or restore step, then re-run ([cleanup pending](bootstrap.md#cleanup-pending)) |
 | 69 | `gbrain serve` exited on its own after its persistence consumer reported `restart_required` for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS` (`serve_unhealthy_exit`; opt-in) | `[gbrain serve] error code=serve_unhealthy_exit` line on stderr | nothing: the supervisor (the installed service restarts on failure) starts a fresh serve; if it repeats, follow [the unhealthy exit](../ENGINES.md#serve-unhealthy-exit) |
 | 75 | another runner holds the migration lock, or an engine graduation owns the brain (`graduation_in_progress`) | error envelope | wait for the other runner, then retry |
 | 124 | the command's own deadline elapsed | error envelope | inspect what is still running (the message names the status command) |
@@ -11108,569 +11363,6 @@ need the user's confirmation (documented legacy; changing it is a v2 item).
 
 The per-command exit changes that came with contract v1 (v0.60.46.0) are in
 the [CHANGELOG](../../CHANGELOG.md#exit-code-changes-by-command).
-
----
-
-## docs/guides/minions-fix.md
-
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/minions-fix.md
-
-# Minions fix: repairing a blocked worker or half-migrated install
-
-**Say to your agent:** *"Use `gbrain jobs supervisor status --json` and
-`gbrain doctor --no-migrate` to find why my worker stopped. Show me the affected
-installation and proposed repair before changing anything or retrying jobs."*
-
-A local driver or child-CLI configuration failure is not a database outage.
-Repair the installation that actually runs the worker, then explicitly restart
-its owner. Repeated restarts or replaying the queue do not repair a missing
-driver capability.
-
-For a **half-migrated install** (no completed migration, autopilot still inline,
-or cron jobs still on `agentTurn`), use the [migration repair](#migration-repair)
-below. Do not use migrations as a substitute for repairing a broken driver.
-
-## Identify the owner and installation first
-
-Work in the same account, brain, `GBRAIN_HOME`, configuration and environment as
-the affected owner. A healthy `gbrain` in an interactive shell does not prove a
-service uses that executable. Preserve queue, concurrency, CLI-path and other
-existing launch options throughout the repair.
-
-| Owner | Inspect | Stop processing before repair | Explicit restart after verification |
-|---|---|---|---|
-| Foreground `gbrain jobs work` | Its startup output and terminal | Ctrl-C in that terminal; wait for shutdown | Run the same `gbrain jobs work` invocation again |
-| Standalone jobs supervisor | `gbrain jobs supervisor status --json` | `gbrain jobs supervisor stop --json` | `gbrain jobs supervisor start --detach --json` with the original options |
-| Autopilot under user systemd | `gbrain autopilot --status --json`; `systemctl --user status gbrain-autopilot.service` | `systemctl --user stop gbrain-autopilot.service` | `systemctl --user start gbrain-autopilot.service` |
-| Autopilot under launchd | `gbrain autopilot --status --json`; `launchctl print "gui/$(id -u)/com.gbrain.autopilot"` | `launchctl bootout "gui/$(id -u)/com.gbrain.autopilot"` | `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gbrain.autopilot.plist"` |
-
-These are the default brain's user-service names. A brain under any other
-`GBRAIN_HOME` uses its own suffixed names; `gbrain autopilot --status --json`
-prints them under `job` ([several brains on one host](live-sync.md#several-brains-on-one-host)).
-If the installation uses a different
-service definition, use its actual name and recorded launcher. For a foreground
-autopilot or a container/cron owner, stop and restart that owner through its
-existing launcher; do not start a competing standalone supervisor. A timed-out
-stop is not confirmation that work has stopped. Inspect remaining processes
-before proceeding.
-
-For systemd, inspect `systemctl --user cat gbrain-autopilot.service`. For
-launchd, inspect the installed plist's `ProgramArguments`. Follow any wrapper
-to the exact executable or checkout it invokes. Do not paste environment
-files, credentials or database URLs into a public report.
-
-### Upgrade and rollback ordering
-
-Upgrading while an older owner (0.59.0.0 or earlier) is still running keeps
-working: that owner respawns the upgraded worker, which processes jobs without
-publishing readiness status. Restart the owner when convenient to get readiness
-reporting and configuration blocking. Rolling a worker back below 0.59.3.0
-under a 0.59.3.0 or later owner is different: the older worker never reports
-readiness, so the owner's 120-second startup deadline stops and restarts it
-repeatedly. Stop the owner first, roll back, then start the owner from the
-rolled-back installation.
-
-## Interpret the failure before choosing a repair
-
-Workers check readiness before queue recovery or claiming jobs. In process
-isolation, readiness also checks the selected job-child CLI. Periodic probes
-continue to distinguish local configuration failures from database failures.
-
-| Finding | Meaning | Action |
-|---|---|---|
-| `client_misconfigured` with `postgres_cancellation_unavailable` | The actual Postgres connection owner lacks the cancellation capability required for signalled SQL | Repair the worker's driver installation; also verify the selected job-child installation |
-| `child_executable_invalid` | The selected child executable cannot be used | Follow [child executable repair](#child-executable-invalid) |
-| `child_protocol_incompatible` | The selected child does not implement the required worker protocol/capabilities | Follow [child protocol repair](#child-protocol-incompatible) |
-| `pool_starved` | The read lane failed while the direct lane answered | Follow [transient or slow retry diagnosis](#transient-or-slow-retry); do not label this a missing driver patch |
-| `server_unreachable` | The database probes failed without evidence of a local capability failure | Diagnose reachability and allow bounded [transient retries](#transient-or-slow-retry) |
-| `unknown` | The available probe evidence cannot distinguish the cause, for example without a direct lane | Inspect the diagnostic detail; do not guess a permanent configuration fault |
-
-A reservation timeout, network error or ordinary cancellation alone does not
-prove the driver is incompatible. A typed local capability fault on either
-lane takes precedence over a generic outage diagnosis. PGLite does not require
-the Postgres cancellation capability and does not use the standalone Postgres
-supervisor.
-
-### Configuration blocked
-
-**Liveness is not readiness.** A supervisor or autopilot can be alive and
-heartbeating while configuration-blocked and unable to start work. Read the
-additive `processing_ready`, `processing_state`, `processing_stage`, `retry_at`,
-`reason_code`, `blocked_since`, `worker_identity` and `child_identity` fields as
-well as the existing running/freshness status.
-`processing_state: configuration_blocked` means no
-processing even when the liveness command exits successfully. Missing readiness
-data is not evidence of readiness; standalone supervisor status reports
-`unknown` for a live owner without that data and `stopped` when not running.
-A blocked owner stays blocked: repairing files in place does not silently
-resume processing. Repair, verify, then explicitly restart the owner.
-
-These are **illustrative subsets**, not complete status responses. A healthy
-standalone supervisor can report:
-
-```json
-{
-  "running": true,
-  "processing_ready": true,
-  "processing_state": "ready",
-  "processing_stage": "ready",
-  "retry_at": null,
-  "reason_code": null,
-  "blocked_since": null,
-  "worker_identity": { "executable": "/opt/gbrain/gbrain", "version": "1.2.3" },
-  "child_identity": { "executable": "/opt/gbrain/gbrain", "version": "1.2.3", "protocol_version": 1 }
-}
-```
-
-The same live owner can instead be blocked by a stale child override:
-
-```json
-{
-  "running": true,
-  "processing_ready": false,
-  "processing_state": "configuration_blocked",
-  "processing_stage": "configuration_blocked",
-  "retry_at": null,
-  "reason_code": "child_protocol_incompatible",
-  "blocked_since": "2026-01-01T12:00:00.000Z",
-  "worker_identity": { "executable": "/opt/gbrain/gbrain", "version": "1.2.3" },
-  "child_identity": { "executable": "/opt/gbrain-old/gbrain", "version": "unknown" }
-}
-```
-
-`unknown` does not identify an installed version; it means the handshake did
-not establish one. Identities may also be `null` when unavailable. Autopilot
-retains its own freshness `state` instead of the supervisor's `running` field;
-its additive processing fields must be checked separately. Neither example
-proves that queued jobs have completed.
-
-### Transient or slow retry
-
-Ordinary crashes still use the soft retry budget (`--max-crashes`) and capped
-backoff. Crossing that budget means degraded retries, not a permanent stop.
-The separate hard crash ceiling is terminal. A known local configuration fault
-blocks immediately rather than consuming those generic crash budgets; a long
-network outage is not reclassified as a local fault merely because it lasts.
-
-`processing_state` remains the coarse `starting`, `ready` or
-`configuration_blocked` verdict. `processing_stage` explains the current wait:
-
-| `processing_stage` | What to inspect |
-|---|---|
-| `startup_readiness` | The owner is awaiting worker readiness; inspect subsequent stage updates and startup logs |
-| `database_readiness` | Required database lanes are being checked; inspect connectivity and pool availability |
-| `child_readiness` | The selected child is being checked; inspect its recorded identity and explicit override |
-| `worker_startup` | Worker startup is not yet complete; wait for the actual `ready` transition |
-| `ready` | Startup readiness completed; verify real queue progress separately |
-| `startup_timeout` | Readiness exceeded the owner's startup budget; inspect logs, not a guessed permanent-fault diagnosis |
-| `retry_backoff` | The owner is delaying another attempt; inspect `retry_at` |
-| `configuration_blocked` | Automatic retries are disabled; repair and explicitly restart the owner |
-| `stopped` | The worker is not processing; inspect owner liveness and why it stopped |
-
-During `retry_backoff`, `retry_at` is the owner's next scheduled retry timestamp
-in ISO format, or `null` when no timestamp is available. It is not a guarantee
-that the database will be healthy or a job will run at that time. For example,
-this live supervisor is waiting, not configuration-blocked:
-
-```json
-{
-  "running": true,
-  "processing_ready": false,
-  "processing_state": "starting",
-  "processing_stage": "retry_backoff",
-  "retry_at": "2026-01-01T12:01:00.000Z",
-  "reason_code": null
-}
-```
-
-A configuration block has `retry_at: null` and still requires manual restart
-after repair. A null timestamp alone does not mean blocked: a probe can still
-be running. If the standalone owner has no current status record, both state
-and stage fall back to `unknown` when alive or `stopped` when not running;
-those fallback labels are not extra worker protocol states.
-
-If readiness is still starting or the latest log says it is temporarily
-unavailable, compare successive owner-status observations and the owner's
-logs. A single slow probe or an expired handshake deadline is not a permanent
-fault. Check `gbrain engine status --probe` with the actual launcher; distinguish
-database/network failure from pool saturation. Restore connectivity or reduce
-the identified competing work with approval, then let the existing owner retry.
-Do not repeatedly start new supervisors to accelerate backoff. A foreground
-worker that has exited needs an explicit rerun; it has no owner to retry it.
-
-If status remains `unknown`, verify the owner account, `GBRAIN_HOME` and PID-file
-selection before concluding the worker is ready or stopped. Missing diagnostics
-do not authorize clearing a configuration block. Never reset crash/stall
-counters or replay jobs merely because recovery is slow.
-
-If the worker says readiness status could not be published, no jobs were
-admitted. Check that its original owner is still running under the expected
-account and that the owner's runtime directory is writable. Repair that path
-and explicitly restart the owner; do not fabricate status files or copy an old
-worker's internal status environment into a new process.
-
-## Repair the installation that owns the failure
-
-### Postgres cancellation unavailable
-
-Stop the affected owner using the table above. Obtain approval for installation
-changes separately from diagnostic commands. Choose the matching branch:
-
-- **Bun global install:** reinstall a known-good GBrain release under the same
-  account and Bun installation used by the service. The canonical GitHub path
-  is `bun install -g github:garrytan/gbrain`; use an approved release ref when
-  pinning. Do not substitute the unrelated npm package or change another
-  account's global installation.
-- **Checkout install:** switch that checkout to the approved fixed revision,
-  then run `bun install` in that checkout. If the service uses a linked CLI,
-  verify its link still points there. Updating Git without refreshing stale
-  dependencies is not enough.
-- **Compiled executable:** replace the exact executable named by the service
-  with the approved fixed build. Updating a separate source checkout does not
-  change an already compiled executable.
-
-GBrain ships its cancellation-capable Postgres.js 3.4.9 in `vendor/postgres`,
-with the upstream license. The package-private `#postgres` import maps directly
-to that source; compiled builds embed the same resolved driver. The cancellation
-changes are recorded in `patches/postgres@3.4.9.patch`. This avoids relying on
-transitive local dependencies or a consuming global installation to reapply
-GBrain's dependency patch. Repair the GBrain package
-as a unit, not by installing stock `postgres` over it or editing another
-installation's `node_modules`.
-
-Maintainers should follow [driver provenance and update instructions](../../vendor/README.md)
-and use `bash vendor/update-postgres.sh --check` to verify the vendored bytes.
-A version string is not a substitute for validating the actual reserved
-connection's capability.
-
-Do not bypass the readiness check, remove AbortSignals or use an unsignalled
-timeout race as a workaround. Safe cancellation must stop the underlying SQL
-and discard its connection when required, not just abandon the caller's wait.
-
-The default job-child CLI follows the current worker's installation. An explicit
-`GBRAIN_JOB_CHILD_CLI` override remains authoritative and can keep selecting a
-stale executable after the worker has been repaired. Check it in the service's
-environment, not just the interactive shell. A compatible version difference
-is diagnostic information; a protocol or required-capability mismatch blocks
-startup. Do not clear an intentional override without the operator's approval.
-
-### Child executable invalid
-
-For `child_executable_invalid`, stop the original owner and compare its recorded
-`child_identity.executable` with `GBRAIN_JOB_CHILD_CLI` in that owner's
-environment. Check that the selected file exists and is executable by that
-account. A path in a different interactive shell is not a repair. Use the
-matching global, checkout or compiled-install branch above; change a stale
-override or permissions only with approval. Then run the diagnostics below
-against both installations and explicitly restart the original owner. Do not
-fall back to a different PATH executable without explaining the change.
-
-### Child protocol incompatible
-
-For `child_protocol_incompatible`, repair the selected child with a compatible
-GBrain release, not just the parent worker. A completed malformed reply or
-missing required protocol/capability can cause this diagnosis; a timeout alone
-does not. Inspect the explicit override first. Compare each executable's
-reported version, but do not treat equal versions as proof of compatibility or
-different versions as proof of failure. The automatic startup handshake is the
-protocol/capability check. Keep the block in place until repair and explicit
-owner restart; do not invoke the hidden handshake command as a public repair
-API or bypass its guard.
-
-## Verify, restart and watch actual progress
-
-### Read-only readiness diagnostics
-
-Run this Bash block under the owner's account, working directory and environment,
-including its `GBRAIN_HOME`, brain selection and `GBRAIN_JOB_CHILD_CLI` if set.
-Edit the absolute launcher and owner-status array first. For a checkout, use
-`actual_cli=(/absolute/path/to/bun /absolute/path/to/gbrain/src/cli.ts)`.
-Use the CLI itself, not the service start wrapper: a wrapper may ignore the
-diagnostic arguments and start processing instead.
-For autopilot, replace the status array with
-`owner_status=(autopilot --status --json)`. For a standalone supervisor, retain
-its actual `--queue` and `--pid-file` options. Do not source an arbitrary service
-file as shell code or print its secrets.
-
-```bash
-(
-  actual_cli=(/absolute/path/to/gbrain)
-  owner_status=(jobs supervisor status --json)
-  brain_args=()
-  diagnostic_failed=0
-
-  if [[ ! -x "${actual_cli[0]}" ]]; then
-    printf 'Set actual_cli to the executable used by this owner.\n' >&2
-    exit 2
-  fi
-
-  run_check() {
-    local label="$1" code
-    shift
-    printf '\n--- %s ---\n' "$label"
-    if "$@"; then code=0; else code=$?; diagnostic_failed=1; fi
-    printf '\n[%s: exit %s]\n' "$label" "$code"
-  }
-
-  printf 'Worker invocation:'
-  printf ' %q' "${actual_cli[@]}"
-  printf '\n'
-  run_check 'Worker version' "${actual_cli[@]}" --version
-  run_check 'Owner status' "${actual_cli[@]}" "${brain_args[@]}" "${owner_status[@]}"
-  run_check 'Worker doctor' "${actual_cli[@]}" "${brain_args[@]}" doctor --no-migrate --json
-  run_check 'Database reachability' "${actual_cli[@]}" "${brain_args[@]}" engine status --probe
-
-  if [[ -n "${GBRAIN_JOB_CHILD_CLI:-}" ]]; then
-    printf '\nExplicit child invocation: %q\n' "$GBRAIN_JOB_CHILD_CLI"
-    child_executable=$(command -v -- "$GBRAIN_JOB_CHILD_CLI") || child_executable=''
-    if [[ -n "$child_executable" && -x "$child_executable" ]]; then
-      printf 'Resolved child executable: %q\n' "$child_executable"
-      run_check 'Selected child version' "$child_executable" --version
-      run_check 'Selected child doctor' "$child_executable" "${brain_args[@]}" doctor --no-migrate --json
-    else
-      printf 'Selected child is missing or not executable by this account.\n' >&2
-      diagnostic_failed=1
-    fi
-  else
-    printf '\nNo explicit child override in this environment; compare child_identity with the worker installation.\n'
-  fi
-  exit "$diagnostic_failed"
-)
-```
-
-If the original worker is foreground-only, use `owner_status=()` and omit the
-`run_check 'Owner status'` line: there is no owning daemon status to query. Inspect
-that worker's terminal diagnostics instead. Set `brain_args=(--brain example-brain)`
-only when that matches the owner's original selection; otherwise leave it empty.
-
-This block does not install, migrate, restart, claim or retry work. Nonzero
-diagnostic exits are printed and retained in the block's final exit code, not
-treated as proof that the next check cannot run. `doctor --no-migrate` reports
-the current schema without applying migrations; do not add `--fix` or replace
-it with plain `doctor` in this diagnostic block.
-Supervisor status also skips schema migration when it needs a database lookup
-because the local PID file is absent. These are observational commands, not a
-filesystem-forensic read-only mode: opening an embedded database can touch its
-raw database files or WAL, just as `doctor --no-migrate` can.
-An exit of zero from the block is not a readiness verdict: owner status keeps
-its liveness exit semantics, so a blocked owner can still return zero. Check
-`processing_ready`, `processing_state` and the identity match below explicitly.
-
-**Verify the identity match before interpreting health:** compare the printed
-worker invocation and version with `worker_identity` in owner status. With a
-source launcher, compare its CLI source path, not just the Bun executable. If
-an override is set, compare its path and separately printed version with
-`child_identity`; an absent/`unknown` identity is an unresolved check, not a
-match. Follow symlinks or wrappers to the recorded installation if the spellings
-differ. If status names another installation, stop and correct the diagnostic
-context rather than repairing the one found by your interactive PATH.
-
-These public diagnostics gather readiness evidence; they do not run or bypass
-the internal protocol. The worker's automatic startup handshake validates the
-selected child's protocol and database readiness before any claims. A parent's
-doctor result does not certify a different child installation. With a live
-PGLite owner, a separate DB-backed doctor may be unable to acquire the exclusive
-file lock; report that limitation rather than stopping the owner automatically
-or declaring the check passed. Review output locally and redact private paths,
-URLs and credentials before sharing it.
-
-An ordinary successful SQL query alone is not proof that cancellation works.
-Doctor and database-repair diagnostics remain usable with a broken driver;
-they must be able to explain the local failure. For a reachability failure,
-follow [engine detection and access repair](../ENGINES.md#engine-detection-and-access-repair)
-instead of repeatedly reinstalling.
-
-After verification, explicitly restart only the original owner using the
-table above. Confirm readiness, then inspect queue progress:
-
-```bash
-gbrain jobs stats --json
-gbrain jobs list
-```
-
-Compare successive observations: completed jobs should increase when work is
-available, without recurring worker restarts or growing stall counts. An empty
-queue is valid; do not create paid or side-effecting work just to make a counter
-move. A live process alone does not establish recovery.
-
-**Say to your agent:** *"Verify the repaired worker and its selected child CLI,
-restart only the original owner with my approval, and show whether existing
-jobs complete without new restarts or stalls. Do not replay failed jobs."*
-
-## In-flight work and limits of recovery
-
-A local fault discovered after startup stops new claims first. Confirmed
-stopped work can be returned to delayed state through an active-job and
-ownership-token check, without charging an attempt or stall solely for this
-configuration shutdown. A stale token must not overwrite a completed,
-cancelled or newly owned job.
-
-### Release-unconfirmed
-
-**Unconfirmed shutdown or release is not a successful requeue.** An inline
-handler may ignore cancellation; a child may leave descendants; a cleanup
-signal or database release may fail. If execution stop or token-fenced release
-cannot be confirmed within the shutdown budget, lease expiry is the fallback.
-That fallback can still incur stalls, and surviving work may still perform
-side effects. Inspect the per-job result before deciding what to retry.
-
-Process-group cleanup and optional tini subreaper mode improve cleanup on
-supported systems. Positive stop verification currently uses bounded Linux
-`/proc` checks of known groups and observed descendants; unavailable or failed
-checks retain the unconfirmed fallback. They do not guarantee containment of
-descendants that escaped before observation, and running under tini does not
-make every process PID 1. Per-child hard RSS enforcement remains a separate TODO; this repair
-does not control every large job's memory use or eliminate autopilot's own
-memory footprint.
-
-Inspect dead-lettered and failed jobs individually. At-least-once execution
-means a job can have performed side effects before it stopped. Do not reset
-stall counts, retry all dead letters or replay the queue as part of installation
-repair. Retry only explicitly selected work after reviewing its effects and
-obtaining approval.
-
-## Migration repair
-
-Minions self-heals on upgrade. If an install is only partially
-set up (no `~/.gbrain/preferences.json`, autopilot still inline, cron jobs
-still on `agentTurn`), run:
-
-```bash
-gbrain apply-migrations --yes
-```
-
-It's idempotent. On an install that already migrated it's a cheap no-op.
-
-## Context
-
-The Minions schema, queue, worker, and migration skill ship together, and
-the migration fires automatically on `gbrain upgrade` and via the
-`postinstall` hook. An install is half-migrated when the schema is present
-but the migration never completed: no `~/.gbrain/preferences.json`,
-autopilot still runs inline, cron jobs still call `agentTurn`. This guide
-covers detecting that state and finishing the migration.
-
-## Detecting the half-migrated state
-
-```bash
-gbrain doctor
-```
-
-If the install is half-migrated, you'll see the `minions_migration` check
-fail:
-
-```
-[FAIL] minions_migration: MINIONS HALF-INSTALLED (partial migration: 0.11.0). Run: gbrain apply-migrations --yes
-```
-
-Three or more partial records in a row read as `WEDGED MIGRATION(s)` and name
-`gbrain apply-migrations --force-retry <version>`. After that retry the version
-is pending again, and doctor warns that it has not run yet with the plain
-`gbrain apply-migrations --yes` command. Doctor also warns when the ledger shows
-a host migration that a newer one already ran past, so it never ran:
-
-```
-[WARN] minions_migration: 1 host migration(s) not run yet: 0.53.0. Run: gbrain apply-migrations --yes
-```
-
-(Missing `~/.gbrain/preferences.json` on a fresh install is a valid
-pre-`apply-migrations` state — doctor deliberately does NOT fail on that
-alone; the partial-migration record is the canonical half-migration signal.)
-
-For a machine-readable report (cron-friendly):
-
-```bash
-gbrain skillpack-check --quiet && echo healthy || echo needs_action
-gbrain skillpack-check | jq -r '.actions[]'    # prints proposed repairs, without executing them
-```
-
-Health checks report proposals only. Review the action and scope and obtain
-separate approval before applying a repair, installing services or spending money.
-
-## The fix
-
-```bash
-gbrain apply-migrations --yes
-```
-
-Reads `~/.gbrain/migrations/completed.jsonl`, diffs against the TS
-migration registry, runs whatever's pending. Seven phases:
-
-```
-A. Schema        gbrain init --migrate-only
-B. Smoke         gbrain jobs smoke
-C. Mode          prompt (or --yes default pain_triggered)
-D. Prefs         write ~/.gbrain/preferences.json
-E. Host          AGENTS.md marker injection + cron rewrites for gbrain
-                 builtins; JSONL TODOs for host-specific handlers
-F. Install       gbrain autopilot --install (env-aware)
-G. Record        append completed.jsonl status:"complete"
-```
-
-If Phase E emits TODOs for host-specific handlers (e.g. your OpenClaw's
-own non-gbrain crons), the migration finishes with `status: "partial"`.
-Your host agent walks the TODOs using `skills/migrations/v0.11.0.md` +
-`docs/guides/plugin-handlers.md`, ships handler registrations in the
-host repo, then re-runs `gbrain apply-migrations --yes`. Newly
-registerable cron entries get rewritten and the JSONL rows mark
-`status: "complete"`.
-
-A failed phase makes the run exit nonzero and prevents that attempt from being
-recorded as complete. Inspect the reported phase failure before retrying;
-pending host work is not the only reason an attempt can remain partial.
-
-## Verify the fix landed
-
-```bash
-# 1. Preferences exist and are readable
-cat ~/.gbrain/preferences.json
-
-# 2. Migration recorded
-cat ~/.gbrain/migrations/completed.jsonl
-
-# 3. Autopilot is supervising a Minions worker child
-# (the exit code is the verdict — 0 fresh, 1 needs attention,
-#  2 self-disabled — so a nonzero exit here IS the finding, not a
-#  broken verify step. Under `set -e`, append `|| true` to keep going.)
-gbrain autopilot --status
-ps aux | grep 'jobs work'
-
-# 4. Jobs show up in the queue
-gbrain jobs list
-
-# 5. Any host-specific TODOs still pending
-cat ~/.gbrain/migrations/pending-host-work.jsonl 2>/dev/null || echo "(none — all host work is done)"
-
-# 6. Doctor + skillpack-check should both be clean
-gbrain doctor
-gbrain skillpack-check --quiet && echo ok
-```
-
-## If the fix fails
-
-Each phase is idempotent. Re-running is safe. Common failure modes:
-
-- **Phase B smoke fails:** the schema didn't apply. Check
-  `~/.gbrain/config.json` has a valid `database_url` (or `database_path`
-  for PGLite). Run `gbrain init --migrate-only` directly and look at
-  the error.
-- **Phase F install fails:** your host environment doesn't match any
-  detected target. Pass `--target <macos|linux-systemd|ephemeral-container|linux-cron>`
-  explicitly.
-- **Pending host work never clears:** your host agent hasn't shipped
-  handler registrations yet. Read
-  `~/.gbrain/migrations/pending-host-work.jsonl`, open
-  `skills/migrations/v0.11.0.md`, and follow the host-agent instruction
-  manual.
-
-## Related
-
-- `skills/migrations/v0.11.0.md` — full migration skill for host agents.
-- `skills/skillpack-check/SKILL.md` — when and how to run the health check.
-- `docs/guides/plugin-handlers.md` — plugin contract for host-specific
-  handlers.
-- `skills/conventions/cron-via-minions.md` — the canonical cron rewrite
-  pattern.
 
 ---
 

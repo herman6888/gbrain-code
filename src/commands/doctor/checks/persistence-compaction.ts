@@ -45,26 +45,39 @@ export async function checkPersistenceCompaction(engine: BrainEngine): Promise<C
  * (`terminal_reservation` per request, plus lifecycle receipts) per principal
  * and brain-wide. Read-only, one statement (one snapshot); also reports how
  * many true-up decrements were clamped at zero (`persistence.true_up.clamped`).
+ * #6759: each drifting scope names its direction (a positive delta is a
+ * bounded overcharge of write capacity, a negative one under-counts) and the
+ * receipts behind it by kind; the comparison is live, so a warn's incident is
+ * current.
  */
 export async function checkPersistenceCounterDrift(engine: BrainEngine): Promise<Check> {
   try {
-    const rows = await engine.executeRaw<{ key: string; counter: string; receipts: string | null; clamped: string | null }>(`WITH s AS (
-        SELECT key,SUM(bytes) AS bytes FROM (
-          SELECT 'principal:'||principal_kind||':'||principal_id AS key,terminal_reservation AS bytes FROM persistence_requests
-          UNION ALL SELECT 'principal:local_cli:'||principal_id::text,terminal_bytes FROM persistence_topology_changes) u GROUP BY key),
-      every AS (SELECT key,bytes FROM s UNION ALL SELECT 'brain',SUM(bytes) FROM s)
-      SELECT c.key,c.terminal_bytes::text AS counter,COALESCE(e.bytes,0)::text AS receipts,(SELECT value FROM config WHERE key=$1) AS clamped
+    const rows = await engine.executeRaw<{ key: string; counter: string; req_rows: string; req_bytes: string; topo_rows: string; topo_bytes: string; clamped: string | null }>(`WITH u AS (
+          SELECT 'principal:'||principal_kind||':'||principal_id AS key,'requests' AS kind,terminal_reservation AS bytes FROM persistence_requests
+          UNION ALL SELECT 'principal:local_cli:'||principal_id::text,'topology_changes',terminal_bytes FROM persistence_topology_changes),
+      s AS (SELECT key,count(*) FILTER (WHERE kind='requests') AS req_rows,COALESCE(SUM(bytes) FILTER (WHERE kind='requests'),0) AS req_bytes,
+          count(*) FILTER (WHERE kind='topology_changes') AS topo_rows,COALESCE(SUM(bytes) FILTER (WHERE kind='topology_changes'),0) AS topo_bytes FROM u GROUP BY key),
+      every AS (SELECT * FROM s UNION ALL SELECT 'brain',COALESCE(SUM(req_rows),0),COALESCE(SUM(req_bytes),0),COALESCE(SUM(topo_rows),0),COALESCE(SUM(topo_bytes),0) FROM s)
+      SELECT c.key,c.terminal_bytes::text AS counter,COALESCE(e.req_rows,0)::text AS req_rows,COALESCE(e.req_bytes,0)::text AS req_bytes,
+        COALESCE(e.topo_rows,0)::text AS topo_rows,COALESCE(e.topo_bytes,0)::text AS topo_bytes,(SELECT value FROM config WHERE key=$1) AS clamped
       FROM persistence_counters c LEFT JOIN every e ON e.key=c.key WHERE c.key='brain' OR c.key LIKE 'principal:%' ORDER BY c.key`, [TRUE_UP_CLAMPED_KEY]);
     const clamped = Number(rows[0]?.clamped ?? 0) || 0;
-    const drift = rows.map(row => ({ scope: row.key, counter: Number(row.counter), receipts: Number(row.receipts), delta: Number(row.counter) - Number(row.receipts) }))
-      .filter(row => row.delta !== 0);
+    const drift = rows.map(row => {
+      const receipts = Number(row.req_bytes) + Number(row.topo_bytes);
+      const delta = Number(row.counter) - receipts;
+      return { scope: row.key, counter: Number(row.counter), receipts, delta, direction: delta > 0 ? 'overcharge' : 'undercount',
+        receipts_by_kind: { requests: { rows: Number(row.req_rows), bytes: Number(row.req_bytes) }, topology_changes: { rows: Number(row.topo_rows), bytes: Number(row.topo_bytes) } } };
+    }).filter(row => row.delta !== 0);
     const details = { inspected: rows.length, drift, true_up_clamped: clamped, docs: DRIFT_DOCS };
     if (!drift.length) return { name: 'persistence_counter_drift', status: 'ok', details,
       message: `Receipt-bytes counters match the receipts they account for (${rows.length} scope(s))${clamped ? `; ${clamped} true-up decrement(s) were clamped at zero earlier` : ''}.` };
-    return { name: 'persistence_counter_drift', status: 'warn', details,
-      message: `Receipt-bytes counters differ from the receipts they account for: ${drift.map(row => `${row.scope} counter ${row.counter} vs receipts ${row.receipts} (${row.delta > 0 ? '+' : ''}${row.delta})`).join('; ')}. `
-        + `A positive delta charges capacity no receipt holds; a negative one under-counts.${clamped ? ` ${clamped} true-up decrement(s) were clamped at zero.` : ''} `
-        + 'Nothing is changed by this check; report it with gbrain doctor --only persistence_counter_drift --json.' };
+    return { name: 'persistence_counter_drift', status: 'warn', details: { ...details, incident: { scope: 'current', since: null } },
+      message: `Receipt-bytes counters differ from the receipts they account for: ${drift.map(row => `${row.scope} counter ${row.counter} vs receipts ${row.receipts} (${row.delta > 0 ? '+' : ''}${row.delta}): `
+          + (row.delta > 0 ? `a bounded overcharge of ${row.delta} bytes` : `under-counts by ${-row.delta} bytes`)).join('; ')}. `
+        + (drift.some(row => row.delta > 0) ? 'An overcharge holds back write capacity no receipt uses; no data is lost. ' : '')
+        + (drift.some(row => row.delta < 0) ? 'An under-count lets writes use capacity the receipts already reserve. ' : '')
+        + `${clamped ? `${clamped} true-up decrement(s) were clamped at zero. ` : ''}`
+        + 'Nothing is changed by this check; details.drift lists the receipts behind each scope by kind. Report it with gbrain doctor --only persistence_counter_drift --json.' };
   } catch (error) {
     return { name: 'persistence_counter_drift', status: 'warn', message: `Receipt-bytes counters could not be compared: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
       details: { health: 'unknown' } };

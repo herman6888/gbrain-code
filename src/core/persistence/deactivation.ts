@@ -98,7 +98,7 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
     blockers.push({ kind: 'request', id: r.request_id, source_id: r.source_id, detail: `${r.operation} ${r.state}${r.recovering ? ', recovering' : ''} (${r.source_id}:${r.slug})`,
       exit: r.state === 'queued' && !r.recovering ? `gbrain cancel-write-request ${r.request_id} (MCP: cancel_write_request), or wait for the owner to publish it`
         : r.state === 'running' && !r.recovering ? 'wait for the owner to finish publishing it, then rerun deactivate'
-          : `gbrain sync --source ${r.source_id} --no-pull --retry-failed` });
+          : `gbrain sync --source ${r.source_id} --no-pull` });
   }
   const topology = await engine.executeRaw<{ id: string; operation: string; source_id: string }>(
     "SELECT id::text AS id, operation, source_id FROM persistence_topology_changes WHERE state='recovering' OR recovery IS NOT NULL ORDER BY created_at LIMIT 20");

@@ -168,20 +168,40 @@ function freeze(event: Record<string, unknown>): never {
 /**
  * Seams one request can reach more than once by design: a preparation runs
  * again after a revision conflict or a group cut, as often as timing
- * dictates (7 to 10 preparations for the same 8-op schedule). Counting every
- * pass made the count run and the run role disagree on nth, so a fault could
- * go unreached. These seams count each request once (its first pass).
+ * dictates (7 to 10 preparations for the same 8-op schedule), and a prepared
+ * request whose publication is requeued (`writer_lock_unavailable`) is
+ * prepared again (caller_bound_replay counted 4 or 5 `consumer:prepared`).
+ * Counting every pass made the count run and the run role disagree on nth,
+ * so a fault could go unreached. These seams count each write request row
+ * once (its first pass), keyed on `writeId`: a caller-bound replay's rows
+ * share one `requestId`.
  */
-const PER_REQUEST_SEAMS: ReadonlySet<FaultPoint> = new Set<FaultPoint>(['consumer:preparing']);
-/** True when this pass counts toward the seam's nth: always, except a repeat of the same request at a per-request seam. */
-export function seamCounter(): (point: FaultPoint, detail: FaultDetail) => boolean {
-  const seen = new Set<string>();
+const PER_REQUEST_SEAMS: ReadonlySet<FaultPoint> = new Set<FaultPoint>(['consumer:preparing', 'consumer:prepared']);
+/**
+ * #6896: `consumer:claiming` fires before every claim attempt, the consumer's idle ticks and the passes that find
+ * the root busy included, so how many passes a run makes follows wall-clock time, not the schedule (a count role
+ * saw 19, the run made fewer and its fault at #19 went unreached). It counts in claim epochs instead: the number of
+ * distinct write request rows that have reached `consumer:preparing`. The first pass at epoch e or later advances
+ * the count to e + 1, so slot n is the first claim attempt after n - 1 requests were prepared; requests of one root
+ * are claimed one after another, so every slot the count role saw comes again in the run.
+ */
+/** How far this pass advances the seam's count: 1, 0 for a repeat of the same request at a per-request seam, the epochs passed at the claim seam. */
+export function seamCounter(): (point: FaultPoint, detail: FaultDetail) => number {
+  const seen = new Set<string>(), prepared = new Set<string>();
+  let claimSlots = 0;
   return (point, detail) => {
-    if (!PER_REQUEST_SEAMS.has(point) || !detail.requestId) return true;
-    const key = `${point}\u0000${detail.requestId}`;
-    if (seen.has(key)) return false;
+    const request = detail.writeId ?? detail.requestId;
+    if (point === 'consumer:preparing' && request) prepared.add(request);
+    if (point === 'consumer:claiming') {
+      const advanced = Math.max(0, prepared.size + 1 - claimSlots);
+      claimSlots += advanced;
+      return advanced;
+    }
+    if (!PER_REQUEST_SEAMS.has(point) || !request) return 1;
+    const key = `${point}\u0000${request}`;
+    if (seen.has(key)) return 0;
     seen.add(key);
-    return true;
+    return 1;
   };
 }
 
@@ -196,7 +216,10 @@ export function robotFaultHook(fault: NonNullable<RobotConfig['fault']>): (point
   let seen = 0;
   const counts = seamCounter();
   return (point, detail) => {
-    if (point !== fault.point || (fault.operation && detail.operation !== fault.operation) || !counts(point, detail) || ++seen !== fault.nth) return;
+    const advanced = counts(point, detail);
+    if (point !== fault.point || (fault.operation && detail.operation !== fault.operation) || !advanced) return;
+    seen += advanced;
+    if (seen < fault.nth) return;
     try { freeze({ event: 'fault', point, nth: seen, detail }); }
     catch (error) { freeze({ event: 'fault_hook_error', point, nth: seen, message: error instanceof Error ? error.message : String(error) }); }
   };
@@ -367,7 +390,7 @@ export async function robotWorker(role: 'count' | 'run' | 'recover', config: Rob
     installLockOrderTrace();
     const counts: Record<string, number> = {};
     const counted = seamCounter();
-    if (role === 'count') installFaultHook((point, detail) => { if (counted(point, detail)) counts[point] = (counts[point] ?? 0) + 1; });
+    if (role === 'count') installFaultHook((point, detail) => { const advanced = counted(point, detail); if (advanced) counts[point] = (counts[point] ?? 0) + advanced; });
     if (role === 'run' && config.fault) installFaultHook(robotFaultHook(config.fault));
     if (role === 'run') {
       let next = 0; let inFlight: string[] = [];

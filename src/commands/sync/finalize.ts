@@ -215,7 +215,16 @@ export async function finalizeIncrementalSync(
     ...(typeWarningsEnabled && typeWarnings.length > 0 ? { type_warnings: typeWarnings } : {}),
     ...(uncommittedDrift ? { uncommitted: uncommittedDrift } : {}),
     ...(extractError ? { extract_error: extractError } : {}),
+    ...identityDowngradesOf(plan),
   };
+}
+
+/** #6729: the inexact renames this run split into a delete plus an add, in the source's origin form (recorded by `performSync`). */
+function identityDowngradesOf(plan: Pick<SyncPlan, 'manifest' | 'inScope' | 'isSelectedForRun' | 'syncOpts' | 'modePath'>): Pick<SyncResult, 'identityDowngrades'> {
+  const selected = (path: string) => plan.inScope(path) && plan.isSelectedForRun(path, plan.syncOpts);
+  const pairs = (plan.manifest.downgradedRenames ?? []).filter(pair => selected(pair.from) || selected(pair.to))
+    .map(pair => ({ ...pair, from: plan.modePath(pair.from), to: plan.modePath(pair.to) }));
+  return pairs.length ? { identityDowngrades: pairs } : {};
 }
 
 /** v0.42.x (#1794, T3): pin-reachability gate; records a `<head>` sentinel on a rewrite. */

@@ -19,6 +19,7 @@ import { withRefreshingLock, LockUnavailableError, LockStolenError, syncLockId }
 import { readSyncAnchor } from '../../core/sync-anchor.ts';
 import { recordUpstreamObservation } from '../../core/sync-upstream.ts';
 import { assertSyncApplicable } from '../../core/sync-applicability.ts';
+import { noteIdentityDowngrades } from '../../core/sync-identity-downgrades.ts';
 import { SyncLockBusyError, formatLockBusyMessage, buildPartialResult } from '../../core/sync-lock.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import { runConnectorSync } from './connector.ts';
@@ -36,7 +37,7 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
       await refreshProjectionStatistics(engine, result.pagesAffected.length + result.deleted);
     }
     if (refresh && !opts.dryRun) await recordUpstreamObservation(engine, opts.sourceId ?? 'default', opts.repoPath);
-    return result;
+    return refresh && !opts.dryRun ? noteIdentityDowngrades(engine, opts.sourceId ?? 'default', result, serr) : result;
   };
   const interruptedBeforeWork = async (): Promise<SyncResult> => {
     assertSourceFilesystemActive(true);
@@ -128,6 +129,7 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
       const stages = (result.staged.stages ?? 1) + 1, d = result.drain, n = next.drain;
       result = { ...next, fromCommit: result.fromCommit, added: result.added + next.added, modified: result.modified + next.modified, deleted: result.deleted + next.deleted,
         renamed: result.renamed + next.renamed, chunksCreated: result.chunksCreated + next.chunksCreated,
+        ...(result.identityDowngrades?.length || next.identityDowngrades?.length ? { identityDowngrades: [...result.identityDowngrades ?? [], ...next.identityDowngrades ?? []] } : {}),
         ...(next.staged ? { staged: { ...next.staged, stages } } : {}),
         ...(n ? { drain: { ...n, passes: d.passes + n.passes, processed: d.processed + n.processed, written: d.written + n.written, waived: d.waived + n.waived } } : {}) };
       if (!next.staged) serr(`[sync] staged catch-up reached HEAD after ${stages} stages.`);
@@ -138,13 +140,18 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
     if (!opts.dryRun) {
       const replayed = await replayImportedRemembers(engine, opts.sourceId ?? 'default');
       if (replayed) result = { ...result, replayedRemembers: replayed };
+      const ghosts = await reportSyncGhosts(engine, opts.sourceId ?? 'default');
+      if (ghosts) result = { ...result, ghostPages: ghosts };
+      // #6712 PR 2: holds that turned needs_human (or file_drift content decisions) since the last count, for the soak counters.
+      await (await import('../../core/persistence/soak-counters.ts')).sweepNeedsHumanHolds(engine, opts.sourceId ?? 'default').catch(() => undefined);
     }
     return result;
   };
   // A dry run reads and previews only; it never waits for, or keeps out, a drainer.
   if (outer.dryRun) return work(undefined);
+  const { withSyncTail } = await import('../../core/persistence/sync-tail.ts');
   try {
-    return await withDrainLease(engine, sourceId, {
+    return await (await import('../../core/repair/slug-autoheal.ts')).healAfterManagedSync(engine, outer, await withSyncTail(engine, sourceId, await withDrainLease(engine, sourceId, {
       holder: outer.drainHolder ?? { kind: 'cli', id: null }, remote: currentSubmissionAuthority()?.kind === 'remote_generic',
       ...(outer.followDrainLease ? { follow: { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs } } : {}),
       tty: process.stderr.isTTY === true,
@@ -155,7 +162,7 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
           ? `[sync] source ${sourceId} is being drained by ${who}; following it until it finishes or this run's budget ends (one drainer per source; it resumes the same cursor). Ctrl-C stops following and leaves it running.`
           : `[sync] following ${who}: ${done}.`);
       },
-    }, work);
+    }, work), { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs }));
   } catch (err) {
     if (err instanceof LockUnavailableError && err.lockId === lockKey) throw new SyncLockBusyError(await formatLockBusyMessage(engine, lockKey), lockKey);
     throw err;
@@ -200,6 +207,14 @@ async function replayImportedRemembers(engine: BrainEngine, sourceId: string): P
     serr(`[sync] could not replay remembers refused while their page's file awaited import: ${error instanceof Error ? error.message : String(error)} (gbrain repair failed-writes --source ${sourceId} replays them).`);
     return null;
   }
+}
+
+/** #6712 PR 2 (L4): the source's ghost pages (live pages whose file is gone), counted and named, never deleted by sync. */
+async function reportSyncGhosts(engine: BrainEngine, sourceId: string): Promise<SyncResult['ghostPages'] | null> {
+  const ghosts = await (await import('../../core/persistence/sync-ghosts.ts')).countSyncGhosts(engine, sourceId).catch(() => null);
+  if (ghosts) serr(`[sync] ${ghosts.count}${ghosts.truncated ? '+' : ''} live page(s) of ${sourceId} have no canonical file (ghost pages${ghosts.samples.length ? `, e.g. ${ghosts.samples.join(', ')}` : ''}); `
+    + `sync leaves them in place. Preview with ${ghosts.fix.argv!.join(' ')} (read-only), or restore the files and sync.`);
+  return ghosts;
 }
 
 /** #6288: a successful managed sync clears this source's recorded failures its imported commit already settles (#6543 D5: legacy ledger rows too); best effort. */

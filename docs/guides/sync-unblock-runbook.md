@@ -27,10 +27,19 @@ moving again; ask me only about the ones gbrain will not decide by itself."*
    host runs an older gbrain build than this checkout; restart them with the
    command it prints before anything else, and stop until it reads ok
    ([serve build drift](troubleshooting.md#serve-build-drift)).
-1. Read `status`. `cursor` is where the run stands (`index/total`, the
-   `pinned_target` commit, `last_advance_at`); `committed_last_10m` is the
-   signal that data is moving (a live process with a flat cursor is not
-   progress). `holds` and `last_error` each carry the triple below.
+1. Read `status`. `state` (`synced` | `resumable` | `blocked`) and `reason`
+   say where the source stands; `cursor` is where the run stands
+   (`index/total`, the `pinned_target` commit, `last_advance_at`);
+   `committed_last_10m` is the signal that data is moving (a live process with
+   a flat cursor is not progress). `holds` and `last_error` each carry the
+   triple below, plus `category` and `public_category`. `oldest_blocker` and
+   `recovery` are bounded live probes that need no cursor; when one times out
+   the state is `resumable` / `status_unknown`, never `synced`. A plain status
+   skips the heavy reads (the terminal-failure summary, the checkpoint blocker
+   list, the live cursor list): their fields keep their types, and
+   `terminal_failures_read`, `checkpoint_blockers_read` and `cursors_read` say
+   `not_read` with the `--detail` command as `fix`. Never read a `not_read`
+   field as "none"; run the fix when the step needs it.
 2. If `needs_human` is false and nothing committed in the last ten minutes,
    run `unblock --apply`: it performs the safe action for every hold that has
    one, refuses the rest by name, and prints the sync to run. For a content
@@ -45,7 +54,7 @@ moving again; ask me only about the ones gbrain will not decide by itself."*
    refuses every repair-class hold instead, as releases before #6377 did.
 3. Run that sync. It re-screens the scheduled files, imports each one that now
    passes and holds again what still fails; the rest of the source is never
-   blocked. With `--retry-failed` a cursor an older release left blocked on a
+   blocked. A cursor an older release left blocked on a
    page fault converts in place (same run, no rediscovery).
 4. If `needs_human` is true, stop looping and page a person with the slug and
    `human_reason` from `status` (`next.user_message` is written for relay).
@@ -73,9 +82,18 @@ Every hold and error has three fields, from one table
   `reconcile` previews two diverged versions; `upgrade` installs a newer gbrain;
   `none` waits for a person.
 - `needs_human`: a person has to choose or act before it clears;
-  `human_reason` says what. A page held three times with the same code
-  (`attempts`) is `needs_human` whatever its code says: it keeps moving under
-  the sync. A repair-class hold is `needs_human` when its stored repair state
+  `human_reason` says what. A page whose safe action failed three times with
+  the same code (`attempts`: a re-hold, or a failed `unblock --apply` or
+  repair) over at least 24 hours since it was first held is `needs_human`
+  whatever its code says, and `human_reason` ends with both numbers. Two holds
+  never escalate this way: a `worktree_dirty` file whose uncommitted bytes
+  changed in the last 24 hours (someone is still editing it) and a
+  `managed_image_sync_unsupported` image (held by design until multimodal
+  embedding is on or the image is excluded). Status and unblock re-read a
+  `worktree_dirty` file before calling its edit abandoned, so new bytes hand
+  it back to the agent. An abandoned edit's fix is `sync unblock --apply`
+  behind `next: ask_user`: the person commits or restores the file, then
+  unblock finds it clean and schedules it. A repair-class hold is `needs_human` when its stored repair state
   says so: a fence hold the lane marked `manual` (a manual-only reason, a gate
   rejection, a model answer the run does not retry) or `paid` (spend only the
   user raises), and a slug-conflict hold the lane decided a person must settle
@@ -87,22 +105,31 @@ Every hold and error has three fields, from one table
 <!-- sync-fault-table:begin (pinned by test/sync-runbook-table.test.ts) -->
 | Code | Class | Safe actions | Needs human | Escalate when |
 |---|---|---|---|---|
-| `worktree_dirty` | page | retry_when_clean | no | held 3 times: the file keeps changing without being committed |
+| `worktree_dirty` | page | retry_when_clean | no | 3 failed attempts over 24 h with no edit in the last 24 h: the uncommitted edit is abandoned |
 | `concurrent_write` | page | reconcile | yes | always: the file and the database page diverge |
 | `file_drift` | page | reconcile | yes | always: the page changed in the database since its file was last imported |
-| `preparation_stalled` | page | retry, upgrade | no | held 3 times, or writer status names a step that never finishes |
+| `preparation_stalled` | page | retry, upgrade | no | 3 failed attempts over 24 h, or writer status names a step that never finishes |
 | `invalid_fence` | page | repair | no | the fence repair preview offers no plan (a manual reason) |
 | `invalid_frontmatter` | page | repair | no | the repair preview needs an interpretation (--include-ambiguous) |
-| `frontmatter_slug_conflict` | page | repair | no | the repair preview needs an interpretation |
+| `frontmatter_slug_conflict` | page | repair | no | the lane recorded why it could not decide |
 | `rename_held` | page | repair | no | the repair preview needs an interpretation |
 | `file_too_large` | page | none | yes | always |
 | `content_rejected` | page | none | yes | always |
 | `parser_regression` | page | upgrade | yes | always: a gbrain bug |
 | `managed_image_sync_unsupported` | page | none | no | never: images stay held while multimodal embedding is off |
+| `purged_content` | page | none | yes | always: only the owner clears a purge tombstone |
+| `write_gate_rejected` | page | none | yes | always: write_gate.external_mode=reject is the user's setting |
+| `legacy_slug_conflict` | page | none | yes | always: only a person decides which legacy page the file takes over |
 | `revision_conflict` | page | retry | no | the same path fails again after a rerun |
 | `page_identity_changed` | page | retry | no | the same path fails again after a rerun |
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
 | `source_changed` | page | retry | no | the same path fails again after a rerun |
+| `pending_import` | page | retry | no | the same path refuses again after a sync imported its file |
+| `raw_file_changed` | page | retry | no | the same path fails again after a rerun re-freezes it |
+| `file_database_drift` | page | reconcile | yes | always: the file and the database page diverge |
+| `canonical_file_missing` | page | repair | yes | always: no sync can import a file that is not there |
+| `source_binding_changed` | systemic | none | yes | always: the source or its checkout binding moved |
+| `unsafe_file_target` | systemic | none | yes | always: the file target resolves outside its source |
 | `cancelled` | page | retry | no | the same group is cancelled again after a rerun |
 | `knock_on` | page | retry | no | never: superseded; an older gbrain cancelled this page for another page's failure and a plain sync re-freezes it |
 | `run_replaced` | page | retry | no | never: another run of the source superseded this one and covers its pages |
@@ -148,7 +175,8 @@ earlier one is held. A file that changed after its request was admitted
 (`source_changed`) is retried after the manifest's last entry, at most three
 times, then held `worktree_dirty`. A transport fault re-freezes the entry in
 place; a systemic stop is re-frozen in place by the next plain sync, at most
-three times in a row before the failure stays recorded for `--retry-failed`.
+three times in a row, and once that bound is spent the next plain sync
+resets it and tries again.
 
 A `knock_on` or `knock_on_exhausted` error was written by an older gbrain
 (a page cancelled only because another page of its sync did not commit, or
@@ -161,7 +189,7 @@ the extra drain and reports it); an older build's `window_dropped` reads as
 a knock-on. A checkpoint refused by a receipt at an index the cursor passed
 without a commit is re-assessed on every resume and commits without
 rediscovering the manifest; one a receipt still blocks is rediscovered by
-`--retry-failed`.
+the next plain sync.
 
 An unknown code is systemic and human: `gbrain errors <code>` explains it
 offline, `gbrain doctor --json` says what the brain thinks.
@@ -187,7 +215,8 @@ it and kept going; the receipt lists the hold (`held`, `held_count`) and
   `gbrain sources writer status --source <id> --json` names the step.
   `unblock --apply` schedules the re-screen.
 - `invalid_fence` and `frontmatter_slug_conflict`: the content-repair lane
-  clears them. `unblock --apply` runs it on the held paths now; the maintenance
+  clears them. Managed sync drops a `slug:` line naming no page or file
+  (#6865). `unblock --apply` runs it on the held paths now; the maintenance
   run's `fence_repair` and `content_repair` phases run it by themselves;
   `gbrain repair content --source <id>` previews it. A hold the lane will not
   decide is `needs_human` with the paragraph in `human_reason`
@@ -197,7 +226,7 @@ it and kept going; the receipt lists the hold (`held`, `held_count`) and
   run ([held files](write-refusals.md#held-files-and-content-refusals)).
 - `revision_conflict`, `page_identity_changed`, `pinned_git_worktree_conflict`
   as a `last_error` come from a run on an older release; this release holds
-  them. Rerun with `--retry-failed`: the stopped entry converts in place, the
+  them. Rerun the plain sync: the stopped entry converts in place, the
   manifest is not re-frozen. A `revision_conflict` or `cancelled` error with
   `detail: knock_on` needs no flag: the next plain sync re-freezes the entry
   (act on `root_cause` instead).
@@ -224,8 +253,11 @@ repair: a source in a subdirectory of its repository pins one
 Ask the user which mode the source keeps. Restoring the pin to the run's mode
 lets the next plain `gbrain sync --no-pull --source <id>` finish (the refused
 checkpoint is retried by itself); keeping the new pin takes
-`gbrain sync --no-pull --source <id> --retry-failed`, and the pages the refused
-run wrote keep their old slugs beside the new ones. A source rooted at its
+`gbrain repair managed-sync-orphans --source <id>` (it lists the cursor as
+`slug_mode_refused`; preview, then `--apply --expect <hash>`), after which the
+next sync discovers the source again under the kept pin. No sync retries that
+checkpoint by itself. The pages the refused run wrote keep their old slugs
+beside the new ones. A source rooted at its
 repository root never gets this code: both modes give it the same slugs, and
 a checkpoint an older release refused there as `revision_conflict` finishes on
 the next plain sync.
@@ -234,10 +266,10 @@ the next plain sync.
 
 The frozen manifest always lived in the cursor (`op_checkpoints`, op
 `managed-sync`). What threw it away was the failure ledger: every run death
-wrote a row, and `--retry-failed` read the row and rediscovered from index 0
+wrote a row, and the retry read the row and rediscovered from index 0
 (eight to twelve minutes of silence on a 14k-entry source). Page faults are
-now holds and connection faults are not recorded, so a relaunch, with or
-without `--retry-failed`, finds the cursor and resumes it. Only a systemic
+now holds and connection faults are not recorded, so a relaunch finds
+the cursor and resumes it. Only a systemic
 failure still writes a ledger row.
 
 When HEAD moved past the pinned target while the run drained, the drain takes
@@ -257,6 +289,35 @@ That is not a page fault and no rerun clears it: preview
 apply with the printed `--apply --expect <hash>` once the user agrees. A cursor
 with a live pending request is kept; the loop above owns it
 ([repair guide](repair.md#managed-sync-orphans)).
+
+## Soak counters
+
+`gbrain doctor --json` reports `sync_soak_counters` (info, never a warning):
+how often a person or an agent had to step in, per UTC day for the last seven
+days, so a soak can show that sync keeps moving on its own.
+
+- `interventions`: `sync_non_plain` (a `gbrain sync` with a recovery flag such
+  as the deprecated `--retry-failed`, `--full`, `--break-lock` or `--skip-failed`; the plain
+  scheduler flags `--all`, `--no-pull`, `--hard-deadline`, `--no-embed`,
+  `--no-lanes`, `--no-bulk` and `--json` do not count), `repair_apply` (a
+  `gbrain repair … --apply` of any kind but file-drift), `unblock_apply`,
+  `retry_held` (a `gbrain sources retry-held` without `--dry-run`) and
+  `needs_human` (a hold that turned `needs_human`, counted once, by the first
+  sync that sees it).
+- `content_decisions`: `file_drift_apply` (a `gbrain repair file-drift
+  --apply`) and `file_drift_hold` (a `file_drift` hold a sync found). These
+  are choices about which version of a page wins, not interventions; a
+  `keep_db` prefix reconciles with no decision and counts in neither line.
+
+Each line has one count per kind and a `total`; `by_day` lists both line
+totals for each day that recorded anything. Fields are only ever added.
+
+## Dry-run convergence classes
+
+`sync --dry-run --json` adds a read-only `convergence` receipt. Class actions:
+- `none`: settled.
+- `owner`: sync finishes it.
+- `repair`: a person decides.
 
 ## See also
 

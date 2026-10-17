@@ -110,9 +110,11 @@ sources:
   sync line. Any other detail means another host owns the source: install a
   per-source line on that host (`gbrain sync --source <id> --no-pull
   --hard-deadline 13m`, plus its refresh) instead of claiming it here.
-- Failed files: run the `--retry-failed` command the failure prints
-  (`gbrain sync --source <id> --no-pull --retry-failed …`) after fixing the
-  files; never add `--skip-failed`.
+- Failed files: after fixing the files and committing them, rerun the plain
+  `gbrain sync --source <id> --no-pull …` with the failed run's options; the
+  next sync retries what the last one recorded. Never add `--skip-failed`
+  (`--retry-failed` is a deprecated alias of the plain sync on a managed
+  brain).
 
 `gbrain doctor` prints this managed line in `sync_consolidation` on a managed
 brain with 2+ active sources.

@@ -24,6 +24,8 @@
  */
 
 import { isValidSourceId } from '../source-id.ts';
+import { syncWireFields, type SyncWireType } from '../sync-flags.ts';
+import { retiredWireFields } from '../wire-skew.ts';
 import type { SyncResult } from '../../commands/sync.ts';
 import type { DrainNext, DrainReport } from '../persistence/sync-drain.ts';
 
@@ -41,28 +43,17 @@ import type { DrainNext, DrainReport } from '../persistence/sync-drain.ts';
  * drain (absent → the serve sweep drains them later).
  */
 export const DELEGATED_SYNC_OPTION_FIELDS = {
+  // The flags the one sync flag table forwards through the serve (src/core/sync-flags.ts) ...
+  ...syncWireFields('serve'),
+  // ... and the fields the client derives rather than parses.
   sourceId: 'string',
-  dryRun: 'boolean',
-  full: 'boolean',
-  noPull: 'boolean',
-  noEmbed: 'boolean',
-  noExtract: 'boolean',
-  noSchemaPack: 'boolean',
-  skipFailed: 'boolean',
-  retryFailed: 'boolean',
-  includeGitignored: 'boolean',
-  noBulk: 'boolean',
-  lanes: 'number',
-  explicitProcessing: 'string[]',
   embedDeferred: 'boolean',
   timeoutSeconds: 'number',
   origin: 'string',
-} as const;
+} as const satisfies Record<string, SyncWireType>;
 
 /** `--lanes N` bounds (`src/commands/sync/args.ts`). */
 export const DELEGATED_SYNC_LANES_MAX = 16;
-/** The processing keys an unfinished managed cursor supplies unless the caller set them (#5632). */
-export const DELEGATED_SYNC_PROCESSING_KEYS = ['noEmbed', 'noExtract', 'noSchemaPack'] as const;
 
 export type DelegatedSyncOptionField = keyof typeof DELEGATED_SYNC_OPTION_FIELDS;
 
@@ -100,7 +91,8 @@ export interface DelegatedSyncOptions {
 }
 
 export type DelegatedSyncValidation =
-  | { ok: true; options: DelegatedSyncOptions }
+  /** `ignored`: retired fields an older client sent (src/core/wire-skew.ts), accepted and dropped. */
+  | { ok: true; options: DelegatedSyncOptions; ignored?: string[] }
   | { ok: false; error: string };
 
 /**
@@ -115,13 +107,22 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
     return { ok: false, error: 'invalid_options:options' };
   }
   const rec = raw as Record<string, unknown>;
+  const retired = retiredWireFields('serve');
+  const ignored: string[] = [];
   for (const key of Object.keys(rec)) {
+    const window = retired.get(key);
+    if (window) {
+      // Accepted from an older client and ignored until its window in src/core/wire-skew.ts closes.
+      if (rec[key] !== undefined && !window.accepts(rec[key])) return { ok: false, error: `invalid_options:${key}` };
+      ignored.push(key);
+      continue;
+    }
     if (!(key in DELEGATED_SYNC_OPTION_FIELDS)) {
       return { ok: false, error: `invalid_options:${key}` };
     }
   }
   const out: Record<string, unknown> = {};
-  for (const [key, type] of Object.entries(DELEGATED_SYNC_OPTION_FIELDS)) {
+  for (const [key, type] of Object.entries(DELEGATED_SYNC_OPTION_FIELDS) as Array<[string, SyncWireType]>) {
     const v = rec[key];
     if (v === undefined) continue;
     if (type === 'string[]') {
@@ -135,14 +136,6 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
   if (out.lanes !== undefined && (!Number.isInteger(out.lanes) || (out.lanes as number) < 1 || (out.lanes as number) > DELEGATED_SYNC_LANES_MAX)) {
     return { ok: false, error: 'invalid_options:lanes' };
   }
-  if (out.explicitProcessing !== undefined) {
-    const keys = out.explicitProcessing as string[];
-    if (keys.length > DELEGATED_SYNC_PROCESSING_KEYS.length || keys.some(key => !(DELEGATED_SYNC_PROCESSING_KEYS as readonly string[]).includes(key))) {
-      return { ok: false, error: 'invalid_options:explicitProcessing' };
-    }
-    // #6712 PR 1: accepted from an older CLI and ignored (WIRE_SKEW_WINDOWS.explicitProcessing); the cursor's opt-outs are inherited.
-    delete out.explicitProcessing;
-  }
   if (out.origin !== undefined && out.origin !== 'interactive' && out.origin !== 'background') {
     return { ok: false, error: 'invalid_options:origin' };
   }
@@ -154,7 +147,7 @@ export function validateDelegatedSyncOptions(raw: unknown): DelegatedSyncValidat
   if (out.sourceId !== undefined && !isValidSourceId(out.sourceId as string)) {
     return { ok: false, error: 'invalid_options:sourceId' };
   }
-  return { ok: true, options: out as unknown as DelegatedSyncOptions };
+  return { ok: true, options: out as unknown as DelegatedSyncOptions, ...(ignored.length ? { ignored } : {}) };
 }
 
 // ── Progress + result shapes ───────────────────────────────────────────────

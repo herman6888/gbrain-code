@@ -349,8 +349,8 @@
               "string",
               "string"
             ],
-            "sql": "SELECT s.incarnation::text AS incarnation, s.purge_epoch, (SELECT e.event_type FROM belief_events e WHERE e.source_id = s.id AND e.subject_kind = 'coverage' AND e.subject_key = $1 AND e.source_incarnation = s.incarnation AND e.event_type <> 'coverage.restored' ORDER BY e.id DESC LIMIT 1) AS coverage, (s.purge_epoch > 0 OR EXISTS (SELECT 1 FROM fact_purges WHERE source_id = s.id) OR EXISTS (SELECT 1 FROM take_purges WHERE source_id = s.id) OR EXISTS (SELECT 1 FROM page_purges WHERE source_id = s.id)) AS purges FROM sources s WHERE s.id = $2",
-            "textSha256": "07c43af557f387634ae6b15e2af1d0f2e84a0bb91c569b2569594a1e32fd21b8"
+            "sql": "SELECT q.*, (SELECT COALESCE(json_agg(json_build_object('enabled', b.enabled)), '[]'::json) FROM persistence_brain b WHERE b.singleton = 1) AS managed_rows, current_setting('plan_cache_mode') AS plan_mode_prev, set_config('plan_cache_mode', CASE WHEN q.coverage IS NOT NULL AND q.coverage <> 'coverage.stopped' THEN 'force_generic_plan' ELSE current_setting('plan_cache_mode') END, true) FROM (SELECT s.incarnation::text AS incarnation, s.purge_epoch, (SELECT e.event_type FROM belief_events e WHERE e.source_id = s.id AND e.subject_kind = 'coverage' AND e.subject_key = $1 AND e.source_incarnation = s.incarnation AND e.event_type <> 'coverage.restored' ORDER BY e.id DESC LIMIT 1) AS coverage, (s.purge_epoch > 0 OR EXISTS (SELECT 1 FROM fact_purges WHERE source_id = s.id) OR EXISTS (SELECT 1 FROM take_purges WHERE source_id = s.id) OR EXISTS (SELECT 1 FROM page_purges WHERE source_id = s.id)) AS purges FROM sources s WHERE s.id = $2) q",
+            "textSha256": "0c74478e82df9c16f1dca2893b2544042c7c735c218cacae18fcb4767902023a"
           },
           {
             "lane": "tx",

@@ -552,6 +552,65 @@ For containers, persist the canonical source root, its sibling-reservation
 parent, persistence home and stable lock/coordination directory together across
 recreation. Storage preflight reports each location and can identify Linux
 overlay/tmpfs backing, but a mount shown as present is **not** attested durable.
+When `GBRAIN_HOME` lies inside the checkout, the lock directory is not the persistence
+home (see [where the coordination lock lives](#coordination-lock)): set
+`GBRAIN_COORDINATION_HOME` to a mounted directory outside the checkout so the lock
+survives recreation, because the default `~/.gbrain/persistence` usually sits on the
+container's ephemeral filesystem.
+
+<a id="coordination-lock"></a>**Where the coordination lock lives.** Every
+canonical checkout has one native lock file that all of its writers share, and
+it never lives inside the checkout it protects (a copied checkout must not copy
+its lock). Claim, reservation, reclone and transfer choose it with one rule;
+the first match wins:
+
+1. `reservation`: the path the outside-root reservation
+   (`.gbrain-owner-<sha256(root)>.json` beside the root) already records. A
+   recorded path always wins over the environment, so two processes with
+   different settings still lock the same file.
+2. `binding`: on a transfer, the accepting host binding's recorded path, when it
+   is absolute, canonical and outside the successor checkout.
+3. `persistence_home`: `<persistence home>/locks/<worktree id>.lock`
+   (`$GBRAIN_HOME/.gbrain/persistence`, else `~/.gbrain/persistence`) when that
+   is outside the checkout. This is every ordinary layout.
+4. `coordination_home` / `home_default`: when the persistence home is inside the
+   checkout (`GBRAIN_HOME` is the checkout or lies inside it),
+   `$GBRAIN_COORDINATION_HOME/locks/<namespace>/<worktree id>.lock`, or the same
+   under `~/.gbrain/persistence` when the variable is unset. The namespace is a
+   hash of the canonical checkout path and the host id, so one shared fallback
+   directory can serve several checkouts and hosts.
+5. A result still inside the checkout (for example `GBRAIN_COORDINATION_HOME`
+   pointing into it through a symlink) refuses with `storage_error` before
+   anything is written.
+
+`GBRAIN_COORDINATION_HOME` must be an absolute path without `..` segments and is
+read only when rule 4 applies. It comes from the process environment only: a
+`.env` file in the working directory cannot set it (it is on the cwd `.env`
+quarantine list). `gbrain sources writer status --json` prints
+`onboarding.sources[].coordination_lock` with the resolved `path` and the `rule`
+that chose it; an unclaimed checkout without a reservation reports the
+`directory` a claim would use, and an unreadable setting reports `error`.
+
+<a id="coordination-home-ignored"></a>Because a recorded path wins, changing
+`GBRAIN_COORDINATION_HOME` after a checkout's reservation was written moves
+nothing: every process keeps locking the recorded file. When the variable applies
+to a checkout (rule 4) and names another directory than the recorded lock's,
+`writer status --json` adds `coordination_lock.coordination_home_ignored`
+(`configured_directory`, `recorded_path`, `move_step`) and doctor's
+`coordination_lock_location` warns with the same move step: make the recorded
+lock's directory survive container recreation (mount it), and unset the variable
+for that checkout's processes if it was meant to move the lock. No gbrain command
+relocates a recorded lock yet; never edit or delete the reservation to force one.
+
+A reservation written before this rule existed, for a checkout that contains
+`GBRAIN_HOME`, records its lock inside the checkout, so every claim refused with
+"The stable coordination lock must live outside the canonical checkout". Status
+marks it `old_path_wedge: true`. Upgrade, then run the claim again on the host
+that reserved it: the claim rewrites only the reservation's lock path (same
+token, brain, host and worktree), under a guard file beside the reservation. A
+reservation that names another brain or host, or a worktree the database
+already records, is left unchanged and keeps the refusal; that case needs
+verified writer recovery. Never delete the reservation to get past it.
 
 ### Claim and activate runbook
 
@@ -592,7 +651,7 @@ through `gbrain sources refresh <source>`, the drained worktree-wide fast-forwar
 which runs inside a resident PGLite owner such as `gbrain serve` when one holds the brain;
 see [worktree refresh refusals](../guides/write-refusals.md#worktree-refresh-refusals)) and refuses `--skip-failed` and
 `--include-gitignored`; after fixing a failed item run
-`gbrain sync --no-pull --retry-failed` with the same source and options. Resume
+the plain `gbrain sync --no-pull` with the same source and options (`--retry-failed` is a deprecated alias of it on a managed brain). Resume
 autopilot with `gbrain autopilot resume` and re-enable the hooks you stopped.
 
 When activation refuses with `writer_not_quiesced` because of queued work, the
@@ -638,7 +697,7 @@ runbook above.
 3. Dry run: `gbrain sources writer deactivate --dry-run`. It lists each blocker
    with its exit and what would change, and changes nothing. Blocker exits:
    `gbrain cancel-write-request <request_id>` for a queued write,
-   `gbrain sync --source <id> --no-pull --retry-failed` for one that needs
+   `gbrain sync --source <id> --no-pull` for one that needs
    recovery, `gbrain repair embedding-effects --source <id>` for a stuck
    embedding effect, `gbrain sources writer retry-effects <source> --request-id <id> --dry-run`
    for a failed Git or withdrawal effect, and `gbrain sources writer unlock` for

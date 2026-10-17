@@ -159,6 +159,23 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect(result.details).toMatchObject({ mode: 'apply', kinds: ['slug-conflicts'] });
     },
   },
+  unindexed_files: {
+    // #6865: a file the source's last synced commit holds with no page and no hold (an older gbrain's unrecorded refusal) is
+    // found and scheduled for a re-screen on the next sync; the phase writes no page.
+    seed: async ({ engine, sourceId, root }) => {
+      git(root, 'init', '-q');
+      mkdirSync(join(root, 'notes'));
+      writeFileSync(join(root, 'notes/unindexed-example.md'), page('note', 'Unindexed example', 'Never imported.\n'));
+      git(root, 'add', '.');
+      git(root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'seed');
+      await engine.executeRaw('UPDATE sources SET last_commit=$2 WHERE id=$1', [sourceId, git(root, 'rev-parse', 'HEAD').trim()]);
+    },
+    assert: async ({ engine, result }) => {
+      expect(result.status).toBe('ok');
+      expect(result.details).toMatchObject({ mode: 'apply', scanned: 1, unindexed: 1, scheduled_now: 1, complete: true });
+      expect(await engine.executeRaw("SELECT 1 FROM pages WHERE slug='notes/unindexed-example'")).toEqual([]);
+    },
+  },
   synthesize: {
     seed: async ({ engine, sourceId, root }) => {
       await put(engine, sourceId, 'people/example', page('note', 'Example', 'Example evidence.'));

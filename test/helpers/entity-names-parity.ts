@@ -108,7 +108,7 @@ async function referenceOne(engine: BrainEngine, sourceId: string, name: string,
     for (const s of sib) bodies.set(s.slug, s.compiled_truth);
   }
   return {
-    name, found: true, slug: entity.slug, title: entity.title, type: entity.type, aka, lead: pageLead(bodies.get(entity.slug) ?? null),
+    name, found: true, source_id: entity.source_id, slug: entity.slug, title: entity.title, type: entity.type, aka, lead: pageLead(bodies.get(entity.slug) ?? null),
     ...(siblingPages.length ? { siblings: siblingPages.map(p => ({ slug: p.slug, title: p.title, type: p.type, aka: p.aka, lead: pageLead(bodies.get(p.slug) ?? null) })) } : {}),
   };
 }

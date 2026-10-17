@@ -50,6 +50,8 @@ export interface OrchestratorPhaseResult {
   name: string;
   status: 'complete' | 'skipped' | 'failed';
   detail?: string;
+  /** A stable code for why the phase ended this way (kept in the ledger), for readers that must not parse `detail`. */
+  reason?: string;
   /** The exact command that resolves or inspects what this phase left open; printed by the runner and kept in the ledger. */
   argv?: string[];
 }

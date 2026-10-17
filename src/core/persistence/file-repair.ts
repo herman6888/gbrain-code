@@ -41,7 +41,7 @@
  * the source root and walked component by component with `lstat`, so a
  * symlinked directory or file is never written through.
  */
-import { lstatSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
@@ -75,6 +75,7 @@ import type { SyncRename } from './sync-discovery.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { contentRepairCommit, fenceRepairCommit } from './effect-model.ts';
+import { recordSlugLineAlias } from '../page-state/rename-alias.ts';
 import type { WriteRequest } from './model.ts';
 
 export interface ManagedFileRepairIntent extends Record<string, unknown> {
@@ -111,6 +112,20 @@ const ownerStatusFix = (sourceId: string): Action => readFix(`Shows source ${sou
   { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] });
 const previewFix = (sourceId: string, kind: FileRepairKind): Action => ({ argv: ['gbrain', 'repair', kind, '--source', sourceId], consent: [], actor: 'agent',
   requires_exclusive: false, why: `Previews the ${WORK[kind]} repair of source ${sourceId} again from the files as they are now; nothing is written.` });
+
+/**
+ * #6865: a stray slug-line removal whose receipt records the declared alias (the sync-time `absent_page` heal) publishes
+ * only while that slug still names no page, no alias of another page and no file at its path: one written since the heal
+ * read the source refuses the write, and the next run judges the file again.
+ */
+async function assertDeclaredSlugAbsent(tx: BrainEngine, sourceId: string, root: string, p: { path: string; sourcePath: string }, alias: string, slug: string, kind: FileRepairKind) {
+  const named = await tx.readPageSnapshot(alias, { sourceId, resolveAlias: true });
+  if (named && named.page.slug !== slug) throw changedSincePreview(sourceId, p.path, `its slug: line now names page ${named.page.slug}`, kind);
+  const prefix = p.sourcePath.endsWith(p.path) ? p.sourcePath.slice(0, p.sourcePath.length - p.path.length) : '';
+  const rel = prefix && alias.startsWith(prefix) ? alias.slice(prefix.length) : alias;
+  const file = ['.md', '.mdx'].map(ext => rel + ext).find(candidate => candidate !== p.path && existsSync(join(root, candidate)));
+  if (file) throw changedSincePreview(sourceId, p.path, `its slug: line now names the file ${file}`, kind);
+}
 
 function changedSincePreview(sourceId: string, path: string, why: string, kind: FileRepairKind) {
   return opError('changed_since_preview', `${path} changed since its repair was previewed: ${why}.`,
@@ -363,6 +378,7 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
         `Source ${row.source_id}'s canonical owner changed while repair request ${row.request_id} was prepared, so it published nothing. Check the owner, then preview the repair again.`,
         { fix: ownerStatusFix(row.source_id) });
       checkFile();
+      if (contentRepair?.declared_alias) await assertDeclaredSlugAbsent(tx, row.source_id, root, p, contentRepair.declared_alias, row.slug, kind);
       await assertRenameSource(tx);
       await ready.validate(tx);
     },
@@ -381,6 +397,7 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
       await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
       if (!applied.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
       const holdCleared = await clearGitHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: p.path, observedAt: p.holdObservedAt ?? new Date().toISOString() });
+      if (contentRepair?.declared_alias) await recordSlugLineAlias(tx, row.source_id, contentRepair.declared_alias, row.slug);
       // #6712 PR 1: the record names what is on disk now (the approved bytes), the page revision they produced and the parser, so the next discovery prescreens the file.
       const page = await tx.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
       if (page && page.page.deleted_at == null) await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(page.page.id), origin: p.sourcePath,

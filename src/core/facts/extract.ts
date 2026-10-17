@@ -268,6 +268,8 @@ export interface ExtractInput {
   sessionId?: string | null;
   /** Existing canonical entity slugs the agent already resolved (D4 hint). */
   entityHints?: string[];
+  /** Hints the prompt forwards; defaults to ENTITY_HINTS_CAP (the extract_facts contract). */
+  entityHintsCap?: number;
   /** Source identifier for provenance — e.g. 'mcp:put_page' or 'mcp:extract_facts'. */
   source: string;
   /**
@@ -649,7 +651,7 @@ export async function extractFactsFromTurnWithOutcome(
   const dateLine = variant.dateGrounding ? `${observationDateLine(input.observationDate ?? null)}\n` : '';
   const userContent = `${dateLine}<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
     input.entityHints && input.entityHints.length
-      ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, ENTITY_HINTS_CAP).join(', ')}.`
+      ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, input.entityHintsCap ?? ENTITY_HINTS_CAP).join(', ')}.`
       : ''
   }`;
   let result: ChatResult;

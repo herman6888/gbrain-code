@@ -17,9 +17,11 @@
  * Exit: `not_moving` → 1 with code `managed_sync_not_moving` (`reason:
  * movement_check`) and the writer summary; `parked` → 1 with the same code
  * and `state: parked` (after a restart nothing picked the catch-up up);
- * `held`/`within_allowance`/`moved`/`nothing_pending` → 0; `--warn-only`
- * prints the same envelopes and exits 0. A read failure keeps its own code
- * (`fix.next: report`), never `managed_sync_not_moving`. `gbrain upgrade`
+ * `held`/`within_allowance`/`moved`/`nothing_pending` → 0; `unknown` (#6781:
+ * the backlog read failed) → 1 with its own code `movement_unknown` (`reason:
+ * backlog_read_failed`); `--warn-only` prints the same envelopes and exits 0.
+ * A read failure keeps its own code (`fix.next: report`), never
+ * `managed_sync_not_moving`. `gbrain upgrade`
  * never runs this (it owns no relaunch); it prints the bare command for the
  * supervisor's step.
  */
@@ -51,8 +53,10 @@ waits the window, and judges each one from committed pages and the head's step
   --warn-only    Print the same verdicts and envelopes but exit 0 (pipelines that cannot fail).
 States: moved, within_allowance (a step or cursor advanced; a multi-wave group preparing
 normally), held (advanced only by holds; the hold kind's repair route is printed), parked
-(pending work and nothing live to move it), not_moving, nothing_pending.
-Exit 1 with code managed_sync_not_moving for not_moving and parked; 0 otherwise.
+(pending work and nothing live to move it), not_moving, nothing_pending, unknown (the
+sync backlog could not be read, so pending work is not known; never nothing_pending).
+Exit 1 with code managed_sync_not_moving for not_moving and parked, 1 with code
+movement_unknown for unknown; 0 otherwise.
 Run it after restarting serve and the workers: gbrain sources writer movement`;
 
 export { MOVEMENT_SUPERVISOR_STEP } from './movement-step.ts';
@@ -96,8 +100,8 @@ export interface MovementReport {
   source_id: string;
   state: MovementVerdict;
   exit: 0 | 1;
-  code: 'managed_sync_not_moving' | null;
-  reason?: 'movement_check';
+  code: 'managed_sync_not_moving' | 'movement_unknown' | null;
+  reason?: 'movement_check' | 'backlog_read_failed';
   why: string;
   fix: RenderedAction | null;
   retry_after_ms?: number;
@@ -115,6 +119,11 @@ export function movementReport(before: SourceMovement | undefined, after: Source
   const verify = { argv: ['gbrain', 'sources', 'writer', 'movement', id, '--json'] };
   const head = after.head?.step ? ` The head is at step ${after.head.step}${after.head.waiting_on && after.head.waiting_on !== 'unknown' ? ` (waiting on ${after.head.waiting_on})` : ''}${after.head.owner ? `, held by ${after.head.owner.kind} pid ${after.head.owner.pid}` : ''}.` : '';
   switch (state) {
+    case 'unknown':
+      return { source_id: id, state, exit: 1, code: 'movement_unknown', reason: 'backlog_read_failed',
+        why: `${id}: the managed sync backlog could not be read (${after.unknown?.error ?? 'no detail'}), so whether sync work is pending is not known; this is not a nothing-pending verdict.`,
+        fix: renderAction({ argv: ['gbrain', 'sources', 'writer', 'movement', id, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+          why: 'Read-only: reads the backlog again. If it keeps failing, gbrain doctor --json checks the database connection.', verify }, ctx), before, after };
     case 'nothing_pending':
       return { source_id: id, state, exit: 0, code: null, why: `${id}: no managed sync is pending${after.holds.count ? ` (${after.holds.count} held file(s) await their repair)` : ''}.`, fix: null, before, after };
     case 'moved':
@@ -146,7 +155,7 @@ export function movementReport(before: SourceMovement | undefined, after: Source
 }
 
 export function formatMovementReport(r: MovementReport): string[] {
-  const lines = [`${r.state === 'not_moving' || r.state === 'parked' ? '✗' : '✓'} ${r.source_id}: ${r.state}${r.code ? ` [${r.code}${r.reason ? `/${r.reason}` : ''}]` : ''}`, `  ${r.why}`];
+  const lines = [`${r.exit !== 0 ? '✗' : '✓'} ${r.source_id}: ${r.state}${r.code ? ` [${r.code}${r.reason ? `/${r.reason}` : ''}]` : ''}`, `  ${r.why}`];
   if (r.fix?.command) lines.push(`  Next: ${r.fix.command}${r.retry_after_ms ? ` (after ${Math.round(r.retry_after_ms / 1000)}s)` : ''}${r.fix.next === 'tell_user_to_run' ? ' (the host operator runs it)' : ''}`);
   return lines;
 }
@@ -219,8 +228,11 @@ export async function runMovementCheck(engine: BrainEngine, opts: { sourceId?: s
   }
   const sources = after.map(m => movementReport(byId.get(m.source_id), m, window.window_ms));
   const failing = sources.find(r => r.exit !== 0);
-  const error = failing ? toAgentError(opError('managed_sync_not_moving', failing.why, `Run ${writerStatusCommand(failing.source_id)} and follow the running claim's next step; verify with gbrain sources writer movement ${failing.source_id}.`,
-    { reason: failing.reason, fix: readFix('Read-only: the request at the head, its step, wait cause, owner and next action.', { argv: ['gbrain', 'sources', 'writer', 'status', '--source', failing.source_id, '--json'] }) }),
-  { transport: 'cli', command: 'sources writer movement', render: cliRenderContext() }) : undefined;
+  const error = !failing ? undefined : toAgentError(failing.code === 'movement_unknown'
+    ? opError('movement_unknown', failing.why, `Rerun gbrain sources writer movement ${failing.source_id}; if the backlog read keeps failing, run gbrain doctor --json.`,
+      { reason: failing.reason, fix: readFix('Read-only: reads the managed sync backlog again.', { argv: ['gbrain', 'sources', 'writer', 'movement', failing.source_id, '--json'] }) })
+    : opError('managed_sync_not_moving', failing.why, `Run ${writerStatusCommand(failing.source_id)} and follow the running claim's next step; verify with gbrain sources writer movement ${failing.source_id}.`,
+      { reason: failing.reason, fix: readFix('Read-only: the request at the head, its step, wait cause, owner and next action.', { argv: ['gbrain', 'sources', 'writer', 'status', '--source', failing.source_id, '--json'] }) }),
+  { transport: 'cli', command: 'sources writer movement', render: cliRenderContext() });
   return { schema_version: 1, window_ms: window.window_ms, budget_ms: window.budget_ms, window_source: window.source, waited_ms: waited, sources, exit_code: failing ? 1 : 0, ...(error ? { error } : {}) };
 }

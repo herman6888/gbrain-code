@@ -4,7 +4,7 @@
  * run's counts. Never includes the pinned account or installation id.
  *
  * #5988: also each Git source's held files (`readGitHoldStatuses`, limited
- * in SQL to `sync.hold_cap`) and the blocked sync requests recent runs
+ * in SQL to `GBRAIN_SYNC_HOLD_CAP`) and the blocked sync requests recent runs
  * converted in place, shown beside connector holds. Only `sources status` and `sources retry-held` merge
  * the two; `readAllSourceHolds`, `gbrain waiting` and doctor
  * `connector_held_items` stay connector-only.
@@ -143,7 +143,7 @@ export function statusSourceNotFound(sourceId: string) {
     { fix: readFix('Lists the registered sources and their ids, read-only.', { argv: ['gbrain', 'sources', 'list', '--json'] }) });
 }
 
-/** A Git source's held files: the outstanding count and up to `sync.hold_cap` of them in detail. */
+/** A Git source's held files: the outstanding count and up to `GBRAIN_SYNC_HOLD_CAP` of them in detail. */
 export interface GitHoldStatus {
   count: number;
   items: GitHoldItem[];

@@ -32,7 +32,7 @@ export async function pinnedSlugModeMismatch(engine: Pick<BrainEngine, 'executeR
 export function slugModeMismatchCause(sourceId: string, pinned: string, slugMode: SlugRootMode): string {
   return `Source ${sourceId} pins slug_root_mode=${pinned}, but this sync ran under ${slugMode}; at a subdirectory the two modes give different slugs, so the checkpoint did not advance. `
     + `A person decides which mode the source keeps: set sources.config.slug_root_mode back to ${slugMode} and rerun gbrain sync --no-pull --source ${sourceId}, `
-    + `or keep ${pinned} and run gbrain sync --no-pull --source ${sourceId} --retry-failed, which discovers the source again under ${pinned} (pages this run wrote keep their ${slugMode} slugs beside the new ones).`;
+    + `or keep ${pinned}: preview gbrain repair managed-sync-orphans --source ${sourceId} (it lists this run's cursor as slug_mode_refused), apply it with the hash it prints, then rerun gbrain sync --no-pull --source ${sourceId}, which discovers the source again under ${pinned} (pages this run wrote keep their ${slugMode} slugs beside the new ones).`;
 }
 
 /**

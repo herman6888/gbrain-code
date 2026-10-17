@@ -138,7 +138,6 @@ describe('validateDelegatedSyncOptions', () => {
     expect(Object.keys(DELEGATED_SYNC_OPTION_FIELDS).sort()).toEqual([
       'dryRun',
       'embedDeferred',
-      'explicitProcessing',
       'full',
       'includeGitignored',
       'lanes',
@@ -153,6 +152,9 @@ describe('validateDelegatedSyncOptions', () => {
       'sourceId',
       'timeoutSeconds',
     ]);
+    // #6712 PR 2: a retired field is not in the table (a newer client never sends it); its window still accepts it.
+    expect(Object.keys(DELEGATED_SYNC_OPTION_FIELDS)).not.toContain('explicitProcessing');
+    expect(validateDelegatedSyncOptions({ explicitProcessing: ['noEmbed'], timeoutSeconds: 0 })).toEqual({ ok: true, options: { timeoutSeconds: 0 }, ignored: ['explicitProcessing'] });
   });
 });
 

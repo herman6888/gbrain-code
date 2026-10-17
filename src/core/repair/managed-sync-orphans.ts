@@ -11,6 +11,9 @@
  * #6834: a cursor whose checkpoint was refused because the source's
  * `last_commit` moved elsewhere (`checkpoint_moved`) is retirable too; it
  * never resumes, and the next sync discovers from the recorded commit.
+ * #6712 PR 3: a cursor refused for its slug-root mode while the source still
+ * pins the other one (`slug_mode_refused`) is retirable too: retiring it is how
+ * a person keeps the new pin.
  * Retiring an old incarnation's bookkeeping says nothing about whether the
  * current source's files were imported; `gbrain sync status` does.
  */
@@ -36,6 +39,7 @@ const describe = (orphan: ManagedSyncOrphan) => orphan.reason === 'no_cursor' ? 
   : orphan.reason === 'incarnation_retired' ? `${orphan.kind === 'unfinished_cursor' ? 'cursor' : 'failure row'} recorded under source incarnation ${orphan.source_incarnation?.slice(0, 8) ?? '?'}, which the source no longer has; no current sync selects it`
   : orphan.reason === 'mirror_only' ? 'local ledger mirror row with no durable failure row under its key'
   : orphan.reason === 'checkpoint_moved' ? `cursor whose pages all committed and whose checkpoint (request ${orphan.pending_request_id ?? '?'}) was refused because the source's last_commit moved to a commit outside this run; no resume can publish it, and the next sync discovers from the commit the source records`
+  : orphan.reason === 'slug_mode_refused' ? `cursor whose pages all committed and whose checkpoint (request ${orphan.pending_request_id ?? '?'}) was refused because the source pins the other slug_root_mode; retiring it keeps the pin, and the next sync discovers the source again under it`
     : 'cursor from before recorded sync options, superseded by a completed run';
 
 export const managedSyncOrphansRepair: RepairHandler = {

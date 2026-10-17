@@ -202,6 +202,30 @@ for (const backend of testBackends()) describe(`C7 bulk file-drift reconcile (${
     expect((await engine.getPage(CONCEPTS[0]!, { sourceId }))!.compiled_truth).toBe(`Stored ${CONCEPTS[0]}.`);
   }), 240_000);
 
+  test('#6712 PR 2: --all-drifted --since 7d keeps pages drifted since that instant, and the returned command carries the instant and applies exactly them', () => fixture(async ({ root, sourceId, ctx }) => {
+    await driftedPages(root, ctx);
+    // The person's conflict is ten days old; the concepts' are new.
+    await engine.executeRaw("UPDATE persistence_requests SET created_at=now()-interval '10 days' WHERE source_id=$1 AND slug=$2 AND state='conflict'", [sourceId, PERSON]);
+    // A group of drift conflicts on several pages is fixed with one --since preview at the group's oldest conflict, never an age.
+    const { readTerminalFailures } = await import('../src/core/persistence/terminal-failures.ts');
+    const grouped = await readTerminalFailures(engine, { sourceId, groupBy: 'category', state: 'all', sinceDays: 30 });
+    const group = grouped.status === 'ok' ? grouped.groups!.find(g => g.category === 'file_conflict') : undefined;
+    expect(group?.fix.argv?.slice(0, 7)).toEqual(['gbrain', 'repair', 'file-drift', '--source', sourceId, '--all-drifted', '--since']);
+    expect(group!.fix.argv![7]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(Date.parse(group!.fix.argv![7]!)).toBeLessThan(Date.now() - 9 * 86_400_000);
+    const future = (await json(['file-drift', '--source', sourceId, '--all-drifted', '--since', new Date(Date.now() + 3_600_000).toISOString(), '--prefer', 'database'])).results[0]!;
+    expect(future).toMatchObject({ affected: 0, residuals: { not_selected: 4 } });
+    const preview = (await json(['file-drift', '--source', sourceId, '--all-drifted', '--since', '7d', '--prefer', 'database'])).results[0]!;
+    expect(preview).toMatchObject({ mode: 'dry_run', affected: 3, residuals: { not_selected: 1 } });
+    const command = String(preview.apply_command);
+    const since = /--since (\S+)/.exec(command)?.[1];
+    expect(since).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(command).not.toContain('--since 7d');
+    const applied = (await json(argvFromCommand(command)!.slice(2))).results[0]!;
+    expect(applied).toMatchObject({ mode: 'apply', applied: 3, complete: true, outcomes: { repaired: 3 } });
+    expect(await stillDrifted(sourceId, [...CONCEPTS, PERSON])).toEqual([PERSON]);
+  }), 240_000);
+
   test('the globs are bound into the preview hash: --skip narrows the set, and an apply under other globs refuses preview_changed', () => fixture(async ({ root, sourceId, ctx }) => {
     await driftedPages(root, ctx);
     const scope = await resolveRepairScope(engine, sourceId);

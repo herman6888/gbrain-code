@@ -42,13 +42,14 @@ import { FENCE_VERSION } from '../fence-repair/refusal.ts';
 import { fenceHoldFix, fenceHoldLocation, fencePreviewArgv, readFenceAutoRepair, type FenceAutoRepair, type FenceHoldLocation } from '../fence-repair/hold-fix.ts';
 import { contentHoldDocs, contentHoldFix } from '../content-repair/hold-fix.ts';
 import { STRUCTURED_WRITE_ADVICE, type FencesNormalized } from '../fence-repair/report.ts';
-import type { SyncRename } from './sync-discovery.ts';
+import type { SyncDiscovery, SyncRename } from './sync-discovery.ts';
 import { isCodeFilePath, isImageFilePath, isMultimodalEnabled } from '../sync.ts';
 import { VERSION } from '../../version.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { chunkerStamp } from '../chunkers/code.ts';
 import { gitBlobOid, sha256 } from './digest.ts';
-import { HOLD_ATTEMPTS_NEEDS_HUMAN } from './sync-fault-class.ts';
+import { HOLD_ATTEMPTS_NEEDS_HUMAN, HOLD_ESCALATE_MS } from './sync-fault-class.ts';
+import { retiredSyncSetting, type RetiredSyncKeyName } from '../sync-config-keys.ts';
 
 export const GIT_HOLD_OP = 'sync-hold';
 export const GIT_HOLD_SUMMARY_OP = 'sync-hold-summary';
@@ -58,7 +59,7 @@ export const SYNC_IMPORT_PROVENANCE_OP = 'sync-import-provenance';
 export const SYNC_CONVERSION_OP = 'sync-conversions';
 /** How many conversions the log keeps per source. */
 export const SYNC_CONVERSION_KEEP = 20;
-/** Default for `sync.hold_cap`: how many holds a result lists in detail. Storage is never capped. */
+/** Default for `GBRAIN_SYNC_HOLD_CAP`: how many holds a result lists in detail. Storage is never capped. */
 export const GIT_HOLD_CAP = 500;
 export const GIT_HOLD_ESCALATE_COUNT = 50;
 export const GIT_HOLD_ESCALATE_PCT = 5;
@@ -67,7 +68,8 @@ export const GIT_HOLD_ESCALATE_MIN_SCREENED = 40;
 
 type Exec = Pick<BrainEngine, 'executeRaw'>;
 
-export type GitHoldCode = ContentRefusal['code'] | 'rename_held' | 'parser_regression' | 'managed_image_sync_unsupported' | 'concurrent_write' | 'preparation_stalled' | 'worktree_dirty' | 'file_drift';
+export type GitHoldCode = ContentRefusal['code'] | 'rename_held' | 'parser_regression' | 'managed_image_sync_unsupported' | 'concurrent_write' | 'preparation_stalled' | 'worktree_dirty' | 'file_drift'
+  | 'legacy_slug_conflict';
 /** #6278: what the owner recorded about a preparation it gave up on (step names and vocabulary only, never content). */
 export interface PreparationStallMeta {
   request_id: string;
@@ -80,7 +82,7 @@ export interface PreparationStallMeta {
   /** The `gbrain sync` arguments that resume the cursor with its stored options (after `sources retry-held`). */
   sync_argv: string[];
 }
-export type GitHoldReason = InvalidFrontmatterReason | 'rename_source_changed' | FenceReason;
+export type GitHoldReason = InvalidFrontmatterReason | 'rename_source_changed' | 'explicit_id_conflict' | FenceReason;
 
 export interface GitHoldMeta {
   reason?: GitHoldReason;
@@ -110,8 +112,14 @@ export interface GitHoldMeta {
   expected_revision?: string;
   /** #6340 `worktree_dirty`: sha256 of the uncommitted working-tree bytes the hold protected (`blob_oid` is the pinned blob). */
   working_hash?: string;
-  /** #6340: how many times this path was held again with the same code since the hold was first written; at `HOLD_ATTEMPTS_NEEDS_HUMAN` the page keeps moving. */
+  /** #6340: how many times this path was held again with the same code since the hold was first written, plus (#6712 PR 2) the hold's safe actions that ran and failed; at `HOLD_ATTEMPTS_NEEDS_HUMAN` over `HOLD_ESCALATE_MS` the page keeps moving. */
   attempts?: number;
+  /** #6712 PR 2: when this path was first held with its code (attempts count from it); `held_at` resets when the held bytes change. */
+  first_held_at?: string;
+  /** #6712 PR 2 `worktree_dirty`: when the uncommitted bytes last changed (`working_hash` moved); a recent edit is a live editor, never escalated. */
+  edited_at?: string;
+  /** #6712 PR 2: when the soak sweep counted this hold as needing a person (`soak-counters.ts`); kept across re-holds with the same code, so it counts once. */
+  needs_human_at?: string;
   /** #6188: the last fence repair attempt (repair kind or maintenance phase) that left this hold in place; location and reason only. */
   fence_repair?: FenceHoldRepairState;
   /** #6377 `frontmatter_slug_conflict`: the content-repair lane's last verdict or attempt on this hold; codes and slugs only. */
@@ -125,6 +133,8 @@ export interface GitHoldMeta {
    * held in that sync; this entry waits on it with the same code, and discovery re-screens it once that hold is gone.
    */
   blocked_on?: string;
+  /** #6727 `legacy_slug_conflict`: the live pages without a recorded origin whose slugs fold to the file's slug. */
+  legacy_slugs?: string[];
 }
 
 /** #6188: why the last fence repair left a hold in place, and when the maintenance run tries it again (null: it does not). */
@@ -156,6 +166,12 @@ export interface ContentHoldRepairState {
   model?: string;
   at: string;
   next_attempt_after: string | null;
+  /** #6865: the content-repair lane version that recorded this verdict (absent: before versioning); an older one is rechecked once. */
+  lane_version?: number;
+  /** #6865 `still_invalid`: the other frontmatter fix codes removing the slug: line alone leaves. */
+  other_codes?: string[];
+  /** #6865: the named page has no file (a database-only page). */
+  named_db_only?: true;
 }
 
 export interface GitHoldRecord {
@@ -268,7 +284,7 @@ export async function writeGitHold(tx: Exec, input: Omit<GitHoldRecord, 'version
   const sameBytes = existing && existing.code === input.code && existing.upstream_version === input.upstream_version;
   const kept = sameBytes ? { ...(existing.meta.fence_repair && !input.meta.fence_repair ? { fence_repair: existing.meta.fence_repair } : {}),
     ...(existing.meta.content_repair && !input.meta.content_repair ? { content_repair: existing.meta.content_repair } : {}) } : {};
-  const record: GitHoldRecord = { version: 1, ...input, meta: { ...kept, ...input.meta, attempts },
+  const record: GitHoldRecord = { version: 1, ...input, meta: { ...kept, ...input.meta, attempts, ...escalationStamps(existing, input, now) },
     held_at: existing && existing.upstream_version === input.upstream_version && existing.code === input.code ? existing.held_at : now, updated_at: now };
   await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)
     ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()`,
@@ -282,6 +298,59 @@ export async function writeGitHold(tx: Exec, input: Omit<GitHoldRecord, 'version
   }
   await adjustSummary(tx, input.source_id, input.incarnation, 1, weightsOf(input));
   return 'inserted';
+}
+
+/** #6712 PR 2: the first-held time of the code's attempt count, the soak count's stamp, and a `worktree_dirty` hold's last edit (a changed `working_hash`). */
+function escalationStamps(existing: GitHoldRecord | null, input: Pick<GitHoldRecord, 'code' | 'meta'>, now: string): Pick<GitHoldMeta, 'first_held_at' | 'edited_at' | 'needs_human_at'> {
+  const same = existing?.code === input.code ? existing : null;
+  const kept = { first_held_at: same ? same.meta.first_held_at ?? same.held_at : now, ...(same?.meta.needs_human_at ? { needs_human_at: same.meta.needs_human_at } : {}) };
+  if (input.code !== 'worktree_dirty') return kept;
+  return { ...kept, edited_at: same && same.meta.working_hash === input.meta.working_hash ? same.meta.edited_at ?? same.held_at : now };
+}
+
+/**
+ * #6712 PR 2 (L4): what escalation reads from a hold: its failed attempts, how long since it was first held with its code,
+ * and whether a `worktree_dirty` hold's uncommitted bytes changed within `HOLD_ESCALATE_MS` (someone is still editing).
+ */
+export function holdEscalation(record: Pick<GitHoldRecord, 'code' | 'meta' | 'held_at'>, now = Date.now()): { attempts: number; held_for_ms: number; live_editor: boolean } {
+  const since = (at: string | undefined) => Math.max(0, now - Date.parse(at ?? record.held_at));
+  return { attempts: record.meta.attempts ?? 1, held_for_ms: since(record.meta.first_held_at),
+    live_editor: record.code === 'worktree_dirty' && since(record.meta.edited_at) < HOLD_ESCALATE_MS };
+}
+
+/**
+ * #6712 PR 2 (L4): a hold's safe action ran and the hold stands (`sync unblock --apply` found the edit still uncommitted, or
+ * its repair left the file held): one more failed attempt, and for `worktree_dirty` the uncommitted bytes it saw now
+ * (`workingHash`), so a changed edit restarts the live-editor clock. A no-op when the path holds another code by now.
+ */
+export function recordHoldAttempt(tx: Exec, input: { sourceId: string; incarnation: string; path: string; code: GitHoldCode; workingHash?: string }): Promise<boolean> {
+  return rewriteHoldMeta(tx, input, existing => ({ ...edit(existing, input.workingHash), attempts: (existing.meta.attempts ?? 1) + 1 })).then(record => record !== null);
+}
+
+/** #6712 PR 2 (L4): a `worktree_dirty` hold whose uncommitted bytes changed since it last looked: a live editor (no attempt counted). */
+export function noteHoldEdit(tx: Exec, input: { sourceId: string; incarnation: string; path: string; workingHash: string }): Promise<GitHoldRecord | null> {
+  return rewriteHoldMeta(tx, { ...input, code: 'worktree_dirty' }, existing => existing.meta.working_hash === input.workingHash ? null : edit(existing, input.workingHash));
+}
+
+function edit(existing: GitHoldRecord, workingHash: string | undefined): Partial<GitHoldMeta> {
+  return workingHash !== undefined && workingHash !== existing.meta.working_hash ? { working_hash: workingHash, edited_at: new Date().toISOString() } : {};
+}
+
+/**
+ * Rewrites one hold's meta when it still holds `code`, guarded on the exact record it read: a hold another run replaced
+ * or re-held meanwhile is left as that run wrote it (the update matches no row), so this never restores an obsolete record.
+ */
+async function rewriteHoldMeta(tx: Exec, input: { sourceId: string; incarnation: string; path: string; code: GitHoldCode }, change: (existing: GitHoldRecord) => Partial<GitHoldMeta> | null): Promise<GitHoldRecord | null> {
+  const existing = await readRow(tx, input.sourceId, input.incarnation, input.path);
+  if (!existing || existing.code !== input.code) return null;
+  const meta = change(existing);
+  if (!meta) return null;
+  const now = new Date().toISOString();
+  const record: GitHoldRecord = { ...existing, meta: { ...existing.meta, ...escalationStamps(existing, existing, now), ...meta }, updated_at: now };
+  const rows = await tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$3::text::jsonb, updated_at=now()
+      WHERE op=$1 AND fingerprint=$2 AND completed_keys=$4::text::jsonb RETURNING 1`,
+  [GIT_HOLD_OP, gitHoldFingerprint(input.sourceId, input.incarnation, input.path), JSON.stringify([record]), JSON.stringify([existing])]);
+  return rows.length ? record : null;
 }
 
 /**
@@ -424,10 +493,12 @@ export async function holdBasisMoved(engine: Pick<BrainEngine, 'executeRaw'>, so
  * has been held `HOLD_ATTEMPTS_NEEDS_HUMAN` times (attempts count real
  * re-holds); past that it waits for `sources retry-held`. #6529: a `managed_image_sync_unsupported` hold
  * re-screens whenever multimodal embedding is on, since managed sync then
- * imports the image instead of holding it.
+ * imports the image instead of holding it. #6712 PR 2: a `content_rejected`, `write_gate_rejected` or
+ * `purged_content` hold rests on a setting, an allow rule or a tombstone its fix lets the user change, so it
+ * re-screens on every sync too. #6727: so does a `legacy_slug_conflict` hold, which rests on the legacy pages a person removes.
  */
 export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, retried: boolean): boolean {
-  return retried || ['frontmatter_slug_conflict', 'file_too_large', 'rename_held', 'parser_regression'].includes(record.code)
+  return retried || ['frontmatter_slug_conflict', 'file_too_large', 'rename_held', 'parser_regression', 'content_rejected', 'write_gate_rejected', 'purged_content', 'legacy_slug_conflict'].includes(record.code)
     // #6712: a transient hold (the write owner stalled, not the file) is retried by every sync until it has been held HOLD_ATTEMPTS_NEEDS_HUMAN times.
     || (record.code === 'preparation_stalled' && (record.meta.attempts ?? 1) < HOLD_ATTEMPTS_NEEDS_HUMAN)
     || (record.code === 'managed_image_sync_unsupported' && isMultimodalEnabled())
@@ -533,6 +604,17 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
       const slug = record.slug ?? '<slug>';
       const by = record.meta.competing_request_id ? `${record.meta.competing_operation ?? 'a database'} request ${record.meta.competing_request_id} wrote page ${slug} straight to the database`
         : `page ${slug} changed in the database${record.meta.page_revision ? ` (revision ${record.meta.page_revision})` : ''} after the sync enumerated it`;
+      // #6712 wave: a held deletion has no file left to reconcile; repair file-drift resolves a page whose file is gone from the commit.
+      if (record.meta.deleted) {
+        const preview = (prefer: 'database' | 'file') => ['gbrain', 'repair', 'file-drift', '--source', source, '--slug', slug, '--prefer', prefer];
+        const verify = { argv: ['gbrain', 'sources', 'status', source, '--json'] };
+        return { argv: preview('database'), consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/guides/repair.md#deleted-canonical-files',
+          why: `${record.path} was deleted in Git while ${by}, so sync held the deletion instead of removing a page that changed. This preview (writes nothing) keeps the page and recreates its file; `
+            + `${preview('file').join(' ')} previews the deletion instead (soft-deletes exactly that page). Decide with the user, run the apply command the preview prints, then sync again. The rest of the source is not blocked.`,
+          then: { argv: ['gbrain', 'sync', '--source', source, '--no-pull'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+            why: `Re-screens ${record.path} after the repair (a changed file or page revision re-screens it by itself).` },
+          verify };
+      }
       return { argv: ['gbrain', 'sources', 'reconcile', source, slug, '--preview'], consent: [], actor: 'agent', requires_exclusive: false,
         why: `${record.path} changed in Git while ${by}, so the two versions diverge and neither was overwritten. `
           + `The reconcile preview shows both and writes nothing; resolve it with the user, apply it, then re-screen the file with gbrain sources retry-held ${source} and gbrain sync --source ${source} --no-pull. The rest of the source is not blocked.`,
@@ -582,16 +664,16 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
     case 'purged_content':
       return { argv: ['gbrain', 'pages', 'purges', 'list', '--source', source], consent: [], actor: 'user', requires_exclusive: false,
         user_message: `${record.path} carries the content of a page the owner purged, so sync holds it. Delete or edit the file and commit; or, only if the purge was a mistake, clear it with gbrain pages unpurge <slug> --source ${source} on the brain host.`,
-        why: 'Purged content stays out of the brain until the owner clears its tombstone; editing the file (a new content hash) imports normally.',
+        why: 'Purged content stays out of the brain until the owner clears its tombstone; the next sync re-screens the file, so an edit (a new content hash) or a cleared tombstone imports it normally.',
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'content_rejected':
       return { argv: ['gbrain', 'config', 'get', 'content_sanity'], consent: [], actor: 'user', requires_exclusive: false,
         user_message: `${record.path} was rejected by the content-sanity gate because junk_disposition is reject. Remove the matched junk from the file, or decide whether to switch junk_disposition back to quarantine.`,
-        why: 'The operator chose to reject junk; changing that setting is a user decision. Editing the file and committing clears the hold on the next sync.' };
+        why: 'The operator chose to reject junk; changing that setting is a user decision. The next sync re-screens the file: an edit committed, or the setting switched, clears the hold.' };
     case 'write_gate_rejected':
       return { argv: ['gbrain', 'config', 'get', 'write_gate.external_mode'], consent: [], actor: 'user', requires_exclusive: false,
         user_message: `${record.path} was refused by the write gate: its source is untrusted and it reads like an instruction to an agent, and write_gate.external_mode is reject. Decide whether to edit the file or switch the setting back to quarantine.`,
-        why: 'The operator chose to reject external instruction-like content; changing that setting is a user decision. Editing the file and committing clears the hold on the next sync.' };
+        why: 'The operator chose to reject external instruction-like content; changing that setting is a user decision. The next sync re-screens the file: an edit committed, the setting switched, or an owner allow rule (gbrain trust allow) for the file clears the hold.' };
     case 'managed_image_sync_unsupported':
       return { argv: ['gbrain', 'config', 'get', 'sync.exclude'], consent: [], actor: 'user', requires_exclusive: false,
         user_message: `Multimodal embedding is off, so managed sync holds ${record.path} and the rest of source ${source} keeps syncing. Keeping images held is fine; to import them, set GBRAIN_EMBEDDING_MULTIMODAL=true for the gbrain process (image embeddings can cost money) and sync again; to stop holding them, leave images out of the source with sync.exclude.`,
@@ -600,7 +682,24 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
     case 'parser_regression':
       return { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'user', requires_exclusive: false,
         user_message: `gbrain refuses ${record.path}, whose exact bytes imported under an earlier version. This is a gbrain bug: report it with the gbrain version, the file and the code, then upgrade or pin the last good version.`,
-        why: 'The same bytes imported before, so only gbrain changed; sync holds the file under sync.parser_regression=hold.' };
+        why: 'The same bytes imported before, so only gbrain changed; sync holds the file under GBRAIN_SYNC_PARSER_REGRESSION=hold.' };
+    case 'legacy_slug_conflict': {
+      const slugs = record.meta.legacy_slugs ?? [];
+      const verify = { argv: ['gbrain', 'sources', 'status', source, '--json'] };
+      return { argv: verify.argv, consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code, record.meta.reason),
+        user_message: record.meta.reason === 'explicit_id_conflict'
+          ? `${record.path} folds to page ${JSON.stringify(slugs[0] ?? '')}, which an older gbrain imported without recording its file, but the file's frontmatter id differs from that page's, so it is a different document and sync held it rather than give it that page's facts, links and history. `
+            + `If it is the same document, give the file the page's id; if not, rename the file to a name that folds to another slug (it imports as a new page), or remove the old page with gbrain delete --source ${source} -- '${slugs[0] ?? '<slug>'}' (recoverable for 72 h); then run gbrain sync --source ${source} --no-pull.`
+          : slugs.length > 1
+          ? `${record.path} belongs to one of the pages ${slugs.map(slug => JSON.stringify(slug)).join(', ')}, which an older gbrain imported without recording their file, so sync held it rather than guess or create another page. `
+            + `Pick the page that is this file's and remove each other one with gbrain delete --source ${source} -- '<slug>' (recoverable for 72 h), or rename the file if none of them is its page, then run gbrain sync --source ${source} --no-pull.`
+          : `${record.path} matches page ${JSON.stringify(slugs[0] ?? '')}, which an older gbrain imported without recording its file under a slug with capitals that sync cannot write and no gbrain command can address yet, so sync held the file rather than create a second page. `
+            + `Keep the file held (the rest of the source syncs), or rename it to a name that folds to another slug, which imports it as a new page beside the old one (the old page keeps its links), then run gbrain sync --source ${source} --no-pull.`,
+        why: 'Which page a file is cannot be decided from the slugs alone, and sync never writes a slug it would have to change. Once one writable page is left, the next sync imports the file into it (same page id, links and history) and records the file as its origin; until then the rest of the source keeps syncing.',
+        then: { argv: ['gbrain', 'sync', '--source', source, '--no-pull'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+          why: `Re-screens ${record.path} after the other pages are removed (this hold is re-screened on every sync).` },
+        verify };
+    }
     case 'rename_held':
       return repair(true, `The page that ${record.path} renames changed after the rename was recorded, so it was not moved; the preview proposes re-binding the rename to the current page for approval.`);
     case 'frontmatter_slug_conflict':
@@ -691,6 +790,18 @@ export async function clearGitHoldRetryPaths(engine: Exec, sourceId: string, inc
   await engine.executeRaw(`DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND jsonb_array_length(completed_keys->0->'paths')=0`, [GIT_HOLD_RETRY_OP, fingerprint]);
 }
 
+/**
+ * #6712 PR 2: a discovery that found nothing to write still releases the held paths that left the source (excluded by
+ * sync.exclude, an image while multimodal embedding is off) and consumes the re-screens it took, inside the run's
+ * freshness write. Before, those waited for the next commit, so a printed exit (exclude the file, then sync) did not
+ * clear its hold.
+ */
+export async function releaseDiscoveredHolds(tx: Exec, discovery: Pick<SyncDiscovery, 'sourceId' | 'incarnation' | 'discoveredAt' | 'releasedHolds' | 'retryTaken'>): Promise<void> {
+  const observedAt = discovery.discoveredAt ?? new Date().toISOString();
+  for (const path of discovery.releasedHolds ?? []) await clearGitHold(tx, { sourceId: discovery.sourceId, incarnation: discovery.incarnation, path, observedAt });
+  await clearGitHoldRetryPaths(tx, discovery.sourceId, discovery.incarnation, discovery.retryTaken ?? []);
+}
+
 export interface SyncHoldPolicy {
   /** `fail` restores fail-closed blocking: a content refusal blocks the sync as before holds existed. */
   mode: 'hold' | 'fail';
@@ -701,18 +812,19 @@ export interface SyncHoldPolicy {
   parserRegression: 'stop' | 'hold';
 }
 
-export async function readSyncHoldPolicy(engine: Pick<BrainEngine, 'getConfig'>): Promise<SyncHoldPolicy> {
-  const read = async (key: string) => (await engine.getConfig(key).catch(() => null))?.trim().toLowerCase() || null;
-  const number = (value: string | null, fallback: number) => {
-    const parsed = value === null ? NaN : Number(value);
+/**
+ * `sync.holds` is the brain's choice (fail-closed or hold). The cap, the escalation thresholds and the
+ * parser-regression stop retired as config keys in #6712 PR 2: their `GBRAIN_SYNC_*` environment variables
+ * (`RETIRED_SYNC_KEYS`) tune them for the process that syncs, and a stored key is not applied.
+ */
+export async function readSyncHoldPolicy(engine: Pick<BrainEngine, 'getConfig'>, env: NodeJS.ProcessEnv = process.env): Promise<SyncHoldPolicy> {
+  const mode = (await engine.getConfig('sync.holds').catch(() => null))?.trim().toLowerCase() || null;
+  const number = (key: RetiredSyncKeyName, fallback: number) => {
+    const parsed = Number(retiredSyncSetting(key, env));
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   };
-  // Sequential: five point reads, without widening the caller's connection pool.
-  const values: Array<string | null> = [];
-  for (const key of ['sync.holds', 'sync.hold_cap', 'sync.hold_escalate_count', 'sync.hold_escalate_pct', 'sync.parser_regression']) values.push(await read(key));
-  const [mode, cap, count, pct, regression] = values;
-  return { mode: mode === 'fail' ? 'fail' : 'hold', cap: Math.floor(number(cap, GIT_HOLD_CAP)), escalateCount: number(count, GIT_HOLD_ESCALATE_COUNT),
-    escalatePct: number(pct, GIT_HOLD_ESCALATE_PCT), parserRegression: regression === 'hold' ? 'hold' : 'stop' };
+  return { mode: mode === 'fail' ? 'fail' : 'hold', cap: Math.floor(number('sync.hold_cap', GIT_HOLD_CAP)), escalateCount: number('sync.hold_escalate_count', GIT_HOLD_ESCALATE_COUNT),
+    escalatePct: number('sync.hold_escalate_pct', GIT_HOLD_ESCALATE_PCT), parserRegression: retiredSyncSetting('sync.parser_regression', env).toLowerCase() === 'hold' ? 'hold' : 'stop' };
 }
 
 /** More holds than the source should carry, or too large a share of this run's screened imports. */
@@ -936,6 +1048,6 @@ export async function buildHoldReport(engine: Exec, input: { sourceId: string; i
 export function syncHoldJsonFields(result: object): Record<string, unknown> {
   const fields = result as Record<string, unknown>;
   return Object.fromEntries(['held', 'held_count', 'holds_outstanding', 'holds_escalated', 'holds_truncated', 'holds_pending_screen', 'holds_fix',
-    'converted_from_failed', 'recovered_frontmatter', 'fences_normalized', 'fence_issues', 'dry_run', 'would_hold', 'would_hold_count', 'would_normalize', 'would_normalize_count', 'screen_skipped', 'breaker']
+    'converted_from_failed', 'recovered_frontmatter', 'fences_normalized', 'fence_issues', 'dry_run', 'would_hold', 'would_hold_count', 'would_normalize', 'would_normalize_count', 'screen_skipped', 'breaker', 'slug_lines_removed']
     .filter(key => fields[key] !== undefined).map(key => [key, fields[key]]));
 }

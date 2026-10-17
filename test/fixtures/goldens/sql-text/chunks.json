@@ -822,8 +822,8 @@
           {
             "lane": "tx",
             "params": [],
-            "sql": "SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')",
-            "textSha256": "0c97097b286eb3415cffbfa812bc301187d88bc7a5266678332b0f4c8c571371"
+            "sql": "SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns', 'embedding_model')",
+            "textSha256": "52b14422ab398f9e070b5981b6726357ba3dff2ad574a15e7b5b7a2679c6d582"
           },
           {
             "lane": "tx",
@@ -920,8 +920,8 @@
           {
             "lane": "tx",
             "params": [],
-            "sql": "SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')",
-            "textSha256": "0c97097b286eb3415cffbfa812bc301187d88bc7a5266678332b0f4c8c571371"
+            "sql": "SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns', 'embedding_model')",
+            "textSha256": "52b14422ab398f9e070b5981b6726357ba3dff2ad574a15e7b5b7a2679c6d582"
           },
           {
             "lane": "tx",
@@ -1195,8 +1195,8 @@
           {
             "lane": "tx",
             "params": [],
-            "sql": "SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')",
-            "textSha256": "0c97097b286eb3415cffbfa812bc301187d88bc7a5266678332b0f4c8c571371"
+            "sql": "SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns', 'embedding_model')",
+            "textSha256": "52b14422ab398f9e070b5981b6726357ba3dff2ad574a15e7b5b7a2679c6d582"
           },
           {
             "lane": "tx",

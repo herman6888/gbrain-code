@@ -8,6 +8,7 @@ import { resolveManagedSyncContext, syncGit, syncGitPath } from './sync-discover
 import { readGitHold } from './sync-holds.ts';
 import { pruneMirrorOnlyManagedFailures } from './managed-sync-orphans.ts';
 import { publicFailureDetail } from './publication-failure.ts';
+import { VERSION } from '../../version.ts';
 
 export interface ManagedSyncFailure {
   source_id: string;
@@ -35,13 +36,15 @@ export interface ManagedSyncFailure {
    * (a receipt from before #6643); the victim is then the only request named.
    */
   root_cause?: ManagedSyncRootCause;
+  /** #6712 PR 3 (L7): the gbrain version that recorded the failure; absent on failures recorded before it was kept. */
+  gbrain_version?: string;
 }
 export interface ManagedSyncRootCause { request_id: string | null; slug: string | null; state: string | null; code: string | null; message: string | null;
   /** The cursor fence cause when the root is a cursor refusal (`outside_fence`, `run_replaced`, `window_dropped`). */
   cause?: string; unknown?: true }
 
 export async function recordManagedSyncFailure(engine: BrainEngine, value: Omit<ManagedSyncFailure, 'first_seen' | 'attempts'> & { first_seen?: string }): Promise<{ failure: ManagedSyncFailure; ledgerRecorded: boolean }> {
-  const failure = { ...value, first_seen: value.first_seen ?? new Date().toISOString(), attempts: 1 };
+  const failure = { ...value, gbrain_version: VERSION, first_seen: value.first_seen ?? new Date().toISOString(), attempts: 1 };
   const recorded = await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     const [row] = await tx.executeRaw<{ completed_keys: [ManagedSyncFailure] }>(`

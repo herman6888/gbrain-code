@@ -98,6 +98,7 @@ export function makeFactsAbsorbHandler(engine: BrainEngine): MinionHandler {
         visibility: job.data.visibility === 'world' ? 'world' : 'private',
         ...(typeof job.data.model === 'string' && job.data.model ? { model: job.data.model } : {}),
         abortSignal: job.signal,
+        deadlineAtMs: job.deadlineAtMs,
       },
     ).catch(refuse);
     // An aborted run returns empty counts; completing it would consume the page's extraction.

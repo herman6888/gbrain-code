@@ -4,7 +4,9 @@
  * bound) is ended (SIGTERM to the group, then SIGKILL after the grace period),
  * retried once, and a second failure stops with a named `::error::`. A slow
  * attempt that keeps printing runs to the total budget instead of being
- * restarted. Each case runs a real command that really stalls or crawls.
+ * restarted. An attempt that exits while the runner is paused past its bound
+ * (the runner pinned to one CPU, so its timer runs before its exit event) is
+ * not a stall. Each case runs a real command that really stalls or crawls.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
@@ -31,13 +33,15 @@ describe.skipIf(process.platform === 'win32')('scripts/ci-bounded-run.ts', () =>
   afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
   const scratch = () => { const dir = mkdtempSync(join(tmpdir(), 'gbrain-ci-bounded-')); dirs.push(dir); return dir; };
 
-  /** A command whose attempts follow `plan` (stall, fail or ok), leaving a backgrounded grandchild on a stall. */
+  /** A command whose attempts follow `plan` (stall, fail or ok), leaving a backgrounded grandchild on a stall. Only shell
+   * builtins run before the step, so a healthy attempt is one short-lived process that forks nothing on its way to exit. */
   function stub(dir: string, plan: string[]): string {
     writeFileSync(join(dir, 'plan'), `${plan.join('\n')}\n`);
     const path = join(dir, 'setup');
     writeFileSync(path, `#!/bin/sh
-n=$(cat '${dir}/count' 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > '${dir}/count'
-case "$(sed -n "\${n}p" '${dir}/plan')" in
+n=1; while [ -e '${dir}/ran.'$n ]; do n=$((n + 1)); done; : > '${dir}/ran.'$n
+i=0; while read -r step; do i=$((i + 1)); [ "$i" = "$n" ] && break; done < '${dir}/plan'
+case "$step" in
   stall) sleep 60 & echo $! >> '${dir}/grandchildren'; sleep 60 ;;
   fail) echo 'E: Unable to fetch some archives' >&2; exit 100 ;;
   *) echo 'done'; exit 0 ;;
@@ -47,8 +51,8 @@ esac
     return path;
   }
 
-  async function cli(args: string[]) {
-    const proc = Bun.spawn([process.execPath, SCRIPT, ...args], { stdout: 'pipe', stderr: 'pipe' });
+  async function cli(args: string[], wrap: string[] = []) {
+    const proc = Bun.spawn([...wrap, process.execPath, SCRIPT, ...args], { stdout: 'pipe', stderr: 'pipe' });
     const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     return { exitCode, stdout, stderr, annotations: stderr.split('\n').filter(line => /^::(warning|error)::/.test(line)) };
   }
@@ -61,6 +65,19 @@ esac
     expect(r.annotations).toEqual([`::warning::${join(dir, 'setup')} attempt 1 stalled: no result after 1s (normally seconds); retrying in 0s`]);
     const [grandchild] = readFileSync(join(dir, 'grandchildren'), 'utf8').trim().split('\n').map(Number);
     expect(alive(grandchild!)).toBe(false);
+  }, 30_000);
+
+  test.skipIf(process.platform !== 'linux')('an attempt that exits before its bound is not a stall, though the runner is paused past the bound', async () => {
+    const dir = scratch();
+    const path = join(dir, 'pauser');
+    writeFileSync(path, `#!/bin/sh\nrunner=$PPID\n(sleep 1.5; kill -CONT "$runner") </dev/null >/dev/null 2>&1 &\nkill -STOP "$runner"\necho $$ >> '${dir}/pids'\necho done\n`);
+    chmodSync(path, 0o755);
+    const cpu = /^Cpus_allowed_list:\s*(\d+)/m.exec(readFileSync('/proc/self/status', 'utf8'))![1]!;
+    const r = await cli(['--attempt-s', '1', '--retry-s', '0', '--', path], ['taskset', '-c', cpu]);
+    expect(r.stderr).toBe('');
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe('done\n');
+    expect(readFileSync(join(dir, 'pids'), 'utf8').trim().split('\n')).toHaveLength(1);
   }, 30_000);
 
   test('two stalls stop with a named error; a failure that is not a stall keeps its exit code', async () => {

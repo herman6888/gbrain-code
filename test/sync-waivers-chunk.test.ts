@@ -3,7 +3,7 @@
  * trip (two calls per entry, 128 for a 64-entry run of deletes). It now sends them in chunks of at most
  * WAIVER_PIPELINE_MAX calls, and sends a chunk only while every entry before it validated, so the contiguous-prefix result
  * is unchanged. The engine here is a recording fake that reports `kind: 'postgres'` (so `pipelined` really issues a chunk
- * at once) and counts the statements outstanding at the same time. The #6423 forced probe is the `no_admission` governor
+ * at once) and counts the statements outstanding at the same time. The #6423 forced probe is the in-pass governor (its `no_progress` stop; #6712 PR 2 retired `no_admission`)
  * test in test/sync-drain-no-admission.test.ts. Synthetic data only.
  */
 import { afterAll, describe, expect, test } from 'bun:test';

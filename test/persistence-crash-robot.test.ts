@@ -366,6 +366,7 @@ const counted = seamCounter(); const counts: Record<string, number> = {};
 installFaultHook((point, detail) => { if (counted(point, detail)) counts[point] = (counts[point] ?? 0) + 1; });
 for (const requestId of ['a', 'a', 'b', 'b', 'b']) await faultPoint('consumer:preparing', { requestId });
 for (const requestId of ['a', 'a']) await faultPoint('publication:after_commit', { requestId });
+for (const writeId of ['w1', 'w1', 'w2']) await faultPoint('consumer:prepared', { requestId: 'shared', writeId });
 process.stdout.write(JSON.stringify({ event: 'counts', counts }) + '\\n');
 installFaultHook(robotFaultHook({ point: 'consumer:preparing', nth: 2 }));
 await faultPoint('consumer:preparing', { requestId: 'a' });
@@ -388,8 +389,45 @@ process.stdout.write('{"event":"continued"}\\n');
       }
       reader.releaseLock();
       expect(lines).toEqual([
-        { event: 'counts', counts: { 'consumer:preparing': 2, 'publication:after_commit': 2 } },
+        { event: 'counts', counts: { 'consumer:preparing': 2, 'publication:after_commit': 2, 'consumer:prepared': 2 } },
         { event: 'fault', point: 'consumer:preparing', nth: 2, detail: { requestId: 'b' } },
+      ]);
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }, 90_000);
+
+  test('#6896: consumer:claiming counts claim epochs, so a run with fewer idle claim passes still reaches every slot the count role saw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-claim-'));
+    const path = join(dir, 'claim.ts');
+    // Count role: busy and idle claim attempts around two preparations (and a re-run one). Run: the same requests, no idle ticks.
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook, seamCounter } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+const counted = seamCounter(); let slots = 0;
+installFaultHook((point, detail) => { const advanced = counted(point, detail); if (point === 'consumer:claiming') slots += advanced; });
+const claim = () => faultPoint('consumer:claiming');
+const prepare = (writeId: string) => faultPoint('consumer:preparing', { requestId: writeId, writeId });
+await claim(); await claim(); await prepare('w1'); await claim(); await claim(); await claim(); await prepare('w1'); await prepare('w2'); await claim(); await claim();
+process.stdout.write(JSON.stringify({ event: 'counts', slots }) + '\\n');
+installFaultHook(robotFaultHook({ point: 'consumer:claiming', nth: slots }));
+await claim(); await prepare('w1'); await claim(); await prepare('w2'); await claim();
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const lines: Record<string, unknown>[] = [];
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (lines.length < 2 && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      expect(lines).toEqual([
+        { event: 'counts', slots: 3 },
+        { event: 'fault', point: 'consumer:claiming', nth: 3, detail: {} },
       ]);
     } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
   }, 90_000);

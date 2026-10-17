@@ -5,6 +5,7 @@ import { currentVerifiedLocalWriter } from './identity.ts';
 import { submissionAuthority } from './authority.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { validateSyncWireParams } from './sync-wire.ts';
+import { retiredWireNotice } from '../wire-skew.ts';
 import { readManagedMode } from './managed-mode.ts';
 import { trustedCliRequired } from '../ops/op-fix.ts';
 
@@ -13,6 +14,7 @@ export async function runAuthenticatedSyncSlice(engine: BrainEngine, params: Rec
   const verified=currentVerifiedLocalWriter();
   if(!verified||verified.remote||verified.principal.kind!=='local_cli')throw trustedCliRequired('Sync requires a current trusted CLI registration.');
   const wire=validateSyncWireParams(params);
+  if(wire.ignored)console.error(retiredWireNotice(wire.ignored));
   const sourceId=await resolveSourceId(engine,wire.options.sourceId??null,wire.cwd,{skipLocalSignals:true});
   const [source]=await engine.executeRaw<{incarnation:string;archived:boolean}>('SELECT incarnation,archived FROM sources WHERE id=$1',[sourceId]);
   if(!source||source.archived)throw opError('source_changed','The selected sync source is unavailable.',

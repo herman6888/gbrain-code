@@ -3390,23 +3390,28 @@
           "tx>sp"
         ],
         "flagOffOpensTransaction": true,
-        "flagOn": "unscoped",
+        "flagOn": "scoped",
         "flagOnLanes": [
           "tx",
           "tx>sp"
         ],
-        "flagOnScopes": []
+        "flagOnScopes": [
+          "src-a"
+        ]
       },
       "updateSlug#noop": {
         "flagOffLanes": [
           "tx"
         ],
         "flagOffOpensTransaction": true,
-        "flagOn": "unscoped",
+        "flagOn": "scoped",
         "flagOnLanes": [
-          "tx"
+          "tx",
+          "tx>sp"
         ],
-        "flagOnScopes": []
+        "flagOnScopes": [
+          "default"
+        ]
       },
       "updateSourceConfig#default": {
         "flagOffLanes": [

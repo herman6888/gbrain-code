@@ -7,6 +7,7 @@ import { makeRemediationStep } from '../../../core/remediation-step.ts';
 import { classifyManagedSyncOrphans, type ManagedSyncOrphan } from '../../../core/persistence/managed-sync-orphans.ts';
 import { readManagedMode } from '../../../core/persistence/ownership.ts';
 import { legacyLedgerNote } from '../../../core/persistence/legacy-sync-failures.ts';
+import { classifyRecordedFault } from '../../../core/persistence/terminal-classify.ts';
 import { agentFix } from '../check-fix.ts';
 
 /** #6518 [R18 vi]: the fast check cannot verify a mirror row; a warning there is uncertainty, never recovery. */
@@ -75,10 +76,15 @@ export async function checkSyncFailures(engine: BrainEngine | null, opts: { sour
   const resumable = managed.filter(row => !orphanKeys.has(row.cursor_key));
   const retries = [...new Set(resumable.map(row => managedSyncRetryCommand(row)))];
   const recovery = requiresManagedRetry
-    ? `${resumable.length || !orphans.length ? `Fix the cause, then run ${retries.length ? retries.join(' ; ') : 'gbrain sync --no-pull --retry-failed with the same source and options'}. Completed full runs do not resolve a different unfinished cursor.` : ''}${orphanNote}${unreadNote}`.trim()
+    ? `${resumable.length || !orphans.length ? `Fix the cause, then run ${retries.length ? retries.join(' ; ') : 'gbrain sync --no-pull with the same source and options (it retries the recorded failure)'}. Completed full runs do not resolve a different unfinished cursor.` : ''}${orphanNote}${unreadNote}`.trim()
     : `Fix the file(s) and re-run 'gbrain sync', or use 'gbrain sync --skip-failed' to acknowledge legacy file failures.${orphanNote}${unreadNote}`;
   const legacyNote = managedBrain ? legacyLedgerNote(unresolvedLegacy) : '';
+  // #6712 PR 2 (L5): each managed failure with the classifier's category and the public category beside it.
+  const failures = managed.map(row => {
+    const v = classifyRecordedFault({ source_id: row.source_id, code: row.code, request_id: row.request_id, error_detail: row.write_error_detail ?? null, message: row.message });
+    return { source_id: row.source_id, path: row.path, code: row.code, category: v.category, public_category: v.public_category, class: v.class, needs_human: v.needs_human };
+  });
   return { name: 'sync_failures', status: severity.status, message: `${summary} ${details.join('; ')} ${recovery}${legacyNote}`,
-    remediation, remediation_status: remediation ? 'remediable' : 'blocked', ...(orphans.length ? { details: { orphans } } : {}), ...orphanFix,
+    remediation, remediation_status: remediation ? 'remediable' : 'blocked', ...(orphans.length || failures.length ? { details: { ...(orphans.length ? { orphans } : {}), ...(failures.length ? { failures } : {}) } } : {}), ...orphanFix,
     ...(engine ? {} : { message: `${summary} Durable sync state is unavailable without a database connection; the local ledger is only a compatibility mirror.${mirrorNote}` }) };
 }

@@ -271,7 +271,9 @@ const READ_ONLY_SUBCOMMANDS = new Set(['config get', 'sources list', 'sources st
   // #6466: `--list` returns before the orchestration lock and never runs an orchestrator or writes the ledger.
   'apply-migrations --list',
   // #6661: [X12] --status takes no lock, makes no home dir and writes no receipt; it probes the serve over HTTP.
-  'bootstrap harness --status']);
+  'bootstrap harness --status',
+  // #6803: the stale-extraction preview returns before any write and reports the terminal counts (actionable, mention_due).
+  'extract --stale --dry-run']);
 
 function tsFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];

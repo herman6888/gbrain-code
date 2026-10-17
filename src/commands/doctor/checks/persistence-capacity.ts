@@ -2,7 +2,8 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { capacityDiagnostics } from '../../../core/persistence/diagnostics.ts';
 import { oneYearCapacity, readJournalLimits } from '../../../core/persistence/limits.ts';
-import { readCapacityForecast, type CapacityForecast } from '../../../core/persistence/capacity-forecast.ts';
+import type { CapacityForecast } from '../../../core/persistence/capacity-forecast.ts';
+import { doctorCapacityForecast, forecastOrNull } from '../capacity-memo.ts';
 import { capacityVerify } from '../../../core/persistence/capacity-view.ts';
 import { BACKGROUND_PRODUCERS, readBackgroundPauseShare } from '../../../core/persistence/admission-origin.ts';
 
@@ -25,7 +26,7 @@ export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Che
       terminal_bytes: string; recovery_bytes: string }>(`SELECT key,outstanding_count::text,intent_bytes::text,lifetime_ids::text,
       terminal_bytes::text,recovery_bytes::text FROM persistence_counters WHERE key='brain' OR key LIKE 'principal:%' ORDER BY key`);
     const limits = await readJournalLimits(engine);
-    const forecast: CapacityForecast | null = await readCapacityForecast(engine, { limits }).catch(() => null);
+    const forecast: CapacityForecast | null = await doctorCapacityForecast(engine, { limits }).catch(forecastOrNull);
     const pause = await readBackgroundPauseShare(engine);
     const cumulative = capacityDiagnostics(counters, limits).filter(row => row.resource === 'lifetime_ids' || row.resource === 'terminal_bytes');
     const resources = [];

@@ -144,7 +144,7 @@ export async function withFileBeliefBrain(sourceId: string, run: (brain: FileBel
 
 /** A page body with a facts fence, a takes fence, prose and wikilinks. */
 export function beliefPage(o: { title?: string; type?: string; prose?: string; facts?: Array<string | { claim: string; context?: string; confidence?: string; visibility?: string }>;
-  takes?: Array<string | { claim: string; weight?: string; since?: string }>; links?: string[]; frontmatter?: Record<string, string> } = {}): string {
+  takes?: Array<string | { claim: string; weight?: string; since?: string; who?: string }>; links?: string[]; frontmatter?: Record<string, string> } = {}): string {
   const fm = { type: o.type ?? 'company', title: o.title ?? 'Acme Example', ...o.frontmatter };
   const facts = (o.facts ?? []).map(f => typeof f === 'string' ? { claim: f } : f);
   const takes = (o.takes ?? []).map(t => typeof t === 'string' ? { claim: t } : t);
@@ -155,7 +155,7 @@ export function beliefPage(o: { title?: string; type?: string; prose?: string; f
     ...facts.map((f, i) => `| ${i + 1} | ${f.claim} | fact | ${f.confidence ?? '1.0'} | ${f.visibility ?? 'world'} | medium | 2026-01-01 |  | remember | ${f.context ?? ''} |`),
     '<!--- gbrain:facts:end -->'].join('\n'));
   if (takes.length) parts.push(['<!--- gbrain:takes:begin -->', '| # | claim | kind | who | weight | since | source |', '|---|-------|------|-----|--------|-------|--------|',
-    ...takes.map((t, i) => `| ${i + 1} | ${t.claim} | take | brain | ${t.weight ?? '0.5'} | ${t.since ?? '2026-07'} | notes |`), '<!--- gbrain:takes:end -->'].join('\n'));
+    ...takes.map((t, i) => `| ${i + 1} | ${t.claim} | take | ${t.who ?? 'brain'} | ${t.weight ?? '0.5'} | ${t.since ?? '2026-07'} | notes |`), '<!--- gbrain:takes:end -->'].join('\n'));
   return `${parts.join('\n\n')}\n`;
 }
 

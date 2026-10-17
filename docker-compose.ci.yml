@@ -156,6 +156,9 @@ services:
       - gbrain-ci-node-modules:/app/node_modules
       - gbrain-ci-admin-node-modules:/app/admin/node_modules
       - gbrain-ci-admin-dist:/app/admin/dist
+      # #6756: the worktree's admin/dist, read-only, outside /app; the runner
+      # copies it into the volume above before building (scripts/ci-hydrate-admin-dist.sh).
+      - ./admin/dist:/ci-src/admin-dist:ro
       # Compiled CLI tests must execute a Linux binary, never a host Mac build.
       - gbrain-ci-bin:/app/bin
       # Warm install cache across runs.

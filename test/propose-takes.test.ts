@@ -23,7 +23,7 @@ import {
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
-  isWellFormedEmptyExtraction,
+  extractorOutcome,
   PROPOSE_TAKES_PROMPT_VERSION,
   EMPTY_EXTRACTION_TOMBSTONE_TEXT,
   resolveProposeTakesDeadlineMs,
@@ -277,49 +277,49 @@ describe('parseExtractorOutput', () => {
   });
 });
 
-// ─── isWellFormedEmptyExtraction ────────────────────────────────────
+// ─── extractorOutcome: the empty-extraction decision ───────────────
 // Guards the tombstone against permanently memoizing a transient parse
 // failure as "no claims". Only a cleanly-parsed empty array counts as a
 // genuine empty extraction; malformed/prose/truncated output must not.
 
-describe('isWellFormedEmptyExtraction', () => {
+describe('extractorOutcome valid_empty (the tombstone decision)', () => {
   test('true for a clean empty array (the well-behaved "no claims" response)', () => {
-    expect(isWellFormedEmptyExtraction('[]')).toBe(true);
-    expect(isWellFormedEmptyExtraction('  []  ')).toBe(true);
-    expect(isWellFormedEmptyExtraction('[   ]')).toBe(true);
+    expect(extractorOutcome('[]').kind).toBe('valid_empty');
+    expect(extractorOutcome('  []  ').kind).toBe('valid_empty');
+    expect(extractorOutcome('[   ]').kind).toBe('valid_empty');
   });
 
   test('true for a fenced empty array', () => {
-    expect(isWellFormedEmptyExtraction('```json\n[]\n```')).toBe(true);
+    expect(extractorOutcome('```json\n[]\n```').kind).toBe('valid_empty');
   });
 
   test('true for leading prose then an empty array', () => {
-    expect(isWellFormedEmptyExtraction('No gradeable claims.\n\n[]')).toBe(true);
+    expect(extractorOutcome('No gradeable claims.\n\n[]').kind).toBe('valid_empty');
   });
 
   test('false for empty / whitespace output (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('')).toBe(false);
-    expect(isWellFormedEmptyExtraction('   \n  ')).toBe(false);
+    expect(extractorOutcome('').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('   \n  ').kind).not.toBe('valid_empty');
   });
 
   test('false for prose-only / non-JSON output (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('There are no gradeable claims here.')).toBe(false);
-    expect(isWellFormedEmptyExtraction('null')).toBe(false);
+    expect(extractorOutcome('There are no gradeable claims here.').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('null').kind).not.toBe('valid_empty');
   });
 
   test('false for malformed / truncated JSON (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('[')).toBe(false);
-    expect(isWellFormedEmptyExtraction('[{"claim_text":"x"')).toBe(false);
+    expect(extractorOutcome('[').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('[{"claim_text":"x"').kind).not.toBe('valid_empty');
   });
 
   test('false for a NON-empty array (has content — not an empty extraction)', () => {
-    expect(isWellFormedEmptyExtraction('[{"claim_text":"x","kind":"take","holder":"brain","weight":0.5}]')).toBe(false);
+    expect(extractorOutcome('[{"claim_text":"x","kind":"take","holder":"brain","weight":0.5}]').kind).not.toBe('valid_empty');
     // Parseable but claim-less array is ambiguous garbage → not a genuine empty.
-    expect(isWellFormedEmptyExtraction('[{"foo":"bar"}]')).toBe(false);
+    expect(extractorOutcome('[{"foo":"bar"}]').kind).not.toBe('valid_empty');
   });
 
   test('false for an empty object (model ignored the array-format instruction)', () => {
-    expect(isWellFormedEmptyExtraction('{}')).toBe(false);
+    expect(extractorOutcome('{}').kind).not.toBe('valid_empty');
   });
 });
 

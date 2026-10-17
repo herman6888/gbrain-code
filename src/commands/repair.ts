@@ -23,6 +23,7 @@ import { OperationError, opError } from '../core/ops/contract.ts';
 import { readFix } from '../core/ops/op-fix.ts';
 import { shellQuote } from '../core/agent-output.ts';
 import { OLDER_THAN_RE } from '../cli/strict-args.ts';
+import { parseSince } from '../core/since.ts';
 import { REPAIR_KINDS, resolveRepairScope, type RepairKind, type RepairResult } from '../core/repair/core.ts';
 import { consentGate, engineConsentEnv } from '../core/consent-cli.ts';
 import { AUTO_REPAIR_REGISTRY, EXPLICIT_REPAIR_REGISTRY, LLM_REPAIR_REGISTRY, PREVIEW_BOUND_REPAIR_REGISTRY, REPAIR_REGISTRY, explicitRepairNotices, repairMayEmbed, repairMaySpend,
@@ -66,11 +67,13 @@ export const REPAIR_HELP = `Usage: gbrain repair [<kind>] [--apply] [--source <i
                             [--no-llm] [--max-usd <n>] [--apply [--expect <preview-hash>]] [--limit <n>] [--json]
        gbrain repair receipt-compaction [--older-than <72h|30d>] [--include-failures] [--force]
                                         [--apply --expect <preview-hash> --yes] [--limit <n>] [--json]
-       gbrain repair file-drift --source <id> (--slug <slug>... | --request <id>... | --all-drifted [--class <name>])
+       gbrain repair file-drift --source <id> (--slug <slug>... | --request <id>... | --all-drifted [--class <name>] [--since <ISO-8601|7d>])
                                 [--only <glob>]... [--skip <glob>]... --prefer file|database [--apply --expect <preview-hash>] [--json]
        gbrain repair stuck-recovery [--source <id>] [--request-id <uuid>]
                                     [--keep prior|disk --apply --expect <preview-hash> --yes] [--json]
        gbrain repair ghost-pages --source <id> [--apply --expect <preview-hash> --yes] [--json]
+       gbrain repair rename-identity --source <id> [--slug <new-slug> [--from <old-slug>] [--close]
+                                     [--apply --expect <preview-hash> --yes]] [--json]
 ${REPAIR_CONTENT_HELP}
 
 Repair residual damage that \`gbrain doctor\` reports. Dry run unless --apply.
@@ -99,10 +102,16 @@ Options:
                  file-drift: narrow the selected pages by canonical file path (repeatable; an exact path, or, on file-drift
                  only, a glob with * within a segment and ** across segments, e.g. --only 'concepts/**'); the hash and the apply command cover them.
   --slug <slug>  fences, file-drift: select a database page by slug (repeatable); the hash covers the selection.
+                 rename-identity: the new page of the one open pair to preview (--from <old-slug> when two pairs share it).
+  --close        rename-identity: release the pair's purge hold instead of carrying its identity; nothing moves.
   --prefer file|database, --request <id>, --all-drifted, --class <name>
                  file-drift: the side that wins; select conflict receipts by request id (repeatable), or every page
                  still drifted (refused across mixed drift classes unless --class keeps one). --keep is refused here:
                  --prefer database keeps the database copy, --prefer file keeps the file.
+  --since <ISO-8601|7d>
+                 file-drift: keep only pages whose newest drift conflict is at or after the instant (with --all-drifted, or
+                 the bare survey). An age (7d, 12h) is resolved once to a concrete instant; the preview, its hash and the
+                 printed apply command carry that instant, so the apply selects exactly what the preview did.
   --diff         frontmatter, fences, slug-conflicts, content: print every per-file diff, not one sample per class or tier.
   --no-llm       Kinds that may call a paid model (${llmKinds}) and the content lane: use only the free tiers;
                  model-tier items stay held with llm_disabled.
@@ -112,7 +121,7 @@ Options:
                  stuck-recovery --apply: the version of each blocked file to keep (the user's choice from the preview).
   --request-id <uuid>
                  stuck-recovery: resolve only this request's recovery (default: every blocked record of the source).
-  --yes          frontmatter, conversation-labels, stuck-recovery, ghost-pages --apply: the user agreed to the previewed changes (destructive
+  --yes          frontmatter, conversation-labels, stuck-recovery, ghost-pages, rename-identity --apply: the user agreed to the previewed changes (destructive
                  consent; without it a terminal asks, and a non-interactive run exits 3 with the consent payload).
   --json         Machine-readable output with a stable shape (frontmatter: every per-file diff).
 
@@ -123,28 +132,29 @@ With no kind, previews every kind. Run it on the brain host.
 Held files (the content lane, then the two-pass frontmatter repair): docs/guides/repair.md#held-files.
 Malformed facts/takes fences (preview, apply, undo): docs/guides/repair.md#fences.
 A write recovery blocked on unexpected_file_bytes: docs/guides/repair.md#stuck-recovery.
-Live pages whose canonical file is missing (ghost pages): docs/guides/repair.md#ghost-pages.`;
+Live pages whose canonical file is missing (ghost pages): docs/guides/repair.md#ghost-pages.
+Renames whose identity sync did not keep (rename-identity): docs/guides/live-sync.md#renaming-a-page.`;
 
-const BOOLEAN_FLAGS = new Set(['--apply', '--all', '--json', '--no-embed', '--include-ambiguous', '--diff', '--yes', '--no-llm', '--all-drifted', '--include-failures', '--force']);
-const VALUE_FLAGS = new Set(['--source', '--limit', '--expect', '--only', '--skip', '--slug', '--max-usd', '--prefer', '--request', '--class', '--keep', '--request-id', '--older-than']);
+const BOOLEAN_FLAGS = new Set(['--apply', '--all', '--json', '--no-embed', '--include-ambiguous', '--diff', '--yes', '--no-llm', '--all-drifted', '--include-failures', '--force', '--close']);
+const VALUE_FLAGS = new Set(['--source', '--limit', '--expect', '--only', '--skip', '--slug', '--max-usd', '--prefer', '--request', '--class', '--since', '--keep', '--request-id', '--older-than', '--from']);
 /** Flags only some kinds accept, with the kinds that do. */
 const KIND_FLAGS: Record<string, readonly string[]> = {
-  '--only': ['frontmatter', 'fences', 'slug-conflicts', 'file-drift', CONTENT_LANE], '--skip': ['frontmatter', 'fences', 'slug-conflicts', 'file-drift', CONTENT_LANE], '--diff': ['frontmatter', 'fences', 'slug-conflicts', CONTENT_LANE], '--yes': ['frontmatter', 'conversation-labels', 'stuck-recovery', 'ghost-pages'],
-  '--slug': ['fences', 'file-drift'], '--prefer': ['file-drift'], '--request': ['file-drift'], '--all-drifted': ['file-drift'], '--class': ['file-drift'],
+  '--only': ['frontmatter', 'fences', 'slug-conflicts', 'file-drift', CONTENT_LANE], '--skip': ['frontmatter', 'fences', 'slug-conflicts', 'file-drift', CONTENT_LANE], '--diff': ['frontmatter', 'fences', 'slug-conflicts', CONTENT_LANE], '--yes': ['frontmatter', 'conversation-labels', 'stuck-recovery', 'ghost-pages', 'rename-identity'],
+  '--slug': ['fences', 'file-drift', 'rename-identity', 'overwritten-edits'], '--from': ['rename-identity'], '--close': ['rename-identity'], '--prefer': ['file-drift'], '--request': ['file-drift'], '--all-drifted': ['file-drift'], '--class': ['file-drift'], '--since': ['file-drift'],
   '--keep': ['stuck-recovery'], '--request-id': ['stuck-recovery'],
   '--older-than': ['receipt-compaction'], '--include-failures': ['receipt-compaction'], '--force': ['receipt-compaction'],
 };
 const VALUE_EXAMPLES: Record<string, string> = { '--source': 'default', '--limit': '50', '--expect': 'PLAN_HASH', '--only': 'notes/a.md', '--skip': 'notes/a.md',
-  '--slug': 'notes/a', '--max-usd': '0.50', '--prefer': 'file', '--request': 'REQUEST_UUID', '--class': 'review_required', '--keep': 'prior',
-  '--request-id': '123e4567-e89b-42d3-a456-426614174000', '--older-than': '30d' };
+  '--slug': 'notes/a', '--max-usd': '0.50', '--prefer': 'file', '--request': 'REQUEST_UUID', '--class': 'review_required', '--since': '7d', '--keep': 'prior',
+  '--request-id': '123e4567-e89b-42d3-a456-426614174000', '--older-than': '30d', '--from': 'notes/old' };
 /** A usage refusal whose fix is the read-only preview (gbrain repair without --apply writes nothing). */
 const invalid = (message: string, suggestion: string, preview: string[] = ['gbrain', 'repair', '--json']) => opError('invalid_params', message, suggestion,
   { fix: readFix('Previews the repair; without --apply it writes nothing.', { argv: preview }) });
 
 interface RepairArgs { kind?: string; apply: boolean; all: boolean; json: boolean; noEmbed: boolean; includeAmbiguous: boolean; diff: boolean; yes: boolean;
   noLlm: boolean; source?: string; limit?: string; expect?: string; maxUsd?: number; only: string[]; skip: string[]; slugs: string[];
-  allDrifted: boolean; prefer?: 'file' | 'database'; requests: string[]; driftClass?: string;
-  keep?: 'prior' | 'disk'; requestId?: string; olderThan?: string; includeFailures: boolean; force: boolean }
+  allDrifted: boolean; prefer?: 'file' | 'database'; requests: string[]; driftClass?: string; since?: string;
+  keep?: 'prior' | 'disk'; requestId?: string; olderThan?: string; includeFailures: boolean; force: boolean; from?: string; close: boolean }
 
 /** `--max-usd` on a kind that never calls a paid model: the cap belongs to the doctor remediation run. */
 function maxUsdRefusal(flag: string, cap: string | undefined, kind: string | undefined): OperationError {
@@ -177,7 +187,7 @@ function fileDriftKeepRefusal(args: string[], keep: string): OperationError {
 /** Strict parse: every flag is known, value flags carry a value, at most one kind. */
 export function parseRepairArgs(args: string[]): RepairArgs {
   const parsed: RepairArgs = { apply: false, all: false, json: false, noEmbed: false, includeAmbiguous: false, diff: false, yes: false, noLlm: false, only: [], skip: [], slugs: [],
-    allDrifted: false, requests: [], includeFailures: false, force: false };
+    allDrifted: false, requests: [], includeFailures: false, force: false, close: false };
   const used = new Set<string>();
   const positional: string[] = [];
   let maxUsdText: string | undefined;
@@ -206,6 +216,7 @@ export function parseRepairArgs(args: string[]): RepairArgs {
       else if (flag === '--all-drifted') parsed.allDrifted = true;
       else if (flag === '--include-failures') parsed.includeFailures = true;
       else if (flag === '--force') parsed.force = true;
+      else if (flag === '--close') parsed.close = true;
       else parsed.noEmbed = true;
       continue;
     }
@@ -224,7 +235,13 @@ export function parseRepairArgs(args: string[]): RepairArgs {
       parsed.prefer = value;
     }
     else if (flag === '--request') parsed.requests.push(value);
+    else if (flag === '--from') parsed.from = value;
     else if (flag === '--class') parsed.driftClass = value;
+    else if (flag === '--since') {
+      try { parsed.since = parseSince(value, '--since'); } catch (error) {
+        throw invalid((error as Error).message, 'Pass an ISO-8601 instant (2026-10-01T00:00:00Z) or an age (7d, 12h); the preview prints the concrete instant it selected.', ['gbrain', 'repair', 'file-drift', ...(parsed.source ? ['--source', parsed.source] : []), '--json']);
+      }
+    }
     else if (flag === '--older-than') {
       if (!OLDER_THAN_RE.test(value)) throw invalid(`--older-than takes hours (72 or 72h) or days (30d) (got "${value}").`, 'Pass the age, e.g. --older-than 30d.',
         ['gbrain', 'repair', 'receipt-compaction', '--json']);
@@ -320,9 +337,11 @@ export function renderRepairResult(result: RepairResult, opts: { diff: boolean }
 export async function runRepairCommand(engine: BrainEngine, args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) { console.log(REPAIR_HELP); return; }
   const { kind, apply, all, json, noEmbed, includeAmbiguous, source, expect, only, skip, slugs, diff, noLlm, maxUsd, limit: limitText,
-    prefer, requests, allDrifted, driftClass, keep, requestId, olderThan, includeFailures, force } = parseRepairArgs(args);
+    prefer, requests, allDrifted, driftClass, since, keep, requestId, olderThan, includeFailures, force, from, close } = parseRepairArgs(args);
   const limit = limitText === undefined ? undefined : Number(limitText);
   if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw invalid('--limit must be a positive integer.', 'Pass --limit as a positive whole number, e.g. --limit 50, or omit it to repair every item.');
+  // #6712 PR 2: a repair apply is a soak intervention; a file-drift apply is a content decision (soak-counters.ts).
+  if (apply && (kind === CONTENT_LANE || REPAIR_KINDS.includes(kind as RepairKind) || (!kind && all))) await (await import('../core/persistence/soak-counters.ts')).recordSoakEvent(engine, kind === 'file-drift' ? 'file_drift_apply' : 'repair_apply');
   if (kind === CONTENT_LANE) {
     if (all) throw invalid('Pass either content or --all, not both.', 'Drop --all to run the content lane, or drop content to run every automatic kind.', ['gbrain', 'repair', CONTENT_LANE, ...(source ? ['--source', source] : []), '--json']);
     const { runRepairContentCommand } = await import('./repair-content.ts');
@@ -342,7 +361,8 @@ export async function runRepairCommand(engine: BrainEngine, args: string[]): Pro
   if (apply && kind && expect && repairSpec(kind as RepairKind).consent === 'destructive') {
     const preview = ['gbrain', 'repair', kind, ...(source ? ['--source', source] : []), ...only.flatMap(path => ['--only', path]), ...skip.flatMap(path => ['--skip', path]),
       ...(includeAmbiguous ? ['--include-ambiguous'] : []), ...(requestId ? ['--request-id', requestId] : []),
-      ...(olderThan ? ['--older-than', olderThan] : []), ...(includeFailures ? ['--include-failures'] : []), ...(force ? ['--force'] : [])];
+      ...(olderThan ? ['--older-than', olderThan] : []), ...(includeFailures ? ['--include-failures'] : []), ...(force ? ['--force'] : []),
+      ...(kind === 'rename-identity' ? [...slugs.flatMap(slug => ['--slug', slug]), ...(from ? ['--from', from] : []), ...(close ? ['--close'] : [])] : [])];
     const custom = repairSpec(kind as RepairKind).consentText;
     const text = custom ? { ...custom, why: `Preview ${expect}: ${custom.why}`, user_message: `${custom.user_message} (preview ${expect.slice(0, 12)}${keep ? `, keep ${keep}` : ''})` } : {
       what: `Rewrite the previewed ${kind} changes on disk and import them`,
@@ -359,9 +379,10 @@ export async function runRepairCommand(engine: BrainEngine, args: string[]): Pro
     const result = await runner.run(k, scope, { limit, sourceFlag: source, explicit: k === kind, expect, includeAmbiguous,
       ...(k === kind && KIND_FLAGS['--only']!.includes(k) ? { only, skip } : {}), ...(k === kind && slugs.length ? { slugs } : {}),
       ...(k === kind && noLlm ? { noLlm } : {}), ...(k === kind && maxUsd !== undefined ? { maxLlmUsd: maxUsd } : {}),
-      ...(k === kind && k === 'file-drift' ? { prefer, requests, allDrifted, driftClass } : {}),
+      ...(k === kind && k === 'file-drift' ? { prefer, requests, allDrifted, driftClass, since } : {}),
       ...(k === kind && keep ? { keep } : {}), ...(k === kind && requestId ? { requestId } : {}),
-      ...(k === kind && k === 'receipt-compaction' ? { olderThan, includeFailures, force } : {}) });
+      ...(k === kind && k === 'receipt-compaction' ? { olderThan, includeFailures, force } : {}),
+      ...(k === kind && k === 'rename-identity' ? { from, close } : {}) });
     results.push({ ...result, paid: repairMaySpend(repairSpec(k), noEmbed) });
     if (result.stopped) break;
   }

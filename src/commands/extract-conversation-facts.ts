@@ -111,6 +111,9 @@ import {
   mergeSaveTimeResolutionCounts,
   resolveExtractedEntitiesForSave,
 } from '../core/entities/resolve-on-save.ts';
+import { CONVERSATION_ENTITY_HINTS_CAP, conversationEntityHints } from '../core/facts/conversation-entity-hints.ts';
+import { inferConversationSubjects } from '../core/facts/conversation-subject-infer.ts';
+import { recordReextractMemo } from '../core/facts/conversation-memo.ts';
 
 // Re-exported verbatim so existing importers (this file's own helpers below
 // and this file's tests) keep working unchanged; doctor.ts, jobs.ts,
@@ -1023,6 +1026,7 @@ async function processPage(
   let pageInsertedTotal = 0;
   const managedRows: Array<NewFact & { row_num: number; source_markdown_slug: string }> = [];
   const pageResolution = emptySaveTimeResolutionCounts();
+  const entityHints = await conversationEntityHints(state.engine, state.sourceId, page.slug, state.factVisibility); // #6731
 
   for (const seg of segments) {
     if (state.segmentLimit > 0 && segmentsThisPage >= state.segmentLimit) break;
@@ -1037,23 +1041,12 @@ async function processPage(
     // per-segment extraction failure aborts the page rather than silently
     // dropping facts.
     let extracted: ExtractedFact[];
+    const input: ExtractInput = { turnText: text, sessionId, source: PER_SEGMENT_SOURCE_PREFIX, engine: state.engine, abortSignal: state.signal,
+      entityHints, entityHintsCap: CONVERSATION_ENTITY_HINTS_CAP };
     if (state.extractor) {
-      extracted = await state.extractor({
-        turnText: text,
-        sessionId,
-        source: PER_SEGMENT_SOURCE_PREFIX,
-        engine: state.engine,
-        abortSignal: state.signal,
-      });
+      extracted = await state.extractor(input);
     } else {
-      const extraction = await extractFactsFromTurnWithOutcome({
-        turnText: text,
-        sessionId,
-        source: PER_SEGMENT_SOURCE_PREFIX,
-        engine: state.engine,
-        abortSignal: state.signal,
-        observationDate: segmentObservationDate(page, seg.startIso),
-      });
+      const extraction = await extractFactsFromTurnWithOutcome({ ...input, observationDate: segmentObservationDate(page, seg.startIso) });
       if (!extraction.ok) {
         // #3669 — rethrow BudgetExhausted UNWRAPPED. Wrapping it in a plain
         // Error strips the BUDGET_EXHAUSTED tag, so the worker pool's D13
@@ -1095,7 +1088,7 @@ async function processPage(
       // (above) ran every fact through the shipped resolver cascade (#3729/#4052),
       // so master's per-row resolveEntitySlug mapper (#4567's independent fix for
       // the same issue) is superseded rather than layered on top.
-      const rows = extracted.map((fact, i) => ({
+      const rows = await inferConversationSubjects(state.engine, state.sourceId, state.factVisibility, extracted.map((fact, i) => ({ // #6764
         ...fact, visibility: state.factVisibility,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
@@ -1107,7 +1100,7 @@ async function processPage(
         ...segmentValidFrom(fact.valid_from, seg.startIso),
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
-      }));
+      })));
       if (state.managed) {
         managedRows.push(...rows);
       } else {
@@ -1141,7 +1134,7 @@ async function processPage(
     // page's facts in one transaction.
     const terminal = terminalAuditFact(page.slug, rowNum, snapshot.versionToken);
     if (state.managed) managedRows.push(terminal);
-    else await writeDerivedFacts(state.engine, state.sourceId, page.slug, db => db.insertFacts([terminal], { source_id: state.sourceId })); // gbrain-allow-direct-insert: page-level TERMINAL audit row (Codex C7 / E16) marks extraction completion in the durable facts table — there's no fence equivalent because this is internal audit state, not user-facing knowledge
+    else await writeDerivedFacts(state.engine, state.sourceId, page.slug, db => db.insertFacts([terminal], { source_id: state.sourceId }).then(async r => { await recordReextractMemo(db, state.sourceId, page.slug); return r; })); // #6764 paid-attempt memo; gbrain-allow-direct-insert: page-level TERMINAL audit row (Codex C7 / E16) marks extraction completion in the durable facts table — there's no fence equivalent because this is internal audit state, not user-facing knowledge
     rowNum++;
   } else if (fullyProcessed && newestEnd !== null) {
     process.stderr.write(
@@ -1982,6 +1975,7 @@ export async function runExtractConversationFacts(
       `in ${sourceIds.length} source(s). ` +
       `Spent ~$${totalSpent.toFixed(4)}.`,
     );
+    if (parsed.dryRun && parsed.slugs?.length) console.log(`  Targets: ${parsed.slugs.join(', ')}`); // #6764: the preview names what the paid run would re-extract
     if (aggregate.pages_skipped > 0) {
       console.log(`  Skipped ${aggregate.pages_skipped} page(s) without eligible segments or outside the selected types:`);
       console.log(`    ${aggregate.pages_skipped_unparsed} with no parseable speaker turns (retryable); ${aggregate.pages_skipped_type_mismatch} with a type mismatch; ${aggregate.pages_skipped_insufficient_turns} with insufficient turns; ${aggregate.pages_skipped_since} with no eligible segments after --since; ${aggregate.pages_skipped_unrecognized_speaker} declined for speaker attribution.`);

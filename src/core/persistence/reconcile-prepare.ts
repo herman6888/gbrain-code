@@ -21,7 +21,7 @@ import { preserveProtectedTakes } from './protected-takes.ts';
 import { digest, sha256 } from './digest.ts';
 import { mergeReconcile, reconcileCanonical, type ReconcileDecision } from './reconcile-merge.ts';
 import { stabilizeSafetyAssessments } from './reconcile-safety.ts';
-import { assertReconcilePins, readReconcileState, reconcileFileReading, reconcilePreviewAdopts, staleReconcile, validateReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
+import { ABSENT_FILE_HASH, assertReconcilePins, readReconcileState, reconcileFileReading, reconcileReadOptions, staleReconcile, validateReconcileArtifact, type ReconcileState } from './reconcile-state.ts';
 import { verifyReconcileBackup } from './reconcile-backup.ts';
 import { assertAutoDecisions } from './reconcile-additive.ts';
 
@@ -131,7 +131,7 @@ export async function prepareReconcileMutation(engine: BrainEngine, row: WriteRe
       `The resolved preview applied by request ${row.request_id} is not ready or names a different source, page or page id than ${row.slug} in source ${row.source_id}. ${freshPreview(row.source_id, row.slug)}`,
       { fix: receiptFix(row) });
   }
-  const adopt = { adoptSlugPath: reconcilePreviewAdopts(artifact) };
+  const adopt = reconcileReadOptions(artifact);
   const state = await readReconcileState(engine, row.source_id, row.slug, artifact.preconditions.assessment_at, adopt);
   assertReconcilePins(artifact.preconditions, state.pins);
   assertAutoDecisions(artifact.auto_decisions ?? [], state.file, reconcileCanonical(state.snapshot.page, state.snapshot.tags), artifact.decisions);
@@ -139,12 +139,14 @@ export async function prepareReconcileMutation(engine: BrainEngine, row: WriteRe
   if (!prepared.ready || digest(prepared.result) !== artifact.result_digest) staleReconcile('canonical policy result changed');
   // #6643: a request that asks to keep the file's bytes (repair file-drift --prefer file) leaves a file that already parses to the
   // reviewed result as it is; any other difference (a protected key, a tag union, a kept private row) renders the result.
-  const keep = row.intent.keep_file_bytes === true && digest(reconcileCanonical(state.file, state.file.tags)) === artifact.result_digest;
+  // #6712 wave: a preview that observed the file absent recreates it from the page and expects no bytes there.
+  const absent = state.pins.raw_file_hash === ABSENT_FILE_HASH;
+  const keep = !absent && row.intent.keep_file_bytes === true && digest(reconcileCanonical(state.file, state.file.tags)) === artifact.result_digest;
   const content = keep ? state.raw.toString('utf8') : serializePageToMarkdown({ ...state.snapshot.page, ...prepared.result }, prepared.result.tags);
   const ready = prepared.ready;
   return {
     observedRevision: state.snapshot.revision, trust: await ownerImportTrust(engine, row, prepared.result.frontmatter, state.path),
-    file: { path: state.path, root: state.root, content, expectedBeforeHash: state.pins.raw_file_hash },
+    file: { path: state.path, root: state.root, content, expectedBeforeHash: absent ? null : state.pins.raw_file_hash },
     // A database-only page matched by its slug path always records that file as its origin.
     noop: ready.noop && sha256(content) === state.pins.raw_file_hash && state.origin === 'recorded',
     validate: async tx => {

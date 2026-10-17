@@ -125,7 +125,7 @@ export function hashGazetteer(gazetteer: Gazetteer): string {
     for (const e of bucket) entries.push(`${e.source_id}\0${e.slug}\0${e.title}\0${e.tokens.join(' ')}\0${e.matchText ?? ''}${e.caseTokens ? `\0${e.caseTokens.join(' ')}` : ''}`);
   }
   // Matching semantics are part of the resume identity, not just DB contents.
-  return createHash('sha256').update('shared-sibling-names-v3\n').update(entries.sort().join('\n')).digest('hex').slice(0, 8);
+  return createHash('sha256').update('html-comments-masked-v4\n').update(entries.sort().join('\n')).digest('hex').slice(0, 8);
 }
 
 /** One row of the saved entry set the mention pass diffs (mention_gazetteer_entries). */
@@ -739,7 +739,7 @@ function hasHangulMatchBoundary(
  *  - First-mention-only cap: dedup by `(entry.source_id, entry.slug)` (one
  *    link per target page regardless of how many body mentions there are).
  *
- * Code-block stripping via `stripCodeBlocks` (preserves offsets, so the
+ * Code-block and HTML-comment stripping via `stripCodeBlocks` (preserves offsets, so the
  * returned mention offsets index into the ORIGINAL text not the stripped
  * text — useful for downstream debugging tools).
  */
@@ -749,7 +749,7 @@ export function findMentionedEntities(
   opts: FindMentionsOpts,
 ): Mention[] {
   if (!text || gazetteer.size === 0) return [];
-  const stripped = stripCodeBlocks(text);
+  const stripped = stripCodeBlocks(text, { onHtmlComment: () => {} });
   const tokens = tokenizeForScan(stripped);
   if (tokens.length === 0) return [];
   const ignored = new Set((opts.ignoreNames ?? []).map(n => tokenizeTitle(n).join(' ')).filter(Boolean));

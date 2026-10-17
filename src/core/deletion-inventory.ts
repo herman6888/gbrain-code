@@ -162,6 +162,7 @@ const ROWS: readonly Row[] = [
   ['subagent_tool_executions', 'out_of_scope', 'probed_reported', 'tool_use_id tool_name input status output error provider_id', 'input output'],
   ['tags', 'out_of_scope', 'no_memory_text', 'tag tag_source'],
   ['take_domain_assignments', 'out_of_scope', 'no_memory_text', 'domain pack source'],
+  ['take_horizons', 'out_of_scope', 'text_free_ledger', 'claim_sha256 basis'],
   ['take_grade_cache', 'out_of_scope', 'probed_reported', 'prompt_version judge_model_id evidence_signature wave_version verdict', 'verdict'],
   ['take_nudge_log', 'out_of_scope', 'no_memory_text', 'source_id nudge_pattern channel wave_version'],
   ['take_proposals', 'swept', 'take_proposals', 'source_id page_slug content_hash prompt_version wave_version proposal_run_id status claim_text kind holder domain dedup_against_fence_rows model_id acted_by'],

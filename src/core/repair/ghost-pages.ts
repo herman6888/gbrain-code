@@ -101,7 +101,7 @@ export function ghostScanRefusal(scan: GhostSourceScan): OperationError | null {
   { reason: scan.reason, fix: writerStatusFix(scan.source_id), docs: DOCS });
 }
 
-function massRefusal(sourceId: string, ghosts: number, fileBacked: number): OperationError {
+export function massRefusal(sourceId: string, ghosts: number, fileBacked: number): OperationError {
   return opError('ghost_mass_delete_refused', `Refusing to soft-delete ${ghosts} of ${fileBacked} file-backed page(s) of source ${sourceId} (more than ${Math.round(MASS_RECONCILE_RATIO * 100)}%).`,
     `That many missing files almost always means the checkout is the wrong path, unmounted or half-cloned, not that the files were deleted; nothing was changed. Check the checkout on the owner host first. If removing these pages is genuinely intended, ask the user, then rerun the same apply command with GBRAIN_ALLOW_MASS_RECONCILE=1.`,
     { fix: writerStatusFix(sourceId), docs: DOCS });
@@ -163,7 +163,7 @@ export const ghostPagesRepair: RepairHandler = {
   },
   async apply(ctx, entry): Promise<RepairItemOutcome> {
     const { ghost, owner, hash, last } = entry as GhostItem;
-    const outcome = await retireGhost(ctx, ghost, owner);
+    const outcome = await retireGhost(ctx, ghost, owner, () => repairRequestId(ctx, 'ghost-pages', ghost, ghost.revision));
     if (last) await clearApprovedSet(ctx.engine, { command: 'ghost-pages', hash });
     return outcome;
   },
@@ -185,15 +185,15 @@ async function stillApproved(engine: BrainEngine, ghost: GhostPage, owner: Ghost
   return null;
 }
 
-async function retireGhost(ctx: OperationContext, ghost: GhostPage, owner: GhostOwner): Promise<RepairItemOutcome> {
+/** Soft-deletes one approved ghost; a managed brain submits it under `requestId()` (also `gbrain repair file-drift --prefer file` on a page whose file is gone, #6712 wave). */
+export async function retireGhost(ctx: OperationContext, ghost: GhostPage, owner: GhostOwner, requestId: () => Promise<string>): Promise<RepairItemOutcome> {
   const engine = ctx.engine;
   const skip = await stillApproved(engine, ghost, owner);
   if (skip) return skip;
   if (await managedPersistenceEnabled(engine)) {
     const authority = (await maintenancePreflight(engine, ghost.source_id))!;
     try {
-      await submitMaintenanceIntent(engine, authority, ghost.slug, { kind: GHOST_PAGES_INTENT, expected_revision: ghost.revision, ghost, owner },
-        await repairRequestId(ctx, 'ghost-pages', ghost, ghost.revision));
+      await submitMaintenanceIntent(engine, authority, ghost.slug, { kind: GHOST_PAGES_INTENT, expected_revision: ghost.revision, ghost, owner }, await requestId());
     } catch (error) {
       if (error instanceof OperationError && ['revision_conflict', 'page_not_found', 'page_identity_changed'].includes(error.code)) return changed(error.message);
       if (error instanceof OperationError && error.code === 'source_changed') return restored(ghost);

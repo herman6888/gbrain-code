@@ -144,7 +144,7 @@ export async function runGate(opts: GateOpts): Promise<GateReport> {
         const g = gold.get(e.slug)!;
         const q = question(e.name);
         for (let r = 0; r < opts.readsPerWrite; r++) {
-          const pack = await pinnedAnswersForPack(ctx, [e.slug]);
+          const pack = await pinnedAnswersForPack(ctx, [{ source_id: sourceId, slug: e.slug }]);
           const pinnedText = (pack?.pinned_questions ?? []).flatMap(p => p.answer).join(' ');
           const pinnedRead = await readerAnswer(opts.reader, opts.readerModel, q, pinnedText);
           const usdP = priced(pinnedRead.model, pinnedRead.input_tokens, pinnedRead.output_tokens);

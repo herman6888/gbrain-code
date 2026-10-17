@@ -39,6 +39,7 @@ import { readFix } from '../ops/op-fix.ts';
 import { shellQuote } from '../agent-output.ts';
 import { fenceHoldStatus, type FenceAutoRepair } from '../fence-repair/hold-fix.ts';
 import type { GitHoldRecord } from '../persistence/sync-holds.ts';
+import { contentRepairLaneCurrent } from '../persistence/sync-fault-class.ts';
 import type { RepairFailedItem, RepairKind, RepairResult, RepairScope } from './core.ts';
 import { repairRunner, type RepairKindSpec } from './registry.ts';
 
@@ -81,6 +82,8 @@ export function contentHoldDisposition(record: Pick<GitHoldRecord, 'code' | 'met
     return { action: 'repair', kind };
   }
   const stored = storedContentAction(record.meta);
+  // #6865: a verdict an older lane recorded is rechecked once; the recheck records this lane's version, so it is listed again after that.
+  if (!contentRepairLaneCurrent(record.meta.content_repair)) return { action: 'repair', kind };
   if (stored === 'merge_into') return { action: 'listed', kind, state: 'needs_human', reason: 'merge_recommended' };
   if (stored === 'needs_human') return { action: 'listed', kind, state: 'needs_human', reason: 'content_repair_needs_human' };
   return { action: 'repair', kind };

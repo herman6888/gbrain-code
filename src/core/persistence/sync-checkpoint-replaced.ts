@@ -1,7 +1,7 @@
 /**
  * #6513 (wave 16 G3.4): a managed-sync checkpoint whose cursor another run of the same source replaced.
  *
- * The replacing run (`--retry-failed` rediscovery, a newer sync of the source) re-covers the source from its own
+ * The replacing run (a rediscovery that retries a recorded failure, a newer sync of the source) re-covers the source from its own
  * discovery, so the superseded checkpoint has nothing left to publish: its refusal is `sync_cursor_replaced` (receipt
  * state `conflict`), it records no managed-sync failure, and the run that awaited it goes on with the winning cursor.
  * A same-run index lag keeps `revision_conflict`, a missing manifest keeps `storage_error`, and a page request whose

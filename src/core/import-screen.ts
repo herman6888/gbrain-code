@@ -404,6 +404,8 @@ export interface ImportScreenInput {
   purgedPages?: ReadonlyMap<string, string>;
   /** #5575: tier and origin of this write; under `write_gate.external_mode: reject` (from `sanity`) a gate reject refuses `write_gate_rejected`. */
   writeGate?: WriteGateInput;
+  /** #6712 PR 2: the owner's trust allow rules that preparation applies (`applyTrustAllowRules`); a reject they cover is not refused. */
+  gateAllowed?: (gate: { families: readonly string[]; detectorError: boolean }) => boolean;
 }
 
 export type ImportScreenResult =
@@ -446,7 +448,7 @@ export function screenImportContent(input: ImportScreenInput): ImportScreenResul
   }
   if (input.writeGate?.tier === 'external_untrusted' && input.sanity?.writeGate?.externalMode === 'reject') {
     const gate = assessPageForGate(parsed, input.writeGate, input.sanity.writeGate);
-    if (gate.verdict === 'reject') return { status: 'refused', refusal: { code: 'write_gate_rejected', message: writeGateRejectedError(gate).message } };
+    if (gate.verdict === 'reject' && !input.gateAllowed?.(gate)) return { status: 'refused', refusal: { code: 'write_gate_rejected', message: writeGateRejectedError(gate).message } };
   }
   return { status: 'importable', parsed, ...(fences ? { fences } : {}) };
 }

@@ -131,7 +131,8 @@ describe('gbrain schema CLI (Phase C)', () => {
     // v1.2.0 (v0.47 open-loop engine): +owes_to +awaiting_reply_from — 15
     // link verbs became 17. (#2117 history: 14 became 15 with `advises`.)
     // v1.3.0 (entity recall): +account page type (alias crm).
-    expect(r.stdout).toContain('gbrain-base-v2 v1.3.0');
+    // v1.4.0 (#6742): +question page type (the pinned-question writer's).
+    expect(r.stdout).toContain('gbrain-base-v2 v1.4.0');
     expect(r.stdout).toContain('Page types (');
     expect(r.stdout).toContain('Link verbs (17)');
   });

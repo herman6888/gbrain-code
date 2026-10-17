@@ -11,7 +11,7 @@
  * phase=compaction` line on stderr when the owner is `serve`.
  */
 import type { BrainEngine } from '../engine.ts';
-import { compactWriteReceiptsDetailed, type ReceiptCompactionResult } from './journal.ts';
+import { compactWriteReceiptsDetailed, yieldToEventLoop, type ReceiptCompactionResult } from './journal.ts';
 import { sweepCompactedReservations } from './receipt-true-up.ts';
 
 export const LAST_COMPACTION_KEY = 'persistence.maintenance.last_compaction';
@@ -24,7 +24,9 @@ const recordedAt = new WeakMap<object, number>();
 
 export async function runCompactionPass(engine: BrainEngine, opts: { hostId: string; notice?: boolean; now?: number }): Promise<CompactionRecord> {
   const result = await compactWriteReceiptsDetailed(engine);
+  await yieldToEventLoop();
   const swept = await sweepCompactedReservations(engine);
+  await yieldToEventLoop();
   const now = opts.now ?? Date.now();
   const record: CompactionRecord = { at: new Date(now).toISOString(), host_id: opts.hostId, compacted: result.compacted,
     freed_bytes: result.freed_bytes + swept.freed_bytes, skipped_by_reason: result.skipped_by_reason };

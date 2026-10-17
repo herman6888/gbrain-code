@@ -28,6 +28,7 @@ import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { VERSION } from '../../version.ts';
 import { sha256 } from './digest.ts';
 import { readPagePurgeTombstones } from './page-purge.ts';
+import { listTrustAllowRules } from '../trust/allow-rules.ts';
 import { readSyncContent, readSyncFile, syncGitPath, type SyncDiscovery, type SyncEntry } from './sync-discovery.ts';
 import { pinnedWindowBlock, readBlobBytes, readBlobContents, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { screenSyncImport, type SyncImportScreenInput } from './sync-prepare.ts';
@@ -72,6 +73,16 @@ function upcomingGitPaths(cursor: PinnedCursor): () => string[] {
 /** The pinned blob of one entry, or null when the commit lacks it; read with the entries after it (`readPinnedBlob`). */
 export function pinnedBlob(cursor: PinnedCursor, path: string): TreeBlob | null {
   return readPinnedBlob(cursor.gitRoot, cursor.target, syncGitPath(cursor, path), upcomingGitPaths(cursor));
+}
+
+/**
+ * A `both` entry's recorded disk blob (`driftBaseline`), or null. When the page still holds what it imports (sync-run.ts
+ * `sameContentAtOrigin`, `pageOnly`), the database changed only what an import keeps (tags, links), so the newer file
+ * overwrites nothing the database alone holds and the entry imports.
+ */
+export function driftBaselineContent(gitRoot: string, entry: Pick<SyncEntry, 'drift' | 'driftBaseline'>): string | null {
+  if (entry.drift !== 'both' || !entry.driftBaseline) return null;
+  try { return readBlobContents(gitRoot, [{ oid: entry.driftBaseline, size: SYNC_READ_BOUND }]).get(entry.driftBaseline) ?? null; } catch { return null; }
 }
 
 /** The frozen import content of one entry (`readSyncContent`); a committed entry's pinned blob is read with the entries after it. */
@@ -188,6 +199,22 @@ function runPurgeTombstones(engine: BrainEngine, run: SyncScreenRun, sourceId: s
   return read;
 }
 
+const writeGateSourceByRun = new WeakMap<SyncScreenRun, Promise<NonNullable<SyncImportScreenInput['writeGateSource']>>>();
+/** #6712 PR 2: one read per sync run of what the write gate needs: the source config (its tier) and the owner's allow rules. */
+function runWriteGateSource(engine: BrainEngine, run: SyncScreenRun, sourceId: string): Promise<NonNullable<SyncImportScreenInput['writeGateSource']>> {
+  let read = writeGateSourceByRun.get(run);
+  if (!read) {
+    read = (async () => {
+      const [row] = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>('SELECT config FROM sources WHERE id=$1', [sourceId]);
+      const config = typeof row?.config === 'string' ? JSON.parse(row.config) as Record<string, unknown> : row?.config ?? null;
+      const allowRules = await listTrustAllowRules(engine, { sourceIds: [sourceId] }).catch(() => []);
+      return { sourceId, config, allowRules };
+    })();
+    writeGateSourceByRun.set(run, read);
+  }
+  return read;
+}
+
 export interface FrozenImportScreen {
   cursor: Pick<SyncDiscovery, 'sourceId' | 'incarnation' | 'root'>;
   entry: SyncEntry; slug: string; pageId: number | null; snapshot: Snapshot;
@@ -202,7 +229,7 @@ export interface FrozenImportScreen {
 
 /**
  * #6696 C8: the `SyncImportScreenInput` a frozen import is screened with (the rename source as its base, the run's
- * schema pack, sanity settings and purge tombstones). Shared with the slug-conflict repair, which screens a held
+ * schema pack, sanity settings, purge tombstones and what the write gate reads). Shared with the slug-conflict repair, which screens a held
  * file exactly as the next sync would.
  */
 export async function frozenImportScreenInput(engine: BrainEngine,
@@ -212,7 +239,7 @@ export async function frozenImportScreenInput(engine: BrainEngine,
   const base = moved ? await engine.readPageSnapshot(moved.slug, { sourceId: input.cursor.sourceId, includeDeleted: true }) : snapshot;
   return { content: input.content, rawHash: input.rawHash, lineEndingOnly: input.lineEndingOnly, slug, sourcePath: entry.sourcePath, path: entry.path,
     root: input.cursor.root, snapshot, base, renamed: !!moved, activePack: run.activePack, sanity: run.sanity,
-    purgedPages: await runPurgeTombstones(engine, run, input.cursor.sourceId) };
+    purgedPages: await runPurgeTombstones(engine, run, input.cursor.sourceId), writeGateSource: await runWriteGateSource(engine, run, input.cursor.sourceId) };
 }
 
 /** The sync screen of one frozen import with the run's `fences.normalize` settled (#6188: with it false, a fence Tier 1 would rewrite is held). */
@@ -232,6 +259,17 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
   if (entry.renameHeld) {
     return heldEntry(entry, slug, pageId, { code: 'rename_held', reason: 'rename_source_changed', message: `${entry.path} is a rename of page ${entry.renameHeld.slug}, which changed after the rename was recorded, so the page was not moved.` }, content, blob);
   }
+  if (entry.legacySlugs?.length && entry.legacyIdVeto) {
+    const held = heldEntry(entry, slug, pageId, { code: 'legacy_slug_conflict', reason: 'explicit_id_conflict', message: `${entry.path} imports as page ${slug}, but page ${entry.legacySlugs[0]}, which an older gbrain imported from a file of that name `
+      + `and records no file, has a frontmatter id that differs from the file's, so it is a different document and sync held the file instead of taking that page over.` }, content, blob);
+    return { ...held, meta: { ...held.meta, legacy_slugs: entry.legacySlugs } };
+  }
+  if (entry.legacySlugs?.length) {
+    const [only, several] = [entry.legacySlugs[0], entry.legacySlugs.length > 1];
+    const held = heldEntry(entry, slug, pageId, { code: 'legacy_slug_conflict', message: `${entry.path} imports as page ${slug}, but ${several ? `pages ${entry.legacySlugs.join(', ')}` : `page ${only}`}, which an older gbrain imported from a file of that name, `
+      + `record${several ? '' : 's'} no file${several ? ' and sync cannot tell which is its page' : ' and has a slug sync cannot write as it stands'}, so sync held the file instead of creating another page.` }, content, blob);
+    return { ...held, meta: { ...held.meta, legacy_slugs: entry.legacySlugs } };
+  }
   // #6188: a fence Tier 1 rewrites is admitted (publication writes the normalized file back); with fences.normalize=false it is held.
   const screen = await screenFrozenContent(await frozenImportScreenInput(engine, { ...input, content }, run), run);
   if (screen.status === 'importable' && screen.fences?.fixes.length) input.onNormalized?.(screen.fences.fixes);
@@ -241,10 +279,10 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
     const provenance = await readSyncImportProvenance(engine, input.cursor.sourceId, input.cursor.incarnation, snapshot.page.id);
     if (provenance?.validated === true && provenance.raw_sha256 === sha256(content) && provenance.origin === entry.sourcePath) {
       const why = `gbrain ${VERSION} refuses ${entry.path} (${refusal.reason ?? 'yaml_parse'}${refusal.line !== undefined ? `, line ${refusal.line}` : ''}), but gbrain ${provenance.gbrain_version} imported these exact bytes and validated them.`;
-      if (run.policy.parserRegression === 'hold') return heldEntry(entry, slug, pageId, { code: 'parser_regression', message: `${why} Held under sync.parser_regression=hold.` }, content, blob);
+      if (run.policy.parserRegression === 'hold') return heldEntry(entry, slug, pageId, { code: 'parser_regression', message: `${why} Held under GBRAIN_SYNC_PARSER_REGRESSION=hold.` }, content, blob);
       throw opError('sync_parser_regression', `Sync stopped: ${why}`,
         `This is a gbrain bug. Report it with the gbrain version (${VERSION}), the file (${entry.path}) and the code (${refusal.code}${refusal.reason ? `/${refusal.reason}` : ''}). `
-          + `Upgrade, or pin the last good version (${provenance.gbrain_version}), then run: ${input.retryCommand}. To hold such files and let the rest sync meanwhile, the user can set sync.parser_regression=hold.`,
+          + `Upgrade, or pin the last good version (${provenance.gbrain_version}), then run: ${input.retryCommand}. To hold such files and let the rest sync meanwhile, the user can set GBRAIN_SYNC_PARSER_REGRESSION=hold for the process that syncs.`,
         { fix: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
           why: 'Collects the gbrain version and brain health to attach to the bug report; the sync checkpoint did not advance past this file.' } });
     }

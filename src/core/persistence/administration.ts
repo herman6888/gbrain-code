@@ -171,13 +171,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       ...(waitDrainMs !== undefined ? { waitDrainMs } : {}), ...(fetchTimeoutMs !== undefined ? { fetchTimeoutMs } : {}) }) };
   }
   if (operation === 'writer_extract_stale') {
-    keys(params, ['source_id', 'dry_run']);
+    keys(params, ['source_id', 'dry_run', 'catch_up', 'source_mode']);
     const writer = currentVerifiedLocalWriter();
     if (!writer || writer.remote || writer.principal.kind !== 'local_cli') throw trustedCliRequired('Stale extraction requires a trusted CLI registration.');
     const { managedPersistenceEnabled } = await import('./ownership.ts');
     if (!await managedPersistenceEnabled(engine)) throw new OperationError('writer_coordinator_required', 'Owner-delegated stale extraction requires activated managed persistence.', WRITER_INSPECTION_HINT);
+    const sourceId = params.source_id === undefined ? undefined : source(params.source_id);
+    // #6803 (D2): the CLI validated --source before the hand-off; only the owner can see whether a source is named db.
+    if (params.source_mode === 'db') await (await import('../../commands/extract-stale-options.ts')).assertStaleSourceModeUnambiguous(engine, ['--stale', '--source', 'db', ...(sourceId ? ['--source-id', sourceId] : [])]);
     return { ...await (await import('./links-maintenance.ts')).runManagedStaleExtraction(engine,
-      { sourceId: params.source_id === undefined ? undefined : source(params.source_id), dryRun: params.dry_run === true }) };
+      { sourceId, dryRun: params.dry_run === true, catchUp: params.catch_up === true }) };
   }
   if (operation === 'writer_reindex_code') return (await import('./reindex-administration.ts')).runAuthenticatedCodeReindex(engine, params);
   if (operation === 'writer_embed_facts') return (await import('./embed-facts-administration.ts')).runAuthenticatedFactEmbedding(engine, params, config);

@@ -1217,8 +1217,8 @@ export async function readStdinBounded(): Promise<string | null> {
 const NON_SCOPE_SOURCE_ID_OPS = new Set(['get_skill']);
 
 /**
- * Returns the ambient binding (GBRAIN_SOURCE / .gbrain-source) that was mapped
- * onto `source_id`, so an empty result can say what narrowed it; null when the
+ * Returns the ambient binding (GBRAIN_SOURCE / .gbrain-source) mapped onto `source_id`
+ * (`prefer_source_id` on ops that declare it: it orders a lookup, never narrows it); null when the
  * scope came from a flag or nothing was mapped.
  */
 export function applyThinClientSourceScope(
@@ -1247,7 +1247,7 @@ export function applyThinClientSourceScope(
     }
     return null; // ambient env/dotfile scope with nowhere to send it
   }
-  params.source_id = resolved;
+  params[!explicit && 'prefer_source_id' in op.params ? 'prefer_source_id' : 'source_id'] = resolved;
   if (explicit) return null;
   const env = process.env.GBRAIN_SOURCE;
   return { sourceId: resolved, via: env && env.length > 0 ? 'GBRAIN_SOURCE' : '.gbrain-source' };
@@ -2436,8 +2436,9 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
   // the only thing that stops the cron orphan-pileup. Disposed in the finally.
   let syncWatchdog: { dispose(): void } | null = null;
   // #6340: `sync status` / `sync unblock` read and schedule on the brain's own engine: no watchdog, no serve delegation (a delegate would refuse the subcommand).
-  const syncOperator = command === 'sync' && (args[0] === 'status' || args[0] === 'unblock');
+  const syncOperator = command === 'sync' && (await import('../commands/sync/operator.ts')).syncOperatorVerb(args) !== null;
   if (command === 'sync' && !syncOperator) {
+    (await import('../commands/sync/args.ts')).noteRetryFailedDeprecated(args);
     try {
       const { resolveSyncHardDeadline } = await import('../commands/sync.ts');
       const res = resolveSyncHardDeadline(args, {

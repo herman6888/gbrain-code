@@ -286,6 +286,8 @@ fi
 # Container runs as root (uid 0) against a host-uid bind-mount; mark repo +
 # any worktree gitdir as safe so `git status` etc. don't refuse.
 git config --global --add safe.directory '*' || true
+# #6756: the admin/dist volume starts empty on a fresh checkout; make it the worktree's bytes.
+bash scripts/ci-hydrate-admin-dist.sh /ci-src/admin-dist admin/dist
 # Revalidate even a warm dependency volume against this checkout's lockfile.
 echo "[runner] bun install --frozen-lockfile"
 bun install --frozen-lockfile

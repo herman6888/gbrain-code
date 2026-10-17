@@ -90,9 +90,9 @@ describe('recognising a single-input over-length rejection', () => {
     expect(isSingleInputOverLengthError(http(400, 'Incorrect API key provided'))).toBe(false);
     expect(isSingleInputOverLengthError(http(400, 'model not found: nomic-embed-text'))).toBe(false);
     expect(isSingleInputOverLengthError(http(404, 'input length exceeds the context length'))).toBe(false);
-    expect(isSingleInputOverLengthError(http(500, 'input length exceeds the context length'))).toBe(false);
+    expect(isSingleInputOverLengthError(http(500, 'Input text is too long for this model'))).toBe(false);
     expect(isSingleInputOverLengthError(http(429, 'rate limit exceeded; token limit exceeded for the minute'))).toBe(false);
-    expect(isSingleInputOverLengthError(new Error('input length exceeds the context length'))).toBe(false);
+    expect(isSingleInputOverLengthError(new Error('Request text too long for URL'))).toBe(false);
     expect(isSingleInputOverLengthError(null)).toBe(false);
   });
 
@@ -189,14 +189,15 @@ describe('healPageAfterOverLength against a PGLite brain', () => {
     });
   });
 
-  test('an unrelated 400, a 5xx and a batch-level token error never rewrite the page', async () => {
+  test('an unrelated 400, a transient 5xx and a batch-level token error never rewrite the page', async () => {
     await withoutChunkTokenEnv(async () => {
       const body = fatParagraph(40);
       const snapshot = await seed('overlength-c', body);
       const before = await engine.getChunks('overlength-c');
       for (const err of [
         http(400, 'Incorrect API key provided'),
-        http(500, 'input length exceeds the context length'),
+        http(500, 'Internal server error'),
+        http(503, 'The input queue is too long, try again later'),
         http(400, 'Too many tokens overall, split into more batches.'),
         new Error('socket hang up'),
       ]) {

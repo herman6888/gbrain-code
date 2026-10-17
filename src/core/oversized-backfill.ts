@@ -20,7 +20,7 @@
  * (`reason: oversized`) is touched. A chunkless one is still re-chunked with
  * the marker kept (#6722), so every page up to the ceiling is keyword-searchable. A large page (over `pages.inline_max_bytes`) is held in
  * `page_embedding_budget` before its rewrite, so no paid embedding starts
- * until the user approves the previewed cost (`gbrain embed --held --max-usd N`).
+ * until the user approves the previewed cost (`gbrain embed --held --source S --max-usd N`).
  *
  * Idempotent and resumable: the work list is recomputed from the markers on
  * every run, so a page done is never redone and an interrupted run continues.
@@ -40,6 +40,7 @@ import { effectiveBytesBlock } from './import-screen.ts';
 import { PAGE_MAX_BYTES, isLargePageBytes } from './page-size-policy.ts';
 import { estimatePageEmbedUsd, holdPageEmbedding } from './page-embedding-budget.ts';
 import { currentEmbeddingSignature } from './embedding.ts';
+import { budgetLimitedReport } from './held-embedding.ts';
 import type { PageType } from './types.ts';
 
 /** The `page_embedding_budget.reason` a backfilled large page waits under. */
@@ -70,8 +71,10 @@ export interface OversizedBackfillReceipt {
   /** null when embeddings are off on this brain. */
   estimated_usd: number | null;
   embedding_enabled: boolean;
-  /** Exact commands: finish the backfill; approve held embedding. */
-  commands: { finish: string[]; approve: string[]; preview: string[] };
+  /** Exact commands: finish the backfill; preview held embedding; approve it for the source with the most waiting chunks (null until a run holds pages). */
+  commands: { finish: string[]; approve: string[] | null; preview: string[] };
+  /** Every source's approve command (a concrete --max-usd ceiling), one approval per source (#6803). */
+  approvals: string[];
 }
 
 interface Candidate { id: number; slug: string; source_id: string; bytes: number }
@@ -131,8 +134,8 @@ export async function runOversizedBackfill(engine: BrainEngine, opts: {
   const receipt: OversizedBackfillReceipt = {
     dry_run: opts.dryRun === true, block_bytes: block, candidates: before.candidates, reindexed: 0, held_for_approval: 0, failed: [],
     remaining: before.candidates, over_block: before.over, rechunked_over_block: 0, chunks_pending_embedding: 0, estimated_usd: null, embedding_enabled: embeddingEnabled,
-    commands: { finish: ['gbrain', 'reindex', '--oversized', ...scope], approve: ['gbrain', 'embed', '--held', ...scope, '--max-usd', '<N>'],
-      preview: ['gbrain', 'embed', '--held', ...scope, '--dry-run'] },
+    commands: { finish: ['gbrain', 'reindex', '--oversized', ...scope], approve: null,
+      preview: ['gbrain', 'embed', '--held', ...scope, '--dry-run'] }, approvals: [],
   };
   const managed = !receipt.dry_run && await managedPersistenceEnabled(engine);
   const touched: number[] = [];
@@ -174,6 +177,12 @@ export async function runOversizedBackfill(engine: BrainEngine, opts: {
   }
   receipt.remaining = receipt.dry_run ? before.candidates : (await countMarked(engine, block, opts.sourceId)).candidates;
   if (embeddingEnabled) receipt.estimated_usd = estimatePageEmbedUsd(pendingChars, currentEmbeddingSignature());
+  const found = embeddingEnabled && receipt.held_for_approval && !receipt.dry_run
+    ? await budgetLimitedReport(engine, { ...(opts.sourceId ? { sourceId: opts.sourceId } : {}), signature: currentEmbeddingSignature() }) : null;
+  if (found) {
+    receipt.commands.approve = found.report.by_source[0]!.fix.argv!;
+    receipt.approvals = found.report.by_source.map(s => s.fix.command!);
+  }
   return receipt;
 }
 
@@ -188,7 +197,7 @@ export function formatOversizedBackfillReceipt(r: OversizedBackfillReceipt): str
   if (!r.embedding_enabled) lines.push('  Embeddings are off on this brain, so keyword search is the whole result; nothing is spent.');
   else if (r.held_for_approval) {
     lines.push(`  ${r.held_for_approval} large page(s) wait for approval before embedding (about $${(r.estimated_usd ?? 0).toFixed(2)} in total). `
-      + `Preview: ${r.commands.preview.join(' ')}; approve with: ${r.commands.approve.join(' ')}`);
+      + `Preview: ${r.commands.preview.join(' ')}${r.approvals.length ? `; with the user's agreement, approve one source at a time: ${r.approvals.join('; ')}` : ''}`);
   } else if (r.estimated_usd !== null && r.chunks_pending_embedding) {
     lines.push(`  The embedding sweep embeds them under the existing caps (about $${r.estimated_usd.toFixed(2)}).`);
   }
@@ -215,7 +224,7 @@ export async function printOversizedBackfillUpgradeNotice(engine: BrainEngine): 
         consent: 'paid, egress',
         actor: 'user',
         next: 'ask_user',
-        if_yes: `Run ${receipt.commands.approve.join(' ')} with the amount the user approves. Preview: ${receipt.commands.preview.join(' ')}`,
+        if_yes: `Preview: ${receipt.commands.preview.join(' ')}. Then, one source at a time, run ${receipt.approvals.join('; ') || 'the approve command the preview prints'}.`,
         if_no: 'Nothing to do: the pages stay keyword-searchable and doctor lists them under partial_embedding.',
         verify: 'gbrain doctor --only partial_embedding --json',
       }, {

@@ -218,8 +218,11 @@ its closures are applied as timeline lines, each undoable. Set
 
 The closure date is the newer relationship's start. When someone left one job and
 started the next later, and only the "joined" lines are written, the earlier job closes
-on the later start date: late, not wrong. An explicit end line
-(`Ended works_at [[companies/x]]`) or a "left" line dates it exactly.
+on the later start date: late, not wrong. So a closure only the check dated is shown as
+an upper bound, `ended: works_at acme-example (by 2025-03-01)`, and `gbrain beliefs
+changes` marks it `end by 2025-03-01`. An explicit end line
+(`Ended works_at [[companies/x]]`) or a "left" line dates it exactly and replaces the
+inferred end, whether its date is earlier or later.
 
 | Setting | Default |
 |---|---|

@@ -7,6 +7,7 @@ import { loadConfigSnapshot } from './config-snapshot.ts';
 import { loadGbrainEnvFile } from './gbrain-env-file.ts';
 import { dotenvValuesForKey } from './env-trust.ts';
 import { REMOTE_PRIVATE_PAGES_KEY } from './search/private-visibility.ts';
+import { RUNTIME_READER_CONFIG_KEYS } from './config-runtime-keys.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -72,6 +73,7 @@ export interface GBrainConfig {
   /** #5232: CLI write wait in ms (file plane; persistence/write-wait.ts). */
   persistence?: { write_wait_ms?: number | string };
   migrate?: { graduation?: boolean }; // `migrate.graduation false`: legacy copier instead of graduation (file plane, read pre-connect)
+  doctor?: { default_budget_ms?: number | string }; // #6803: non-interactive CLI doctor --json check-run cap (file plane, read pre-connect; 0 off)
   /** A4 user preapprovals (file plane only; set by the trusted local CLI; read by core/consent.ts). */
   consent?: { preapprove?: { paid?: { max_usd_per_run?: number }; persistent_install?: boolean } };
   database_url?: string;
@@ -1726,8 +1728,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #5984: managed Postgres sync publishes pages in bulk groups (on by default; each page keeps its own request).
   'sync.bulk',
   'sync.bulk_size',
-  'sync.bulk_max_txn_ms', 'sync.job_drain', // the last: #6706, `false` keeps a managed `sync` job single-pass
-  'sync.lanes', 'sync.waive_batch', 'persistence.single_write_group', 'persistence.preadmit_cache', // the last three: write-path kill switches (persistence/switches.ts)
+  // #6858 ask 6: on-commit sync in the resident serve and its freshness target (src/core/sync-config-keys.ts).
+  'sync.on_commit', 'sync.freshness_target_seconds',
+  // #6712 PR 2: rollback keys (src/core/sync-config-keys.ts; windows in wire-skew.ts): readable and honored, not tunables.
+  'sync.job_drain', 'sync.waive_batch', 'sync.foreground_priority',
+  'sync.lanes', 'persistence.single_write_group', 'persistence.preadmit_cache', // the last two: write-path kill switches (persistence/switches.ts)
   // Persisted indexing scope (comma/newline-separated glob list; trailing '/'
   // normalizes to a '/**' subtree glob). Read best-effort at the top of
   // performSyncInner and UNIONED with any per-call --exclude so internal
@@ -1739,13 +1744,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // include-hidden flag, which bulk sync refuses); registered so `config set` accepts it.
   'sync.include_hidden',
   // #5988: Git sync holds (read by readSyncHoldPolicy). `sync.holds=fail`
-  // restores fail-closed blocking; the rest tune detail, escalation and the
-  // parser-regression stop. Registered so the documented `config set` works.
-  'sync.holds',
-  'sync.hold_cap',
-  'sync.hold_escalate_count',
-  'sync.hold_escalate_pct',
-  'sync.parser_regression',
+  // restores fail-closed blocking. Detail, escalation and the parser-regression
+  // stop are tuned by GBRAIN_SYNC_* env since #6712 PR 2 (RETIRED_SYNC_KEYS).
+  'sync.holds', 'sync.slug_conflicts.auto_remove', // #6865: sync-time removal of a stray slug: line naming no page (repair/slug-autoheal.ts); default on
   'fences.normalize', // #6188: inline Tier 1 fence normalization (fence-repair/config.ts); default on
   'fences.repair.enabled', 'fences.repair.llm', // #6188: the fence_repair cycle phase and its Tier 3 model step (fence-repair/config.ts); default on
   'fences.repair.max_usd_per_page', 'fences.repair.max_usd_per_day', // #6188: Tier 3 fence repair caps; 0 = no model spend
@@ -1787,11 +1788,13 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'shared_skills.inventory.max_files', 'shared_skills.inventory.max_total_bytes', 'shared_skills.inventory.max_file_bytes', 'shared_skills.inventory.max_entries', 'shared_skills.migration.enabled', // #6466: false declines the 0.53.0 migration (commands/migrations/opt-out.ts)
   'persistence.write_wait_ms', // #5232: file plane, persistence/write-wait.ts
   'migrate.graduation', // file plane, src/commands/migrate-graduation.ts (engine graduation opt-out)
+  'doctor.default_budget_ms', 'doctor.entry_budget_ms', 'doctor.orphan_ratio.full_scan_max_pages', // #6803: file plane (commands/doctor/default-budget.ts); DB plane (doctor/budget.ts, checks/orphan-estimate.ts)
   'consent.preapprove.paid.max_usd_per_run', 'consent.preapprove.persistent_install', // A4: file plane, core/consent.ts
   // F4b: PGLite row-delta ANALYZE (src/core/planner-stats.ts); F4a: get_health memo TTL (src/core/health-memo.ts, 0 disables).
   'planner.auto_analyze', 'planner.first_read_budget_ms', 'import.analyze_every_pages', 'health.cache_ttl_ms',
   // Wave B segmented page storage (src/core/page-body/limits.ts PAGE_BODY_CONFIG_KEYS; switch defaults off).
   'pages.segmented_storage', 'pages.max_bytes', 'pages.flip_retire_max_rows', 'versions.segmented_max_per_page', 'versions.segmented_max_pinned_bytes',
+  ...RUNTIME_READER_CONFIG_KEYS, // #6780: getConfig() runtime knobs (config-runtime-keys.ts)
 ];
 
 /**

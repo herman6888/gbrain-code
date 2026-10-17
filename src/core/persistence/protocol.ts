@@ -32,10 +32,15 @@ export async function declarePersistenceProtocol(tx: SqlEngine): Promise<void> {
  * under that lock timeout. Later `declarePersistenceProtocol` calls on the
  * same transaction engine are free.
  */
-/** Returns the brain id read under that lock (null when the row is missing). */
-export async function declareDurablePersistence(tx: SqlEngine, lockTimeout = '1s', statementTimeout = '5s'): Promise<string | null> {
-  const [row] = await tx.executeRaw<{ brain: string | null }>(`SELECT set_config('gbrain.persistence_protocol','2',true),set_config('synchronous_commit','on',true),
-    set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),${BRAIN_SHARE}`, [lockTimeout, statementTimeout]);
+/**
+ * Returns the brain id read under that lock (null when the row is missing). `idleInTransaction` also sets a
+ * transaction-local idle bound in the same statement, first (a publication's, publication-deadline.ts).
+ */
+export async function declareDurablePersistence(tx: SqlEngine, lockTimeout = '1s', statementTimeout = '5s', idleInTransaction?: string): Promise<string | null> {
+  const idle = idleInTransaction === undefined ? '' : "set_config('idle_in_transaction_session_timeout',$3,true),";
+  const [row] = await tx.executeRaw<{ brain: string | null }>(`SELECT ${idle}set_config('gbrain.persistence_protocol','2',true),set_config('synchronous_commit','on',true),
+    set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),${BRAIN_SHARE}`,
+    idleInTransaction === undefined ? [lockTimeout, statementTimeout] : [lockTimeout, statementTimeout, idleInTransaction]);
   if ((tx as { _pageTransaction?: boolean })._pageTransaction === true) declared.add(tx);
   return row?.brain ?? null;
 }

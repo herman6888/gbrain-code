@@ -503,6 +503,7 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
     modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
+    ...(includeEmbedding && row.embedding_image != null && { embedding_image: parseEmbedding(row.embedding_image) }),
     // v244: projected UTF-8 span (bigint on Postgres); only when the SELECT carried the column.
     ...(row.projected_byte_start !== undefined && { projected_byte_start: row.projected_byte_start == null ? null : Number(row.projected_byte_start) }),
     ...(row.projected_byte_end !== undefined && { projected_byte_end: row.projected_byte_end == null ? null : Number(row.projected_byte_end) }),

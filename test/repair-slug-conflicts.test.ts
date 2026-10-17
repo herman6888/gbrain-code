@@ -44,7 +44,7 @@ import { dailyLedger, FENCE_REPAIR_LEDGER } from '../src/core/budget/daily-ledge
 import { resolveRepairScope, type RepairResult } from '../src/core/repair/core.ts';
 import { repairRunner, repairSpec } from '../src/core/repair/registry.ts';
 import { parseRepairArgs } from '../src/commands/repair.ts';
-import type { SlugConflictsPreviewDetails } from '../src/core/repair/slug-conflicts.ts';
+import { slugConflictsRepair, type SlugConflictsPreviewDetails } from '../src/core/repair/slug-conflicts.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-repair-slug-conflicts-'));
@@ -305,4 +305,42 @@ test('a transient provider error keeps the memo and schedules a retry; changed_s
   expect(await s.run({ apply: true })).toMatchObject({ remaining: { content_repair_needs_human: 1 } });
   expect(calls).toHaveLength(1);
   expectNoSecrets([await s.holds(), surfaceOf(down), surfaceOf(capped)]);
+}), 240_000);
+
+// #6749: the issue's fixture. autoFixFrontmatter reports [NESTED_QUOTES, SLUG_MISMATCH] (a style-only re-quote of a valid JSON-style
+// alias array beside the slug), so the lane used to hold it still_invalid. Now the slug: line alone is removed, the aliases line stays
+// byte-for-byte, and the preview, the result and the receipt list the untouched NESTED_QUOTES alongside remove_slug.
+const ACME = '---\ntitle: "Acme Capital"\ntype: company\nslug: acme-capital\naliases: ["Acme", "Acme Capital Management"]\n---\nbody\n';
+
+test('#6749: a mismatched slug beside a style-only NESTED_QUOTES alias array is a deterministic remove_slug; the aliases line is untouched', () => each(async () => {
+  const s = await managed({ 'companies/acme-capital.md': ACME });
+  expect((await s.sync()).held_count).toBe(1);
+  const preview = await s.run({ noLlm: true });
+  expect(preview.listing!.map(entry => [entry.item, entry.class])).toEqual([[`${s.id}:companies/acme-capital.md`, 'deterministic']]);
+  expect(preview.listing![0]!.detail).toContain('remove_slug (absent_page)');
+  expect(preview.listing![0]!.detail).toContain('NESTED_QUOTES');
+  expect(details(preview).diffs).toEqual([expect.objectContaining({ rule: 'absent_page', style_only: ['NESTED_QUOTES'] })]);
+  expect(details(preview).diffs[0]!.diff).toContain('-slug: acme-capital');
+  expect(details(preview).diffs[0]!.diff).not.toContain('aliases');
+  const rendered = slugConflictsRepair.render!(preview.details!, { diff: true } as never).join('\n');
+  expect(rendered).toContain('remove_slug, absent_page; style-only NESTED_QUOTES left as written');
+  const applied = await s.run({ apply: true, expect: hashOf(preview), noLlm: true });
+  expect(applied).toMatchObject({ applied: 1, repaired: 1 });
+  expect(s.read('companies/acme-capital.md')).toBe(ACME.replace('slug: acme-capital\n', ''));
+  expect(await s.holds()).toEqual([]);
+  const [row] = await receipts(s.id);
+  expect(row!.outcome.content_repair).toMatchObject({ action: 'remove_slug', tier: 'deterministic', style_only: ['NESTED_QUOTES'] });
+  expect(JSON.stringify(applied)).toContain('NESTED_QUOTES');
+}), 240_000);
+
+test('#6749: a slug conflict that also needs NULL_BYTES stays still_invalid and the hold message names the code', () => each(async () => {
+  const content = '---\ntitle: "Acme Capital"\ntype: company\nslug: acme-capital\n---\nbo\u0000dy\n';
+  const s = await managed({ 'companies/acme-capital.md': content });
+  expect((await s.sync()).held_count).toBe(1);
+  const preview = await s.run({ noLlm: true });
+  expect(preview.listing!.map(entry => entry.class)).toEqual(['still_invalid']);
+  expect(preview.listing![0]!.detail).toContain('NULL_BYTES');
+  expect(details(preview).diffs).toEqual([]);
+  expect(await s.run({ apply: true, noLlm: true })).toMatchObject({ applied: 0 });
+  expect(s.read('companies/acme-capital.md')).toBe(content);
 }), 240_000);

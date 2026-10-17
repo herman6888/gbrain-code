@@ -330,6 +330,30 @@ doesn't answer at the URL you gave (a wrong `--url` or `--port`), anything
 else answering there, a run without `--token`, and a Postgres brain all still
 fail the health check with exit 1.
 
+<a id="cleanup-pending"></a>Each rotation leaves the old shared-skills
+enrollment with that enrollment's own credential, then revokes the
+credential: leave before revoke, because `leave_brain` is principal-owned and
+a revoked token can never leave. Each carried token id is revoked and cleared
+on its own, so one stuck enrollment no longer holds every other id on the
+receipt. An enrollment whose credential is already revoked (for example,
+revoked by hand before its leave finished) is inert: the run still removes it
+locally (adapter receipt, native router, unchanged owned files; edited files
+are retained) and records it as left with reason `credential_revoked`.
+
+While anything is still pending, the run exits `bootstrap_cleanup_pending`
+(exit 14, `"status": "cleanup_pending"` under `--json`) instead of 0. The
+JSON `cleanup` array lists each id with its token state (`active`,
+`revoked`, `missing`, `unknown`), its cleanup state (`revoke_pending`,
+`leave_pending`, `enrollment_retained`, `credential_unreadable`) and whether
+a re-run can finish it. When every id can, the `fix` re-runs the same command
+(`next: run`). When one cannot, the `fix` is the owner's step
+(`next: tell_user_to_run`): for a lost cleanup credential, restore it or
+revoke that token by id, after which the next re-run finishes the local
+cleanup; for an old enrollment kept because the current one is not ready,
+resolve the current enrollment first. `--status` exits 14 with the same list,
+and doctor's `bootstrap_harness_health` names each id as revoked (cleanup
+pending) or active.
+
 Postgres brains mint fine while the serve runs. A token you supply is never
 revoked by `--remove` or rotation (it is not the harness's to revoke) —
 retire it yourself with `gbrain auth revoke` when you're done with it.

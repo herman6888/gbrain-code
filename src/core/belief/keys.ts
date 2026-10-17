@@ -40,12 +40,35 @@ export function sha256Hex(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-/** Canonical JSON: object keys sorted at every depth, so equal values hash equally. */
+const byCodeUnits = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+const QUOTED_KEYS_MAX = 4096;
+/** Object keys as JSON strings: the ledger's values reuse a few dozen field names. */
+const quotedKeys = new Map<string, string>();
+
+/**
+ * Canonical JSON: object keys sorted at every depth (UTF-16 code unit order), so equal values hash equally. An
+ * undefined property is left out, an undefined array element or top-level value is `null`, an array hole is empty.
+ * Every stored hash depends on these bytes: test/belief-ledger-canonical-json.test.ts holds them to the original
+ * implementation.
+ */
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
+  if (Array.isArray(value)) {
+    let out = '[';
+    for (let i = 0; i < value.length; i++) out += (i ? ',' : '') + (i in value ? canonicalJson(value[i]) : '');
+    return out + ']';
+  }
+  const keys = Object.keys(value);
+  for (let i = 1; i < keys.length; i++) if (!(keys[i - 1]! < keys[i]!)) { keys.sort(byCodeUnits); break; }
+  let out = '{';
+  for (const key of keys) {
+    const v = (value as Record<string, unknown>)[key];
+    if (v === undefined) continue;
+    let quoted = quotedKeys.get(key);
+    if (quoted === undefined) { quoted = JSON.stringify(key); if (quotedKeys.size < QUOTED_KEYS_MAX) quotedKeys.set(key, quoted); }
+    out += (out.length > 1 ? ',' : '') + quoted + ':' + (v === null ? 'null' : typeof v === 'object' ? canonicalJson(v) : JSON.stringify(v));
+  }
+  return out + '}';
 }
 
 export const valueHash = (value: unknown) => sha256Hex(canonicalJson(value));

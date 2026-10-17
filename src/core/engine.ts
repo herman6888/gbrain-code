@@ -1913,8 +1913,8 @@ export interface BrainEngine {
    * `jsonb_to_recordset(($1::jsonb)->'rows')` through `executeRawJsonb` (#1861;
    * free-text-safe, replaced the prior `unnest(::text[])` path). Idempotency:
    * ON CONFLICT (page_id, row_num) DO UPDATE — re-extract on a changed
-   * claim/weight updates the row in place. Returns the number of rows inserted
-   * OR updated. Row construction + weight clamp/round + NUL-strip live in
+   * claim/weight updates the row in place; an identical row stays unwritten. Returns
+   * the rows inserted, updated or already current. Row construction + weight clamp/round + NUL-strip live in
    * `src/core/batch-rows.ts:buildTakeRows` (shared across both engines).
    *
    * Wrapped in `batchRetry` like the other batch primitives, so `opts` (auditSite,

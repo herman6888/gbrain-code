@@ -4,8 +4,10 @@
  * and baseline progress; drift (slugs whose current belief set no longer
  * hashes to their newest event's state_hash), sampled by default and complete
  * under `--tier deep`; orphan lifetimes; committed publications with no commit
- * mark; and a restore whose purge replay was unavailable, partial or
- * unverified.
+ * mark; a restore whose purge replay was unavailable, partial or
+ * unverified; and page transitions that left no version of the revision they
+ * moved off (the preimage invariant, section 14 item 8; last 30 days unless
+ * `--tier deep`).
  *
  * `--fix` appends `reconcile` events for the drifted slugs (a managed source's
  * slug interval stays uncertified) and fills the missing commit marks, then
@@ -19,6 +21,7 @@ import { connectedEngine, doctorSourceIds, type DoctorContext, type DoctorEntry 
 import {
   DRIFT_SAMPLE_PAGES, coverageIntervals, coveredSources, fillCommitMarks, orphanLifetimes, reconcileBeliefDrift, scanBeliefDrift, unmarkedPublications,
 } from '../../../core/belief/coverage-report.ts';
+import { preimageGaps } from '../../../core/belief/preimages.ts';
 
 const DOCS = 'docs/designs/BELIEF_LEDGER.md#73-the-doctor-coverage-check';
 const UNSAFE_REPLAY = new Set(['unavailable', 'partial', 'unverified']);
@@ -50,7 +53,8 @@ async function runBeliefLedger(ctx: DoctorContext): Promise<Check[]> {
       perSource.push({ source_id: sourceId, recording: !open.stopped_at, certified: open.certified, watermark: open.watermark, baseline: open.baseline,
         intervals: intervals.length, drift: { checked: drift.checked, candidates: drift.candidates, exact: drift.exact, slugs: drift.drifted.slice(0, 10).map(d => d.slug), count: drift.drifted.length },
         drift_marks: open.drift.length, orphans: await orphanLifetimes(engine, sourceId, 5, { deep }), unmarked: (await unmarkedPublications(engine, sourceId, 1000, { deep })).length,
-        restores: open.restores.filter(r => r.purge_replay && UNSAFE_REPLAY.has(r.purge_replay)) });
+        restores: open.restores.filter(r => r.purge_replay && UNSAFE_REPLAY.has(r.purge_replay)),
+        preimage_gaps: (await preimageGaps(engine, sourceId, { deep, limit: 10 })).map(g => ({ slug: g.slug, event_id: g.event_id, event_type: g.event_type, revision: g.revision })) });
     }
     const details = { sources: perSource, deep, docs: DOCS };
     const restore = perSource.find(s => s.restores.length);
@@ -75,6 +79,16 @@ async function runBeliefLedger(ctx: DoctorContext): Promise<Check[]> {
           + '. A writer changed beliefs without appending; reconcile appends reconcile events and the drifted interval stays uncertified on a managed source.',
         fix: agentFix(['gbrain', 'beliefs', 'reconcile', '--source', first.source_id, '--json'],
           'Appends reconcile events (origin reconcile, honest recorded time) for the drifted slugs and fills missing commit marks; it changes no belief.', 'belief_ledger_coverage', { docs: DOCS }) });
+      return checks;
+    }
+    const gapped = perSource.filter(s => s.preimage_gaps.length);
+    if (gapped.length) {
+      checks.push({ name: 'belief_ledger_coverage', status: 'warn', details,
+        message: gapped.map(s => `${s.source_id}: ${s.preimage_gaps.length}${s.preimage_gaps.length === 10 ? '+' : ''} page transition(s) left no version of the revision they moved off`
+          + ` (e.g. ${s.preimage_gaps.slice(0, 3).map(g => `${g.slug} at event ${g.event_id}`).join(', ')})`).join('; ')
+          + '. A writer advanced a page\'s revision without versioning the page first, so page-at-time (known_as_of) discloses those bodies as version_missing; the body is not recoverable.',
+        fix: agentFix(['gbrain', 'doctor', '--only', 'belief_ledger_coverage', '--tier', 'deep', '--json'],
+          'Read-only: lists every such transition (slug, event id, revision) without the recency window, to report the writer.', 'belief_ledger_coverage', { docs: DOCS }) });
       return checks;
     }
     const pending = perSource.find(s => s.recording && !s.baseline.complete);

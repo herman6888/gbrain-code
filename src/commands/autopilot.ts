@@ -52,6 +52,7 @@ import { detectInstallMethod, readInstallTargetFloor } from './upgrade.ts';
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
 import { relativeSourceLocalPathSkipWarning } from '../core/sources-load.ts';
+import { installRepoFallback } from './autopilot/install-repo.ts';
 // Path helpers live in a LEAF core module so other commands (gbrain migrate)
 // can read the daemon's state files without importing this one — a dynamic
 // import of a command module drags its whole flag surface into the importer's
@@ -901,7 +902,7 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
     console.error(guardMsg);
     process.exit(1);
   }
-  const rawRepoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
+  const rawRepoPath = parseArg(args, '--repo') || await installRepoFallback(engine);
   if (!rawRepoPath) {
     console.error('No repo path. Use --repo or run gbrain sync --repo first.');
     process.exit(1);
@@ -909,7 +910,7 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
   // #3696: the daemon runs with an arbitrary cwd (launchd: `/`), so a
   // relative `--repo .` baked into the wrapper script resolves to a phantom
   // path at daemon runtime. Resolve NOW, against the installer's cwd.
-  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rawRepoPath is the local operator's own --repo CLI arg or the operator-written sync.repo_path config row; installDaemon is reachable only via `gbrain autopilot --install` on the trusted local CLI (never MCP/remote), and absolutizing it here IS the #3696 fix
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rawRepoPath is the local operator's own --repo CLI arg, the operator-written sync.repo_path config row or the default source's local_path; installDaemon is reachable only via `gbrain autopilot --install` on the trusted local CLI (never MCP/remote), and absolutizing it here IS the #3696 fix
   const repoPath = resolvePath(rawRepoPath);
 
   const forcedTarget = parseArg(args, '--target') as InstallTarget | undefined;

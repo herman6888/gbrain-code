@@ -101,6 +101,18 @@ describe('CI execution evidence', () => {
     const slow = e2e.jobs['coverage-full-slow'].steps.map(step => step.run ?? '').join('\n');
     for (const file of excluded) expect(slow).toContain(`bun test test/${file}`);
   });
+
+  test('unit shard count agrees across the matrix, the shard step and the coverage manifest', () => {
+    const job = unit.jobs.test as Job & { strategy: { matrix: { shard: number[] } } };
+    const shards = job.strategy.matrix.shard;
+    expect(shards).toEqual(Array.from({ length: shards.length }, (_, i) => i + 1));
+    const run = job.steps.find(step => step.run?.includes('scripts/test-shard.sh'))!;
+    expect(run.name).toBe(`Run test shard \${{ matrix.shard }}/${shards.length}`);
+    expect(run.run).toContain(`scripts/test-shard.sh \${{ matrix.shard }} ${shards.length}`);
+    const merge = unit.jobs['coverage-report'].steps.find(step => step.name === 'Merge lanes')!.run!;
+    const expected = /--manifest-expect (\S+)/.exec(merge)![1].split(',').filter(lane => lane.startsWith('shard-'));
+    expect(expected).toEqual(shards.map(shard => `shard-${shard}`));
+  });
 });
 
 describe('test:full exit status', () => {

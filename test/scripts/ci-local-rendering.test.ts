@@ -55,6 +55,8 @@ describe('ci-local command rendering', () => {
           writeFileSync(join(bin, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         }
         writeFileSync(join(bin, 'apt-get'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$INSTALL_LOG"\n', { mode: 0o755 });
+        mkdirSync(join(home, 'scripts'));
+        writeFileSync(join(home, 'scripts', 'ci-hydrate-admin-dist.sh'), 'exit 0\n');
         const phaseLog = join(home, 'phase.log');
         const installLog = join(home, 'install.log');
         const phases = [
@@ -106,6 +108,7 @@ function runPhases(noShard: boolean, diff: boolean, failStage = '') {
     const trace = join(home, 'trace');
     const put = (path: string, body: string) => writeFileSync(join(home, path), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
     for (const name of ['git', 'python3', 'ps', 'psql', 'apt-get']) put(`bin/${name}`, 'exit 0');
+    put('scripts/ci-hydrate-admin-dist.sh', 'exit 0');
     put('bin/bun', `
 case "$*" in
   "scripts/lib/ensure-e2e-database.ts "*)

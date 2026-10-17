@@ -39,10 +39,11 @@ export async function budgetedPageRead(engine: BrainEngine, jobId: number, budge
     slug: typeof page.slug === 'string' ? page.slug : slug,
     ...(typeof page.title === 'string' ? { title: page.title } : {}),
     ...(typeof page.type === 'string' ? { type: page.type } : {}),
+    ...(typeof page.revision === 'string' ? { revision: page.revision } : {}),
     truncated: true,
     code: 'read_budget_exhausted',
     read_budget: { limit_bytes: budgetBytes, used_bytes: used, page_bytes: pageBytes, ...(typeof bodyBytes === 'number' ? { body_bytes: bodyBytes } : {}) },
     ...(excerpt ? { excerpt } : {}),
-    note: 'This job has used its get_page read budget, so the page is summarized. Work from the pages already read; writes still work. To update this page, append with add_timeline_entry instead of rewriting it.',
+    note: 'This job has used its get_page read budget, so the page is summarized. Work from the pages already read; writes still work. To update this page, append with add_timeline_entry instead of rewriting it, or skip it when it already covers what you would add.',
   };
 }

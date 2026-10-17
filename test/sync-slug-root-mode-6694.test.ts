@@ -21,6 +21,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { readManagedSyncFailures } from '../src/core/persistence/sync-failures.ts';
+import { classifyManagedSyncOrphans, retireManagedSyncOrphan } from '../src/core/persistence/managed-sync-orphans.ts';
 import { classifySyncFault } from '../src/core/persistence/sync-fault-class.ts';
 import { CODES } from '../src/core/error-registry.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -123,12 +124,18 @@ describe('#6694 managed-sync checkpoint under a pinned slug_root_mode', () => {
     expect(await slugs(engine, f)).toEqual(['notes/alpha', 'notes/beta', 'notes/gamma']);
   }), 120_000);
 
-  test('keeping a changed pin, --retry-failed discovers the subdirectory source again under it, beside the pages the refused run wrote', async () => each(async engine => {
+  // #6712 PR 3 (L7): --retry-failed is a plain sync now, so keeping the pin is the orphan repair's preview-first retirement.
+  test('keeping a changed pin: no sync rediscovers it, and retiring the slug_mode_refused cursor discovers the subdirectory source again under it, beside the pages the refused run wrote', async () => each(async engine => {
     const f = await fixture(engine, 'brain', 'source-root');
     await beforeCheckpoint(engine, f, 3);
     await engine.executeRaw(`UPDATE sources SET config=jsonb_set(config,'{slug_root_mode}','"git-root"') WHERE id=$1`, [f.id]);
     expect(JSON.stringify(await outcome(performManagedSync(engine, f.opts)))).toContain('slug_root_mode_mismatch');
-    const retried = await outcome(performManagedSync(engine, { ...f.opts, retryFailed: true }));
+    for (const retryFailed of [false, true]) expect(JSON.stringify(await outcome(performManagedSync(engine, { ...f.opts, retryFailed })))).toContain('slug_root_mode_mismatch');
+    expect(await source(engine, f)).toEqual({ last_commit: null, mode: 'git-root' });
+    const [refused] = (await classifyManagedSyncOrphans(engine, [f.id])).orphans;
+    expect(refused).toMatchObject({ kind: 'unfinished_cursor', reason: 'slug_mode_refused' });
+    expect((await retireManagedSyncOrphan(engine, refused!)).cursor).toBe(true);
+    const retried = await outcome(performManagedSync(engine, f.opts));
     expect(retried).not.toHaveProperty('thrown');
     expect(await source(engine, f)).toEqual({ last_commit: f.head, mode: 'git-root' });
     // The pages the refused run wrote under source-root keep their slugs beside the git-root ones; that is the cost the user accepts.

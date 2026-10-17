@@ -6,6 +6,7 @@
  *   0 ok · 1 failed (class/retryable in JSON) · 2 usage / invalid input ·
  *   3 confirmation_required (its ONLY meaning) · 10 write pending ·
  *   11 resumable budget stop · 13 harness wired, verification pending ·
+ *   14 harness wired, shared-skills/token cleanup pending ·
  *   69 serve exited unhealthy · 75 migration
  *   lock held · 124 timeout · 130 interrupted. `test/exit-codes.test.ts` enumerates every literal
  *   exit 3 in src/ so a new one cannot reuse it.
@@ -52,6 +53,15 @@ export const BUDGET_STOP_EXIT_CODE = 11;
  * `gbrain serve --http` runs; `--status` stays partial until then.
  */
 export const HARNESS_PENDING_VERIFY_EXIT_CODE = 13;
+
+/**
+ * #6743: `gbrain bootstrap harness` wired and verified the harness, but the
+ * cleanup of earlier shared-skills enrollments or carried token ids is still
+ * pending (`bootstrap_cleanup_pending`). The JSON lists each id's state; its
+ * `fix` re-runs the command when every id can converge, or names the owner's
+ * revoke or leave step when one cannot.
+ */
+export const HARNESS_CLEANUP_PENDING_EXIT_CODE = 14;
 
 /**
  * #6543: `gbrain serve` exited on its own because its persistence consumer

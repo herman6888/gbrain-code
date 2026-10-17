@@ -11,10 +11,10 @@ import { probeSourceGitState } from '../../../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
 import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
-import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
+import { resolveHoursEnv } from '../../../core/env-number.ts';
 import { chunkerStamp } from '../../../core/chunkers/code.ts';
-import { effectiveLinkExtractorWatermark, smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
-import { previewMentionPass } from '../../../core/mentions/stale.ts';
+import { smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
+import { extractionLagVerdict, extractionRoutes, readExtractionLag } from '../../../core/extraction-lag.ts';
 import { isMissingSchemaObject } from '../../../core/utils.ts';
 import {
   loadStorageConfig,
@@ -38,21 +38,14 @@ import { checkError } from '../check-fix.ts';
 import { checkpointMovedFix, firstSyncRunning, noSuccessfulSync, stoppedConnectorIssues, type SyncOutcomeEntry } from '../sync-outcome.ts';
 import { haltReasonsWithUnknown, readRecordedHaltReasons7d, topHaltReason } from '../../../core/extract/rollup-writer.ts';
 
-/** Local aliases; the shared warn-once memo lives in core so it can't fork per module. */
-const _resolveEnvNumber = resolveEnvNumber;
+/** Local alias; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 /**
- * v0.42.7 (#1696): single source of truth for the extraction-lag warn
- * threshold (percent). Both the `links_extraction_lag` doctor check AND the
- * end-of-sync nudge (`sync.ts:maybeExtractionNudge`) resolve through this +
- * `_resolveEnvNumber` so "the nudge fires iff doctor would warn" can't drift.
+ * The extraction-lag threshold and vacuous-skip floor live with the shared read and verdict
+ * (core/extraction-lag.ts), so "the sync nudge fires iff doctor would warn" can't drift.
  */
-export const EXTRACTION_LAG_WARN_PCT_DEFAULT = 20;
-/** Min non-deleted page count below which extraction-lag is vacuous-skipped
- *  (unless an explicit --source scope is set). Shared by doctor + the sync
- *  nudge (D6/C4) so their skip predicates match exactly. */
-export const EXTRACTION_LAG_MIN_PAGES = 100;
+export { EXTRACTION_LAG_WARN_PCT_DEFAULT, EXTRACTION_LAG_MIN_PAGES } from '../../../core/extraction-lag.ts';
 
 /**
  * Sync freshness check (v0.32.4) — verify that sources with local_path have
@@ -106,77 +99,39 @@ export const EXTRACTION_LAG_MIN_PAGES = 100;
  */
 export async function checkLinksExtractionLag(
   engine: BrainEngine,
-  opts?: { sourceId?: string },
+  opts?: { sourceId?: string; remote?: boolean },
 ): Promise<Check> {
   const name = 'links_extraction_lag';
   const sourceId = opts?.sourceId;
-  const fix = "Run: gbrain extract --stale";
   try {
-    const totalRows = await engine.executeRaw<{ count: number }>(
-      sourceId
-        ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND ${quarantineFilterFragment('pages')} AND source_id = $1`
-        : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND ${quarantineFilterFragment('pages')}`,
-      sourceId ? [sourceId] : [],
-    );
-    const total = Number(totalRows[0]?.count ?? 0);
+    // #6803 (D1): one statement and one verdict shared with the sync nudge; attendance-blocked pages (#5761: stale
+    // only by an unresolved attendee, `extract --stale` cannot clear them) are reported apart from lag.
+    const lag = await readExtractionLag(engine, { sourceId });
+    const { total, actionable: stale, attendance_blocked: attendanceBlocked } = lag;
     if (total === 0) {
       return { name, status: 'ok', message: 'Extraction lag not applicable (no pages)' };
     }
-    // Vacuous-skip tiny brains unless explicitly source-scoped. Shared floor
-    // const so the sync nudge (D6/C4) skips on the exact same predicate.
-    if (total < EXTRACTION_LAG_MIN_PAGES && !sourceId) {
+    const verdict = extractionLagVerdict(lag, sourceId);
+    if (verdict.skipped) {
       return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)${await smallBrainBacklogNote(engine)}` };
     }
-
-    // #5761: a page left stale only by an unresolved attendee, and not edited
-    // since, is attendance-blocked: `extract --stale` cannot clear it, so it
-    // is reported apart from lag. Pre-v180 brains have no marker column.
-    const versionTs = await effectiveLinkExtractorWatermark(engine);
-    let stale: number;
-    let attendanceBlocked = 0;
-    try {
-      stale = await engine.countStalePagesForExtraction({ sourceId, versionTs, attendance: 'exclude' });
-      attendanceBlocked = await engine.countStalePagesForExtraction({ sourceId, versionTs, attendance: 'blocked' });
-    } catch (e) {
-      if (!isMissingSchemaObject(e, 'column', 'links_attendance_blocked_revision')) throw e;
-      stale = await engine.countStalePagesForExtraction({ sourceId, versionTs });
-    }
-    const pct = (stale / total) * 100;
-    const pctStr = pct.toFixed(0);
+    const pctStr = verdict.pct.toFixed(0);
     const scope = sourceId ? ` in source '${sourceId}'` : '';
     const blockedNote = attendanceBlocked
       ? `. ${attendanceBlocked} more page(s) wait on unresolved attendees; the next extraction clears each once its attendee's person page exists in the meeting's source (docs/guides/attendance-evidence.md)`
       : '';
-
-    const warnPct = _resolveEnvNumber('GBRAIN_EXTRACTION_LAG_WARN_PCT', EXTRACTION_LAG_WARN_PCT_DEFAULT, { unit: '%' });
-    // Fail threshold is DISABLED unless explicitly set (warn-only default). A
-    // bare unset env var → no hard-fail; invalid value → warn-once + disabled.
-    let failPct: number | undefined;
-    const failRaw = process.env.GBRAIN_EXTRACTION_LAG_FAIL_PCT;
-    if (failRaw !== undefined && failRaw !== '') {
-      const n = Number(failRaw);
-      if (Number.isFinite(n) && n > 0) {
-        failPct = n;
-      } else {
-        warnOnceForEnv(
-          'GBRAIN_EXTRACTION_LAG_FAIL_PCT',
-          `[gbrain] Ignoring invalid GBRAIN_EXTRACTION_LAG_FAIL_PCT=${failRaw}; hard-fail stays disabled.`,
-        );
-      }
+    const mentionNote = lag.mention_due ? `; ${lag.mention_due} page(s) await the mention pass (last pass: ${lag.mention_last_pass_at ?? 'never'})` : '';
+    const details: Record<string, unknown> = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: verdict.warn_pct, fail_pct: verdict.fail_pct,
+      source_id: sourceId ?? null, mention_due: lag.mention_due, mention_last_pass_at: lag.mention_last_pass_at };
+    if (verdict.status === 'ok') {
+      return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${mentionNote}${blockedNote}`, details };
     }
-
-    // Entity mention index: pages the mention pass has not scanned at their current content.
-    const mention = await previewMentionPass(engine, sourceId).catch(() => null);
-    const mentionNote = mention?.due ? `; ${mention.due} page(s) await the mention pass (last pass: ${mention.last_pass_at ?? 'never'})` : '';
-    const details = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: warnPct, fail_pct: failPct ?? null, source_id: sourceId ?? null,
-      mention_due: mention?.due ?? null, mention_last_pass_at: mention?.last_pass_at ?? null };
-    if (failPct !== undefined && pct > failPct) {
-      return { name, status: 'fail', message: `${stale}/${total} pages (${pctStr}%)${scope} need link/timeline extraction (> ${failPct}% fail threshold)${mentionNote}. ${fix}${blockedNote}`, details };
-    }
-    if (pct > warnPct) {
-      return { name, status: 'warn', message: `${stale}/${total} pages (${pctStr}%)${scope} have un-extracted edges${mentionNote}. ${fix}${blockedNote}`, details };
-    }
-    return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${mentionNote}${blockedNote}`, details };
+    const { fix, decision, routes } = extractionRoutes(lag, { sourceId, remote: opts?.remote });
+    details.routes = routes;
+    details.decision = decision;
+    const fixText = `Run: ${routes.map(route => `${route.argv.join(' ')} (${route.label})`).join(', or ')}`;
+    const what = verdict.status === 'fail' ? `need link/timeline extraction (> ${verdict.fail_pct}% fail threshold)` : 'have un-extracted edges';
+    return { name, status: verdict.status, message: `${stale}/${total} pages (${pctStr}%)${scope} ${what}${mentionNote}. ${fixText}${blockedNote}`, details, fix };
   } catch (e) {
     // Pre-v112 brain: links_extracted_at column doesn't exist yet. Graceful OK
     // (migration/bootstrap adds it; nothing to assess until then).

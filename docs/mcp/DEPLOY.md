@@ -750,6 +750,20 @@ Operator checklist:
 Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
 allowed `source_id`s, so even a leaked connection string can't read everything.
 
+### Writer coordination lock in containers
+
+A managed checkout's writers share one native lock file outside the checkout.
+It lives in `$GBRAIN_HOME/.gbrain/persistence/locks` unless `GBRAIN_HOME` is the
+checkout or lies inside it; then it goes under `GBRAIN_COORDINATION_HOME` (else
+`~/.gbrain/persistence`). For the lock to survive container recreation, mount the
+directory that holds it together with the checkout and its parent: mount
+`GBRAIN_HOME`, or, when `GBRAIN_HOME` is inside the checkout, set
+`GBRAIN_COORDINATION_HOME` to a mounted absolute path outside the checkout in the
+container's environment (a `.env` file in the working directory cannot set it).
+`gbrain sources writer status --json` shows the resolved path and the rule that
+chose it under `onboarding.sources[].coordination_lock`; the full rule is in
+[topologies](../architecture/topologies.md#coordination-lock).
+
 ### Run gbrain under a real init (tini / `--init`)
 
 If `gbrain serve` is your container's entrypoint, it runs as PID 1 and
