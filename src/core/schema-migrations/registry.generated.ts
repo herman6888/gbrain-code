@@ -252,7 +252,16 @@ import { v248 } from './v248-segmented-page-storage.ts';
 import { v249 } from './v249-belief-ledger.ts';
 import { v250 } from './v250-persistence-request-id-index.ts';
 import { v251 } from './v251-take-horizons.ts';
-import { v252 } from './v252-cjk-bigram-fts.ts';
+import { v252 } from './v252-segmented-chunk-gc-index.ts';
+import { v253 } from './v253-page-view-digests.ts';
+import { v254 } from './v254-segment-reader-marks.ts';
+import { v255 } from './v255-page-body-staging-texts.ts';
+import { v256 } from './v256-chunk-retirement-index.ts';
+import { v257 } from './v257-pages-live-origin-key.ts';
+import { v258 } from './v258-pages-links-extract-failure.ts';
+import { v259 } from './v259-ingest-log-marked-index.ts';
+import { v260 } from './v260-segmented-page-size-index.ts';
+import { v261 } from './v261-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -504,4 +513,13 @@ export const MIGRATIONS: Migration[] = [
   v250,
   v251,
   v252,
+  v253,
+  v254,
+  v255,
+  v256,
+  v257,
+  v258,
+  v259,
+  v260,
+  v261,
 ];

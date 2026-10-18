@@ -43,6 +43,11 @@ gbrain doctor --json
 - `schema_version`: current
 - `embeddings`: coverage percentage
 
+A check that carries `skipped_segmented: N` (message ending in
+`skipped (segmented): N`) did not read N pages stored in segments, so its
+`ok` covers only the pages it read; see
+[segmented page storage](guides/memory-boundaries.md#segmented-doctor-skips).
+
 **If it fails:** The doctor output includes specific fix instructions for each
 check. See `skills/setup/SKILL.md` Error Recovery table.
 

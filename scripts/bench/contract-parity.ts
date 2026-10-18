@@ -271,7 +271,7 @@ async function buildTemplate(): Promise<void> {
       generation: 2,
       occurrences: [
         { id: 10, byteStart: 0, genFrom: 1, chunks: [{ text: 'live heron passage about the harbor ledger' }, { text: 'second live heron passage' }] },
-        { id: 30, byteStart: 4096, genFrom: 1, genTo: 2, chunks: [{ text: 'retired quokka passage about the harbor ledger', retiredGeneration: 2 }] },
+        { id: 30, byteStart: 4096, genFrom: 1, genTo: 2, chunks: [{ text: 'retired quokka passage about the harbor ledger' }] },
         { id: 40, byteStart: 8192, genFrom: 3, chunks: [{ text: 'staged wombat passage about the harbor ledger' }] },
       ],
     });

@@ -47,6 +47,38 @@ END;
 $func$ LANGUAGE plpgsql;`;
 
 /**
+ * The segment texts each staging staged or deduped onto (migration v255). A create keeps its manifest rows in memory
+ * until it publishes and a replace stages its texts before its manifest rows, so this is the only durable record of
+ * which texts a live staging still needs: a page purge keeps exactly those of the texts no manifest row references.
+ * Rows go with their staging; they hold hashes, never text.
+ */
+export const PAGE_BODY_STAGING_TEXTS_SQL = `CREATE TABLE IF NOT EXISTS page_body_staging_texts (
+  staging_id UUID  NOT NULL REFERENCES page_body_stagings(id) ON DELETE CASCADE,
+  source_id  TEXT  NOT NULL,
+  sha256     BYTEA NOT NULL,
+  PRIMARY KEY (staging_id, sha256)
+);
+CREATE INDEX IF NOT EXISTS page_body_staging_texts_text ON page_body_staging_texts (source_id, sha256);`;
+
+/**
+ * A live staging (open, sealed or prepared, or named by a non-terminal persistence request's body_ref, the segment
+ * GC's roots) recorded the text `t` (a caller alias exposing source_id and sha256) in page_body_staging_texts: a write
+ * that has not published still needs it. Constant SQL over the alias, no values, for the purge statements that keep
+ * exactly those texts.
+ */
+export function stagingNeedsTextSql(t: string): string {
+  return `EXISTS (SELECT 1 FROM page_body_staging_texts r JOIN page_body_stagings rs ON rs.id = r.staging_id
+      WHERE r.source_id = ${t}.source_id AND r.sha256 = ${t}.sha256 AND ${liveStagingSql('rs')})`;
+}
+
+/** The staging `s` (an alias of page_body_stagings) is live in stagingNeedsTextSql's sense: a write that may still publish it. */
+export function liveStagingSql(s: string): string {
+  return `(${s}.state IN ('open','sealed','prepared')
+          OR EXISTS (SELECT 1 FROM persistence_requests rq WHERE rq.state IN ('queued','running','recovering')
+                      AND rq.intent->'body_ref'->>'staging_id' = ${s}.id::text))`;
+}
+
+/**
  * Segment texts (stored once per source and sha256), the generation-ranged
  * manifest, body stagings and their raw upload parts, and the occurrence id
  * sequence. The manifest's text FK is NO ACTION: a referenced text can't be
@@ -133,4 +165,30 @@ CREATE TABLE IF NOT EXISTS page_body_staging_parts (
   sha256     BYTEA   NOT NULL,
   body       BYTEA   NOT NULL,
   PRIMARY KEY (staging_id, part_no)
-);`;
+);
+${PAGE_BODY_STAGING_TEXTS_SQL}`;
+
+/**
+ * The segment tables hold page text (`page_segment_texts`, `page_body_staging_parts`) or a page's shape and
+ * headings (`page_body_manifest`, `page_body_stagings`, `page_view_digests`), so they get the posture of `pages`
+ * and `content_chunks`: RLS on, re-asserted on every schema replay like the core list in src/schema.sql, so a brain
+ * the auto-RLS event trigger (v35) missed, or one where it was dropped or disabled, never serves segment text to a
+ * role `pages` returns no rows to. Only under a role that bypasses RLS (else the runtime role would lock itself out),
+ * and only for a table still without it (ENABLE takes an ACCESS EXCLUSIVE lock even when RLS is on, #5227).
+ * `page_view_digests` is absent while migration v248 runs. Postgres only: PGLite has no role system, and its
+ * bootstrap enables RLS on no core table either. Source-scoped policies are operator SQL (docs/ENGINES.md).
+ */
+export const PAGE_BODY_RLS_TABLES = ['page_segment_texts', 'page_body_manifest', 'page_body_stagings', 'page_body_staging_parts', 'page_view_digests', 'page_body_staging_texts'] as const;
+export const PAGE_BODY_RLS_SQL = `DO $rls$
+DECLARE target TEXT;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    FOREACH target IN ARRAY ARRAY[${PAGE_BODY_RLS_TABLES.map(t => `'${t}'`).join(',')}] LOOP
+      IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = target AND c.relkind = 'r' AND NOT c.relrowsecurity) THEN
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', target);
+      END IF;
+    END LOOP;
+  END IF;
+END $rls$;`;
+

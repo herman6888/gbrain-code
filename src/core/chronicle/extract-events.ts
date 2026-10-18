@@ -176,7 +176,7 @@ export function allDroppedReason(dropped: ChronicleDropCounts): ChronicleDropRea
 }
 
 /** The latest message timestamp of a chat-shaped body (multi-day conversations end on their last message). */
-function lastMessageAt(body: string, fallbackDate: string | undefined): Date | null {
+export function lastMessageAt(body: string, fallbackDate: string | undefined): Date | null {
   const { messages } = parseConversation(body, { fallbackDate, noPolish: true, noFallback: true });
   let last: Date | null = null;
   for (const m of messages) {
@@ -193,9 +193,14 @@ function asDate(value: unknown): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/** The judge input for one immutable depth snapshot (E5: the judge never re-reads the page). */
+/**
+ * The judge input for one immutable depth snapshot (E5: the judge never re-reads the page). `lastMessage` is the
+ * body's last message time when the caller read the body itself (a segmented page, block by block); `compiled_truth`
+ * is then its lead.
+ */
 export function chronicleJudgeContext(page: { slug: string; type: string; title: string; compiled_truth?: string | null;
-  effective_date?: unknown; effective_date_source?: string | null; frontmatter?: Record<string, unknown> | null }): ChronicleJudgeContext {
+  effective_date?: unknown; effective_date_source?: string | null; frontmatter?: Record<string, unknown> | null },
+  lastMessage?: Date | null): ChronicleJudgeContext {
   const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
   const edRaw = page.effective_date as unknown;
   const effectiveDate: string | null =
@@ -207,7 +212,8 @@ export function chronicleJudgeContext(page: { slug: string; type: string; title:
   const body = page.compiled_truth ?? '';
   const own = chroniclePageDate({ effectiveDate: page.effective_date as Date | string | null | undefined,
     effectiveDateSource: page.effective_date_source ?? null, frontmatter: fm });
-  const pageDates = [own, asDate(fm.end), lastMessageAt(body, own?.toISOString().slice(0, 10))].filter((d): d is Date => d !== null);
+  const last = lastMessage !== undefined ? lastMessage : lastMessageAt(body, own?.toISOString().slice(0, 10));
+  const pageDates = [own, asDate(fm.end), last].filter((d): d is Date => d !== null);
   return {
     effectiveDate, attendees, pageDates,
     input: { slug: page.slug, type: page.type, title: page.title, body, effectiveDate, attendees },

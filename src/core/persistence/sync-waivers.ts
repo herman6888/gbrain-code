@@ -15,7 +15,8 @@ import { isSyncReadBound } from './sync-screen.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { sha256 } from './digest.ts';
 import { startClaimPhase } from './claim-phase.ts';
-import { inspectUnchanged, KERNEL_PAGE_SQL, kernelPageWork, screeningRequest, type KernelPage, type NoopKernelWaiver } from './noop-kernel.ts';
+import { inspectUnchanged, kernelPageSql, kernelPageWork, screeningRequest, type KernelPage, type NoopKernelWaiver } from './noop-kernel.ts';
+import { chunkManifestReads } from '../search/safe-chunks.ts';
 import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
 import { readSyncFile, type SyncEntry } from './sync-discovery.ts';
 import { isImageFilePath } from '../sync.ts';
@@ -283,7 +284,7 @@ export async function waivePrescreenedRun<C extends WaiverCursor & { binding: { 
       await faultPoint('sync:prescreened', { sourceId: cursor.sourceId });
       const binding = await getWorktreeBinding(tx, cursor.sourceId);
       if (!binding || String(binding.owner_epoch) !== String(cursor.binding.owner_epoch)) return null;
-      const pages = new Map((await tx.executeRaw<KernelPage>(`${KERNEL_PAGE_SQL} WHERE p.source_id=$1 AND p.slug=ANY($2::text[]) AND p.deleted_at IS NULL`,
+      const pages = new Map((await tx.executeRaw<KernelPage>(`${kernelPageSql(await chunkManifestReads(engine, tx))} WHERE p.source_id=$1 AND p.slug=ANY($2::text[]) AND p.deleted_at IS NULL`,
         [cursor.sourceId, run.map(entry => entry.slug)])).map(page => [page.slug, page]));
       const records = await readSyncImportProvenances(tx, cursor.sourceId, cursor.incarnation, run.map(entry => entry.pageId));
       const holds = await heldGitPaths(tx, cursor.sourceId, cursor.incarnation, run.map(entry => entry.path));

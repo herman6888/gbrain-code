@@ -21,7 +21,9 @@ import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fen
 import { parseMarkdown } from '../markdown.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { contentHash } from '../utils.ts';
-import { assertInlineBody } from '../page-body/page-shape.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { rewriteLiveSegmentedFences } from '../page-body/segment-rewrite.ts';
+import type { BodyRegion } from '../page-body/types.ts';
 import { recordFactWithdrawal } from './withdrawal.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { markBeliefCommits } from '../belief/append.ts';
@@ -183,12 +185,24 @@ export async function forgetFactInFence(
 
   // Mirror the retraction in the page body. The withdrawal record protects
   // active facts even if this best-effort mirror fails or a stale file returns.
+  // Wave B (spec 11): a segmented page's row is struck in the segment holding its fence (a new generation; only the
+  // rewritten occurrences' chunks are replaced), never by loading the body. As `strikeFenceRow` on the whole string,
+  // only the first facts fence is a candidate: of the compiled truth for the DB body, of truth then timeline for the
+  // file mirror (the file holds both); a first fence without the row strikes nothing.
+  const strikeSegments = async (pageId: number, regions: readonly BodyRegion[], strikeRow = strike): Promise<void> => {
+    let first = true;
+    await maintenanceTransaction(engine, tx => rewriteLiveSegmentedFences(tx, pageId, async (fence, at) => {
+      if (!first || !regions.includes(at.region) || !fence.includes(FENCE_BEGIN)) return fence;
+      first = false;
+      return strikeFenceRow(fence, row.row_num!, strikeRow) ?? fence;
+    }));
+  };
   const strikeDbBody = async (): Promise<void> => {
     if (row.row_num === null || row.source_markdown_slug === null) return;
     const slug = row.source_markdown_slug;
     const page = await engine.getPage(slug, { sourceId: row.source_id });
     if (!page) return;
-    assertInlineBody(page, 'forget fence strike');
+    if (isSegmentedPage(page)) return strikeSegments(page.id, ['truth']);
     const struck = strikeFenceRow(page.compiled_truth ?? '', row.row_num, strike);
     if (struck === null) return;
     // The FILE was not rewritten on this tier, so the row must NOT keep the
@@ -297,8 +311,11 @@ export async function forgetFactInFence(
       try {
         const reparsed = parseMarkdown(tmpBody, `${slug}.md`);
         const page = await engine.getPage(slug, { sourceId: row.source_id });
-        if (page) {
-          assertInlineBody(page, 'forget fence mirror');
+        // The withdrawal already struck the segmented row with the overlay's reason; it takes the file's row, as the
+        // inline body takes the file's text, so the caller's reason reaches the stored body.
+        const fileRow = parseFactsFence(tmpBody).facts.find(f => f.rowNum === targetRowNum);
+        if (page && isSegmentedPage(page)) await strikeSegments(page.id, ['truth', 'timeline'], fileRow ? () => fileRow : strike);
+        else if (page) {
           await maintenanceTransaction(engine, tx => tx.refreshPageBody(slug, row.source_id,
             sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
             page.content_hash || contentHash(page)));

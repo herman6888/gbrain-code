@@ -12,6 +12,7 @@ import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { compactWriteReceipts } from '../../src/core/persistence/journal.ts';
 import { clientRequestUuid } from '../../src/core/persistence/preconditions.ts';
+import { LATEST_SCHEMA_VERSION } from '../../src/core/schema-migrations/latest.generated.ts';
 
 const RUN = hasDatabase();
 const d = RUN ? describe : describe.skip;
@@ -38,6 +39,7 @@ d('client request ids on Postgres', () => {
   });
 
   test('a string id journals its UUIDv5, replays, reads by either id, refuses other intent and survives compaction', async () => {
+    await setConfigVersion(LATEST_SCHEMA_VERSION);
     const id = `pg-put-notes-${Date.now()}`;
     const uuid = clientRequestUuid(id);
     const first = await call('put_page', { slug: `notes/${id}`, content: page('Postgres one'), request_id: id });

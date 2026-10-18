@@ -111,6 +111,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('page_body_manifest', 'user_data', 'Segmented page bodies: which segment texts make each body generation, in order; without it a large page has no body.'),
     carry('page_body_staging_parts', 'operational', 'Raw parts of open upload sessions; without them a client resuming an upload starts over.'),
     carry('page_body_stagings', 'operational', 'Body stagings of segmented writes and upload sessions (idempotent begin and commit, expiry deadlines).'),
+    carry('page_body_staging_texts', 'operational', 'The segment texts each live body staging needs, so a page purge keeps an unpublished write\'s texts.'),
     carry('page_embedding_budget', 'operational', 'Large-page embedding spend ledger: per-page spend, holds awaiting approval and caps; without it held pages would embed without consent.'),
     carry('page_extraction_state', 'operational', 'Extraction watermarks and partial-input receipts per page and pipeline; without them the next extraction of a large page reads its head again and records the receipt anew.'),
     carry('page_facts_reconcile', 'operational', 'Facts reconcile watermark: per-page revision extract_facts last reconciled; without it every page is due again.'),
@@ -194,6 +195,7 @@ export const GRADUATION_INVENTORY: Inventory = {
 
     entry('query_cache', 'rebuild', 'operational', 'Query result cache; regenerated on the target.'),
     entry('code_traversal_cache', 'rebuild', 'operational', 'Code traversal cache; regenerated on the target.'),
+    entry('page_view_digests', 'rebuild', 'operational', 'get_page view sizes and sha256 of segmented pages per revision; recomputed by the next read on the target.'),
 
     entry('planner_stats_deltas', 'discard', 'operational', 'PGLite-only planner accounting.', { engines: { pglite: true, postgres: false } }),
     entry('planner_stats_state', 'discard', 'operational', 'PGLite-only planner accounting.', { engines: { pglite: true, postgres: false } }),

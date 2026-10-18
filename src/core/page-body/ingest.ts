@@ -22,18 +22,22 @@ import { readManagedMode } from '../persistence/managed-mode.ts';
 import { maintenanceAttribution, principalAttribution } from '../persistence/attribution.ts';
 import type { Principal } from '../persistence/model.ts';
 import { stepFenceWalk, type FenceWalk } from '../fence-scan.ts';
-import { BODY_LEAD_BYTES, BODY_STAGING_HARD_MS, BODY_STAGING_IDLE_MS, STAGE_BATCH_BYTES } from './limits.ts';
+import { BODY_LEAD_BYTES, BODY_STAGING_HARD_MS, BODY_STAGING_IDLE_MS, SEGMENTED_CREATE_SEAL_MAX_BYTES, STAGE_BATCH_BYTES } from './limits.ts';
 import type { BodyRegion, BodyStagingKind, BodyStorage, JsonObject, ManifestRow, ManifestRowInput, SegmentChunkInput,
   SegmentedBodyColumns, SegmentTextInput } from './types.ts';
-import { segmentProjectionParts, segmentStream, SEGMENTER_VERSION, type StoredRegion } from './segmenter.ts';
+import { regionTrust, segmentStream, SEGMENTER_VERSION, type StoredRegion } from './segmenter.ts';
 import { initialEntryState, readEntryState, timelineEntryState, type EntryState } from './entry-state.ts';
 import { ContentHashStream } from './content-hash-stream.ts';
 import { prepareSegmentChunks } from './segment-chunks.ts';
 import { reuseSegmentChunkVectors } from '../import-chunk-reuse.ts';
 import { newFenceChunkBudget } from '../markdown-chunks.ts';
 import { loadFenceChunkOverlay } from '../eligibility/fence-overlay.ts';
+import { withdrawalFenceBlocks } from '../facts/withdrawal-overlay.ts';
+import { overlaySegmentText, readBodyLedger, type BodyLedger } from './segment-ledger.ts';
+import { assertGenerationTiles } from './body-tiling.ts';
+import { hasStaleChunks } from './projection.ts';
 
-const utf8 = new TextDecoder('utf-8', { fatal: true });
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /** The live page a segmented write replaces (null: create). */
 export interface SegmentedLivePage { id: number; generation: number; storage: BodyStorage; title: string; type: string; flags: JsonObject | null }
@@ -77,10 +81,20 @@ export interface PreparedSegmentedBody {
   newGeneration: number;
   /** Create only: every manifest row, written in the publication transaction once the page row exists. */
   createRows: ManifestRowInput[] | null;
+  /**
+   * Create within SEGMENTED_CREATE_SEAL_MAX_BYTES (or quarantined): the chunk rows, prepared for `slug` and inserted by
+   * the publication, which then seals. Null: the create publishes unsealed and its projection runs after commit.
+   */
+  createChunks: { slug: string; chunks: SegmentChunkInput[] } | null;
   closeOccurrences: number[];
   retireChunkOccurrences: number[];
-  /** Occurrences of the new generation that have no chunk rows after staging (create: all; chunked after publication). */
+  /** Occurrences of the new generation that have no chunk rows after staging (a create without `createChunks`: all, chunked after publication). */
   unchunked: number;
+  /**
+   * The live generation stores chunk rows it does not hold (an earlier write's deferred retirement), so the publication
+   * leaves the page unsealed. Read here, not in the publication transaction: the probe walks every occurrence of the page.
+   */
+  priorStale: boolean;
   body: SegmentedBodyColumns;
   /** No manifest row changed: the write changes metadata only. */
   bodyUnchanged: boolean;
@@ -142,10 +156,6 @@ export function stringBodyFlags(truth: string, timeline: string): JsonObject {
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString('hex');
 const sameBytes = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
-/** The whole-region fence trust a region's stored regions are computed under (body_flags). */
-export function regionTrust(flags: JsonObject | null | undefined, region: BodyRegion): 'trusted' | 'void' {
-  return (region === 'truth' ? flags?.fence_trust : flags?.timeline_fence_trust) === 'void' ? 'void' : 'trusted';
-}
 
 /** An occurrence is its bytes, entry state and the trust its stored regions were computed under: a trust flip rechunks the region. */
 const occurrenceKey = (sha256: Uint8Array, entryState: unknown, trust: 'trusted' | 'void') => `${hex(sha256)}|${stableJson(entryState)}|${trust}`;
@@ -230,7 +240,7 @@ async function stageBody(engine: BrainEngine, input: SegmentedBodyInput, staging
   const flushTexts = async () => {
     if (!pending.length) return;
     const batch = pending.splice(0);
-    await writes(exec => exec.stageSegmentTexts(input.sourceId, batch));
+    await writes(exec => exec.stageSegmentTexts(input.sourceId, batch, { stagingId }));
     collectBatchGarbage();
     pendingBytes = 0;
     if (engine.kind === 'pglite') await new Promise(resolve => setImmediate(resolve));
@@ -313,8 +323,11 @@ async function stageBody(engine: BrainEngine, input: SegmentedBodyInput, staging
     body_flags: { ...input.flags, has_protected: hasProtected },
   };
   if (!input.live) {
-    return { stagingId, expectedGeneration, newGeneration, createRows: rows, closeOccurrences: [], retireChunkOccurrences: [],
-      unchunked: rows.length, body, bodyUnchanged: false, rows: { texts, manifest: rows.length, chunks: 0 }, stagedChunkIndexes: [] };
+    const createChunks = input.chunking.quarantined || byteStart <= SEGMENTED_CREATE_SEAL_MAX_BYTES ? { slug: input.slug, chunks: [] as SegmentChunkInput[] } : null;
+    if (createChunks) await stageOccurrenceChunks(engine, { pageId: 0, sourceId: input.sourceId, slug: input.slug, generation: newGeneration, occurrences: rows,
+      title: input.title, frontmatter: input.frontmatter, flags: body.body_flags, chunking: input.chunking, retiredOccurrences: [], hold: createChunks.chunks });
+    return { stagingId, expectedGeneration, newGeneration, createRows: rows, createChunks, closeOccurrences: [], retireChunkOccurrences: [],
+      unchunked: createChunks ? 0 : rows.length, priorStale: false, body, bodyUnchanged: false, rows: { texts, manifest: rows.length, chunks: createChunks?.chunks.length ?? 0 }, stagedChunkIndexes: [] };
   }
   if (changed.length) await writes(exec => exec.stageManifestRows(changed));
   await faultPoint('segmented:manifest_staged', { sourceId: input.sourceId });
@@ -325,25 +338,35 @@ async function stageBody(engine: BrainEngine, input: SegmentedBodyInput, staging
   await faultPoint('segmented:chunks_staged', { sourceId: input.sourceId });
   const kept = new Set(rows.filter((_, i) => matched[i]).map(row => row.occurrenceId));
   retireChunkOccurrences.push(...chunkable.filter(row => kept.has(row.occurrenceId)).map(row => row.occurrenceId));
-  return { stagingId, expectedGeneration, newGeneration, createRows: null, closeOccurrences, retireChunkOccurrences,
-    unchunked: input.chunking.quarantined ? 0 : chunkable.length - chunks.occurrences, body,
+  const priorStale = !!live && await hasStaleChunks(engine, live.id, expectedGeneration, liveRows.map(row => Number(row.occurrenceId)));
+  return { stagingId, expectedGeneration, newGeneration, createRows: null, createChunks: null, closeOccurrences, retireChunkOccurrences,
+    unchunked: input.chunking.quarantined ? 0 : chunkable.length - chunks.occurrences, priorStale, body,
     bodyUnchanged: changed.length === 0 && retireChunkOccurrences.length === 0, rows: { texts, manifest: changed.length, chunks: chunks.rows },
     stagedChunkIndexes: chunks.indexes };
 }
 
 /**
  * The rows of `rows` whose occurrence has no live chunk row at `generation`: new
- * occurrences, and kept ones a crashed or deferred projection never chunked.
+ * occurrences, and kept ones a crashed or deferred projection never chunked. One
+ * index probe per occurrence (content_chunks_occurrence_generation_idx), never a
+ * scan of the page's chunk rows.
  */
 export async function occurrencesWithoutChunks(engine: Pick<BrainEngine, 'executeRaw'>, pageId: number, generation: number,
   rows: readonly ManifestRowInput[]): Promise<ManifestRowInput[]> {
   if (!rows.length) return [];
-  const chunked = new Set((await engine.executeRaw<{ occurrence_id: number }>(`SELECT DISTINCT occurrence_id FROM content_chunks
-    -- chunk-visibility-ok: write path; the generation predicate is explicit, at the generation the caller diffed against
-    WHERE page_id=$1 AND occurrence_id=ANY($2::bigint[]) AND body_generation<=$3 AND retired_generation IS NULL`,
+  const chunked = new Set((await engine.executeRaw<{ occurrence_id: number }>(`SELECT o AS occurrence_id FROM unnest($2::bigint[]) AS o
+    WHERE EXISTS (SELECT 1 FROM content_chunks c
+      -- chunk-visibility-ok: write path; the generation predicate is explicit, at the generation the caller diffed against
+      WHERE c.page_id=$1 AND c.occurrence_id=o AND c.body_generation<=$3::bigint)`,
   [pageId, rows.map(row => row.occurrenceId), generation])).map(row => Number(row.occurrence_id)));
   return rows.filter(row => !chunked.has(row.occurrenceId));
 }
+
+/**
+ * @internal Work stageOccurrenceChunks does, for the projection tests: segment text batches chunked (`batches`) and
+ * chunk rows prepared (`chunks`), whoever stages them (a replace's preparation, a create's, or a projection).
+ */
+export const segmentChunkWork = { batches: 0, chunks: 0 };
 
 /**
  * Chunk occurrences one text batch at a time (texts read back from
@@ -356,10 +379,16 @@ export async function stageOccurrenceChunks(engine: BrainEngine, input: { pageId
   retiredOccurrences: readonly number[];
   /** Projection: each batch inserts under the page guard, after re-reading which occurrences still lack rows, so two projections never both chunk one;
    *  a page whose generation moved past `generation` stops the projection before it inserts. */
-  guarded?: boolean }): Promise<{ rows: number; occurrences: number; indexes: number[] }> {
+  guarded?: boolean;
+  /** A create's preparation: the chunks are collected here (its page row does not exist yet) and inserted by the publication. */
+  hold?: SegmentChunkInput[];
+  /** Guarded: runs in each batch's transaction before its insert (the projection renews its claim on the page's queue row);
+   *  false when the caller lost its claim: that batch inserts nothing and the staging stops. */
+  renew?: (tx: BrainEngine) => Promise<boolean> }): Promise<{ rows: number; occurrences: number; indexes: number[] }> {
   if (input.chunking.quarantined || !input.occurrences.length) return { rows: 0, occurrences: 0, indexes: [] };
   const batchBytes = STAGE_BATCH_BYTES[engine.kind];
   const fenceBudget = newFenceChunkBudget();
+  let ledger: BodyLedger | undefined;
   let rows = 0, done = 0;
   const indexes: number[] = [];
   for (let start = 0; start < input.occurrences.length;) {
@@ -367,40 +396,46 @@ export async function stageOccurrenceChunks(engine: BrainEngine, input: { pageId
     while (end < input.occurrences.length && (end === start || bytes + input.occurrences[end]!.byteLen <= batchBytes)) bytes += input.occurrences[end++]!.byteLen;
     const batch = input.occurrences.slice(start, end);
     start = end;
+    if (input.guarded) await faultPoint('segmented:projection_batch', { sourceId: input.sourceId, slug: input.slug });
     const texts = await engine.readSegmentTexts(input.sourceId, batch.map(row => row.sha256));
-    const segments = batch.map(row => {
+    ledger ??= await readBodyLedger(engine, input.sourceId, input.slug);
+    const segments = [];
+    for (const row of batch) {
       const bytes = texts.get(hex(row.sha256));
       if (bytes === undefined) throw new Error(`Segment text ${hex(row.sha256)} of page ${input.pageId} is missing.`);
       const entryState = readEntryState(row.entryState);
       if (!entryState) throw new Error(`Manifest row ${row.occurrenceId} of page ${input.pageId} has an entry state of another version; resegment the page.`);
       const fenceTrust = regionTrust(input.flags, row.region);
-      return { row, fenceTrust, segment: { region: row.region, bytes, byteStart: row.byteStart, entryState, fenceTrust, protectedRegions: row.protectedRegions as StoredRegion[] } };
-    });
-    const factsTexts = segments.flatMap(({ segment }) => segment.protectedRegions.some(region => region.kind === 'facts')
-      ? segmentProjectionParts(utf8.decode(segment.bytes), segment.protectedRegions, segment.byteStart)
-        .filter(part => part.kind === 'facts' && part.region?.open_start === undefined).map(part => part.text) : []);
+      const text = await overlaySegmentText(engine, ledger, { sourceId: input.sourceId, byteStart: row.byteStart, entryState }, utf8.decode(bytes), 'read');
+      segments.push({ row, fenceTrust, text, segment: { region: row.region, bytes, byteStart: row.byteStart, entryState, fenceTrust, protectedRegions: row.protectedRegions as StoredRegion[] } });
+    }
+    const factsTexts = segments.flatMap(({ text }) => text.includes('gbrain:facts:begin') ? withdrawalFenceBlocks(text).map(block => text.slice(block.start, block.end)) : []);
     const overlay = factsTexts.length ? await loadFenceChunkOverlay(engine, { sourceId: input.sourceId, slug: input.slug, compiled_truth: factsTexts.join('\n') }) : undefined;
     const chunks: SegmentChunkInput[] = [];
-    for (const { row, fenceTrust, segment } of segments) {
-      for (const chunk of await prepareSegmentChunks(segment, { fenceTrust, frontmatter: input.frontmatter, overlay, fenceBudget })) {
+    for (const { row, fenceTrust, segment, text } of segments) {
+      for (const chunk of await prepareSegmentChunks(segment, { fenceTrust, frontmatter: input.frontmatter, overlay, fenceBudget, text })) {
         chunks.push({ ...chunk, occurrence_id: row.occurrenceId });
       }
     }
     if (chunks.length && input.retiredOccurrences.length) await reuseSegmentChunkVectors(engine, { pageId: input.pageId,
       retiredOccurrences: input.retiredOccurrences, chunks, title: input.title, corpusGeneration: input.chunking.corpusGeneration, tier: input.chunking.tier });
-    if (chunks.length && !input.guarded) indexes.push(...await engine.stageSegmentChunks(input.pageId, input.generation, chunks));
-    let moved = false;
+    segmentChunkWork.batches++;
+    segmentChunkWork.chunks += chunks.length;
+    if (input.hold) input.hold.push(...chunks);
+    else if (chunks.length && !input.guarded) indexes.push(...await engine.stageSegmentChunks(input.pageId, input.generation, chunks));
+    let moved = false, lost = false;
     if (chunks.length && input.guarded) rows -= chunks.length - await engine.transaction(async tx => {
       await tx.lockPageKeys([{ sourceId: input.sourceId, slug: input.slug }]);
       const [page] = await tx.executeRaw<{ body_generation: number | string }>('SELECT body_generation FROM pages WHERE id=$1', [input.pageId]);
       if (Number(page?.body_generation) !== input.generation) { moved = true; return 0; }
+      if (input.renew && !await input.renew(tx)) { lost = true; return 0; }
       const open = new Set((await occurrencesWithoutChunks(tx, input.pageId, input.generation, batch)).map(row => row.occurrenceId));
       const still = chunks.filter(chunk => open.has(chunk.occurrence_id));
       if (still.length) await tx.stageSegmentChunks(input.pageId, input.generation, still);
       return still.length;
     });
     rows += chunks.length;
-    if (moved) break;
+    if (moved || lost) break;
     done += batch.length;
     collectBatchGarbage();
     if (engine.kind === 'pglite') await new Promise(resolve => setImmediate(resolve));
@@ -412,6 +447,7 @@ export async function stageOccurrenceChunks(engine: BrainEngine, input: { pageId
 export async function* readSegmentedBody(engine: BrainEngine, pageId: number, sourceId: string,
   opts: { generation?: number } = {}): AsyncIterable<{ region: BodyRegion; bytes: Uint8Array }> {
   const rows = await engine.readManifest(pageId, opts.generation === undefined ? {} : { generation: opts.generation });
+  await assertGenerationTiles(engine, pageId, opts.generation, rows);
   const batchBytes = STAGE_BATCH_BYTES[engine.kind];
   for (let start = 0; start < rows.length;) {
     let end = start, bytes = 0;

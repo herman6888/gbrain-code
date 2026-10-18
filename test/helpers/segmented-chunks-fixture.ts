@@ -3,13 +3,15 @@
  * and chunk rows (raw SQL, no segmenter or flip), so chunk-visibility,
  * vector-reuse and version tests can put rows in exactly the generation
  * states they probe: live, staged (body_generation above the page's) and
- * retired. The page is sealed as an inline page first, then its body columns
+ * retired (rows of an occurrence whose manifest row is closed, not yet deleted:
+ * a deferred retirement, whose page stays unsealed until they are). The page is sealed as an inline page first, then its body columns
  * are cleared the way a segmented row stores them (NULL bodies, body_bytes).
  */
 import { createHash } from 'node:crypto';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { resolveActiveEmbeddingColumnFromEngine } from '../../src/core/search/embedding-column.ts';
 import { installFixtureChunks } from './page-projection.ts';
+import { SEGMENTED_CHUNKER_VERSION } from '../../src/core/page-body/segment-chunks.ts';
 
 export interface FixtureChunk {
   text: string;
@@ -17,7 +19,6 @@ export interface FixtureChunk {
   chunkIndex?: number;
   /** First generation the row is part of; defaults to the occurrence's genFrom. */
   generation?: number;
-  retiredGeneration?: number | null;
   /** A unit vector seed: the row gets a vector with 1 at this dimension. */
   vector?: number;
 }
@@ -48,6 +49,8 @@ export async function segmentPage(engine: BrainEngine, slug: string, opts: {
   title?: string;
   bodyBytes?: number;
   sourceId?: string;
+  /** Leave the text projection unsealed, as a flip that deferred its retirement does (default sealed). */
+  unsealed?: boolean;
 }): Promise<SegmentedFixture> {
   const sourceId = opts.sourceId ?? 'default';
   await engine.putPage(slug, { type: 'note', title: opts.title ?? slug, compiled_truth: 'Segmented fixture.', timeline: '', frontmatter: {} }, { sourceId });
@@ -76,15 +79,16 @@ export async function segmentPage(engine: BrainEngine, slug: string, opts: {
       nextIndex = Math.max(nextIndex, chunkIndex) + 1;
       const vector = chunk.vector === undefined ? null : `[${(await unitVector(engine, chunk.vector)).join(',')}]`;
       const [row] = await engine.executeRaw<{ id: number }>(`INSERT INTO content_chunks (page_id, chunk_index, chunk_text, chunk_source, token_count,
-          occurrence_id, local_ordinal, body_generation, retired_generation, ${col.name}, model, embedded_at, embedded_text_hash)
-          VALUES ($1, $2, $3, 'compiled_truth', $4, $5, $6, $7, $8, $9::vector, $10, $11, $12) RETURNING id`,
+          occurrence_id, local_ordinal, body_generation, ${col.name}, model, embedded_at, embedded_text_hash)
+          VALUES ($1, $2, $3, 'compiled_truth', $4, $5, $6, $7, $8::vector, $9, $10, $11) RETURNING id`,
       [pageId, chunkIndex, chunk.text, Math.ceil(chunk.text.length / 4), occ.id, ordinal, chunk.generation ?? occ.genFrom,
-        chunk.retiredGeneration ?? null, vector, col.embeddingModel, vector ? new Date() : null,
+        vector, col.embeddingModel, vector ? new Date() : null,
         vector ? createHash('md5').update(chunk.text).digest('hex') : null]);
       chunkIds.set(chunk.text, Number(row!.id));
     }
   }
-  // Clearing the body and replacing the rows unseals the projection; the fixture's rows are the projection.
-  await engine.executeRaw('UPDATE pages SET text_projection_revision = knowledge_revision WHERE id = $1', [pageId]);
+  // Clearing the body and replacing the rows unseals the projection; the fixture's rows are the projection, sealed at
+  // the chunker version sealSegmentedPage stamps.
+  if (!opts.unsealed) await engine.executeRaw('UPDATE pages SET text_projection_revision = knowledge_revision, chunker_version = $2 WHERE id = $1', [pageId, SEGMENTED_CHUNKER_VERSION]);
   return { pageId, chunkIds };
 }

@@ -153,7 +153,7 @@ RRF fusion, multi-query expansion, and 4-layer dedup are engine-agnostic. They o
 - `tsvector` + `GIN` index for full-text search with `ts_rank` weighting
 - `pgvector` HNSW index for cosine similarity vector search
 - `pg_trgm` + `GIN` for fuzzy slug resolution
-- Recursive CTEs for graph traversal
+- Recursive CTEs for graph traversal (breadth-first, each page visited once)
 - Trigger-based search_vector (spans pages + timeline_entries)
 - JSONB for frontmatter with GIN index
 - Connection pooling via Supabase Supavisor (port 6543)
@@ -173,14 +173,14 @@ describes bounded candidate recovery and incomplete-result metadata.
 
 On Postgres the same refresh also analyzes the page columns every search
 filter reads (`deleted_at`, `source_id`, `type`, `slug`) and
-`content_chunks(model, modality, page_id, body_generation, retired_generation)`, and an embed drain that embedded
+`content_chunks(model, modality, page_id, body_generation)`, and an embed drain that embedded
 anything analyzes those chunk columns once at its end (each ANALYZE bounded by
 a 30 s statement and 2 s lock timeout). Without those statistics the vector
 candidate statement sorts every eligible chunk instead of walking the HNSW
 index, and at 1M chunks and above that sort runs past the 8 s vector budget,
 so hybrid search falls back to keyword-only results until autovacuum
 analyzes the tables. If a refresh is skipped (a lock, or a role that does not
-own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation, retired_generation)` and
+own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation)` and
 `ANALYZE pages` as the table owner.
 
 ### Vector index sizing
@@ -248,6 +248,88 @@ per-request scope binding — unwrapped paths (writes, admin/maintenance reads)
 run under the role default and are not backstopped per caller. This is layer 2;
 the app-layer source filters remain layer 1 and stay mandatory. Behavioral pins
 live in `test/postgres-engine-rls-scope.test.ts`.
+
+**Segmented page tables.** A page over 1 MiB stored in segments (`pages.segmented_storage`)
+keeps its text in `page_segment_texts`, its layout and headings in
+`page_body_manifest`, uploads in progress in `page_body_stagings` /
+`page_body_staging_parts` (with the segment texts each one holds in
+`page_body_staging_texts`), and view sizes in `page_view_digests`. gbrain
+enables RLS on all six on every schema replay, as it does on `pages` and
+`content_chunks`, so with no policy a role that does not bypass RLS reads no row
+of them. Title search, the source-scoped vector scan, the chunk windows search
+reads around its hits, `get_chunks` and get_page check a chunk of a page stored
+in segments against `page_body_manifest`. A restricted read role that can see
+such a chunk (a segmented page of one of its sources) needs `SELECT` on it;
+without it those reads fail with `permission_denied` (42501). A role that sees
+no such chunk, as every role does while no page is segmented
+(`pages.segmented_storage` is off by default), reads as before without the
+grant (`test/e2e/segmented-switch-off-rls.test.ts`). Grant it together with
+these policies, never with an open one, or the role reads every source's segment
+text. A scoped role then sees exactly the segment rows of its sources:
+
+<!-- gbrain:segmented-rls-recipe:begin (applied verbatim by test/e2e/segmented-rls-scope.test.ts) -->
+```sql
+-- The pages_scope_filter predicate, on each table's own source_id.
+CREATE POLICY page_segment_texts_scope_filter ON page_segment_texts
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_body_manifest_scope_filter ON page_body_manifest
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_body_stagings_scope_filter ON page_body_stagings
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- A write role records the texts each staging holds here; without a policy its
+-- segmented writes are refused.
+CREATE POLICY page_body_staging_texts_scope_filter ON page_body_staging_texts
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- Search joins sources; a scoped role sees its own.
+CREATE POLICY sources_scope_filter ON sources
+  USING (current_setting('app.scopes', true) = '*'
+         OR id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- No source_id of their own: visible exactly when their staging or page is
+-- (the pages policy filters the subquery). content_chunks holds every page's
+-- chunk text, segmented or not.
+CREATE POLICY page_body_staging_parts_scope_filter ON page_body_staging_parts
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM page_body_stagings s WHERE s.id = staging_id));
+CREATE POLICY page_view_digests_scope_filter ON page_view_digests
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+CREATE POLICY content_chunks_scope_filter ON content_chunks
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+
+-- A read role that searches and reads pages. The other tables it reads
+-- (config, timeline_entries, facts, ...) need policies of their own.
+GRANT SELECT ON pages, content_chunks, page_body_manifest, page_segment_texts,
+  page_view_digests, sources TO <reader-role>;
+
+-- If the runtime role OWNS these tables, as for pages:
+ALTER TABLE page_segment_texts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_manifest FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_stagings FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_staging_parts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_staging_texts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_view_digests FORCE ROW LEVEL SECURITY;
+ALTER TABLE content_chunks FORCE ROW LEVEL SECURITY;
+```
+<!-- gbrain:segmented-rls-recipe:end -->
+
+A role whose reads do not run through the scoped helper is scoped by its own
+default (`ALTER ROLE <reader-role> SET app.scopes = 'source-a,source-b'`). The
+policies read `app.scopes` only; the app-layer source filters stay layer 1.
+
+A write role that does not own the tables needs `SELECT, INSERT, UPDATE, DELETE`
+on all six, as on any table a migration adds, even while no page is segmented:
+purging soft-deleted pages, fact withdrawal (`forget_fact`, `purge_fact`), the
+maintenance sweep's facts pass, doctor's credential check and the segment
+storage sweep name them. Its ordinary writes (`put_page`, `remember`, sync
+imports, their embedding and the unchanged-file check) do not, while it sees no
+segmented chunk (`test/e2e/segmented-switch-off-write-role.test.ts`). With the
+policies above it creates segmented pages and sees only its sources' rows
+(`test/e2e/segmented-rls-scope.test.ts`).
 
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
@@ -343,6 +425,7 @@ and the fix is the read-only `gbrain migrate --to postgres --plan --json`.
 | Cost | Free | Supabase Pro ($25/mo) |
 | Concurrency | Single process | Connection pooling |
 | Backups | Manual (file copy) | Managed by Supabase |
+| Largest page | 128 MiB, stored in segments (`pages.max_bytes`) | 256 MiB, stored in segments (`pages.max_bytes`) |
 
 **The belief ledger lives only in the database.** `belief_events` and its side tables record what the brain had recorded, and when (`gbrain beliefs status`). Markdown carries only current state, so a rebuild from Markdown, `gbrain reinit-pglite` or a dropped database starts an empty history; back up the database itself. After restoring a Postgres (or PGLite) backup, replay the purges made after the backup was taken: until then content purged later is readable again, and `gbrain doctor --only belief_ledger_coverage` reports a restore whose purge replay was partial, unavailable or unverified. Graduation copies the ledger verbatim (equal event keys and digests); the legacy copier refuses a brain that has one.
 
@@ -441,6 +524,54 @@ version bump changes it.
 to connect: it diagnoses the dir from disk, names the repair command, reports
 retained repair backups, and escalates when repairs keep recurring (that
 means the unclean-shutdown genesis is still active — see the ladder's rung 4).
+
+<a id="legacy-pglite-lock"></a>
+### Legacy PGLite lock (`pglite_busy` reason `legacy_owner_unverified`)
+
+A PGLite brain is owned through the stable sibling kernel lock
+`<data-dir>.gbrain-owner.lock`. Brains last opened by an older gbrain may
+still hold that release's lock folder, `<data-dir>/.gbrain-lock/`. The first
+open by a current gbrain removes it automatically only when it can prove the
+old owner is dead: readable metadata with a PID that `kill -0` reports gone
+and, on Linux, the same PID namespace and boot id as this process. A live
+owner keeps the ordinary `pglite_busy` refusal.
+
+When the folder's metadata is torn or missing, records no PID, or (Linux) does
+not prove the PID ran in this namespace since the last boot, waiting never
+helps, so the open refuses `pglite_busy` with reason
+`legacy_owner_unverified` (class consent, exit 3, not retryable). Its fix
+asks the user and starts with the read-only preview; `gbrain doctor` shows
+the same reason and fix on its `connection` check.
+
+1. **Preview.** `gbrain pglite-repair --legacy-lock --dry-run --json [--path <dir>]`
+   never opens the engine and never creates anything. It names the recorded
+   PID, whether `kill -0` says it is running and its command, the processes
+   an open-file scan of `/proc` (Linux) saw holding files under the data dir,
+   and the filesystem type (Linux `statfs`, macOS `df -P` and `mount`), and prints the `plan_hash` and
+   the apply command. This evidence is advisory: it covers only this host and
+   PID namespace and cannot see other containers or other hosts that share the
+   folder.
+2. **Apply, after the user agrees.**
+   `gbrain pglite-repair --legacy-lock --path <dir> --yes --expect <plan_hash>`
+   takes the kernel lock (so no current gbrain can be running), inspects
+   again under it and refuses `legacy_lock_removal_refused` while a process
+   on this host holds the data dir or the recorded PID runs a command that
+   could be gbrain (`live_holder`), or when the data dir is on a network or
+   shared filesystem such as NFS, SMB, 9p, virtiofs or FUSE
+   (`network_filesystem`), or when it cannot confirm the filesystem is local
+   (`filesystem_unverified`: Linux reads `statfs`; macOS reads the mount
+   point from `df -P` and its `mount` line, and counts it local only with
+   the `local` flag and a local type such as apfs or hfs. Other systems, a
+   failed probe, an unrecognised type, a macOS network mount such as smbfs or
+   nfs, and a macOS mount without the `local` flag all refuse). A lock that changed since the preview refuses `preview_changed`.
+   It inspects again after consent, so a holder or change that appears while
+   the prompt waits refuses the same way. Otherwise it moves the folder into
+   `<data-dir>.legacy-lock-removed-<timestamp>/` (nothing is deleted) with a
+   `receipt.json` and the exact restore command (it also puts back the prior
+   `<data-dir>.gbrain-owner.json` bytes, kept as `prior-owner-marker.json`,
+   or removes the new marker when there was none), writes the kernel-v1 marker
+   `<data-dir>.gbrain-owner.json`, and starts the 10-minute WAL-repair
+   quarantine (`<data-dir>.lock-reap.json`). The next ordinary open succeeds.
 
 ## Canonical schema sources
 
@@ -916,6 +1047,25 @@ checkpoint did not advance. The message names both errors (redacted, at most
 200 characters each). Fix the cause they name, then run
 `gbrain backfill <kind> --resume`.
 
+<a id="backfill-commit-indeterminate"></a>**`backfill_commit_indeterminate`** (error).
+A `gbrain backfill` batch sent its `COMMIT` and got no verdict from the
+server (for example the connection dropped), so the batch may or may not have
+committed. The run stops without bisecting or skipping anything, and the
+checkpoint stays before the batch. Run `gbrain backfill <kind> --resume`:
+rows that did commit no longer match the backfill and are not redone.
+
+<a id="backfill-skipped-rows"></a>**Skipped backfill rows.** A row whose compute
+or UPDATE fails on its own (a CHECK or type violation, a compute error) is
+isolated by splitting its batch, each part in its own transaction, and recorded
+in the config key `backfill.<kind>.skipped`; the checkpoint moves past it and
+the other rows land. `gbrain backfill <kind>` prints each recorded row with
+its code and the retry command, and every later run retries it first. A row
+that fails with the same content error on 3 consecutive runs (same row, same
+gbrain version) is held: it is reported but not retried until the row or the
+gbrain version changes; `gbrain backfill <kind> --fresh` retries it now. When
+most rows of a run fail, the run stops with `item_failures_systemic` and keeps
+the skip record and checkpoint it began with.
+
 <a id="persistence-consumer-log"></a>**`[persistence] phase=<phase> reason=<code>`**
 (stderr). The resident write consumer could not finish a phase. `reason` is
 the SQLSTATE (for example `53300` when a pooler's client limit is reached),
@@ -1063,7 +1213,7 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 | Keyword search | tsvector + ts_rank | tsvector + ts_rank | Identical (real Postgres) |
 | Vector search | pgvector HNSW | pgvector HNSW | Same operators; bounded fallback/cancellation differs |
 | Fuzzy slug | pg_trgm | pg_trgm | Identical (real Postgres) |
-| Graph traversal | Recursive CTE | Recursive CTE | Same SQL |
+| Graph traversal | Breadth-first recursive CTE (one row per layer) | Breadth-first recursive CTE (one row per layer) | Same SQL |
 | Transactions | Full ACID | Full ACID | Both support this |
 | JSONB queries | GIN index | GIN index | Identical |
 | Concurrent access | Connection pooling | Single process | PGLite limitation |

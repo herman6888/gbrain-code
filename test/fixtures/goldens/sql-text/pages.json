@@ -680,8 +680,8 @@
               "number",
               "number"
             ],
-            "sql": "SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at_iso FROM pages WHERE deleted_at IS NULL AND NOT (COALESCE(pages.frontmatter, '{}'::jsonb) ? 'quarantine') AND (links_extracted_at IS NULL OR links_extracted_at < $1::timestamptz OR updated_at > links_extracted_at OR id IN (SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL WHERE t.updated_at > w.checked_at UNION SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)) AND source_id = $2 AND body_storage = 'inline' AND id > $3 ORDER BY id LIMIT $4",
-            "textSha256": "1ab30a03a7515fc473086bf91c7f83adca485b27801bf9a2527674ee40238be4"
+            "sql": "SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at_iso FROM pages WHERE deleted_at IS NULL AND NOT (COALESCE(pages.frontmatter, '{}'::jsonb) ? 'quarantine') AND (links_extracted_at IS NULL OR links_extracted_at < $1::timestamptz OR updated_at > links_extracted_at OR id IN (SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL WHERE t.updated_at > w.checked_at UNION SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)) AND source_id = $2 AND id > $3 ORDER BY id LIMIT $4",
+            "textSha256": "22fb498ad7872c970f05a3905d04bebef7df2790c417bea32d6a214eb0ae4505"
           }
         ],
         "default": [
@@ -690,8 +690,8 @@
             "params": [
               "number"
             ],
-            "sql": "SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at_iso FROM pages WHERE deleted_at IS NULL AND NOT (COALESCE(pages.frontmatter, '{}'::jsonb) ? 'quarantine') AND (links_extracted_at IS NULL OR updated_at > links_extracted_at OR id IN (SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL WHERE t.updated_at > w.checked_at UNION SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)) AND body_storage = 'inline' ORDER BY id LIMIT $1",
-            "textSha256": "183a892cb76864e3da999c28c4eed5ceb6495ef22656b92c89ec1ff087fe2fd3"
+            "sql": "SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at_iso FROM pages WHERE deleted_at IS NULL AND NOT (COALESCE(pages.frontmatter, '{}'::jsonb) ? 'quarantine') AND (links_extracted_at IS NULL OR updated_at > links_extracted_at OR id IN (SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL WHERE t.updated_at > w.checked_at UNION SELECT w.origin_page_id FROM wanted_links w JOIN pages t ON t.source_id = w.target_source_id AND regexp_replace(t.slug, '^.*/', '') = w.target_ref AND t.deleted_at IS NULL WHERE w.ref_kind = 'name' AND t.updated_at > w.checked_at)) ORDER BY id LIMIT $1",
+            "textSha256": "27cc368fcbecffffad33b5d8542adbc3d0fcd24e6700ce7b5d351ec5e2103a57"
           }
         ]
       },
@@ -765,20 +765,36 @@
               "array<string>",
               "array<string>"
             ],
-            "sql": "UPDATE pages p SET links_extracted_at = v.ts::timestamptz, links_attendance_blocked_revision = NULL, links_attendance_blocked_at = NULL FROM unnest($1::text[], $2::text[], $3::text[]) AS v(slug, source_id, ts) WHERE p.slug = v.slug AND p.source_id = v.source_id",
-            "textSha256": "38571ef9bc7efbcc636e789f18047fbcfab31eb71509440e6b7fadc7e70a93ad"
+            "sql": "UPDATE pages p SET links_extracted_at = v.ts::timestamptz, links_attendance_blocked_revision = NULL, links_attendance_blocked_at = NULL, links_extract_failure = NULL FROM unnest($1::text[], $2::text[], $3::text[]) AS v(slug, source_id, ts) WHERE p.slug = v.slug AND p.source_id = v.source_id",
+            "textSha256": "8aca8d9906c57653530ec671b03a9eaca5866385f12c765594cc8451c0d63679"
           }
         ]
       },
       "purgeDeletedPages": {
         "default": [
           {
-            "lane": "pool",
+            "event": "begin",
+            "lane": "tx"
+          },
+          {
+            "lane": "tx",
             "params": [
               "number"
             ],
-            "sql": "DELETE FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval -- #6729: the old page of an open rename-identity downgrade waits for its disposition (identityDowngradePurgeHold). AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz) RETURNING slug",
-            "textSha256": "8fc15609300a1a13325d70453a322bc25eedbd57d6c0029beefca7d0c2bcfeb4"
+            "sql": "SELECT DISTINCT m.source_id, encode(m.sha256, 'hex') AS sha FROM page_body_manifest m JOIN pages p ON p.id = m.page_id WHERE p.deleted_at IS NOT NULL AND p.deleted_at < now() - ($1 || ' hours')::interval",
+            "textSha256": "4b0222c2e2ac186c99149f232e8252422c9ad242f9af5240ef093e847432ae4a"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "number"
+            ],
+            "sql": "DELETE FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < now() - ($1 || ' hours')::interval -- #6729: the old page of an open rename-identity downgrade waits for its disposition (identityDowngradePurgeHold). AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz) RETURNING slug, source_id",
+            "textSha256": "3c28a0ea4ebbe757ed585c56f918dd4f3f98afbda412a509c1bdd9cb5d34c8c5"
+          },
+          {
+            "event": "commit",
+            "lane": "tx"
           }
         ],
         "dryRun": [
@@ -839,6 +855,15 @@
               "string",
               "string"
             ],
+            "sql": "SELECT id, slug, source_path, deleted_at FROM pages WHERE source_id=$1 AND slug=$2",
+            "textSha256": "13e0824db40fa0938c1e53873667c76000adde55a7fa159fce8e1a5969bf1bb0"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
+              "string"
+            ],
             "sql": "SELECT compiled_truth, body_storage, body_bytes FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1",
             "textSha256": "5dc846d005a55cfbdd0af4437f04cc30cd6ea8245fc9c8eb5b744890a1a4b845"
           },
@@ -864,8 +889,8 @@
               "null",
               "null"
             ],
-            "sql": "INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13::smallint, $14, $15, $16, $17, $18) ON CONFLICT (source_id, slug) DO UPDATE SET type = EXCLUDED.type, page_kind = EXCLUDED.page_kind, title = EXCLUDED.title, compiled_truth = EXCLUDED.compiled_truth, timeline = EXCLUDED.timeline, frontmatter = EXCLUDED.frontmatter, content_hash = EXCLUDED.content_hash, updated_at = now(), deleted_at = NULL, effective_date = COALESCE(EXCLUDED.effective_date, pages.effective_date), effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source), import_filename = COALESCE(EXCLUDED.import_filename, pages.import_filename), chunker_version = CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM EXCLUDED.compiled_truth AND pages.timeline IS NOT DISTINCT FROM EXCLUDED.timeline THEN pages.chunker_version WHEN pages.chunker_version < 0 OR (CASE WHEN pages.body_storage = 'segmented' THEN pages.body_flags->>'has_protected' IS DISTINCT FROM 'false' ELSE (COALESCE(pages.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(pages.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->') END) OR COALESCE(EXCLUDED.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(EXCLUDED.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' THEN -1 ELSE LEAST(COALESCE(pages.chunker_version, 0), 3) END, source_path = COALESCE(EXCLUDED.source_path, pages.source_path), database_only_reason = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason = 'detached' THEN NULL ELSE pages.database_only_reason END, source_kind = COALESCE(EXCLUDED.source_kind, pages.source_kind), source_uri = COALESCE(EXCLUDED.source_uri, pages.source_uri), ingested_via = COALESCE(EXCLUDED.ingested_via, pages.ingested_via), ingested_at = COALESCE(EXCLUDED.ingested_at, pages.ingested_at) RETURNING knowledge_revision, text_projection_revision, id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at",
-            "textSha256": "c324c562921a1025b756c95252af6dc0adec5df49b286e4be407de3a96b15242"
+            "sql": "INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13::smallint, $14, $15, $16, $17, $18) ON CONFLICT (source_id, slug) DO UPDATE SET type = EXCLUDED.type, page_kind = EXCLUDED.page_kind, title = EXCLUDED.title, compiled_truth = EXCLUDED.compiled_truth, timeline = EXCLUDED.timeline, frontmatter = EXCLUDED.frontmatter, content_hash = EXCLUDED.content_hash, updated_at = now(), deleted_at = NULL, effective_date = COALESCE(EXCLUDED.effective_date, pages.effective_date), effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source), import_filename = COALESCE(EXCLUDED.import_filename, pages.import_filename), chunker_version = CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM EXCLUDED.compiled_truth AND pages.timeline IS NOT DISTINCT FROM EXCLUDED.timeline THEN pages.chunker_version WHEN pages.chunker_version < 0 OR (CASE WHEN pages.body_storage = 'segmented' THEN pages.body_flags->>'has_protected' IS DISTINCT FROM 'false' ELSE (COALESCE(pages.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(pages.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->') END) OR COALESCE(EXCLUDED.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(EXCLUDED.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' THEN -1 ELSE LEAST(COALESCE(pages.chunker_version, 0), 3) END, source_path = COALESCE(EXCLUDED.source_path, pages.source_path), database_only_reason = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason IN ('detached', 'origin_twin') THEN NULL ELSE pages.database_only_reason END, source_kind = COALESCE(EXCLUDED.source_kind, pages.source_kind), source_uri = COALESCE(EXCLUDED.source_uri, pages.source_uri), ingested_via = COALESCE(EXCLUDED.ingested_via, pages.ingested_via), ingested_at = COALESCE(EXCLUDED.ingested_at, pages.ingested_at) RETURNING knowledge_revision, text_projection_revision, id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at",
+            "textSha256": "abe31a1d94feb3381dd47ed9184d401c99487afe2787905d9ff2f1a373fed95c"
           },
           {
             "event": "commit",
@@ -916,6 +941,15 @@
             "lane": "tx",
             "params": [
               "string",
+              "string"
+            ],
+            "sql": "SELECT id, slug, source_path, deleted_at FROM pages WHERE source_id=$1 AND slug=$2",
+            "textSha256": "13e0824db40fa0938c1e53873667c76000adde55a7fa159fce8e1a5969bf1bb0"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
               "string",
               "string",
               "string",
@@ -934,8 +968,8 @@
               "null",
               "null"
             ],
-            "sql": "INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13::smallint, $14, $15, $16, $17, $18) ON CONFLICT (source_id, slug) DO UPDATE SET type = EXCLUDED.type, page_kind = EXCLUDED.page_kind, title = EXCLUDED.title, compiled_truth = EXCLUDED.compiled_truth, timeline = EXCLUDED.timeline, frontmatter = EXCLUDED.frontmatter, content_hash = EXCLUDED.content_hash, updated_at = now(), deleted_at = NULL, effective_date = COALESCE(EXCLUDED.effective_date, pages.effective_date), effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source), import_filename = COALESCE(EXCLUDED.import_filename, pages.import_filename), chunker_version = CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM EXCLUDED.compiled_truth AND pages.timeline IS NOT DISTINCT FROM EXCLUDED.timeline THEN pages.chunker_version WHEN pages.chunker_version < 0 OR (CASE WHEN pages.body_storage = 'segmented' THEN pages.body_flags->>'has_protected' IS DISTINCT FROM 'false' ELSE (COALESCE(pages.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(pages.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->') END) OR COALESCE(EXCLUDED.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(EXCLUDED.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' THEN -1 ELSE LEAST(COALESCE(pages.chunker_version, 0), 3) END, source_path = COALESCE(EXCLUDED.source_path, pages.source_path), database_only_reason = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason = 'detached' THEN NULL ELSE pages.database_only_reason END, source_kind = COALESCE(EXCLUDED.source_kind, pages.source_kind), source_uri = COALESCE(EXCLUDED.source_uri, pages.source_uri), ingested_via = COALESCE(EXCLUDED.ingested_via, pages.ingested_via), ingested_at = COALESCE(EXCLUDED.ingested_at, pages.ingested_at) RETURNING knowledge_revision, text_projection_revision, id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at",
-            "textSha256": "c324c562921a1025b756c95252af6dc0adec5df49b286e4be407de3a96b15242"
+            "sql": "INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13::smallint, $14, $15, $16, $17, $18) ON CONFLICT (source_id, slug) DO UPDATE SET type = EXCLUDED.type, page_kind = EXCLUDED.page_kind, title = EXCLUDED.title, compiled_truth = EXCLUDED.compiled_truth, timeline = EXCLUDED.timeline, frontmatter = EXCLUDED.frontmatter, content_hash = EXCLUDED.content_hash, updated_at = now(), deleted_at = NULL, effective_date = COALESCE(EXCLUDED.effective_date, pages.effective_date), effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source), import_filename = COALESCE(EXCLUDED.import_filename, pages.import_filename), chunker_version = CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM EXCLUDED.compiled_truth AND pages.timeline IS NOT DISTINCT FROM EXCLUDED.timeline THEN pages.chunker_version WHEN pages.chunker_version < 0 OR (CASE WHEN pages.body_storage = 'segmented' THEN pages.body_flags->>'has_protected' IS DISTINCT FROM 'false' ELSE (COALESCE(pages.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(pages.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->') END) OR COALESCE(EXCLUDED.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(EXCLUDED.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' THEN -1 ELSE LEAST(COALESCE(pages.chunker_version, 0), 3) END, source_path = COALESCE(EXCLUDED.source_path, pages.source_path), database_only_reason = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason IN ('detached', 'origin_twin') THEN NULL ELSE pages.database_only_reason END, source_kind = COALESCE(EXCLUDED.source_kind, pages.source_kind), source_uri = COALESCE(EXCLUDED.source_uri, pages.source_uri), ingested_via = COALESCE(EXCLUDED.ingested_via, pages.ingested_via), ingested_at = COALESCE(EXCLUDED.ingested_at, pages.ingested_at) RETURNING knowledge_revision, text_projection_revision, id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at",
+            "textSha256": "abe31a1d94feb3381dd47ed9184d401c99487afe2787905d9ff2f1a373fed95c"
           },
           {
             "event": "commit",
@@ -997,6 +1031,15 @@
             "lane": "tx",
             "params": [
               "string",
+              "string"
+            ],
+            "sql": "SELECT id, slug, source_path, deleted_at FROM pages WHERE source_id=$1 AND slug=$2",
+            "textSha256": "13e0824db40fa0938c1e53873667c76000adde55a7fa159fce8e1a5969bf1bb0"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
               "string",
               "string",
               "string",
@@ -1015,8 +1058,8 @@
               "null",
               "null"
             ],
-            "sql": "INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13::smallint, $14, $15, $16, $17, $18) ON CONFLICT (source_id, slug) DO UPDATE SET type = EXCLUDED.type, page_kind = EXCLUDED.page_kind, title = EXCLUDED.title, compiled_truth = EXCLUDED.compiled_truth, timeline = EXCLUDED.timeline, frontmatter = EXCLUDED.frontmatter, content_hash = EXCLUDED.content_hash, updated_at = now(), deleted_at = NULL, effective_date = COALESCE(EXCLUDED.effective_date, pages.effective_date), effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source), import_filename = COALESCE(EXCLUDED.import_filename, pages.import_filename), chunker_version = CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM EXCLUDED.compiled_truth AND pages.timeline IS NOT DISTINCT FROM EXCLUDED.timeline THEN pages.chunker_version WHEN pages.chunker_version < 0 OR (CASE WHEN pages.body_storage = 'segmented' THEN pages.body_flags->>'has_protected' IS DISTINCT FROM 'false' ELSE (COALESCE(pages.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(pages.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->') END) OR COALESCE(EXCLUDED.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(EXCLUDED.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' THEN -1 ELSE LEAST(COALESCE(pages.chunker_version, 0), 3) END, source_path = COALESCE(EXCLUDED.source_path, pages.source_path), database_only_reason = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason = 'detached' THEN NULL ELSE pages.database_only_reason END, source_kind = COALESCE(EXCLUDED.source_kind, pages.source_kind), source_uri = COALESCE(EXCLUDED.source_uri, pages.source_uri), ingested_via = COALESCE(EXCLUDED.ingested_via, pages.ingested_via), ingested_at = COALESCE(EXCLUDED.ingested_at, pages.ingested_at) RETURNING knowledge_revision, text_projection_revision, id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at",
-            "textSha256": "c324c562921a1025b756c95252af6dc0adec5df49b286e4be407de3a96b15242"
+            "sql": "INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13::smallint, $14, $15, $16, $17, $18) ON CONFLICT (source_id, slug) DO UPDATE SET type = EXCLUDED.type, page_kind = EXCLUDED.page_kind, title = EXCLUDED.title, compiled_truth = EXCLUDED.compiled_truth, timeline = EXCLUDED.timeline, frontmatter = EXCLUDED.frontmatter, content_hash = EXCLUDED.content_hash, updated_at = now(), deleted_at = NULL, effective_date = COALESCE(EXCLUDED.effective_date, pages.effective_date), effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source), import_filename = COALESCE(EXCLUDED.import_filename, pages.import_filename), chunker_version = CASE WHEN pages.compiled_truth IS NOT DISTINCT FROM EXCLUDED.compiled_truth AND pages.timeline IS NOT DISTINCT FROM EXCLUDED.timeline THEN pages.chunker_version WHEN pages.chunker_version < 0 OR (CASE WHEN pages.body_storage = 'segmented' THEN pages.body_flags->>'has_protected' IS DISTINCT FROM 'false' ELSE (COALESCE(pages.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(pages.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->') END) OR COALESCE(EXCLUDED.compiled_truth, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' OR COALESCE(EXCLUDED.timeline, '') ~ '<!--- gbrain:(facts|takes):(begin|end) -->' THEN -1 ELSE LEAST(COALESCE(pages.chunker_version, 0), 3) END, source_path = COALESCE(EXCLUDED.source_path, pages.source_path), database_only_reason = CASE WHEN EXCLUDED.source_path IS NOT NULL AND pages.database_only_reason IN ('detached', 'origin_twin') THEN NULL ELSE pages.database_only_reason END, source_kind = COALESCE(EXCLUDED.source_kind, pages.source_kind), source_uri = COALESCE(EXCLUDED.source_uri, pages.source_uri), ingested_via = COALESCE(EXCLUDED.ingested_via, pages.ingested_via), ingested_at = COALESCE(EXCLUDED.ingested_at, pages.ingested_at) RETURNING knowledge_revision, text_projection_revision, id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at",
+            "textSha256": "abe31a1d94feb3381dd47ed9184d401c99487afe2787905d9ff2f1a373fed95c"
           },
           {
             "event": "commit",
@@ -1230,31 +1273,67 @@
               "array<string>",
               "string"
             ],
-            "sql": "SELECT slug, source_path FROM pages WHERE source_path = ANY($1::text[]) AND source_id = $2",
-            "textSha256": "eb7db9ec7a9b853b93f4d475f715a6a72fd1ee4b48da9bbf9217deac299ebfff"
+            "sql": "SELECT slug, source_path, deleted_at IS NULL AS live FROM pages WHERE source_path = ANY($1::text[]) AND source_id = $2 ORDER BY source_path, slug",
+            "textSha256": "bee87a5adc9be889a362de92ea6380595113f9360e8c720aada24a4e9a3e44d5"
           }
         ]
       },
       "restorePage": {
         "default": [
           {
-            "lane": "pool",
+            "event": "begin",
+            "lane": "tx"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
+              "null",
+              "null"
+            ],
+            "sql": "SELECT id, source_id FROM pages WHERE slug=$1 AND deleted_at IS NOT NULL AND ($2::text IS NULL OR source_id=$3) ORDER BY source_id",
+            "textSha256": "8d4bea0f03c96cfdea2bad6a82c4050073b3cad615d0115bb66cf05aaa9f9300"
+          },
+          {
+            "lane": "tx",
             "params": [
               "string"
             ],
             "sql": "UPDATE pages SET deleted_at = NULL, updated_at = now() WHERE slug = $1 AND deleted_at IS NOT NULL RETURNING slug",
             "textSha256": "e657e4a81c518ed0669a4f80ce47e3114b42aaa4aa13667cdc35bb516e4d37cd"
+          },
+          {
+            "event": "commit",
+            "lane": "tx"
           }
         ],
         "sourceId": [
           {
-            "lane": "pool",
+            "event": "begin",
+            "lane": "tx"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "SELECT id, source_id FROM pages WHERE slug=$1 AND deleted_at IS NOT NULL AND ($2::text IS NULL OR source_id=$3) ORDER BY source_id",
+            "textSha256": "8d4bea0f03c96cfdea2bad6a82c4050073b3cad615d0115bb66cf05aaa9f9300"
+          },
+          {
+            "lane": "tx",
             "params": [
               "string",
               "string"
             ],
             "sql": "UPDATE pages SET deleted_at = NULL, updated_at = now() WHERE slug = $1 AND deleted_at IS NOT NULL AND source_id = $2 RETURNING slug",
             "textSha256": "d36ab3e3d4968ce3e210fbbc3a1e9247e4d6065537b380001da3285a3dc6054b"
+          },
+          {
+            "event": "commit",
+            "lane": "tx"
           }
         ]
       },
@@ -1591,6 +1670,25 @@
             "params": [
               "string",
               "string",
+              "string",
+              "string"
+            ],
+            "sql": "WITH m AS ( SELECT f.id, f.expired_at, $1::text AS e, f.source_markdown_slug AS s, f.dimension, f.value_hash, f.valid_from FROM facts f WHERE f.source_id = $2 AND f.dimension IS NOT NULL AND f.entity_slug = $3), cand AS ( SELECT m.id, m.expired_at, m.e, m.s, m.dimension, m.value_hash, m.valid_from, 1 AS moving FROM m UNION ALL SELECT t.id, t.expired_at, t.entity_slug, t.source_markdown_slug, t.dimension, t.value_hash, t.valid_from, 0 FROM facts t WHERE t.source_id = $4 AND t.dimension IS NOT NULL AND NOT EXISTS (SELECT 1 FROM m WHERE m.id = t.id) AND EXISTS (SELECT 1 FROM m WHERE m.e = t.entity_slug AND m.s = t.source_markdown_slug AND m.dimension = t.dimension AND m.value_hash = t.value_hash AND m.valid_from = t.valid_from)), ranked AS ( SELECT id, row_number() OVER w AS rn, first_value(id) OVER w AS keep FROM cand WHERE e IS NOT NULL AND s IS NOT NULL AND value_hash IS NOT NULL AND valid_from IS NOT NULL WINDOW w AS (PARTITION BY e, s, dimension, value_hash, valid_from ORDER BY (expired_at IS NULL) DESC, moving, id)) SELECT id, keep FROM ranked WHERE rn > 1",
+            "textSha256": "625c2bd6d6158459e460f5f5284500a2df6f7388761406d953e8b1a74473de58"
+          },
+          {
+            "event": "savepoint-release",
+            "lane": "tx>sp"
+          },
+          {
+            "event": "savepoint",
+            "lane": "tx>sp"
+          },
+          {
+            "lane": "tx>sp",
+            "params": [
+              "string",
+              "string",
               "string"
             ],
             "sql": "UPDATE facts SET entity_slug = $1 WHERE source_id = $2 AND entity_slug = $3",
@@ -1614,6 +1712,25 @@
             ],
             "sql": "DELETE FROM facts f WHERE f.source_id = $1 AND f.source_markdown_slug = $2 AND f.row_num IS NOT NULL AND EXISTS (SELECT 1 FROM facts o WHERE o.source_id = $3 AND o.source_markdown_slug = $4 AND o.row_num = f.row_num)",
             "textSha256": "163406688a2f8e56c47b708d3c931a006d3bef83783c247c48b0838627ed9677"
+          },
+          {
+            "event": "savepoint-release",
+            "lane": "tx>sp"
+          },
+          {
+            "event": "savepoint",
+            "lane": "tx>sp"
+          },
+          {
+            "lane": "tx>sp",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "WITH m AS ( SELECT f.id, f.expired_at, f.entity_slug AS e, $1::text AS s, f.dimension, f.value_hash, f.valid_from FROM facts f WHERE f.source_id = $2 AND f.dimension IS NOT NULL AND f.source_markdown_slug = $3), cand AS ( SELECT m.id, m.expired_at, m.e, m.s, m.dimension, m.value_hash, m.valid_from, 1 AS moving FROM m UNION ALL SELECT t.id, t.expired_at, t.entity_slug, t.source_markdown_slug, t.dimension, t.value_hash, t.valid_from, 0 FROM facts t WHERE t.source_id = $4 AND t.dimension IS NOT NULL AND NOT EXISTS (SELECT 1 FROM m WHERE m.id = t.id) AND EXISTS (SELECT 1 FROM m WHERE m.e = t.entity_slug AND m.s = t.source_markdown_slug AND m.dimension = t.dimension AND m.value_hash = t.value_hash AND m.valid_from = t.valid_from)), ranked AS ( SELECT id, row_number() OVER w AS rn, first_value(id) OVER w AS keep FROM cand WHERE e IS NOT NULL AND s IS NOT NULL AND value_hash IS NOT NULL AND valid_from IS NOT NULL WINDOW w AS (PARTITION BY e, s, dimension, value_hash, valid_from ORDER BY (expired_at IS NULL) DESC, moving, id)) SELECT id, keep FROM ranked WHERE rn > 1",
+            "textSha256": "0b322cac7bcdffc723a918ff5a7891fdab2d2655acec826cb0b1720f1819d6b0"
           },
           {
             "event": "savepoint-release",

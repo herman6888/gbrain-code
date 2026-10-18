@@ -80,7 +80,7 @@ import { withEnv } from '../helpers/with-env.ts';
   /** Runs `check` as a reader that sees pages only from a statement where `predicate` holds. */
   async function asSettingProbeReader(predicate: string, check: (reader: PostgresEngine) => Promise<void>) {
     await engine.executeRaw('CREATE ROLE query_contract_probe NOLOGIN');
-    const tables = ['pages', 'content_chunks', 'sources', 'timeline_entries', 'config'];
+    const tables = ['pages', 'content_chunks', 'page_body_manifest', 'sources', 'timeline_entries', 'config'];
     const original = await engine.executeRaw<{ relname: string; relrowsecurity: boolean }>(`SELECT relname, relrowsecurity FROM pg_class WHERE relname = ANY($1::text[])`, [tables]);
     const reader = new PostgresEngine();
     try {

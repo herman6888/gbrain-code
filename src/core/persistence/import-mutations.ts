@@ -126,7 +126,7 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
       const path = canonicalInput ? canonicalRelative : sourcePath;
       const target = resolve(root, path);
       await assertImportPaths(reads, sourceId, root, inputPath, target);
-      const streamed = await managedStreamedIdentity(sourcePath, inputPath, target, bodyPolicy);
+      const streamed = await managedStreamedIdentity(sourcePath, inputPath, target, bodyPolicy, sourceId);
       const bytes = streamed ? null : readImportBytes(inputPath);
       const { slug, content } = streamed ? { slug: streamed.slug, content: undefined } : managedImportContent(sourcePath, bytes!, opts.activePack);
       if (slugs.has(slug)) { rest = i; break; }

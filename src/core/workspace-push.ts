@@ -58,7 +58,7 @@ import {
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { createHash, randomBytes } from 'crypto';
-import { execFileSync } from './spawn.ts';
+import { execFileSync, spawn } from './spawn.ts';
 import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, detectDefaultBranch, divergenceSafePull, type PullStrategy } from './git-remote.ts';
 import { loadConfigFileOnly } from './config.ts';
 import { ensureGbrainHome } from './gbrain-home.ts';
@@ -75,6 +75,7 @@ import {
   SCAN_ALLOW_FILENAME, SCAN_MAX_FILE_BYTES,
   type SecretFinding,
 } from './secret-scan.ts';
+import { scanTextStream } from './secret-scan-stream.ts';
 import { shellQuote } from './mcp-registration.ts';
 import { gitChildEnv } from './git-env.ts';
 
@@ -172,8 +173,19 @@ export const PUSH_DENY_GLOBS: readonly string[] = [
   '*.pglite', '.env*', '*.pem', '*.key', '.gbrain/**', ...OWNERSHIP_MARKER_GLOBS, '.gbrain-bootstrap.lock/**',
 ];
 
-/** Files larger than this are neither scanned nor considered text candidates. */
+/**
+ * Staged blobs up to this size are read whole and scanned in memory; larger
+ * ones are streamed through the windowed scan (secret-scan-stream.ts) up to
+ * PUSH_STREAM_SCAN_MAX_BYTES.
+ */
 export const PUSH_MAX_SCAN_BYTES = SCAN_MAX_FILE_BYTES;
+
+/**
+ * Hard ceiling of the streamed pre-push scan: a staged blob over it blocks the
+ * push as unscannable. Above the largest canonical file (a 256 MiB page plus
+ * its frontmatter).
+ */
+export const PUSH_STREAM_SCAN_MAX_BYTES = 512 * 1024 ** 2;
 
 // ── Cross-platform push lock [CX2-6, G14/A5] ────────────────────────────────
 
@@ -345,6 +357,117 @@ export function resolveWorkspaceRoot(dir: string): string | null {
 function listZ(root: string, args: string[]): string[] {
   const out = git(root, [...args, '-z']);
   return out.split('\0').filter((s) => s.length > 0);
+}
+
+/**
+ * Index blob id and size of each of `paths` (stage 0 entries only), from one
+ * `ls-files -s` and one `cat-file --batch-check`. Empty on any git error: a
+ * path missing here takes the whole-blob read, which fails closed.
+ */
+function stagedBlobSizes(root: string, paths: readonly string[]): Map<string, { oid: string; size: number }> {
+  const out = new Map<string, { oid: string; size: number }>();
+  try {
+    const wanted = new Set(paths);
+    const entries = listZ(root, ['ls-files', '-s']).flatMap((rec) => {
+      const m = /^(\d{6}) ([0-9a-f]+) 0\t(.*)$/s.exec(rec);
+      return m && m[1] !== '160000' && wanted.has(m[3]!) ? [{ oid: m[2]!, path: m[3]! }] : [];
+    });
+    if (entries.length === 0) return out;
+    const batch = execFileSync('git', ['-C', root, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], {
+      input: entries.map((e) => e.oid).join('\n') + '\n',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60_000,
+      maxBuffer: 64 * 1024 * 1024,
+      env: gitChildEnv({ ...GIT_ENV }),
+    }).toString();
+    const sizes = new Map<string, number>();
+    for (const line of batch.split('\n')) {
+      const [oid, type, size] = line.split(' ');
+      if (type === 'blob') sizes.set(oid!, Number(size));
+    }
+    for (const e of entries) {
+      const size = sizes.get(e.oid);
+      if (size !== undefined) out.set(e.path, { oid: e.oid, size });
+    }
+  } catch {
+    out.clear();
+  }
+  return out;
+}
+
+/**
+ * Stream one staged blob (`git cat-file blob <oid>`) through the windowed
+ * scan, never holding it whole. Throws when git fails, exceeds 10 minutes, or
+ * delivers a byte count other than the index recorded.
+ */
+async function scanStagedBlobStreamed(root: string, blob: { oid: string; size: number }, allowlist: string[]): Promise<SecretFinding[]> {
+  const child = spawn('git', ['-C', root, 'cat-file', 'blob', blob.oid], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: gitChildEnv({ ...GIT_ENV }),
+  });
+  const exited = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  exited.catch(() => {});
+  let stderr = '';
+  child.stderr.on('data', (d: Buffer) => { stderr = (stderr + d.toString()).slice(0, 200); });
+  let bytes = 0;
+  async function* counted(): AsyncGenerator<Uint8Array> {
+    for await (const chunk of child.stdout) {
+      bytes += (chunk as Buffer).length;
+      yield chunk as Buffer;
+    }
+  }
+  const timer = setTimeout(() => child.kill('SIGKILL'), 600_000);
+  try {
+    const findings = await scanTextStream(counted(), { allowlist });
+    const code = await exited;
+    if (code !== 0) throw new Error(`git cat-file exited ${code}: ${stderr.trim()}`);
+    if (bytes !== blob.size) throw new Error(`read ${bytes} of ${blob.size} bytes`);
+    return findings;
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+}
+
+/**
+ * Read and scan one staged, non-deleted blob: its findings, or the
+ * `unscannable` entry naming why it cannot be proven clean (fail closed).
+ * Up to PUSH_MAX_SCAN_BYTES (or when its size is unknown) the blob is read
+ * whole; above it, streamed by oid up to PUSH_STREAM_SCAN_MAX_BYTES.
+ */
+async function scanStagedBlob(
+  root: string, rel: string, staged: { oid: string; size: number } | undefined, allowlist: string[],
+): Promise<SecretFinding[] | string> {
+  if (staged && staged.size > PUSH_MAX_SCAN_BYTES) {
+    if (staged.size > PUSH_STREAM_SCAN_MAX_BYTES) return `${rel} (${staged.size}B exceeds the ${PUSH_STREAM_SCAN_MAX_BYTES}B scan ceiling)`;
+    try {
+      return await scanStagedBlobStreamed(root, staged, allowlist);
+    } catch (e) {
+      return `${rel} (unreadable: ${(e as Error).message.slice(0, 80)})`;
+    }
+  }
+  let blob: Buffer;
+  try {
+    blob = gitBuffer(root, ['cat-file', '-p', `:${rel}`]);
+  } catch (e) {
+    // NOT a deletion (the caller checked) — we cannot prove this file is clean.
+    // A blob we can't read (missing index entry, over maxBuffer, git error)
+    // must never sail through the only pre-push secret gate.
+    return `${rel} (unreadable: ${(e as Error).message.slice(0, 80)})`;
+  }
+  if (blob.length > PUSH_MAX_SCAN_BYTES) {
+    // Its size was not looked up, and it is too big to scan in-memory → block rather than exempt.
+    return `${rel} (${blob.length}B exceeds the ${PUSH_MAX_SCAN_BYTES}B scan cap)`;
+  }
+  // Binary (NUL-sniffed) files are scanned ANYWAY — a NUL byte doesn't mean
+  // the blob is secret-free (an ASCII key can sit inside a "binary" file).
+  // Buffer.toString('utf-8') keeps ASCII runs intact so the named patterns
+  // still fire; invalid byte sequences become U+FFFD and simply don't match.
+  const text = blob.toString('utf-8');
+  return scanText(text, { allowlist });
 }
 
 /**
@@ -856,10 +979,11 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // 4. secret scan over the STAGED content. This is the SOLE
     // block-secrets-before-they-leave control, so it FAILS CLOSED: the only
     // benign "no blob" case is a staged DELETION (removes content — nothing to
-    // leak); every OTHER unscannable case (cat-file error, oversized blob)
-    // BLOCKS the push naming the path, rather than silently exempting it.
-    // `git cat-file -p :<path>` reads the index blob verbatim (no filters) —
-    // exactly what a commit would record.
+    // leak); every OTHER unscannable case (cat-file error, a blob over
+    // PUSH_STREAM_SCAN_MAX_BYTES) BLOCKS the push naming the path, rather than
+    // silently exempting it. `git cat-file -p :<path>` reads the index blob
+    // verbatim (no filters) — exactly what a commit would record; a blob over
+    // PUSH_MAX_SCAN_BYTES is streamed by its index oid and scanned in windows.
     let stagedDeletions: Set<string>;
     try {
       stagedDeletions = new Set(listZ(root, ['diff', '--cached', '--name-only', '--diff-filter=D']));
@@ -875,30 +999,15 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     const retryCommand = pushRetryCommand(opts);
     const findings: PushSecretFinding[] = [];
     const unscannable: string[] = [];
+    const stagedBlobs = stagedBlobSizes(root, stagedForScan);
     for (const rel of stagedForScan) {
       if (pathAllowlisted(rel, allowlist)) continue; // user-declared safe path
       if (stagedDeletions.has(rel)) continue;        // deletion — no content to scan
-      let blob: Buffer;
-      try {
-        blob = gitBuffer(root, ['cat-file', '-p', `:${rel}`]);
-      } catch (e) {
-        // NOT a deletion (checked above) — we cannot prove this file is clean.
-        // A blob we can't read (missing index entry, over maxBuffer, git error)
-        // must never sail through the only pre-push secret gate.
-        unscannable.push(`${rel} (unreadable: ${(e as Error).message.slice(0, 80)})`);
+      const fileFindings = await scanStagedBlob(root, rel, stagedBlobs.get(rel), allowlist);
+      if (typeof fileFindings === 'string') {
+        unscannable.push(fileFindings);
         continue;
       }
-      if (blob.length > PUSH_MAX_SCAN_BYTES) {
-        // Too big to scan in-memory → block rather than exempt.
-        unscannable.push(`${rel} (${blob.length}B exceeds the ${PUSH_MAX_SCAN_BYTES}B scan cap)`);
-        continue;
-      }
-      // Binary (NUL-sniffed) files are scanned ANYWAY — a NUL byte doesn't mean
-      // the blob is secret-free (an ASCII key can sit inside a "binary" file).
-      // Buffer.toString('utf-8') keeps ASCII runs intact so the named patterns
-      // still fire; invalid byte sequences become U+FFFD and simply don't match.
-      const text = blob.toString('utf-8');
-      const fileFindings = scanText(text, { allowlist });
       if (fileFindings.length === 0) continue;
       for (const f of buildPushFindings({ file: rel, findings: fileFindings, allowlist, allowlistPath, retryCommand })) {
         findings.push(f);
@@ -922,7 +1031,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
       const reason =
         `secret scan could not read ${unscannable.length} staged file(s): ${summary} — nothing committed. ` +
         `The pre-push secret gate fails closed: remove the file from the index (git rm --cached <path>), ` +
-        `keep it under the scan cap (${PUSH_MAX_SCAN_BYTES}B), or allowlist it in ${SCAN_ALLOW_FILENAME}.`;
+        `keep it under the scan ceiling (${PUSH_STREAM_SCAN_MAX_BYTES}B), or allowlist it in ${SCAN_ALLOW_FILENAME}.`;
       log(`PUSH BLOCKED: ${reason}`);
       return finish({
         ok: false, status: 'blocked_unscannable', repoRoot: root, branch, unscannable, reason,

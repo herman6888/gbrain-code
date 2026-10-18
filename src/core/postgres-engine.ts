@@ -5,11 +5,13 @@ import { mutatePageTag } from './page-state/tags.ts';
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
 import type { GetVersionsOpts, PageVersionRows } from './page-state/version-types.ts';
 import { assertPageRevision } from './page-state/types.ts';
+import { assertOriginUnclaimed, assertRevivalUnclaimed, classifyOriginUniqueViolation } from './persistence/origin-guard.ts';
 import { lockUnheldPageKeys, withHeldPageKeys, type HeldPageKeys } from './page-state/guards.ts';
 import { readPageSnapshot as readCanonicalPageSnapshot } from './page-state/snapshot.ts';
 import { readPageSnapshotsBatch } from './page-snapshot-batch.ts';
 import { createPageVersion } from './page-state/versions.ts';
 import { moveSlugBindings, recordRenameAlias } from './page-state/rename-alias.ts';
+import { dropPhantomMigrationDuplicates } from './facts/ontology-rekey.ts';
 import { composablePostgresTransaction, transactionMemo } from './page-state/transactions.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
@@ -70,7 +72,7 @@ import { SCHEMA_SQL } from './schema-embedded.generated.ts';
 import { verifySchema } from './schema-verify.ts';
 import { applyChunkEmbeddingIndexPolicy, dropZombieIndexes, supportsHnswIterativeScan } from './vector-index.ts';
 import { searchIndexWalk, searchVectorPool, readVectorPool, remainingVectorBudget, type VectorPoolAttempt, POOL_MAX_SCAN_TUPLES } from './search/vector-pool.ts';
-import { buildVectorSearchStatement, PAGE_SOURCE_STATS_SQL, SCOPE_CHUNKS_SQL, VECTOR_EXTENSION_VERSION_SQL, vectorScopeLoader, type PageSourceStats, type ScopeChunkCount, type VectorSearchStatement } from './search/vector-statement.ts';
+import { buildVectorSearchStatement, PAGE_SOURCE_STATS_SQL, SCOPE_CHUNKS_SQL, VECTOR_EXTENSION_VERSION_SQL, vectorScopeLoader, vectorStatementForms, type PageSourceStats, type ScopeChunkCount, type VectorSearchStatement } from './search/vector-statement.ts';
 import { VECTOR_SETTING_DEFAULTS, vectorScanSettings } from './search/vector-settings.ts';
 import { guardSearchStatistics } from './search/projection-statistics.ts';
 import {
@@ -83,7 +85,7 @@ import {
 } from './search/embedding-column.ts';
 import { getFtsLanguage, applyFtsLanguagePolicy } from './fts-language.ts';
 import { splitEmbeddingSignature, currentSpaceChunkPredicate, lockEmbeddingSources } from './embedding-invalidation.ts';
-import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, chunkManifestReads, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
@@ -163,6 +165,8 @@ export function cancelSettleMs(): number {
 }
 import type { SqlExecutor } from './engine-sql/executor.ts';
 import { scopedRead, unscopedExecutor } from './engine-sql/brands.ts';
+import { writerStamp } from './persistence/writer-versions.ts';
+import { wellFormedJson } from './text-safe.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -812,7 +816,8 @@ export class PostgresEngine implements BrainEngine {
       if (opts?.expectedRevision !== undefined || opts?.force !== undefined) {
         assertPageRevision(await tx.readPageSnapshot(slug, { sourceId, includeDeleted: true }), opts);
       }
-      return pagesImpl.putPage((tx as PostgresEngine).engineSql, slug, page, opts);
+      await assertOriginUnclaimed(tx, { sourceId, slug, sourcePath: page.source_path ?? null, revive: true });
+      return pagesImpl.putPage((tx as PostgresEngine).engineSql, slug, page, opts).catch(error => { throw classifyOriginUniqueViolation(error) ?? error; });
     };
     return opts?.inline && this._pageTransaction ? write(this) : this.transaction(write);
   }
@@ -858,12 +863,12 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean> {
-    return pagesImpl.restorePage(this.engineSql, slug, opts);
+    return this.transaction(async tx => { await assertRevivalUnclaimed(tx, slug, opts?.sourceId); return pagesImpl.restorePage((tx as PostgresEngine).engineSql, slug, opts); });
   }
 
   async purgeDeletedPages(
     olderThanHours: number,
-    opts?: { dryRun?: boolean },
+    opts?: { dryRun?: boolean; excludeIds?: number[] },
   ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; deleted_at: Date }[] }> {
     return pagesImpl.purgeDeletedPages(this.engineSql, olderThanHours, opts);
   }
@@ -902,13 +907,12 @@ export class PostgresEngine implements BrainEngine {
     // index. MAX counts expired rows too (the index only excludes NULL);
     // NULL + M stays NULL (legacy-guard semantics intact). extract_facts
     // hasRowNumDrift re-harmonises the numbering against the disk fence.
-    // Idempotent by virtue of the WHERE clause matching nothing on re-run.
-    //
-    // We scope to `expired_at IS NULL` so the migration touches only
+    // Idempotent by virtue of the WHERE clause matching nothing on re-run. We scope to `expired_at IS NULL` so the migration touches only
     // active facts. Forgotten / superseded rows that already carry an
     // expiry stay where they are — soft-deleting the phantom page is
     // sufficient to make them invisible without rewriting their slug
-    // (and rewriting would break the audit trail in listSupersessions).
+    // (and rewriting would break the audit trail in listSupersessions). B-10: an observation the canonical page already holds would collide on idx_facts_ontology_stint_dedup; drop it first.
+    await dropPhantomMigrationDuplicates(this, sourceId, canonicalSlug, phantomSlug);
     const result = await sql`
       UPDATE facts
       SET entity_slug = ${canonicalSlug},
@@ -1208,7 +1212,7 @@ export class PostgresEngine implements BrainEngine {
       (read, settings) => this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx => read(scopedRead(this.engineSqlOn(tx))), { alwaysTransaction: true, jitOff: true, settings }),
       query,
       opts,
-      { statementTimeout: await this.keywordStatementTimeoutSetting(), relaxedPrefersIndex: true, staleProbe: false },
+      { statementTimeout: await this.keywordStatementTimeoutSetting(), relaxedPrefersIndex: true, staleProbe: false, chunkManifest: exec => chunkManifestReads(this, exec) },
     );
   }
 
@@ -1398,19 +1402,22 @@ export class PostgresEngine implements BrainEngine {
     // so the HNSW index stays usable; the outer stages re-rank by source
     // factor. Statement shape, freshness placement (#5824) and pool counts
     // live in search/vector-statement.ts, shared with PGLite and doctor.
-    const stmt = buildVectorSearchStatement({ dialect: 'postgres', embedding, limit, offset: opts?.offset || 0, opts, scope: await this.vectorScope(opts) });
+    const scope = await this.vectorScope(opts);
+    const statementFor = vectorStatementForms(chunkManifest => buildVectorSearchStatement({ dialect: 'postgres', embedding, limit, offset: opts?.offset || 0, opts, scope, chunkManifest }));
+    const stmt = statementFor(true);
     const iterative = await this.vectorIterativeScanSupported();
-    const walked = await searchIndexWalk(stmt, limit, async walk => readVectorPool(await this.runVectorAttempt(stmt, walk, iterative, opts, (tx, sql, bound) => tx.unsafe(sql, bound))));
+    const walked = await searchIndexWalk(stmt, limit, async walk => readVectorPool(await this.runVectorAttempt(statementFor, walk, iterative, opts, (tx, sql, bound) => tx.unsafe(sql, bound))));
     if (walked) return walked.map(rowToSearchResult);
     const rows = await searchVectorPool(limit, stmt.innerLimit, iterative, stmt.indexed, 'postgres',
       async attempt => {
-        const batch = await this.runVectorAttempt(stmt, attempt, iterative, opts, (tx, sql, bound) => tx.unsafe(sql, bound));
+        const batch = await this.runVectorAttempt(statementFor, attempt, iterative, opts, (tx, sql, bound) => tx.unsafe(sql, bound));
         return { ...readVectorPool(batch), exhausted: attempt.exact };
       },
       async (pool, remainingMs) => {
         const deadline = performance.now() + remainingMs;
         return this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async tx => {
-          const rows = await tx.unsafe(stmt.hasMoreSql, [...stmt.params.slice(0, stmt.innerLimitIdx), pool + 1] as Parameters<typeof tx.unsafe>[1]);
+          const { hasMoreSql } = statementFor(await chunkManifestReads(this, this.engineSqlOn(tx)));
+          const rows = await tx.unsafe(hasMoreSql, [...stmt.params.slice(0, stmt.innerLimitIdx), pool + 1] as Parameters<typeof tx.unsafe>[1]);
           return Number(rows[0].eligible) > pool;
         }, { alwaysTransaction: true, jitOff: true, settings: () => ({ statement_timeout: String(remainingVectorBudget(deadline)) }) });
       },
@@ -1427,10 +1434,12 @@ export class PostgresEngine implements BrainEngine {
    */
   async explainVectorSearch(embedding: Float32Array, opts?: SearchOpts): Promise<Record<string, unknown>> {
     const limit = clampSearchLimit(opts?.limit, 20, searchLimitCap());
-    const stmt = buildVectorSearchStatement({ dialect: 'postgres', embedding, limit, offset: opts?.offset || 0, opts, scope: await this.vectorScope(opts) });
+    const scope = await this.vectorScope(opts);
+    const statementFor = vectorStatementForms(chunkManifest => buildVectorSearchStatement({ dialect: 'postgres', embedding, limit, offset: opts?.offset || 0, opts, scope, chunkManifest }));
+    const stmt = statementFor(true);
     const iterative = await this.vectorIterativeScanSupported();
     const attempt = { innerLimit: stmt.innerLimit, maxScanTuples: stmt.indexWalkSql || stmt.scopeScanSql ? Math.max(2_000, stmt.innerLimit * stmt.indexWalkOverfetch) : POOL_MAX_SCAN_TUPLES, remainingMs: 8_000, exact: false, indexWalk: !!stmt.indexWalkSql, scopeScan: !stmt.indexWalkSql && !!stmt.scopeScanSql };
-    const [row] = await this.runVectorAttempt(stmt, attempt, iterative, opts, (tx, sql, bound) => tx.unsafe(`EXPLAIN (FORMAT JSON) ${sql}`, bound));
+    const [row] = await this.runVectorAttempt(statementFor, attempt, iterative, opts, (tx, sql, bound) => tx.unsafe(`EXPLAIN (FORMAT JSON) ${sql}`, bound));
     const plan = row?.['QUERY PLAN'];
     return (Array.isArray(plan) ? plan[0] : plan) as Record<string, unknown>;
   }
@@ -1438,6 +1447,11 @@ export class PostgresEngine implements BrainEngine {
   /** #6495: resolve the keyword/title statement bound for this connection at connect (file plane, else the DB plane, else 8000 ms; postgres-engine/keyword-statement-timeout.ts), never from a request or inside a search's transaction. */
   private keywordStatementTimeoutSetting(): Promise<string> {
     return this.keywordStatementTimeout ??= loadKeywordStatementTimeout(this, this._savedConfig?.keyword_statement_timeout_ms);
+  }
+
+  async keywordBoundedRead<T>(read: (db: Pick<BrainEngine, 'executeRaw'>) => Promise<T>): Promise<T> {
+    const statementTimeout = await this.keywordStatementTimeoutSetting();
+    return this.withScopedReadTransaction(undefined, undefined, tx => read(this.engineSqlOn(tx)), { alwaysTransaction: true, settings: { statement_timeout: statementTimeout } });
   }
 
   private async vectorIterativeScanSupported(): Promise<boolean> {
@@ -1452,19 +1466,21 @@ export class PostgresEngine implements BrainEngine {
   }
 
   private runVectorAttempt(
-    stmt: VectorSearchStatement,
+    statementFor: (chunkManifest: boolean) => VectorSearchStatement,
     { innerLimit, maxScanTuples, remainingMs, exact, indexWalk, scopeScan }: VectorPoolAttempt,
     iterative: boolean,
     opts: SearchOpts | undefined,
     run: (tx: ReturnType<typeof postgres>, sql: string, bound: Parameters<ReturnType<typeof postgres>['unsafe']>[1]) => Promise<Record<string, unknown>[]>,
   ): Promise<Record<string, unknown>[]> {
     const deadline = performance.now() + remainingMs;
-    const walk = indexWalk && stmt.indexWalkSql;
-    return this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx => {
+    const shape = statementFor(true);
+    const walk = indexWalk && !!shape.indexWalkSql;
+    return this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async tx => {
+      const stmt = statementFor(await chunkManifestReads(this, this.engineSqlOn(tx)));
       const bound = [...stmt.params];
       bound[stmt.innerLimitIdx] = exact ? null : innerLimit;
-      return run(tx, (scopeScan && stmt.scopeScanSql) || walk || (exact ? stmt.exactSql : stmt.sql), bound as Parameters<typeof tx.unsafe>[1]);
-    }, { alwaysTransaction: true, jitOff: true, settings: () => vectorScanSettings(iterative, innerLimit, maxScanTuples, deadline, opts?.hnswIterativeScan, walk ? stmt.indexWalkOverfetch : undefined) });
+      return run(tx, (scopeScan && stmt.scopeScanSql) || (walk && stmt.indexWalkSql) || (exact ? stmt.exactSql : stmt.sql), bound as Parameters<typeof tx.unsafe>[1]);
+    }, { alwaysTransaction: true, jitOff: true, settings: () => vectorScanSettings(iterative, innerLimit, maxScanTuples, deadline, opts?.hnswIterativeScan, walk ? shape.indexWalkOverfetch : undefined) });
   }
 
   async getEmbeddingsByChunkIds(ids: number[], column: string = 'embedding'): Promise<Map<number, Float32Array>> {
@@ -1567,21 +1583,24 @@ export class PostgresEngine implements BrainEngine {
   }
 
   getChunkWindows(requests: ChunkWindowRequest[], opts: ChunkWindowOpts): Promise<ChunkWindowPage[]> {
-    return this.withScopedReadTransaction(opts.sourceIds?.length ? opts.sourceIds : undefined, opts.sourceIds?.length ? undefined : opts.sourceId, tx => chunksImpl.getChunkWindows(scopedRead(this.engineSqlOn(tx)), requests, opts));
+    return this.withScopedReadTransaction(opts.sourceIds?.length ? opts.sourceIds : undefined, opts.sourceIds?.length ? undefined : opts.sourceId,
+      async tx => chunksImpl.getChunkWindows(scopedRead(this.engineSqlOn(tx)), requests, opts, requests.length > 0 && await chunkManifestReads(this, this.engineSqlOn(tx))));
   }
 
   async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean }): Promise<Chunk[]> {
     const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const sourceId = opts?.sourceId ?? 'default';
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
-    return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId, tx => chunksImpl.getChunks(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, opts));
+    return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId,
+      async tx => chunksImpl.getChunks(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, { ...opts, chunkManifest: await chunkManifestReads(this, this.engineSqlOn(tx)) }));
   }
 
   async getChunkPage(slug: string, opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
     const sourceIds = opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const sourceId = opts.sourceId ?? 'default';
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
-    return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId, tx => chunksImpl.getChunkPage(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, opts));
+    return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId,
+      async tx => chunksImpl.getChunkPage(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, { ...opts, chunkManifest: await chunkManifestReads(this, this.engineSqlOn(tx)) }));
   }
 
   /** S2: quoted identifier of the registry-ACTIVE embedding column for the
@@ -1651,7 +1670,7 @@ export class PostgresEngine implements BrainEngine {
     return chunksImpl.deleteChunks(this.engineSql, slug, opts);
   }
 
-  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked' }): Promise<number> {
+  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only' }): Promise<number> {
     return this.withScopedReadTransaction(undefined, opts?.sourceId, tx => pagesImpl.countStalePagesForExtraction(scopedRead(this.engineSqlOn(tx)), opts));
   }
 
@@ -1660,6 +1679,7 @@ export class PostgresEngine implements BrainEngine {
     afterPageId?: number;
     sourceId?: string;
     versionTs?: string;
+    held?: 'exclude';
   }): Promise<StalePageRow[]> {
     return this.withScopedReadTransaction(undefined, opts.sourceId, tx => pagesImpl.listStalePagesForExtraction(scopedRead(this.engineSqlOn(tx)), opts));
   }
@@ -1777,11 +1797,11 @@ export class PostgresEngine implements BrainEngine {
     seeds: string[],
     opts?: import('./types.ts').RelationalFanoutOpts,
   ): Promise<import('./types.ts').RelationalFanoutRow[]> {
-    return readRelationalFanout(this.executeRaw.bind(this), seeds, opts);
+    return readRelationalFanout(this.executeRaw.bind(this), seeds, opts, await chunkManifestReads(this));
   }
 
   async relationalChainHop(frontierPageIds: number[], opts: import('./types.ts').ChainHopOpts): Promise<import('./types.ts').ChainHopEdge[]> {
-    return readChainHop(this.executeRaw.bind(this), frontierPageIds, opts);
+    return readChainHop(this.executeRaw.bind(this), frontierPageIds, opts, await chunkManifestReads(this));
   }
 
   async getBacklinkCounts(pageIds: number[], opts?: PageReadScope): Promise<Map<number, number>> {
@@ -2142,6 +2162,7 @@ export class PostgresEngine implements BrainEngine {
 
   async putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void> {
     const sql = this.sql;
+    verdict = wellFormedJson(verdict);
     // Expiry is computed server-side (now() + TTL) so it lives on the same
     // clock as the `expires_at > now()` read predicate and judged_at.
     await sql`
@@ -2320,7 +2341,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Segmented page storage (Wave B): SQL in ./engine-sql/page-body.ts.
   async allocateBodyOccurrenceIds(count: number): Promise<number[]> { return pageBodyImpl.allocateBodyOccurrenceIds(this.engineSql, count); }
-  async stageSegmentTexts(sourceId: string, texts: readonly SegmentTextInput[]): Promise<{ inserted: number }> { return pageBodyImpl.stageSegmentTexts(this.engineSql, sourceId, texts); }
+  async stageSegmentTexts(sourceId: string, texts: readonly SegmentTextInput[], opts?: { stagingId?: string }): Promise<{ inserted: number }> { return pageBodyImpl.stageSegmentTexts(this.engineSql, sourceId, texts, opts); }
   async readSegmentTexts(sourceId: string, sha256s: readonly Uint8Array[]): Promise<Map<string, Uint8Array>> {
     return pageBodyImpl.readSegmentTexts(unscopedExecutor(this.engineSql, 'page-body: page-id keyed internal read'), sourceId, sha256s);
   }
@@ -2574,9 +2595,11 @@ export class PostgresEngine implements BrainEngine {
     // v0.31.2 (codex P1 #3): source_id threaded so multi-source brains can
     // scope ingest_log queries. Default 'default' matches the column DEFAULT.
     const sourceId = entry.source_id ?? 'default';
+    // v254: the writer's version, host and segment-reader mark (writer-versions.ts writerStamp).
+    const stamp = writerStamp({ mint: false });
     await sql`
-      INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
-      VALUES (${sourceId}, ${entry.source_type}, ${entry.source_ref}, ${sql.json(entry.pages_updated)}, ${entry.summary})
+      INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary, writer_version, writer_host_id, writer_segment_reader)
+      VALUES (${sourceId}, ${entry.source_type}, ${entry.source_ref}, ${sql.json(entry.pages_updated)}, ${entry.summary}, ${stamp.version}, ${stamp.hostId}::uuid, true)
     `;
   }
 
@@ -2589,7 +2612,7 @@ export class PostgresEngine implements BrainEngine {
       ? sql`WHERE source_id = ANY(${opts.sourceIds}::text[])`
       : sql``;
     const rows = await sql`
-      SELECT * FROM ingest_log ${scope} ORDER BY created_at DESC LIMIT ${limit}
+      SELECT id, source_id, source_type, source_ref, pages_updated, summary, created_at FROM ingest_log ${scope} ORDER BY created_at DESC LIMIT ${limit}
     `;
     // Belt-and-suspenders source_id fallback for any pre-v50 row.
     return (rows as unknown as IngestLogEntry[]).map(r => ({

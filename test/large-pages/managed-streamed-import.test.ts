@@ -12,7 +12,9 @@
  *    collects an abandoned preparation's staged rows under the guard. A file that
  *    changes between admission and preparation publishes nothing; a request_id
  *    replayed with other bytes is `idempotency_conflict`; with the switch off
- *    the refusal is the one before Wave B.
+ *    the refusal is the one before Wave B. With the switch on a file-backed
+ *    source takes a page over 24 MiB only by import of its own canonical
+ *    file, never by a managed write of new content.
  * 2. Fails when: the journal carries the body, the preparer skips the hash
  *    check, the publication rewrites the canonical file, or the switch-off
  *    refusal changes.
@@ -188,6 +190,32 @@ describe('managed import over the single-string ceiling', () => {
       expect((await preparePageAdmission(ctx, { operation: 'put_page', params: params('a'.repeat(64)), managedFileImport: true })).prior?.request_id).toBe(requestId);
     }
   }), 120_000);
+
+  test('switch on: a file over 24 MiB imports only from its place in the canonical root; put_page content stays within 24 MiB', async () => withEnv(env, async () => {
+    for (const engine of engines) {
+      await disposePersistenceConsumer(engine);
+      await engine.setConfig('pages.segmented_storage', 'on');
+      const f = await fixture(engine);
+      const outside = join(home, `${f.sourceId}-outside.md`);
+      writeFileSync(outside, content);
+      await expect(importManagedFile(engine, outside, 'notes/outside.md', { sourceId: f.sourceId, noEmbed: true }))
+        .rejects.toMatchObject({ code: 'invalid_params', message: `File too large (${Buffer.byteLength(content)} bytes, max ${PAGE_MAX_BYTES}): a file over the single-string import limit `
+          + `imports only from its place inside the source root. Move it to ${join(f.root, 'notes/outside.md')} and import it there.` });
+      expect(await engine.getPage('notes/outside', { sourceId: f.sourceId })).toBeNull();
+
+      const file = join(f.root, 'notes/inside.md');
+      writeFileSync(file, content);
+      const before = statSync(file);
+      expect(await importManagedFile(engine, file, 'notes/inside.md', { sourceId: f.sourceId, noEmbed: true })).toMatchObject({ slug: 'notes/inside', status: 'imported' });
+      expect((await reconstructedPage(engine, 'notes/inside', f.sourceId)).page.body_storage).toBe('segmented');
+      expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
+
+      const ctx = { engine, remote: false, sourceId: f.sourceId } as OperationContext;
+      await expect(preparePageAdmission(ctx, { operation: 'put_page', params: { slug: 'notes/put-huge', content, source_id: f.sourceId, request_id: randomUUID() } }))
+        .rejects.toMatchObject({ code: 'request_too_large' });
+      expect(await engine.getPage('notes/put-huge', { sourceId: f.sourceId })).toBeNull();
+    }
+  }), 600_000);
 
   test('switch off: the refusal is the one before segmented storage', async () => withEnv(env, async () => {
     for (const engine of engines) {

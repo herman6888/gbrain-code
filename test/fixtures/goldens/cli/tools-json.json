@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 242884,
-    "stdoutSha256": "181e7dd98ce52c544dc1ae81a4035e2024e3b584428401576b24e815c584f9dc",
+    "stdoutBytes": 242920,
+    "stdoutSha256": "746130fbb9b8f33b5e8f81d8b9377ae133c1f3866c76c891b155f9d50971cb3e",
     "toolNames": [
       "remember",
       "entity",
@@ -451,7 +451,7 @@
             },
             "bytes": {
               "additionalProperties": false,
-              "description": "Window: UTF-8 bytes (snapped to a line start).",
+              "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).",
               "properties": {
                 "length": {
                   "type": "number"

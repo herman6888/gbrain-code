@@ -1,10 +1,11 @@
 /**
  * `gbrain projections drain` (#5401): rebuilds queued Markdown and code text
  * projections in-process, in batches of up to 100, until every row queued
- * before the run started has been tried once, then (#6803) restores the
- * importer's own seal on `sealable` image pages (page-state/image-seal.ts),
- * keyless and without re-embedding. Trusted local CLI only; it is not an
- * operation, so MCP and remediation cannot run it.
+ * before the run started has been tried once; pages stored in segments go
+ * first through buildSegmentedProjection, skipping a live claim (Wave B). Then
+ * (#6803) it restores the importer's own seal on `sealable` image pages
+ * (page-state/image-seal.ts), keyless and without re-embedding. Trusted local
+ * CLI only; it is not an operation, so MCP and remediation cannot run it.
  *
  * Postgres: safe beside a resident owner, because each page is rebuilt or
  * sealed under its page lock with a revision recheck. PGLite: a resident owner
@@ -28,9 +29,10 @@ export const PROJECTION_DRAIN_DOCS = 'docs/guides/repair.md#projection-drain';
 export const PROJECTIONS_HELP = `Usage: gbrain projections drain [--dry-run] [--limit <n>] [--json]
 
 Rebuild queued Markdown and code text projections now, in batches of up to 100,
-until every row queued before the run started has been tried once, then seal
-the image pages the importer already attested safe (sealable). Keyless: no
-provider call, no file read, no re-embedding. Image pages it cannot seal
+until every row queued before the run started has been tried once. Pages stored
+in segments are built first, except one another gbrain process is building.
+Then seal the image pages the importer already attested safe (sealable). Keyless:
+no provider call, no file read, no re-embedding. Image pages it cannot seal
 (reimport) need their importer: preview with gbrain embed --stale --images --dry-run.
 Protected-OCR images and archived-source pages stay unsealed by design.
 

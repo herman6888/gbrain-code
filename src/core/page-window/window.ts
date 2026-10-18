@@ -113,6 +113,15 @@ export function sliceWindow(buf: Buffer, start: number, end: number, forced = fa
   };
 }
 
+/** A stretch of a document too large to hold (a segmented page): its bytes from document byte `start`, and the newlines before it. */
+export interface DocumentSlab { bytes: Buffer; start: number; linesBefore: number }
+
+/** A window `cut` from the slab's bytes, in document offsets and line numbers. */
+export function slabWindow(slab: DocumentSlab, cut: (buf: Buffer) => WindowSlice): WindowSlice {
+  const w = cut(slab.bytes);
+  return { ...w, byte_start: w.byte_start + slab.start, byte_end: w.byte_end + slab.start, line_start: w.line_start + slab.linesBefore, line_end: w.line_end + slab.linesBefore };
+}
+
 /** A window from a clean boundary (a cursor position or the document start). */
 export function windowFrom(buf: Buffer, offset: number, maxBytes: number): WindowSlice {
   const start = snapCodePoint(buf, offset);

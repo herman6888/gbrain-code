@@ -8,7 +8,9 @@
  *
  * Sizes are the bytes of the returned result, never a page body read here, so
  * a segmented page (no body string) is sized like any other read; the summary
- * names its stored `size.body_bytes` when the result carries it. The excerpt
+ * names the body size the result carries: `size.body_bytes`, or a segmented
+ * page's read-view `size.total_bytes` for a remote caller, who is never told
+ * the stored size (as an inline page reports its privacy-stripped body). The excerpt
  * is a bounded prefix of the rendered `content` (or a window's `text`) the
  * result already holds.
  */
@@ -34,7 +36,8 @@ export async function budgetedPageRead(engine: BrainEngine, jobId: number, budge
   const page = (output && typeof output === 'object' ? output : {}) as Record<string, unknown>;
   const rendered = typeof page.content === 'string' ? page.content : typeof page.text === 'string' ? page.text : '';
   const excerpt = boundedRawPrefix(rendered, Math.max(0, Math.min(READ_BUDGET_EXCERPT_BYTES, budgetBytes - used)));
-  const bodyBytes = (page.size as { body_bytes?: unknown } | undefined)?.body_bytes;
+  const size = page.size as { body_bytes?: unknown; total_bytes?: unknown } | undefined;
+  const bodyBytes = size?.body_bytes ?? size?.total_bytes;
   return {
     slug: typeof page.slug === 'string' ? page.slug : slug,
     ...(typeof page.title === 'string' ? { title: page.title } : {}),

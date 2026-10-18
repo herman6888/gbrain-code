@@ -65,6 +65,7 @@ import { abortSegmentedStaging, bodyStorageOf, demoteSegmentedPage, materialized
 import type { SegmentedStagingOwner } from './page-body/ingest.ts';
 import type { PageBodyPolicy } from './page-body/limits.ts';
 import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
+import { assertOriginUnclaimed, isOriginClaimRefusal } from './persistence/origin-guard.ts';
 
 /**
  * #2044 / #4548: row-level, visibility-aware fence merge for one page
@@ -147,6 +148,8 @@ export interface ImportResult {
   /** Which flag tier fired, when `flagged` (`instruction_like`: the #5575 write gate). */
   flag_reason?: 'markup_heavy' | 'oversized' | 'instruction_like';
   gate?: WriteGateAssessment; // #5575: the write-gate assessment, when the caller passed writeGate
+  /** Wave B, a segmented write imported outside the coordinator: whether search sees it on return (searchable.ts). */
+  searchable?: boolean | 'pending';
   /** #5050: unchanged content below the safe-chunk fence was re-sealed; chunks left to embed. */
   resealed?: { pendingChunks: number; pendingChars: number };
   /**
@@ -207,12 +210,16 @@ async function refreshSourcePath(engine: BrainEngine, slug: string, sourceId: st
   try {
     // Keep this optional legacy repair inside a savepoint: a rejected SQL
     // statement must not poison the surrounding canonical transaction.
-    await engine.transaction(tx => tx.executeRaw(
-      `UPDATE pages SET source_path = $1, source_uri = COALESCE($4::text, source_uri) WHERE source_id = $2 AND slug = $3
+    await engine.transaction(async tx => {
+      await assertOriginUnclaimed(tx, { sourceId: sourceId ?? 'default', slug, sourcePath });
+      // origin-guard-ok: assertOriginUnclaimed above, in the same savepoint
+      await tx.executeRaw(`UPDATE pages SET source_path = $1, source_uri = COALESCE($4::text, source_uri) WHERE source_id = $2 AND slug = $3
         AND deleted_at IS NULL AND (source_path IS DISTINCT FROM $1 OR source_uri IS DISTINCT FROM COALESCE($4::text, source_uri))`,
-      [sourcePath, sourceId ?? 'default', slug, originUri],
-    ));
-  } catch { /* bookkeeping only — never fail the import over it */ }
+      [sourcePath, sourceId ?? 'default', slug, originUri]);
+    });
+  } catch (error) {
+    if (isOriginClaimRefusal(error)) process.stderr.write(`[import] ${slug}: origin ${sourcePath} not recorded: ${(error as Error).message}\n`);
+  }
 }
 
 /** #6188 (E8): `importFromContent`'s fence options. */
@@ -862,7 +869,7 @@ export async function importFromContent(
     noop: false, contentHash: hash, result: { slug, status: 'imported', chunks: segmented ? segmented.prepared.rows.chunks : chunks.length, parsedPage,
       ...(pageQuarantined ? { quarantined: true } : {}), ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}), ...(disposition.gate ? { gate: disposition.gate } : {}), ...fences.fields },
     validate: tx => assertPreparedFactWithdrawals(tx, txOpts.sourceId, parsed.compiled_truth, parsed.timeline || '', slug),
-    apply: applyPrepared, ...(segmented ? { afterCommit: segmented.afterCommit, segmented } : {}),
+    apply: applyPrepared, ...(segmented ? { afterCommit: async (target: BrainEngine) => { await segmented.afterCommit(target); }, segmented } : {}),
   });
   await withUnmanagedBeliefs(engine, txOpts.sourceId, [slug], 'import', run => maintenanceTransaction(engine, tx => run(tx, () => applyPrepared(tx)), writeTrustOfGate(opts.writeGate)).catch(async (err: unknown) => {
     await abortSegmentedStaging(engine, segmented?.prepared);
@@ -881,7 +888,7 @@ export async function importFromContent(
     }
     throw decorateEmbeddingDimError(err, slug, activeColName);
   }));
-  await segmented?.afterCommit(engine);
+  const searchable = await segmented?.afterCommit(engine);
 
 
   if (postCommitEmbedding && !noEmbed && chunks.length > 0) {
@@ -906,7 +913,7 @@ export async function importFromContent(
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
     ...(typeWarning ? { type_warning: typeWarning } : {}),
-    ...(embeddingDeferred ? { embedding_deferred: true } : {}), ...fences.fields,
+    ...(embeddingDeferred ? { embedding_deferred: true } : {}), ...fences.fields, ...(searchable !== undefined ? { searchable } : {}),
   };
 }
 

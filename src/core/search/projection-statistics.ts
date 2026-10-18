@@ -56,7 +56,7 @@ export async function verifyProjectionStatistics(engine: Pick<BrainEngine, 'exec
  */
 export const SEARCH_STATISTICS_COLUMNS = {
   pages: ['text_projection_revision', 'knowledge_revision', 'deleted_at', 'source_id', 'type', 'slug', 'body_generation'],
-  content_chunks: ['model', 'modality', 'page_id', 'body_generation', 'retired_generation'],
+  content_chunks: ['model', 'modality', 'page_id', 'body_generation'],
 } as const;
 
 /**

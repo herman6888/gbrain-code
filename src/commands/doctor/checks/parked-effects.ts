@@ -4,6 +4,26 @@ import type { ParkedTarget } from '../../../core/persistence/effect-model.ts';
 import type { WriteRequest } from '../../../core/persistence/model.ts';
 import { OperationError } from '../../../core/ops/contract.ts';
 import { authorizeStoredRequest } from '../../../core/persistence/authority.ts';
+import { indexLockReceiptPath, readIndexLockReclaims } from '../../../core/persistence/index-lock-reclaim.ts';
+
+const RECLAIM_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * #6932: index locks this host's writer reclaimed in the last 7 days. Each one was left by a git that was
+ * killed before it could remove its lock, so a run of them points at git steps being killed (deadlines,
+ * job group kills, the OOM killer). Null when there were none.
+ */
+function recentIndexLockReclaims(): { last_7_days: number; latest: { at: string; checkout: string; lock: string; size: number; age_ms: number }; receipts: string } | null {
+  const recent = readIndexLockReclaims().filter(entry => Date.now() - Date.parse(entry.at) < RECLAIM_WINDOW_MS);
+  const latest = recent.at(-1);
+  if (!latest) return null;
+  return { last_7_days: recent.length, latest: { at: latest.at, checkout: latest.checkout, lock: latest.lock, size: latest.size, age_ms: latest.age_ms },
+    receipts: indexLockReceiptPath() };
+}
+
+const reclaimNote = (reclaims: NonNullable<ReturnType<typeof recentIndexLockReclaims>>) =>
+  ` The canonical writer reclaimed ${reclaims.last_7_days} abandoned Git index lock(s) in the last 7 days (latest ${reclaims.latest.at} in ${reclaims.latest.checkout}); `
+  + `each was left by a git process that was killed before it could remove its lock. Receipts: ${reclaims.receipts}.`;
 
 /** #6697: the stored authority's refusal message, or null while the original writer may still act. */
 async function revokedAuthority(engine: BrainEngine, request: WriteRequest): Promise<string | null> {
@@ -41,16 +61,18 @@ export async function checkParkedEffects(engine: BrainEngine, sourceIds?: string
           ? `the original writer is revoked; ask the user, then retry once under the brain owner's authority: gbrain sources writer retry-effects ${row.source_id} --request-id ${request.request_id} --admin-intent writer_retry_effects --expected-state <admin_state from gbrain sources writer status>`
           : 'the original writer is revoked and a withdrawal is never retried under another authority; ask the user how to withdraw the page' }) });
     }
-    const details = { parked_effects: count, exact: true, inspected: rows.length, truncated: count > rows.length, effects };
-    if (!count) return { name: 'parked_effects', status: 'ok', message: 'No Git or withdrawal effect is parked.', details };
+    const reclaims = recentIndexLockReclaims();
+    const details = { parked_effects: count, exact: true, inspected: rows.length, truncated: count > rows.length, effects, ...(reclaims ? { index_lock_reclaims: reclaims } : {}) };
+    if (!count) return { name: 'parked_effects', status: 'ok', message: `No Git or withdrawal effect is parked.${reclaims ? reclaimNote(reclaims) : ''}`, details };
     const listed = effects.map(effect => `${effect.kind} ${effect.source_id}: ${effect.parked.map(target =>
       `${target.slug ?? '(whole effect)'} (${target.error_code})`).join(', ')}; ${'exit' in effect ? effect.exit : effect.command}`);
     return { name: 'parked_effects', status: 'warn', details,
-      message: `${count} Git or withdrawal effect(s) have parked targets after five consecutive failures; their withdrawal or Git backup is incomplete. ` +
+      message: `${count} Git, withdrawal or embedding effect(s) have parked targets after repeated failures; their withdrawal, Git backup or vectors are incomplete. ` +
         `Inspect \`gbrain sources writer status <source>\`, fix the cause, preview with the command shown, then rerun it without --dry-run to authorize one more attempt: ${listed.join(' | ')}` +
         (count > rows.length ? ` (first ${rows.length} of ${count} shown)` : '') +
         (effects.some(effect => effect.parked.some(target => target.error_code === 'git_target_pending'))
-          ? '. git_target_pending: Git still lists a removed page file in the index; on Windows close the program holding it open (a sync watcher, indexer or antivirus), check with `git -c core.fscache=false status` on the brain host, then run the retry command.' : '') };
+          ? '. git_target_pending: Git still lists a removed page file in the index; on Windows close the program holding it open (a sync watcher, indexer or antivirus), check with `git -c core.fscache=false status` on the brain host, then run the retry command.' : '') +
+        (reclaims ? reclaimNote(reclaims) : '') };
   } catch (error) {
     return { name: 'parked_effects', status: 'warn',
       message: `Parked effects could not be read: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,

@@ -21,7 +21,7 @@ import { EXTERNAL_DATA_RULE, needsDataEnvelope, trustAttributes } from '../eligi
 import { hybridSearch } from '../search/hybrid.ts';
 import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { boundedProjectedPrefix } from '../page-window/document.ts';
-import { overlaidBoundedRows } from '../page-window/bounded-lead.ts';
+import { overlaidBoundedRows, pageLeadSource } from '../page-window/bounded-lead.ts';
 import type { Page, SearchResult } from '../types.ts';
 import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget } from './pages-budget.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
@@ -138,8 +138,9 @@ export async function runGather(
   const decide = { remote: opts.remote !== false, callSite: 'think', ...(opts.decideIntent ? { intent: opts.decideIntent } : {}) };
   // Large pages: a page row's text is a bounded, withdrawal-overlaid prefix
   // (raw for the trusted local CLI, the sanitized projection otherwise), never the whole body.
+  // A segmented page's lead source is its stored truth_lead (its body fields throw).
   const visibleLeads = async (rows: Page[]): Promise<string[]> =>
-    (await overlaidBoundedRows(engine, rows.map(p => ({ slug: p.slug, source_id: p.source_id ?? 'default', compiled_truth: p.compiled_truth ?? '' }))))
+    (await overlaidBoundedRows(engine, await Promise.all(rows.map(async p => ({ slug: p.slug, source_id: p.source_id ?? 'default', compiled_truth: await pageLeadSource(engine, p) ?? '' })))))
       .map(r => opts.remote === false ? r.compiled_truth ?? '' : boundedProjectedPrefix(r.compiled_truth));
 
   // Sanitize the question for any path that includes it in an LLM prompt.

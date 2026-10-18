@@ -12,6 +12,7 @@
 
 | Symptom | Next step | Who acts | Consent | Verify |
 |---|---|---|---|---|
+| The dream cycle's purge phase fails every night with `managed_purge_failed` (`42P01`, relation `query_cache` does not exist), or doctor `schema_missing_tables` warns | upgrade (#6911: the purge skips a missing rebuildable cache), then preview recreating it: `gbrain repair missing-tables` ([missing tables](repair.md#missing-tables)); apply the printed `--apply --expect <hash>` command. Pages parked by the earlier failures: `gbrain pages purge-deleted --retry-parked --dry-run`, then without `--dry-run` | agent, after the user agrees | `destructive` (the parked-page retry purges them) | `gbrain doctor --only schema_missing_tables --json` reports ok |
 | A managed source's autopilot freshness `sync` jobs each land about one page, or `sources status` says `parked` while a sync job runs | upgrade (#6706: sync jobs drain to their deadline and count as the source's live drain), then restart `gbrain jobs work` / the supervisor so the worker loads the handler; a job result with `incomplete: true` names its follow-up (`continuation_job_id`) or the next step in `next` | agent | none | `gbrain sync status --source <id> --json` shows `live_job_id` or a cursor at `done`; `gbrain jobs get <id> --json` shows `outcome` |
 | Doctor `sync_freshness` says a source has "no successful sync recorded" or "first sync running" | follow the check's `fix`: `first sync running` (code `sync_first_run_in_progress`, warn) means wait; `no successful sync recorded` (code `sync_no_successful_sync`, fail) names the last attempt and its `reason`: wait for a queued job, inspect holds (`gbrain sync status --source <id> --json`), or retry (`gbrain sync --source <id>`) ([details](#sync-freshness-no-successful-sync)) | agent | none | `gbrain doctor --only sync_freshness --json` |
 | Recall returns conversation facts like "Date said …", "Attendees said …" or "Summary said …" | `gbrain repair conversation-labels` previews them ([conversation labels](repair.md#conversation-labels)); apply the printed command with `--yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only conversation_label_facts --json` is ok |
@@ -20,6 +21,7 @@
 | A write (`add_timeline_entry`, `put_page`, `remember`, any `mutating` tool) refused `invalid_params` "unknown parameter … write operations always reject unknown parameters; nothing was written" | the call named a parameter the tool does not declare (for example `content` instead of `detail`); the `suggestion` names the submitted key and the declared one; resend with the declared name. Reads keep the `mcp.strict_params` warn grace period | agent | none | the resent call returns no `invalid_params` and no `unknown_param` warning |
 | Facts extraction or embedding reports `(cause=AIConfigError model_not_found)` or `gbrain models doctor` says `model_not_found` while the key is valid | the provider refused the model, not the key (a 404, or a 403 "project does not have access to model"): the fix text names the config key that selected the model when the gateway knows it ("Selected via models.tier.reasoning. Fix: gbrain config set …"; an env var or config.json pin says what to clear); otherwise check the model id with `gbrain models`, enable the model for the project in the provider console or set another model (`gbrain config set models.facts <provider:model>`) | user (provider console); agent for the config change, after the user agrees | none | `gbrain models doctor` reports the model `ok` |
 | Doctor `links_extraction_lag` or sync says "N page(s) have un-extracted edges" | `gbrain extract --stale --dry-run --json`, then on the host `gbrain extract --stale --catch-up [--source-id <id>]` | user above 120 s, else agent | none | dry run: `actionable: 0` |
+| Doctor `links_extraction_lag` says "N page(s) failed link extraction 3 runs in a row and are held", or `extract --stale` lists failed pages | Read each page's code (`unknown_source`: the page's source row is gone; restore the source or delete the page), fix the cause, then `gbrain extract --stale [--source-id <id>] --retry-held` | agent | none | `gbrain extract --stale --dry-run --json`: `held: 0` |
 | A gbrain call failed with a code you don't recognize | follow `fix.next` ([protocol](../protocol/AGENT_OPERATOR_v1.md)); `gbrain errors <code>` | agent | as the fix's `consent` | the fix's `verify` |
 | A graph read omits a relationship you know existed, or says someone still works somewhere they left | the default read returns relationships true today: repeat with `status: "all"` or `as_of`; to record an end, add a dated timeline line (`Ended works_at [[companies/x]]`) or `add_link ... valid_until` ([temporal edges](temporal-edges.md)) | agent | none | `gbrain doctor --only edge_validity --json` |
 | A command exited 3 (`confirmation_required`) | relay `user_message`; run `fix.command` only after the user agrees | agent, after the user agrees | the payload's `effects` | the fix's `verify` |
@@ -219,7 +221,7 @@ Two calls, no SQL: the doctor or `sources status` row names the command, and `wr
 <a id="terminal-write-failures"></a>**Doctor warns `persistence_terminal_failures`, or `gbrain sync status` reports terminal write failures?** Every write leaves a receipt, and a receipt that ended `failed`, `conflict` or `cancelled` stays in `persistence_requests` until compaction. gbrain reads them at query time and sorts each one into a category with a class, safe actions, whether a person decides, and a structured fix (nothing new is stored). Most rows need no action, so the check separates three things:
 
 - **Active blockers** hold work now: a receipt still holding a publication recovery record (it blocks every queued write on its root), or a receipt that blocks a managed sync's checkpoint. Doctor warns whenever one exists, whatever the trend, and its `fix.command` is the next step (for a recovery record, `gbrain sync --source <id> --no-pull`, which runs the owner pass that clears it; a `recovery_blocked` record names the file to inspect instead).
-- **Unresolved rows** are terminal receipts in the window (`persistence.terminal_failures.window_days`, default 7, never longer than `persistence.receipt_retention_days`) that no later write superseded. Doctor warns when any of them is a gbrain-defect class (`owner_exception`, `database_refusal`, `writer_guard`, `outside_fence`, `gbrain_defect`): report those with the receipt ids. The rest are ordinary refusals the caller already received (`caller_conflict`, `caller_refusal`, `operator_cancelled`) or sync faults a rerun retries.
+- **Unresolved rows** are terminal receipts in the window (`persistence.terminal_failures.window_days`, default 7, never longer than `persistence.receipt_retention_days`) that no later write superseded. Doctor warns when any of them is a gbrain-defect class (`owner_exception`, `database_refusal`, `writer_guard`, `outside_fence`, `gbrain_defect`): report those with the receipt ids. The rest are ordinary refusals the caller already received (`caller_conflict`, `caller_refusal`, `operator_cancelled`) or sync faults a rerun retries. A `schema_missing` row (#6904) is a write that met a missing table or column: when the schema is behind, its fix is `gbrain apply-migrations --yes` as the database role that owns the gbrain tables, then resubmit; at head, it asks the user and points at doctor's `schema_missing_tables` check and the `gbrain repair missing-tables` preview.
 - **Historical rows** do not block: a later write superseded them (`superseded`, `already_written`, `duplicate`), or they came from a build older than the release that fixed their cause (sync knock-on cancels before 0.60.216.0, the `Publication failed (P0001)` refusal before 0.60.40.0). Doctor counts them and never warns on them.
 
 A spike warns only on its own: when at least `persistence.terminal_failures.spike_min` (default 25) receipts ended in the last 24 h and that is more than `persistence.terminal_failures.spike_factor` (default 3) times the median of the 7 days before. When most of those receipts were written by a gbrain build older than the release that fixed their class, the warning says an older write owner is still producing them and names the build; its fix is the read-only `gbrain sources writer status --source <id> --json` that names the owner, so upgrade or restart that process. A `file_database_drift` row is the page-drift class: [file drift](repair.md#file-drift) resolves it with `gbrain repair file-drift`. A read that does not finish within its deadline (5 s per statement, 2 s to get a connection) reports `unknown`, never a clean pile; rerun it.
@@ -247,7 +249,7 @@ Refused writes a caller never saw land (`lost_caller_writes`) have their own rep
 | `reason` | What it means | Next |
 |---|---|---|
 | `host_mismatch` | Another host id owns the checkout. The message prints both ids' first 8 characters and, to a local caller, the `host.json` this process read (`<GBRAIN_HOME>/.gbrain/persistence/host.json`). A maintenance worker (launchd, cron, autopilot) started with a different `GBRAIN_HOME` or user than the shell that ran the sync reads a different identity file and is, to the brain, a different host. `retryable: false`: a retry from the same environment cannot change the answer. | Run the step on the owner host writer status names, or make both environments use one `GBRAIN_HOME`. Never copy or regenerate `host.json`: a new identity orphans the ownership and pending writes recorded for the old one. |
-| `transfer_in_progress` | The worktree is `draining`: a writer transfer was prepared and not yet accepted or cancelled. | `fix.next` is `wait`: retry after 30 s; the status read shows the state. |
+| `transfer_in_progress` | The worktree is `draining`: a writer transfer was prepared and not yet accepted or cancelled. | `fix.next` is `wait`: retry after 30 s; the status read shows the state. A transfer prepared more than 30 minutes ago never ends on its own, so its refusal reads `ask_user` and names both exits: `gbrain sources writer transfer accept` on the successor, or `gbrain sources writer transfer cancel <source> --expected-epoch <n>` on the owner host (`--dry-run` previews; the worktree returns to active at the same epoch and the prepared manifest is cleared). A drain an older release prepared records no time and keeps the wait, whose `why` names the cancel. |
 | `clone_in_progress` | The worktree is `recovering`: a topology clone or reclone is in progress. | `wait`: retry after 30 s; it is `active` when the clone finishes. |
 | `binding_missing` | The source has no canonical worktree binding at all. | Claiming a checkout is the host administrator's decision. |
 | `incarnation_changed` | The binding belongs to an earlier incarnation of the source (removed and re-added, or restored). | Re-bind the checkout on the brain host. |
@@ -575,6 +577,38 @@ maintenance job completed (the phase records a partial result). Raise that
 child's timeout with `gbrain config set dream.<phase>.subagent_timeout_ms <ms>`;
 `gbrain dream --phase <phase>` reruns it and spends model tokens, so ask the
 user first. The warning clears once that phase's next child completes.
+
+## Global maintenance stalled
+
+**Doctor reports `global_maintenance_stalled`, or `gbrain autopilot --status`
+exits 1 with a `Global maintenance:` line?** A brain-wide maintenance pass
+stamps `autopilot.last_global_at` only when no phase blocked it. Each blocking
+phase keeps a streak in `autopilot.global_maintenance.progress`, keyed by why
+it blocked: `fail:<code>` (the phase failed), `budget`, `child:<outcome>` or
+`deferred`. After a phase fails with the same code in three passes in a row,
+later passes stamp past it (the job result lists it under
+`pass_completed_with_failing_phase`) and the phase backs off: it is skipped
+for two global intervals, then four, up to a day. Budget, deferral and child
+blockers never let a pass stamp past them; child failures back off too.
+
+Doctor warns when the stamp is older than three global intervals
+(`autopilot.global_floor_min`, 60 minutes by default) while maintenance jobs
+failed or a phase streak is active, fails once it is a week old, and also
+warns while passes stamp past a phase that keeps failing. The message names
+the phase, its blocker key and back-off, or the last failed job.
+
+1. Run the named phase in the foreground to see its error:
+   `gbrain dream --phase <name>`. LLM and embedding phases spend tokens, so
+   ask the user first. With no phase named, read the failed job:
+   `gbrain jobs get <id>`.
+2. Fix the cause the error names, then end the back-off so the next pass
+   runs the phase again: `gbrain autopilot --retry-global --phase <name>`
+   (without `--phase`, every backed-off phase). The streak count stays, so a
+   phase that still fails backs off again. Upgrading gbrain drops every
+   streak, and a phase that fails for a different reason starts a new one.
+3. Confirm with `gbrain doctor --only global_maintenance_stalled`: it is `ok`
+   after a pass completes with the phase passing.
+
 ## auto_chronicle has no effect
 
 **Say to your agent:** *"Why aren't my meetings showing up as timeline events?"*

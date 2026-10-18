@@ -9,6 +9,8 @@ import { familySync, GLIBC, MUSL } from 'detect-libc';
 export interface NativeExportPublisher {
   beginExport(absoluteDestination: string): object;
   publishExportFile(handle: object, relativePath: string, data: Buffer): void;
+  /** Publishes a staged regular file (absolute path, leaf links refused) copied in bounded reads, never held whole. */
+  publishExportFileFrom(handle: object, relativePath: string, absoluteSource: string): void;
   completeExport(handle: object): void;
   closeExport(handle: object): void;
 }
@@ -141,7 +143,7 @@ export async function nativeLockCapability(): Promise<{ target: string; napi: 3 
 
 export async function nativeExportPublisher(): Promise<NativeExportPublisher> {
   const binding = await (bindingPromise ??= loadBinding());
-  if (typeof binding.beginExport !== 'function' || typeof binding.publishExportFile !== 'function' ||
+  if (typeof binding.beginExport !== 'function' || typeof binding.publishExportFile !== 'function' || typeof binding.publishExportFileFrom !== 'function' ||
       typeof binding.completeExport !== 'function' || typeof binding.closeExport !== 'function') {
     throw new NativeLockUnavailableError('Installed native addon lacks safe export publication support');
   }

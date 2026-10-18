@@ -2,9 +2,11 @@
  * Wave B chunk visibility (spec 4.2).
  *
  * 1. Protects: a segmented page's staged rows (body_generation above the
- *    page's, an unpublished write) and retired rows (an old body) never reach
- *    keyword search, vector search, get_chunks, chunk windows or the embed
- *    sweep's stale selection; inline pages' rows are unaffected; get_chunks
+ *    page's, an unpublished write) and retired rows (an old body whose
+ *    deferred retirement has not deleted them yet; the page stays unsealed)
+ *    never reach keyword search, vector search, get_chunks, chunk windows or
+ *    the embed sweep's stale selection, and generation readers of the
+ *    unsealed page see only its live rows; inline pages' rows are unaffected; get_chunks
  *    returns a segmented page in document order (manifest byte_start,
  *    local_ordinal), paging by position.
  * 2. Fails when: a reader drops `chunkVisibleFilter` / `chunkGenerationFilter`
@@ -21,6 +23,7 @@ import { segmentPage, unitVector, type SegmentedFixture } from '../helpers/segme
 import { testBackends } from '../helpers/test-backends.ts';
 
 const SLUG = 'notes/segmented-log';
+const RETIRING = 'notes/segmented-retiring';
 const LIVE = ['zebrafish opening of the log', 'second live passage', 'later appended passage about herons'];
 
 for (const kind of testBackends()) {
@@ -28,6 +31,7 @@ for (const kind of testBackends()) {
     let engine: BrainEngine;
     let close: () => Promise<void>;
     let fixture: SegmentedFixture;
+    let retiring: SegmentedFixture;
 
     beforeAll(async () => {
       if (kind === 'postgres') ({ engine, close } = await isolatedPersistencePostgres(process.env.DATABASE_URL!));
@@ -47,18 +51,27 @@ for (const kind of testBackends()) {
         occurrences: [
           { id: 20, byteStart: 4096, genFrom: 1, chunks: [{ text: LIVE[2]!, vector: 7, chunkIndex: 0 }] },
           { id: 10, byteStart: 0, genFrom: 1, chunks: [{ text: LIVE[0]!, vector: 7, chunkIndex: 1 }, { text: LIVE[1]!, vector: 7, chunkIndex: 2 }] },
-          { id: 30, byteStart: 8192, genFrom: 1, genTo: 2, chunks: [{ text: 'retired quokka passage', vector: 9, retiredGeneration: 2 }] },
           { id: 40, byteStart: 8192, genFrom: 3, chunks: [{ text: 'staged wombat passage', vector: 9 }, { text: 'staged stale wombat tail' }] },
-          { id: 50, byteStart: 12288, genFrom: 1, genTo: 2, chunks: [{ text: 'retired stale quokka tail', retiredGeneration: 2 }] },
           { id: 60, byteStart: 12288, genFrom: 2, chunks: [{ text: 'live stale heron tail' }] },
+        ],
+      });
+      // A flip to generation 2 that deferred its retirement: occurrences 30 and 50 are closed, their rows not yet deleted.
+      retiring = await segmentPage(engine, RETIRING, {
+        generation: 2,
+        unsealed: true,
+        occurrences: [
+          { id: 70, byteStart: 0, genFrom: 1, chunks: [{ text: 'kept passage of the retiring page', vector: 7 }] },
+          { id: 30, byteStart: 4096, genFrom: 1, genTo: 2, chunks: [{ text: 'retired quokka passage', vector: 9 }] },
+          { id: 50, byteStart: 8192, genFrom: 1, genTo: 2, chunks: [{ text: 'retired stale quokka tail' }] },
+          { id: 80, byteStart: 4096, genFrom: 2, chunks: [{ text: 'new passage of the retiring page', vector: 7 }] },
         ],
       });
     }, 120_000);
     afterAll(async () => { await close?.(); });
 
     const liveIds = () => [...LIVE, 'live stale heron tail'].map(t => fixture.chunkIds.get(t)!);
-    const hiddenIds = () => ['retired quokka passage', 'staged wombat passage', 'staged stale wombat tail', 'retired stale quokka tail']
-      .map(t => fixture.chunkIds.get(t)!);
+    const hiddenIds = () => [...['staged wombat passage', 'staged stale wombat tail'].map(t => fixture.chunkIds.get(t)!),
+      ...['retired quokka passage', 'retired stale quokka tail'].map(t => retiring.chunkIds.get(t)!)];
 
     test('keyword search sees live rows only', async () => {
       expect((await engine.searchKeyword('zebrafish')).map(r => r.slug).sort()).toEqual(['notes/inline', SLUG]);
@@ -104,6 +117,13 @@ for (const kind of testBackends()) {
       const stale = await engine.listStaleChunks({ batchSize: 100 });
       const texts = stale.filter(r => r.slug === SLUG).map(r => r.chunk_text);
       expect(texts).toEqual(['live stale heron tail']);
+      expect(stale.filter(r => r.slug === RETIRING)).toEqual([]);
+    });
+
+    test('generation readers of a page awaiting its deferred retirement see its live rows only', async () => {
+      expect((await engine.getChunks(RETIRING, { includeUnsealed: true })).map(c => c.chunk_text))
+        .toEqual(['kept passage of the retiring page', 'new passage of the retiring page']);
+      expect(await engine.getChunks(RETIRING)).toEqual([]);
     });
   });
 }

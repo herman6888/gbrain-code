@@ -35,7 +35,7 @@
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
@@ -266,7 +266,8 @@ export async function buildHistoryFixture(engine: BrainEngine,
 
   // A Git effect that fails on a stale index.lock reschedules into the future. A lock younger than
   // 10 minutes is contention (`git_index_locked`, retried after 250 ms), so the lock is dated
-  // 11 minutes back: the effect fails as `git_index_stale` and requeues 30 s out.
+  // 11 minutes back: the effect fails as `git_index_stale` and requeues 30 s out. This process
+  // keeps the lock open, so the writer cannot prove it abandoned and never reclaims it (#6932).
   // A committed op's Git effect can still be queued or running (always so when replies outlive
   // their wait); a lock planted under a running effect is renamed away by Git's own commit.
   const drainDeadline = Date.now() + 60_000;
@@ -280,6 +281,7 @@ export async function buildHistoryFixture(engine: BrainEngine,
   writeFileSync(lock, '');
   const staleAt = new Date(Date.now() - 11 * 60_000);
   utimesSync(lock, staleAt, staleAt);
+  const held = openSync(lock, 'r');
   let delayedEffectId: string;
   try {
     const delayed = descriptor('delayed-effect', 'put_page', 'local', delayedSource.id,
@@ -306,6 +308,7 @@ export async function buildHistoryFixture(engine: BrainEngine,
     });
   } finally {
     await disposePersistenceConsumer(engine);
+    closeSync(held);
     if (existsSync(lock)) rmSync(lock);
   }
 

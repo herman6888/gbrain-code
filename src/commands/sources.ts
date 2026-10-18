@@ -680,7 +680,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
         console.error('PUSH BLOCKED — staged file(s) the secret scan could not read (fail-closed):');
         for (const p of res.unscannable ?? []) console.error(`  ${p}`);
         console.error(
-          'Remove from the index (git rm --cached <path>), keep it under the scan cap, ' +
+          'Remove from the index (git rm --cached <path>), keep it under the scan ceiling, ' +
             `or allowlist it in ${SCAN_ALLOW_FILENAME}.`,
         );
       }

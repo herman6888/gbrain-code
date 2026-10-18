@@ -106,12 +106,22 @@ export async function recordFactWithdrawal(
       if (opts.semanticReview !== false && reviewWithdrawOn(await tx.getConfig(REVIEW_WITHDRAW_KEY))) {
         await tx.executeRaw(`INSERT INTO decide_review_queue(kind,source_id,a_ref) VALUES ('withdraw',$1,$2) ON CONFLICT DO NOTHING`, [sourceId, String(id)]);
       }
+      // Wave B (spec 11): a segmented page's withdrawn rows are struck in the segment holding the fence, a new
+      // generation whose flip retires only the chunks of the occurrences it rewrote.
+      const segmented = affected.length ? await tx.executeRaw<{ id: number; slug: string }>(`SELECT id,slug FROM pages
+        WHERE source_id=$1 AND slug=ANY($2::text[]) AND body_storage='segmented'`, [sourceId, affected.map(page => page.slug)]) : [];
+      if (segmented.length) {
+        const { rewriteLiveSegmentedFences } = await import('../page-body/segment-rewrite.ts');
+        for (const page of segmented) await rewriteLiveSegmentedFences(tx, Number(page.id), fence => preserveWithdrawnFenceRows(tx, sourceId, fence, page.slug));
+      }
       // Logical revision and projection invalidation commit with the withdrawal.
       // The revision trigger queues durable rebuild work even for unmanaged calls.
-      const pages = affected.length ? await tx.executeRaw<{ id: number; slug: string; knowledge_revision: string }>(
+      const inline = affected.length ? await tx.executeRaw<{ id: number; slug: string; knowledge_revision: string }>(
         `UPDATE pages SET knowledge_revision=gen_random_uuid(),text_projection_revision=NULL,embedding_signature=NULL
-          WHERE source_id=$1 AND slug=ANY($2::text[]) RETURNING id,slug,knowledge_revision`, [sourceId, affected.map(page => page.slug)]) : [];
-      if (pages.length) await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=ANY($1::integer[])', [pages.map(page => page.id)]);
+          WHERE source_id=$1 AND slug=ANY($2::text[]) AND body_storage<>'segmented' RETURNING id,slug,knowledge_revision`, [sourceId, affected.map(page => page.slug)]) : [];
+      if (inline.length) await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=ANY($1::integer[])', [inline.map(page => page.id)]);
+      const pages = [...inline, ...segmented.length ? await tx.executeRaw<{ id: number; slug: string; knowledge_revision: string }>(
+        'SELECT id,slug,knowledge_revision FROM pages WHERE id=ANY($1::int[])', [segmented.map(page => page.id)]) : []];
       if (opts.requestId) {
         await tx.executeRaw(`INSERT INTO persistence_effects(request_id,kind,data,source_id,source_incarnation,worktree_id)
           SELECT $1::uuid,k.kind,$3::text::jsonb,s.id,s.incarnation,b.worktree_id

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { load } from 'js-yaml';
+import { UNIT_SHARDS } from '../../scripts/sharding.ts';
 
 const root = join(import.meta.dir, '..', '..');
 type Job = { needs?: string | string[]; if?: string; steps: Array<{ name?: string; run?: string; uses?: string; env?: Record<string, string> }> };
@@ -105,11 +106,23 @@ describe('CI execution evidence', () => {
   test('unit shard count agrees across the matrix, the shard step and the coverage manifest', () => {
     const job = unit.jobs.test as Job & { strategy: { matrix: { shard: number[] } } };
     const shards = job.strategy.matrix.shard;
-    expect(shards).toEqual(Array.from({ length: shards.length }, (_, i) => i + 1));
+    expect(shards).toEqual(Array.from({ length: UNIT_SHARDS }, (_, i) => i + 1));
     const run = job.steps.find(step => step.run?.includes('scripts/test-shard.sh'))!;
     expect(run.name).toBe(`Run test shard \${{ matrix.shard }}/${shards.length}`);
     expect(run.run).toContain(`scripts/test-shard.sh \${{ matrix.shard }} ${shards.length}`);
     const merge = unit.jobs['coverage-report'].steps.find(step => step.name === 'Merge lanes')!.run!;
+    const expected = /--manifest-expect (\S+)/.exec(merge)![1].split(',').filter(lane => lane.startsWith('shard-'));
+    expect(expected).toEqual(shards.map(shard => `shard-${shard}`));
+  });
+
+  test('the nightly coverage-full-unit lane runs the same unit partition', () => {
+    const job = e2e.jobs['coverage-full-unit'] as Job & { strategy: { matrix: { shard: number[] } } };
+    const shards = job.strategy.matrix.shard;
+    expect(shards).toEqual(Array.from({ length: UNIT_SHARDS }, (_, i) => i + 1));
+    const run = job.steps.find(step => step.run?.includes('scripts/test-shard.sh'))!;
+    expect(run.name).toBe(`Coverage shard \${{ matrix.shard }}/${UNIT_SHARDS}`);
+    expect(run.run).toBe(`scripts/test-shard.sh \${{ matrix.shard }} ${UNIT_SHARDS}`);
+    const merge = e2e.jobs['coverage-full-report'].steps.find(step => step.name === 'Merge full corpus')!.run!;
     const expected = /--manifest-expect (\S+)/.exec(merge)![1].split(',').filter(lane => lane.startsWith('shard-'));
     expect(expected).toEqual(shards.map(shard => `shard-${shard}`));
   });

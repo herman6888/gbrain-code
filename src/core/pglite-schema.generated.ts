@@ -318,7 +318,10 @@ CREATE TABLE IF NOT EXISTS ingest_log (
   source_ref    TEXT    NOT NULL,
   pages_updated JSONB   NOT NULL DEFAULT '[]',
   summary       TEXT    NOT NULL DEFAULT '',
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  writer_version TEXT,
+  writer_host_id UUID,
+  writer_segment_reader BOOLEAN
 );
 
 CREATE INDEX IF NOT EXISTS idx_ingest_log_source_type_created
@@ -1295,6 +1298,17 @@ CREATE TABLE IF NOT EXISTS page_extraction_state (
 );
 CREATE INDEX IF NOT EXISTS page_extraction_state_truncated_idx
   ON page_extraction_state (pipeline, page_id) WHERE input_truncated IS NOT NULL;
+CREATE TABLE IF NOT EXISTS page_view_digests (
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  revision TEXT NOT NULL,
+  view TEXT NOT NULL CHECK (view IN ('read','markdown')),
+  audience TEXT NOT NULL CHECK (audience IN ('trusted','remote')),
+  total_bytes BIGINT NOT NULL CHECK (total_bytes >= 0),
+  total_lines BIGINT NOT NULL CHECK (total_lines >= 0),
+  sha256 TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (page_id, revision, view, audience)
+);
 -- Wave B segmented page storage (migration v248): segment texts, the
 -- generation-ranged body manifest and body stagings (src/core/page-body/).
 -- Before the persistence region so the managed-writer guard covers them.
@@ -1376,6 +1390,15 @@ CREATE TABLE IF NOT EXISTS page_body_staging_parts (
   body       BYTEA   NOT NULL,
   PRIMARY KEY (staging_id, part_no)
 );
+CREATE TABLE IF NOT EXISTS page_body_staging_texts (
+  staging_id UUID  NOT NULL REFERENCES page_body_stagings(id) ON DELETE CASCADE,
+  source_id  TEXT  NOT NULL,
+  sha256     BYTEA NOT NULL,
+  PRIMARY KEY (staging_id, sha256)
+);
+CREATE INDEX IF NOT EXISTS page_body_staging_texts_text ON page_body_staging_texts (source_id, sha256);
+
+
 
 -- Durable concurrent persistence (migration 151).
 CREATE TABLE IF NOT EXISTS persistence_brain (
@@ -1508,6 +1531,7 @@ CREATE TABLE IF NOT EXISTS persistence_consumers (
     version text NOT NULL,
     boot_id text,
     process_start text,
+    segment_reader boolean,
     PRIMARY KEY(host_id,pid,nonce)
   );
 

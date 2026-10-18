@@ -447,7 +447,7 @@ export const ROLLBACK_CASES: RollbackCase[] = [
         [hexOf(ORPHAN_TEXT.sha256)]);
     },
     async write(tx) {
-      expect((await tx.sweepSegments({ pageId: await segmentedPageId(tx, SEGMENTED_SLUG) })).textsDeleted).toBeGreaterThanOrEqual(1);
+      expect((await tx.sweepSegments({ sourceId: 'default' })).textsDeleted).toBeGreaterThanOrEqual(1);
     },
     observe: engine => segmentTextExists(engine, ORPHAN_TEXT),
   },

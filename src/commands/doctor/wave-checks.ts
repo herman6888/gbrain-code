@@ -252,6 +252,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/writer-version.ts')).writerVersionCheck(engine),
   },
   {
+    id: 'segmented_storage', resolution: 'operator', registration: 'wave',
+    impact: 'A recent writer older than this release keeps segmented page storage off, so pages over 1 MiB are written inline up to 24 MiB',
+    instruction: 'Run `gbrain upgrade` on each host doctor names (by host UUID), then restart its gbrain processes; the hold clears seven days after that writer\'s last request.',
+    count: d => (Array.isArray(d.blockers) ? d.blockers.length : 0),
+    run: async engine => (await import('./checks/segmented-storage.ts')).segmentedStorageCheck(engine),
+  },
+  {
     id: 'self_capture', resolution: 'operator', registration: 'wave',
     count: d => Number(d.classified ?? 0),
     impact: 'The session corpus still holds files captured from gbrain\'s own model sessions',
@@ -403,9 +410,10 @@ export const REMOTE_HOST_ACTION = 'host operator action required: on the brain h
  */
 export async function remoteWaveHandoff(engine: BrainEngine, sourceIds?: string[]): Promise<Check[]> {
   const findings = await runWaveChecks(engine, { sourceIds, remote: true });
-  return findings.map(({ spec, state }) => {
+  return findings.map(({ spec, check, state }) => {
     const host_action = { check_id: spec.id, state: state === 'finding' ? 'action_required' : state, preview_command: 'gbrain doctor --remediation-plan' };
-    if (state === 'ok') return { name: spec.id, status: 'ok' as const, message: 'No host action needed.', details: { host_action } };
+    if (state === 'ok') return { name: spec.id, status: 'ok' as const, message: 'No host action needed.', details: { host_action },
+      ...(check.severity ? { severity: check.severity } : {}), ...(check.readiness_state ? { readiness_state: check.readiness_state } : {}) };
     if (state === 'unknown') return { name: spec.id, status: 'warn' as const, details: { host_action },
       message: `Unknown: this check could not run for the remote caller; ${REMOTE_HOST_ACTION}.` };
     return { name: spec.id, status: 'warn' as const, details: { host_action }, message: `${spec.impact}; ${REMOTE_HOST_ACTION}.` };

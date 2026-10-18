@@ -141,7 +141,7 @@ jobs:
           cd admin && bun install --frozen-lockfile --ignore-scripts && cd ..
           bun run build:admin
       # No test re-run here: the Test workflow already gated this exact SHA at
-      # merge (10 shards + E2E). Re-running the whole suite serially on the
+      # merge (unit shards + E2E). Re-running the whole suite serially on the
       # release runner is a flakier duplicate gate — it blocked the first
       # release on ambient-env tests (run 30698650484). The build job's gate
       # is the artifact itself: compile, then smoke-test the binary.

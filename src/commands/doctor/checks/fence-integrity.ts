@@ -33,7 +33,7 @@
  */
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
-import { agentFix, doctorVerify } from '../check-fix.ts';
+import { agentFix, doctorVerify, withSkippedSegmented } from '../check-fix.ts';
 import { scanDeadline } from '../budget.ts';
 import { auditUnadoptableFacts, planUnfencedFacts, unboundRefusedSentence, type UnadoptableFactRecord, type UnfencedFactsOutcome } from '../../../core/facts/unfenced-facts.ts';
 import { UNBOUND_SOURCE_DOCS, UNBOUND_WRITE_KEY } from '../../../core/persistence/unbound-source.ts';
@@ -174,8 +174,15 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
     unrenderable_legacy_facts: unrenderable,
     unbound_legacy_facts: { total: unbound.reduce((sum, page) => sum + page.rows, 0), pages: unbound },
   };
+  // Decision #10: the census judges a stored page by its body columns, which are NULL on a page stored in segments;
+  // only the checkout walk judges its file, so a segmented page without a walked file is skipped.
+  const [segmented] = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM pages
+    WHERE deleted_at IS NULL AND page_kind = 'markdown' AND body_storage = 'segmented' AND source_id = ANY($1::text[])
+      AND (source_path IS NULL OR NOT (source_id = ANY($2::text[])))`,
+    [census.map(c => c.source_id), runs.filter(run => run.files !== 'none').map(run => run.source_id)]).catch(() => []);
+  const skipped = Number(segmented?.n ?? 0);
   if (!total && !partial.length && !noisy.length && !uncommitted.length && !unrenderable.total && unrenderable.complete && !unbound.length) {
-    return { status: 'ok', details, message: census.length ? `No malformed facts or takes fence is held, stored or waiting in a checkout (${census.length} source(s) scanned).` : 'No sources to scan.' };
+    return withSkippedSegmented({ status: 'ok', details, message: census.length ? `No malformed facts or takes fence is held, stored or waiting in a checkout (${census.length} source(s) scanned).` : 'No sources to scan.' }, skipped);
   }
   const auto = await readFenceAutoRepair(engine, now());
   const at = now().getTime();
@@ -219,7 +226,7 @@ export async function fenceIntegrityResult(engine: BrainEngine, opts: { timeoutM
           // No command to run: the rows stay as they are, so the fix is a report; verify re-counts them.
           : { consent: [], actor: 'agent' as const, requires_exclusive: false, docs: UNRENDERABLE_DOCS, verify: doctorVerify('fence_integrity'),
             why: `Nothing to run: ${unrenderable.total} legacy fact row(s) stay active and searchable because their text cannot be written into a facts fence unchanged. Tell the user which pages are listed under unrenderable_legacy_facts and report them with the gbrain version; the verify re-counts the rows.` };
-  return { status: 'warn', details: { ...details, auto_repair: auto }, fix, message: sentences.join(' ') };
+  return withSkippedSegmented({ status: 'warn', details: { ...details, auto_repair: auto }, fix, message: sentences.join(' ') }, skipped);
 }
 
 /** The wave check (`WAVE_CHECKS`): the same verdict, scoped to `sourceIds` when a remote caller is. */

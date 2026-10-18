@@ -77,6 +77,7 @@ import type { PreparedMutation } from './coordinator.ts';
 import { contentRepairCommit, fenceRepairCommit } from './effect-model.ts';
 import { recordSlugLineAlias } from '../page-state/rename-alias.ts';
 import type { WriteRequest } from './model.ts';
+import { bindOrigin } from './origin-guard.ts';
 
 export interface ManagedFileRepairIntent extends Record<string, unknown> {
   kind: 'managed_file_repair';
@@ -368,8 +369,11 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   const importContent = p.content.replace(/^\uFEFF/, '');
   const overrideTier = (await ownerSourceGateInput(engine, row.source_id, parseMarkdown(importContent, `${row.slug}.md`, { activePack: screenConfig.activePack }).frontmatter)).tier;
   const importOptions = { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, overrideTier, activePack: screenConfig.activePack, filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true };
+  // afterCommit follows the import that published (a page stored in segments chunks what its publication left unsealed).
+  let published = ready;
   return { observedRevision: snapshot?.revision ?? null, noop: ready.noop && !fileChanges && !moved, contentUnchanged: ready.noop && !fileChanges && !moved,
     trust: await ownerImportTrust(engine, row, ready.parsedPage.frontmatter, p.sourcePath), deferEmbedding: p.noEmbed, ...(moved ? { additionalPageKeys: [{ sourceId: row.source_id, slug: moved.slug }] } : {}),
+    ...(ready.afterCommit || moved ? { afterCommit: async (target: BrainEngine) => { await published.afterCommit?.(target); } } : {}),
     ...(fileChanges ? { file: { root, path: target, content: bytes, expectedBeforeHash: p.beforeHash,
       ...(fenceRepair ? { commit: fenceRepairCommit(p.path, fenceRepair.classes, fenceRepair.tier) } : contentRepair ? { commit: contentRepairCommit(p.path, contentRepair) } : {}) } } : {}),
     validate: async tx => {
@@ -393,9 +397,11 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
         await movedImport.validate(tx);
         applied = movedImport;
       }
-      await applied.apply(tx);
-      await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
-      if (!applied.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
+      published = applied;
+      const installed = await applied.apply(tx);
+      await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: p.sourcePath });
+      // A body stored in segments was sealed by its import's apply when complete (sealSegmentedPage); the inline text seal reads the whole timeline.
+      if (!applied.noop) { await project(tx); if (!installed?.segmented) await sealPageTextProjection(tx, row.slug, row.source_id); }
       const holdCleared = await clearGitHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: p.path, observedAt: p.holdObservedAt ?? new Date().toISOString() });
       if (contentRepair?.declared_alias) await recordSlugLineAlias(tx, row.source_id, contentRepair.declared_alias, row.slug);
       // #6712 PR 1: the record names what is on disk now (the approved bytes), the page revision they produced and the parser, so the next discovery prescreens the file.

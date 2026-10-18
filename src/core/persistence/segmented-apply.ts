@@ -5,9 +5,11 @@
  * everything heavy was staged by `prepareSegmentedBody`.
  *
  * - Create: the page row (`createSegmentedPageShell`), its manifest rows and
- *   the flip 0 -> 1. The text projection stays unsealed (chunks of a page row
- *   that did not exist could not be staged); `buildSegmentedProjection` chunks
- *   it after commit, or the projection queue does after a crash.
+ *   the flip 0 -> 1. A create within SEGMENTED_CREATE_SEAL_MAX_BYTES inserts
+ *   the chunk rows its preparation held (`createChunks`) and the caller seals;
+ *   a larger one stays unsealed (chunks of a page row that did not exist could
+ *   not be staged) and `buildSegmentedProjection` chunks it after commit, or
+ *   the projection queue does after a crash.
  * - Replace (and promotion from inline): the flip G -> G+1 over the staged
  *   rows, dropping chunk rows a dead preparation left under G+1; the caller
  *   seals as its last revision-changing step when every occurrence has chunks
@@ -30,8 +32,13 @@ import { SEGMENTED_CHUNKER_VERSION } from '../page-body/segment-chunks.ts';
 import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
 import { pageSearchVectorSql } from '../fts-language.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
+import { overlayCanonicalBodies, readPageSnapshot } from '../page-state/snapshot.ts';
 import { faultPoint } from './fault-points.ts';
+import { bodyStagingGoneError, LIVE_STAGING_STATES } from '../engine-sql/page-body.ts';
+import { segmentedPageSearchable } from './searchable.ts';
 import { stableJson } from './digest.ts';
+import { pageBodyOverCeilingError } from '../page-body/page-shape.ts';
+import { assertOriginUnclaimed } from './origin-guard.ts';
 
 const BODY_KEYS = new Set(['compiled_truth', 'timeline', 'content']);
 
@@ -82,10 +89,28 @@ export function segmentedOverCeiling(page: { body_storage?: string | null; body_
   return page.body_storage === 'segmented' && Number(page.body_bytes ?? 0) > PAGE_MAX_BYTES;
 }
 
-/** `materializedPage` over a snapshot (null passes through). */
+/**
+ * `materializedPage` over a snapshot (null passes through), with the read-back body under the snapshot's withdrawal
+ * ledger, as readPageSnapshot gives an inline page's body: a facts row the ledger withdraws is struck (or, purged,
+ * dropped), so the body a write merges into or the drift check compares a file with is the one an inline page has.
+ */
 export async function materializedSnapshot(engine: BrainEngine, snapshot: PageSnapshot | null): Promise<PageSnapshot | null> {
   if (!snapshot || bodyStorageOf(snapshot.page) !== 'segmented') return snapshot;
-  return { ...snapshot, page: await materializedPage(engine, snapshot.page) };
+  const page = await materializedPage(engine, snapshot.page);
+  if (page === snapshot.page) return snapshot;
+  Object.assign(page, await overlayCanonicalBodies(engine.executeRaw.bind(engine), page.compiled_truth, page.timeline ?? '', snapshot.withdrawals,
+    { sourceId: page.source_id, marker: snapshot.globalPurges }));
+  return { ...snapshot, page };
+}
+
+/**
+ * The snapshot a whole-body write (a fence or timeline edit through the put path) reads and merges into: a segmented
+ * page within PAGE_MAX_BYTES read back as strings, as `materializedSnapshot` gives it; one over it refuses with
+ * `page_body_segmented` (`site` names the write) before anything is read or staged.
+ */
+export async function wholeBodySnapshot(engine: BrainEngine, snapshot: PageSnapshot | null, site: string): Promise<PageSnapshot | null> {
+  if (snapshot && segmentedOverCeiling(snapshot.page)) throw pageBodyOverCeilingError(snapshot.page, site);
+  return materializedSnapshot(engine, snapshot);
 }
 
 /**
@@ -114,21 +139,34 @@ export interface SegmentedApplyInput {
   requestId?: string | null;
 }
 
-/** `complete`: every occurrence has chunks and the flip retired the old rows, so the caller seals as its last step (`sealSegmentedPage`). */
+/** `complete`: every occurrence has chunks and no retired occurrence's row is still stored, so the caller seals as its last step (`sealSegmentedPage`). */
 export interface SegmentedApplied { pageId: number; complete: boolean; retireDeferred: boolean }
 
-/** Seal a segmented page's text projection at its current revision (chunks visible, title + timeline lead searchable). */
+/**
+ * Seal a segmented page's text projection at its current revision (chunks visible, title + timeline lead searchable).
+ * The lead is indexed as the inline seal indexes a snapshot's timeline: after the page's withdrawal overlay, sanitized.
+ */
 export async function sealSegmentedPage(tx: Pick<BrainEngine, 'executeRaw'>, pageId: number, timelineLead?: string): Promise<void> {
-  const lead = timelineLead ?? (await tx.executeRaw<{ timeline_lead: string | null }>('SELECT timeline_lead FROM pages WHERE id=$1', [pageId]))[0]?.timeline_lead ?? '';
+  const [page] = await tx.executeRaw<{ slug: string; source_id: string; timeline_lead: string | null }>('SELECT slug, source_id, timeline_lead FROM pages WHERE id=$1', [pageId]);
+  if (!page) return;
+  const query = <T>(sql: string, params?: unknown[]) => tx.executeRaw<T>(sql, params);
+  const ledger = await readPageSnapshot(query, page.slug, { sourceId: page.source_id, includeDeleted: true });
+  const { timeline } = await overlayCanonicalBodies(query, '', timelineLead ?? page.timeline_lead ?? '', ledger?.withdrawals ?? [],
+    { sourceId: page.source_id, marker: ledger?.globalPurges });
   await tx.executeRaw(`UPDATE pages SET text_projection_revision=knowledge_revision, chunker_version=$3,
-    search_vector=${pageSearchVectorSql('title', '$2')} WHERE id=$1`, [pageId, sanitizeRemoteBody(lead), SEGMENTED_CHUNKER_VERSION]);
+    search_vector=${pageSearchVectorSql('title', '$2')} WHERE id=$1`, [pageId, sanitizeRemoteBody(timeline), SEGMENTED_CHUNKER_VERSION]);
 }
 
 /** The segmented branch of a page write's apply, inside the publication transaction. */
 export async function applySegmentedBody(tx: BrainEngine, input: SegmentedApplyInput): Promise<SegmentedApplied> {
   const { prepared } = input;
   let pageId = input.pageId;
+  await assertOriginUnclaimed(tx, { sourceId: input.sourceId, slug: input.slug, pageId, sourcePath: input.meta.source_path ?? null, revive: true });
   if (prepared.createRows) {
+    // A create inserts its manifest rows before the flip checks its staging: a staging a fact purge aborted (and whose
+    // claim-bearing texts it deleted) refuses here, not on the manifest's text foreign key.
+    const [staging] = await tx.executeRaw<{ state: string }>('SELECT state FROM page_body_stagings WHERE id=$1::uuid FOR UPDATE', [prepared.stagingId]);
+    if (!LIVE_STAGING_STATES.includes(staging?.state ?? '')) throw bodyStagingGoneError(input.slug, prepared.stagingId, staging?.state ?? null);
     pageId = (await tx.createSegmentedPageShell(input.slug, input.meta, { sourceId: input.sourceId })).id;
     await tx.stageManifestRows(prepared.createRows.map(row => ({ ...row, pageId: pageId! })));
   }
@@ -138,9 +176,16 @@ export async function applySegmentedBody(tx: BrainEngine, input: SegmentedApplyI
     retireInlineChunks: input.promotion, retireMaxRows: input.retireMaxRows, body: prepared.body, meta: input.meta });
   if (!prepared.createRows) await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=$1 AND body_generation=$2 AND NOT (chunk_index = ANY($3::int[]))',
     [pageId, prepared.newGeneration, prepared.stagedChunkIndexes]);
+  const createChunks = prepared.createChunks?.slug === input.slug ? prepared.createChunks.chunks : null;
+  if (createChunks?.length) await tx.stageSegmentChunks(pageId, prepared.newGeneration, createChunks);
   await faultPoint('segmented:flipped', { sourceId: input.sourceId });
   await tx.setBodyStagingState(prepared.stagingId, 'committed', { commitRequestId: input.requestId ?? null });
-  return { pageId, complete: !prepared.createRows && !flip.retireDeferred && prepared.unchunked === 0, retireDeferred: flip.retireDeferred };
+  const chunked = prepared.createRows ? createChunks !== null : prepared.unchunked === 0;
+  // The flip retires only the occurrences this write closes: rows an earlier write's deferred retirement left keep the page
+  // unsealed. Preparation read them (`priorStale`); while the generation it read is live no stale row is added, since a
+  // projection chunks only occurrences without rows and this flip retires every occurrence the preparation chunked again.
+  const complete = chunked && !flip.retireDeferred && !prepared.priorStale;
+  return { pageId, complete, retireDeferred: flip.retireDeferred };
 }
 
 /**
@@ -148,7 +193,10 @@ export async function applySegmentedBody(tx: BrainEngine, input: SegmentedApplyI
  * (the caller's inline write fills it in the same transaction). The live
  * manifest rows close at the next generation, so versions that pin earlier
  * generations keep theirs; the page's segmented chunk rows are deleted here,
- * before the inline write stages its chunks.
+ * before the inline write stages its chunks. The write holds the page row FOR
+ * UPDATE (lockPageKeys), so a chunk batch in flight (FOR KEY SHARE) commits
+ * before this delete, and a later batch of a racing preparation refuses
+ * (stageSegmentChunks: an inline page at the generation it targets).
  */
 export async function demoteSegmentedPage(tx: Pick<BrainEngine, 'executeRaw'>, pageId: number): Promise<void> {
   await tx.executeRaw(`UPDATE page_body_manifest SET gen_to=(SELECT body_generation+1 FROM pages WHERE id=$1)
@@ -172,8 +220,11 @@ export interface SegmentedImport {
   /** Set by apply. */
   applied: SegmentedApplied | null;
   apply(tx: BrainEngine, meta: SegmentedPageMeta, contextual: { mode: string; corpusGeneration: string | null }): Promise<SegmentedApplied>;
-  /** After commit: chunk and seal a page the apply left unsealed (create, deferred retirement); the projection queue retries a failure. */
-  afterCommit(engine: BrainEngine): Promise<void>;
+  /**
+   * After commit: chunk and seal a page the apply left unsealed (a create over SEGMENTED_CREATE_SEAL_MAX_BYTES, a deferred
+   * retirement); the projection queue retries a failure. Resolves to whether search sees the page now (undefined: not applied).
+   */
+  afterCommit(engine: BrainEngine): Promise<boolean | 'pending' | undefined>;
 }
 
 /**
@@ -211,10 +262,11 @@ export async function stageSegmentedImport(engine: BrainEngine, input: { slug: s
       return staged.applied;
     },
     afterCommit: async target => {
-      if (!staged.applied) return;
+      if (!staged.applied) return undefined;
       if (!staged.applied.complete) await buildSegmentedProjection(target, { sourceId: input.sourceId, slug: input.slug }).catch(() => undefined);
       const pageId = staged.applied.pageId;
       await segmentWriteScope(target, input.sourceId).then(writes => writes(exec => exec.sweepSegments({ pageId }))).catch(() => undefined);
+      return input.chunking.quarantined ? false : segmentedPageSearchable(target, input.sourceId, input.slug);
     } };
   return staged;
 }

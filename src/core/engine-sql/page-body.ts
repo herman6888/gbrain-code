@@ -9,9 +9,12 @@
  *   while a non-terminal persistence request's `intent.body_ref` names it.
  * - Manifest rows are staged before the chunk rows of their occurrences: a
  *   staged chunk row no live staging's manifest row owns is garbage.
- * - A writer that dedupes onto an existing text stages its manifest row in the
- *   same transaction as the text insert, so the FK lock protects the text from
- *   a concurrent sweep (insert-reference-before-GC).
+ * - Insert-reference-before-GC: staging a text that already exists refreshes
+ *   its `created_at` under the row lock (a concurrent sweep skips the locked
+ *   row, then sees it inside the grace window), and the text sweep keeps every
+ *   text touched since the oldest live staging of its source opened, so a
+ *   text a preparation staged or deduped onto stays until its manifest row
+ *   references it, however long publication waits.
  *
  * Statement sizes stay bounded whatever the page size: texts by
  * STAGE_BATCH_BYTES per engine, manifest and chunk rows by `jsonRowBatches`
@@ -31,8 +34,9 @@ import { jsonbParam, type SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
 import { joinFragments, sqlFragment, trustedSql, type SqlFragment } from './fragment.ts';
 import { compileRowNormalizer } from './normalize.ts';
+import { stagingNeedsTextSql } from '../page-body/schema.ts';
 
-const LIVE_STAGING_STATES = ['open', 'sealed', 'prepared'];
+export const LIVE_STAGING_STATES = ['open', 'sealed', 'prepared'];
 const TERMINAL_STAGING_STATES = ['committed', 'aborted', 'expired'];
 const NON_TERMINAL_REQUEST_STATES = ['queued', 'running', 'recovering'];
 
@@ -55,24 +59,37 @@ export async function allocateBodyOccurrenceIds(exec: SqlExecutor, count: number
   return rows.map(row => Number(row.id));
 }
 
-export async function stageSegmentTexts(exec: SqlExecutor, sourceId: string, texts: readonly SegmentTextInput[]): Promise<{ inserted: number }> {
+/**
+ * With `stagingId`, each batch first records its texts under the staging (page_body_staging_texts), so a page purge
+ * that runs while the write is unpublished keeps them; recorded before the upsert, a text a purge deleted in between is
+ * inserted again by it.
+ */
+export async function stageSegmentTexts(exec: SqlExecutor, sourceId: string, texts: readonly SegmentTextInput[],
+  opts: { stagingId?: string } = {}): Promise<{ inserted: number }> {
   const maxBytes = stageBatchBytes(exec);
   const maxRows = Math.floor(exec.capabilities.maxBindParamsPerStatement / 5);
   let inserted = 0;
   let batch: SqlFragment[] = [];
+  let batchShas = new Set<string>();
   let batchBytes = 0;
   const flush = async () => {
     if (batch.length === 0) return;
-    const { affectedRows } = await exec.run(sqlFragment`INSERT INTO page_segment_texts (source_id, sha256, byte_len, line_count, body)
-      VALUES ${joinFragments(batch, ', ')} ON CONFLICT (source_id, sha256) DO NOTHING`);
-    inserted += affectedRows;
+    if (opts.stagingId !== undefined) await exec.run(sqlFragment`INSERT INTO page_body_staging_texts (staging_id, source_id, sha256)
+      SELECT ${opts.stagingId}::uuid, ${sourceId}, decode(h, 'hex') FROM unnest(${[...batchShas]}::text[]) AS h ON CONFLICT DO NOTHING`);
+    const { rows } = await exec.run<{ inserted: boolean }>(sqlFragment`INSERT INTO page_segment_texts (source_id, sha256, byte_len, line_count, body)
+      VALUES ${joinFragments(batch, ', ')} ON CONFLICT (source_id, sha256) DO UPDATE SET created_at = now() RETURNING (xmax = 0) AS inserted`);
+    inserted += rows.filter(row => row.inserted).length;
     batch = [];
+    batchShas = new Set();
     batchBytes = 0;
     await yieldTurn();
   };
   for (const text of texts) {
+    const sha = hex(text.sha256);
+    if (batchShas.has(sha)) continue;
     if (batch.length > 0 && (batchBytes + text.body.byteLength > maxBytes || batch.length >= maxRows)) await flush();
-    batch.push(sqlFragment`(${sourceId}, decode(${hex(text.sha256)}, 'hex'), ${text.body.byteLength}::int, ${text.lineCount}::int,
+    batchShas.add(sha);
+    batch.push(sqlFragment`(${sourceId}, decode(${sha}, 'hex'), ${text.body.byteLength}::int, ${text.lineCount}::int,
       ${Buffer.from(text.body.buffer, text.body.byteOffset, text.body.byteLength)}::bytea)`);
     batchBytes += text.body.byteLength;
   }
@@ -177,6 +194,25 @@ export async function stageSegmentChunks(exec: SqlExecutor, pageId: number, gene
       // Lock-census: COMPLIANT — key is the page id, unique brain-wide.
       await tx.run(sqlFragment`SELECT pg_advisory_xact_lock(hashtextextended('gbrain:page-body-chunks:' || ${pageId}::text, 0))`);
     }
+    // A preparation stages above the live generation and a projection at it, on a segmented page. Rows for a generation the
+    // page has passed, or reached as an inline page, belong to a write that cannot publish. Read after the key-share lock:
+    // a demotion holds the row FOR UPDATE (lockPageKeys) until it commits, so this read sees it.
+    const { rows: pages } = await tx.run<{ body_generation: unknown; body_storage: string; slug: string }>(sqlFragment`
+      SELECT body_generation, body_storage, slug FROM pages WHERE id = ${pageId}`);
+    const live = Number(pages[0]?.body_generation);
+    // At the live generation only occurrences its published manifest holds take rows: a preparation that lost the flip to
+    // another write of the same generation still holds its own (unpublished) occurrences, and a row of one would be
+    // searchable on the sealed page (chunkVisibleFilter reads the generation alone).
+    const unpublished = pages[0]?.body_storage === 'segmented' && generation === live && (await tx.run(sqlFragment`
+      SELECT 1 FROM unnest(${[...new Set(chunks.map(chunk => chunk.occurrence_id))]}::bigint[]) AS o(id)
+       WHERE NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.page_id = ${pageId} AND m.occurrence_id = o.id AND m.staging_id IS NULL
+         AND m.gen_from <= ${generation}::bigint AND (m.gen_to IS NULL OR m.gen_to > ${generation}::bigint))
+       LIMIT 1`)).rows.length > 0;
+    if (!pages[0] || generation < live || (generation === live && pages[0].body_storage !== 'segmented') || unpublished) {
+      throw opError('revision_changed', `Page ${pages[0]?.slug ?? pageId} moved to body generation ${pages[0] ? live : 'none'} while chunks for generation ${generation} were staged.`,
+        'Another write published first. Read the page again and repeat this write against its current revision.',
+        { legacy_error: 'invalid_params', detail: JSON.stringify({ staged_generation: generation, current_generation: pages[0] ? live : null }) });
+    }
     // chunk-visibility-ok: chunk_index is never reused, so the next index is past every row, staged and retired included
     const { rows } = await tx.run<{ next: unknown }>(sqlFragment`SELECT COALESCE(MAX(chunk_index), -1) + 1 AS next FROM content_chunks WHERE page_id = ${pageId}`);
     const first = Number(rows[0]?.next ?? 0);
@@ -231,6 +267,7 @@ function metaParams(meta: SegmentedPageMeta) {
 
 export async function createSegmentedPageShell(exec: SqlExecutor, slug: string, meta: SegmentedPageMeta, opts: { sourceId: string }): Promise<{ id: number }> {
   const m = metaParams(meta);
+  // origin-guard-ok: applySegmentedBody runs assertOriginUnclaimed in this transaction first
   const { rows } = await exec.run<{ id: number }>(sqlFragment`
     INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, updated_at, effective_date,
       effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at,
@@ -268,15 +305,11 @@ export async function flipBodyGeneration(exec: SqlExecutor, input: BodyFlipInput
             mcp: { tool: 'get_page', arguments: { slug: page.slug, source_id: page.source_id, body: 'none' } } }) });
     }
     const { rows: stagings } = await tx.run<{ state: string }>(sqlFragment`SELECT state FROM page_body_stagings WHERE id = ${input.stagingId}::uuid FOR UPDATE`);
-    if (!LIVE_STAGING_STATES.includes(stagings[0]?.state ?? '')) {
-      throw opError('body_staging_expired', `The staged body of this write to ${page.slug} is ${stagings[0]?.state ?? 'gone'}, so nothing was published.`,
-        'The write waited past its staging deadline and its staged segments were collected. Send the write again.',
-        { detail: JSON.stringify({ staging_id: input.stagingId, state: stagings[0]?.state ?? null }) });
-    }
+    if (!LIVE_STAGING_STATES.includes(stagings[0]?.state ?? '')) throw bodyStagingGoneError(page.slug, input.stagingId, stagings[0]?.state ?? null);
     const newLive = sqlFragment`(SELECT s.occurrence_id FROM page_body_manifest s WHERE s.page_id = ${input.pageId}
         AND (s.staging_id = ${input.stagingId}::uuid
           OR (s.staging_id IS NULL AND s.gen_to IS NULL AND NOT (s.occurrence_id = ANY(${[...input.closeOccurrences]}::bigint[])))))`;
-    const retire = sqlFragment`c.page_id = ${input.pageId} AND c.retired_generation IS NULL AND (
+    const retire = sqlFragment`c.page_id = ${input.pageId} AND (
         (c.occurrence_id = ANY(${[...input.retireChunkOccurrences]}::bigint[]) AND c.body_generation <= ${input.expectedGeneration}::bigint)
         OR (${input.retireInlineChunks === true}::boolean AND c.body_generation IS NULL)
         OR (c.body_generation = ${input.newGeneration}::bigint AND c.occurrence_id NOT IN ${newLive}))`;
@@ -286,12 +319,13 @@ export async function flipBodyGeneration(exec: SqlExecutor, input: BodyFlipInput
     const retireDeferred = toRetire > input.retireMaxRows;
     await tx.run(sqlFragment`UPDATE page_body_manifest SET gen_to = ${input.newGeneration}::bigint
       WHERE page_id = ${input.pageId} AND gen_to IS NULL AND staging_id IS NULL AND occurrence_id = ANY(${[...input.closeOccurrences]}::bigint[])`);
-    // Retired rows are deleted, not marked: GC would delete a marked row at once (retired_generation <= the live generation),
-    // nothing reads one (vector reuse runs during preparation, against live rows), and marking rewrote each row's HNSW entry.
+    // Retired rows are deleted, not marked (marking rewrote each row's HNSW entry). Their occurrences are closed above, so a
+    // deferred retirement's rows are invisible to every reader (chunkGenerationFilter) before the projection job deletes them.
     const retired = retireDeferred || toRetire === 0 ? 0 : (await tx.run(sqlFragment`DELETE FROM content_chunks c WHERE ${retire}`)).affectedRows;
     await tx.run(sqlFragment`UPDATE page_body_manifest SET staging_id = NULL WHERE page_id = ${input.pageId} AND staging_id = ${input.stagingId}::uuid`);
     const m = metaParams(input.meta);
     const b = input.body;
+    // origin-guard-ok: applySegmentedBody runs assertOriginUnclaimed in this transaction first
     await tx.run(sqlFragment`UPDATE pages SET
         body_storage = 'segmented', compiled_truth = NULL, timeline = NULL, body_generation = ${input.newGeneration}::bigint,
         content_hash = ${b.content_hash}, body_bytes = ${b.body_bytes}::bigint, truth_bytes = ${b.truth_bytes}::bigint,
@@ -308,6 +342,15 @@ export async function flipBodyGeneration(exec: SqlExecutor, input: BodyFlipInput
       WHERE id = ${input.pageId}`);
     return { retiredChunks: retired, retireDeferred };
   });
+}
+
+/** A write's staging is no longer live, so the write publishes nothing: expired and collected, or aborted (a fact purge removed text it staged). */
+export function bodyStagingGoneError(slug: string, stagingId: string, state: string | null) {
+  return opError('body_staging_expired', `The staged body of this write to ${slug} is ${state ?? 'gone'}, so nothing was published.`,
+    state === 'aborted'
+      ? 'The staging was aborted (a fact purge removed text it staged, or its preparation failed). Send the write again; purged content is refused.'
+      : 'The write waited past its staging deadline and its staged segments were collected. Send the write again.',
+    { detail: JSON.stringify({ staging_id: stagingId, state }) });
 }
 
 export async function openBodyStaging(exec: SqlExecutor, input: BodyStagingInput): Promise<void> {
@@ -332,11 +375,17 @@ export async function setBodyStagingState(exec: SqlExecutor, id: string, state: 
 /**
  * Garbage collection (spec 3.5). Roots: each segmented page's live generation,
  * every generation a page_versions row references, and staged rows of live
- * stagings (`liveStagingIds`). Deletes chunk rows marked retired at or below
- * the live generation (the flip deletes the rows it retires, so none are
- * marked today), staged chunk rows no live staging owns, manifest rows outside every root, and unreferenced
- * texts older than the grace window (a text a concurrent writer is
- * referencing is row-locked by its FK check and skipped). With
+ * stagings (`liveStagingIds`). Deletes staged chunk rows (above the page's
+ * generation) no live staging owns, manifest rows outside every root, and
+ * unreferenced texts older than the grace window and older than every live
+ * staging of their source, that no live staging recorded
+ * (page_body_staging_texts: a create that deduped onto an older text holds it
+ * until it publishes); a text a concurrent writer is referencing is row-locked
+ * by its FK check or its refresh and skipped. A page-scoped sweep
+ * (`pageId`) considers only the texts its own manifest deletes released, so
+ * its cost is the page's, not the source's; the source-wide sweep collects the
+ * rest. Rows of retired occurrences are deleted by the flip or, deferred, by
+ * the projection job; until then no reader sees them. With
  * `expireStagings`, stagings past a deadline (and not request-held) become
  * `expired`, every non-live staging loses its parts, and terminal stagings
  * (committed, aborted, expired) are deleted once BODY_STAGING_HARD_MS has
@@ -368,24 +417,39 @@ export async function sweepSegments(exec: SqlExecutor, opts: SegmentSweepOptions
         AND ${stagingScope} AND s.id::text NOT IN ${liveStagingIds}`);
   }
   const { affectedRows: retiredChunksDeleted } = await exec.run(sqlFragment`DELETE FROM content_chunks c USING pages p
-    WHERE c.page_id = p.id AND ${pageScope} AND (
-      (c.retired_generation IS NOT NULL AND c.retired_generation <= p.body_generation)
-      OR (c.body_generation > p.body_generation AND NOT EXISTS (SELECT 1 FROM page_body_manifest m
-            WHERE m.page_id = c.page_id AND m.occurrence_id = c.occurrence_id AND m.staging_id::text IN ${liveStagingIds})))`);
-  const { affectedRows: stagedRowsDeleted } = await exec.run(sqlFragment`DELETE FROM page_body_manifest m USING pages p
-    WHERE m.page_id = p.id AND ${pageScope} AND m.staging_id IS NOT NULL AND m.staging_id::text NOT IN ${liveStagingIds}`);
-  const { affectedRows: closedRowsDeleted } = await exec.run(sqlFragment`DELETE FROM page_body_manifest m USING pages p
+    WHERE c.page_id = p.id AND ${pageScope} AND c.body_generation IS NOT NULL AND c.body_generation > p.body_generation
+      AND NOT EXISTS (SELECT 1 FROM page_body_manifest m
+            WHERE m.page_id = c.page_id AND m.occurrence_id = c.occurrence_id AND m.staging_id::text IN ${liveStagingIds})`);
+  // Rows at or below the live generation of an occurrence that only a dead staging owns: a preparation that lost the flip
+  // to another write of its generation and staged a late batch before stageSegmentChunks refused one. Found through the
+  // dead staging's manifest rows (deleted next), so the sweep's cost is the garbage's, not the page's.
+  const { affectedRows: orphanedChunksDeleted } = await exec.run(sqlFragment`DELETE FROM content_chunks c USING page_body_manifest d, pages p
+    WHERE d.page_id = p.id AND ${pageScope} AND d.staging_id IS NOT NULL AND d.staging_id::text NOT IN ${liveStagingIds}
+      AND c.page_id = d.page_id AND c.occurrence_id = d.occurrence_id AND c.body_generation IS NOT NULL AND c.body_generation <= p.body_generation
+      AND NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.page_id = c.page_id AND m.occurrence_id = c.occurrence_id
+            AND (m.staging_id IS NULL OR m.staging_id::text IN ${liveStagingIds}))`);
+  const released = new Set<string>();
+  const returning = opts.pageId !== undefined ? sqlFragment`RETURNING encode(m.sha256, 'hex') AS sha` : sqlFragment``;
+  const { rows: stagedRows, affectedRows: stagedRowsDeleted } = await exec.run<{ sha: string }>(sqlFragment`DELETE FROM page_body_manifest m USING pages p
+    WHERE m.page_id = p.id AND ${pageScope} AND m.staging_id IS NOT NULL AND m.staging_id::text NOT IN ${liveStagingIds} ${returning}`);
+  const { rows: closedRows, affectedRows: closedRowsDeleted } = await exec.run<{ sha: string }>(sqlFragment`DELETE FROM page_body_manifest m USING pages p
     WHERE m.page_id = p.id AND ${pageScope} AND m.staging_id IS NULL
       AND NOT (p.body_storage = 'segmented' AND m.gen_from <= p.body_generation AND (m.gen_to IS NULL OR m.gen_to > p.body_generation))
       AND NOT EXISTS (SELECT 1 FROM page_versions v WHERE v.page_id = m.page_id AND v.body_generation >= m.gen_from
-                       AND (m.gen_to IS NULL OR v.body_generation < m.gen_to))`);
+                       AND (m.gen_to IS NULL OR v.body_generation < m.gen_to)) ${returning}`);
+  for (const row of [...stagedRows, ...closedRows]) released.add(row.sha);
   const graceMs = opts.graceMs ?? SEGMENT_TEXT_GC_GRACE_MS;
-  const textScope = opts.sourceId !== undefined ? sqlFragment`AND t.source_id = ${opts.sourceId}`
-    : opts.pageId !== undefined ? sqlFragment`AND t.source_id = (SELECT source_id FROM pages WHERE id = ${opts.pageId}::int)` : sqlFragment``;
-  const { affectedRows: textsDeleted } = await exec.run(sqlFragment`DELETE FROM page_segment_texts d
+  const textScope = opts.pageId !== undefined
+    ? sqlFragment`AND t.source_id = (SELECT source_id FROM pages WHERE id = ${opts.pageId}::int)
+        AND t.sha256 = ANY(SELECT decode(h, 'hex') FROM unnest(${[...released]}::text[]) AS h)`
+    : opts.sourceId !== undefined ? sqlFragment`AND t.source_id = ${opts.sourceId}` : sqlFragment``;
+  const textsDeleted = opts.pageId !== undefined && released.size === 0 ? 0 : (await exec.run(sqlFragment`DELETE FROM page_segment_texts d
     WHERE (d.source_id, d.sha256) IN (SELECT t.source_id, t.sha256 FROM page_segment_texts t
       WHERE t.created_at < ${now} - (${graceMs}::bigint * interval '1 millisecond') ${textScope}
         AND NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.source_id = t.source_id AND m.sha256 = t.sha256)
-      FOR UPDATE SKIP LOCKED)`);
-  return { retiredChunksDeleted, manifestRowsDeleted: stagedRowsDeleted + closedRowsDeleted, textsDeleted, stagingsExpired };
+        AND NOT EXISTS (SELECT 1 FROM page_body_stagings s WHERE s.source_id = t.source_id AND s.created_at <= t.created_at
+                         AND s.id::text IN ${liveStagingIds})
+        AND NOT ${trustedSql(stagingNeedsTextSql('t'))}
+      FOR UPDATE SKIP LOCKED)`)).affectedRows;
+  return { retiredChunksDeleted: retiredChunksDeleted + orphanedChunksDeleted, manifestRowsDeleted: stagedRowsDeleted + closedRowsDeleted, textsDeleted, stagingsExpired };
 }

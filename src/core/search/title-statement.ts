@@ -27,6 +27,8 @@ export interface SearchTitlesDialect {
   relaxedPrefersIndex: boolean;
   /** Project `stale` from timeline_entries (PGLite); otherwise `false`. */
   staleProbe: boolean;
+  /** chunkManifestReads; unset reads the manifest. */
+  chunkManifest?: boolean;
 }
 
 export interface SearchTitlesStatement {
@@ -107,7 +109,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
   const sql = `
     WITH top_pages AS (
       SELECT p.slug, p.id AS page_id, p.title, p.type, p.source_id,
-        p.effective_date, p.effective_date_source, p.updated_at, p.body_generation,
+        p.effective_date, p.effective_date_source, p.updated_at, p.body_storage, p.body_generation,
         (lower(btrim(p.title, ' "''' || chr(160))) = $2) AS exact_title,
         ${rankSql} * ${sourceFactorCase} AS score
       FROM pages p
@@ -131,7 +133,7 @@ export function buildSearchTitlesStatement(query: string, opts: SearchOpts | und
     LEFT JOIN LATERAL (
       SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
       FROM content_chunks cc
-      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc')}
+      WHERE cc.page_id = tp.page_id AND ${chunkGenerationFilter('tp', 'cc', dialect.chunkManifest ?? true)}
         AND cc.modality = 'text'
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
       ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC

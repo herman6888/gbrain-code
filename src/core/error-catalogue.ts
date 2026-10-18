@@ -168,19 +168,27 @@ export function canonicalCodeFor(wire: string): string {
   return CANONICAL_BY_LEGACY.get(wire) ?? wire;
 }
 
-/** An unregistered code is a server fault by construction (the AST test keeps that set empty). */
-export function codeClass(code: string): ErrorClass {
-  return isRegistryCode(code) ? (CODES[code] as CodeEntry).class : 'server';
+function reasonOverride(code: string, reason: string | undefined): { class: ErrorClass; exit?: number } | undefined {
+  return reason === undefined || !isRegistryCode(code) ? undefined : (CODES[code] as CodeEntry).reason_overrides?.[reason];
 }
 
-export function codeRetryable(code: string): boolean {
+/** An unregistered code is a server fault by construction (the AST test keeps that set empty). A reason override replaces the code's class. */
+export function codeClass(code: string, reason?: string): ErrorClass {
+  return reasonOverride(code, reason)?.class ?? (isRegistryCode(code) ? (CODES[code] as CodeEntry).class : 'server');
+}
+
+export function codeRetryable(code: string, reason?: string): boolean {
   if (!isRegistryCode(code)) return false;
+  const override = reasonOverride(code, reason);
+  if (override) return override.class === 'retryable';
   const e = CODES[code] as CodeEntry;
   return e.retryable ?? e.class === 'retryable';
 }
 
-/** CLI exit code for an error code (A3 table): entry override, else 1. */
-export function exitCodeForCode(code: string): number {
+/** CLI exit code for an error code (A3 table): reason override, then entry override, else 1. */
+export function exitCodeForCode(code: string, reason?: string): number {
+  const override = reasonOverride(code, reason);
+  if (override) return override.exit ?? 1;
   return isRegistryCode(code) ? (CODES[code] as CodeEntry).exit ?? 1 : 1;
 }
 

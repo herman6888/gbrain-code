@@ -10,7 +10,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, symlinkSync,
+  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, symlinkSync, truncateSync,
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -19,7 +19,7 @@ import {
   workspacePush, acquirePushLock, pushLockDir, pushStatusPath, pushStatusPathForRoot,
   readPushStatuses, readPushStatusForRoot, summarizePushStatuses, verifyRemotePrivacy,
   parseGithubOwnerRepo, resolveWorkspaceRoot, PUSH_LOCK_STALE_MS, PUSH_DENY_GLOBS,
-  sanitizePushReason, SECRET_SCAN_REFUSAL_DOCS,
+  sanitizePushReason, SECRET_SCAN_REFUSAL_DOCS, PUSH_STREAM_SCAN_MAX_BYTES,
 } from '../src/core/workspace-push.ts';
 import { SCAN_ALLOW_FILENAME } from '../src/core/secret-scan.ts';
 import { visibilityCachePath } from '../src/core/repo-visibility.ts';
@@ -363,17 +363,20 @@ describe('secret-scan gate — fails CLOSED on unscannable staged blobs', () => 
     expect(readPushStatuses()[0]!.ok).toBe(false);
   }, T);
 
-  test('an oversized staged blob (> scan cap) BLOCKS the push', async () => {
-    // 26MiB > SCAN_MAX_FILE_BYTES (25MiB): too big to scan in-memory, so it
-    // must block rather than sail through the sole pre-push secret gate.
-    writeFileSync(join(work, 'big.bin'), Buffer.alloc(26 * 1024 * 1024, 0x61));
+  test('an oversized staged blob (> scan ceiling) BLOCKS the push', async () => {
+    // Over PUSH_STREAM_SCAN_MAX_BYTES: too big even for the streamed scan
+    // (blobs over the 25 MiB in-memory cap are streamed up to it,
+    // test/workspace-push-large-blob.serial.test.ts), so it must block rather
+    // than sail through the sole pre-push secret gate. Sparse: no disk blocks.
+    writeFileSync(join(work, 'big.bin'), '');
+    truncateSync(join(work, 'big.bin'), PUSH_STREAM_SCAN_MAX_BYTES + 1);
     const before = originHead(bare);
     const beforeCount = commitCount(work);
     const r = await push();
     expect(r.status).toBe('blocked_unscannable');
     expect(r.ok).toBe(false);
     expect(r.unscannable?.some((u) => u.startsWith('big.bin'))).toBe(true);
-    expect(r.reason).toContain('scan cap');
+    expect(r.reason).toContain('scan ceiling');
     expect(commitCount(work)).toBe(beforeCount); // nothing committed
     expect(originHead(bare)).toBe(before);       // nothing pushed
     expect(git(work, 'diff', '--cached', '--name-only')).toBe('');

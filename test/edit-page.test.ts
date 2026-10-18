@@ -19,6 +19,7 @@ import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { renderTakesFence } from '../src/core/takes-fence.ts';
 import { editDiff, editableView } from '../src/core/persistence/page-edit.ts';
+import { materializedPage } from '../src/core/persistence/segmented-apply.ts';
 import { STARTER_OPS } from '../src/mcp/surface.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import type { Page } from '../src/core/types.ts';
@@ -169,7 +170,8 @@ describe('edit_page matching', () => {
     const result = await edit('notes/long', [{ old_text: 'Row 25000 of the long page.', new_text: 'Row 25000 was edited.' }], { revision: head.body.revision });
     expect({ isError: result.isError, text: result.text.slice(0, 300) }).toMatchObject({ isError: false });
     const snapshot = (await engine.readPageSnapshot('notes/long', { sourceId: 'default' }))!;
-    const line = editableView(snapshot.page as Page, snapshot.tags, true).split('\n').indexOf('Row 25000 was edited.') + 1;
+    // Wave B: the 50k-line page is over 1 MiB, so it may be stored in segments; read it back whole (within 24 MiB) to locate the line.
+    const line = editableView(await materializedPage(engine, snapshot.page as Page), snapshot.tags, true).split('\n').indexOf('Row 25000 was edited.') + 1;
     expect(line).toBeGreaterThan(25_000);
     expect(result.body.diff).toBe([
       '--- a/notes/long.md',

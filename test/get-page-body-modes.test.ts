@@ -65,6 +65,8 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  // Wave A inline behaviour: pin segmented storage off (segmented reads of get_page and gbrain get are lane 2a's).
+  await engine.setConfig('pages.segmented_storage', 'off');
   await put('notes/small', 'A small page about acme-example.');
   await put('logs/big', conversation(9000));
   await put('logs/mid', conversation(6000));

@@ -26,7 +26,7 @@ import { importFromContent } from '../../src/core/import-file.ts';
 import { prepareEmbeddingProjections } from '../../src/core/embedding-readiness.ts';
 import { countSegmentedEmbedRows, embedSegmentedPage, readSegmentedEmbedPage } from '../../src/core/page-body/segmented-embedding.ts';
 import { estimatePageEmbedUsd, holdPageEmbedding, listBudgetLimitedPages, PAGE_EMBED_CAP_KEY, readPageSizeStates } from '../../src/core/page-embedding-budget.ts';
-import { PAGE_INLINE_MAX_BYTES, SEGMENTED_DEMOTE_AT_OR_BELOW_BYTES, SEGMENTED_PROMOTE_ABOVE_BYTES } from '../../src/core/page-body/limits.ts';
+import { PAGE_INLINE_MAX_BYTES, SEGMENTED_CREATE_SEAL_MAX_BYTES, SEGMENTED_DEMOTE_AT_OR_BELOW_BYTES, SEGMENTED_PROMOTE_ABOVE_BYTES } from '../../src/core/page-body/limits.ts';
 import { installFaultHook } from '../../src/core/persistence/fault-points.ts';
 import { resolveActiveEmbeddingColumnFromEngine } from '../../src/core/search/embedding-column.ts';
 import { conversationPage } from '../helpers/conversation-page.ts';
@@ -160,7 +160,7 @@ for (const kind of testBackends()) {
       const UNSEALED = 'notes/unsealed';
       beforeEach(async () => {
         installFaultHook(point => { if (point === 'segmented:projection_staged') throw new Error('projection died'); });
-        await importFromContent(engine, UNSEALED, conversationPage(SEGMENTED_PROMOTE_ABOVE_BYTES + 128 * 1024, { seed: 9 }), { sourceId: 'default', noEmbed: true });
+        await importFromContent(engine, UNSEALED, conversationPage(SEGMENTED_CREATE_SEAL_MAX_BYTES + 128 * 1024, { seed: 9 }), { sourceId: 'default', noEmbed: true });
         installFaultHook(undefined);
         const page = await segmentedPageRow(engine, UNSEALED);
         await engine.executeRaw('DELETE FROM content_chunks WHERE page_id = $1', [page.id]);

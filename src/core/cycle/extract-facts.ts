@@ -45,7 +45,9 @@
  * `guardTriggered` and the halt rollup still report the run; status returns
  * `warn` naming each failed page. Rows with no backing page or checkout
  * (slugify-floor / stub-guard-blocked slugs from the inline writer) are
- * structurally unfenceable and never gate.
+ * structurally unfenceable and never gate, and neither are the rows of a
+ * clone gbrain owns (#6946), which stay database-only and out of
+ * reconciliation.
  */
 
 import { withUnmanagedBeliefs } from '../belief/projection-point.ts';
@@ -53,6 +55,7 @@ import { isQuarantined } from '../quarantine.ts';
 import { existsSync, readFileSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
+import type { Page } from '../types.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import { isTerminal, type WriteRequest } from '../persistence/model.ts';
@@ -69,6 +72,7 @@ import { resolveManagedFactsEmbedding } from '../persistence/facts-maintenance.t
 import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { REVISION_BACKFILL_PENDING } from '../page-state/types.ts';
 import { opError, OperationError } from '../ops/contract.ts';
+import { ItemRun } from '../item-failure.ts';
 import {
   resolveSupersededByRow,
   supersessionChainOf,
@@ -78,7 +82,8 @@ import {
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { fenceUnfencedFacts, planUnfencedFacts } from '../facts/unfenced-facts.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { factsFenceSection, factsFenceSections, parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { factsFenceView } from '../facts-fence.ts';
+import { segmentedBodyMatchesFile, segmentedFactsFenceView } from '../page-body/segment-facts.ts';
 import {
   duplicateActiveFenceRows,
   extractFactsFromFenceText,
@@ -93,6 +98,7 @@ import { embed, getEmbeddingDimensions, getEmbeddingModel, isAvailable } from '.
 import { isAborted } from '../abort-check.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { urlCloneReadOnly } from '../url-clone.ts';
 import { acquirePageLock } from '../page-lock.ts';
 import {
   lockReconcileRevision,
@@ -208,6 +214,17 @@ async function syncSupersession(
   return { warnings, changed };
 }
 
+/** The pages-table body a reconcile read: its strings, or a segmented page whose body stays in its segments. */
+type CachedBody = { id: number; body_storage?: Page['body_storage']; compiled_truth: string | null; timeline: string | null };
+
+/** The body a reconcile planned from is still the stored one: the same strings, or the same segmented body (content hash and size). */
+function sameBody(current: Page, planned: Page): boolean {
+  if (isSegmentedPage(current) || isSegmentedPage(planned)) {
+    return isSegmentedPage(current) && isSegmentedPage(planned) && current.content_hash === planned.content_hash && current.body_bytes === planned.body_bytes;
+  }
+  return current.compiled_truth === planned.compiled_truth && current.timeline === planned.timeline;
+}
+
 /**
  * Destructive reconciliation may only trust the pages-table body when it
  * still matches the canonical Markdown file. The fact writer deliberately
@@ -224,8 +241,7 @@ async function canonicalCacheState(
   engine: BrainEngine,
   slug: string,
   sourceId: string,
-  cachedCompiledTruth: string,
-  cachedTimeline: string,
+  cached: CachedBody,
 ): Promise<'fresh' | 'stale' | 'unavailable'> {
   // sync.write_through=off: the fence writers already treat the file as
   // non-canonical (fence-write.ts legacy fallback), so a stale mirror file must
@@ -234,9 +250,10 @@ async function canonicalCacheState(
   const target = await resolvePageWriteTarget(engine, slug, sourceId);
   if (!target.ok || !existsSync(target.filePath)) return 'unavailable';
   try {
+    if (isSegmentedPage(cached)) return await segmentedBodyMatchesFile(engine, cached, target.filePath);
     const canonical = parseMarkdown(readFileSync(target.filePath, 'utf-8'), target.filePath);
-    return canonical.compiled_truth === cachedCompiledTruth.trim()
-      && canonical.timeline === cachedTimeline.trim()
+    return canonical.compiled_truth === (cached.compiled_truth ?? '').trim()
+      && canonical.timeline === (cached.timeline ?? '').trim()
       ? 'fresh'
       : 'stale';
   } catch {
@@ -248,17 +265,10 @@ async function refuseDestructiveReconcileOnStaleCache(
   engine: BrainEngine,
   slug: string,
   sourceId: string,
-  cachedCompiledTruth: string,
-  cachedTimeline: string,
+  cached: CachedBody,
   warnings: string[],
 ): Promise<boolean> {
-  const state = await canonicalCacheState(
-    engine,
-    slug,
-    sourceId,
-    cachedCompiledTruth,
-    cachedTimeline,
-  );
+  const state = await canonicalCacheState(engine, slug, sourceId, cached);
   if (state !== 'stale') return false;
   warnings.push(
     `${slug}: FACTS_PAGE_CACHE_STALE: canonical Markdown differs from the pages cache; ` +
@@ -357,6 +367,10 @@ async function listExistingFactsForPage(
   );
 }
 
+/** The page a reconcile plans from: its body as strings, or a segmented page whose fences are read from its segments. */
+type PageFenceInput = { id?: number; slug?: string; source_id?: string; body_storage?: Page['body_storage']; compiled_truth: string | null; timeline: string | null;
+  effective_date?: Date | string | null };
+
 interface FenceReconcilePlan {
   /** Rows the parsed fence carries (duplicates included), for the pages-with-facts count. */
   fenceRows: number;
@@ -375,13 +389,13 @@ interface FenceReconcilePlan {
  * not authoritative (warnings are appended): a warning-bearing parse or a
  * fence in each section of the page (#6686: a split fence) preserves the page's existing index.
  */
-async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: string | null; timeline: string | null; effective_date?: Date | string | null },
-  slug: string, sourceId: string, warnings: string[]): Promise<FenceReconcilePlan | null> {
+async function planFenceReconcile(db: BrainEngine, page: PageFenceInput, slug: string, sourceId: string, warnings: string[]): Promise<FenceReconcilePlan | null> {
+  const view = isSegmentedPage(page) ? await segmentedFactsFenceView(db, page) : factsFenceView(page);
   // #6686: a lone fence below the timeline sentinel that parses cleanly is the page's fence, read where the writers
   // edit it; one that does not parse keeps the #3625 guard below.
-  const below = factsFenceSection(page) === 'timeline' ? parseFactsFence(page.timeline ?? '') : null;
+  const below = !view.sections.body && view.sections.timeline ? view.timeline : null;
   const lone = below !== null && below.warnings.length === 0;
-  const parsed = lone ? below : parseFactsFence(page.compiled_truth ?? '');
+  const parsed = lone ? below : view.body;
   if (parsed.warnings.length > 0) {
     // The parser deliberately skips malformed rows and returns any rows it
     // could still recover. That partial result is not authoritative: using
@@ -392,9 +406,9 @@ async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: strin
   // #3625: a fence below the timeline sentinel lands in page.timeline, where
   // parseFactsFence cannot see it; reading compiled_truth alone would treat
   // its rows as deleted. timelineHasGenuineFactsFenceMarker explains the scan.
-  if (!lone && timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
+  if (!lone && view.timelineMarker) {
     // #6686: a fence in each section (a writer added one above the sentinel) is merged by an explicit repair.
-    if (factsFenceSections(page).body) {
+    if (view.sections.body) {
       warnings.push(`${slug}: FACTS_FENCE_BELOW_SENTINEL: the page holds a ## Facts fence above the <!-- timeline --> sentinel and another below it `
         + `(a split fence), so extract_facts leaves its indexed facts as they are. Preview merging them into one with gbrain repair split-facts --source ${sourceId}, `
         + 'then apply the hash it prints.');
@@ -684,75 +698,6 @@ export interface ExtractFactsResult {
 }
 
 /**
- * #3625 (adversarial review, 2 rounds): whether `timeline` contains a
- * GENUINE Facts fence marker, as opposed to the marker text merely being
- * mentioned inside a fenced code example or quoted prose. A naive
- * `.includes(FACTS_FENCE_BEGIN)` false-positives on both — e.g. a page
- * whose real fence WAS removed, but whose timeline documents the fence
- * syntax in a ```markdown code block or a `> ...` blockquote, would wrongly
- * be treated as "misplaced" and block a genuine deletion, leaving stale
- * facts indexed indefinitely.
- *
- * Round 1 tried reusing fence-scan.ts's scanFencedBlocks() + string removal
- * of its extracted fence bodies. Round-2 adversarial review broke that:
- * scanFencedBlocks normalizes line endings (splits on `\r\n|\r|\n`, joins
- * fence bodies with plain `\n`) and strips opener indentation before
- * returning fence text — so `stripped.split(fenceText).join('')` on the
- * ORIGINAL (un-normalized) string silently fails to match a CRLF or
- * indented code block, leaving the marker inside it undetected and still
- * false-positive. Reconstructed-text removal can't safely undo a lossy
- * normalization.
- *
- * Fix: a self-contained single-pass line scanner (mirroring fence-scan.ts's
- * own CommonMark-subset opener/closer grammar, applied directly against
- * `timeline.split(/\r\n|\r|\n/)` — ONE split, no re-normalization, no
- * text-based removal) that skips lines between a real ``` /~~~ opener and
- * its closer, then checks whether any remaining line, trimmed, exactly
- * equals the marker. A real fence marker is always written as its own line
- * (see FENCE_BODY-shaped output from fence-write.ts / upsertFactRow), so
- * exact-line-match — on lines outside any code fence — rules out both
- * hazards without needing a full markdown AST (mirrors
- * findTimelineSplitIndex's own `trimmed === sentinel` pattern for the same
- * class of problem on the timeline sentinel itself). An unclosed opener
- * runs to EOF (matches fence-scan.ts's documented behavior) — a marker
- * appearing after it is inside an ambiguous, unclosed block and is not
- * trusted as genuine.
- */
-function timelineHasGenuineFactsFenceMarker(timeline: string): boolean {
-  if (!timeline.includes(FACTS_FENCE_BEGIN)) return false;
-  const lines = timeline.split(/\r\n|\r|\n/);
-  const OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-  const CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i]!;
-    const open = OPEN_RE.exec(line);
-    if (open) {
-      const marker = open[1]!;
-      const fenceChar = marker[0]!;
-      const info = open[2]!.trim();
-      // Mirrors fence-scan.ts: a backtick opener whose info string contains
-      // a backtick is inline code, not a fence opener.
-      if (!(fenceChar === '`' && info.includes('`'))) {
-        let j = i + 1;
-        for (; j < lines.length; j++) {
-          const close = CLOSE_RE.exec(lines[j]!);
-          if (close && close[1]![0] === fenceChar && close[1]!.length >= marker.length) {
-            j++;
-            break;
-          }
-        }
-        i = j; // unclosed fence: j reaches lines.length, ending the scan
-        continue;
-      }
-    }
-    if (line.trim() === FACTS_FENCE_BEGIN) return true;
-    i++;
-  }
-  return false;
-}
-
-/**
  * Empty-fence guard (Codex R2-#7; #2484; #2646; per page, #6278): the active
  * unfenced rows the fence step left on live pages of this source, per page.
  * A row counts only when `row_num IS NULL`, its `entity_slug` resolves to a
@@ -855,9 +800,10 @@ export async function runExtractFacts(
   // the destructive reconciliation pass; the other pages reconcile.
   // #6610: rows the unbound-source policy keeps unfenced on database-only pages stay held out of reconciliation
   // but never gate the run; doctor fence_integrity names the opt-in that fences them.
+  // #6946: so do the database-only rows of a clone gbrain owns, which is never fenced.
   const pending = await pendingLegacyRows(engine, sourceId);
   const legacySlugs = new Set(pending.keys());
-  const gating = [...pending].filter(([slug]) => !unboundRefused.has(slug));
+  const gating = await urlCloneReadOnly(engine, sourceId) ? [] : [...pending].filter(([slug]) => !unboundRefused.has(slug));
   const legacyCount = gating.reduce((sum, [, n]) => sum + n, 0);
   result.legacyRowsPending = legacyCount;
   result.legacyPages = gating.map(([slug]) => slug).sort();
@@ -933,6 +879,8 @@ export async function runExtractFacts(
   result.phantomsHeldLegacyRows = phantomResult.held_legacy_rows;
   result.phantomsLockBusy = phantomResult.lock_busy;
   result.phantomsMorePending = phantomResult.more_pending;
+  for (const f of phantomResult.failures) result.warnings.push(`phantom_redirect_failed: ${f.key} (${f.code}); retry: ${(f.fix.argv ?? []).join(' ')}`);
+  if (phantomResult.stopped) result.warnings.push(`phantom_redirect_stopped: ${phantomResult.stopped.message.slice(0, 300)}`);
 
   // ── Facts of soft-deleted pages ────────────────────────────────
   // Deleting a page removes the fence that is the facts' system of record,
@@ -956,7 +904,7 @@ export async function runExtractFacts(
     // Managed: one receipted request per page, rechecked under its key, so a
     // concurrent restore is either seen as restored or waited for, never
     // expired underneath it.
-    const expired = managed ? await expireDeletedPagesManaged(engine, sourceId, managedAuthority) : await maintenanceTransaction(engine, expireDeleted);
+    const expired = managed ? await expireDeletedPagesManaged(engine, sourceId, managedAuthority, result.warnings) : await maintenanceTransaction(engine, expireDeleted);
     result.factsExpiredForDeletedPages = expired.length;
   }
 
@@ -1013,11 +961,6 @@ export async function runExtractFacts(
     revision = page.knowledge_revision ?? null;
     // #6259: a quarantined page projects no fence facts; its existing index is left as it is.
     if (isQuarantined(page.frontmatter as Record<string, unknown> | null)) return 'skipped';
-    if (isSegmentedPage(page)) {
-      result.warnings.push(`${slug}: FACTS_RECONCILE_SEGMENTED: the page body is stored in segments, which fence reconcile cannot read yet; its existing facts index is preserved`);
-      return 'skipped';
-    }
-
     const plan = await planFenceReconcile(engine, page, slug, sourceId, result.warnings);
     if (!plan) return 'invalid';
     if (plan.fenceRows > 0) result.pagesWithFacts += 1;
@@ -1081,7 +1024,7 @@ export async function runExtractFacts(
           opts.signal?.throwIfAborted();
           if (watermark && !await lockReconcileRevision(tx, sourceId, slug, page.knowledge_revision ?? null)) return null;
           const current = await tx.getPage(slug, { sourceId });
-          if (!current || current.compiled_truth !== page.compiled_truth || current.timeline !== page.timeline) return null;
+          if (!current || !sameBody(current, page)) return null;
           const written = await writeFenceReconcile(tx, sourceId, slug, plan, writes, opts.signal);
           if (watermark && !deferInserts) await settleFactsReconcile(tx, sourceId, slug, 'complete', page.knowledge_revision ?? null);
           return written;
@@ -1095,9 +1038,7 @@ export async function runExtractFacts(
     const outcome = detach.length === 0 && expireInPlace.length === 0 && plan.updates.length === 0
       ? await apply()
       : await underPageLock(slug, async () => {
-        if (await refuseDestructiveReconcileOnStaleCache(
-          engine, slug, sourceId, page.compiled_truth ?? '', page.timeline ?? '', result.warnings,
-        )) return null;
+        if (await refuseDestructiveReconcileOnStaleCache(engine, slug, sourceId, page, result.warnings)) return null;
         if (isAborted(opts.signal)) return null;
         return apply();
       }, opts, result.warnings);
@@ -1178,8 +1119,12 @@ export async function runExtractFacts(
   return result;
 }
 
+/**
+ * A refused page never stops the expiry or the reconcile after it (GBRA-130 A-21): it is a
+ * FACTS_EXPIRE_FAILED warning retried by the next run; a page the refusal breaker holds back is skipped.
+ */
 async function expireDeletedPagesManaged(engine: BrainEngine, sourceId: string,
-  managedAuthority: () => Promise<MaintenanceAuthority | null>): Promise<Array<{ id: number }>> {
+  managedAuthority: () => Promise<MaintenanceAuthority | null>, warnings: string[]): Promise<Array<{ id: number }>> {
   const pages = await engine.executeRaw<{ slug: string }>(
     `SELECT DISTINCT f.source_markdown_slug AS slug FROM facts f
       WHERE f.source_id = $1 AND f.row_num IS NOT NULL AND f.expired_at IS NULL
@@ -1187,9 +1132,20 @@ async function expireDeletedPagesManaged(engine: BrainEngine, sourceId: string,
     [sourceId],
   );
   const expired: Array<{ id: number }> = [];
+  const run = new ItemRun('extract_facts.expire_deleted');
   for (const { slug } of pages) {
     const authority = (await managedAuthority())!;
-    expired.push(...(await expireDeletedPageFactsManaged(engine, authority, slug)).map(id => ({ id })));
+    try {
+      expired.push(...(await expireDeletedPageFactsManaged(engine, authority, slug)).map(id => ({ id })));
+      run.succeed();
+    } catch (error) {
+      if (error instanceof OperationError && error.detail === 'refusal_breaker') {
+        warnings.push(`FACTS_EXPIRE_SKIPPED: ${slug}: ${error.code}: the same expiry was refused repeatedly; it is tried again once the page changes or the oldest refusal is 24 hours old`);
+        continue;
+      }
+      const failure = run.fail(slug, error);
+      warnings.push(`FACTS_EXPIRE_FAILED: ${slug}: ${failure.code}: ${failure.message.slice(0, 200)} (retried by the next extract_facts run${failure.requestId ? `; gbrain write-request -- ${failure.requestId} names the refusal` : ''})`);
+    }
   }
   return expired;
 }

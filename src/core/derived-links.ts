@@ -6,7 +6,7 @@ import { executeRawJsonb } from './sql-query.ts';
 import { pageSnapshotKey } from './page-snapshot-batch.ts';
 import { sanitizeForJsonb } from './batch-rows.ts';
 import { replaceWantedLinks, type WantedLinksReplacement } from './wanted-links-store.ts';
-import { applyTemporalEvidence, relationshipKeysForOrigin } from './link-temporal-apply.ts';
+import { applyTemporalEvidence, relationshipKeysForOrigin, type TemporalBody } from './link-temporal-apply.ts';
 import { primeRelationSemantics } from './link-semantics-pack.ts';
 import { effectiveRangesEnabled, LINK_EXTRACTION_GENERATION_KEY, type LineGrammarSettings } from './line-grammar.ts';
 
@@ -39,6 +39,8 @@ export interface DerivedLinkReplacementOptions {
    * so a page is never published from one setting and ranged from another.
    */
   lineGrammar?: LineGrammarSettings;
+  /** The origin body's temporal inputs, read at preparation; a segmented origin's body is never read inside the publication. */
+  temporalBody?: TemporalBody;
 }
 
 export class DerivedLinkRepairRequiredError extends Error {
@@ -267,7 +269,7 @@ async function publishDerivedLinks(tx: BrainEngine, origin: DerivedLinkOrigin, p
     () => opts.lineGrammar ? Promise.resolve(opts.lineGrammar.effectiveRanges) : effectiveRangesEnabled(tx),
   ]) as [unknown, Awaited<ReturnType<typeof relationshipKeysForOrigin>>, unknown[], unknown[], unknown[], Existing[], boolean];
   const withTemporal = async (result: { created: number; removed: number }) => {
-    await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore, { inlineRanges });
+    await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore, { inlineRanges, body: opts.temporalBody });
     return result;
   };
   if (ambiguous.length) throw new DerivedLinkRepairRequiredError();

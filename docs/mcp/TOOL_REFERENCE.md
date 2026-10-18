@@ -444,12 +444,12 @@ Submit an LLM agent job that the worker dispatches via the gateway-native tool l
 
 ## `traverse_graph`
 
-Traverse link graph from a page. Remote callers default to bidirectional edges (GraphPath[]) at depth 2 (pass depth explicitly for deeper walks); trusted local no-filter callers get the legacy node shape at depth 5.
+Traverse link graph from a page. Remote callers default to bidirectional edges (GraphPath[]) at depth 2 (pass depth explicitly for deeper walks); trusted local no-filter callers get the legacy node shape at depth 5. The walk is breadth-first: each page comes back once at its shortest depth and each edge once, and a walk stops at 20,000 visited pages or 5,000 edge rows, keeping the shallowest (a stderr note says when).
 
 | Parameter | Type | Guidance |
 | --- | --- | --- |
 | `slug` (required) | string | Slug of the page to start the traversal from, e.g. 'people/alice-example'. This is the start-node param — there is no `start` or `root` param. |
-| `depth` | number | Max traversal depth (capped at 10). Default 5, except a remote call that lets direction default to 'both' uses 2 (bidirectional path enumeration is combinatorial on hubs); an explicit depth is always honored up to the cap. |
+| `depth` | number | Max traversal depth (capped at 10). Default 5, except a remote call that lets direction default to 'both' uses 2 (a both-direction walk from a hub reaches much of the brain and fills the 5,000-edge cap); an explicit depth is always honored up to the cap. |
 | `link_type` | string | Filter to one link type (per-edge filter, traversal only follows matching edges) |
 | `direction` | string (`in`, `out`, `both`) | Traversal direction ('in', 'out', or 'both'). Remote callers default to 'both'; trusted local no-filter callers get the legacy outgoing-node output. |
 | `hops` | array of `{link_type, toward}` | Typed chain of 1-3 hops from the start page, e.g. `[{"link_type":"invested_in","toward":"object"},{"link_type":"founded","toward":"subject"}]` (companies the person invested in, then their founders). `toward` follows the relationship's meaning (`object`: subject → object; `subject`: object → subject), not stored link direction. Returns `{anchor, answers, paths, diagnostics}` with each answer's evidence edges; a chain that finds nothing carries a `relational_chain` notice with the next call. Not combinable with `depth`, `link_type` or `direction`; each hop walks live relationships. Advertised on the full surface only. Chain link types: founded, invested_in, led_round, advises, works_at, attended, yc_partner. See docs/guides/multi-hop.md. |

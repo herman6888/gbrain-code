@@ -32,8 +32,8 @@ async function pageRow(pageId: number) {
 }
 
 async function chunkRows(pageId: number) {
-  return engine.executeRaw<{ chunk_index: number; occurrence_id: number | null; body_generation: number | null; retired_generation: number | null; chunk_text: string }>(
-    `SELECT chunk_index, occurrence_id::int AS occurrence_id, body_generation::int AS body_generation, retired_generation::int AS retired_generation, chunk_text
+  return engine.executeRaw<{ chunk_index: number; occurrence_id: number | null; body_generation: number | null; chunk_text: string }>(
+    `SELECT chunk_index, occurrence_id::int AS occurrence_id, body_generation::int AS body_generation, chunk_text
        FROM content_chunks WHERE page_id = $1 ORDER BY chunk_index`, [pageId]);
 }
 
@@ -146,7 +146,7 @@ describe('manifest and flip', () => {
       { closeOccurrences: page.occurrences, retireChunkOccurrences: page.occurrences, retireMaxRows: 2 })));
     expect(deferred).toEqual({ retiredChunks: 0, retireDeferred: true });
     const rows = await chunkRows(page.pageId);
-    expect(rows.filter(r => r.body_generation === 1).every(r => r.retired_generation === null)).toBe(true);
+    expect(rows.filter(r => r.body_generation === 1).map(r => r.occurrence_id).sort()).toEqual([...page.occurrences].sort());
     expect((await pageRow(page.pageId)).body_generation).toBe(2);
 
     const next = [segmentText('# A3\na\n')];
@@ -155,7 +155,7 @@ describe('manifest and flip', () => {
       { closeOccurrences: staged.occurrences, retireChunkOccurrences: [...page.occurrences, ...staged.occurrences], retireMaxRows: 6 }));
     expect(retired).toEqual({ retiredChunks: 6, retireDeferred: false });
     const after = await chunkRows(page.pageId);
-    expect(after.map(r => [r.occurrence_id, r.retired_generation])).toEqual(staged3.occurrences.map(occurrence => [occurrence, null]));
+    expect(after.map(r => r.occurrence_id)).toEqual(staged3.occurrences);
   });
 
   test('two preparers at one generation: the loser\'s staged chunk rows are deleted with the winner\'s flip', async () => {
@@ -167,7 +167,7 @@ describe('manifest and flip', () => {
       { closeOccurrences: page.occurrences, retireChunkOccurrences: page.occurrences }));
     expect(result).toEqual({ retiredChunks: 2, retireDeferred: false });
     const rows = await chunkRows(page.pageId);
-    expect(rows.map(r => [r.occurrence_id, r.retired_generation])).toEqual([[winner.occurrences[0]!, null]]);
+    expect(rows.map(r => r.occurrence_id)).toEqual([winner.occurrences[0]!]);
     expect((await engine.readManifest(page.pageId)).map(r => r.occurrenceId)).toEqual(winner.occurrences);
   });
 
@@ -180,7 +180,7 @@ describe('manifest and flip', () => {
     const result = await engine.flipBodyGeneration(flipInput(pageId, 0, staged.stagingId, t, { retireInlineChunks: true }));
     expect(result).toEqual({ retiredChunks: 1, retireDeferred: false });
     const rows = await chunkRows(pageId);
-    expect(rows.map(r => [r.chunk_index, r.body_generation, r.retired_generation])).toEqual([[1, 1, null]]);
+    expect(rows.map(r => [r.chunk_index, r.body_generation])).toEqual([[1, 1]]);
     const page = await pageRow(pageId);
     expect([page.body_storage, page.compiled_truth, page.timeline, page.body_generation]).toEqual(['segmented', null, null, 1]);
   });

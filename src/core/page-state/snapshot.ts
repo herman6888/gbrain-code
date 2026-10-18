@@ -132,5 +132,6 @@ async function readSnapshotStatement(query: ReadQuery, slug: string, opts?: Page
     page.timeline = overlayWithdrawalBody(page.timeline, String(row.fingerprint_timeline ?? ''), withdrawals);
   }
   return { page, tags: row.snapshot_tags as string[], revision: row.knowledge_revision == null ? REVISION_BACKFILL_PENDING : String(row.knowledge_revision),
-    sourceIncarnation: String(row.source_incarnation), withdrawals, ...(globalPurges.count > 0 ? { globalPurges } : {}) };
+    sourceIncarnation: String(row.source_incarnation), withdrawals, ...(globalPurges.count > 0 ? { globalPurges } : {}),
+    ...(isSegmentedPage(page) ? { bodyGeneration: Number(row.body_generation) } : {}) };
 }

@@ -212,6 +212,8 @@ export const SECTIONS: DocSection[] = [
         title: "docs/guides/quiet-hours.md",
         description: "Notification hold + timezone-aware delivery.",
         path: "docs/guides/quiet-hours.md",
+        // Linked, not inlined: the Wave B PR 2 master merge put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
       },
       {
         title: "docs/guides/scaling-skills.md",

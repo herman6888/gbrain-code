@@ -8,7 +8,6 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import type { WriteAuthority, WriteRequest } from '../persistence/model.ts';
 import { derivedExtractionSkip } from '../persistence/derived-extraction-gate.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
-import { segmentedOverCeiling } from '../persistence/segmented-apply.ts';
 import type { BodyStorage } from '../page-body/types.ts';
 import { CHRONICLE_ACTIVATED_AT_KEY, autoChronicleSetting, chronicleSettings, type ChronicleSettings } from './config.ts';
 import { CHRONICLE_EXTRACTOR_VERSION, type ChronicleLedgerRow, type ChronicleTrigger } from './contract.ts';
@@ -68,7 +67,6 @@ export function decideChronicle(input: {
     }
     return skip(eligible.reason.startsWith('kind:') ? 'not_chronicle_shaped' : eligible.reason);
   }
-  if (segmentedOverCeiling(page)) return skip('page_body_segmented');
   return { state: 'pending', reason: null, nextAttemptAt: new Date(input.now.getTime() + input.settings.settleSeconds * 1000) };
 }
 

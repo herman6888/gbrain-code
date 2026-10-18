@@ -1,4 +1,5 @@
-import { verbError, OperationError } from '../ops/contract.ts';
+import { verbError, opError, OperationError } from '../ops/contract.ts';
+import type { Action } from '../agent-output.ts';
 import { isTerminalWriteState, isWriteErrorCode, type WriteErrorCode, type WriteReceipt } from './types.ts';
 import { pendingWriteHint } from './health.ts';
 import { UNBOUND_COLLISION_MESSAGE, UNBOUND_PUBLICATION_MESSAGE } from './unbound-source.ts';
@@ -127,14 +128,40 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
   // #6188 (UC3): a company-brain source names the fence correction it will not write; the repository commit is the fix.
   if (code === 'source_writeback_required' && message?.startsWith('Canonical preparation would normalize a facts or takes fence (')) return { reason: code, message,
     suggestion: 'A company-brain source never rewrites repository files: fix the named fence in the repository, commit it, and resume the sync.' };
+  // Wave B: a page whose body is stored in segments refuses a whole-body write; a deliberate per-page verdict, never a server fault.
+  if (code === 'page_body_segmented') return { reason: code, message: message ?? SEGMENTED_WRITE_MESSAGE, suggestion: SEGMENTED_WRITE_SUGGESTION };
   // #5575: a purged claim or page content is refused for good; the owner alone can clear its tombstone.
   if (code === 'purged_content') return { reason: code, message: 'This content was purged from this source and cannot be saved again.',
     suggestion: PURGED_SUGGESTION };
+  // Flip lane C: the receipt names the attempts, the limit and the SQLSTATE; the next step is the read-only writer status.
+  if (code === 'write_interrupted' && message) return { reason: code, message,
+    suggestion: 'Inspect the owner with gbrain sources writer status --source <source> --json (read-only), then submit the write again with a new request_id once the database is less loaded; a held sync file needs gbrain sources retry-held <source> and the same sync.' };
   const memory = code === 'invalid_params' ? MEMORY_REFUSAL.exec(message ?? '') : null;
   if (memory) return { reason: code, message: message!, suggestion: MEMORY_REFUSAL_SUGGESTION[/, extracted from that conversation page\.$/.test(message!) ? 'replaces_cross_page_derived' : memory[1]!]! };
   const reason = isWriteErrorCode(code) ? code : 'storage_error';
   return { reason, message: `The write did not commit: it ended with ${reason}, and nothing was saved.`,
     suggestion: 'Resolve the reported write failure before starting a corrected attempt.' };
+}
+
+const SEGMENTED_WRITE_MESSAGE = 'The target page stores its body in segments, and this write needs the whole body as one string; nothing was changed.';
+const SEGMENTED_WRITE_SUGGESTION = 'The target page stores its body in segments over the 24 MiB limit up to which this write reads the body whole, so retrying refuses the same way. '
+  + 'For remember: save the claim without an entity (omit entity, infer_entity: false); it is filed under memory/unattributed, and remembering it with entity once that page accepts fact rows replaces that copy. '
+  + "Read the page with get_page body: 'auto' or a window.";
+
+/** The next step of a `remember` refused because its entity page stores its body in segments: save the claim unattributed. */
+export function segmentedRememberFix(): Action {
+  return { argv: ['gbrain', 'remember', '<FACT>', '--provenance', '<PROVENANCE>', '--infer-entity', 'false'],
+    mcp: { tool: 'remember', arguments: { fact: '<FACT>', provenance: '<PROVENANCE>', infer_entity: false } },
+    inputs: [{ name: 'FACT', how: 'The claim you tried to remember, unchanged.' }, { name: 'PROVENANCE', how: 'The same provenance you passed.' }],
+    consent: [], actor: 'agent', requires_exclusive: false,
+    why: "Saves the claim without an entity: the entity page's facts fence cannot take a row while its body is stored in segments over 24 MiB. Remembering it with entity later replaces this copy." };
+}
+
+/** A `remember` whose entity (named or inferred) stores its body in segments: refused before admission with the unattributed-save fix. */
+export function segmentedRememberRefusal(slug: string, sourceId: string, inferred: boolean): OperationError {
+  return opError('page_body_segmented',
+    `remember: the entity page ${slug} (source ${sourceId})${inferred ? ', inferred from a mention in the fact,' : ''} stores its body in segments over the 24 MiB limit up to which remember reads it whole, so remember cannot add a row to its facts fence. Nothing was saved.`,
+    SEGMENTED_WRITE_SUGGESTION, { fix: segmentedRememberFix() });
 }
 
 const PURGED_SUGGESTION = 'Do not retry the same content. If it is still true, write it in new words; only the owner can clear a purge tombstone on the brain host.';
@@ -170,6 +197,12 @@ export async function runMemoryWrite<T>(run: () => Promise<T>): Promise<T> {
       purged.canonical = 'purged_content'; purged.writeError = 'purged_content';
       throw purged;
     }
+    // Wave B: a segmented target is a caller-class refusal; the frozen wire code is invalid_params and the canonical code says why.
+    if (error.canonicalCode === 'page_body_segmented') {
+      const segmented = verbError('invalid_params', error.message, error.suggestion ?? SEGMENTED_WRITE_SUGGESTION);
+      Object.assign(segmented, { canonical: 'page_body_segmented', writeError: 'page_body_segmented', fix: error.fix ?? segmentedRememberFix() });
+      throw segmented;
+    }
     const code = ['permission_denied','scope_denied','source_changed','writer_registration_required'].includes(error.code)
       ? 'scope_denied' : ['revision_required','revision_conflict','idempotency_conflict','invalid_params','page_identity_changed'].includes(error.code)
         ? 'invalid_params' : 'unavailable';
@@ -191,7 +224,7 @@ export function frozenVerbWriteError(receipt: WriteReceipt, reason?: WriteErrorC
     : receipt.state === 'conflict' ? 'revision_conflict'
       : receipt.state === 'cancelled' ? 'cancelled' : 'storage_error');
   const code = ['source_changed','permission_denied','scope_denied','writer_registration_required'].includes(writeError) ? 'scope_denied'
-    : ['revision_required', 'revision_conflict', 'idempotency_conflict','invalid_params','page_identity_changed','purged_content'].includes(writeError) || writeError.startsWith('core_')
+    : ['revision_required', 'revision_conflict', 'idempotency_conflict','invalid_params','page_identity_changed','purged_content','page_body_segmented'].includes(writeError) || writeError.startsWith('core_')
       ? 'invalid_params' : 'unavailable';
   const diagnostic = writeFailureDiagnostic(writeError, message);
   const suggestion = pending
@@ -204,6 +237,7 @@ export function frozenVerbWriteError(receipt: WriteReceipt, reason?: WriteErrorC
     suggestion);
   if (!pending) error.detail = diagnostic.reason;
   if (writeError === 'purged_content') error.canonical = 'purged_content';
+  if (writeError === 'page_body_segmented') Object.assign(error, { canonical: 'page_body_segmented', fix: segmentedRememberFix() });
   error.writeError = writeError;
   error.writeRequest = receipt;
   return error;

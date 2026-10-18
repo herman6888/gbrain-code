@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
@@ -6,7 +6,7 @@ import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { pageIdentityError } from './page-identity.ts';
-import { atomicWriteFileSync, mkdirPrivate } from '../atomic-write.ts';
+import { atomicStagingPath, atomicWriteFileSync, mkdirPrivate, validateAtomicStagingPath } from '../atomic-write.ts';
 import { flushDirectory } from '../fs-durable.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { sha256 } from './digest.ts';
@@ -16,6 +16,8 @@ import { acquireWorktree, getWorktreeBinding, guardOwnership, type WorktreeBindi
 import { chargePreparationAttempt, clearResolvedRecovery, completeWrite, getWriteRequestById, lockCounters, markRecovering, prepareRecovery, releaseUnpublishedClaim } from './journal.ts';
 import type { WaitingOn } from './claim-phase.ts';
 import { preparationKind } from './preparation-budget.ts';
+import { readWriteSwitchSnapshot } from './switches.ts';
+import { isSharedReadFailure } from './bounded-reads.ts';
 import { isTerminal, principalKey, requestPrincipal, recoveryFiles, type FileRecoveryRecord, type RecoveryRecord, type WriteRequest } from './model.ts';
 import { isLockOpenFailure, noteLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { withCoordinatedWrite } from './context.ts';
@@ -31,7 +33,9 @@ import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
-import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, upgradeRecoveryStaging } from './staging.ts';
+import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, restoreBeforeStage, upgradeRecoveryStaging, type RecoveryStagingFile } from './staging.ts';
+import { assertManagedFilesystemWrite } from './filesystem-guard.ts';
+import { beforeStagePath, fileContentBytes, fileContentHash, hashDescriptor, hashFile, isStreamedContent, LARGE_FILE_MIN_BYTES, stageBeforeCopy, stageStreamedContent, type StreamedFileContent } from './large-file.ts';
 import { declarePublication, publicationTransaction } from './publication-deadline.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
@@ -59,7 +63,7 @@ interface PreparedMutationBase {
   contentUnchanged?: boolean;
   deferEmbedding?: boolean;
   /** Why a page write bound to a worktree publishes no file (receipt `write_through.skipped`). */
-  databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only' | 'sync_excluded' | 'shared_origin';
+  databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only' | 'sync_excluded' | 'shared_origin' | 'origin_twin';
   /** #6517: the receipt's `write_through.warning` for a database-only publication, set by `validate` under the publication guards. */
   databaseOnlyWarning?: string;
   /**
@@ -99,7 +103,8 @@ export interface PublicationHooks {
   fileBoundary?(name: 'before_file' | 'staging_flushed' | 'file_replaced' | 'directory_flushed' | 'after_file'
     | 'before_restore' | 'restoration_staging_flushed' | 'restoration_file_replaced' | 'restoration_directory_flushed' | 'after_restore', request: WriteRequest, index: number): void;
 }
-function fileHash(path: string): string | null { return existsSync(path) ? sha256(readFileSync(path)) : null; }
+/** SHA-256 of the file at `path` read in pieces (large-file.ts), null when absent. */
+const fileHash = hashFile;
 const ownerStatusFix = (sourceId?: string): Action => readFix(sourceId
   ? `Shows source ${sourceId}'s canonical owner with its pending, failed and recovering write requests, read-only.`
   : 'Shows every source\'s canonical owner with its pending, failed and recovering write requests, read-only.',
@@ -119,7 +124,8 @@ function unexpectedRecoveryBytes(message: string, row: WriteRequest, when: strin
     `A canonical file of request ${row.request_id} in source ${row.source_id} ${when} matches neither its prior nor its published bytes, so recovery left it untouched and the worktree stays blocked. Inspect the owner and ask the user which version to keep; do not delete the file to unblock it.`,
     { fix: ownerStatusFix(row.source_id) });
 }
-function publishFile(file: PageMutationFile, stagingPath?: string, afterStagingFlush?: () => void, mode?: number | null): void {
+/** Creates the file's parent directories, confined to its source root. */
+function prepareParent(file: Pick<PageMutationFile, 'path' | 'root' | 'publishMode'>): void {
   if (!isWriteTargetContained(file.path, file.root)) throw opError('storage_error', 'Canonical file target escapes its source root.',
     `The file path resolves outside its source's canonical root (a symlinked directory or a moved checkout), so the file was not written. ${confinementCheck}`,
     { fix: ownerStatusFix() });
@@ -128,11 +134,47 @@ function publishFile(file: PageMutationFile, stagingPath?: string, afterStagingF
   if (!isWriteTargetContained(file.path, file.root)) throw opError('storage_error', 'Canonical parent path changed during publication.',
     `A directory on the file's path was replaced (for example by a symlink) while gbrain created it, so the file was not written. ${confinementCheck}`,
     { fix: ownerStatusFix() });
+}
+function publishFile(file: PageMutationFile, stagingPath?: string, afterStagingFlush?: () => void, mode?: number | null): void {
+  prepareParent(file);
   const openMode = mode ?? file.publishMode;
   if (file.content === null) {
     try { unlinkSync(file.path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  } else atomicWriteFileSync(file.path, file.content, { durable: true, stagingPath, ...(openMode === undefined ? {} : { mode: openMode }), afterStagingFlush });
+  } else if (isStreamedContent(file.content)) publishStagedContent(file.path, file.content, stagingPath, afterStagingFlush);
+  else atomicWriteFileSync(file.path, file.content, { durable: true, stagingPath, ...(openMode === undefined ? {} : { mode: openMode }), afterStagingFlush });
   flushDirectory(dirname(file.path));
+}
+/**
+ * The rename half of a streamed content's publication: `stageLargeFiles` wrote and verified its staging file before
+ * the publication transaction; here it must still be that regular file of the measured length.
+ */
+function publishStagedContent(path: string, content: StreamedFileContent, stagingPath: string | undefined, afterStagingFlush?: () => void): void {
+  assertManagedFilesystemWrite(path);
+  if (!stagingPath) throw opError('storage_error', 'A streamed canonical file has no reserved staging file.',
+    'The publication recorded no staging file for its streamed content, so nothing was written. Inspect the owner and report it to the user; do not resubmit it unchanged.', { fix: ownerStatusFix() });
+  validateAtomicStagingPath(path, stagingPath);
+  const staged = lstatSync(stagingPath);
+  if (!staged.isFile() || staged.nlink !== 1 || staged.size !== content.bytes) throw opError('unexpected_staging_bytes', 'The staged canonical file changed before publication.',
+    'A recovery staging file changed outside gbrain. Inspect the pending recovery in writer status and tell the user; never delete or edit staging files by hand.', { fix: ownerStatusFix() });
+  afterStagingFlush?.();
+  renameSync(stagingPath, path);
+}
+/**
+ * A before stage and streamed content (large-file.ts): once the recovery record naming the stages is durable and
+ * before the publication transaction, the prior file is copied to its before stage and a streamed content is written
+ * into its publication stage. A prior file that changed since its digest was recorded refuses as a local edit.
+ */
+async function stageLargeFiles(engine: BrainEngine, row: WriteRequest, file: PageMutationFile, record: FileRecoveryRecord): Promise<void> {
+  const before = record.staging?.before, publication = record.staging?.publication;
+  if (!before && !isStreamedContent(file.content)) return;
+  await withFilesystemPublication([file.root], async () => {
+    if (before && !await stageBeforeCopy(file.path, before, record.mode,
+      phase => faultPoint(`large_file:${phase}`, { requestId: row.request_id, sourceId: row.source_id, operation: row.operation }))) throw localEditRefusal('The canonical file changed after preparation.', row, false, 'while its prior bytes were being staged');
+    if (isStreamedContent(file.content)) {
+      prepareParent(file);
+      await stageStreamedContent(engine, file.path, file.content, publication!, record.mode);
+    }
+  });
 }
 // Effect recovery uses the same confined durable publication primitive, under
 // its own recovery record and native root capability.
@@ -160,6 +202,62 @@ function conflictCode(code: string): boolean { return ['revision_required','revi
 export function transientDatabaseFailure(error: unknown): boolean {
   return ['40001','40P01','55P03','57014','53300','57P01','57P02','57P03','08000','08003','08006','08001','08004',
     'ECONNRESET','ECONNREFUSED','ETIMEDOUT','CONNECTION_CLOSED','CONNECTION_ENDED'].includes(String((error as {code?:string})?.code));
+}
+/**
+ * The SQLSTATE of a transient failure that ended this write's own statement while the database stayed up (57014: a
+ * statement timeout or cancel), else null. It throws the preparation away and recurs while the write's work outlasts
+ * its bound, so it is charged like a cut-off preparation (`chargedInterruption`). Contention with other transactions
+ * (a lock timeout, a serialization failure, a deadlock) clears when they finish, and a lost connection or a database
+ * shutting down or out of connections is not the write's doing: neither is charged, so a restart never fails a write.
+ */
+function writeInterruption(error: unknown): string | null {
+  return String((error as {code?:string})?.code) === '57014' ? '57014' : null;
+}
+/**
+ * Flip lane C: the shared-read failures (`sharedReadFailure`) already charged. A group's memoized read the database cancelled
+ * ran once, for the whole group, and every member waiting on it gets the same failure: it is charged once, to the first
+ * member that settles with it (in group order, the member that would have sent it alone), and the other members are
+ * released uncounted. A read cancelled on every pass so still reaches the limit, one member at a time, never unbounded.
+ */
+const chargedSharedReads = new WeakSet<object>();
+function writeInterruptedFailure(row: WriteRequest, sqlstate: string, attempts: number, limit: number): PublicationFailure {
+  const fix = preparationKind(row) === 'sync'
+    ? `The file is held and the rest of the source syncs; reduce the load, then gbrain sources retry-held ${row.source_id} and the same gbrain sync with the same options.`
+    : 'Submit the write again with a new request_id once the database is less loaded.';
+  return { code: 'write_interrupted',
+    message: `The database ended this write's statements ${attempts} time(s) (SQLSTATE ${sqlstate}, a statement timeout or cancel), the limit of persistence.max_preparation_attempts (${limit}); it is not prepared again. `
+      + `Run gbrain sources writer status --source ${row.source_id} --json to see the load on the owner. ${fix}`,
+    detail: { origin: 'database_interruption', sqlstate, attempts, limit } as unknown as PublicationFailureDetail };
+}
+/**
+ * Flip lane C: the limit an interruption (`writeInterruption`) is charged against, persistence.max_preparation_attempts.
+ * Null when the failure is not an interruption, the `preparation_deadlines` switch is off (nothing is counted, as
+ * before), or the database cannot be read (the claim is then released uncounted).
+ */
+async function interruptionCharge(engine: BrainEngine, error: unknown): Promise<{ sqlstate: string; limit: number } | null> {
+  const sqlstate = writeInterruption(error);
+  if (!sqlstate) return null;
+  if (isSharedReadFailure(error)) {
+    if (chargedSharedReads.has(error as object)) return null;
+    chargedSharedReads.add(error as object);
+  }
+  try {
+    const { switches, preparation } = await readWriteSwitchSnapshot(engine);
+    return switches.preparation_deadlines ? { sqlstate, limit: preparation.maxAttempts } : null;
+  } catch { return null; }
+}
+/**
+ * Flip lane C: the recovery route's charge, returning the terminal `write_interrupted` failure once the count reaches the
+ * limit. It runs in its own statement before `markRecovering`: the request already holds its recovery record, which the
+ * expired-owner sweep never takes, so a crash in between leaves the one charge for the owner's recovery to finish.
+ */
+async function chargedInterruption(engine: BrainEngine, row: WriteRequest, error: unknown): Promise<PublicationFailure | null> {
+  const charge = await interruptionCharge(engine, error);
+  if (!charge) return null;
+  try {
+    const attempts = await chargePreparationAttempt(engine, row);
+    return attempts >= charge.limit ? writeInterruptedFailure(row, charge.sqlstate, attempts, charge.limit) : null;
+  } catch { return null; }
 }
 /**
  * #6278: the reasons a consumer aborts a preparation with. An error that is
@@ -212,6 +310,21 @@ export async function finishPreparationStalled(engine: BrainEngine, row: WriteRe
 
 export async function finishUnpublishedFailure(engine: BrainEngine, row: WriteRequest, error: unknown,
   stage: PublicationStage = 'publication'): Promise<WriteRequest> {
+  const charge = await interruptionCharge(engine, error);
+  if (charge) {
+    // Flip lane C: charged in the transaction that releases or finishes the claim. A crash before it commits leaves the claim
+    // uncharged (the expired-owner sweep charges a preparing claim once), after it the charged outcome; never both.
+    const done = await engine.transaction(async tx => {
+      const attempts = await chargePreparationAttempt(tx, row);
+      if (attempts >= charge.limit) return completeWrite(tx, row, 'failed', {}, withAttempt(writeInterruptedFailure(row, charge.sqlstate, attempts, charge.limit), stage));
+      await releaseUnpublishedClaim(tx, row, 'database_contention');
+      return null;
+    }).then(outcome => ({ outcome }), () => null);
+    if (done) {
+      await faultPoint('persistence:interruption_charged', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id, operation: row.operation });
+      return done.outcome ?? (await getWriteRequestById(engine, row.id))!;
+    }
+  }
   const failure = withAttempt(requestError(error), stage);
   if (mayReprepare(row, failure) || transientDatabaseFailure(error)) {
     await releaseUnpublishedClaim(engine, row, transientDatabaseFailure(error) ? 'database_contention' : 'revision_changed_repreparing');
@@ -255,21 +368,49 @@ export function decoratePublicationOutcome(row: WriteRequest, prepared: Prepared
  * while holding the worktree's native lock, before any file is touched.
  */
 export function pageRecoveryRecord(row: WriteRequest, file: PageMutationFile, binding: WorktreeBinding): { record: FileRecoveryRecord; bytes: number } {
+  const large = largeRecoveryRecord(row, file, binding);
+  if (large) return large;
   const before = existsSync(file.path) ? readFileSync(file.path) : null;
   const record: FileRecoveryRecord = {
     version: 1, path: file.path, root: file.root,
     before: before?.toString('base64') ?? null, beforeHash: before ? sha256(before) : null,
-    afterHash: file.content === null ? null : sha256(file.content),
+    afterHash: file.content === null ? null : fileContentHash(file.content),
     mode: before ? statSync(file.path).mode & 0o7777 : null,
     ownerEpoch: String(binding.owner_epoch), attempt: row.execution_token!,
     staging: {
-      ...(file.content === null ? {} : { publication: recoveryStagingFile(file.path, file.content) }),
+      ...(file.content === null ? {} : { publication: publicationStage(file.path, file.content) }),
       ...(before === null ? {} : { restoration: recoveryStagingFile(file.path, before) }),
     },
   };
-  const nextBytes = file.content === null ? 0 : typeof file.content === 'string' ? Buffer.byteLength(file.content) : file.content.byteLength;
+  const nextBytes = file.content === null ? 0 : fileContentBytes(file.content);
   const beforeBytes = before?.byteLength ?? 0;
   return { record, bytes: Math.max(beforeBytes * 3 + nextBytes * 2, Buffer.byteLength(JSON.stringify(record)) + beforeBytes + nextBytes) + 4096 };
+}
+
+function publicationStage(path: string, content: string | Uint8Array | StreamedFileContent): RecoveryStagingFile {
+  return isStreamedContent(content) ? { path: atomicStagingPath(path), hash: content.hash, bytes: content.bytes } : recoveryStagingFile(path, content);
+}
+/**
+ * A prior file over the single-string ceiling is hashed in pieces and named as the before stage (path, SHA-256,
+ * length) its copy is written to, never embedded (model.ts). The reservation counts the copy and the publication stage
+ * on disk plus the record. Null for a smaller or absent prior file (its bytes are embedded).
+ */
+function largeRecoveryRecord(row: WriteRequest, file: PageMutationFile, binding: WorktreeBinding): { record: FileRecoveryRecord; bytes: number } | null {
+  if (!existsSync(file.path) || statSync(file.path).size <= LARGE_FILE_MIN_BYTES) return null;
+  const fd = openSync(file.path, 'r');
+  let prior: { hash: string; bytes: number; mode: number };
+  try { prior = { ...hashDescriptor(fd), mode: fstatSync(fd).mode & 0o7777 }; } finally { closeSync(fd); }
+  const record: FileRecoveryRecord = {
+    version: 1, path: file.path, root: file.root, before: null, beforeHash: prior.hash,
+    afterHash: file.content === null ? null : fileContentHash(file.content), mode: prior.mode,
+    ownerEpoch: String(binding.owner_epoch), attempt: row.execution_token!,
+    staging: {
+      ...(file.content === null ? {} : { publication: publicationStage(file.path, file.content) }),
+      before: { path: beforeStagePath(file.path), hash: prior.hash, bytes: prior.bytes },
+    },
+  };
+  const nextBytes = file.content === null ? 0 : fileContentBytes(file.content);
+  return { record, bytes: Buffer.byteLength(JSON.stringify(record)) + prior.bytes + nextBytes + 4096 };
 }
 
 export async function publishMutation(engine: BrainEngine, row: WriteRequest, prepared: PreparedMutation,
@@ -362,6 +503,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       }
       await prepareRecovery(engine, row, record, bytes);
       recovery = record;
+      await stageLargeFiles(engine, row, prepared.file, record);
       await hooks.boundary?.('prepared', row);
     }
     const done = await publicationTransaction(engine, async tx => {
@@ -441,15 +583,22 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
     });
     await hooks.boundary?.('after_commit', done);
     if (beliefReport.appended && done.state === 'committed') await markBeliefCommits(engine, [row.id]).catch(() => undefined);
-    if (recovery) await clearResolvedRecovery(engine, row.id, done);
+    if (recovery) {
+      // A version 3 record's prior-file copy is removed once the outcome is durable, before its record is cleared.
+      const staged = recovery;
+      if (staged.version === 1 && staged.staging?.before) await withFilesystemPublication([staged.root], async () => cleanupRecoveryStaging(staged));
+      await clearResolvedRecovery(engine, row.id, done);
+    }
     afterCommitDue = done.state === 'committed';
     return done;
   } catch (error) {
     if (recovery) {
       // Even a rejected prepare can retain a journal record; do not leave that
       // record unaccounted or let a sibling publication bypass its recovery.
-      const failure = !transactionBodyCompleted && !mayReprepare(row, requestError(error)) && !transientDatabaseFailure(error)
-        ? withAttempt(requestError(error), published ? 'after_file_publication' : 'publication') : undefined;
+      const interrupted = transactionBodyCompleted ? null : await chargedInterruption(engine, row, error);
+      if (!transactionBodyCompleted && writeInterruption(error)) await faultPoint('persistence:recovery_interruption_charged', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id, operation: row.operation });
+      const failure = interrupted || (!transactionBodyCompleted && !mayReprepare(row, requestError(error)) && !transientDatabaseFailure(error))
+        ? withAttempt(interrupted ?? requestError(error), published ? 'after_file_publication' : 'publication') : undefined;
       try { await markRecovering(engine, row, failure ? 'publication_failed' : published ? 'commit_outcome_uncertain' : 'publication_not_started', failure); }
       catch { /* database outage: durable recovery record remains discoverable */ }
       if (lock) {
@@ -516,9 +665,39 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
           const actual = current.recovery.version === 2 ? bundleFileHash(record) : fileHash(record.path);
           if (actual !== record.beforeHash && actual !== record.afterHash) throw unexpectedRecoveryBytes('Canonical recovery bytes changed outside publication.', current, 'was edited outside gbrain and');
         }
+        // A terminal outcome's prior-file copy is dropped unread when its canonical file still holds the prior bytes.
         await withFilesystemPublication([...new Set(records.map(record => record.root))], async () => {
-          for (const record of records) cleanupRecoveryStaging(record);
+          for (const record of records) cleanupRecoveryStaging(record, { keepBefore: !isTerminal(current),
+            priorIntact: isTerminal(current) && !!record.staging?.before && fileHash(record.path) === record.beforeHash });
         });
+        // A live request's restoration runs inside this guard too, so a refusal there is recorded as its blocked reason.
+        if (!isTerminal(current)) for (let index = 0; index < records.length; index++) {
+          const record = records[index];
+          hooks.fileBoundary?.('before_restore', current, index);
+          const actual = current.recovery.version === 2 ? bundleFileHash(record) : fileHash(record.path);
+          if (actual !== record.beforeHash && actual !== record.afterHash) throw unexpectedRecoveryBytes('Canonical recovery bytes changed during restoration.', current, 'changed while recovery was restoring it and');
+          if (record.staging?.before) {
+            await withFilesystemPublication([record.root], async () => {
+              if (actual === record.afterHash && actual !== record.beforeHash) restoreBeforeStage(record, phase => hooks.fileBoundary?.(`restoration_${phase}`, current, index));
+              else cleanupRecoveryStaging(record, { priorIntact: actual === record.beforeHash });
+            });
+          } else if (actual === record.afterHash && actual !== record.beforeHash) {
+            await withFilesystemPublication([record.root], async () => {
+              const file = { path: record.path, root: record.root, content: record.before === null ? null : Buffer.from(record.before, 'base64') };
+              if (current.recovery!.version === 2) {
+                const restored = { ...record, beforeHash: record.afterHash, afterHash: record.beforeHash,
+                  mode: record.afterHash === null ? null : record.afterMode ?? record.mode, afterMode: record.mode ?? undefined,
+                  staging: { publication: record.staging?.restoration } };
+                stageBundleFile(file, restored);
+                if (file.content !== null) hooks.fileBoundary?.('restoration_staging_flushed', current, index);
+                publishStagedBundleFile(restored, phase => hooks.fileBoundary?.(`restoration_${phase}`, current, index));
+              } else publishFile(file, record.staging?.restoration?.path,
+                () => hooks.fileBoundary?.('restoration_staging_flushed', current, index), record.mode);
+            });
+          }
+          hooks.fileBoundary?.('after_restore', current, index);
+          assertRecoveryStagingAbsent(record);
+        }
       }
       catch (error) {
         if (!(error instanceof OperationError) || !['unexpected_staging_bytes','unexpected_file_bytes','storage_error'].includes(error.code)) throw error;
@@ -531,28 +710,6 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
       // A delivered or durable terminal outcome is immutable. Only its known
       // temporary files are cleaned; its canonical file is never restored.
       if (isTerminal(current)) return { ...current, blocked_reason: null };
-      for (let index = 0; index < records.length; index++) {
-        const record = records[index];
-        hooks.fileBoundary?.('before_restore', current, index);
-        const actual = current.recovery.version === 2 ? bundleFileHash(record) : fileHash(record.path);
-        if (actual !== record.beforeHash && actual !== record.afterHash) throw unexpectedRecoveryBytes('Canonical recovery bytes changed during restoration.', current, 'changed while recovery was restoring it and');
-        if (actual === record.afterHash && actual !== record.beforeHash) {
-          await withFilesystemPublication([record.root], async () => {
-            const file = { path: record.path, root: record.root, content: record.before === null ? null : Buffer.from(record.before, 'base64') };
-            if (current.recovery!.version === 2) {
-              const restored = { ...record, beforeHash: record.afterHash, afterHash: record.beforeHash,
-                mode: record.afterHash === null ? null : record.afterMode ?? record.mode, afterMode: record.mode ?? undefined,
-                staging: { publication: record.staging?.restoration } };
-              stageBundleFile(file, restored);
-              if (file.content !== null) hooks.fileBoundary?.('restoration_staging_flushed', current, index);
-              publishStagedBundleFile(restored, phase => hooks.fileBoundary?.(`restoration_${phase}`, current, index));
-            } else publishFile(file, record.staging?.restoration?.path,
-              () => hooks.fileBoundary?.('restoration_staging_flushed', current, index), record.mode);
-          });
-        }
-        hooks.fileBoundary?.('after_restore', current, index);
-        assertRecoveryStagingAbsent(record);
-      }
       // Withdrawal is authoritative DB state and is never rolled back here.
       const failure: PublicationFailure | undefined = terminalError ?? (current.error_code ? {code:current.error_code,message:current.error_message ?? 'Publication failed before database completion.',
         ...(current.error_detail ? { detail: current.error_detail as unknown as PublicationFailureDetail } : {})} : undefined);

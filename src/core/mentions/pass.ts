@@ -39,9 +39,12 @@
  * MENTION_EXTRACTOR_VERSION is separate from LINK_EXTRACTOR_VERSION_TS, so a
  * gazetteer change never reruns link or timeline extraction.
  *
- * A segmented page (body in segments, NULL body columns) is never scanned:
- * mentions derived from its title alone would delete the ones its body holds.
- * It stays due, and counted as pending, until the per-segment pass.
+ * A segmented page (body in segments, NULL body columns) is scanned block by
+ * block (page-body/segment-blocks.ts), the title first, keeping each target's
+ * first mention: a name whose tokens straddle a segment cut (a blank line,
+ * heading, dated line or message boundary) is not matched. A gazetteer change
+ * marks every segmented page in scope due (no SQL prefilter reads its body).
+ * Derived aliases are still refreshed for inline entity pages only.
  */
 
 import { createHash } from 'node:crypto';
@@ -50,8 +53,9 @@ import { pipelined } from '../page-state/transactions.ts';
 import { isCrossSourceLinksEnabled } from '../link-extraction.ts';
 import {
   buildGazetteer, findMentionedEntities, gazetteerEntryKeys, tokenizeTitle,
-  type Gazetteer, type GazetteerEntry, type GazetteerEntryKey,
+  type FindMentionsOpts, type Gazetteer, type GazetteerEntry, type GazetteerEntryKey, type Mention,
 } from '../by-mention.ts';
+import { bodyBlocks } from '../page-body/segment-blocks.ts';
 import { linkableTypesFor, loadSourcePack, parseNameList, readMentionPolicy, type MentionPolicy, type PackTypes } from './policy.ts';
 import { deriveEntityAliases, type DerivedAlias } from './aliases.ts';
 import { normalizeAliasList } from '../search/alias-normalize.ts';
@@ -232,7 +236,24 @@ async function disableSource(engine: BrainEngine, managed: boolean, sourceId: st
 }
 
 interface DuePage { id: number; slug: string; source_id: string; revision: string; title: string | null; type: string | null;
-  compiled_truth: string | null; timeline: string | null; mention_ignore: unknown; frontmatter?: Record<string, unknown> | null }
+  compiled_truth: string | null; timeline: string | null; mention_ignore: unknown; frontmatter?: Record<string, unknown> | null; body_storage?: string }
+
+/** findMentionedEntities over `${title}\n\n${compiled_truth}\n\n${timeline}`; a segmented body is scanned block by block. */
+export async function pageMentions(engine: BrainEngine,
+  p: { id: number; slug: string; source_id: string; title: string | null; compiled_truth?: string | null; timeline?: string | null; body_storage?: string | null },
+  gazetteer: Gazetteer, opts: FindMentionsOpts): Promise<Mention[]> {
+  if (p.body_storage !== 'segmented') {
+    return (p.title || p.compiled_truth || p.timeline) ? findMentionedEntities(`${p.title ?? ''}\n\n${p.compiled_truth ?? ''}\n\n${p.timeline ?? ''}`, gazetteer, opts) : [];
+  }
+  const found = new Map<string, Mention>();
+  const add = (mentions: Mention[], at: number) => {
+    for (const m of mentions) if (!found.has(`${m.source_id}\0${m.slug}`)) found.set(`${m.source_id}\0${m.slug}`, { ...m, offset: m.offset + at });
+  };
+  add(findMentionedEntities(p.title ?? '', gazetteer, opts), 0);
+  const base = (p.title ?? '').length + 2;
+  for await (const block of bodyBlocks(engine, p, { separator: '\n\n' })) add(findMentionedEntities(block.text, gazetteer, opts), base + block.at);
+  return [...found.values()];
+}
 
 /** Alias derivation options from the mention policy (`mentions.alias_deny`, `mentions.multiword_aliases`). */
 export function aliasOptsOf(policy: Pick<MentionPolicy, 'aliasDeny' | 'multiwordAliases'>): { deny: string[]; multiword: boolean } {
@@ -324,16 +345,17 @@ async function pagesMatchingNames(engine: BrainEngine, sourceIds: string[], adde
   const out: number[] = [];
   let after = 0;
   for (;;) {
-    const rows = await engine.executeRaw<{ id: number; slug: string; source_id: string; body: string; mention_ignore: unknown }>(
-      `SELECT id, slug, source_id, COALESCE(title, '') || E'\\n\\n' || COALESCE(compiled_truth, '') || E'\\n\\n' || COALESCE(timeline, '') AS body,
+    const rows = await engine.executeRaw<{ id: number; slug: string; source_id: string; body_storage: string; body: string; mention_ignore: unknown }>(
+      `SELECT id, slug, source_id, body_storage, COALESCE(title, '') || E'\\n\\n' || COALESCE(compiled_truth, '') || E'\\n\\n' || COALESCE(timeline, '') AS body,
               frontmatter->'mention_ignore' AS mention_ignore
-         FROM pages WHERE deleted_at IS NULL AND body_storage = 'inline' AND source_id = ANY($1::text[]) AND id > $2
-          ${ascii ? `AND lower(COALESCE(title, '') || ' ' || COALESCE(compiled_truth, '') || ' ' || COALESCE(timeline, '')) LIKE ANY($4::text[])` : ''}
+         FROM pages WHERE deleted_at IS NULL AND source_id = ANY($1::text[]) AND id > $2
+          ${ascii ? `AND (body_storage = 'segmented' OR lower(COALESCE(title, '') || ' ' || COALESCE(compiled_truth, '') || ' ' || COALESCE(timeline, '')) LIKE ANY($4::text[]))` : ''}
         ORDER BY id LIMIT $3`,
       ascii ? [sourceIds, after, PREFILTER_BATCH, patterns] : [sourceIds, after, PREFILTER_BATCH]);
     if (!rows.length) break;
     after = rows[rows.length - 1]!.id;
     for (const r of rows) {
+      if (r.body_storage === 'segmented') { out.push(Number(r.id)); continue; }
       const hits = findMentionedEntities(r.body, added, { fromSlug: r.slug, fromSourceId: r.source_id, allowCrossSource });
       if (hits.length) out.push(Number(r.id));
     }
@@ -432,17 +454,15 @@ async function reconcileSource(engine: BrainEngine, sourceId: string, gazetteer:
     if (Date.now() > deadline) return;
     const pages = await engine.executeRaw<DuePage>(
       `SELECT p.id, p.slug, p.source_id, p.knowledge_revision::text AS revision, p.title, p.type, p.compiled_truth, p.timeline,
-              p.frontmatter->'mention_ignore' AS mention_ignore
+              p.frontmatter->'mention_ignore' AS mention_ignore, p.body_storage
          FROM pages p LEFT JOIN page_mention_state s ON s.page_id = p.id
-        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.body_storage = 'inline' AND p.id > $3 AND ${DUE_PREDICATE}
+        WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.id > $3 AND ${DUE_PREDICATE}
         ORDER BY p.id LIMIT $4`, [sourceId, MENTION_EXTRACTOR_VERSION, after, RECONCILE_BATCH]);
     if (!pages.length) return;
     after = pages[pages.length - 1]!.id;
-    const found = new Map(pages.map(p => [Number(p.id), (p.title || p.compiled_truth || p.timeline)
-      ? findMentionedEntities(`${p.title ?? ''}\n\n${p.compiled_truth ?? ''}\n\n${p.timeline ?? ''}`, gazetteer, {
-          fromSlug: p.slug, fromSourceId: p.source_id, allowCrossSource, ignoreNames: parseNameList(p.mention_ignore),
-        })
-      : []]));
+    const found = new Map<number, Mention[]>();
+    for (const p of pages) found.set(Number(p.id), await pageMentions(engine, p, gazetteer,
+      { fromSlug: p.slug, fromSourceId: p.source_id, allowCrossSource, ignoreNames: parseNameList(p.mention_ignore) }));
     await opts.beforePublish?.(pages.map(p => Number(p.id)));
     const outcome = await engine.transaction(async tx => {
       if (!sameGenerations(generations, await readGenerations(tx, genSources, true))) return null;

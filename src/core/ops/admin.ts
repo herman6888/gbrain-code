@@ -21,6 +21,8 @@ import { resolveActiveEmbeddingColumnFromEngine } from '../search/embedding-colu
 import { memoizedHealth } from '../health-memo.ts';
 import { LARGE_PAGES_CAPABILITY } from './get-page-body.ts';
 import { isSegmentedPage, pageBodyBytes } from '../page-body/page-shape.ts';
+import { openSegmentedBody } from '../page-body/read-range.ts';
+import { segmentedReadDocument } from '../page-window/segmented.ts';
 import { getVersionsKnownAsOf, KNOWN_AS_OF_PARAM, VERSIONS_DIFF_PARAM } from './known-as-of.ts';
 
 // --- Admin ---
@@ -227,25 +229,43 @@ const get_versions: Operation = {
       // An adapter that ignores includeBody never leaks an unsanitized body through the metadata default.
       const metadata = page(await ctx.engine.getVersions(p.slug as string, { ...opts, includeBody: false }))
         .map(v => { const { compiled_truth: _b, timeline: _t, ...rest } = v as typeof v & { compiled_truth?: unknown; timeline?: unknown }; return rest; });
-      return canReadWriteAttribution(ctx) ? attributeVersions(ctx.engine, metadata) : metadata;
+      const sized = [];
+      for (const v of metadata) sized.push(await remoteVersionSize(ctx, v));
+      return canReadWriteAttribution(ctx) ? attributeVersions(ctx.engine, sized) : sized;
     }
     const plain = page(await ctx.engine.getVersions(p.slug as string, opts));
     const versions = canReadWriteAttribution(ctx) ? await attributeVersions(ctx.engine, plain) : plain;
     // Wave B: a segmented version's body is never returned whole; body_ref names its size and the windowed read.
-    return versions.map(v => {
+    const out = [];
+    for (const v of versions) {
       if (isSegmentedPage(v)) {
-        const { compiled_truth: _b, timeline: _t, ...rest } = v;
-        return { ...rest, body_ref: { version_id: v.id, total_bytes: pageBodyBytes(v),
-          read: { tool: 'get_page', arguments: { slug: p.slug, version_id: v.id, body: 'window' } } } };
+        const sized = await remoteVersionSize(ctx, v);
+        const { compiled_truth: _b, timeline: _t, ...rest } = sized;
+        out.push({ ...rest, body_ref: { version_id: v.id, total_bytes: 'total_bytes' in sized ? sized.total_bytes : pageBodyBytes(v),
+          read: { tool: 'get_page', arguments: { slug: p.slug, version_id: v.id, body: 'window' } } } });
+        continue;
       }
-      if (ctx.remote === false) return v;
-      return { ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth),
-        ...(typeof v.timeline === 'string' ? { timeline: sanitizeRemoteBody(v.timeline) } : {}) };
-    });
+      if (ctx.remote === false) { out.push(v); continue; }
+      out.push({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth),
+        ...(typeof v.timeline === 'string' ? { timeline: sanitizeRemoteBody(v.timeline) } : {}) });
+    }
+    return out;
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },
 };
+
+/**
+ * A segmented version as a remote caller sees it: the size of its read projection (`total_bytes`, what get_page reports
+ * for a segmented page), never the stored body_bytes, whose difference would say how much text the projection hides.
+ */
+async function remoteVersionSize<V extends { page_id: number; body_storage?: string; body_generation?: number; body_bytes?: number }>(ctx: OperationContext, v: V):
+  Promise<V | Omit<V, 'body_bytes'> & { total_bytes: number }> {
+  if (ctx.remote === false || v.body_storage !== 'segmented') return v;
+  const { body_bytes: _stored, ...rest } = v;
+  const body = await openSegmentedBody(ctx.engine, { pageId: v.page_id, generation: v.body_generation });
+  return { ...rest, total_bytes: (await segmentedReadDocument(ctx.engine, body)).total };
+}
 
 const revert_version: Operation = {
   name: 'revert_version',

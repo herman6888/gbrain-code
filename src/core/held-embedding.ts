@@ -33,6 +33,7 @@ import { opError } from './ops/contract.ts';
 import { chunkGenerationFilter } from './search/safe-chunks.ts';
 import { quoteIdentifier } from './search/embedding-column.ts';
 import { embeddingWriteTarget } from './page-state/projections.ts';
+import { budgetRowAppliesFilter } from './page-size-policy.ts';
 import { reservationCostUsd } from './budget/reservation-cost.ts';
 import { estimatePageEmbedUsd, listBudgetLimitedPages } from './page-embedding-budget.ts';
 import {
@@ -56,7 +57,7 @@ export async function readBudgetLimited(engine: BrainEngine, opts: { sourceId?: 
        FROM page_embedding_budget b JOIN pages p ON p.id = b.page_id
        CROSS JOIN LATERAL (SELECT count(*)::int AS chunks, COALESCE(sum(length(cc.chunk_text)), 0)::bigint AS chars
          FROM content_chunks cc WHERE cc.page_id = p.id AND ${chunkGenerationFilter('p', 'cc')} AND ${pending}) w
-      WHERE b.state <> 'open' AND p.deleted_at IS NULL AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND w.chunks > 0${bySource}
+      WHERE ${budgetRowAppliesFilter('b', 'p')} AND p.deleted_at IS NULL AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND w.chunks > 0${bySource}
       GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, params);
   const out: BudgetLimited = { held: 0, capped: 0, held_reasons: {}, pending_chunks: 0, by_source: [] };
   const sources = new Map<string, BudgetLimitedSource>();

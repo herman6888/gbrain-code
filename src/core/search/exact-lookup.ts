@@ -31,7 +31,7 @@
  * Fail-open everywhere: a probe error returns the organic results unchanged.
  */
 
-import { projectedLead } from '../page-window/bounded-lead.ts';
+import { pageLeadSource, projectedLead } from '../page-window/bounded-lead.ts';
 import { hasReadPolicy } from './read-policy-sql.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult, PageReadPolicy } from '../types.ts';
@@ -130,7 +130,7 @@ export async function structuralExactLookup(
           type: page.type,
           source_id: page.source_id ?? scope ?? 'default',
           // Large pages: a bounded, withdrawal-overlaid prefix is sanitized, never the whole body.
-          chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? scope ?? 'default', compiled_truth: page.compiled_truth })).slice(0, 200),
+          chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? scope ?? 'default', compiled_truth: await pageLeadSource(engine, page) })).slice(0, 200),
           chunk_index: 0,
           chunk_id: 0,
           score: 0, // caller assigns the injection score

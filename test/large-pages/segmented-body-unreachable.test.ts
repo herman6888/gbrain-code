@@ -5,7 +5,7 @@
  *    fields that throw `page_body_segmented` (property read, spread, JSON.stringify,
  *    assignment), so no caller sees '' where a multi-megabyte body lives; old-shape
  *    body writes over a segmented row are refused; every whole-body writer (spec top-25
- *    rows 11-19) refuses before it writes, leaving segments, manifest, body_generation
+ *    rows 11 and 13-19) refuses before it writes, leaving segments, manifest, body_generation
  *    and content_hash as they were. Inline pages read exactly as before.
  * 2. Fails when: a read path builds a segmented page without the guard, a writer
  *    reaches the database or the file before refusing, or get_page body:'none' stops
@@ -184,13 +184,8 @@ for (const kind of ['pglite', 'postgres'] as const) {
       expect(readFileSync(file, 'utf8')).toBe(fileBefore);
       // Row 19: concept and enrich fence preservation.
       expectSegmented(() => preserveCanonicalFences(snapshot.page, '# replacement\n'));
-      // Row 12: tag and timeline writes through the persistence coordinator.
-      const tag = await call('add_tag', { slug: SLUG, tag: 'probe', request_id: randomUUID() });
-      expect(tag).toMatchObject({ error: 'page_body_segmented' });
-      expect(String(tag.message)).toStartWith('add_tag: ');
-      const entry = await call('add_timeline_entry', { slug: SLUG, date: '2026-10-03', summary: 'probe', request_id: randomUUID() });
-      expect(entry).toMatchObject({ error: 'page_body_segmented' });
-      expect(String(entry.message)).toStartWith('add_timeline_entry: ');
+      // Row 12 (tag and timeline writes through the persistence coordinator) writes segmented pages now: a tag as a
+      // metadata flip, a timeline entry through the put path within 24 MiB (segmented-semantic-writes.test.ts).
       expect(await state()).toEqual(before);
     });
 

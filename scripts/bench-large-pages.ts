@@ -86,7 +86,7 @@ async function pageRows(engine: BrainEngine) {
     texts: await count(engine, 'SELECT count(DISTINCT sha256) AS n FROM page_body_manifest WHERE page_id=$1 AND gen_from<=$2 AND (gen_to IS NULL OR gen_to>$2)', [id, generation]),
     manifest: await count(engine, 'SELECT count(*) AS n FROM page_body_manifest WHERE page_id=$1 AND gen_from<=$2 AND (gen_to IS NULL OR gen_to>$2)', [id, generation]),
     manifestAtGeneration: await count(engine, 'SELECT count(*) AS n FROM page_body_manifest WHERE page_id=$1 AND gen_from=$2', [id, generation]),
-    chunks: await count(engine, 'SELECT count(*) AS n FROM content_chunks WHERE page_id=$1 AND retired_generation IS NULL', [id]),
+    chunks: await count(engine, 'SELECT count(*) AS n FROM content_chunks WHERE page_id=$1', [id]),
     chunksAtGeneration: await count(engine, 'SELECT count(*) AS n FROM content_chunks WHERE page_id=$1 AND body_generation=$2', [id, generation]),
   };
 }

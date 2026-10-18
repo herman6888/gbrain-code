@@ -5,6 +5,7 @@
  */
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { materializeSegmentedBody } from '../../src/core/page-body/ingest.ts';
+import { chunkGenerationFilter } from '../../src/core/search/safe-chunks.ts';
 import { contentHash } from '../../src/core/utils.ts';
 
 export interface SegmentedPageRow { id: number; body_storage: string; body_generation: number; content_hash: string; title: string; type: string;
@@ -25,11 +26,11 @@ export async function reconstructedPage(engine: BrainEngine, slug: string, sourc
   return { page, body, hash: contentHash({ title: page.title, type: page.type, compiled_truth: body.compiled_truth, timeline: body.timeline, frontmatter: page.frontmatter, tags }) };
 }
 
-/** Chunk rows of the live generation (not retired, not staged past the page's generation). */
+/** Chunk rows of the live body (chunkGenerationFilter: not retired, not staged past the page's generation). */
 export async function visibleChunks(engine: BrainEngine, pageId: number): Promise<Array<{ occurrence_id: number | null; embedded: boolean }>> {
   const rows = await engine.executeRaw<{ occurrence_id: number | string | null; embedded: boolean }>(`SELECT c.occurrence_id, c.embedding IS NOT NULL AS embedded
     FROM content_chunks c JOIN pages p ON p.id=c.page_id
-    WHERE c.page_id=$1 AND c.retired_generation IS NULL AND (c.body_generation IS NULL OR c.body_generation<=p.body_generation)`, [pageId]);
+    WHERE c.page_id=$1 AND ${chunkGenerationFilter('p', 'c')}`, [pageId]);
   return rows.map(row => ({ occurrence_id: row.occurrence_id === null ? null : Number(row.occurrence_id), embedded: row.embedded }));
 }
 

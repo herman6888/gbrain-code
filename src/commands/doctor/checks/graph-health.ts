@@ -338,6 +338,7 @@ export const timelineHistoryEntry: DoctorEntry = {
     'coordination_lock_location',
     'unbound_source',
     'writer_version',
+    'segmented_storage',
     'self_capture',
     'vector_plan',
     'keyword_plan',

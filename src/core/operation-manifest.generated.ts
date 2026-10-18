@@ -280,7 +280,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "bytes": {
         "type": "object",
-        "description": "Window: UTF-8 bytes (snapped to a line start).",
+        "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).",
         "properties": {
           "offset": {
             "type": "number",

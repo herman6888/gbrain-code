@@ -410,6 +410,9 @@ export async function preparePageProjection(prepared: ProjectionSnapshot) {
 // rows no inline rebuild takes (v153 queued 93K image pages on one brain), so
 // only the explicit drain walks it whole, oldest first; the resident reads a
 // bounded window (page-state/projection-window.ts).
+/** The queue rows the segmented route (page-body/projection.ts) rebuilds: live segmented pages of active sources. */
+export const SEGMENTED_JOB_PROBES = `JOIN sources s ON s.incarnation=j.source_incarnation AND NOT s.archived
+    JOIN pages p ON p.source_id=s.id AND p.slug=j.slug AND p.deleted_at IS NULL AND p.body_storage='segmented'`;
 /**
  * The page probe of a queue walk. `media` also admits `sealable` image rows
  * (projection-class.ts), for the explicit drain and its preview only: the
@@ -455,11 +458,23 @@ export async function noteProjectionRebuilds(engine: BrainEngine, rebuilt: numbe
 }
 
 /**
- * #5401: a failed rebuild waits this long before the resident retries it. One
- * fragment over `page_projection_jobs j`, shared by the consumer's idle probe
- * and the resident's selector.
+ * The queue reason of a segmented page whose projection a process is building (buildSegmentedProjection): the claim
+ * holds while its `updated_at`, renewed with each chunk batch, is younger than SEGMENTED_PROJECTION_LEASE_SECONDS.
+ * A build writes it as `segmented_projecting:<uuid>`, a token per acquisition that its renewals, seal and release match
+ * (a bare `segmented_projecting`, written by an older binary, is a claim too); a deferral or failure mark skips a live claim.
  */
-export const PROJECTION_RETRY_READY_SQL = "(j.reason IS DISTINCT FROM 'rebuild_failed' OR j.updated_at<now()-interval '30 seconds')";
+export const SEGMENTED_PROJECTION_CLAIM = 'segmented_projecting';
+export const SEGMENTED_PROJECTION_LEASE_SECONDS = 60;
+
+/**
+ * #5401: a failed rebuild waits this long before the resident retries it, and
+ * a segmented projection another process holds is left to it. One fragment
+ * over `page_projection_jobs j`, shared by the consumer's idle probe and the
+ * resident's selector.
+ */
+export const SEGMENTED_PROJECTION_CLAIMED_SQL = `(split_part(j.reason,':',1)='${SEGMENTED_PROJECTION_CLAIM}' AND j.updated_at>=now()-interval '${SEGMENTED_PROJECTION_LEASE_SECONDS} seconds')`;
+export const PROJECTION_RETRY_READY_SQL = "(j.reason IS DISTINCT FROM 'rebuild_failed' OR j.updated_at<now()-interval '30 seconds')"
+  + ` AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`;
 
 export interface ProjectionRebuildFailure { source_id: string; slug: string; reason: string }
 
@@ -688,7 +703,8 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
         const built = await buildSegmentedProjection(engine, { sourceId: job.source_id, slug: job.slug });
         await engine.executeRaw(built.sealed
           ? 'DELETE FROM page_projection_jobs WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid'
-          : 'UPDATE page_projection_jobs SET updated_at=now() WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid', observed);
+          : `UPDATE page_projection_jobs j SET updated_at=now() WHERE j.source_incarnation=$1::uuid AND j.slug=$2 AND j.revision=$3::uuid
+            AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`, observed);
         if (built.sealed) rebuilt++;
         else superseded++;
         continue;
@@ -698,8 +714,8 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
       rebuilt++;
     } catch (error) {
       if (!(error instanceof PageRevisionConflictError)) {
-        await engine.executeRaw(`UPDATE page_projection_jobs SET reason='rebuild_failed',updated_at=now()
-          WHERE source_incarnation=$1::uuid AND slug=$2 AND revision=$3::uuid`, observed);
+        await engine.executeRaw(`UPDATE page_projection_jobs j SET reason='rebuild_failed',updated_at=now()
+          WHERE j.source_incarnation=$1::uuid AND j.slug=$2 AND j.revision=$3::uuid AND NOT ${SEGMENTED_PROJECTION_CLAIMED_SQL}`, observed);
         if (opts.onFailure) opts.onFailure({ source_id: job.source_id, slug: job.slug, reason: (error instanceof Error ? error.message : String(error)).split('\n')[0].slice(0, 300) });
         else process.stderr.write('[gbrain] Projection rebuild failed; work remains queued. Inspect projection readiness and the recorded source path.\n');
         continue;
@@ -733,6 +749,12 @@ export async function rebuildPendingPageProjections(engine: BrainEngine, limit =
 
 /** #6286: queued projections are rebuilt in batches of this many pages. */
 const DRAIN_BATCH = 100;
+
+/**
+ * @internal Work the drain does, for its tests: route batches it ran (`batches`), and queued pages each route tried
+ * (`inline_pages`: rebuilt, healed or failed; `segmented_pages`: every segmented row listed, built or not).
+ */
+export const projectionDrainWork = { batches: 0, inline_pages: 0, segmented_pages: 0 };
 
 export interface ProjectionDrainResult {
   rebuilt: number;
@@ -780,6 +802,21 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
   let seal = { sealed: 0, sealed_with_visual: 0, sealed_text_only: 0 };
   const walk: { after?: QueueKey } = {};
   try {
+    // Wave B: pages stored in segments first, through their own route, each queued row listed once per run. A row
+    // another process's live claim holds is not listed; one that row's build leaves unsealed stays queued.
+    const { rebuildPendingSegmentedProjections } = await import('../page-body/projection.ts');
+    const listed: string[] = [];
+    while (opts.limit === undefined || tried < opts.limit) {
+      const batch = await rebuildPendingSegmentedProjections(engine, Math.min(DRAIN_BATCH, (opts.limit ?? Infinity) - tried),
+        { notAfter: runStart, reasons: opts.reasons, retryCooldown: false, exclude: listed, onFailure: failure => { failed.push(failure); } });
+      projectionDrainWork.batches++;
+      projectionDrainWork.segmented_pages += batch.listed.length;
+      if (!batch.listed.length) break;
+      listed.push(...batch.listed);
+      rebuilt += batch.rebuilt;
+      tried += batch.listed.length;
+      opts.progress?.tick(batch.listed.length, `${rebuilt} rebuilt, ${failed.length} failed`);
+    }
     // Continue while a batch rebuilt, removed, failed or durably deferred a
     // row; stop on a no-op batch. A bare `superseded` row (another worker
     // consumed it) is not progress, so one row can never spin the drain.
@@ -792,6 +829,8 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
       rebuilt += batch.rebuilt;
       superseded += batch.superseded;
       const progressed = batch.rebuilt + healed + failedNow;
+      projectionDrainWork.batches++;
+      projectionDrainWork.inline_pages += progressed;
       if (progressed === 0) break;
       tried += progressed;
       opts.progress?.tick(progressed, `${rebuilt} rebuilt, ${failed.length} failed`);
@@ -809,7 +848,8 @@ export async function drainProjections(engine: BrainEngine, opts: { limit?: numb
   }
   const after = await projectionBacklog(engine);
   const more = opts.limit !== undefined && tried >= opts.limit
-    && (await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j ${probes} LIMIT 1`)).length > 0;
+    && (await engine.executeRaw(`SELECT 1 FROM page_projection_jobs j ${probes}
+      UNION ALL SELECT 1 FROM page_projection_jobs j ${SEGMENTED_JOB_PROBES} LIMIT 1`)).length > 0;
   const result: ProjectionDrainResult = { rebuilt, superseded, failed, remaining: after.pending, limited: more };
   return opts.media ? { ...result, ...seal, statistics_refreshed: projectionStatisticsRefreshes(engine) > refreshes, remaining_by_class: after } : result;
 }

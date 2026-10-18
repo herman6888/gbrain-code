@@ -61,9 +61,13 @@ within Node-API v3 and the existing Windows platform minimum.
 ## Export publication
 
 `export-publication.h` adds `beginExport(absoluteDestination)`,
-`publishExportFile(handle, relativePath, Buffer)`, `completeExport(handle)` and
-idempotent `closeExport(handle)`. `nativeExportPublisher()` loads these four
-synchronous methods asynchronously through the same literal addon imports.
+`publishExportFile(handle, relativePath, Buffer)`,
+`publishExportFileFrom(handle, relativePath, absoluteSource)`, `completeExport(handle)` and
+idempotent `closeExport(handle)`. `publishExportFileFrom` copies a staged regular
+file (an absolute path, leaf symlinks and reparse points refused) through 1 MiB
+reads into the same no-replace leaf publication, so a large page is never held
+whole in memory. `nativeExportPublisher()` loads these five synchronous methods
+asynchronously through the same literal addon imports.
 Export handles have their own registry and cleanup hook; they cannot be passed
 to lock operations, or vice versa. There is no filesystem fallback when the
 addon or an OS primitive is unavailable.

@@ -186,6 +186,16 @@ describe('search.keyword_statement_timeout_ms governs all six Postgres keyword s
     });
   }
 
+  test('every site issues no statement before its bound but the knob read (the manifest-grant probe runs inside the bounded transaction)', async () => {
+    for (const site of Object.keys(SITES)) {
+      const { engine, recorded } = await recordingEngine({ dbValue: '2500' });
+      await SITES[site](engine);
+      const boundAt = recorded.findIndex(({ sql, params }) => Connection.statementTimeoutChanges(sql, params).length > 0);
+      expect(boundAt, site).toBeGreaterThanOrEqual(0);
+      expect(recorded.slice(0, boundAt).filter(r => !r.sql.includes(KEYWORD_STATEMENT_TIMEOUT_KEY)).map(r => r.sql), site).toEqual([]);
+    }
+  });
+
   test('countKeywordPages keeps a narrower caller timeoutMs under the knob', async () => {
     expect(await timeoutFor('countKeywordPages', { dbValue: '5000' }, 1500)).toEqual(['1500ms']);
     expect(await timeoutFor('countKeywordPages', {}, 2000)).toEqual(['2000ms']);

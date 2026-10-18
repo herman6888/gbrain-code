@@ -23,6 +23,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { Action } from '../agent-output.ts';
 import { isStatementTimeout } from './bounded-reads.ts';
+import { readSchemaBehind } from './schema-admission.ts';
 import { readReceiptRetentionDays, DEFAULT_RECEIPT_RETENTION_DAYS } from './limits.ts';
 import type { PublicCategory } from './public-category.ts';
 import { classifyTerminal, dispositionOf, driftSinceAction, TERMINAL_FIXED_IN, supersessionOrderSql, supersessionSql, terminalInspectArgv, terminalKnockOnSql, type TerminalCategory,
@@ -80,17 +81,19 @@ const BUILD = (r: string) => `COALESCE(${r}.error_detail->'attempt'->>'consumer_
 const ENDED = (r: string) => `COALESCE(${r}.completed_at, ${r}.updated_at)`;
 const TERMINAL = (r: string) => `${r}.state IN ('failed','conflict','cancelled')`;
 /** A request holding a publication recovery record outside an in-flight claim: it blocks its root. `recovering` is the durable parked state (a blocked restore). */
+/** #6904: the grouped `reason`, with an older build's owner exception on a missing relation or column (its errno) read as `schema_missing`, as `classifyTerminal` reads the full detail. */
+const SCHEMA_AWARE_REASON = (r: string) => `COALESCE(${r}.error_detail->>'reason', CASE WHEN ${r}.error_detail->>'origin'='owner_exception' AND ${r}.error_detail->>'errno' IN ('42P01','42703') THEN 'schema_missing' END)`;
 const RECOVERY = (r: string) => `(${r}.recovery IS NOT NULL AND ${r}.state IN ('committed','recovering','failed','conflict','cancelled'))`;
 
 interface KeyColumns { source_id: string; state: string; error_code: string | null; origin: string | null; reason: string | null; cause: string | null; operation: string; intent_kind?: string | null;
   has_recovery: boolean; blocked_reason: string | null; compacted: boolean; knock_on: boolean; routed_message: string | null; build: string | null }
 
-function verdictOf(row: KeyColumns & { request_id?: string; slug?: string; error_detail?: Record<string, unknown> | null }): TerminalVerdict {
+function verdictOf(row: KeyColumns & { request_id?: string; slug?: string; error_detail?: Record<string, unknown> | null }, schemaBehind: boolean | null = null): TerminalVerdict {
   const detail = row.error_detail ?? (row.origin || row.reason || row.cause ? { ...(row.origin ? { origin: row.origin } : {}), ...(row.reason ? { reason: row.reason } : {}),
     ...(row.cause ? { cause: row.cause } : {}) } : null);
   return classifyTerminal({ request_id: row.request_id, source_id: row.source_id, slug: row.slug ?? '<slug>', operation: row.operation, state: row.state, error_code: row.error_code,
     error_detail: detail, recovery: row.has_recovery || null, blocked_reason: row.blocked_reason, compacted: row.compacted, knock_on: row.knock_on,
-    error_message: row.routed_message, build: row.build, intent_kind: row.intent_kind ?? null })!;
+    error_message: row.routed_message, build: row.build, intent_kind: row.intent_kind ?? null, schema_behind: schemaBehind })!;
 }
 
 async function bounded<T>(engine: BrainEngine, sql: string, params: unknown[]): Promise<T[] | 'unknown'> {
@@ -125,13 +128,14 @@ export type TerminalSummary = { status: 'ok'; window_days: number; window_clampe
 export async function readTerminalFailureSummary(engine: BrainEngine, opts: { sourceIds?: string[]; thresholds?: TerminalThresholds;
   checkpointBlockers?: Map<string, Array<{ request_id: string; slug: string; knock_on: boolean; recovery: boolean }>> } = {}): Promise<TerminalSummary> {
   const t = opts.thresholds ?? await readTerminalThresholds(engine);
+  const schemaBehind = await readSchemaBehind(engine);
   const span = Math.max(t.windowDays, 8);
   const days = Array.from({ length: 7 }, (_, i) => `count(*) FILTER (WHERE state IN ('failed','conflict','cancelled') AND ended_at <= now()-interval '${i + 1} day' AND ended_at > now()-interval '${i + 2} day')::int AS d${i + 2}`).join(',\n      ');
   const rows = await bounded<KeyColumns & { set: number; resolved: boolean | null; rows: number; in_window: number; n_24h: number; oldest: string | null; oldest_age: number | null;
     distinct_slugs: number; distinct_intents: number; recovery_ids: string[] | null; recovery_slugs: string[] | null } & Record<string, number>>(engine,
     `WITH base AS (
       SELECT r.id, r.request_id::text AS request_id, r.source_id, r.slug, r.digest, r.sequence, r.operation, r.intent->>'kind' AS intent_kind, r.state, r.error_code,
-        r.error_detail->>'origin' AS origin, r.error_detail->>'reason' AS reason, r.error_detail->>'cause' AS cause,
+        r.error_detail->>'origin' AS origin, ${SCHEMA_AWARE_REASON('r')} AS reason, r.error_detail->>'cause' AS cause,
         r.recovery IS NOT NULL AS has_recovery, r.blocked_reason, r.compacted, ${terminalKnockOnSql('r')} AS knock_on,
         ${ROUTED_MESSAGE('r')} AS routed_message, ${BUILD('r')} AS build, ${ENDED('r')} AS ended_at
       FROM persistence_requests r JOIN sources s ON s.id=r.source_id AND s.archived IS NOT TRUE
@@ -173,7 +177,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
       s.daily_7d = Array.from({ length: 7 }, (_, i) => Number(row[`d${i + 2}`] ?? 0));
       continue;
     }
-    const verdict = verdictOf(row);
+    const verdict = verdictOf(row, schemaBehind);
     const n = Number(row.rows);
     if (verdict.historical && Number(row.n_24h) > 0) {
       s.new_last_24h_older_builds.rows += Number(row.n_24h);
@@ -181,7 +185,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
     }
     if (row.has_recovery) {
       (row.recovery_ids ?? []).forEach((id, i) => {
-        const v = verdictOf({ ...row, request_id: id, slug: row.recovery_slugs?.[i] });
+        const v = verdictOf({ ...row, request_id: id, slug: row.recovery_slugs?.[i] }, schemaBehind);
         s.active_blockers.push({ kind: 'recovery', source_id: row.source_id, request_id: id, slug: row.recovery_slugs?.[i], category: v.category, action: v.action,
           needs_human: v.needs_human, ...(v.human_reason ? { human_reason: v.human_reason } : {}) });
       });
@@ -288,6 +292,7 @@ export function terminalFailuresArgv(q: TerminalFailureQuery, extra: Record<stri
  */
 export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailureQuery): Promise<TerminalFailureListing> {
   const t = await readTerminalThresholds(engine, q.sinceDays);
+  const schemaBehind = await readSchemaBehind(engine);
   const limit = Math.min(100, Math.max(1, q.limit ?? 20));
   const state = q.state ?? 'unresolved';
   const out: TerminalFailureRow[] = [];
@@ -313,7 +318,7 @@ export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailu
     for (const row of batch) {
       scanned++;
       cursor = row.sequence;
-      const v = verdictOf(row);
+      const v = verdictOf(row, schemaBehind);
       const disposition = dispositionOf(row.later_state ? { state: row.later_state, same_intent: row.same_intent === true } : null);
       const historical = !row.has_recovery && (disposition !== 'unknown' || v.historical);
       const matches = (!q.category || v.category === q.category) && (!q.code || v.code === q.code)

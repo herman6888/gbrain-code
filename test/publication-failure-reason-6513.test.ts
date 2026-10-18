@@ -25,7 +25,7 @@ const raise = (raiser: string, message: string, extra: Record<string, unknown> =
 const leak = (value: unknown) => JSON.stringify(value).includes(PRIVATE);
 
 test('the reason enum is closed and covers the three known raisers; everything else is unknown', () => {
-  expect([...PUBLICATION_REASONS].sort()).toEqual(['attribution_unclassified_table', 'graduation_in_progress', 'trust_unclassified_table', 'unknown']);
+  expect([...PUBLICATION_REASONS].sort()).toEqual(['attribution_unclassified_table', 'graduation_in_progress', 'schema_missing', 'trust_unclassified_table', 'unknown']);
   const attribution = databaseRefusal(raise('gbrain_stamp_write_attribution', 'gbrain_stamp_write_attribution is not classified for table pages'))!;
   expect(attribution).toMatchObject({ code: 'storage_error', detail: { origin: 'database_trigger', sqlstate: 'P0001', raiser: 'gbrain_stamp_write_attribution', table: 'pages', reason: 'attribution_unclassified_table' } });
   expect(attribution.message).toBe('Publication failed (P0001 in gbrain_stamp_write_attribution: attribution_unclassified_table). Inspect owner diagnostics.');

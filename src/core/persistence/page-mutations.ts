@@ -38,6 +38,7 @@ import { assertRestoreOrigin } from './detached-pages.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
 import { publishesDatabaseOnly } from './page-prepare.ts';
 import { materializedSnapshot } from './segmented-apply.ts';
+import { liveSearchable } from './searchable.ts';
 import { cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
@@ -182,6 +183,21 @@ export function pendingAwareResponse(ctx: OperationContext, row: WriteRequest): 
   }
 }
 
+/**
+ * A committed reply whose outcome left the projection pending says whether search sees the page now (searchable.ts), in
+ * the reply and its `write_request`; `projection: 'pending'` stays only while it still is.
+ */
+async function withLiveSearchable(ctx: OperationContext, response: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (response.searchable !== 'pending') return response;
+  const live = await liveSearchable(ctx, response as Parameters<typeof liveSearchable>[1]);
+  const settle = (fields: Record<string, unknown>) => {
+    const { projection, ...rest } = fields;
+    return { ...(live.searchable === 'pending' ? { projection } : {}), ...rest, ...live };
+  };
+  const receipt = response.write_request as Record<string, unknown> | undefined;
+  return { ...settle(response), ...(receipt ? { write_request: settle(receipt) } : {}) };
+}
+
 /** #6188 (D21): a write whose fence Tier 1 rewrote carries one `fence_normalized` coaching notice. */
 export function emitFenceNotice(ctx: Pick<OperationContext, 'emitNotice'>, response: Record<string, unknown>, slug?: string): void {
   const report = response.fences_normalized as FencesNormalized | undefined;
@@ -209,7 +225,7 @@ export async function submitPageMutation(ctx: OperationContext,
   // cache could explain drops it and prepares the write once more, uncached, so it ends as it would without it.
   const cached = await preadmitReads(ctx.engine);
   let prepared = await preparePageAdmission(cached ? { ...ctx, engine: cached } : ctx, { ...input, params });
-  if (prepared.prior) return throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false);
+  if (prepared.prior) return withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false));
   const brainId = cached ? cachedPreadmitBrain(ctx.engine) : undefined;
   // Phase 4.4: the admission transaction runs on the warm single-write lane when it is free.
   const admit = (admission: WriteAdmission) => onPersistenceLane(ctx.engine, transaction => admitWrite(ctx.engine, admission, undefined, transaction),
@@ -220,10 +236,10 @@ export async function submitPageMutation(ctx: OperationContext,
     if (!cached || !preadmitRecheckFailed(error)) throw error;
     dropPreadmitCache(ctx.engine);
     prepared = await preparePageAdmission(ctx, { ...input, params: { ...params, request_id: prepared.admission.requestId } });
-    if (prepared.prior) return throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false);
+    if (prepared.prior) return withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false));
     row = await admit(prepared.admission);
   }
-  const response = throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, row, ctx.config, waitMs())), false);
+  const response = await withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, row, ctx.config, waitMs())), false));
   emitFenceNotice(ctx, response, row.slug);
   return { ...response, ...(prepared.typeWarning ? { type_warning: prepared.typeWarning } : {}), ...(prepared.slugAdvisory ? { slug_advisory: prepared.slugAdvisory } : {}) };
 }

@@ -42,11 +42,16 @@ import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { PERSISTENCE_REQUEST_SLUG_INTENT_INDEX } from './schema.ts';
 import { readRequestIndexStates, REQUEST_INDEXES_REPAIR_COMMAND, type RequestIndexState } from './checkpoint-validation.ts';
 import { faultPoint } from './fault-points.ts';
+import { clearRebuildableCache } from './rebuildable-cache.ts';
 import { carryingNeedles, findRequestsForSlugs, JOURNAL_SWEEP_MATCH_CAP, recheckRequestsCarrying, redactRequestIntents, sweepRequestsCarrying, sweepRequestsForGroups,
   type JournalSweep } from './intent-redaction.ts';
 import { dropPurgedFenceRows } from '../facts/purge-overlay.ts';
 import { derivedRowsFrom, hideDerivedRows } from '../facts/derivation-inputs.ts';
 import { contentHash } from '../utils.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { rewrittenContentHash } from '../page-body/segment-rewrite.ts';
+import { stagingNeedsTextSql } from '../page-body/schema.ts';
+import type { PagePurgeContext } from '../facts/purge-verify.ts';
 import { assertHeldPageKeys } from '../page-state/guards.ts';
 import { noteBelief } from '../belief/ledger.ts';
 import { appendPurgeIntent } from '../belief/purge-mirror.ts';
@@ -68,7 +73,7 @@ function hostOnly(command: string) {
  * needles) and row ids, keyed by `<source_id>:<request_id>`, in this process only. A receipt built where the
  * map has no entry reports the prose probe as unverified.
  */
-const purgeContext = new Map<string, { needles: string[]; factIds: number[]; pageId: number; paths: string[]; ledgerClaims?: string[]; ledger?: LedgerPurgeReport | null }>();
+const purgeContext = new Map<string, PagePurgeContext>();
 const PURGE_CONTEXT_LIMIT = 64;
 const purgeReceipts = new Map<string, { receipt: Record<string, unknown>; purge: Record<string, unknown> }>();
 
@@ -214,7 +219,8 @@ async function journalLookup<T>(row: WriteRequest, point: PurgeLookupPoint, slug
 
 /** The text-free tombstones of an owner-requested page purge: its facts, takes, and the content hash of the page and every retained version. */
 async function tombstonePage(tx: BrainEngine, sourceId: string, slug: string, pageId: number, snapshot: PageSnapshot, requestId: string, actor: string,
-  storedHash: string | null, hashes: Set<string>): Promise<void> {
+  stored: { hash: string | null; generation: number }, hashes: Set<string>): Promise<void> {
+  const page = snapshot.page;
   await tx.executeRaw(`INSERT INTO fact_purges(source_id,visibility,subject,fact_hash,request_id,actor,reason)
     SELECT DISTINCT source_id,visibility,COALESCE(entity_slug,'*'),gbrain_fact_fingerprint(fact),$3::uuid,$4,'page purge'
     FROM facts WHERE source_id=$1 AND source_markdown_slug=$2 ON CONFLICT DO NOTHING`, [sourceId, slug, requestId, actor]);
@@ -223,16 +229,28 @@ async function tombstonePage(tx: BrainEngine, sourceId: string, slug: string, pa
   // Tombstone the content hash of the page and of every retained version, each as an import of that body would
   // compute it and as the purge overlay leaves it (the overlay now drops this page's tombstoned fence rows), so
   // neither the stale file nor an older version of it imports again under any slug.
-  const versions = await tx.executeRaw<Record<string, unknown>>(`SELECT title,type,compiled_truth,timeline,frontmatter,tags,source_path FROM page_versions
-    WHERE page_id=$1 ORDER BY id DESC LIMIT 1000`, [pageId]);
-  const bodies = [{ ...snapshot.page, tags: snapshot.tags }, ...versions.map(v => ({ title: String(v.title ?? ''), type: v.type as never,
-    compiled_truth: String(v.compiled_truth ?? ''), timeline: String(v.timeline ?? ''), frontmatter: (v.frontmatter ?? {}) as Record<string, unknown>,
-    tags: Array.isArray(v.tags) ? v.tags.map(String) : [] }))];
-  if (storedHash) hashes.add(storedHash);
-  for (const body of bodies) {
+  const versions = await tx.executeRaw<Record<string, unknown>>(`SELECT title,type,compiled_truth,timeline,frontmatter,tags,body_storage,body_generation,content_hash
+    FROM page_versions WHERE page_id=$1 ORDER BY id DESC LIMIT 1000`, [pageId]);
+  const meta = (v: Record<string, unknown>) => ({ title: String(v.title ?? ''), type: v.type as never, frontmatter: (v.frontmatter ?? {}) as Record<string, unknown>,
+    tags: Array.isArray(v.tags) ? v.tags.map(String) : [] });
+  if (stored.hash) hashes.add(stored.hash);
+  // Wave B (spec 5, 11): a segmented body is never held whole: its stored hash (and a version's) is the import hash, and
+  // the purge-overlaid hash is streamed from its segments.
+  const overlaid = (fence: string) => dropPurgedFenceRows(tx, sourceId, fence, slug);
+  const segmented = isSegmentedPage(page) ? [{ generation: stored.generation, meta: { ...meta(page as never), tags: snapshot.tags } }] : [];
+  const inline = isSegmentedPage(page) ? [] : [{ ...page, tags: snapshot.tags }];
+  for (const v of versions) {
+    if (v.body_storage !== 'segmented') { inline.push({ ...meta(v), compiled_truth: String(v.compiled_truth ?? ''), timeline: String(v.timeline ?? '') } as never); continue; }
+    if (typeof v.content_hash === 'string') hashes.add(v.content_hash);
+    segmented.push({ generation: Number(v.body_generation), meta: meta(v) });
+  }
+  for (const body of inline) {
     hashes.add(contentHash(body));
-    hashes.add(contentHash({ ...body, compiled_truth: await dropPurgedFenceRows(tx, sourceId, body.compiled_truth, slug),
-      timeline: await dropPurgedFenceRows(tx, sourceId, body.timeline ?? '', slug) }));
+    hashes.add(contentHash({ ...body, compiled_truth: await overlaid(body.compiled_truth), timeline: await overlaid(body.timeline ?? '') }));
+  }
+  for (const body of segmented) {
+    const hash = await rewrittenContentHash(tx, pageId, sourceId, body.generation, overlaid, body.meta);
+    if (hash) hashes.add(hash);
   }
   await tx.executeRaw(`INSERT INTO page_purges(source_id,content_hash,slug,request_id) SELECT $1,h,$3,$4::uuid FROM unnest($2::text[]) AS h
     ON CONFLICT (source_id,content_hash) DO UPDATE SET slug=EXCLUDED.slug,request_id=EXCLUDED.request_id,purged_at=now()`, [sourceId, [...hashes], slug, requestId]);
@@ -242,7 +260,7 @@ async function tombstonePage(tx: BrainEngine, sourceId: string, slug: string, pa
 export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest, snapshot: PageSnapshot, prepared: PreparedPagePurge): Promise<Record<string, unknown>> {
   const page = snapshot.page, sourceId = row.source_id, slug = page.slug;
   const actor = `${row.principal_kind}:${row.principal_id}`;
-  const [stored] = await tx.executeRaw<{ content_hash: string | null }>('SELECT content_hash FROM pages WHERE id=$1', [page.id]);
+  const [stored] = await tx.executeRaw<{ content_hash: string | null; body_generation: number | string }>('SELECT content_hash,body_generation FROM pages WHERE id=$1', [page.id]);
   const storedHash = stored?.content_hash ?? null;
   const lookup = <T>(point: PurgeLookupPoint, fn: () => Promise<T>) => journalLookup(row, point, prepared.slugIndex, fn);
   const retention = prepared.retention;
@@ -254,7 +272,7 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
     visibility, COALESCE(entity_slug,'*') AS subject FROM facts WHERE source_id=$1 AND source_markdown_slug=$2`, [sourceId, slug]);
   const mirrorTakes = retention ? [] : (await tx.executeRaw<{ claim_hash: string }>('SELECT DISTINCT gbrain_fact_fingerprint(claim) AS claim_hash FROM takes WHERE page_id=$1', [page.id])).map(t => t.claim_hash);
   const hashes = new Set<string>();
-  if (!retention) await tombstonePage(tx, sourceId, slug, page.id, snapshot, row.id, actor, storedHash, hashes);
+  if (!retention) await tombstonePage(tx, sourceId, slug, page.id, snapshot, row.id, actor, { hash: storedHash, generation: Number(stored?.body_generation) }, hashes);
   const { factRows, takeRows, needles } = await readPurgeClaims(tx, sourceId, slug, page.id);
   const factIds = factRows.map(f => Number(f.id)), takeIds = takeRows.map(t => Number(t.id));
   const derivedFrom = await derivedRowsFrom(tx, [{ table: 'pages', id: page.id }, ...factIds.map(id => ({ table: 'facts', id })), ...takeIds.map(id => ({ table: 'takes', id }))]);
@@ -280,7 +298,10 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   removed.write_gate_receipts = await count(`DELETE FROM write_gate_receipts WHERE (target_table='pages' AND target_id=$1) OR (target_table='facts' AND target_id=ANY($2::text[]))
     OR (target_table='takes' AND target_id=ANY($3::text[])) OR (target_table='write_gate_holds' AND target_id=ANY($4::text[])) RETURNING 1`,
   [String(page.id), refs, takeIds.map(String), holds]);
-  removed.query_cache = await count('DELETE FROM query_cache RETURNING 1', []);
+  const missingCaches: string[] = [];
+  const cleared = await clearRebuildableCache(tx, 'query_cache');
+  if (cleared === null) missingCaches.push('query_cache');
+  removed.query_cache = cleared ?? 0;
   removed.facts = await count('DELETE FROM facts WHERE source_id=$1 AND source_markdown_slug=$2 RETURNING 1', [sourceId, slug]);
   removed.take_proposals = await count('DELETE FROM take_proposals WHERE source_id=$1 AND page_slug=$2 RETURNING 1', [sourceId, slug]);
   removed.open_loops = await count('DELETE FROM open_loops WHERE source_id=$1 AND page_slug=$2 RETURNING 1', [sourceId, slug]);
@@ -312,15 +333,17 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
     derived_hidden: await appendDerivedHidden(tx, { sourceId, request: row.id, publicationId: row.id, op: 'delete_page', targets: heldTargets, truncated: walk === 'truncated' }),
     derived_walk: walk })) : null;
   if (ledger) removed.belief_events = ledger.purged_events + ledger.redacted_fields.length;
-  await tx.deletePage(slug, { sourceId });
+  const { shas, ...segmentRows } = await deletePageWithSegments(tx, sourceId, slug, page.id);
+  Object.assign(removed, segmentRows);
   if (!retention) appendPurgeIntent({ request: row.id, request_id: row.request_id, source_id: sourceId, source_incarnation: row.source_incarnation,
     scope: 'page', slug, purge_epoch: epoch, content_hashes: [...hashes], facts: mirrorFacts, takes: mirrorTakes, lifetimes });
   const key = `${sourceId}:${row.request_id}`;
   purgeContext.delete(key);
-  purgeContext.set(key, { needles, factIds, pageId: page.id, paths, ledgerClaims: inventory.claims, ledger });
+  purgeContext.set(key, { needles, factIds, pageId: page.id, paths, segmentShas: shas.slice(0, 4096), ledgerClaims: inventory.claims, ledger });
   while (purgeContext.size > PURGE_CONTEXT_LIMIT) purgeContext.delete(purgeContext.keys().next().value!);
   return { status: 'purged', slug, source_id: sourceId, residuals: PURGE_RESIDUALS, journal_sweep: journalSweep, ...(retention ? { retention: true } : {}),
     purge: { content_hash8: storedHash?.slice(0, 8) ?? null, tombstoned: hashes.size > 0, content_hashes_tombstoned: hashes.size, removed,
+      ...(missingCaches.length ? { missing_caches: missingCaches } : {}),
       ...(ledger ? { ledger: { purged_events: ledger.purged_events, redacted_fields: ledger.redacted_fields.length, live_carriers: ledger.live_carriers.length, derived_hidden: ledger.derived_hidden, derived_walk: ledger.derived_walk } } : {}),
       derived: { ...derived, truncated: derivedFrom.truncated },
       blobs: files.map(f => f.storage_path).filter(Boolean) } };
@@ -386,4 +409,22 @@ export async function unpurgePage(ctx: OperationContext, p: Record<string, unkno
     return { slug, source_id: sourceId, cleared: cleared.length, fact_tombstones_cleared: facts, take_tombstones_cleared: takes,
       next: cleared.length ? `The next import of ${slug} with its old content is accepted (gbrain sync --source ${sourceId} --no-pull). Nothing was restored.` : `No purge tombstone is recorded for ${slug} in source ${sourceId}.` };
   });
+}
+
+/**
+ * Delete a purged page with its segment storage (Wave B, spec 11), in the caller's transaction: the segment texts only
+ * its manifests referenced go with it, and so do its stagings (one of a create has no page row to cascade from). A text
+ * another page still references stays, and so does one an unpublished write of another page staged or deduped onto (a
+ * create holds its manifest rows in memory until it publishes): that write's copy, not this page's. The restore-time
+ * purge replay deletes a page this way too.
+ */
+export async function deletePageWithSegments(tx: BrainEngine, sourceId: string, slug: string, pageId: number):
+  Promise<{ shas: string[]; page_body_manifest: number; page_body_stagings: number; page_segment_texts: number }> {
+  const shas = (await tx.executeRaw<{ sha: string }>(`SELECT DISTINCT encode(sha256,'hex') AS sha FROM page_body_manifest WHERE page_id=$1`, [pageId])).map(r => r.sha);
+  const manifest = (await tx.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM page_body_manifest WHERE page_id=$1', [pageId]))[0]?.n ?? 0;
+  const stagings = (await tx.executeRaw('DELETE FROM page_body_stagings WHERE source_id=$1 AND (slug=$2 OR page_id=$3) RETURNING 1', [sourceId, slug, pageId])).length;
+  await tx.deletePage(slug, { sourceId });
+  const texts = shas.length ? (await tx.executeRaw(`DELETE FROM page_segment_texts t WHERE t.source_id=$1 AND t.sha256=ANY(SELECT decode(h,'hex') FROM unnest($2::text[]) AS h)
+    AND NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.source_id=t.source_id AND m.sha256=t.sha256) AND NOT ${stagingNeedsTextSql('t')} RETURNING 1`, [sourceId, shas])).length : 0;
+  return { shas, page_body_manifest: manifest, page_body_stagings: stagings, page_segment_texts: texts };
 }

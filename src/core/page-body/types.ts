@@ -68,7 +68,7 @@ export interface SegmentChunkInput extends Omit<ChunkInput, 'chunk_index'> {
   occurrence_id: number;
   /** Order of the chunk inside its occurrence; document order is (manifest byte_start, local_ordinal). */
   local_ordinal: number;
-  /** Stored-stream span (generation-bound). */
+  /** Stored span relative to the occurrence's segment (add the manifest row's byte_start), so it survives a shift. */
   raw_byte_start: number;
   raw_byte_end: number;
 }

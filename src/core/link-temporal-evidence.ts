@@ -172,9 +172,10 @@ const EXPLICIT_RE = /\b(Started|Ended)\s+([a-z][a-z0-9_]*)\s+(?:\[\[([^\]|\n]+)(
 const isRelationToken = (token: string) => token.includes('_') || KNOWN_LINK_TYPES.has(token) || relationSemantics(token) !== 'reference';
 const hasExplicit = (text: string) => [...text.matchAll(EXPLICIT_RE)].some(m => isRelationToken(m[2]));
 
-interface DatedLine { date: string; text: string; dream: boolean }
+export interface DatedLine { date: string; text: string; dream: boolean }
 
-function datedLines(content: string): DatedLine[] {
+/** The dated timeline lines of `content` outside code fences. */
+export function datedLines(content: string): DatedLine[] {
   const out: DatedLine[] = [];
   let fence = false;
   for (const line of content.split('\n')) {
@@ -201,12 +202,35 @@ export interface PageForEvidence {
 /** Receives each derived transition with the stable id of the cue that produced it (`cue.*`, `unit.*`). */
 export type TransitionExplainer = (t: DerivedTransition, rule: string) => void;
 
+/**
+ * What temporal evidence reads from a page body: the dated lines of the joined body and every reference in the
+ * compiled truth outside dated lines, with the clause before it. A segmented page collects them block by block.
+ */
+export interface TemporalInputs { lines: DatedLine[]; narrative: NarrativeRef[] }
+export interface NarrativeRef { target: string; window: string }
+
+/** The references of a compiled-truth text outside dated lines, each with the clause before it (windowBefore). */
+export function narrativeRefs(truth: string): NarrativeRef[] {
+  const narrative = stripDatedLines(truth);
+  let prevEnd = 0;
+  return referencesIn(narrative).map(ref => {
+    const window = windowBefore(narrative, ref.index, prevEnd);
+    prevEnd = ref.index + 2;
+    return { target: ref.target, window };
+  });
+}
+
 export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly OwnedRow[], explain?: TransitionExplainer): TemporalEvidence {
+  return temporalEvidenceFrom(page, { lines: datedLines(`${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`), narrative: narrativeRefs(page.compiled_truth ?? '') },
+    rows, explain);
+}
+
+export function temporalEvidenceFrom(page: Pick<PageForEvidence, 'slug' | 'frontmatter'>, inputs: TemporalInputs, rows: readonly OwnedRow[],
+  explain?: TransitionExplainer): TemporalEvidence {
   const tense = new Map<string, AssertionTense>();
   const transitions: DerivedTransition[] = [];
   const unmatched: TemporalEvidence['unmatched'] = [];
-  const content = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
-  const lines = datedLines(content);
+  const { lines } = inputs;
   const temporalRows = rows.filter(r => relationSemantics(r.link_type) !== 'reference');
   const other = (r: OwnedRow) => (r.from_slug === page.slug ? r.to_slug : r.from_slug);
   const seen = new Set<string>();
@@ -301,16 +325,12 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   }
 
   // 4. Tense of each owned assertion row, from compiled-truth mentions only.
-  const narrative = stripDatedLines(page.compiled_truth ?? '');
-  const narrativeRefs = referencesIn(narrative);
   for (const r of temporalRows) {
     const cues = relationSemantics(r.link_type) === 'state' ? cuesFor(r.link_type!) : null;
     if (!cues) { if (relationSemantics(r.link_type) === 'state') tense.set(rowKey(r), 'present'); continue; }
-    let past = 0, present = 0, prevEnd = 0;
-    for (const ref of narrativeRefs) {
-      const window = windowBefore(narrative, ref.index, prevEnd);
-      prevEnd = ref.index + 2;
-      if (!refersTo(ref.target, other(r))) continue;
+    let past = 0, present = 0;
+    for (const { target, window } of inputs.narrative) {
+      if (!refersTo(target, other(r))) continue;
       if (cues.past.test(window) || cues.end.test(window)) past++; else present++;
     }
     tense.set(rowKey(r), past > 0 && present === 0 && r.link_source !== 'frontmatter' ? 'past' : 'present');

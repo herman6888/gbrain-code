@@ -65,7 +65,7 @@ import { installPageEmbeddings, readProjectionSnapshot, type ProjectionSnapshot 
 import { reconcileContextualEmbeddingInputs } from './page-state/contextual-proof.ts';
 import { digest } from './persistence/digest.ts';
 import { isLargePageBytes } from './page-size-policy.ts';
-import { pageBodyBytes } from './page-body/page-shape.ts';
+import { isSegmentedPage, pageBodyBytes } from './page-body/page-shape.ts';
 
 /**
  * v3 = chunks embed with optional contextual retrieval wrapper. The
@@ -228,7 +228,7 @@ export type ReembedPageResult =
     }
   | {
       kind: 'skipped';
-      reason: 'mode_none' | 'no_chunks' | 'page_missing' | 'soft_deleted' | 'budget_limited';
+      reason: 'mode_none' | 'no_chunks' | 'page_missing' | 'soft_deleted' | 'budget_limited' | 'page_body_segmented';
     }
   | {
       kind: 'page_fallback';
@@ -310,6 +310,9 @@ export async function reembedPageWithContextualRetrieval(
   if (initial.deleted_at != null) {
     return { kind: 'skipped', reason: 'soft_deleted' };
   }
+  // Wave B: a segmented page's vectors come from its stale chunk rows (page-body/segmented-embedding.ts); its contextual
+  // synopsis per segment is spec 8.6. Nothing is stamped: its vectors were not rebuilt under this mode.
+  if (isSegmentedPage(initial)) return { kind: 'skipped', reason: 'page_body_segmented' };
 
   const prepared = await readProjectionSnapshot(args.engine, args.pageSlug, args.sourceId, { allowUnsealed: true });
   if (!prepared) return { kind: 'skipped', reason: 'page_missing' };

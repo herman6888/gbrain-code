@@ -14,6 +14,9 @@
  * malformed fences removed) for every caller, at most EXCERPT_PAGE_CHARS per
  * page and EXCERPT_CARD_CHARS per card; a page that did not fit is listed in
  * `identity_excerpt_omitted`. The excerpt adds nothing to the mention index.
+ * A segmented page (body stored in segments) is excerpted from its trusted,
+ * withdrawal-overlaid lead, the first EXCERPT_LEAD_BYTES of its compiled truth
+ * ending on a whole line, so lines past that window are not considered.
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -25,9 +28,15 @@ import { readIdentitySiblings, SIBLING_GROUP_CAP } from '../mentions/siblings.ts
 import type { MentionPolicy, PackTypes } from '../mentions/policy.ts';
 import type { Notice } from '../agent-output.ts';
 import type { RecordGroupView } from './entity-references.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { truthLead } from '../page-body/segment-blocks.ts';
+import { boundedRawPrefix } from '../page-window/bounded-lead.ts';
+import { BOUNDED_PREFIX_BYTES } from '../page-window/document.ts';
 
 export const EXCERPT_PAGE_CHARS = 600;
 export const EXCERPT_CARD_CHARS = 1200;
+/** How much of a segmented page's compiled truth the excerpt reads: the bounded lead every other lead reader uses. */
+export const EXCERPT_LEAD_BYTES = BOUNDED_PREFIX_BYTES;
 const EXCERPT_LINE_CHARS = 300;
 const NOT_NAMES = new Set(['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'ARR', 'MRR', 'TBD', 'N/A', 'NA', 'CEO', 'CFO', 'CTO', 'COO', 'VP', 'UTC', 'PST', 'PDT', 'EST', 'ID']);
 const NAME_RUN_RE = /\b[A-Z][\p{L}\p{N}&'’-]*(?:\s+[A-Z][\p{L}\p{N}&'’-]*)+/gu;
@@ -140,6 +149,19 @@ export async function readSiblingIdentity(engine: BrainEngine, sourceId: string,
   };
 }
 
+/**
+ * The body an excerpt is cut from: the compiled truth, or a segmented page's lead (EXCERPT_LEAD_BYTES, cut back to a
+ * whole line when the truth goes on), read at the snapshot's revision.
+ */
+async function excerptSource(engine: BrainEngine, snapshot: PageSnapshot): Promise<string> {
+  const { page } = snapshot;
+  if (!isSegmentedPage(page)) return page.compiled_truth ?? '';
+  const lead = await truthLead(engine, page.id, EXCERPT_LEAD_BYTES, { revision: snapshot.revision, generation: snapshot.bodyGeneration });
+  const bounded = boundedRawPrefix(lead, EXCERPT_LEAD_BYTES);
+  if (bounded.length === lead.length && lead.length < EXCERPT_LEAD_BYTES) return lead;
+  return bounded.slice(0, Math.max(0, bounded.lastIndexOf('\n')));
+}
+
 /** The card's identity fields for `row`. Fail-soft: a failed read leaves the field out. */
 export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   row: { slug: string; title: string | null; compiled_truth: string | null },
@@ -159,7 +181,7 @@ export async function readCardIdentity(engine: BrainEngine, sourceId: string,
   const bodies = new Map<string, { title: string; body: string }>();
   for (const slug of slugs) {
     const snapshot = snapshots.get(pageSnapshotKey(sourceId, slug));
-    if (snapshot) bodies.set(slug, { title: snapshot.page.title ?? slug, body: snapshot.page.compiled_truth ?? '' });
+    if (snapshot) bodies.set(slug, { title: snapshot.page.title ?? slug, body: await excerptSource(engine, snapshot).catch(() => '') });
   }
   const excerpt: IdentityExcerptLine[] = [];
   const omitted: string[] = [];

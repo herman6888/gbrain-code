@@ -45,6 +45,7 @@ import { isFactsBackstopEligible } from './eligibility.ts';
 import type { PageType } from '../types.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
+import type { ManagedFactsRefusal } from '../persistence/facts-maintenance.ts';
 import type { GBrainConfig } from '../config.ts';
 import { isAvailable } from '../ai/gateway.ts';
 import { withAIInvocationPreflight } from '../ai/invocation-guard.ts';
@@ -61,7 +62,7 @@ import { intentContentOrigin } from '../trust/channel.ts';
 import { readTaintInputs, derivedWriteTrust, recordTaintEdges } from '../trust/taint.ts';
 import { applyGateDecision, derivedGateConfig, derivedGateInput, emptyGateTally, type GateTally } from '../trust/derived-gate.ts';
 import { decideFactWrite } from '../write-gate-store.ts';
-import { commitExtractionPlan, planExtraction, readPageWatermark, type InputTruncated } from '../extraction-watermark.ts';
+import { commitExtractionPlan, planExtraction, planSegmentedExtraction, readPageWatermark, type InputTruncated } from '../extraction-watermark.ts';
 
 // The notability-filter vocabulary lives in notability-filter.ts; re-exported for existing importers.
 export { NOTABILITY_FILTERS, coerceNotabilityFilter, type FactNotabilityFilter } from './notability-filter.ts';
@@ -184,6 +185,8 @@ export type FactsBackstopResult =
       would_dedup_same_page?: number;
       /** #6506: candidates skipped because the exact claim was forgotten in this source and visibility. */
       withdrawn_skipped?: number;
+      /** GBRA-130 A-36 (managed): entity requests refused for their own page; the other entities' facts committed. */
+      refused?: ManagedFactsRefusal[];
       /** Large pages A7: the extractor read only part of the page (also stored in page_extraction_state). */
       input_truncated?: InputTruncated;
     };
@@ -201,13 +204,15 @@ interface PipelineInput {
 }
 
 /** One page or turn pipeline run's counts (runPipelineWithBody). */
-interface PipelineResult { inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number; withdrawn_skipped?: number }
+interface PipelineResult { inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason; write_gate?: GateTally; fence_refused?: number; would_dedup_same_page?: number; withdrawn_skipped?: number; refused?: ManagedFactsRefusal[] }
 
 interface ParsedPageInput {
   slug: string;
   type: PageType;
+  /** A segmented page's (`segmentedPageId`) lead: what eligibility reads; the extraction plan reads its segments. */
   compiled_truth: string;
   frontmatter: Record<string, unknown>;
+  segmentedPageId?: number;
 }
 
 /** k for findCandidateDuplicates — ceiling on candidates considered. */
@@ -559,6 +564,8 @@ export async function runFactsPipeline(
   would_dedup_same_page?: number;
   /** #6506: candidates skipped because the exact claim was forgotten in this source and visibility. */
   withdrawn_skipped?: number;
+  /** GBRA-130 A-36 (managed): entity requests refused for their own page; the other entities' facts committed. */
+  refused?: ManagedFactsRefusal[];
 }> {
   return runPipelineWithBody({
     turnText,
@@ -585,11 +592,15 @@ async function runPipeline(
   // tail; without a usable one it reads the head and the receipt says so.
   const { MAX_TURN_TEXT_CHARS } = await import('./extract.ts');
   const { pageId, stored } = await readPageWatermark(ctx.engine, ctx.sourceId, parsedPage.slug, 'facts_backstop');
-  const plan = planExtraction(parsedPage.compiled_truth, stored, { cap: MAX_TURN_TEXT_CHARS, pipeline: 'facts_backstop', emptyTail: 'skip' });
+  // A segmented page is planned over its segments; its whole body is never one string, so the turn text is the plan's.
+  const planOpts = { cap: MAX_TURN_TEXT_CHARS, pipeline: 'facts_backstop', emptyTail: 'skip' } as const;
+  const plan = parsedPage.segmentedPageId !== undefined
+    ? await planSegmentedExtraction(ctx.engine, parsedPage.segmentedPageId, stored, planOpts)
+    : planExtraction(parsedPage.compiled_truth, stored, planOpts);
   if (!plan.text) return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [] };
   const result = await runPipelineWithBody(
     {
-      turnText: parsedPage.compiled_truth,
+      turnText: parsedPage.segmentedPageId !== undefined ? plan.text : parsedPage.compiled_truth,
       ...(plan.mode === 'full' ? {} : { extractText: plan.text }),
       isDreamGenerated: false,  // eligibility check already rejected dream pages
       ref: parsedPage.slug,
@@ -722,6 +733,7 @@ async function runPipelineBodyInner(
   const derivation = await factsDerivation(ctx, input);
   const managed = await prepareManagedFactsSession(ctx, input, derivation);
   if (managed) {
+    managed.reportRefusals = true;
     const replay = await resumeManagedFacts(ctx.engine, managed);
     if (replay) return replay;
     const embedding = await resolveManagedFactsEmbedding(ctx.engine, managed.config);
@@ -1028,7 +1040,7 @@ async function runPipelineBodyInner(
       // didn't (null-localPath echo, or the write_through flag flipped
       // mid-pipeline across the config-cache TTL). Route the group to the
       // legacy DB-only path — never drop facts.
-      warnOnce(
+      if (result.databaseOnlyReason !== 'url_clone') warnOnce(
         'facts:fence-write-unexpected-fallback',
         `[facts] writeFactsToFence returned legacyFallback for slug=${slug} despite localPath being set — routing to DB-only inserts.`,
       );

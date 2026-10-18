@@ -12,6 +12,7 @@ import { guardEffectSource } from './effect-recovery.ts';
 import type { SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
 import { excludesPrivateWrites } from './page-visibility.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { extractSegmentedPageLinks } from '../page-body/segment-links.ts';
 import { isRemoteWantedPagesEnabled, replaceWantedLinks } from '../wanted-links.ts';
 
 /** `mcp.remote_auto_links`: unset is on; false/0/no/off (any case) turns the remote `links` effect off. */
@@ -28,11 +29,16 @@ const SKIPPED_TARGET_LIMIT = 50;
  * Plain mention targets of a page body: markdown links, [[wikilinks]] and
  * page-path mentions in compiled_truth only. No frontmatter, no timeline
  * section, no schema-pack verbs; every edge is stored as an untyped `mentions`.
+ * A segmented page's compiled truth is read block by block (page-body/segment-links.ts).
  */
 async function mentionTargets(engine: BrainEngine, snapshot: PageSnapshot, sourceId: string) {
   const { page } = snapshot;
-  const { candidates } = await extractPageLinks(page.slug, page.compiled_truth, {}, page.type,
-    makeResolver(engine, { mode: 'live', sourceId }), { skipFrontmatter: true, pack: null, globalBasename: await isGlobalBasenameEnabled(engine) });
+  const resolver = makeResolver(engine, { mode: 'live', sourceId });
+  const opts = { skipFrontmatter: true, pack: null, globalBasename: await isGlobalBasenameEnabled(engine) };
+  const { candidates } = isSegmentedPage(page)
+    ? await extractSegmentedPageLinks(engine, { id: Number(page.id), slug: page.slug, source_id: sourceId, type: page.type, frontmatter: {} }, resolver,
+      { ...opts, regions: ['truth'] })
+    : await extractPageLinks(page.slug, page.compiled_truth, {}, page.type, resolver, opts);
   const targets = new Map<string, string>();
   const skipped: SkippedLinkTarget[] = [];
   for (const candidate of candidates) {
@@ -69,9 +75,8 @@ async function targetGrant(tx: SqlEngine, a: WriteAuthority): Promise<(slug: str
  * mention edges (link_source `mcp-remote-mention`, origin = the page) against
  * the targets that exist at execution time, in the page's source, visible to
  * the writer and inside its slug grant. Only this producer's edges are added
- * or removed. A changed or deleted page, a revoked grant, a disabled config or
- * a segmented page (its body is not read; its edges are kept) finishes the
- * effect as skipped with its reason. The links table carries no
+ * or removed. A changed or deleted page, a revoked grant or a disabled config
+ * finishes the effect as skipped with its reason. The links table carries no
  * writer guard or row attribution, so the source guard and the page keys of
  * the page and its targets are what serialize this with publications.
  */
@@ -83,7 +88,6 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
   const snapshot = await engine.readPageSnapshot(effect.data.slug, { sourceId });
   if (!snapshot || snapshot.page.id !== effect.data.page_id || snapshot.revision !== effect.revision) return skip(engine, 'superseded');
   if (!await isAutoLinkEnabled(engine) || !await isRemoteAutoLinksEnabled(engine)) return skip(engine, 'disabled');
-  if (isSegmentedPage(snapshot.page)) return skip(engine, 'page_body_segmented');
   const { targets, skipped } = await mentionTargets(engine, snapshot, sourceId);
   const beliefs = unmanagedBeliefPoint(sourceId, [snapshot.page.slug], 'remote_auto_links');
   await engine.transaction(async tx => {

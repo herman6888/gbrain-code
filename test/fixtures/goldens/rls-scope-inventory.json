@@ -2484,12 +2484,12 @@
       },
       "purgeDeletedPages#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -2851,23 +2851,23 @@
       },
       "restorePage#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
       "restorePage#sourceId": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -3550,7 +3550,7 @@
       }
     },
     "static": {
-      "callSites": 32,
+      "callSites": 33,
       "directMethods": {
         "_searchKeywordCJK": 1,
         "countChunklessPagesWithContent": 1,
@@ -3566,6 +3566,7 @@
         "getChunkWindows": 1,
         "getChunks": 1,
         "getLinks": 1,
+        "keywordBoundedRead": 1,
         "listChunklessPagesWithContent": 1,
         "listCorpusSample": 1,
         "listEmbeddingStateRows": 1,
@@ -3687,6 +3688,7 @@
         "invalidateContentDriftEmbeddings": "none",
         "invalidateStaleSignatureEmbeddings": "none",
         "jitOffRead": "none",
+        "keywordBoundedRead": "direct",
         "keywordStatementTimeoutSetting": "none",
         "listActiveTakesForPages": "none",
         "listAllPageRefs": "none",

@@ -13,8 +13,7 @@ import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
 import { derivedExtractionSkip } from './derived-extraction-gate.ts';
-import { bodyStorageOf, stringWriteStorage } from './segmented-apply.ts';
-import { isSegmentedPage, pageBodyBytes } from '../page-body/page-shape.ts';
+import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
@@ -80,7 +79,8 @@ async function extractionCompletedForPage(engine: BrainEngine, pageId: number): 
  */
 async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: ParsedPage, before: PageSnapshot | null): Promise<boolean> {
   const live = before && !before.page.deleted_at ? before.page : null;
-  if (!live || live.compiled_truth !== page.compiled_truth) return false;
+  // A segmented prior body is not compared; the extraction's watermark finds nothing appended and calls no model.
+  if (!live || isSegmentedPage(live) || bodyUnread(page) || live.compiled_truth !== page.compiled_truth) return false;
   if (!isFactsBackstopEligible(slug, live).ok) return false;
   if (!(await extractionCompletedForPage(engine, live.id))) return false;
   return !(await extractionPendingForPage(engine, live.id));
@@ -96,7 +96,6 @@ export async function prepareFactsBackstop(engine: BrainEngine, row: WriteReques
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };
-  if ((await stringWriteStorage(engine, pageBodyBytes(page), bodyStorageOf(before?.page))).storage === 'segmented') return { skipped: 'page_body_segmented' };
   if (await bodyAlreadyOffered(engine, row.slug, page, before)) return { skipped: 'body_unchanged' };
   return { queued: true };
 }
@@ -120,7 +119,6 @@ export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record
       throw error;
     }
   }
-  if (isSegmentedPage(snapshot.page)) return { skipped: 'page_body_segmented' } as const;
   return { page: snapshot.page };
 }
 

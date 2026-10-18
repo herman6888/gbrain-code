@@ -16,7 +16,7 @@ import { embeddingInputHash, plainEmbeddingTier } from '../embedding-input-hash.
 import { meterPageBatch, spendGrant } from '../page-embedding-budget.ts';
 import { embeddingInputContext, embeddingWriteTarget } from '../page-state/projections.ts';
 import { quoteIdentifier, vectorCastSuffix } from '../search/embedding-column.ts';
-import { chunkGenerationFilter, chunkVisibleFilter, currentTextProjectionFilter } from '../search/safe-chunks.ts';
+import { chunkGenerationFilter, currentTextProjectionFilter } from '../search/safe-chunks.ts';
 import { buildSegmentedProjection } from './projection.ts';
 import { isSegmentedPage } from './page-shape.ts';
 import type { BodyStorage } from './types.ts';
@@ -81,7 +81,7 @@ export async function countSegmentedEmbedRows(engine: Pick<BrainEngine, 'execute
   const [row] = await engine.executeRaw<{ total: number; stale: number }>(
     `SELECT count(*)::int AS total, count(*) FILTER (WHERE cc.${col} IS NULL)::int AS stale
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-      WHERE cc.page_id = $1 AND ${chunkVisibleFilter('p', 'cc')}`, [pageId]);
+      WHERE cc.page_id = $1 AND ${currentTextProjectionFilter('p')} AND ${chunkGenerationFilter('p', 'cc')}`, [pageId]);
   return { total: Number(row?.total ?? 0), stale: Number(row?.stale ?? 0) };
 }
 
@@ -97,7 +97,8 @@ export async function listSegmentedStaleRows(engine: Pick<BrainEngine, 'executeR
     `SELECT cc.chunk_index, cc.chunk_text, cc.chunk_source
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
       WHERE cc.page_id = $1 AND ($5::boolean OR cc.${col} IS NULL) AND ($2::int IS NULL OR cc.chunk_index < $2::int)
-        AND ($4::bigint[] IS NULL OR cc.occurrence_id = ANY($4::bigint[])) AND ${chunkVisibleFilter('p', 'cc')}
+        AND ($4::bigint[] IS NULL OR cc.occurrence_id = ANY($4::bigint[]))
+        AND ${currentTextProjectionFilter('p')} AND ${chunkGenerationFilter('p', 'cc')}
       ORDER BY cc.chunk_index DESC LIMIT $3`,
     [pageId, opts.beforeChunkIndex, opts.limit, opts.occurrenceIds ? [...opts.occurrenceIds] : null, opts.includeEmbedded ?? false]);
 }

@@ -60,8 +60,8 @@ for (const kind of testBackends()) {
         bodyBytes: 2 * KB,
         occurrences: [
           { id: 1, byteStart: 0, genFrom: 1, byteLen: KB, chunks: [{ text: 'opening passage' }] },
-          { id: 2, byteStart: KB, genFrom: 1, genTo: 2, byteLen: 8 * KB, chunks: [{ text: 'first tail', retiredGeneration: 2 }] },
-          { id: 3, byteStart: KB, genFrom: 2, genTo: 3, byteLen: 8 * KB, chunks: [{ text: 'second tail', retiredGeneration: 3 }] },
+          { id: 2, byteStart: KB, genFrom: 1, genTo: 2, byteLen: 8 * KB, chunks: [{ text: 'first tail' }] },
+          { id: 3, byteStart: KB, genFrom: 2, genTo: 3, byteLen: 8 * KB, chunks: [{ text: 'second tail' }] },
           { id: 4, byteStart: KB, genFrom: 3, byteLen: KB, chunks: [{ text: 'third tail' }] },
         ],
       }));

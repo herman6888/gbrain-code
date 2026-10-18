@@ -6,11 +6,12 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { opError, OperationError } from '../ops/contract.ts';
-import { assertInlineBody } from '../page-body/page-shape.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { wholeBodySnapshot } from './segmented-apply.ts';
 import { pageIdentityError } from './page-identity.ts';
 import { renderTimelineEntry, spliceTimelineBlock } from '../timeline-write-through.ts';
 import { extractTimelineFromContent } from '../timeline-extract.ts';
-import { preparePageMutation } from './page-prepare.ts';
+import { preparePageMutation, prepareSegmentedTagMutation } from './page-prepare.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
 import { assertPageRevision } from '../page-state/types.ts';
@@ -44,18 +45,21 @@ export function regeneratedByWriter(sourceKind: string | null | undefined, page:
 }
 
 export async function prepareSemanticPageMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
-  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
-  if (!snapshot || snapshot.page.id !== row.page_id) throw pageIdentityError(snapshot != null, 'The accepted page was replaced by another page.');
-  assertInlineBody(snapshot.page, row.operation);
+  const stored = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
+  if (!stored || stored.page.id !== row.page_id) throw pageIdentityError(stored != null, 'The accepted page was replaced by another page.');
   const p = row.intent!;
-  if (p.expected_revision !== undefined) assertPageRevision(snapshot,engineMutationPrecondition(parseMutationPrecondition(p)));
+  if (p.expected_revision !== undefined) assertPageRevision(stored,engineMutationPrecondition(parseMutationPrecondition(p)));
   if (row.operation === 'add_tag' || row.operation === 'remove_tag') {
     if (typeof p.tag !== 'string' || !p.tag.trim()) {
       throw opError('invalid_params', 'A tag must be nonempty.', `Request ${row.request_id} for ${row.slug} in source ${row.source_id} named an empty tag, so nothing changed. Submit the tag change again with a nonempty tag.`);
     }
     const tag = p.tag.trim();
-    const tags = row.operation === 'add_tag' ? [...new Set([...snapshot.tags, tag])].sort() : snapshot.tags.filter(value => value !== tag);
-    const prepared = await preparePageMutation(engine, row, config, {
+    const tags = row.operation === 'add_tag' ? [...new Set([...stored.tags, tag])].sort() : stored.tags.filter(value => value !== tag);
+    // Wave B (spec 6.4): a tag change on a segmented page is a metadata flip over the live manifest, at any size;
+    // only a write whose gate scans the whole body (an external_untrusted writer) takes the put path, up to 24 MiB.
+    const flipped = isSegmentedPage(stored.page) ? await prepareSegmentedTagMutation(engine, row, stored, tags) : null;
+    const snapshot = flipped ? stored : (await wholeBodySnapshot(engine, stored, `${row.operation} (the write gate scans the whole body of an external_untrusted write)`))!;
+    const prepared = flipped ?? await preparePageMutation(engine, row, config, {
       expectedRevision: snapshot.revision, tags, content: serializePageToMarkdown(snapshot.page, tags),
     });
     // #5251: a tag change leaves every chunk's text as it was, so the republication queues no
@@ -66,6 +70,8 @@ export async function prepareSemanticPageMutation(engine: BrainEngine, row: Writ
     throw opError('writer_coordinator_required', 'This semantic writer has no registered preparation handler.',
       `Request ${row.request_id} (${row.operation}) in source ${row.source_id} has no preparation handler in this gbrain version, so nothing changed. This is an internal or version-skew fault: report it to the user.`);
   }
+  // Wave B: a segmented page within 24 MiB is read back whole and written as a normal put; a larger one refuses.
+  const snapshot = (await wholeBodySnapshot(engine, stored, row.operation))!;
   const entry = { date: String(p.date), summary: String(p.summary), source: String(p.source ?? ''), detail: String(p.detail ?? '') };
   const rendered = renderTimelineEntry(entry, row.slug);
   if (!rendered) {

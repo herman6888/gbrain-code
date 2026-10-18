@@ -215,7 +215,7 @@ test('#5762 a lock timeout in the validation stays transient contention', async 
   const f = await fixture(engine);
   const restore = failValidation(engine, 'lock');
   try { expect(await performManagedSync(engine, f.opts)).toMatchObject({ status: 'partial', reason: 'writer_pending' }); }
-  finally { restore(); }
+  finally { await disposePersistenceConsumer(engine); restore(); }
   const [checkpoint] = await engine.executeRaw<{ state: string; error_code: string | null }>(
     "SELECT state,error_code FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_checkpoint'", [f.id]);
   expect(checkpoint.error_code).toBeNull();

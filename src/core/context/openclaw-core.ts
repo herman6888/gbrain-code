@@ -19,6 +19,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { pressureNotice, readPressureGate, shouldWarn, type PressureGate } from './pressure.ts';
+import { loadContextModule } from './load-warning.ts';
 
 export const CORE_MEMO_TTL_MS = 60_000;
 
@@ -40,7 +41,7 @@ export type CoreFetcher = (sessionId: string | null, memoIdentity: string | null
 /** The core_delivery cache identity (generation, then eligibility); null when it cannot be read. Read before the core content. */
 export async function coreTrustIdentity(engine: BrainEngine): Promise<string | null> {
   try {
-    const { proactiveCacheIdentity } = await import('../eligibility/generation.ts');
+    const { proactiveCacheIdentity } = await loadContextModule('src/core/eligibility/generation.ts', () => import('../eligibility/generation.ts'));
     return (await proactiveCacheIdentity({ engine }, 'core_delivery')).identity;
   } catch {
     return null;
@@ -52,7 +53,7 @@ export async function refreshCoreFromEngine(engine: BrainEngine, sourceId: strin
   const identity = await coreTrustIdentity(engine);
   const pressure = await readPressureGate(engine, true).catch(() => null);
   if (identity !== null && identity === memoIdentity) return { kind: 'unchanged', identity, pressure };
-  const { loadCoreBlock } = await import('../core-memory.ts');
+  const { loadCoreBlock } = await loadContextModule('src/core/core-memory.ts', () => import('../core-memory.ts'));
   return { kind: 'fresh', value: { text: (await loadCoreBlock(engine, { sessionSourceId: sourceId, excludePrivate: true })).text, pressure }, identity };
 }
 
@@ -92,10 +93,10 @@ export function createOpenClawCoreLane(opts: OpenClawCoreLaneOptions): OpenClawC
   async function fetchCore(sessionId: string | null, memoIdentity: string | null): Promise<CoreRefresh> {
     const work = opts.fetcher ? opts.fetcher(sessionId, memoIdentity).catch(() => null) : (async (): Promise<CoreRefresh> => {
       try {
-        const { loadConfig } = await import('../config.ts');
+        const { loadConfig } = await loadContextModule('src/core/config.ts', () => import('../config.ts'));
         const cfg = loadConfig();
         if (cfg?.engine === 'pglite' && cfg.database_path) {
-          const ipc = await import('./resolve-ipc.ts');
+          const ipc = await loadContextModule('src/core/context/resolve-ipc.ts', () => import('./resolve-ipc.ts'));
           const secret = ipc.readIpcSecret(cfg.database_path);
           if (!secret) return null;
           // bankOnly rides along for version skew: an older serve without the
@@ -112,10 +113,10 @@ export function createOpenClawCoreLane(opts: OpenClawCoreLaneOptions): OpenClawC
           if (trust?.unchanged) return memoIdentity && trust.identity === memoIdentity ? { kind: 'unchanged', identity: trust.identity, pressure } : null;
           return { kind: 'fresh', value: { text: res.block.core?.text ?? '', pressure }, identity: trust?.identity ?? null };
         }
-        const { getDirectPostgresEngine } = await import('./reflex.ts');
+        const { getDirectPostgresEngine } = await loadContextModule('src/core/context/reflex.ts', () => import('./reflex.ts'));
         const pg = await getDirectPostgresEngine(cfg);
         if (!pg) return null;
-        const { resolveSourceId } = await import('../source-resolver.ts');
+        const { resolveSourceId } = await loadContextModule('src/core/source-resolver.ts', () => import('../source-resolver.ts'));
         return await refreshCoreFromEngine(pg, await resolveSourceId(pg, null, opts.workspaceDir), memoIdentity);
       } catch {
         return null;

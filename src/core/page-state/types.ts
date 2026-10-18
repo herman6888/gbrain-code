@@ -74,6 +74,8 @@ export interface PageSnapshot {
   withdrawals: PageWithdrawal[];
   /** Subject-'*' purges, listed in `withdrawals` only when the stored text names them. Absent when the source has none under the read's filter. */
   globalPurges?: GlobalPurgeMarker;
+  /** A segmented page's body generation at `revision` (readPageSnapshot): what a read that follows this snapshot pins. */
+  bodyGeneration?: number;
 }
 
 /**

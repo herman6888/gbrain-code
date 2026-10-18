@@ -50,7 +50,7 @@ import type { Notice } from '../core/agent-output.ts';
 import { opError, opOwnsSource } from '../core/ops/contract.ts';
 import { PAGE_MAX_BYTES } from '../core/page-size-policy.ts';
 import { opParamValue } from './op-param-values.ts';
-import { formatGetPage, readWholePageMarkdown, remoteErrorCode, wantsWholePage } from './page-render.ts';
+import { SEGMENTED_STREAMED, formatGetPage, printPagedPage, remoteErrorCode, streamSegmentedGet, wantsWholePage } from './page-render.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from '../core/cli-options.ts';
 import { runCliPreflight } from '../core/cli-preflight.ts';
 import { isBooleanLiteral, isKnownOpFlag } from '../core/op-flag-tokens.ts';
@@ -677,7 +677,10 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     if (op.scope === 'read') {
       try {
         rawResult = await withTimeout(
-          op.handler(ctx, params),
+          op.handler(ctx, params).catch(async (e: unknown) => { // large pages: a segmented page streams to stdout
+            if (op.name === 'get_page' && await streamSegmentedGet(engine, params, e, writeStdoutFinal)) return SEGMENTED_STREAMED;
+            throw e;
+          }),
           wallclockMs,
           `gbrain ${command}`,
         );
@@ -692,6 +695,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
       rawResult = await op.handler(ctx, params);
       if (op.mutating) await captureCapacityNotices(engine); // #6696 (A4)
     }
+    if (rawResult === SEGMENTED_STREAMED) return;
     // ENG-2 (renderer parity by data shape): JSON-round-trip the local-engine
     // path's return value so renderers see the same shape they'd see on the
     // routed path. Date → ISO string; bigint → string (postgres.js shape);
@@ -798,8 +802,7 @@ async function runThinClientRouted(
       ...(op.mutating ? { writeWaitMs: currentCliWriteWait().waitMs } : {}),
     }).catch(async (e: unknown) => { // large pages: a page too big for one response is paged to its end, verified, then printed
       if (op.name !== 'get_page' || remoteErrorCode(e) !== 'page_too_large_for_inline' || !wantsWholePage(params)) throw e;
-      const paged = await readWholePageMarkdown(async p => unpackToolResult(await callRemoteTool(cfg, 'get_page', p, { timeoutMs, signal: sigintController.signal })), params);
-      await writeStdoutFinal(params.json === true ? JSON.stringify({ slug: params.slug, revision: paged.revision, content: paged.markdown, windows: paged.windows }) + '\n' : paged.markdown);
+      await printPagedPage(async p => unpackToolResult(await callRemoteTool(cfg, 'get_page', p, { timeoutMs, signal: sigintController.signal })), params, writeStdoutFinal);
       return null;
     });
     if (raw === null) return;

@@ -344,7 +344,13 @@ completed run prints `Exported N pages` (or `Restored N pages`).
 
 Enumeration uses 256-key batches, not OFFSET or a total-page cap. Private on-disk
 SQLite staging is bounded to 8 GiB, individual payloads/withdrawal ledgers to 32 MiB,
-and snapshot collection to ten minutes with a 60-second statement timeout. Reaching
+and snapshot collection to ten minutes with a 60-second statement timeout. A page
+stored in segments (over 1 MiB, see
+[segmented page storage](guides/memory-boundaries.md#segmented-page-storage)) is
+streamed to a staged file instead: its limit is the page ceiling plus 8 MiB of
+metadata (256 MiB on Postgres, 128 MiB on PGLite), it needs that much free space
+plus 512 MiB on the staging filesystem, and each MiB of it adds a second to the
+collection limit. Reaching
 a bound is failure, not truncation or success. Use `--source`, `--type` or
 `--slug-prefix` to make smaller snapshots. These are fixed safety limits, not a
 promise about export duration or a paid-work budget. No model provider is called.

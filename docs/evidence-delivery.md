@@ -431,6 +431,7 @@ delivered text and each result gains `delivered`.
 | `no_section_structure` | `section` found no headings or speaker turns. | A `window` block (`delivered.unit: "window"`). |
 | `no_text_chunks` / `anchor_not_located` | No hit could be placed in the page text: no text chunk was in reach and the hit text itself was not found, or none of the located chunks overlap a hit. | The hit chunk (a code chunk without its synthesized header line), `fallback_reason` set. |
 | `page_missing` | A hit carried no page id (cannot be re-authorized by id). | The hit chunk (live hits only), `fallback_reason` set. |
+| `segment_read_failed` | A page stored in segments could not be read around its hits (its stored projection metadata was unusable, or a segment read failed). | The hit chunk (live hits only; cached hits are dropped as `not_readable`), `fallback_reason` set. |
 | `redaction_unmapped` | Secret redaction changed a block. | Redacted block; its spans move to `unmapped_chunk_ids`. |
 | `image_query_unsupported` | `query` with `image`: image hits are never expanded. | Plain image results; meta says so. |
 | `snippet_cap` | An explicit `snippet_chars` cut a block. | Capped block, `truncated: true`. |

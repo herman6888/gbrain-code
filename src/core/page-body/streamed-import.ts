@@ -4,8 +4,11 @@
  * over `PAGE_MAX_BYTES` and at most `readPageBodyPolicy().maxBytes` is read
  * twice through one descriptor and never held as one string. Pass 1
  * (`BodyScanner`) parses the bounded head and decides the timeline split and
- * fence trust; pass 2 streams the stored regions through the segmenter, the
- * hash and the staging (`prepareSegmentedBody`). The publication runs in one
+ * fence trust, and records the sha256 of each READ_BYTES block of the file;
+ * pass 2 streams the stored regions through the segmenter, the hash and the
+ * staging (`prepareSegmentedBody`), reading whole blocks and checking each
+ * against its pass-1 digest, so a rewrite that keeps the size and mtime is
+ * held rather than stored as a mix of both versions. The publication runs in one
  * maintenance transaction, as `importFromContent` does on an unmanaged brain.
  *
  * Every `importFromFile` / `importFromContent` step either runs here on the
@@ -16,15 +19,16 @@
  *   inference (head: the first 20 lines must be in it); the frontmatter holds
  *   and the path-authoritative slug; gate-owned marker strip (a quarantine
  *   override binds the whole body, so it is dropped: fail closed); content
- *   sanity (junk patterns read a 2 KB head, size from the stored byte count);
+ *   sanity (junk patterns read a 2 KB head and the prose pass the head, middle
+ *   and tail windows; size from the stored byte count, against
+ *   `content_sanity.bytes_block` or, unset, the page ceiling `pages.max_bytes`);
  *   type preservation and subtype; provenance,
  *   effective date, tags, frontmatter aliases; the content hash (resumed per
  *   segment); the no-op skip; identity dedup by hash (an external `id` holds);
  *   code-reference edges (per line, skipped when the body has protected
  *   regions); the read-back check and the gate receipt.
- * - holds: a registered guardrail (it reads the whole payload); the
- *   content-sanity prose pass (it runs only when `bytes_block` is above the
- *   body size); a write gate that applies to the source's tier; facts or takes
+ * - holds: a registered guardrail (it reads the whole payload); a write gate
+ *   that applies to the source's tier; facts or takes
  *   fences (fence normalization, withdrawal and purge preservation parse the
  *   whole body); derived entity aliases (a linkable page type); NUL bytes (the
  *   size check needs the stored byte count before the hash); invalid UTF-8
@@ -45,7 +49,7 @@ import { FRONTMATTER_HEAD_MAX_BYTES, SEGMENT_MAX_BYTES, type PageBodyPolicy } fr
 import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
 import { classifyImportHold, resolveParsedSubtype, type ParsedMarkdown } from '../markdown.ts';
 import { loadImportSanityConfig, settleContentDisposition, stripGateOwnedMarkers } from '../import-screen.ts';
-import { DEFAULT_BYTES_BLOCK, SCAN_HEAD_BYTES } from '../content-sanity.ts';
+import { JUNK_SAMPLE_CHARS } from '../content-sanity.ts';
 import { QUARANTINE_OVERRIDE_KEY } from '../quarantine-override.ts';
 import { hasGuardrails } from '../guardrails.ts';
 import { DEFAULT_WRITE_GATE_CONFIG, writeGateApplies } from '../write-gate.ts';
@@ -71,10 +75,18 @@ import { sanitizeText } from '../batch-rows.ts';
 import { applySegmentedBody, sealSegmentedPage, segmentedLivePage } from '../persistence/segmented-apply.ts';
 import { buildSegmentedProjection } from './projection.ts';
 import { prepareSegmentedBody, segmentWriteScope, utf8Prefix, type SegmentedStagingOwner } from './ingest.ts';
+import { readGarbageCollector } from './segment-blocks.ts';
 import type { JsonObject } from './types.ts';
 
 const READ_BYTES = 1024 * 1024;
 const FENCE_MARKER = /gbrain:(facts|takes):begin/;
+
+/**
+ * @internal Work the checked reads after pass 1 do, for the drift test: file blocks read and hashed against their
+ * pass-1 digests (`blocks`) and their bytes (`bytes`); and, for the scan memory test, the most file bytes pass 1
+ * read between two full collections (`scanUncollected`). Counts, not time.
+ */
+export const streamedImportWork = { blocks: 0, bytes: 0, scanUncollected: 0 };
 
 type StreamedImportOptions = {
   noEmbed?: boolean;
@@ -90,6 +102,10 @@ type StreamedImportOptions = {
    * runs in the coordinator's publication transaction.
    */
   coordinated?: { snapshot: PageSnapshot | null; owner: SegmentedStagingOwner; sha256: string;
+    /** The admitted page (a managed sync's `row.slug`): the page that records the file as its origin, which may differ from the path's slug. */
+    slug?: string;
+    /** A managed sync rename: `snapshot` is the page at its old slug, which the publication moves here first; an implicit type follows the new path. */
+    moved?: boolean;
     prepare(prepared: StreamedPreparedImport): Promise<ImportResult> };
 };
 
@@ -114,6 +130,57 @@ async function* readVirtual(file: FileHandle, bom: number, prefix: Uint8Array, s
   }
 }
 
+/** sha256 of each READ_BYTES block of the file after its BOM, from pass 1's reads whatever their sizes. */
+class BlockDigests {
+  readonly digests: string[] = [];
+  private hash = createHash('sha256');
+  private filled = 0;
+
+  push(bytes: Uint8Array): void {
+    for (let at = 0; at < bytes.length;) {
+      const take = Math.min(READ_BYTES - this.filled, bytes.length - at);
+      this.hash.update(bytes.subarray(at, at + take));
+      this.filled += take;
+      at += take;
+      if (this.filled === READ_BYTES) this.flush();
+    }
+  }
+
+  end(): readonly string[] {
+    if (this.filled) this.flush();
+    return this.digests;
+  }
+
+  private flush(): void {
+    this.digests.push(this.hash.digest('hex'));
+    this.hash = createHash('sha256');
+    this.filled = 0;
+  }
+}
+
+/**
+ * Bytes `[start, end)` of the virtual stream after pass 1, read in whole READ_BYTES blocks of the file; a block whose
+ * sha256 differs from its pass-1 digest sets `drift.changed`, and the caller holds the import.
+ */
+async function* readChecked(file: FileHandle, bom: number, prefix: Uint8Array, size: number, digests: readonly string[], drift: { changed: boolean },
+  start: number, end: number): AsyncIterable<Uint8Array> {
+  if (start < prefix.length) yield prefix.subarray(start, Math.min(end, prefix.length));
+  const from = Math.max(start, prefix.length) - prefix.length, to = end - prefix.length;
+  for (let block = Math.floor(from / READ_BYTES); from < to && block * READ_BYTES < to; block++) {
+    const offset = block * READ_BYTES;
+    const buffer = Buffer.allocUnsafe(Math.min(READ_BYTES, size - bom - offset));
+    for (let filled = 0; filled < buffer.length;) {
+      const { bytesRead } = await file.read(buffer, filled, buffer.length - filled, bom + offset + filled);
+      if (bytesRead === 0) throw new Error('The file shrank while it was imported.');
+      filled += bytesRead;
+    }
+    streamedImportWork.blocks++;
+    streamedImportWork.bytes += buffer.length;
+    if (createHash('sha256').update(buffer).digest('hex') !== digests[block]) drift.changed = true;
+    yield buffer.subarray(Math.max(from - offset, 0), Math.min(to - offset, buffer.length));
+  }
+}
+
 /** One stored region: its pieces in order, NUL bytes stripped (`sanitizeText` on a valid UTF-8 stream), every chunk passed to `inspect`. */
 async function* regionStream(pieces: readonly BodyPiece[], read: (start: number, end: number) => AsyncIterable<Uint8Array>,
   inspect: (bytes: Uint8Array) => void): AsyncIterable<Uint8Array> {
@@ -127,16 +194,25 @@ async function* regionStream(pieces: readonly BodyPiece[], read: (start: number,
   }
 }
 
-/** The first `max` bytes of a region (NUL-free), as text cut on a code-point boundary. */
-async function regionHead(pieces: readonly BodyPiece[], read: (start: number, end: number) => AsyncIterable<Uint8Array>, max: number): Promise<string> {
-  const parts: Uint8Array[] = [];
-  let bytes = 0;
-  for await (const part of regionStream(pieces, (start, end) => read(start, Math.min(end, start + max)), () => undefined)) {
-    parts.push(part);
-    bytes += part.length;
-    if (bytes >= max) break;
+/**
+ * Bytes `[from, from + max)` of a stored body as text, one window of the content-sanity sample (`sampleWindows`
+ * cuts the same head, middle and tail of a string body); a code point cut at either end decodes as U+FFFD.
+ */
+async function bodyWindow(pieces: readonly BodyPiece[], read: (start: number, end: number) => AsyncIterable<Uint8Array>, from: number, max: number): Promise<string> {
+  const parts: Buffer[] = [];
+  let at = 0;
+  for (const piece of pieces) {
+    if (at >= from + max) break;
+    const text = 'text' in piece ? Buffer.from(sanitizeText(piece.text), 'utf8') : null;
+    const length = 'text' in piece ? text!.length : piece.end - piece.start;
+    const start = Math.max(from, at), end = Math.min(from + max, at + length);
+    if (start < end) {
+      if ('text' in piece) parts.push(text!.subarray(start - at, end - at));
+      else for await (const part of read(piece.start + start - at, piece.start + end - at)) parts.push(Buffer.from(part));
+    }
+    at += length;
   }
-  return utf8Prefix(Buffer.concat(parts), max);
+  return Buffer.concat(parts).toString('utf8');
 }
 
 /**
@@ -147,7 +223,7 @@ async function regionHead(pieces: readonly BodyPiece[], read: (start: number, en
 class CodeRefLines {
   readonly refs = new Map<string, { path: string; line?: number }>();
   private carry = '';
-  private readonly decoder = new TextDecoder();
+  private readonly decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
   push(bytes: Uint8Array): void {
     const text = this.carry + this.decoder.decode(bytes, { stream: true });
@@ -167,13 +243,27 @@ class CodeRefLines {
   }
 }
 
-/** Pass 1 over the virtual stream; `prefix` is inferred frontmatter (empty when none). `hash` receives the file's bytes after its BOM. */
-async function scanFile(file: FileHandle, bom: number, prefix: Uint8Array, size: number, relativePath: string, opts: StreamedImportOptions, hash: Hash | null) {
+/**
+ * Pass 1 over the virtual stream; `prefix` is inferred frontmatter (empty when none). `hash` and `blocks` receive the
+ * file's bytes after its BOM. A full collection every few MiB read (readGarbageCollector), as the staging batches
+ * after it collect: each read leaves its buffer and the scanner's decoded text behind, and JSC's own collector rarely
+ * runs during the pass, so a 32 MiB file's pass 1 left ~170 MiB of garbage under the first staging batch, the import's
+ * peak; the peak grew with the file (segmented-ingest-memory: ~310 MiB above a 1 MiB import at 32 MiB, ~400 at 48 MiB;
+ * ~230 at both with the collection).
+ */
+async function scanFile(file: FileHandle, bom: number, prefix: Uint8Array, size: number, relativePath: string, opts: StreamedImportOptions, hash: Hash | null,
+  blocks: BlockDigests) {
   const scanner = new BodyScanner(relativePath, { validate: true, ...(opts.activePack ? { activePack: opts.activePack } : {}) });
   if (prefix.length) scanner.push(prefix);
+  const collect = readGarbageCollector();
+  let uncollected = 0;
   for await (const part of readVirtual(file, bom, new Uint8Array(0), 0, size - bom)) {
     hash?.update(part);
+    blocks.push(part);
     scanner.push(part);
+    uncollected += part.length;
+    streamedImportWork.scanUncollected = Math.max(streamedImportWork.scanUncollected, uncollected);
+    if (collect(part.length)) uncollected = 0;
   }
   return scanner.finish();
 }
@@ -182,6 +272,14 @@ async function scanFile(file: FileHandle, bom: number, prefix: Uint8Array, size:
 async function inferredPrefix(file: FileHandle, bom: number, size: number, relativePath: string): Promise<Uint8Array | null> {
   const buffer = Buffer.alloc(Math.min(FRONTMATTER_HEAD_MAX_BYTES, size - bom));
   await file.read(buffer, 0, buffer.length, bom);
+  return inferredHeadPrefix(buffer, relativePath);
+}
+
+/**
+ * The frontmatter inference would prepend to a file, from its head (at most FRONTMATTER_HEAD_MAX_BYTES after the BOM):
+ * empty when no rule applies, null when the head does not hold the first 20 lines inference reads (undecidable).
+ */
+export async function inferredHeadPrefix(buffer: Uint8Array, relativePath: string): Promise<Uint8Array | null> {
   const raw = utf8Prefix(buffer, buffer.length);
   const head = raw.slice(0, raw.lastIndexOf('\n') + 1);
   if (head.split('\n').length <= 20 || !head.trim()) return null;
@@ -209,22 +307,23 @@ export async function importStreamedMarkdownFile(engine: BrainEngine, filePath: 
     const prefix = opts.inferFrontmatter !== false ? await inferredPrefix(file, bom, size, relativePath) : new Uint8Array(0);
     if (!prefix) return hold(expectedSlug, size, 'frontmatter inference reads the first 20 lines, and they are not within the file head');
     const hash = opts.coordinated ? createHash('sha256').update(bomBytes.subarray(0, bom)) : null;
-    const scan = await scanFile(file, bom, prefix, size, relativePath, opts, hash);
+    const blocks = new BlockDigests();
+    const scan = await scanFile(file, bom, prefix, size, relativePath, opts, hash, blocks);
     if (hash && hash.digest('hex') !== opts.coordinated!.sha256) throw opError('source_changed', 'The input file changed after import admission.',
       `${relativePath} no longer has the bytes its import request admitted, so the request published nothing. Import it again to publish the current bytes.`);
     if (scan.kind === 'frontmatter_head_unbounded') {
       return { slug: expectedSlug, status: 'skipped', chunks: 0, error: scan.message, refusal: { code: 'invalid_frontmatter', message: scan.message }, skip_reason: 'invalid_frontmatter' };
     }
     if (scan.kind === 'invalid_utf8') return hold(expectedSlug, size, `the file is not valid UTF-8 at byte ${scan.offset} (the text path decodes it lossily)`);
-    return await importScanned(engine, { file, bom, prefix, size, scan, relativePath, filePath, expectedSlug, stat, policy, opts });
+    return await importScanned(engine, { file, bom, prefix, size, digests: blocks.end(), scan, relativePath, filePath, expectedSlug, stat, policy, opts });
   } finally {
     await file.close();
   }
 }
 
-async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom: number; prefix: Uint8Array; size: number; scan: BodyScan;
+async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom: number; prefix: Uint8Array; size: number; digests: readonly string[]; scan: BodyScan;
   relativePath: string; filePath: string; expectedSlug: string; stat: { mtimeMs: number; birthtime: Date; mtime: Date }; policy: PageBodyPolicy; opts: StreamedImportOptions }): Promise<ImportResult> {
-  const { file, bom, prefix, size, scan, relativePath, expectedSlug, opts } = input;
+  const { file, bom, prefix, size, digests, scan, relativePath, expectedSlug, opts } = input;
   const sourceId = opts.sourceId ?? 'default';
   const parsed = { ...scan.parsed, compiled_truth: '', timeline: '' } as ParsedMarkdown;
   const frontmatterHold = classifyImportHold(parsed);
@@ -243,9 +342,11 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
     slug = parsed.slug;
     logSlugFallback(slug, relativePath, expectedSlug ? 'normalization-equivalent identity restore' : 'path slugified empty');
   }
+  slug = opts.coordinated?.slug ?? slug;
   if (hasGuardrails()) return hold(slug, size, 'a registered guardrail reads the whole payload');
   if (scan.bodyFlags.has_nul) return hold(slug, size, 'NUL bytes change the stored size the content gate measures');
-  const read = (start: number, end: number) => readVirtual(file, bom, prefix, start, end);
+  const drift = { changed: false };
+  const read = (start: number, end: number) => readChecked(file, bom, prefix, size, digests, drift, start, end);
   parsed.title = sanitizeText(parsed.title);
   delete parsed.frontmatter[QUARANTINE_OVERRIDE_KEY];
   const writeGate = await ownerSourceGateInput(engine, sourceId, parsed.frontmatter);
@@ -253,10 +354,11 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
   const sanity = await loadImportSanityConfig(engine);
   if (writeGateApplies(writeGate.tier, sanity.writeGate ?? DEFAULT_WRITE_GATE_CONFIG)) return hold(slug, size, `the write gate scans the whole body of a ${writeGate.tier} page`);
   const bodyBytes = scan.truthBytes + (scan.timelineBytes ? 1 + scan.timelineBytes : 0);
-  if (!sanity.disabled && (sanity.cs.bytes_block ?? DEFAULT_BYTES_BLOCK) >= bodyBytes) return hold(slug, size, 'the content-sanity prose pass samples the whole body below content_sanity.bytes_block');
-  const truthHead = await regionHead(scan.truth, read, SCAN_HEAD_BYTES * 4);
-  const head = { ...parsed, compiled_truth: truthHead, timeline: truthHead.length >= SCAN_HEAD_BYTES ? '' : await regionHead(scan.timeline, read, SCAN_HEAD_BYTES * 4) };
-  const disposition = await settleContentDisposition(engine, head, { slug, sourceId, stripped: false, writeGate, bodyBytes });
+  const body: BodyPiece[] = [...scan.truth, ...(scan.timelineBytes ? [{ text: '\n' }, ...scan.timeline] : [])];
+  const sample = [0, Math.floor((bodyBytes - JUNK_SAMPLE_CHARS) / 2), bodyBytes - JUNK_SAMPLE_CHARS];
+  const windows = await Promise.all(sample.map(from => bodyWindow(body, read, from, JUNK_SAMPLE_CHARS)));
+  const disposition = await settleContentDisposition(engine, { ...parsed, compiled_truth: windows.join(''), timeline: '' },
+    { slug, sourceId, stripped: false, writeGate, bodyBytes, defaultBytesBlock: input.policy.maxBytes });
   const existing = opts.coordinated ? opts.coordinated.snapshot?.page ?? null : await engine.getPage(slug, { sourceId, includeDeleted: true });
   if (existing?.deleted_at) return hold(slug, size, 'restoring a deleted page rewrites its body through the inline writer');
   if (existing) stabilizeSafetyAssessments(parsed.frontmatter, existing.frontmatter);
@@ -266,7 +368,7 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
     process.stderr.write(`[import] slug collision: ${relativePath} and ${collisionOwner} both map to ${slug} in source ${sourceId}; keeping ${collisionOwner}. Rename one file to import both.\n`);
     return { slug, status: 'skipped', chunks: 0, skip_reason: 'slug_collision' };
   }
-  if (parsed.typeExplicit !== true && existing) parsed.type = existing.type;
+  if (parsed.typeExplicit !== true && existing && !opts.coordinated?.moved) parsed.type = existing.type;
   resolveParsedSubtype(parsed, existing);
   const typeClass = parsed.typeExplicit === true && opts.activePack ? classifyStoredType(parsed.type, opts.activePack) : null;
   const typeWarning = typeClass?.kind === 'alias_of' ? { kind: 'alias_of' as const, type: parsed.type, canonical: typeClass.canonical, directory: typeClass.directory }
@@ -306,7 +408,7 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
   codeRefs.end();
   const abort = async () => { await engine.setBodyStagingState(prepared.stagingId, 'aborted').catch(() => undefined); };
   const after = await file.stat();
-  if (after.size !== size || after.mtimeMs !== input.stat.mtimeMs) { await abort(); return hold(slug, size, 'the file changed while it was imported (import it again)'); }
+  if (drift.changed || after.size !== size || after.mtimeMs !== input.stat.mtimeMs) { await abort(); return hold(slug, size, 'the file changed while it was imported (import it again)'); }
   if (fenced) { await abort(); return hold(slug, size, 'facts and takes fences are normalized and checked against withdrawals over the whole body'); }
   const hash = prepared.body.content_hash;
   if (existing && !existing.deleted_at && !opts.forceRechunk && existing.content_hash === hash && existing.text_projection_revision === existing.knowledge_revision
@@ -316,7 +418,8 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
     return opts.coordinated ? opts.coordinated.prepare({ slug, observedRevision: opts.coordinated.snapshot?.revision ?? null, noop: true, result: skipped, frontmatter: parsed.frontmatter,
       validate: async () => {}, apply: async () => {} }) : skipped;
   }
-  const identity = await decideImportIdentity(engine, { sourceId, slug, hash, frontmatterId: null, sourcePath: relativePath, sourceRoot, body: { title: parsed.title, compiled_truth: '', timeline: '' } });
+  const identity = opts.coordinated?.moved ? { kind: 'none' as const }
+    : await decideImportIdentity(engine, { sourceId, slug, hash, frontmatterId: null, sourcePath: relativePath, sourceRoot, body: { title: parsed.title, compiled_truth: '', timeline: '' } });
   if (identity.kind === 'shared_hash') process.stderr.write(`[import] WARNING: ${relativePath} shares content_hash with ${identity.dupSlug} in source ${sourceId}. Indexing both.\n`);
   const nowDate = new Date();
   const { loadBrainTimeZone } = await import('../import-file.ts');
@@ -372,5 +475,6 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
     return apply(tx);
   }, writeTrustOfGate(writeGate)).catch(async error => { await abort(); throw error; });
   await afterCommit(engine, applied);
-  return imported;
+  const { segmentedPageSearchable } = await import('../persistence/searchable.ts');
+  return { ...imported, searchable: disposition.quarantined ? false : await segmentedPageSearchable(engine, sourceId, slug) };
 }

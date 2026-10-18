@@ -254,6 +254,10 @@
         "name": "writer_version"
       },
       {
+        "category": "ops",
+        "name": "segmented_storage"
+      },
+      {
         "category": "brain",
         "name": "self_capture"
       },

@@ -177,6 +177,8 @@ export interface Check extends CheckAgentFields {
   category?: CheckCategory;
   /** #6696 B1: wall time of the registry entry that produced this check. */
   elapsed_ms?: number;
+  /** Wave B decision #10: pages stored in segments this whole-body check did not read; only when > 0 (`withSkippedSegmented`). */
+  skipped_segmented?: number;
 }
 
 /**

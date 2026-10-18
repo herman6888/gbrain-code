@@ -10,7 +10,12 @@
  *
  * Weights are milliseconds per file (both arms, one Bun process) mined from
  * the job's `::group::<file>` timestamps; a file without a weight gets the
- * p75 (scripts/sharding.ts). Docs: docs/TESTING.md#postgres-arm-lanes.
+ * p75 (scripts/sharding.ts). The job runs ARM_SHARDS shards, each inside an
+ * ARM_STEP_TIMEOUT_MS step; re-mine after adding heavy files.
+ * test/scripts/postgres-unit-arms.test.ts fails when a shard's weighted sum
+ * passes ARM_SHARD_BUDGET_MS, and ci:ubicloud's pg-arms lane fails when a
+ * shard's measured sum passes the step timeout (scripts/ubicloud/README.md).
+ * Docs: docs/TESTING.md#postgres-arm-lanes.
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -18,6 +23,15 @@ import { loadWeights, partition } from './sharding.ts';
 
 export const ARMS_LIST = 'test/postgres-unit-arms.txt';
 export const ARM_WEIGHTS = 'scripts/postgres-arm-weights.json';
+/** persistence-validation's unit-postgres-arms matrix size; test/scripts/postgres-unit-arms.test.ts pins the workflow to it. */
+export const ARM_SHARDS = 16;
+/** The workflow step's `timeout-minutes: 20`: a shard whose files run longer is cut off mid-list. */
+export const ARM_STEP_TIMEOUT_MS = 20 * 60 * 1000;
+/**
+ * A shard's weighted sum may be at most this: on a runner twice as slow as the mined weights (Bun 1.4.0 runners
+ * measured 1.3-2x) it still ends a minute inside the step timeout.
+ */
+export const ARM_SHARD_BUDGET_MS = (ARM_STEP_TIMEOUT_MS - 60_000) / 2;
 const DOCS = 'docs/TESTING.md#postgres-arm-lanes';
 const PATH_RE = /^test\/[\w./-]+\.test\.ts$/;
 
@@ -74,6 +88,11 @@ export function mineArmWeights(logs: string[]): Map<string, number> {
   }));
 }
 
+/** Shard n of m (1-based), as persistence-validation's unit-postgres-arms matrix runs it and ci:ubicloud's pg-arms lane reports it. */
+export function armShards(root: string, files: string[], m: number): string[][] {
+  return partition(files, loadWeights(join(root, ARM_WEIGHTS)), m).map(shard => [...shard].sort());
+}
+
 function main(argv: string[]): number {
   const root = join(import.meta.dir, '..');
   const [command, ...rest] = argv;
@@ -92,8 +111,7 @@ function main(argv: string[]): number {
       console.error('usage: bun scripts/postgres-unit-arms.ts shard <n> <m>   (1 <= n <= m)');
       return 2;
     }
-    const shards = partition(list.files, loadWeights(join(root, ARM_WEIGHTS)), m!);
-    console.log([...shards[n! - 1]!].sort().join('\n'));
+    console.log(armShards(root, list.files, m!)[n! - 1]!.join('\n'));
     return 0;
   }
   if (command === 'mine' && rest.length) {

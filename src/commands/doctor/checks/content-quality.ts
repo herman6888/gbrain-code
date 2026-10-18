@@ -12,7 +12,7 @@ import { startHeartbeat } from '../../../core/progress.ts';
 import { checkUnverifiedExtractions } from './extraction-sync.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
+import { agentFix, checkError, doctorVerify, withSkippedSegmented } from '../check-fix.ts';
 import { scanDeadline } from '../budget.ts';
 
 async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
@@ -71,8 +71,11 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
        WHERE p.deleted_at IS NULL AND p.frontmatter->'embed_skip'->>'reason' = 'oversized'
          AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) <= $1`, [bytesBlock]);
     const backfillable = Number(skipped?.n ?? 0);
+    // Decision #10: a segmented page's body columns are NULL, so both size scans above pass it by.
+    const [segmented] = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM pages p WHERE p.deleted_at IS NULL AND p.body_storage = 'segmented'`).catch(() => []);
+    const oversizedCheck = (check: Check) => checks.push(withSkippedSegmented(check, Number(segmented?.n ?? 0)));
     if (backfillable > 0) {
-      checks.push({
+      oversizedCheck({
         name: 'oversized_pages',
         status: 'warn',
         message: `${backfillable} page(s) were stored without chunks by an older gbrain because of their size, and now fit under the ${bytesBlock}-byte bytes_block. `
@@ -81,7 +84,7 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
           'oversized_pages', { docs: 'docs/guides/memory-boundaries.md#large-pages-upgrade' }),
       });
     } else if (rows.length === 0) {
-      checks.push({
+      oversizedCheck({
         name: 'oversized_pages',
         status: 'ok',
         message: `No pages exceed ${bytesBlock} bytes (excluding embed_skip pages, which already took the accepted non-embeddable remediation)`,
@@ -91,7 +94,7 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       const top = oversizeRows.slice(0, 3)
         .map(r => `${r.slug} (${r.bytes}b, src=${r.source_id})`)
         .join('; ');
-      checks.push({
+      oversizedCheck({
         name: 'oversized_pages',
         status: 'warn',
         message: `${rows.length} page(s) exceed the ${bytesBlock}-byte content_sanity.bytes_block. Top: ${top}. A page over the block is stored without chunks on its next write. `
@@ -136,6 +139,10 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
         );
     const hits: Array<{ slug: string; matched: string[] }> = [];
     const scanRows = rows as unknown as Array<{ slug: string; source_id: string; title: string; body_head: string; tl_head: string; frontmatter: Record<string, unknown> | null }>;
+    // Decision #10: a segmented row's body heads are NULL, so only its title was assessed (LIMIT NULL is the full audit).
+    const [segmentedRow] = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM (SELECT p.body_storage FROM pages p
+       WHERE p.deleted_at IS NULL ORDER BY p.updated_at DESC LIMIT $1) s WHERE s.body_storage = 'segmented'`, [scanLimit]).catch(() => []);
+    const segmentedScanned = Number(segmentedRow?.n ?? 0);
     for (const r of scanRows) {
       const sanity = assessContentSanity({
         compiled_truth: r.body_head ?? '',
@@ -153,20 +160,20 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       }
     }
     if (hits.length === 0) {
-      checks.push({
+      checks.push(withSkippedSegmented({
         name: 'scraper_junk_pages',
         status: 'ok',
         message: scanLimit
           ? `No junk-pattern hits in ${rows.length} recent page(s) (use --content-audit for full scan)`
           : `No junk-pattern hits in ${rows.length} page(s) (full audit)`,
-      });
+      }, segmentedScanned));
     } else {
       const top = hits.slice(0, 3).map(h => `${h.slug} [${h.matched.join(',')}]`).join('; ');
-      checks.push({
+      checks.push(withSkippedSegmented({
         name: 'scraper_junk_pages',
         status: 'warn',
         message: `${hits.length} page(s) match junk patterns. Top: ${top}. ${scanLimit ? '(scanned 1000 most-recent; rerun with --content-audit for full scan)' : '(full audit)'} New ingests with these shapes are now hard-blocked; existing inventory should be cleaned at source.`,
-      });
+      }, segmentedScanned));
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

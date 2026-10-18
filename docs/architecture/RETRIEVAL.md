@@ -393,6 +393,39 @@ pages at the top as the pin allows, where an unpinned run would place one at
 `limit`. Turn it off per brain with `gbrain config set search.relational_rerank_pin off`.
 The knob folds into the query-cache key (`rrp=`).
 
+### Breadth-first graph walks
+
+Since v0.60.294.0 every graph walk (`traverse_graph`, `gbrain graph`, the graph
+context `think` gathers) is breadth-first. Each page is visited once, at its
+shortest distance from the start page, and each edge comes back once, one hop
+past its shallower walked endpoint. The old walk followed every possible route,
+so a densely linked cluster multiplied the work with every hop (a 12-page
+clique at depth 5 took 22 s before a 20,000-path cap bounded it) and returned
+the same page and edge again at every depth some route reached it.
+
+What that changes for you:
+
+- **Faster on the graphs that were slow.** On Postgres, a depth-5 walk over a
+  12-page clique dropped from 44–91 ms to 4–9 ms, and walks from a 400-spoke hub
+  got 1.8x to 4x faster (`scripts/bench-graph-walk.ts`, medians, against v0.60.292.0).
+- **Complete answers.** The old cap counted routes, so a busy neighbourhood
+  could stop the walk before it reached deeper pages. The new cap counts
+  visited pages (20,000, shallowest first), so a walk reaches every page within
+  its depth unless the brain itself is that large.
+- **Cleaner output.** No repeated pages or edges at deeper depths, so an
+  agent's context holds each relationship once and `gbrain graph` prints each
+  edge once.
+- **Same safety.** Soft delete, private pages and private link origins, source
+  scope, link type and temporal policy still apply at every hop: a page the
+  caller may not read never relays a walk (`test/traverse-bfs.test.ts`).
+
+The walk is one SQL statement on both engines: a recursive CTE whose rows are
+whole layers (`bfsWalkCtes` in `src/core/engine-sql/links.ts`). Walks that reach
+most of a large graph in both directions are still dominated by turning tens
+of thousands of edges into results before the 5,000-row cap, about half a
+second on a 10,000-page, 60,000-link graph; speeding that projection up is
+open work.
+
 ### Multi-hop relationship chains
 
 A question that chains two or three relationships ("who founded the companies

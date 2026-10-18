@@ -3,7 +3,7 @@
  * scripts/ci-ubicloud.ts — the ci:local gate fanned out across ephemeral
  * Ubicloud VMs.
  *
- *   bun run ci:ubicloud                 # gitleaks + verify + serial + slow + unit + ALL E2E
+ *   bun run ci:ubicloud                 # gitleaks + verify + serial + slow + unit + pg-arms + ALL E2E
  *   bun run ci:ubicloud:diff            # doc-only diff: doc checks + gitleaks; any other diff: the full gate
  *
  * Options:
@@ -15,7 +15,7 @@
  *   --image IMAGE      boot image (default: UBI_CI_IMAGE, else stock Ubuntu 24.04);
  *                      gbrain-ci@latest is the prebaked machine image
  *                      scripts/ubicloud/build-ci-image.sh builds
- *   --lanes a,b        subset of gitleaks,verify,serial,slow,unit,e2e (default all)
+ *   --lanes a,b        subset of gitleaks,verify,serial,slow,unit,pg-arms,e2e (default all)
  *   --diff             doc-only diffs run only the doc checks and gitleaks (ci:local --diff)
  *   --record-weights   write measured durations to scripts/ubicloud/weights.json
  *   --keep             leave the VMs running (destroy with ubi-runner.sh down NAME)
@@ -32,7 +32,11 @@
  * serial and slow lanes' machine-exclusive files) and then joins the pool. Every other
  * test file is an item in one global heaviest-first queue that idle slots pull
  * from (scripts/ubicloud/schedule.ts); items run through the same wrappers
- * ci:local uses (scripts/ubicloud/ci-item.sh). Durations of every run are
+ * ci:local uses (scripts/ubicloud/ci-item.sh). The pg-arms lane runs every
+ * file in test/postgres-unit-arms.txt with DATABASE_URL set, the way
+ * persistence-validation's unit-postgres-arms job does, and fails the run when
+ * a shard of that job's partition measures over its step timeout; with the unit
+ * and slow lanes it does the same for test.yml's unit shards. Durations of every run are
  * merged into .context/ci-ubicloud/weights.json, which weights the next run.
  *
  * VMs are named ubirun-<owner>-<epoch>-ciNN<hex> (owner: UBI_OWNER or the
@@ -63,6 +67,8 @@ import {
 } from "./ubicloud/schedule.ts";
 import { runScript, type RunScriptOpts } from "./ubicloud/run-script.ts";
 import { buildTypecheckState, portableBuildInfo, typecheckBuildInfo } from "./ubicloud/typecheck-state.ts";
+import { ARM_SHARDS, ARM_STEP_TIMEOUT_MS, ARM_WEIGHTS, armShards, readArmsList } from "./postgres-unit-arms.ts";
+import { UNIT_JOB_TIMEOUT_MS, UNIT_SETUP_ALLOWANCE_MS, UNIT_SHARDS, unitShards } from "./sharding.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const RUNNER = join(ROOT, "scripts/ubicloud/ubi-runner.sh");
@@ -72,7 +78,7 @@ const UNPACKED_MARKER = "work/gbrain.unpacked";
 const SETUP_SCRIPT = join(ROOT, "scripts/ubicloud/setup-ci-vm.sh");
 const COMMITTED_WEIGHTS = join(ROOT, "scripts/ubicloud/weights.json");
 const LOCAL_WEIGHTS = join(ROOT, ".context/ci-ubicloud/weights.json");
-const ALL_LANES = ["gitleaks", "verify", "serial", "slow", "unit", "e2e"] as const;
+const ALL_LANES = ["gitleaks", "verify", "serial", "slow", "unit", "pg-arms", "e2e"] as const;
 const BATCH_TIMEOUT_MS = 20 * 60 * 1000;
 // Items this heavy are the run's long poles: spread them one per VM so two of
 // them never compete for the same VM's CPUs.
@@ -213,10 +219,13 @@ async function main() {
   const exclusive = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list-exclusive"]));
   const serialPool = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list"])).filter((f) => !exclusive.includes(f));
   const slowExclusive = lines(sh("bash", ["scripts/run-slow-tests.sh", "--dry-run-list-exclusive"]));
+  const arms = readArmsList(ROOT);
+  if (arms.errors.length) throw new Error(`test/postgres-unit-arms.txt: ${arms.errors.join("; ")}`);
   const inventory: Record<Lane, string[]> = {
     unit: lines(sh("bash", ["scripts/run-unit-shard.sh", "--dry-run-list"])),
     serial: serialPool,
     slow: lines(sh("bash", ["scripts/run-slow-tests.sh", "--dry-run-list"])).filter((f) => !slowExclusive.includes(f)),
+    "pg-arms": arms.files,
     e2e: e2eFiles,
   };
 
@@ -224,12 +233,13 @@ async function main() {
     readWeightTable(LOCAL_WEIGHTS),
     readWeightTable(COMMITTED_WEIGHTS),
     readWeightTable(join(ROOT, "scripts/e2e-weights.json"), 1, "e2e:"),
+    readWeightTable(join(ROOT, ARM_WEIGHTS), 1, "pg-arms:"),
     readWeightTable(join(ROOT, "scripts/serial-weights.json"), 1000, "serial:"),
     readWeightTable(join(ROOT, "scripts/test-weights.json"), 1, "unit:"),
     readWeightTable(join(ROOT, "scripts/test-weights.json"), 1, "slow:"),
   ];
   const queue: Item[] = [];
-  for (const lane of ["unit", "serial", "slow", "e2e"] as Lane[]) {
+  for (const lane of ["unit", "serial", "slow", "pg-arms", "e2e"] as Lane[]) {
     if (opts.lanes.has(lane)) queue.push(...buildItems(lane, inventory[lane], tables));
   }
   sortQueue(queue);
@@ -520,6 +530,35 @@ async function main() {
   console.log("  slowest items:");
   for (const r of [...all].sort((a, b) => b.ms - a.ms).slice(0, 8)) console.log(`    ${Math.round(r.ms / 1000)}s ${r.lane} ${r.file}`);
 
+  // The pg-arms lane's proof that unit-postgres-arms fits: each shard of the
+  // workflow's own partition, summed from this run's measured file durations.
+  const armShardReport = opts.lanes.has("pg-arms")
+    ? armShards(ROOT, arms.files, ARM_SHARDS).map((files, i) => ({
+      shard: i + 1,
+      files: files.length,
+      ms: files.reduce((sum, file) => sum + (results.get(weightKey("pg-arms", file))?.ms ?? 0), 0),
+    }))
+    : [];
+  if (armShardReport.length) {
+    console.log(`  pg-arms shards (unit-postgres-arms partition, ${ARM_SHARDS} shards, step timeout ${ARM_STEP_TIMEOUT_MS / 1000}s each):`);
+    for (const s of armShardReport) console.log(`    ${s.shard}/${ARM_SHARDS}: ${Math.round(s.ms / 1000)}s across ${s.files} files`);
+  }
+  const overBudget = armShardReport.filter((s) => s.ms > ARM_STEP_TIMEOUT_MS);
+  // The same proof for test.yml's unit shards: test-shard.sh's own partition,
+  // summed from this run's measured unit and slow file durations.
+  const unitShardRoomMs = UNIT_JOB_TIMEOUT_MS - UNIT_SETUP_ALLOWANCE_MS;
+  const unitShardReport = opts.lanes.has("unit") && opts.lanes.has("slow")
+    ? unitShards(ROOT).map((files, i) => {
+      const measured = files.map((file) => results.get(weightKey("unit", file))?.ms ?? results.get(weightKey("slow", file))?.ms);
+      return { shard: i + 1, files: files.length, unmeasured: measured.filter((ms) => ms === undefined).length, ms: measured.reduce<number>((sum, ms) => sum + (ms ?? 0), 0) };
+    })
+    : [];
+  if (unitShardReport.length) {
+    console.log(`  unit shards (test.yml partition, ${UNIT_SHARDS} shards, ${unitShardRoomMs / 1000}s each after setup):`);
+    for (const s of unitShardReport) console.log(`    ${s.shard}/${UNIT_SHARDS}: ${Math.round(s.ms / 1000)}s across ${s.files} files${s.unmeasured ? ` (${s.unmeasured} not run by this gate)` : ""}`);
+  }
+  const unitOverBudget = unitShardReport.filter((s) => s.ms > unitShardRoomMs);
+
   const timings: Record<string, number> = {};
   for (const r of all) if (r.rc === 0 && r.file !== "-") timings[weightKey(r.lane as Lane, r.file)] = r.ms;
   const merged = { ...Object.fromEntries(readWeightTable(LOCAL_WEIGHTS)), ...timings };
@@ -536,6 +575,8 @@ async function main() {
     sha, runId, wallMs, computeMs, opts: { ...opts, lanes: [...opts.lanes] },
     vms: vms.map(({ name, state, setupMs, infraErrors }) => ({ name, state, setupMs, infraErrors })),
     lanes: Object.fromEntries(byLane), failures: failures.map(({ lane, file, rc, ms, vm }) => ({ lane, file, rc, ms, vm })),
+    armShards: armShardReport,
+    unitShards: unitShardReport,
   }, null, 2) + "\n");
 
   if (failures.length) {
@@ -547,6 +588,14 @@ async function main() {
       console.log(f.output.split("\n").slice(-30).join("\n"));
     }
     console.log(`\nFull per-item logs: ${join(runDir, "failures")}`);
+    exitCode = 1;
+  }
+  if (overBudget.length) {
+    console.log(`\npg-arms: ${overBudget.map((s) => `shard ${s.shard}/${ARM_SHARDS} measured ${Math.round(s.ms / 1000)}s`).join(", ")}, over the ${ARM_STEP_TIMEOUT_MS / 1000}s step timeout of persistence-validation's unit-postgres-arms job, which would cut that shard off mid-list. Fix: raise ARM_SHARDS (and the workflow matrix) or speed up the heaviest files, then re-mine scripts/postgres-arm-weights.json. Docs: docs/TESTING.md#postgres-arm-lanes`);
+    exitCode = 1;
+  }
+  if (unitOverBudget.length) {
+    console.log(`\nunit: ${unitOverBudget.map((s) => `shard ${s.shard}/${UNIT_SHARDS} measured ${Math.round(s.ms / 1000)}s`).join(", ")}, over the ${unitShardRoomMs / 1000}s a test.yml unit shard has inside its job timeout after setup, which would cancel that shard mid-list. Fix: raise UNIT_SHARDS (and both workflow matrices) or speed up the heaviest files, then re-mine scripts/test-weights.json. Docs: docs/TESTING.md#keeping-ci-partitions-balanced`);
     exitCode = 1;
   }
   const expected = totalItems;

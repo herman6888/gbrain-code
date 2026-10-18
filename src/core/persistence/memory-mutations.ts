@@ -11,6 +11,9 @@ import { isFactWithdrawn, recordFactWithdrawal, type WithdrawalCommit } from '..
 import { rebuildPendingPageProjections } from '../page-state/projections.ts';
 import { inferFactSubject, isEntityInferenceEnabled, type InferredVia } from '../facts/subject-infer.ts';
 import { parseFactsFence } from '../facts-fence.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { segmentedRememberRefusal } from './verb-errors.ts';
+import { materializedPage, segmentedOverCeiling } from './segmented-apply.ts';
 import { excludesPrivateWrites } from './page-visibility.ts';
 import { emitFenceNotice, initializeLocalPersistence, requestPrincipalForContext } from './page-mutations.ts';
 import { authorizeStoredRequest, submissionAuthority } from './authority.ts';
@@ -87,8 +90,12 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
       `Entity page ${slug} in source ${sourceId} is deleted or not visible to this caller, so nothing was saved. Remember the fact against a visible entity, or without an entity (it is then filed under memory/unattributed).`);
   }
   if (inferred && !snapshot) throw new InferredTargetRejected('NO_ENTITY');
+  // Wave B: a segmented entity page over the single-string ceiling cannot take a fence row; named or inferred, the save refuses
+  // before admission instead of misfiling it. Below the ceiling an inferred target's checks read the page back whole, as preparation does.
+  if (entitySlug !== null && snapshot && segmentedOverCeiling(snapshot.page)) throw segmentedRememberRefusal(slug, sourceId, inferred !== null);
+  const whole = inferred && snapshot && isSegmentedPage(snapshot.page) ? await materializedPage(ctx.engine, snapshot.page) : snapshot?.page;
   if (inferred && (await isFactWithdrawn(ctx.engine, sourceId, inferred.visibility, inferred.fact, slug)
-    || parseFactsFence(snapshot!.page.compiled_truth).warnings.length)) throw new InferredTargetRejected('ENTITY_LINK_FAILED');
+    || parseFactsFence(whole!.compiled_truth).warnings.length)) throw new InferredTargetRejected('ENTITY_LINK_FAILED');
   // Preserve the stub guard: a fallback name remains DB-only until a real
   // entity page exists. No placeholder page is created by remember.
   const fence = entitySlug !== null && snapshot !== null;
@@ -117,7 +124,7 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
     const { serializePageToMarkdown } = await import('../markdown.ts');
     try {
       await prepareFileTarget(ctx.engine, { source_id: sourceId, worktree_id: binding.worktree_id, slug }, snapshot,
-        serializePageToMarkdown(snapshot.page, snapshot.tags));
+        serializePageToMarkdown(whole!, snapshot.tags));
     } catch {
       throw new InferredTargetRejected('ENTITY_LINK_FAILED');
     }
@@ -143,6 +150,7 @@ async function inferRememberTarget(ctx: OperationContext, sourceId: string, sour
     return { target, via: inferred.via };
   } catch (error) {
     if (error instanceof InferredTargetRejected) return { warning: error.warning };
+    if (error instanceof OperationError && error.canonicalCode === 'page_body_segmented') throw error;
     if (error instanceof OperationError) return null;
     throw error;
   }

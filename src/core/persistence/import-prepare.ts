@@ -36,6 +36,7 @@ import type { WriteRequest } from './model.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
+import { bindOrigin } from './origin-guard.ts';
 
 export type ImportPack = { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
 /** A Markdown file over the single-string ceiling, journaled by reference: the preparer streams and verifies it (Wave B). */
@@ -51,6 +52,17 @@ const reimportFix = (inputPath: string, sourceId: string): Action => ({
   argv: ['gbrain', 'import', inputPath, '--source', sourceId], consent: [], actor: 'agent', requires_exclusive: false,
   why: `Re-reads the file as it is now and imports it into source ${sourceId} under a new request through its canonical owner.`,
 });
+/** A Markdown file over the single-string ceiling imports only from its place in the source root: the user moves it there, then imports it. */
+const moveIntoSourceFix = (inputPath: string, target: string, sourceId: string): Action => ({
+  argv: ['gbrain', 'import', target, '--source', sourceId], consent: [], actor: 'user', requires_exclusive: false,
+  user_message: `Move ${inputPath} to ${target}, inside source ${sourceId}'s root, then run this command.`,
+  why: `A file over the single-string import limit imports only from its place inside the source root, since its canonical file is never rewritten; this imports it from ${target}.`,
+});
+/** The refusal of a Markdown file over the single-string ceiling imported from outside its source root: the message itself names the move. */
+function outsideRootTooLarge(inputPath: string, target: string, sourceId: string, bytes: number, suggestion: string, fix: Action = moveIntoSourceFix(inputPath, target, sourceId)): OperationError {
+  return opError('invalid_params', `File too large (${bytes} bytes, max ${PAGE_MAX_BYTES}): a file over the single-string import limit imports only from its place inside the source root. Move it to ${target} and import it there.`,
+    suggestion, { fix });
+}
 const receiptFix = (row: WriteRequest): Action => readFix('Reads the import request\'s durable receipt: its state and recorded error, read-only.',
   { argv: ['gbrain', 'write-request', '--', row.request_id] });
 const ownerStatusFix = (sourceId: string): Action => readFix(`Shows source ${sourceId}'s canonical owner and its state, read-only.`,
@@ -120,14 +132,14 @@ export function managedImportContent(sourcePath: string, bytes: Buffer, activePa
  * place in the canonical root (`input === target`), since its canonical file is
  * never rewritten.
  */
-export async function managedStreamedIdentity(sourcePath: string, input: string, target: string, policy: PageBodyPolicy):
+export async function managedStreamedIdentity(sourcePath: string, input: string, target: string, policy: PageBodyPolicy, sourceId: string):
   Promise<{ slug: string; bodyRef: ManagedImportBodyRef } | null> {
   if (!policy.segmented || !/\.mdx?$/i.test(sourcePath)) return null;
   if (realpathSync(input) !== resolve(input) || !lstatSync(input).isFile()) return null;
   const bytes = lstatSync(input).size;
   if (bytes <= importSizeLimit(input) || bytes > policy.maxBytes) return null;
   managedImportPathChecks(sourcePath);
-  if (target !== input) throw opError('invalid_params', `File too large (max ${PAGE_MAX_BYTES} bytes).`,
+  if (target !== input) throw outsideRootTooLarge(input, target, sourceId, bytes,
     `${basename(input)} is over the single-string import limit, so it imports only from its place inside the source root (its canonical file is never rewritten). Move it into the source and import it there.`);
   const hash = createHash('sha256');
   for await (const part of createReadStream(input)) hash.update(part);
@@ -264,7 +276,7 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
     file: { root, path, content: rendered, expectedBeforeHash: p.targetHash },
     apply: async tx => {
       const applied = await ready.apply(tx);
-      await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
+      await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: p.sourcePath });
       if (project) {
         // The coordinator proved the base revision under its page guard (importFromContent `coordinated`); this is the
         // one read of the page after its last page write (the projections and the seal leave its revision unchanged):
@@ -312,7 +324,8 @@ async function prepareStreamedManagedImport(engine: BrainEngine, row: WriteReque
   const tooLarge = (why: string) => opError('invalid_params', `File too large (max ${PAGE_MAX_BYTES} bytes).`,
     `${p.sourcePath} is ${ref.bytes} bytes, over the single-string import limit, and ${why}, so import request ${row.request_id} published nothing.`,
     { fix: receiptFix(row) });
-  if (resolve(p.inputPath) !== path) throw tooLarge(`a file this size is imported only from its place inside source ${row.source_id}'s root (its canonical file is never rewritten); move it into the source and import it there`);
+  if (resolve(p.inputPath) !== path) throw outsideRootTooLarge(p.inputPath, path, row.source_id, ref.bytes,
+    `${p.sourcePath} is over the single-string import limit, and a file this size is imported only from its place inside source ${row.source_id}'s root (its canonical file is never rewritten), so import request ${row.request_id} published nothing. Move it into the source and import it there.`);
   const policy = await readPageBodyPolicy(engine);
   if (!policy.segmented || ref.bytes > policy.maxBytes) throw tooLarge(`segmented page storage (pages.segmented_storage) is off or the file is over pages.max_bytes`);
   await checkPlacement(engine);

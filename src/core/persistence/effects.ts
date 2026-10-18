@@ -32,24 +32,29 @@ import type { ResolvedColumn } from '../types.ts';
 import { acquireWorktree, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { persistenceFileHash, transientDatabaseFailure } from './coordinator.ts';
 import { sha256 } from './digest.ts';
-import { prepareFileTarget } from './page-prepare.ts';
+import { prepareFileTarget, unreadPageFile } from './page-prepare.ts';
+import { isStreamedContent, type StreamedFileContent } from './large-file.ts';
+import { atomicStagingPath } from '../atomic-write.ts';
 import { isSourceDbOnlySlug } from './source-storage.ts';
-import { advanceEffectCursor, claimCoalescedGitEffects, claimPersistenceEffect, completeEffect, failEffect, parkEffect, renewPersistenceEffectClaim, requeueEffect, retryEffect, singleFileGitEffect } from './effect-journal.ts';
+import { advanceEffectCursor, claimCoalescedGitEffects, claimPersistenceEffect, completeEffect, effectClaimKeeper, failEffect, hasRearmableTargets, mirrorGates, parkEffect, rearmWithheldTargets, renewPersistenceEffectClaim, requeueEffect, retryEffect, singleFileGitEffect, type MirrorGate } from './effect-journal.ts';
 import { guardEffectSource, recoverEffectPublication, reserveEffectRecovery } from './effect-recovery.ts';
-import { commitGitTargets, DURABILITY_NOT_ENABLED, publishGitEffect, pushGitRoot } from './effect-git.ts';
+import { commitGitTargets, DURABILITY_NOT_ENABLED, publishGitEffect, pushGitRoot, type GitEffectOwner } from './effect-git.ts';
+import { retryIndexLockParks } from './effect-retry.ts';
 import { gitDurabilityPolicy } from './git-durability-policy.ts';
 import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
 import { dispatchFactsBackstopEffect } from './effect-facts.ts';
 import { runLinksEffect } from './effect-links.ts';
-import { PARK_AFTER_FAILURES, type EffectRecovery, type GitCommitNote, type PersistenceEffect, type SkippedTarget } from './effect-model.ts';
+import { PARK_AFTER_FAILURES, WITHHELD_BY_MIRROR, type EffectRecovery, type GitCommitNote, type PersistenceEffect, type SkippedTarget } from './effect-model.ts';
+import { fileContentHash } from './large-file.ts';
 import { isSyncMetafile } from '../sync.ts';
 import { recoveryStagingFile } from './staging.ts';
 import { selectEffectRecoveries } from './effect-recovery-scan.ts';
 import { nativeFileTarget } from './native-file-target.ts';
 import { sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { isLockOpenFailure } from './native-lock.ts';
+import { isLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { planPageEmbedding } from '../page-embedding-budget.ts';
-import { chunkGenerationFilter } from '../search/safe-chunks.ts';
+import { chunkGenerationFilter, chunkManifestReads } from '../search/safe-chunks.ts';
+import { classifyItemFailure, ItemRun } from '../item-failure.ts';
 
 const effectStatusFix = (effect: Pick<PersistenceEffect, 'source_id'>): Action => readFix(
   `Shows source ${effect.source_id}'s canonical owner with its blocking, retrying and parked effects, read-only.`,
@@ -121,7 +126,9 @@ async function materializeAndAdvance(engine: BrainEngine, effect: PersistenceEff
     if (current?.revision !== snapshot.revision || current.page.id !== snapshot.page.id) throw opError('revision_conflict', 'The withdrawal page changed during preparation.',
       `Page ${snapshot.page.slug} in source ${effect.source_id} changed while its withdrawal was materializing; the effect worker picks up the new revision on its next pass. Nothing needs resubmitting.`,
       { fix: effectStatusFix(effect) });
-    await materializePageSnapshot(tx, current);
+    // A segmented page's withdrawn rows were struck in its segments when the withdrawal committed (withdrawal.ts,
+    // purge.ts), so it has no overlay left to persist.
+    if (!isSegmentedPage(current.page)) await materializePageSnapshot(tx, current);
     if (skipped) await recordSkippedTarget(tx, effect, { slug: current.page.slug, reason: skipped });
     await finishPage(tx, effect, current);
   });
@@ -168,37 +175,86 @@ function isFileDatabaseDrift(error: unknown): boolean {
 }
 
 /** The target a failing attempt was working on; unset means the failure is effect-wide. */
-interface EffectAttempt { target?: string }
+interface EffectAttempt {
+  target?: string;
+  /** GBRA-130 A-12: the request's withdrawal mirror, read when this Git or embedding attempt executes. */
+  gate?: MirrorGate;
+}
+
+export { WITHHELD_BY_MIRROR };
+/** The code a Git or embedding attempt waits with while its request's withdrawal mirror is queued or running again. */
+export const MIRROR_PENDING = 'withdrawal_mirror_pending';
+
+/**
+ * GBRA-130 A-12: whether Git or embedding work may touch a page behind its
+ * request's withdrawal mirror. `handled`: the attempt waited (the mirror is
+ * queued or running again) or the page was parked behind a failed mirror.
+ * `evidence`: a page the mirror passed, which a Git page walk commits only when
+ * the file's raw bytes are the mirror's rendering of the current snapshot (the
+ * same serialization mirrorPage writes; a recorded publication is not enough:
+ * the file may since have been reverted, and a mirror from before publications
+ * were recorded has none); a single-file effect, whose file already holds
+ * exactly the bytes its request published, needs the recorded publication. Embedding needs a recorded
+ * publication behind a failed mirror.
+ */
+async function mirrorVerdict(engine: BrainEngine, effect: PersistenceEffect, attempt: EffectAttempt, slug: string): Promise<'go' | 'evidence' | 'handled'> {
+  const gate = attempt.gate;
+  if (!gate) return 'go';
+  if (gate.state === 'pending') { await retryEffect(engine, effect, MIRROR_PENDING); return 'handled'; }
+  if (effect.kind === 'git' && (gate.published.has(slug) || gate.passed.has(slug))) return 'evidence';
+  if (gate.published.has(slug) || gate.state === 'committed') return 'go';
+  await parkEffectTarget(engine, effect, WITHHELD_BY_MIRROR, slug);
+  return 'handled';
+}
+
+
 
 async function mirrorPage(engine: BrainEngine, effect: PersistenceEffect, binding: WorktreeBinding | null, opts: EffectWorkerOptions, attempt: EffectAttempt): Promise<void> {
   const snapshot = await selectedEffectPage(engine, effect);
-  if (!snapshot) { await completeEffect(engine, effect); return; }
+  if (!snapshot) {
+    await engine.transaction(async tx => { await completeEffect(tx, effect); await rearmWithheldTargets(tx, [effect.request_id]); });
+    return;
+  }
   attempt.target = snapshot.page.slug;
   if (snapshot.sourceIncarnation !== effect.source_incarnation) throw opError('source_changed', 'The mirror source was replaced.',
     `Source ${effect.source_id} was replaced after this withdrawal mirror was queued, so the effect ends without writing; the new source has its own effects. Check the owner if files still look stale.`,
     { fix: effectStatusFix(effect) });
   if (isMetafilePage(snapshot)) { await materializeAndAdvance(engine, effect, snapshot, opts.hostId, 'metafile'); return; }
-  // Wave B PR 1: a segmented body has no whole-body mirror yet (per-segment mirror in PR 2).
-  if (isSegmentedPage(snapshot.page)) { await skipTarget(engine, effect, snapshot, 'page_body_segmented'); return; }
-  const content = serializePageToMarkdown(snapshot.page, snapshot.tags);
+  // A segmented page's file is streamed from its segments (unreadPageFile), never rendered as one string, and only once
+  // the page has a file to rewrite: its comparison reads the stored body, never the rendered file.
+  const segmented = isSegmentedPage(snapshot.page);
+  const keep = effectClaimKeeper(engine, effect, effectRenewalIntervalMs);
   let file: Awaited<ReturnType<typeof prepareFileTarget>>;
+  let content: string | StreamedFileContent;
   try {
-    file = binding?.local_path ? await prepareFileTarget(engine, { ...effect, slug: snapshot.page.slug }, snapshot, content, opts.hostId, { allowMissing: true }) : undefined;
+    file = binding?.local_path ? await prepareFileTarget(engine, { ...effect, slug: snapshot.page.slug }, snapshot,
+      segmented ? null : serializePageToMarkdown(snapshot.page, snapshot.tags), opts.hostId, { allowMissing: true, between: keep }) : undefined;
+    if (!file || snapshot.page.deleted_at || !existsSync(file.path)) {
+      // A withdrawal cannot resurrect a deleted or missing physical page.
+      await materializeAndAdvance(engine, effect, snapshot, opts.hostId);
+      return;
+    }
+    content = segmented ? await unreadPageFile(engine, snapshot, keep) : file.content as string;
   } catch (error) {
+    // A segmented page whose fence a withdrawal cannot read whole (page_body_segmented) retries and parks like any failed
+    // target, so writer status and doctor list it; only a file that differs from the database is passed by.
     if (!isFileDatabaseDrift(error)) throw error;
     await materializeAndAdvance(engine, effect, snapshot, opts.hostId, 'file_database_drift');
     return;
   }
-  if (!file || snapshot.page.deleted_at || !existsSync(file.path)) {
-    // A withdrawal cannot resurrect a deleted or missing physical page.
-    await materializeAndAdvance(engine, effect, snapshot, opts.hostId);
+  const target = { kind: 'withdrawal-mirror' as const, path: file.path, root: file.root, beforeHash: file.expectedBeforeHash ?? null,
+    mode: statSync(file.path).mode & 0o7777, ownerEpoch: String(binding!.owner_epoch), pageId: snapshot.page.id,
+    sourceIncarnation: snapshot.sourceIncarnation, slug: snapshot.page.slug, revision: snapshot.revision };
+  if (isStreamedContent(content)) {
+    // Version 2: the file is staged by path and digest, never embedded; the reservation counts its one staged copy.
+    const record: EffectRecovery = { ...target, version: 2, afterHash: content.hash, after: null,
+      staging: { publication: { path: atomicStagingPath(file.path), hash: content.hash, bytes: content.bytes } } };
+    await reserveEffectRecovery(engine, effect, record, Buffer.byteLength(JSON.stringify(record)) + content.bytes + 4096, opts.hostId);
+    await recoverEffectPublication(engine, effect, opts.hostId, { boundary: opts.boundary, content, between: keep });
     return;
   }
   const after = Buffer.from(content);
-  const record: EffectRecovery = { version: 1, kind: 'withdrawal-mirror', path: file.path, root: file.root,
-    beforeHash: file.expectedBeforeHash ?? null, afterHash: sha256(after), after: after.toString('base64'),
-    mode: statSync(file.path).mode & 0o7777, ownerEpoch: String(binding!.owner_epoch), pageId: snapshot.page.id,
-    sourceIncarnation: snapshot.sourceIncarnation, slug: snapshot.page.slug, revision: snapshot.revision,
+  const record: EffectRecovery = { ...target, version: 1, afterHash: sha256(after), after: after.toString('base64'),
     staging: { publication: recoveryStagingFile(file.path, after) } };
   await reserveEffectRecovery(engine, effect, record, Buffer.byteLength(JSON.stringify(record)) * 2 + 4096, opts.hostId);
   await recoverEffectPublication(engine, effect, opts.hostId, opts);
@@ -215,11 +271,18 @@ async function singleFileGitTarget(engine: BrainEngine, effect: PersistenceEffec
     `The Git effect queued by request ${effect.request_id} in source ${effect.source_id} has no recorded file path, so nothing was committed to Git; the page write itself is committed. Inspect the owner's effects before resubmitting anything.`,
     { fix: effectStatusFix(effect) });
   attempt.target = effect.data.slug ?? effect.data.relative_path;
+  const verdict = await mirrorVerdict(engine, effect, attempt, attempt.target);
+  if (verdict === 'handled') return null;
   const sourceRoot = join(binding.local_path, binding.relative_path);
   let path = join(binding.local_path, effect.data.relative_path);
   if (!isWriteTargetContained(path, sourceRoot)) throw gitTargetEscaped(effect);
   path = nativeFileTarget(binding.local_path, path, 'git_target_unsafe');
   if (persistenceFileHash(path) !== effect.data.expected_hash) { await completeEffect(engine, effect, { git: 'superseded' }); return null; }
+  // The file holds exactly the bytes this request published; behind its mirror they also need the mirror's record of rewriting the page.
+  if (verdict === 'evidence' && !attempt.gate!.published.has(attempt.target)) {
+    await completeEffect(engine, effect, { git: 'skipped', reason: 'withdrawal_not_mirrored' });
+    return null;
+  }
   if (!isWriteTargetContained(path, sourceRoot)) throw gitTargetEscaped(effect);
   // Declared db_only content stays out of Git. Its gitignored local cache file
   // is invisible to `git status`, so publishing it would be refused as unsafe.
@@ -238,27 +301,41 @@ function gitCommitNote(effect: PersistenceEffect): GitCommitNote | undefined {
 }
 
 async function gitPage(engine: BrainEngine, effect: PersistenceEffect, binding: WorktreeBinding | null, opts: EffectWorkerOptions,
-  attempt: EffectAttempt, hardened: boolean | undefined): Promise<void> {
+  attempt: EffectAttempt, hardened: boolean | undefined, writerLock: NativeLockHandle | null): Promise<void> {
   if (!binding?.local_path) { await completeEffect(engine, effect, { git: 'skipped', reason: 'no_repo_configured' }); return; }
   // #5409: a read-only mirror's checkout is never committed to; its publications wrote no file.
   if (await sourceMirrorReadOnly(engine, effect.source_id)) { await completeEffect(engine, effect, { git: 'skipped', reason: 'mirror_read_only' }); return; }
   const root = binding.local_path;
+  let reclaimed = false;
+  const owner = writerLock ? { writerLock, onReclaim: () => { reclaimed = true; } } : undefined;
+  try { await publishGitPage(engine, effect, { ...binding, local_path: root }, opts, attempt, hardened, owner); }
+  finally { if (reclaimed && effect.worktree_id) await retryIndexLockParks(engine, effect.worktree_id); }
+}
+
+async function publishGitPage(engine: BrainEngine, effect: PersistenceEffect, binding: WorktreeBinding & { local_path: string }, opts: EffectWorkerOptions,
+  attempt: EffectAttempt, hardened: boolean | undefined, owner: GitEffectOwner | undefined): Promise<void> {
+  const root = binding.local_path;
   if (!targetedWithdrawalEffect(effect) && !effect.data.source_scan) {
     const target = await singleFileGitTarget(engine, effect, { ...binding, local_path: root }, attempt);
-    if (target !== null) await completeEffect(engine, effect, await publishGitEffect(root, target, opts.signal, hardened, gitCommitNote(effect)));
+    if (target !== null) await completeEffect(engine, effect, await publishGitEffect(root, target, opts.signal, hardened, gitCommitNote(effect), undefined, owner));
     return;
   }
   // Only a page walk reads snapshots; a single-file effect completes by its recorded hash.
   const snapshot = await selectedEffectPage(engine, effect);
   if (!snapshot) { await completeEffect(engine, effect); return; }
   attempt.target = snapshot.page.slug;
+  const verdict = await mirrorVerdict(engine, effect, attempt, snapshot.page.slug);
+  if (verdict === 'handled') return;
   if (isMetafilePage(snapshot)) { await skipTarget(engine, effect, snapshot, 'metafile'); return; }
-  if (isSegmentedPage(snapshot.page)) { await skipTarget(engine, effect, snapshot, 'page_body_segmented'); return; }
+  const keep = effectClaimKeeper(engine, effect, effectRenewalIntervalMs);
+  const content = snapshot.page.deleted_at || isSegmentedPage(snapshot.page) ? null : serializePageToMarkdown(snapshot.page, snapshot.tags);
   let file: Awaited<ReturnType<typeof prepareFileTarget>>;
   try {
-    file = await prepareFileTarget(engine, { ...effect, slug: snapshot.page.slug }, snapshot,
-      snapshot.page.deleted_at ? null : serializePageToMarkdown(snapshot.page, snapshot.tags), opts.hostId, { allowMissing: true });
+    // Only the file's comparison with the stored page is needed here, so a segmented page's file is never rendered.
+    file = await prepareFileTarget(engine, { ...effect, slug: snapshot.page.slug }, snapshot, content, opts.hostId, { allowMissing: true, between: keep });
   } catch (error) {
+    // A segmented page whose fence a withdrawal cannot read whole (page_body_segmented) retries and parks like any failed
+    // target, so writer status and doctor list it; only a file that differs from the database is passed by.
     if (!isFileDatabaseDrift(error)) throw error;
     await skipTarget(engine, effect, snapshot, 'file_database_drift');
     return;
@@ -274,7 +351,16 @@ async function gitPage(engine: BrainEngine, effect: PersistenceEffect, binding: 
     await finishPage(engine, effect, snapshot, { git: 'skipped', reason: 'db_only' });
     return;
   }
-  const result = await publishGitEffect(root, relative(root, path).split(sep).join('/'), opts.signal, hardened, gitCommitNote(effect));
+  // A page the mirror passed is committed only when its raw bytes are the mirror's rendering of the page as it is now: the
+  // hash the mirror recorded writing at this revision, else the rendering measured now (a segmented page's from its
+  // segments, unreadPageFile, never held as one string).
+  const mirrored = attempt.gate?.files.get(snapshot.page.slug);
+  if (verdict === 'evidence' && (snapshot.page.deleted_at || persistenceFileHash(path) !== (mirrored?.revision === snapshot.revision ? mirrored.hash
+    : content === null ? (await unreadPageFile(engine, snapshot, keep)).hash : fileContentHash(content)))) {
+    await skipTarget(engine, effect, snapshot, 'withdrawal_not_mirrored');
+    return;
+  }
+  const result = await publishGitEffect(root, relative(root, path).split(sep).join('/'), opts.signal, hardened, gitCommitNote(effect), undefined, owner);
   if (result.reason === 'durability_not_enabled') await completeEffect(engine, effect, result);
   else await finishPage(engine, effect, snapshot, result);
 }
@@ -302,7 +388,7 @@ export async function readEmbeddingEffectProjection(engine: BrainEngine, effect:
     const completion = await tx.executeRaw<{ id: number; complete: boolean }>(`SELECT cc.id,
       p.embedding_signature=$2 AND cc.${quoteIdentifier(column.name)} IS NOT NULL AND cc.embedded_at IS NOT NULL
         AND cc.embedded_text_hash=md5(cc.chunk_text) AND cc.model IS NOT DISTINCT FROM $3 AS complete
-      FROM content_chunks cc JOIN pages p ON p.id=cc.page_id WHERE p.id=$1 AND ${chunkGenerationFilter('p', 'cc')}`,
+      FROM content_chunks cc JOIN pages p ON p.id=cc.page_id WHERE p.id=$1 AND ${chunkGenerationFilter('p', 'cc', await chunkManifestReads(engine, tx))}`,
     [snapshot.page.id, signature, embeddingCompletionModel(column, signature, model)]);
     const complete = new Set(completion.filter(chunk => chunk.complete === true).map(chunk => chunk.id));
     const pending = prepared.chunks.filter(chunk => !complete.has(chunk.id));
@@ -310,9 +396,11 @@ export async function readEmbeddingEffectProjection(engine: BrainEngine, effect:
   });
 }
 
-async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: PersistenceEffect, opts: EffectWorkerOptions): Promise<void> {
+async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: PersistenceEffect, opts: EffectWorkerOptions, attempt: EffectAttempt): Promise<void> {
   const snapshot = await selectedEffectPage(engine, effect);
   if (!snapshot || snapshot.page.deleted_at) { await finishPage(engine, effect, snapshot); return; }
+  attempt.target = snapshot.page.slug;
+  if (await mirrorVerdict(engine, effect, attempt, snapshot.page.slug) === 'handled') return;
   if (!targetedWithdrawalEffect(effect) && !effect.data.source_scan && (snapshot.revision !== effect.revision || snapshot.page.id !== effect.data.page_id)) {
     await completeEffect(engine, effect, { embedding: 'superseded', reason: 'revision_changed' }); return;
   }
@@ -335,7 +423,7 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
   if (pending.length) {
     await assertEmbeddingEffectEnabled(engine, config);
     if (effect.attempts - (effect.data.embedding_retry_base ?? effect.data.embedding_attempt_base ?? 0) > MAX_RATE_LIMIT_RETRIES) {
-      await failEffect(engine, effect, 'embedding_attempts_exhausted'); return;
+      await exhaustEmbedding(engine, effect, snapshot.page.slug); return;
     }
     if (!opts.embedding) validateEmbeddingCreds();
     opts.signal?.throwIfAborted();
@@ -435,7 +523,7 @@ async function embedSegmentedEffect(engine: BrainEngine, config: GBrainConfig, e
   page: SegmentedEmbedPage, signature: string, opts: EffectWorkerOptions): Promise<void> {
   await assertEmbeddingEffectEnabled(engine, config);
   if (effect.attempts - (effect.data.embedding_retry_base ?? effect.data.embedding_attempt_base ?? 0) > MAX_RATE_LIMIT_RETRIES) {
-    await failEffect(engine, effect, 'embedding_attempts_exhausted'); return;
+    await exhaustEmbedding(engine, effect, snapshot.page.slug); return;
   }
   if (!opts.embedding) validateEmbeddingCreds();
   const claimLost = () => opError('write_claim_lost', 'The embedding claim changed.',
@@ -461,6 +549,18 @@ async function embedSegmentedEffect(engine: BrainEngine, config: GBrainConfig, e
   await finishPage(engine, effect, snapshot);
 }
 
+/**
+ * GBRA-130 A-13: a scan parks the page that used up its per-page attempts and moves on; a single-page effect, or a
+ * scan spending an explicit retry allowance (`embedding_retry_base`, shared by every page), fails.
+ */
+async function exhaustEmbedding(engine: BrainEngine, effect: PersistenceEffect, target: string): Promise<void> {
+  if (perPageBudget(effect)) await parkEffectTarget(engine, effect, 'embedding_attempts_exhausted', target);
+  else await failEffect(engine, effect, 'embedding_attempts_exhausted');
+}
+
+const scanningEffect = (effect: PersistenceEffect) => targetedWithdrawalEffect(effect) || effect.data.source_scan === true;
+const perPageBudget = (effect: PersistenceEffect) => scanningEffect(effect) && effect.data.embedding_retry_base === undefined;
+
 export async function assertEmbeddingEffectEnabled(engine: BrainEngine, config: GBrainConfig | null): Promise<void> {
   assertEmbeddingEnabled(config);
   const disabled = await engine.getConfig('embedding_disabled').catch(error => { throw embeddingStorageFailure(error); });
@@ -479,7 +579,7 @@ function embeddingStorageFailure(error: unknown): unknown {
       { fix: readFix('Checks the brain database connection and schema health, read-only.', { argv: ['gbrain', 'doctor', '--json'] }) }) : error;
 }
 
-async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, error: unknown, signal?: AbortSignal, target?: string): Promise<void> {
+async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, error: unknown, signal?: AbortSignal, target?: string, derived?: DerivedFailures): Promise<void> {
   const code = error instanceof OperationError ? error.code : isLockOpenFailure(error) ? error.code : 'effect_unavailable';
   // Source replacement is final only without recovery. Unknown physical bytes
   // retain their record and continue to block this root for explicit repair.
@@ -502,6 +602,13 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
       await failEffect(engine, effect, 'embedding_configuration'); return;
     }
     const attempt = effect.attempts - (effect.data.embedding_retry_base ?? effect.data.embedding_attempt_base ?? 0);
+    // GBRA-130 A-13: a page the provider keeps refusing is parked once its budget (or a retry's single attempt) is spent and the scan moves on;
+    // provider throttling and run-scoped failures stay effect-wide.
+    const scanTarget = target !== undefined && perPageBudget(effect) ? target : undefined;
+    if (scanTarget !== undefined && (attempt >= MAX_RATE_LIMIT_RETRIES || effect.data.retry_slugs?.includes(scanTarget)) && !signal?.aborted
+      && !isEmbedRetriableError(error) && classifyItemFailure(error).scope === 'item') {
+      await parkEffectTarget(engine, effect, code, scanTarget); return;
+    }
     if (attempt >= MAX_RATE_LIMIT_RETRIES) {
       await failEffect(engine, effect, 'embedding_attempts_exhausted'); return;
     }
@@ -511,8 +618,20 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
     await retryEffect(engine, effect, reason, delay); return;
   }
   if (CONTENTION_CODES.includes(code)) { await retryEffect(engine, effect, code, 250); return; }
-  if (!['git', 'withdrawal-mirror'].includes(effect.kind) || DEPENDENCY_CODES.includes(code) || signal?.aborted || transientDatabaseFailure(error)) {
+  // A lost connection, a failed transaction or an abort is never the effect's own failure (GBRA-130); for links and
+  // facts-backstop effects neither is a run-scoped refusal.
+  const derivedKind = DERIVED_KINDS.includes(effect.kind);
+  const classified = classifyItemFailure(error);
+  const runScoped = classified.scope !== 'item' && (derivedKind || !(error instanceof OperationError));
+  if (DEPENDENCY_CODES.includes(code) || signal?.aborted || runScoped || (!derivedKind && transientDatabaseFailure(error))) {
     await retryEffect(engine, effect, code, 30_000); return;
+  }
+  if (derivedKind) {
+    const failureCode = error instanceof OperationError || classified.code === 'internal' ? code : classified.code;
+    if (!derived) { await countDerivedFailure(engine, effect, failureCode); return; }
+    derived.run.record(String(effect.id), error);
+    derived.counted.push({ effect, code: failureCode });
+    return;
   }
   const [current] = await engine.executeRaw<{ recovering: boolean }>('SELECT recovery IS NOT NULL AS recovering FROM persistence_effects WHERE id=$1', [effect.id]);
   if (current?.recovering) { await retryEffect(engine, effect, code, 30_000); return; }
@@ -526,6 +645,33 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
     return;
   }
   await parkEffectTarget(engine, effect, code, target);
+}
+
+/** Effects whose work is derived from a committed page: they count failures without a target and end terminal at the cap. */
+const DERIVED_KINDS: readonly string[] = ['links', 'facts-backstop'];
+
+/** GBRA-130 A-11: one pass's counted links and facts-backstop failures, settled when the pass ends unless the pass looks systemic. */
+interface DerivedFailures { run: ItemRun; counted: Array<{ effect: PersistenceEffect; code: string }> }
+
+/**
+ * A links or facts-backstop failure counts toward PARK_AFTER_FAILURES. At the cap a links effect completes as
+ * skipped with the code (its edges are derived; `gbrain extract --stale` recovers them) and a facts-backstop effect
+ * fails with it (`gbrain sources writer retry-effects` authorizes one more attempt).
+ */
+async function countDerivedFailure(engine: BrainEngine, effect: PersistenceEffect, code: string): Promise<void> {
+  const failures = (effect.data.target_failures ?? 0) + 1;
+  if (failures < PARK_AFTER_FAILURES) { await requeueEffect(engine, effect, { ...effect.data, target_failures: failures }, code, 30_000); return; }
+  if (effect.kind === 'links') await completeEffect(engine, effect, { links: 'skipped', reason: code });
+  else await failEffect(engine, effect, code);
+}
+
+/** A pass where most links and facts-backstop effects failed counts none of them: each retries as `item_failures_systemic`. */
+async function settleDerivedFailures(engine: BrainEngine, derived: DerivedFailures): Promise<void> {
+  const systemic = derived.run.systemic();
+  for (const { effect, code } of derived.counted.splice(0)) {
+    if (systemic) await retryEffect(engine, effect, 'item_failures_systemic', 30_000);
+    else await countDerivedFailure(engine, effect, code);
+  }
 }
 
 /** Waits that say nothing about the target never count toward parking. */
@@ -544,7 +690,9 @@ async function parkEffectTarget(engine: BrainEngine, effect: PersistenceEffect, 
   const parked = [...(effect.data.parked ?? []), { ...(target ?? effect.data.slug ? { slug: target ?? effect.data.slug } : {}), error_code: code }];
   if (!scanning) { await parkEffect(engine, effect, { ...data, ...(retrying.length ? { retry_slugs: retrying } : {}), parked }); return; }
   const remaining = retrying.filter(slug => slug !== target);
-  await requeueEffect(engine, effect, { ...data, parked, ...(retrying.includes(target) ? {} : { after_slug: target }),
+  // An embedding scan's next page starts with a full attempt budget, as when the cursor advances.
+  await requeueEffect(engine, effect, { ...data, parked, ...(effect.kind === 'embedding' ? { embedding_attempt_base: effect.attempts } : {}),
+    ...(retrying.includes(target) ? {} : { after_slug: target }),
     ...(remaining.length ? { retry_slugs: remaining, target_failures: PARK_AFTER_FAILURES - 1 } : {}) }, code, 0);
 }
 
@@ -555,17 +703,40 @@ const GIT_YIELD_ATTEMPTS = 20;
 const GIT_YIELD_MS = 250;
 
 /**
+ * Claims one effect recovery and finishes it forward (`recoverEffectPublication`); a failure is recorded on the effect,
+ * whose record stays. The caller holds the worktree's native lock: any old process holding it has exited, so no lease
+ * timeout is needed and no second process can steal this claim. Returns the claimed row, or undefined when the effect
+ * no longer holds a recovery record.
+ */
+export async function claimAndRecoverEffect(engine: BrainEngine, id: string | number, hostId: string,
+  hooks: Parameters<typeof recoverEffectPublication>[3] = {}): Promise<PersistenceEffect | undefined> {
+  let claimed: PersistenceEffect | undefined;
+  try {
+    [claimed] = await engine.executeRaw<PersistenceEffect>(`UPDATE persistence_effects SET state='running',execution_token=$2::uuid,
+      claim_expires_at=now()+interval '2 minutes',attempts=attempts+1,updated_at=now() WHERE id=$1 AND recovery IS NOT NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING *`, [id, randomUUID()]);
+    if (claimed) await recoverEffectPublication(engine, claimed, hostId, { ...hooks, between: hooks.between ?? effectClaimKeeper(engine, claimed, effectRenewalIntervalMs) });
+  } catch (error) { if (claimed) await recordFailure(engine, claimed, error); }
+  return claimed;
+}
+
+/**
  * Bounded, idempotent work. Recovery obtains kernel exclusion before a DB claim.
  * Resolves with the number of effects attempted, so a caller can keep draining.
  */
 export async function runPersistenceEffects(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions): Promise<number> {
   // #6696 (A1): every request whose effect this pass claimed is trued up after the pass, outside the settling transactions.
   const touched = new Set<string>();
-  try { return await runEffectPass(engine, config, opts, touched); }
-  finally { await trueUpRequests(engine, touched).catch(() => { /* idempotent; the next settlement of the request retries it */ }); }
+  const derived: DerivedFailures = { run: new ItemRun('effects.derived_retry_budget'), counted: [] };
+  try { return await runEffectPass(engine, config, opts, touched, derived); }
+  finally {
+    await settleDerivedFailures(engine, derived).catch(() => { /* an unsettled claim expires and the effect is claimed again */ });
+    await (async () => { if (await hasRearmableTargets(engine, [...touched])) await engine.transaction(tx => rearmWithheldTargets(tx, [...touched])); })()
+      .catch(() => { /* idempotent; the next pass touching the request retries it */ });
+    await trueUpRequests(engine, touched).catch(() => { /* idempotent; the next settlement of the request retries it */ });
+  }
 }
 
-async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions, touched: Set<string>): Promise<number> {
+async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions, touched: Set<string>, derived: DerivedFailures): Promise<number> {
   const limit = Math.max(1, Math.min(opts.limit ?? 2, 20));
   const recoveries = await selectEffectRecoveries(engine, opts.hostId, limit);
   let attempted = 0;
@@ -575,15 +746,10 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
     if (!binding) continue;
     const lock = await acquireWorktree(binding, 0, undefined, engine);
     if (!lock) continue;
-    let claimed: PersistenceEffect | undefined;
     try {
-      // Any old process holding this native lock has exited. No lease timeout
-      // can provide that proof and no second process can steal this claim now.
-      [claimed] = await engine.executeRaw<PersistenceEffect>(`UPDATE persistence_effects SET state='running',execution_token=$2::uuid,
-        claim_expires_at=now()+interval '2 minutes',attempts=attempts+1,updated_at=now() WHERE id=$1 AND recovery IS NOT NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING *`, [recovery.id, randomUUID()]);
-      if (claimed) { attempted++; touched.add(claimed.request_id); await recoverEffectPublication(engine, claimed, opts.hostId, opts); }
-    } catch (error) { if (claimed) await recordFailure(engine, claimed, error); }
-    finally { await lock.release(); }
+      const claimed = await claimAndRecoverEffect(engine, recovery.id, opts.hostId, { boundary: opts.boundary });
+      if (claimed) { attempted++; touched.add(claimed.request_id); }
+    } finally { await lock.release(); }
   }
   const run = async (claimed: PersistenceEffect, binding: WorktreeBinding | null, hardened?: boolean) => {
     let effect = claimed;
@@ -608,13 +774,15 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
         }
       });
       effect = await upgradeWithdrawalEffect(engine, effect, opts.hostId);
+      if (effect.kind === 'git' || effect.kind === 'embedding') attempt.gate = (await mirrorGates(engine, [effect.request_id])).get(effect.request_id);
       if (effect.kind === 'withdrawal-mirror') await mirrorPage(engine, effect, binding, opts, attempt);
-      else if (effect.kind === 'git') await gitPage(engine, effect, binding, opts, attempt, hardened);
+      else if (effect.kind === 'git') await gitPage(engine, effect, binding, opts, attempt, hardened, lock);
       else await withAIAttribution({ request_id: effect.request_id, effect: effect.kind }, () => effect.kind === 'facts-backstop'
         ? dispatchFactsBackstopEffect(engine, effect, opts.hostId)
         : effect.kind === 'links' ? runLinksEffect(engine, effect, opts.hostId)
-          : embedPage(engine, config, effect, opts));
-    } catch (error) { await recordFailure(engine, effect, error, opts.signal, attempt.target); }
+          : embedPage(engine, config, effect, opts, attempt));
+      if (DERIVED_KINDS.includes(effect.kind)) derived.run.succeed();
+    } catch (error) { await recordFailure(engine, effect, error, opts.signal, attempt.target, derived); }
     finally { await lock?.release(); }
   };
   // A git effect first needs its durability probe (git child processes, one
@@ -654,7 +822,9 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
       }
     }
     let lock: Awaited<ReturnType<typeof acquireWorktree>> = null;
+    let gates: Map<string, MirrorGate>;
     try {
+      gates = await mirrorGates(engine, effects.map(effect => effect.request_id));
       lock = await acquireWorktree(binding, 0, undefined, engine);
       if (!lock) throw writerBusy(effects[0]!);
     } catch (error) {
@@ -662,9 +832,10 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
       return;
     }
     const targets: { effect: PersistenceEffect; path: string; attempt: EffectAttempt }[] = [];
+    let reclaimed = false;
     try {
       for (const effect of effects) {
-        const attempt: EffectAttempt = {};
+        const attempt: EffectAttempt = { gate: gates.get(effect.request_id) };
         try {
           // Sources sharing a worktree have their own relative roots: validate each path against its own binding.
           const own = await engine.transaction(async tx => {
@@ -681,7 +852,8 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
         } catch (error) { await recordFailure(engine, effect, error, opts.signal, attempt.target); }
       }
       const notes = new Map(targets.flatMap(({ effect, path }) => { const note = gitCommitNote(effect); return note ? [[path, note] as const] : []; }));
-      const outcomes = targets.length ? await commitGitTargets(binding.local_path, targets.map(t => t.path), opts.signal, notes) : new Map();
+      const outcomes = targets.length ? await commitGitTargets(binding.local_path, targets.map(t => t.path), opts.signal, notes,
+        { writerLock: lock, onReclaim: () => { reclaimed = true; } }) : new Map();
       const pending = unpushed.get(binding.local_path) ?? { binding, items: [] };
       for (const { effect, path, attempt } of targets) {
         const outcome = outcomes.get(path)!;
@@ -692,7 +864,11 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
       if (pending.items.length) unpushed.set(binding.local_path, pending);
     } catch (error) {
       for (const { effect, attempt } of targets) await recordFailure(engine, effect, error, opts.signal, attempt.target);
-    } finally { await lock.release(); }
+    } finally {
+      // #6932: the reclaimed lock may have parked earlier effects of this worktree; they get one more attempt.
+      if (reclaimed) await retryIndexLockParks(engine, effects[0]!.worktree_id!);
+      await lock.release();
+    }
   };
   // A group of single-file Git effects in a root without the durability hook
   // runs no git command: each effect only records its outcome. The group takes
@@ -705,8 +881,11 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
     const guards = new Map<string, unknown>();
     const mirrors = new Map<string, boolean>();
     const recorded: PersistenceEffect[] = [];
+    let gates: Map<string, MirrorGate>;
+    try { gates = await mirrorGates(engine, effects.map(effect => effect.request_id)); }
+    catch (error) { for (const effect of effects) await recordFailure(engine, effect, error, opts.signal); return; }
     for (const effect of effects) {
-      const attempt: EffectAttempt = {};
+      const attempt: EffectAttempt = { gate: gates.get(effect.request_id) };
       try {
         let binding = bindings.get(effect.source_id);
         if (binding === undefined) bindings.set(effect.source_id, binding = await getWorktreeBinding(engine, effect.source_id, opts.hostId));

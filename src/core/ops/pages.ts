@@ -19,7 +19,8 @@ import { PageSnapshotAmbiguousError, type PageSnapshot } from '../page-state/typ
 import { serializePageToMarkdown } from '../markdown.ts';
 import { pageTrustForRead, projectFetchText, projectGetPage, readQuarantined } from './get-page-projection.ts';
 import { assertLargePageAdmission } from '../persistence/large-page-guard.ts';
-import { assertFullReadFits, bodyBytes, fetchWindowResult, GET_PAGE_BODY_PARAMS, inlineBodyBytes, parseBodyRequest, readPartialBody } from './get-page-body.ts';
+import { assertFullReadFits, bodyBytes, fetchWindowResult, GET_PAGE_BODY_PARAMS, inlineBodyBytes, parseBodyRequest, readPartialBody, segmentedFullReadError, authorizedReadPin } from './get-page-body.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { MIN_TRUST_PARAM } from '../eligibility/policy.ts';
 import { getPageKnownAsOf, KNOWN_AS_OF_PARAM } from './known-as-of.ts';
 import { stampRowTrust } from '../eligibility/stamp.ts';
@@ -220,17 +221,20 @@ const get_page: Operation = {
     const timelineEntries = includeTimelineEntries
       ? await stampRowTrust(ctx.engine, 'timeline_entries', await ctx.engine.getTimeline(page.slug, { ...await readPolicyOpts(ctx, { sourceId: page.source_id }), eligibility: readable.eligibility }), e => e.id) : undefined;
     // Read-only, over the same visibility-filtered body the reader gets.
-    const lineGrammar = p.grammar_diagnostics === true ? await (await import('../line-grammar-report.ts')).lineGrammarReport(ctx.engine, { slug: page.slug, sourceId: page.source_id, body: visibleBody.compiled_truth }) : undefined;
+    const lineGrammar = p.grammar_diagnostics !== true ? undefined : await (await import('../line-grammar-report.ts')).grammarDiagnosticsForPage(ctx.engine, page, visibleBody);
     const quarantined = readQuarantined(ctx, page, p.include_quarantined === true); // #6259
     const fileHeld = held ? { file_held: fileHeldField(held, isUntrustedReader) } : {};
+    const segmented = isSegmentedPage(page);
+    const pin = authorizedReadPin(ctx, page, snapshot!.bodyGeneration, p.min_trust, () => pageNotFoundError(ctx, slug, { includeDeleted, sourceIdParam }));
     const whole = bodyRequest.mode === 'full'
-      || (bodyRequest.mode === 'auto' && bodyBytes(visibleBody) <= await inlineBodyBytes(ctx));
+      || (bodyRequest.mode === 'auto' && !segmented && bodyBytes(visibleBody) <= await inlineBodyBytes(ctx));
     if (!whole) {
-      const partial = await readPartialBody(ctx, { page, visibleBody, revision: snapshot!.revision, tags, quarantined, trust: readable.trust,
+      const partial = await readPartialBody(ctx, { page, visibleBody, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, pin,
         extras: { ...(quarantined ? { quarantined } : {}), ...(timelineEntries ? { timeline_entries: timelineEntries } : {}), ...fileHeld,
           ...(resolved_slug ? { resolved_slug } : {}), ...(content_flag ? { content_flag } : {}) } }, bodyRequest);
       return lineGrammar ? { ...partial, line_grammar: lineGrammar } : partial;
     }
+    if (segmented) throw await segmentedFullReadError(ctx, page, bodyRequest, { ...pin, revision: snapshot!.revision });
     const projected = projectGetPage(visibleBody, {
       revision: snapshot!.revision, tags, includeContent, contentOnly, resolved_slug, content_flag, quarantined, trust: readable.trust,
       ...(timelineEntries ? { timeline_entries: timelineEntries } : {}),
@@ -295,10 +299,12 @@ const fetch_page: Operation = {
     bumpLastRetrievedAt(ctx.engine, [page.id]);
     const tags = snapshot!.tags;
     // Same boundaries as get_page: untrusted readers never see takes or private facts fences, nor a quarantined body (#6259).
-    const visibleBody = ctx.remote === false ? page : stripPrivacyFencesForRemoteReader(page);
+    const segmented = isSegmentedPage(page);
+    const visibleBody = ctx.remote === false || segmented ? page : stripPrivacyFencesForRemoteReader(page);
     const quarantined = readQuarantined(ctx, page, p.include_quarantined === true);
-    if (ctx.remote !== false && !quarantined?.body_omitted && bodyBytes(visibleBody) > await inlineBodyBytes(ctx)) {
-      return fetchWindowResult(ctx, { page, visibleBody: visibleBody as Page, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, extras: {} }, id, identity ? decodeDeepResearchAnchor(id) : null);
+    if (!quarantined?.body_omitted && (segmented || (ctx.remote !== false && bodyBytes(visibleBody) > await inlineBodyBytes(ctx)))) {
+      const pin = authorizedReadPin(ctx, page, snapshot!.bodyGeneration, p.min_trust, missing);
+      return fetchWindowResult(ctx, { page, visibleBody: visibleBody as Page, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, extras: {}, pin }, id, identity ? decodeDeepResearchAnchor(id) : null);
     }
     return {
       id: identity ? id : page.slug,
@@ -392,11 +398,11 @@ async function runAutoLink(
   opts?: { sourceId?: string },
 ) {
   const sourceId = opts?.sourceId ?? 'default';
-  const { materializedSnapshot, segmentedOverCeiling } = await import('../persistence/segmented-apply.ts');
-  const snapshot = await materializedSnapshot(engine, await engine.readPageSnapshot(slug, { sourceId }));
-  if (!snapshot || segmentedOverCeiling(snapshot.page)) return;
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+  if (!snapshot) return;
   const { prepareAutomaticLinks } = await import('../persistence/links-preparation.ts');
-  const prepared = await prepareAutomaticLinks(engine, slug, { ...snapshot.page, frontmatter: snapshot.page.frontmatter ?? {} }, sourceId);
+  snapshot.page.frontmatter ??= {};
+  const prepared = await prepareAutomaticLinks(engine, slug, snapshot.page, sourceId);
   return engine.transaction(async tx => {
     await tx.lockPageKeys([{sourceId,slug}, ...prepared.pageKeys]);
     const current = await tx.readPageSnapshot(slug, {sourceId});

@@ -58,7 +58,7 @@ for (const kind of testBackends()) {
         occurrences: [
           { id: 10, byteStart: 0, genFrom: 1, chunks: [{ text: 'first live row' }, { text: 'second live row' }] },
           { id: 20, byteStart: 4096, genFrom: 2, chunks: [{ text: 'appended row' }] },
-          { id: 30, byteStart: 4096, genFrom: 1, genTo: 2, chunks: [{ text: 'retired row', retiredGeneration: 2 }] },
+          { id: 30, byteStart: 4096, genFrom: 1, genTo: 2, chunks: [{ text: 'retired row' }] },
           { id: 40, byteStart: 8192, genFrom: 3, chunks: [{ text: 'staged row' }] },
         ],
       });

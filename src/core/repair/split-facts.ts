@@ -16,6 +16,10 @@
  * that set through revision-bound `put_page`s (`changed_since_preview` when a
  * page moved). It never runs from `--all`, the remediation plan, the
  * maintenance cycle or an upgrade.
+ *
+ * A segmented page (Wave B) is not merged: this repair rewrites the whole body
+ * as one string. A segmented page whose stored segments record a facts fence
+ * in both its body and its timeline is listed (`segmented`) and kept.
  */
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
@@ -101,6 +105,18 @@ export const splitFactsRepair: RepairHandler = {
       [scope.source_ids]);
     const residuals: Record<string, number> = {};
     const listing: NonNullable<RepairPlan['listing']> = [];
+    const segmented = await engine.executeRaw<{ source_id: string; slug: string }>(`SELECT p.source_id, p.slug FROM pages p
+      WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND p.body_storage='segmented'
+        AND EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.page_id=p.id AND m.gen_to IS NULL AND m.staging_id IS NULL AND m.region='truth'
+          AND m.protected_regions @> '[{"kind":"facts"}]'::jsonb)
+        AND EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.page_id=p.id AND m.gen_to IS NULL AND m.staging_id IS NULL AND m.region='timeline'
+          AND m.protected_regions @> '[{"kind":"facts"}]'::jsonb)
+      ORDER BY p.id`, [scope.source_ids]);
+    for (const page of segmented) {
+      residuals.segmented = (residuals.segmented ?? 0) + 1;
+      listing.push({ item: `${page.source_id}:${page.slug}`, class: 'segmented',
+        detail: 'the page stores its body in segments and this repair rewrites the whole body as one string; no command merges its fences yet' });
+    }
     const merge: ApprovedPage[] = [];
     for (const page of pages) {
       const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });

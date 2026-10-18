@@ -26,6 +26,7 @@ import {
   computeConversationParserProbeHealthCheck,
 } from './search-eval.ts';
 import type { Check } from '../../doctor.ts';
+import { withSkippedSegmented } from '../check-fix.ts';
 import type { DoctorContext, DoctorEntry } from '../context.ts';
 
 async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
@@ -208,10 +209,12 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
       applyExtractAtomsNoPricing(check, await readExtractAtomsNoPricing(engine).catch(() => []));
       // #5151: unmanaged brains reconcile fences in the cycle, so fence pages
       // behind their facts watermark are facts not indexed yet.
+      let skippedSegmented = 0;
       if (!await managedPersistenceEnabled(engine).catch(() => true)) {
         const backlog = await readFactsReconcileBacklog(engine).catch(() => null);
-        if (backlog) applyFactsReconcileBacklog(check, backlog);
+        if (backlog) { applyFactsReconcileBacklog(check, backlog); skippedSegmented = backlog.skipped_segmented ?? 0; }
       }
+      Object.assign(check, withSkippedSegmented(check, skippedSegmented));
       checks.push(check);
     } catch {
       // Best-effort; rollup-table missing on pre-v106 brains is normal

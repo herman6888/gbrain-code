@@ -113,6 +113,8 @@ export interface ContentDispositionContext {
   writeGate?: WriteGateInput;
   /** Wave B: the whole body's bytes when `parsed` holds only its head (a streamed page). */
   bodyBytes?: number;
+  /** Wave B: the bytes_block a streamed page is judged against while `content_sanity.bytes_block` is unset (its page ceiling). */
+  defaultBytesBlock?: number;
 }
 
 export interface ContentDisposition {
@@ -162,7 +164,7 @@ export async function settleContentDisposition(engine: BrainEngine, parsed: Pars
   // Disposition for the high-confidence junk path: quarantine (hide) by
   // default, or reject (throw → sync-failure) when the operator opts in.
   const junkDisposition = sanityCfg.junkDisposition;
-  const sanityResult = await carryStoredQuarantineOverride(engine, parsed, assessImportSanity(parsed, sanityCfg, ctx.bodyBytes), { slug, sourceId, stripped: ctx.stripped });
+  const sanityResult = await carryStoredQuarantineOverride(engine, parsed, assessImportSanity(parsed, sanityCfg, ctx.bodyBytes, ctx.defaultBytesBlock), { slug, sourceId, stripped: ctx.stripped });
   if (!sanityDisabled && !sanityResult.shouldQuarantine && sanityResult.flag_reason !== 'oversized' && (parsed.frontmatter[EMBED_SKIP_KEY] as { reason?: unknown } | undefined)?.reason === 'oversized') {
     delete parsed.frontmatter[EMBED_SKIP_KEY];
     if ((parsed.frontmatter[CONTENT_FLAG_KEY] as { reason?: unknown } | undefined)?.reason === 'oversized') delete parsed.frontmatter[CONTENT_FLAG_KEY];
@@ -320,14 +322,14 @@ export function stripGateOwnedMarkers(parsed: Pick<ParsedMarkdown, 'frontmatter'
 
 /** #6259: a page carrying a current `quarantine_override` keeps the classifier's verdict off (see quarantine-override.ts). */
 export function assessImportSanity(page: Pick<ParsedMarkdown, 'compiled_truth' | 'timeline' | 'title' | 'type'> & { frontmatter?: Record<string, unknown> }, cfg: ImportSanityConfig,
-  bodyBytes?: number): ContentSanityResult {
+  bodyBytes?: number, defaultBytesBlock?: number): ContentSanityResult {
   return withQuarantineOverride(assessContentSanity({
     compiled_truth: page.compiled_truth,
     ...(bodyBytes !== undefined ? { body_bytes: bodyBytes } : {}),
     timeline: page.timeline ?? '',
     title: page.title,
     bytes_warn: cfg.cs.bytes_warn,
-    bytes_block: cfg.cs.bytes_block,
+    bytes_block: cfg.cs.bytes_block ?? defaultBytesBlock,
     max_markup_ratio: cfg.cs.max_markup_ratio,
     prose_check_enabled: cfg.cs.prose_check_enabled,
     page_kind: page.type,

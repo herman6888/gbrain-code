@@ -29,6 +29,15 @@ export function countWork(counters: Counters, fn: () => unknown): Work {
   return work;
 }
 
+/** countWork for an async `fn`: nothing else that counts may run while it is awaited. */
+export async function countWorkAsync(counters: Counters, fn: () => Promise<unknown>): Promise<Work> {
+  countWork(counters, () => {});
+  await fn();
+  const work: Work = {};
+  for (const [name, group] of Object.entries(counters)) for (const [k, v] of Object.entries(group)) work[`${name}.${k}`] = v;
+  return work;
+}
+
 export interface Sample { bytes: number; work: Work }
 
 /**

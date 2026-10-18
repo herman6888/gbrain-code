@@ -5,7 +5,7 @@
  */
 
 import type { SearchResult } from '../types.ts';
-import { projectedLead } from '../page-window/bounded-lead.ts';
+import { pageLeadSource, projectedLead } from '../page-window/bounded-lead.ts';
 import { isIdentityEntity } from '../entities/resolve.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { isPrivatePage } from './private-visibility.ts';
@@ -235,7 +235,7 @@ async function aliasInjectedRow(engine: import('../engine.ts').BrainEngine, page
     type: page.type,
     source_id: page.source_id ?? ref.source_id,
     // Large pages: a bounded, withdrawal-overlaid prefix is sanitized, never the whole body.
-    chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? ref.source_id, compiled_truth: page.compiled_truth })).slice(0, 200),
+    chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? ref.source_id, compiled_truth: await pageLeadSource(engine, page) })).slice(0, 200),
     chunk_index: 0,
     chunk_id: 0,
     score,

@@ -11,7 +11,9 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { absentCanonicalPath, findLiveFileClaimants, recordedReconcilePath, type FileClaimTarget } from './file-claims.ts';
+import { wholeBodySnapshot } from './segmented-apply.ts';
 import { sharedOriginExit } from './sync-origin.ts';
+import { originTwinsPreviewArgv } from './origin-twins.ts';
 export { fileClaimCandidatesQuery } from './file-claims.ts';
 import { localHostId } from './identity.ts';
 import { isDatabaseOnlyPage, slugDerivedOrigin } from './unbound-pages.ts';
@@ -134,7 +136,10 @@ async function assertSoleFileClaim(engine: BrainEngine, target: FileClaimTarget)
   const [claimant] = await findLiveFileClaimants(engine, target);
   if (claimant) throw opError('source_changed', 'Several pages claim the recorded canonical file.',
     `Nothing changed. Pages ${target.slug} and ${claimant.slug} in '${target.sourceId}' both record the same file, so reconcile cannot tell which owns it; decide with the user which page owns the file before reconciling either. `
-    + sharedOriginExit(target.sourceId, [target.slug, claimant.slug]) + ' Then preview again.');
+    + sharedOriginExit(target.sourceId, [target.slug, claimant.slug]) + ' Then preview again.',
+    // #6948 (B-15): the read-only group listing names the page that keeps the file and the exact command for each other one.
+    { detail: 'shared_origin', fix: readFix(`Lists the duplicate-origin group of ${target.slug} and ${claimant.slug} with the page its path names and the command that resolves each other page; writes nothing.`,
+      { argv: originTwinsPreviewArgv(target.sourceId) }) });
 }
 /**
  * #6394: `adoptSlugPath` lets a live page with no recorded origin and no database-only marker reconcile against the file
@@ -148,7 +153,8 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     throw new OperationError('owner_unavailable', 'Reconciliation requires the existing active owner on this host.', 'Run repair on the current owner; repair never claims or activates a source.');
   }
   const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
-  const snapshot = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+  // Wave B: a page stored in segments is compared and merged as strings up to 24 MiB; a larger one refuses.
+  const snapshot = await wholeBodySnapshot(engine, await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true }), 'sources reconcile');
   if (!snapshot || snapshot.page.deleted_at) throw opError('page_not_found', 'Reconciliation requires an existing live page; use the separate restore workflow for deleted pages.',
     `Page ${slug} in '${sourceId}' is deleted or missing; nothing changed. If it was deleted by mistake, restore it (gbrain restore, within the 72-hour window) and then preview it again.`,
     { fix: readFix('Shows whether the page exists or is soft-deleted in this source.', { argv: ['gbrain', 'get', '--source', sourceId, '--include-deleted', '--', slug] }) });

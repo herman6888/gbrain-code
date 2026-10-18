@@ -176,6 +176,13 @@ for i in $(seq 1 "$SLOTS"); do
 done
 step "$SLOTS postgres + pgbouncer slots ready"
 
+# The pg-arms lane's database: empty like the unit-postgres-arms job's service
+# database, and apart from the E2E schema bootstrapped below.
+for i in $(seq 1 "$SLOTS"); do
+  PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$((15432 + i))" -U postgres -d gbrain_test -qc 'CREATE DATABASE gbrain_arms_test' \
+    || { echo "[setup-ci-vm] could not create gbrain_arms_test on slot $i" >&2; exit 1; }
+done
+
 # Initialize every slot's schema up front, exactly like e2e.yml's "Bootstrap
 # isolated E2E schema" step, so no file depends on whichever file happens to
 # reach a fresh database first.

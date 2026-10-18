@@ -105,7 +105,20 @@ build's output is in `logs/local-typecheck.log`. Items run through the `ci:local
 (`scripts/ubicloud/ci-item.sh`): `run-unit-shard.sh`, `run-serial-tests.sh` and
 `run-slow-tests.sh` accept explicit file arguments for this purpose, and
 `run-e2e.sh` runs each E2E file against its slot's own server and pooler. The
-unit, serial and slow lanes run with database URLs unset. Tests run natively as
+unit, serial and slow lanes run with database URLs unset. The `pg-arms` lane
+runs every file in `test/postgres-unit-arms.txt` the way persistence-validation's
+`unit-postgres-arms` step does (`bun --no-env-file test --timeout=120000`,
+`GBRAIN_TEST_ALLOW_DATABASE_URL=1`, no timeout multiplier) against the slot's
+own empty `gbrain_arms_test` database. The summary sums its measured durations over
+that job's `ARM_SHARDS` partition (16 shards), and a shard over the step's 20-minute timeout
+fails the run, since GitHub would cut that shard off mid-list. The committed
+weights must also fit each shard twice over with a minute to spare
+(`ARM_SHARD_BUDGET_MS`, 570 s), because a slow runner ran the files 1.3-2x
+their mined weights. With the unit and slow lanes, the summary does the same
+for test.yml's unit shards: it sums measured durations over `test-shard.sh`'s
+`UNIT_SHARDS` partition and fails a shard over the 21 minutes left in the
+22-minute job after setup (`docs/TESTING.md#keeping-ci-partitions-balanced`);
+`evals/` files, which no ci:ubicloud lane runs, count as unmeasured. Tests run natively as
 a non-root user on Ubuntu 24.04, the same OS as the CI runners, instead of as
 root in the `oven/bun` container.
 

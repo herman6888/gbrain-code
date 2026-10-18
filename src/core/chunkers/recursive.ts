@@ -72,6 +72,12 @@ export interface ChunkOptions {
   maxTokens?: number;
   /** Record each chunk's projected UTF-8 byte span (TextChunk.byte_start/byte_end). Chunk text is unchanged. */
   spans?: boolean;
+  /**
+   * A Markdown heading line (or a run of them) joins the running chunk only together with the piece after it;
+   * when that piece starts the next chunk, the headings start it too. Segmented pages only (segment-chunks.ts):
+   * a section appended after a full last chunk then leaves that chunk's text, and its vector, unchanged.
+   */
+  headingsLead?: boolean;
 }
 
 export interface TextChunk {
@@ -141,7 +147,7 @@ export function chunkProjectedText(stripped: string, opts?: ChunkOptions): TextC
 
   // Recursively split, then greedily merge to target size
   const pieces = recursiveSplit(stripped, 0, chunkSize, 0);
-  const merged = greedyMerge(pieces, chunkSize);
+  const merged = greedyMerge(pieces, chunkSize, opts?.headingsLead === true);
   const withOverlap = applyOverlap(merged, chunkOverlap);
   // v0.32.7: hard char cap. Catches pathological CJK + whitespace-less text
   // that the word-level pipeline can't bound (a single Chinese paragraph can
@@ -474,7 +480,10 @@ function splitOnWhitespace(text: string, target: number, base: number): Piece[] 
  * stats grow with it (concatWordStats), so each piece is counted once instead
  * of recounting the whole chunk on every merge.
  */
-function greedyMerge(pieces: Piece[], target: number): Run[] {
+const HEADING_PIECE = /^#{1,6}[ \t][^\n]*$/;
+const isHeadingPiece = (p: Piece) => HEADING_PIECE.test(p.text.trim());
+
+function greedyMerge(pieces: Piece[], target: number, headingsLead = false): Run[] {
   if (pieces.length === 0) return [];
 
   const result: Run[] = [];
@@ -486,7 +495,16 @@ function greedyMerge(pieces: Piece[], target: number): Run[] {
   for (let i = 1; i < pieces.length; i++) {
     const pieceStats = wordStats(pieces[i].text);
     const combinedStats = concatWordStats(currentStats, pieceStats);
-    if (wordCountOf(combinedStats) <= limit) {
+    // A run of heading pieces is checked once, at its first piece, together with the piece after the run.
+    let leads = false;
+    if (headingsLead && isHeadingPiece(pieces[i]) && !isHeadingPiece(pieces[i - 1])) {
+      let runStats = combinedStats;
+      let j = i + 1;
+      for (; j < pieces.length && isHeadingPiece(pieces[j]); j++) runStats = concatWordStats(runStats, wordStats(pieces[j].text));
+      if (j < pieces.length) runStats = concatWordStats(runStats, wordStats(pieces[j].text));
+      leads = j < pieces.length && wordCountOf(runStats) > limit;
+    }
+    if (!leads && wordCountOf(combinedStats) <= limit) {
       // `current` is this loop's own run: extend it in place (copying its segs per merge is quadratic in
       // pieces per chunk), and grow the last seg when the piece follows it directly in the projected text.
       const last = current.segs[current.segs.length - 1];

@@ -32,6 +32,10 @@ import { readFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import type { BrainEngine, TakeBatchInput } from '../engine.ts';
 import { parseTakesFence, TAKES_FENCE_BEGIN, type ParsedTake } from '../takes-fence.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { bodyBlocks } from '../page-body/segment-blocks.ts';
+import { parseTakesFenceBlocks, type StreamedTakes } from '../page-body/segment-takes.ts';
+import type { BodyStorage } from '../page-body/types.ts';
 import { walkMarkdownFiles } from '../../commands/extract.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { withWriteTrust } from '../persistence/context.ts';
@@ -138,12 +142,12 @@ async function deleteUnheldTakes(engine: BrainEngine, pageId: number, where: str
 async function pruneRemovedTakes(
   engine: BrainEngine,
   pageId: number,
-  body: string,
+  hasBegin: boolean,
   takes: ParsedTake[],
   warnings: string[],
   dryRun: boolean,
 ): Promise<void> {
-  if (dryRun || warnings.length > 0 || !body.includes(TAKES_FENCE_BEGIN)) return;
+  if (dryRun || warnings.length > 0 || !hasBegin) return;
   await deleteUnheldTakes(engine, pageId, 'NOT (row_num = ANY($2::integer[]))', [takes.map(t => t.rowNum)], 'removed');
 }
 
@@ -287,7 +291,7 @@ export async function extractTakesFromFs(
     }
     // #6259: the stored page decides (the gate stamps quarantine on it); a quarantined page projects no takes.
     if ((await engine.executeRaw('SELECT 1 FROM pages WHERE id=$1 AND frontmatter ? $2', [pageId, QUARANTINE_KEY])).length) continue;
-    await pruneRemovedTakes(engine, pageId, body, takes, warnings, dryRun);
+    await pruneRemovedTakes(engine, pageId, body.includes(TAKES_FENCE_BEGIN), takes, warnings, dryRun);
     if (takes.length === 0) continue;
 
     if (opts.rebuild && !dryRun) await deleteDivergedTakes(engine, pageId, takes);
@@ -341,22 +345,21 @@ export async function extractTakesFromDb(
     if (!page) continue;
     // #6259: a quarantined page projects no takes (its existing rows are left as they are).
     if (isQuarantined(page.frontmatter as Record<string, unknown> | null)) continue;
+    const read = await readPageTakes(engine, page);
     if (coordinated) {
       // A page with no takes marker at all yields no prune, no upsert and no
       // warning; near-miss and unbalanced markers still reach the parser.
-      if (`${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`.includes('gbrain:takes:')) {
-        await reextractCoordinated(engine, authorityFor, slug, source_id, rebuild, result);
-      }
+      if (read.hasMarker) await reextractCoordinated(engine, authorityFor, slug, source_id, rebuild, result);
       continue;
     }
     if (covered.has(source_id)) {
       await withUnmanagedBeliefs(engine, source_id, [slug], 'takes_reextract', run => maintenanceTransaction(engine, tx => run(tx, async () => {
-        const takes = await reconcilePageTakes(tx, page, slug, rebuild, false, result);
+        const takes = await reconcilePageTakes(tx, page.id, read, slug, rebuild, false, result);
         result.takesUpserted += await upsertProjectedTakes(engine, takes.map(t => parsedTakeToBatchInput(page.id, t)), result, tx);
       })));
       continue;
     }
-    const takes = await reconcilePageTakes(engine, page, slug, rebuild, dryRun, result);
+    const takes = await reconcilePageTakes(engine, page.id, read, slug, rebuild, dryRun, result);
     for (const t of takes) {
       buffer.push(parsedTakeToBatchInput(page.id, t));
       if (buffer.length >= BATCH_SIZE) await flushBatch(engine, buffer, result, dryRun);
@@ -366,21 +369,30 @@ export async function extractTakesFromDb(
   return result;
 }
 
+type TakesPage = { id: number; slug: string; source_id: string; body_storage?: BodyStorage | null; compiled_truth: string | null; timeline: string | null };
+const TAKES_PAGE_COLUMNS = 'id, slug, source_id, body_storage, compiled_truth, timeline';
+
+/** parseTakesFence over the page's `${compiled_truth}\n${timeline}`; a segmented body is read block by block (page-body/segment-takes.ts). */
+async function readPageTakes(engine: BrainEngine, page: TakesPage): Promise<StreamedTakes> {
+  if (isSegmentedPage(page)) return parseTakesFenceBlocks(bodyBlocks(engine, page), page);
+  const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
+  return { parsed: parseTakesFence(body), hasBegin: body.includes(TAKES_FENCE_BEGIN), hasMarker: body.includes('gbrain:takes:') };
+}
+
 /**
- * Parse one page's body and record its warnings, then prune rows that left a
- * cleanly parsed fence (and, under rebuild, clear the page). Returns the takes
- * the caller upserts.
+ * Record one page's takes warnings, then prune rows that left a cleanly parsed
+ * fence (and, under rebuild, clear the page). Returns the takes the caller upserts.
  */
 async function reconcilePageTakes(
   db: BrainEngine,
-  page: { id: number; compiled_truth: string | null; timeline: string | null },
+  pageId: number,
+  read: StreamedTakes,
   slug: string,
   rebuild: boolean,
   dryRun: boolean,
   result: ExtractTakesResult,
 ): Promise<ParsedTake[]> {
-  const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
-  const { takes, warnings } = parseTakesFence(body);
+  const { takes, warnings } = read.parsed;
   for (const w of warnings) {
     result.warnings.push(`${slug}: ${w}`);
     if (w.startsWith('TAKES_HOLDER_INVALID')) {
@@ -390,9 +402,9 @@ async function reconcilePageTakes(
       result.failedFiles.push({ path: slug, error: w });
     }
   }
-  await pruneRemovedTakes(db, page.id, body, takes, warnings, dryRun);
+  await pruneRemovedTakes(db, pageId, read.hasBegin, takes, warnings, dryRun);
   if (takes.length === 0) return [];
-  if (rebuild && !dryRun) await deleteDivergedTakes(db, page.id, takes);
+  if (rebuild && !dryRun) await deleteDivergedTakes(db, pageId, takes);
   result.pagesWithTakes++;
   return takes;
 }
@@ -400,15 +412,14 @@ async function reconcilePageTakes(
 export const TAKES_REEXTRACT_INTENT = 'managed_maintenance_takes_reextract';
 
 /** The page's takes reconcile as it stands: what a write would prune, rebuild and upsert. */
-async function plannedTakes(db: BrainEngine, page: { id: number; compiled_truth: string | null; timeline: string | null }, rebuild: boolean) {
-  const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
-  const { takes, warnings } = parseTakesFence(body);
+async function plannedTakes(db: BrainEngine, page: { id: number }, read: StreamedTakes, rebuild: boolean) {
+  const { takes, warnings } = read.parsed;
   const { rows } = buildTakeRows(takes.map(t => takesPreparation.toCanonicalBatchInput(page.id, t)));
   const stored = await db.executeRaw<{ row_num: number; claim: string; kind: string; holder: string; weight: number | string; since_date: string | null;
     until_date: string | null; source: string | null; superseded_by: number | null; active: boolean }>(
     'SELECT row_num, claim, kind, holder, weight, since_date, until_date, source, superseded_by, active FROM takes WHERE page_id = $1', [page.id]);
   const byRow = new Map(stored.map(r => [Number(r.row_num), r]));
-  const prunes = warnings.length === 0 && body.includes(TAKES_FENCE_BEGIN) && stored.some(r => !takes.some(t => t.rowNum === Number(r.row_num)));
+  const prunes = warnings.length === 0 && read.hasBegin && stored.some(r => !takes.some(t => t.rowNum === Number(r.row_num)));
   const diverged = rebuild && stored.some(r => !takes.some(t => t.rowNum === Number(r.row_num) && t.claim === r.claim));
   const upserts = rows.some(row => {
     const s = byRow.get(row.row_num);
@@ -439,13 +450,13 @@ async function reextractCoordinated(
   result: ExtractTakesResult,
 ): Promise<void> {
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
-  const [page] = await engine.executeRaw<{ id: number; compiled_truth: string | null; timeline: string | null }>(
-    'SELECT id, compiled_truth, timeline FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [sourceId, slug]);
+  const [page] = await engine.executeRaw<TakesPage>(
+    `SELECT ${TAKES_PAGE_COLUMNS} FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL`, [sourceId, slug]);
   if (!snapshot || !page || Number(page.id) !== snapshot.page.id) return;
-  const plan = await plannedTakes(engine, page, rebuild);
+  const read = await readPageTakes(engine, page);
+  const plan = await plannedTakes(engine, page, read, rebuild);
   if (!plan.changed) {
-    const { warnings } = parseTakesFence(`${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`);
-    recordTakesWarnings(slug, warnings, result);
+    recordTakesWarnings(slug, read.parsed.warnings, result);
     if (plan.takes.length) result.pagesWithTakes++;
     return;
   }
@@ -490,13 +501,16 @@ export async function prepareTakesReextract(engine: BrainEngine, row: WriteReque
   }
   await authorizeWrite(engine, row.authority, 'submit_job', row.slug);
   const rebuild = (row.intent as { rebuild?: unknown } | null)?.rebuild === true;
+  // A segmented body is read here, at the observed revision, never inside the publication.
+  const segmented = isSegmentedPage(snapshot.page) ? await readPageTakes(engine, snapshot.page as TakesPage) : null;
   return { observedRevision: snapshot.revision, noop: true,
     validate: async tx => { await authorizeWrite(tx, row.authority, 'submit_job', row.slug); },
     apply: async tx => {
-      const [page] = await tx.executeRaw<{ id: number; compiled_truth: string | null; timeline: string | null }>(
-        'SELECT id, compiled_truth, timeline FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [row.source_id, row.slug]);
+      const [page] = await tx.executeRaw<TakesPage>(
+        `SELECT ${TAKES_PAGE_COLUMNS} FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL`, [row.source_id, row.slug]);
       const local: ExtractTakesResult = { pagesScanned: 0, pagesWithTakes: 0, takesUpserted: 0, warnings: [], failedFiles: [] };
-      const takes = page ? await reconcilePageTakes(tx, page, row.slug, rebuild, false, local) : [];
+      const read = page && (isSegmentedPage(page) ? segmented : await readPageTakes(tx, page));
+      const takes = page && read ? await reconcilePageTakes(tx, page.id, read, row.slug, rebuild, false, local) : [];
       const upserted = takes.length ? await upsertProjectedTakes(tx, takes.map(t => takesPreparation.toCanonicalBatchInput(page!.id, t)), local, tx) : 0;
       return { status: 'completed', takes_upserted: upserted, with_takes: local.pagesWithTakes > 0, ...(local.writeGate ? { write_gate: local.writeGate } : {}),
         warnings: local.warnings.map(w => w.slice(row.slug.length + 2)) };

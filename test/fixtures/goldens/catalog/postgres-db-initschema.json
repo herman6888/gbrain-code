@@ -169,6 +169,8 @@
       "page_body_staging_parts.page_body_staging_parts_part_no_check": "c CHECK ((part_no >= 0))",
       "page_body_staging_parts.page_body_staging_parts_pkey": "p PRIMARY KEY (staging_id, part_no)",
       "page_body_staging_parts.page_body_staging_parts_staging_id_fkey": "f FOREIGN KEY (staging_id) REFERENCES page_body_stagings(id) ON DELETE CASCADE",
+      "page_body_staging_texts.page_body_staging_texts_pkey": "p PRIMARY KEY (staging_id, sha256)",
+      "page_body_staging_texts.page_body_staging_texts_staging_id_fkey": "f FOREIGN KEY (staging_id) REFERENCES page_body_stagings(id) ON DELETE CASCADE",
       "page_body_stagings.page_body_stagings_declared_bytes_check": "c CHECK ((declared_bytes >= 0))",
       "page_body_stagings.page_body_stagings_kind_check": "c CHECK ((kind = ANY (ARRAY['upload'::text, 'import'::text, 'sync'::text, 'put'::text, 'append'::text, 'edit'::text, 'resegment'::text])))",
       "page_body_stagings.page_body_stagings_mode_check": "c CHECK ((mode = ANY (ARRAY['create'::text, 'replace'::text, 'append'::text])))",
@@ -202,6 +204,12 @@
       "page_segment_texts.page_segment_texts_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "page_versions.page_versions_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "page_versions.page_versions_pkey": "p PRIMARY KEY (id)",
+      "page_view_digests.page_view_digests_audience_check": "c CHECK ((audience = ANY (ARRAY['trusted'::text, 'remote'::text])))",
+      "page_view_digests.page_view_digests_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "page_view_digests.page_view_digests_pkey": "p PRIMARY KEY (page_id, revision, view, audience)",
+      "page_view_digests.page_view_digests_total_bytes_check": "c CHECK ((total_bytes >= 0))",
+      "page_view_digests.page_view_digests_total_lines_check": "c CHECK ((total_lines >= 0))",
+      "page_view_digests.page_view_digests_view_check": "c CHECK ((view = ANY (ARRAY['read'::text, 'markdown'::text])))",
       "page_write_guards.page_write_guards_pkey": "p PRIMARY KEY (source_incarnation, slug)",
       "page_write_guards.page_write_guards_source_incarnation_fkey": "f FOREIGN KEY (source_incarnation) REFERENCES sources(incarnation) ON DELETE CASCADE",
       "pages.pages_page_kind_check": "c CHECK ((page_kind = ANY (ARRAY['markdown'::text, 'code'::text, 'image'::text])))",
@@ -564,6 +572,9 @@
       "page_body_staging_parts": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "page_body_staging_texts": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "page_body_stagings": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -589,6 +600,9 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "page_versions": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "page_view_digests": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "page_write_guards": [
@@ -935,6 +949,8 @@
       "page_body_manifest_staging": "CREATE INDEX page_body_manifest_staging ON public.page_body_manifest USING btree (staging_id) WHERE (staging_id IS NOT NULL)",
       "page_body_manifest_text": "CREATE INDEX page_body_manifest_text ON public.page_body_manifest USING btree (source_id, sha256)",
       "page_body_staging_parts_pkey": "CREATE UNIQUE INDEX page_body_staging_parts_pkey ON public.page_body_staging_parts USING btree (staging_id, part_no)",
+      "page_body_staging_texts_pkey": "CREATE UNIQUE INDEX page_body_staging_texts_pkey ON public.page_body_staging_texts USING btree (staging_id, sha256)",
+      "page_body_staging_texts_text": "CREATE INDEX page_body_staging_texts_text ON public.page_body_staging_texts USING btree (source_id, sha256)",
       "page_body_stagings_expiry": "CREATE INDEX page_body_stagings_expiry ON public.page_body_stagings USING btree (hard_expires_at) WHERE (state = ANY (ARRAY['open'::text, 'sealed'::text, 'prepared'::text]))",
       "page_body_stagings_pkey": "CREATE UNIQUE INDEX page_body_stagings_pkey ON public.page_body_stagings USING btree (id)",
       "page_body_stagings_principal_kind_principal_id_client_reque_key": "CREATE UNIQUE INDEX page_body_stagings_principal_kind_principal_id_client_reque_key ON public.page_body_stagings USING btree (principal_kind, principal_id, client_request_id)",
@@ -948,6 +964,7 @@
       "page_retrievals_pkey": "CREATE UNIQUE INDEX page_retrievals_pkey ON public.page_retrievals USING btree (page_id)",
       "page_segment_texts_pkey": "CREATE UNIQUE INDEX page_segment_texts_pkey ON public.page_segment_texts USING btree (source_id, sha256)",
       "page_versions_pkey": "CREATE UNIQUE INDEX page_versions_pkey ON public.page_versions USING btree (id)",
+      "page_view_digests_pkey": "CREATE UNIQUE INDEX page_view_digests_pkey ON public.page_view_digests USING btree (page_id, revision, view, audience)",
       "page_write_guards_pkey": "CREATE UNIQUE INDEX page_write_guards_pkey ON public.page_write_guards USING btree (source_incarnation, slug)",
       "pages_coalesce_date_idx": "CREATE INDEX pages_coalesce_date_idx ON public.pages USING btree (COALESCE(effective_date, updated_at))",
       "pages_deleted_at_purge_idx": "CREATE INDEX pages_deleted_at_purge_idx ON public.pages USING btree (deleted_at) WHERE (deleted_at IS NOT NULL)",
@@ -1763,7 +1780,10 @@
           "4 source_ref text/text NOT NULL",
           "5 pages_updated jsonb/jsonb NOT NULL DEFAULT '[]'::jsonb",
           "6 summary text/text NOT NULL DEFAULT ''::text",
-          "7 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "7 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "8 writer_version text/text NULL",
+          "9 writer_host_id uuid/uuid NULL",
+          "10 writer_segment_reader boolean/bool NULL"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -2119,7 +2139,7 @@
           "23 staging_id uuid/uuid NULL",
           "24 staging_key uuid/uuid NOT NULL"
         ],
-        "flags": "relkind=r rls=false force_rls=false"
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "page_body_staging_parts": {
         "columns": [
@@ -2130,7 +2150,15 @@
           "5 sha256 bytea/bytea NOT NULL",
           "6 body bytea/bytea NOT NULL"
         ],
-        "flags": "relkind=r rls=false force_rls=false"
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "page_body_staging_texts": {
+        "columns": [
+          "1 staging_id uuid/uuid NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 sha256 bytea/bytea NOT NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "page_body_stagings": {
         "columns": [
@@ -2158,7 +2186,7 @@
           "22 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
           "23 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
-        "flags": "relkind=r rls=false force_rls=false"
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "page_embedding_budget": {
         "columns": [
@@ -2230,7 +2258,7 @@
           "5 body bytea/bytea NOT NULL",
           "6 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
-        "flags": "relkind=r rls=false force_rls=false"
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "page_versions": {
         "columns": [
@@ -2246,6 +2274,19 @@
           "10 tags jsonb/jsonb NULL",
           "11 is_deleted boolean/bool NULL",
           "12 source_path text/text NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "page_view_digests": {
+        "columns": [
+          "1 page_id integer/int4 NOT NULL",
+          "2 revision text/text NOT NULL",
+          "3 view text/text NOT NULL",
+          "4 audience text/text NOT NULL",
+          "5 total_bytes bigint/int8 NOT NULL",
+          "6 total_lines bigint/int8 NOT NULL",
+          "7 sha256 text/text NULL",
+          "8 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -2317,7 +2358,8 @@
           "14 minted_under jsonb/jsonb NULL",
           "15 version text/text NOT NULL",
           "16 boot_id text/text NULL",
-          "17 process_start text/text NULL"
+          "17 process_start text/text NULL",
+          "18 segment_reader boolean/bool NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

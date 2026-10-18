@@ -78,7 +78,7 @@ import {
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
 import { insertDerivedFacts, writeDerivedFacts } from '../core/persistence/derived-facts.ts';
 import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
-import { clearConversationFacts, enqueueManagedPage, flushManagedBatch, managedConversationPublisher, startManagedPage, stopsRun, type ManagedConversationPublisher } from '../core/facts/conversation-publication.ts';
+import { clearConversationFacts, countConversationFacts, enqueueManagedPage, flushManagedBatch, managedConversationPublisher, startManagedPage, stopsRun, type ManagedConversationPublisher } from '../core/facts/conversation-publication.ts';
 import { ConversationRunClaims, listConversationPagesBySlug } from '../core/facts/conversation-enumeration.ts';
 import { BudgetTracker, BudgetExhausted, loadPricingOverrides, type BudgetReason, type NoPricingGuidance } from '../core/budget/budget-tracker.ts';
 import { noPricingMessage } from '../core/budget/no-pricing.ts';
@@ -375,7 +375,8 @@ import {
   parseConversation,
   type ParseConversationOpts as OrchestratorParseOpts,
 } from '../core/conversation-parser/parse.ts';
-import { ConversationBodyTooLargeError, CONVERSATION_BODY_MAX_BYTES, readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
+import { ConversationBodyTooLargeError, CONVERSATION_BODY_MAX_BYTES, readConversationInput } from '../core/conversation-parser/body.ts';
+import { CONVERSATION_WINDOW_BYTES, type ConversationWindow } from '../core/page-body/segment-conversation.ts';
 import { setExtractionReceipt } from '../core/extraction-watermark.ts';
 import { conversationSkip } from '../core/facts/conversation-skip.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
@@ -532,19 +533,31 @@ function filterOutSlug(entries: string[], sourceId: string, slug: string): strin
 // Body cap (Eng A2).
 // ---------------------------------------------------------------------------
 
-/** The body cap, pre-parse: a skip leaves a durable receipt (doctor: extraction_input_truncated); a page under the cap clears an earlier one. */
+/**
+ * The body cap, pre-parse: a skip leaves a durable receipt (doctor: extraction_input_truncated); a page under the cap
+ * clears an earlier one. A segmented page over the window cap is extracted from its newest window only when it has no
+ * conversation facts (the run clears them all; lossless until PR 4's anchors): one with any arrives unread (window.priorFacts).
+ */
 async function skippedForSize(state: ExtractCoreState, snapshot: ConversationPageSnapshot): Promise<boolean> {
   const origin = snapshot.oversizedSidecarBytes === undefined ? 'page' : 'sidecar';
   const bytes = snapshot.oversizedSidecarBytes ?? Buffer.byteLength(snapshot.body, 'utf8');
   const over = bytes > MAX_PAGE_BODY_BYTES;
-  if (over) {
+  const window = snapshot.window;
+  const priorFacts = window?.priorFacts ?? 0;
+  if (over || priorFacts > 0) {
     state.result.pages_skipped_too_large++;
-    process.stderr.write(`[extract-conversation-facts] SKIP ${snapshot.page.slug}: ${origin === 'sidecar' ? 'raw_transcript sidecar ' : ''}`
-      + `${(bytes / 1024 / 1024).toFixed(1)}MB exceeds ${MAX_PAGE_BODY_BYTES / 1024 / 1024}MB cap\n`);
+    process.stderr.write(`[extract-conversation-facts] SKIP ${snapshot.page.slug}: ${over ? `${origin === 'sidecar' ? 'raw_transcript sidecar ' : ''}`
+      + `${(bytes / 1024 / 1024).toFixed(1)}MB exceeds ${MAX_PAGE_BODY_BYTES / 1024 / 1024}MB cap` : `${(window!.totalBytes / 1024 / 1024).toFixed(1)}MB is over the `
+      + `${CONVERSATION_WINDOW_BYTES / 1024 / 1024}MB window and its ${priorFacts} conversation fact(s) may lie outside it; they were kept`}\n`);
   }
   if (!state.dryRun) await setExtractionReceipt(state.engine, snapshot.page.id, 'conversation_facts', over
-    ? { kind: 'skipped_too_large', pipeline: 'conversation_facts', processed_chars: 0, total_bytes: bytes, cap_bytes: MAX_PAGE_BODY_BYTES, origin } : null);
-  return over;
+    ? { kind: 'skipped_too_large', pipeline: 'conversation_facts', processed_chars: 0, total_bytes: bytes, cap_bytes: MAX_PAGE_BODY_BYTES, origin }
+    : !window ? null : priorFacts > 0
+      ? { kind: 'skipped_too_large', pipeline: 'conversation_facts', processed_chars: 0, total_bytes: window.totalBytes, cap_bytes: CONVERSATION_WINDOW_BYTES,
+        origin: 'page', window_rule: 'prior_facts_kept', prior_facts: priorFacts }
+      : { kind: 'tail_window', pipeline: 'conversation_facts', processed_chars: snapshot.body.length, total_bytes: window.totalBytes,
+        cap_bytes: CONVERSATION_WINDOW_BYTES, origin: 'page', window_rule: 'no_prior_facts' });
+  return over || priorFacts > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +733,8 @@ export type DurableExtractionOutcome = 'complete' | 'non_extractable';
 interface ConversationPageSnapshot {
   page: Page;
   body: string;
+  /** A segmented page over the window cap: `body` is its newest window. */
+  window?: ConversationWindow;
   versionToken: string;
   /** The `raw_transcript` sidecar was over the cap and not read; `body` is empty. */
   oversizedSidecarBytes?: number;
@@ -749,15 +764,15 @@ function regularPageVersionToken(page: Page): string {
   return `page-${hash}-${effectiveDate}`;
 }
 
-function snapshotVersionToken(page: Page, body: string): string {
+function snapshotVersionToken(page: Page, input: { body: string; sidecar?: true }): string {
   if (!hasRawTranscriptSidecar(page)) return regularPageVersionToken(page);
-  // Sidecar contents can change without touching pages.updated_at. Hash the
-  // exact parser input plus parser-relevant page metadata so those edits reopen
-  // the page without a schema migration.
+  // Sidecar contents can change without touching pages.updated_at. Hash the exact parser input plus parser-relevant page metadata so those
+  // edits reopen the page without a schema migration. A segmented page parsing its own body hashes content_hash, never the input the prior-fact guard empties.
+  const parserInput = page.body_storage === 'segmented' && !input.sidecar ? { page: regularPageVersionToken(page) } : { body: input.body };
   return `sidecar-${createHash('sha256')
     .update(
       JSON.stringify({
-        body,
+        ...parserInput,
         title: page.title,
         type: page.type,
         frontmatter: page.frontmatter,
@@ -772,8 +787,8 @@ async function preparePageSnapshot(
   page: Page,
 ): Promise<ConversationPageSnapshot> {
   try {
-    const body = await readConversationBodyForParsing(engine, page);
-    return { page, body, versionToken: snapshotVersionToken(page, body) };
+    const input = await readConversationInput(engine, page, { priorFacts: () => countConversationFacts(engine, page.source_id, page.slug) });
+    return { page, body: input.body, ...(input.window ? { window: input.window } : {}), versionToken: snapshotVersionToken(page, input) };
   } catch (error) {
     if (!(error instanceof ConversationBodyTooLargeError)) throw error;
     return { page, body: '', versionToken: `sidecar-oversized-${error.bytes}-${error.mtimeMs}`, oversizedSidecarBytes: error.bytes };
@@ -882,7 +897,8 @@ async function processPage(
   // `parseConversationMessages(body)` shape only saw the body, which
   // meant Telegram-bracket pages with frontmatter dates landed at
   // 1970-01-01. Now they pick up the correct date.
-  const parseResult = parseConversation(body, { page });
+  const fallbackDate = snapshot.window?.fallbackDate ?? undefined;
+  const parseResult = parseConversation(body, { page, ...(fallbackDate ? { fallbackDate } : {}) });
   let messages = parseResult.messages;
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
@@ -929,7 +945,7 @@ async function processPage(
       body,
       engine: state.engine,
       signal: state.signal,
-      fallbackDate: deriveDateContext({ page }).fallbackDate,
+      fallbackDate: deriveDateContext({ page, ...(fallbackDate ? { fallbackDate } : {}) }).fallbackDate,
       propagateError: (error) =>
         error instanceof BudgetExhausted ||
         (state.signal?.aborted === true && isAbortError(error)),

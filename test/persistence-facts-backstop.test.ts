@@ -16,6 +16,7 @@ import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
 
 let engine: PGLiteEngine;
 const config = { engine: 'pglite' as const, embedding_disabled: true };
@@ -25,7 +26,7 @@ afterAll(async () => { await engine.disconnect(); });
 
 async function fixture(run: () => Promise<void>) {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-facts-effect-'));
-  try { await withEnv({ GBRAIN_HOME: home }, async () => { await resetPgliteState(engine); await engine.setConfig('version', '156'); await registerLocalWriter(engine, 'cli'); await run(); }); }
+  try { await withEnv({ GBRAIN_HOME: home }, async () => { await resetPgliteState(engine); await engine.setConfig('version', String(LATEST_SCHEMA_VERSION)); await registerLocalWriter(engine, 'cli'); await run(); }); }
   finally { rmSync(home, { force: true, recursive: true }); }
 }
 async function prepare(overrides: Partial<OperationContext> = {}, params: Record<string, unknown> = {}) {

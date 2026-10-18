@@ -101,6 +101,7 @@ export const PERSISTENCE_CONSUMERS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS persi
     version text NOT NULL,
     boot_id text,
     process_start text,
+    segment_reader boolean,
     PRIMARY KEY(host_id,pid,nonce)
   )`;
 /** Indexes the Postgres blob omits because a migration builds them CONCURRENTLY. */

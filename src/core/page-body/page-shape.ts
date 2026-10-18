@@ -13,6 +13,7 @@
  * enforcement, not the type checker.
  */
 import { opError } from '../ops/contract.ts';
+import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
 import type { Page } from '../types.ts';
 import type { BodyStorage } from './types.ts';
 
@@ -57,10 +58,25 @@ export function pageBodySegmentedError(page: { slug?: string; source_id?: string
   const sourceId = page.source_id ?? 'default';
   return opError('page_body_segmented',
     `${site}: page ${slug} (source ${sourceId}) stores its body in segments, and this path reads or writes the whole body as one string. Nothing was read or changed.`,
-    "Read the page's revision and stored size with get_page body: 'none' (size.body_bytes). Windowed reads of a segmented body arrive with the segment reader; until then this path cannot process the page.",
-    { fix: { argv: ['gbrain', 'get', '--source', sourceId, '--body', 'none', '--', slug],
-      mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId, body: 'none' } },
-      consent: [], actor: 'agent', requires_exclusive: false, why: "Returns the page's revision and size without its body." } });
+    "This path cannot process a page stored in segments yet; retrying refuses the same way. Read the page in pieces: get_page body: 'auto' returns its outline and first window, and body: 'window' reads any lines or bytes.",
+    { fix: { argv: ['gbrain', 'get', '--source', sourceId, '--body', 'auto', '--', slug],
+      mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId, body: 'auto' } },
+      consent: [], actor: 'agent', requires_exclusive: false, why: "Returns the page's outline and its first window, with next_cursor to read on." } });
+}
+
+/**
+ * The refusal of a write that reads the body whole (a fence or timeline edit through the put path) on a segmented page
+ * over PAGE_MAX_BYTES (24 MiB): up to it the page is read back as strings and written as a normal put.
+ */
+export function pageBodyOverCeilingError(page: { slug?: string; source_id?: string; body_bytes?: number | null }, site: string) {
+  const slug = page.slug ?? '<unknown>';
+  const sourceId = page.source_id ?? 'default';
+  return opError('page_body_segmented',
+    `${site}: page ${slug} (source ${sourceId}) stores its ${Number(page.body_bytes ?? 0)}-byte body in segments, over the 24 MiB (${PAGE_MAX_BYTES}-byte) limit up to which this write reads the body whole. Nothing was read or changed.`,
+    "This write edits a page stored in segments by reading its body whole, which works up to 24 MiB; this page is larger, so retrying refuses the same way. Read the page in pieces: get_page body: 'auto' returns its outline and first window, and body: 'window' reads any lines or bytes.",
+    { fix: { argv: ['gbrain', 'get', '--source', sourceId, '--body', 'auto', '--', slug],
+      mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId, body: 'auto' } },
+      consent: [], actor: 'agent', requires_exclusive: false, why: "Returns the page's outline and its first window, with next_cursor to read on." } });
 }
 
 /** Throws `page_body_segmented` for a segmented page; `site` names the caller. Inline pages pass. */

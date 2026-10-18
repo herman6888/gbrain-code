@@ -58,6 +58,8 @@ import { authorizePageVisibility } from './page-visibility.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
+import { isStreamedContent } from './large-file.ts';
+import { sharedReadFailure } from './bounded-reads.ts';
 import { decoratePublicationOutcome, finishPreparationStalled, finishUnpublishedFailure, pageRecoveryRecord, persistenceFileHash, preparationAbortReason, publicationPostimage, publishMutation,
   publishPersistenceFile, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { pipelined } from '../page-state/transactions.ts';
@@ -67,7 +69,7 @@ import { readJournalLimits } from './limits.ts';
 import type { JournalLimits } from './model.ts';
 import { writerStamp } from './writer-versions.ts';
 import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
-import { faultPoint, type PublicationBoundary } from './fault-points.ts';
+import { faultHookInstalled, faultPoint, type PublicationBoundary } from './fault-points.ts';
 import { assertMutationProtocol } from './protocol.ts';
 import { writeSwitchOn } from './switches.ts';
 import { importGroupReads, type ImportGroupReads } from './import-reads.ts';
@@ -92,6 +94,8 @@ export function singleWrite(row: Pick<WriteRequest, 'operation' | 'intent'>): bo
 export function groupable(row: WriteRequest, prepared: PreparedMutation): boolean {
   if ((row.target_kind ?? 'page') !== 'page' || prepared.target === 'skill_bundle' || prepared.sourceExclusive || prepared.exclusiveSources?.length) return false;
   if (syncMember(row)) return !prepared.file && typeof prepared.validate === 'function';
+  // A streamed file (large-file.ts) is staged before its publication transaction, which only publishMutation does.
+  if (isStreamedContent(prepared.file?.content)) return false;
   return independentGroup(publicationGroupKey(row)) || singleWrite(row);
 }
 
@@ -167,7 +171,9 @@ export function preparationReads(engine: BrainEngine, imports?: ImportGroupReads
   const reads = new Map<string, Promise<unknown>>();
   const once = <T>(id: string, read: () => Promise<T>): Promise<T> => {
     let value = reads.get(id) as Promise<T> | undefined;
-    if (!value) { value = read(); reads.set(id, value); value.catch(() => reads.delete(id)); }
+    // Flip lane C: a failed shared read is no member's own statement (`sharedReadFailure`): it is charged once, never to every member.
+    // The read is sent synchronously (the memo rule); only an installed hook runs the `group:shared_read` seam first.
+    if (!value) { value = (faultHookInstalled() ? faultPoint('group:shared_read').then(read) : read()).catch(error => { throw sharedReadFailure(error); }); reads.set(id, value); value.catch(() => reads.delete(id)); }
     return value;
   };
   return new Proxy(engine, { get(target, key) {
@@ -262,6 +268,8 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       if (!file || prepared[i]!.noop) continue;
       if (!isWriteTargetContained(file.path, file.root)) return none;
       const member = { row: rows[i]!, ...pageRecoveryRecord(rows[i]!, file, binding) };
+      // A large prior file is copied to its before stage ahead of the transaction: the single path does that.
+      if (member.record.staging?.before) return none;
       // A file that moved since preparation takes the single path, which decides between reprepare and refusal.
       if (file.expectedBeforeHash !== undefined && member.record.beforeHash !== file.expectedBeforeHash) return none;
       files.set(i, member);
@@ -527,7 +535,7 @@ export async function completeGroup(tx: BrainEngine, rows: WriteRequest[], outco
       ), done AS (
         UPDATE persistence_requests r SET state='committed',outcome=m.outcome::jsonb,error_code=NULL,error_message=NULL,
           completed_at=now(),updated_at=now(),claim_expires_at=NULL,blocked_reason=NULL,
-          consumer_version=$6,consumer_host_id=$7::uuid,published_at=now(),preparation_attempts=0,
+          consumer_version=$6,consumer_host_id=$7::uuid,consumer_segment_reader=true,published_at=now(),preparation_attempts=0,
           terminal_reservation=CASE WHEN COALESCE(e.unfinished,false) THEN r.terminal_reservation
             ELSE LEAST(r.terminal_reservation,m.retained+COALESCE(e.bytes,0)) END
         FROM m LEFT JOIN e ON e.request_id=m.id

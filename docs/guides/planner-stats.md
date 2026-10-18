@@ -78,7 +78,7 @@ until 10% of a table changes. Without the page columns search filters read,
 search plans as nested loops over every page (50-60 s per search at 5,000
 pages instead of 0.5 s). gbrain guards this two ways, both through the same
 refresh as import and sync (`ANALYZE pages(...)` and
-`ANALYZE content_chunks(model, modality, page_id, body_generation, retired_generation)`, 30 s bounded):
+`ANALYZE content_chunks(model, modality, page_id, body_generation)`, 30 s bounded):
 
 - The first search of each process checks in the background and collects them
   when the database role owns the tables. The search does not wait for it.

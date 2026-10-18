@@ -18,7 +18,7 @@ import { importFromContent } from '../../src/core/import-file.ts';
 import { installFaultHook, type FaultPoint } from '../../src/core/persistence/fault-points.ts';
 import { materializeSegmentedBody } from '../../src/core/page-body/ingest.ts';
 import { rebuildPendingSegmentedProjections } from '../../src/core/page-body/projection.ts';
-import { BODY_STAGING_HARD_MS } from '../../src/core/page-body/limits.ts';
+import { BODY_STAGING_HARD_MS, SEGMENTED_CREATE_SEAL_MAX_BYTES } from '../../src/core/page-body/limits.ts';
 import { conversationBody, conversationPage } from '../helpers/conversation-page.ts';
 
 let engine: PGLiteEngine;
@@ -94,7 +94,7 @@ describe('replace: a crash at any step leaves the previous generation', () => {
 
 describe('create: a crash after the projection staged its chunks', () => {
   test('the page publishes unsealed, the projection queue seals it, and a second rebuild adds nothing', async () => {
-    const created = conversationPage(2 * 1024 * 1024, { seed: 31, needles: [{ at: 0.9, word: NEEDLE }] });
+    const created = conversationPage(SEGMENTED_CREATE_SEAL_MAX_BYTES + 256 * 1024, { seed: 31, needles: [{ at: 0.9, word: NEEDLE }] });
     crashAt('segmented:projection_staged');
     const result = await importFromContent(engine, 'notes/fresh', created, { sourceId: 'default', noEmbed: true });
     installFaultHook(undefined);
@@ -113,7 +113,7 @@ describe('create: a crash after the projection staged its chunks', () => {
     expect(await searchHits(NEEDLE, 'notes/fresh')).toBe(1);
 
     const perOccurrence = async () => engine.executeRaw<{ occurrence_id: number; n: number }>(
-      `SELECT occurrence_id, count(*)::int AS n FROM content_chunks WHERE page_id=$1 AND retired_generation IS NULL GROUP BY occurrence_id ORDER BY occurrence_id`, [sealed.id]);
+      `SELECT occurrence_id, count(*)::int AS n FROM content_chunks WHERE page_id=$1 GROUP BY occurrence_id ORDER BY occurrence_id`, [sealed.id]);
     const once = await perOccurrence();
     await engine.executeRaw(`INSERT INTO page_projection_jobs(source_incarnation, slug, revision, reason)
       SELECT s.incarnation, $1, p.knowledge_revision, 'canonical_change' FROM pages p JOIN sources s ON s.id=p.source_id WHERE p.slug=$1`, ['notes/fresh']);
@@ -124,7 +124,7 @@ describe('create: a crash after the projection staged its chunks', () => {
 
 describe('replace of a page whose projection never ran', () => {
   test('the rewrite chunks every kept occurrence with the flip and seals the page', async () => {
-    const created = conversationPage(2 * 1024 * 1024, { seed: 41, needles: [{ at: 0.2, word: NEEDLE }] });
+    const created = conversationPage(SEGMENTED_CREATE_SEAL_MAX_BYTES + 256 * 1024, { seed: 41, needles: [{ at: 0.2, word: NEEDLE }] });
     crashAt('segmented:projection_staged');
     await importFromContent(engine, 'notes/unchunked', created, { sourceId: 'default', noEmbed: true });
     installFaultHook(undefined);
@@ -139,7 +139,7 @@ describe('replace of a page whose projection never ran', () => {
     const bare = await engine.executeRaw(`SELECT m.occurrence_id FROM page_body_manifest m WHERE m.page_id=$1 AND m.staging_id IS NULL
         AND m.gen_from <= $2 AND (m.gen_to IS NULL OR m.gen_to > $2)
         AND NOT EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id=m.page_id AND c.occurrence_id=m.occurrence_id
-          AND c.body_generation <= $2 AND (c.retired_generation IS NULL OR c.retired_generation > $2))`, [sealed.id, sealed.body_generation]);
+          AND c.body_generation <= $2)`, [sealed.id, sealed.body_generation]);
     expect(bare).toEqual([]);
     expect(await searchHits(NEEDLE, 'notes/unchunked')).toBe(1);
   }, 180_000);

@@ -7,7 +7,8 @@ import { pageIdentityError } from './page-identity.ts';
 import { assertPageRevision } from '../page-state/types.ts';
 import { factsFenceSection, parseFactsFence, strikeFactRowInPage, upsertFactRow, formatFenceDate } from '../facts-fence.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { assertInlineBody } from '../page-body/page-shape.ts';
+import { pageBodyOverCeilingError } from '../page-body/page-shape.ts';
+import { materializedPage, segmentedOverCeiling } from './segmented-apply.ts';
 import { assertFactNotWithdrawn, decideReplacement, decideSingleFact, prepareFactEmbedding, type SingleFactIntent } from '../facts/single-prepare.ts';
 import { factEmbeddingDisabled } from '../embedding-disabled.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
@@ -146,9 +147,11 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   let rowNum: number | undefined;
   let fencesNormalized: Record<string, unknown> = {};
   if (p.fence === true && snapshot) {
-    assertInlineBody(snapshot.page, 'remember facts fence write');
+    // Wave B: a segmented page is read back whole up to the single-string ceiling and rewritten through the put path.
+    if (segmentedOverCeiling(snapshot.page)) throw pageBodyOverCeilingError(snapshot.page, 'remember facts fence write');
+    const base = await materializedPage(engine, snapshot.page);
     // #6188 (D20): the stored fence is normalized in this same write; a residual refuses typed `target_fence_malformed`.
-    const target = await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page });
+    const target = await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: base });
     if (target.fixes.length) fencesNormalized = { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: target.fixes,
       writer: row.principal_kind, path: snapshot.page.source_path ?? null, remote: row.authority.remote }) };
     // #6696 C9: a facts row the fence does not hold (extraction, a hand edit) still owns its row_num, so the new row numbers past both.
@@ -165,7 +168,7 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
     let next = { ...fenced, [section]: appended.body };
     const old = decision.candidate;
     if (status === 'superseded' && old?.source_markdown_slug === row.slug && old.row_num != null) next = strikeFactRowInPage(next, Number(old.row_num), rowNum);
-    const content = serializePageToMarkdown({ ...snapshot.page, ...next }, snapshot.tags);
+    const content = serializePageToMarkdown({ ...base, ...next }, snapshot.tags);
     // Reuse the canonical parser/chunker and durable filesystem publication.
     // The original caller revision was checked above; this CAS binds this render.
     // #5575 ENG-1: the new row has no facts row yet; its chunks are cut at the append's tier.

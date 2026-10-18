@@ -27,7 +27,7 @@ import { loadEmbeddingQueryPrefix } from './query-prefix.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
 export { applyAliasHop, isExcludedIdentity, type IdentityTierOpts };
-import { dedupResults } from './dedup.ts';
+import { dedupResults, segmentRegions } from './dedup.ts';
 import { accumulateRrf, type RrfEntry } from './rrf-page-fusion.ts';
 import type { RrfAttribution } from '../types.ts';
 import {
@@ -1170,7 +1170,7 @@ export async function hybridSearch(
   // aliasing in the postFusionOpts resolver near line ~256.
 
   // Dedup
-  const deduped = await timer.stage('post_fusion', async () => capSessionPool(req, dedupResults(fused, dedupOpts)));
+  const deduped = await timer.stage('post_fusion', async () => capSessionPool(req, dedupResults(fused, { ...dedupOpts, regions: await segmentRegions(req.engine, fused) })));
   opts?.explainTarget?.observe('deduped', deduped);
 
   // Auto-escalate: if detail=low returned 0, retry with high. The inner

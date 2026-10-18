@@ -29,6 +29,7 @@ import { makeFactsAbsorbHandler } from '../src/core/minions/handlers/facts-absor
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
 
 const DIMS = 1536;
 const ENTITY = 'people/alice-example';
@@ -80,7 +81,7 @@ async function scenario(managed: boolean) {
   try {
     await withEnv({ GBRAIN_HOME: home, OPENAI_API_KEY: 'test' }, async () => {
       await resetPgliteState(engine);
-      await engine.setConfig('version', '156');
+      await engine.setConfig('version', String(LATEST_SCHEMA_VERSION));
       await engine.setConfig('embedding_model', 'openai:text-embedding-3-small');
       await engine.setConfig('embedding_dimensions', String(DIMS));
       await registerLocalWriter(engine, 'cli');

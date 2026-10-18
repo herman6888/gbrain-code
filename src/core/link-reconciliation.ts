@@ -1,6 +1,6 @@
 import type { BrainEngine, LinkBatchInput } from './engine.ts';
 import { extractPageLinks, unwrapWikilink, resolvedLinkCandidate,
-  isCrossSourceLinksEnabled, type LinkCandidate, type LinkExtractionPack, type SlugResolver } from './link-extraction.ts';
+  isCrossSourceLinksEnabled, type LinkCandidate, type LinkExtractionPack, type PageLinksResult, type SlugResolver } from './link-extraction.ts';
 import { fetchSource, isSourceFederated } from './sources-load.ts';
 import { parseMarkdown } from './markdown.ts';
 import { isValidSourceId } from './source-id.ts';
@@ -9,6 +9,8 @@ import { collectWantedLinks, isWantedPagesEnabled } from './wanted-links.ts';
 import { readLineGrammarSettings } from './line-grammar.ts';
 import { DerivedLinkSettingsChangedError } from './derived-links.ts';
 import { isSegmentedPage } from './page-body/page-shape.ts';
+import { extractSegmentedPageLinks } from './page-body/segment-links.ts';
+import type { TemporalBody } from './link-temporal-apply.ts';
 
 export interface LinkPageMetadata {
   slug: string;
@@ -93,18 +95,17 @@ export async function reconcileSourceLinks(
         return result;
       }
       const page = snapshot.page;
-      if (isSegmentedPage(page)) {
-        result.failures.push({ originSlug, code: 'page_body_segmented' });
-        result.nextAfterSlug = page.slug;
-        continue;
-      }
       const sourcesOf = makeLinkSourceResolver(page.slug, sourceId, endpoints, policy);
-      const extracted = await extractPageLinks(page.slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter,
-        page.type, resolver, { pack: opts.pack, globalBasename: opts.globalBasename, lineGrammar,
-          targetType: (slug, source) => {
-            const resolved = sourcesOf.resolve({ targetSlug: slug, targetSourceId: source, linkType: '', context: '' });
-            return resolved.ok ? metadata.get(`${resolved.toSourceId}\0${slug}`)?.type : undefined;
-          } });
+      const linkOpts = { pack: opts.pack, globalBasename: opts.globalBasename, lineGrammar,
+        targetType: (slug: string, source?: string) => {
+          const resolved = sourcesOf.resolve({ targetSlug: slug, targetSourceId: source, linkType: '', context: '' });
+          return resolved.ok ? metadata.get(`${resolved.toSourceId}\0${slug}`)?.type : undefined;
+        } };
+      // A segmented body is read block by block, and its temporal inputs with it (the publication never reads it).
+      const extracted: PageLinksResult & { temporalBody?: TemporalBody } = isSegmentedPage(page)
+        ? await extractSegmentedPageLinks(engine, { id: Number(page.id), slug: page.slug, source_id: sourceId, type: page.type, frontmatter: page.frontmatter },
+          resolver, { ...linkOpts, temporal: true })
+        : await extractPageLinks(page.slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter, page.type, resolver, linkOpts);
       for (const ref of extracted.unresolved) {
         const target = unwrapWikilink(ref.name);
         const qualifier = target.split(':')[0];
@@ -130,7 +131,8 @@ export async function reconcileSourceLinks(
       try {
         written = await engine.replaceDerivedLinks({ slug: page.slug, sourceId,
           expectedRevision: snapshot.revision, sourceIncarnation }, rows, { lineGrammar: grammar,
-          wanted: { producers: ['body', 'frontmatter'], rows: wanted }, expectedEndpoints: capturedLinkEndpoints(rows, metadata) });
+          wanted: { producers: ['body', 'frontmatter'], rows: wanted }, expectedEndpoints: capturedLinkEndpoints(rows, metadata),
+          ...(extracted.temporalBody ? { temporalBody: extracted.temporalBody } : {}) });
       } catch (error) {
         if (!(error instanceof DerivedLinkSettingsChangedError)) throw error;
         result.failures.push({ originSlug, code: 'revision_conflict' });

@@ -3,12 +3,15 @@
  * number and config key in one place. The product numbers (ceilings, version
  * retention) are open product calls; change them here and nowhere else.
  *
- * `pages.segmented_storage` defaults to `off`: while it is off no page is ever
- * segmented, every page stays inline up to `PAGE_MAX_BYTES` (Wave A) and no
- * code path below the inline threshold changes.
+ * `pages.segmented_storage` defaults to `on` (SEGMENTED_STORAGE_DEFAULT); on, it
+ * is effectively on only while no recent writer predates segmented
+ * pages (`segmentedWriterBlockers`). While
+ * it is off no page is newly segmented, every page stays inline up to
+ * `PAGE_MAX_BYTES` (Wave A) and no code path below the inline threshold changes.
  */
 import type { BrainEngine } from '../engine.ts';
 import { PAGE_INLINE_MAX_BYTES, PAGE_MAX_BYTES } from '../page-size-policy.ts';
+import type { SegmentedGateWriter } from '../persistence/writer-versions.ts';
 
 export { PAGE_INLINE_MAX_BYTES };
 
@@ -33,6 +36,13 @@ export const SEGMENT_TARGET_BYTES = 256 * 1024;
 export const SEGMENT_RANK4_BYTES = 384 * 1024;
 /** Hard bound, matched by the `page_segment_texts.byte_len` CHECK. */
 export const SEGMENT_MAX_BYTES = 1024 * 1024;
+/**
+ * The longest facts fence a withdrawal holds as one string, counted from its begin marker through its end marker
+ * (UTF-8 bytes): withdrawal discovery, the purge and forget rewrite of the segments (segment-rewrite.ts), the trusted
+ * read's join (read-range.ts `trustedSegments`) and the canonical file's overlaid digest (body-digests.ts) all count a
+ * fence this way and refuse a longer one with `page_body_segmented` (`fenceTooLargeError`).
+ */
+export const FENCE_MAX_BYTES = PAGE_MAX_BYTES;
 
 /** Raw prefix of each region kept on the page row (`truth_lead`, `timeline_lead`), equal to Wave A's bounded prefix. */
 export const BODY_LEAD_BYTES = 64 * 1024;
@@ -67,6 +77,16 @@ export const STAGE_BATCH_BYTES: Readonly<Record<'postgres' | 'pglite', number>> 
 export const DEFAULT_FLIP_RETIRE_MAX_ROWS = 20_000;
 
 /**
+ * A segmented create of at most this many body bytes is searchable when its write commits: it chunks during preparation
+ * (outside the transaction, the chunk inputs held in memory) and its publication inserts the chunk rows, one staging
+ * statement's worth or a little more (STAGE_BATCH_BYTES), and seals. A larger create publishes unsealed and its projection runs after
+ * commit (`searchable: 'pending'` on the receipt). The insert is the part the publication holds the page lock for:
+ * about 0.3 s per MB on PGLite and 0.25 s on Postgres (a 20 MB chat page, 8,900 chunk rows): ~1.2 s at this bound,
+ * ~7 s at 24 MiB, and 30 s to over a minute at the 128/256 MiB ceilings, with every write to the page waiting behind it.
+ */
+export const SEGMENTED_CREATE_SEAL_MAX_BYTES = 4 * 1024 ** 2;
+
+/**
  * Snapshots of an inline page over the inline cap kept per page (Wave A). Each
  * one is a full copy of the body, so an append-heavy 24 MiB page would otherwise
  * grow history by 24 MiB per write. Snapshots at or under the inline cap, and
@@ -84,8 +104,13 @@ export const SEGMENT_TEXT_GC_GRACE_MS = 60 * 60 * 1000;
 export const BODY_STAGING_IDLE_MS = 60 * 60 * 1000;
 export const BODY_STAGING_HARD_MS = 24 * 60 * 60 * 1000;
 
+/** A writer below `SEGMENTED_WRITER_FLOOR` keeps the switch off until this many days after its last committed request. */
+export const SEGMENTED_WRITER_WINDOW_DAYS = 7;
+/** The writer-version gate is read at most once per this many ms per engine (a transaction engine shares its root's entry). */
+export const SEGMENTED_WRITER_GATE_TTL_MS = 60_000;
+
 export interface PageBodyPolicy {
-  /** `pages.segmented_storage = on`. */
+  /** The effective switch: `pages.segmented_storage` is not `off` and no recent writer predates segmented pages. */
   segmented: boolean;
   /** Largest page body admitted: `PAGE_MAX_BYTES` while the switch is off, else `pages.max_bytes` or the engine ceiling. */
   maxBytes: number;
@@ -94,7 +119,7 @@ export interface PageBodyPolicy {
   versionsMaxPinnedBytes: number;
 }
 
-type PolicyEngine = Pick<BrainEngine, 'getConfig' | 'kind'>;
+type PolicyEngine = Pick<BrainEngine, 'getConfig' | 'kind' | 'executeRaw'>;
 
 function positiveInt(raw: string | null, fallback: number): number {
   if (raw === null || raw.trim() === '') return fallback;
@@ -102,9 +127,47 @@ function positiveInt(raw: string | null, fallback: number): number {
   return Number.isSafeInteger(n) && n > 0 ? n : fallback;
 }
 
-/** True when `pages.segmented_storage` is `on` (default `off`). */
-export function parseSegmentedStorage(raw: string | null): boolean {
-  return /^(on|true|1|yes)$/i.test((raw ?? '').trim());
+/** The effective `pages.segmented_storage` when it is not configured. */
+export const SEGMENTED_STORAGE_DEFAULT: 'on' | 'off' = 'on';
+
+/** The configured `pages.segmented_storage`: unset means SEGMENTED_STORAGE_DEFAULT; an unrecognized value counts as `off`. */
+export function parseSegmentedStorage(raw: string | null): 'on' | 'off' | 'unset' | 'invalid' {
+  const value = (raw ?? '').trim();
+  if (!value) return 'unset';
+  if (/^(on|true|1|yes)$/i.test(value)) return 'on';
+  return /^(off|false|0|no)$/i.test(value) ? 'off' : 'invalid';
+}
+
+let writerGate = new WeakMap<object, { at: number; blockers: SegmentedGateWriter[] }>();
+/** Work counter: reads of the writer-version gate (the TTL cache answers the rest). */
+export const segmentedWriterGateWork = { reads: 0 };
+
+/**
+ * Writers seen in the last `SEGMENTED_WRITER_WINDOW_DAYS` days that do not read segmented pages
+ * (`segmentedGateWriters`: evidence without the segment-reader mark, or marked evidence of any role stamped below
+ * `SEGMENTED_WRITER_FLOOR`, writer-floor.ts). Any one keeps segmented storage off. Cached per engine for
+ * `SEGMENTED_WRITER_GATE_TTL_MS`; `fresh` (doctor) reads through.
+ */
+export async function segmentedWriterBlockers(engine: Pick<BrainEngine, 'executeRaw'>, opts: { fresh?: boolean } = {}): Promise<SegmentedGateWriter[]> {
+  let root: object = engine;
+  for (let proto = Object.getPrototypeOf(root); proto && !Object.hasOwn(proto, 'constructor'); proto = Object.getPrototypeOf(proto)) root = proto;
+  const cached = writerGate.get(root);
+  if (!opts.fresh && cached && Date.now() - cached.at < SEGMENTED_WRITER_GATE_TTL_MS) return cached.blockers;
+  const [{ segmentedGateWriters }, { SEGMENTED_WRITER_FLOOR }] = await Promise.all([import('../persistence/writer-versions.ts'), import('./writer-floor.ts')]);
+  segmentedWriterGateWork.reads++;
+  const blockers = await segmentedGateWriters(engine, SEGMENTED_WRITER_WINDOW_DAYS, SEGMENTED_WRITER_FLOOR);
+  writerGate.set(root, { at: Date.now(), blockers });
+  return blockers;
+}
+
+/** Whether the configured switch asks for segmented storage, before the writer gate. */
+export function segmentedStorageRequested(setting: ReturnType<typeof parseSegmentedStorage>): boolean {
+  return setting === 'on' || (setting === 'unset' && SEGMENTED_STORAGE_DEFAULT === 'on');
+}
+
+/** Test seam: forget cached writer-gate reads. */
+export function _resetSegmentedWriterGateForTests(): void {
+  writerGate = new WeakMap();
 }
 
 /** The engine's default segmented ceiling. */
@@ -112,18 +175,47 @@ export function segmentedPageCeiling(kind: BrainEngine['kind']): number {
   return kind === 'pglite' ? SEGMENTED_PAGE_CEILING_BYTES.pglite : SEGMENTED_PAGE_CEILING_BYTES.postgres;
 }
 
-/** Read the segmented-storage policy once per write. A configured `pages.max_bytes` never exceeds the engine ceiling. */
+/** The largest body admitted while the switch is on: a configured `pages.max_bytes`, never above the engine ceiling. */
+export function segmentedMaxBytes(kind: BrainEngine['kind'], maxRaw: string | null): number {
+  const ceiling = segmentedPageCeiling(kind);
+  return Math.min(positiveInt(maxRaw, ceiling), ceiling);
+}
+
+/** Bytes a page's file adds over its body, per staged copy, in the recovery default: frontmatter, separators, the record. */
+export const RECOVERY_FILE_HEADROOM_BYTES = 1024 ** 2;
+
+/**
+ * The default `persistence.limits.worktree_recovery_bytes` (persistence/limits.ts): never below `floor`, room for the
+ * largest page the configured switch admits, and room for the largest page already stored in segments
+ * (`storedSegmentedBytes`, deleted pages included, which a restore brings back). A restore that writes a page's file
+ * back reserves the file twice (persistence/coordinator.ts `pageRecoveryRecord`: its staging file and the file), so a
+ * page needs twice its body plus RECOVERY_FILE_HEADROOM_BYTES per copy. It ignores the writer gate, and a switch turned
+ * off or a lowered `pages.max_bytes` never shrinks it below a stored page: that page stays deletable, restorable and
+ * mirrorable (a withdrawal rewrites its file) instead of being refused `request_too_large` with its file unchanged.
+ */
+export function pageRecoveryBytes(kind: BrainEngine['kind'], switchRaw: string | null, maxRaw: string | null, floor: number, storedSegmentedBytes = 0): number {
+  const maxBytes = segmentedStorageRequested(parseSegmentedStorage(switchRaw)) ? segmentedMaxBytes(kind, maxRaw) : PAGE_MAX_BYTES;
+  return Math.max(floor, 2 * (Math.max(maxBytes, storedSegmentedBytes) + RECOVERY_FILE_HEADROOM_BYTES));
+}
+
+/**
+ * Read the segmented-storage policy once per write. The switch is effectively on when it is configured `on`
+ * (or unset while SEGMENTED_STORAGE_DEFAULT is `on`) and no recent writer predates segmented pages; an
+ * unreadable gate counts as blocked, and so does a failed read of `pages.segmented_storage` or `pages.max_bytes`
+ * (only a missing row is unset, which means on). A configured `pages.max_bytes` never exceeds the engine ceiling.
+ */
 export async function readPageBodyPolicy(engine: PolicyEngine): Promise<PageBodyPolicy> {
-  const read = (key: string) => engine.getConfig(key).catch(() => null);
-  const [switchRaw, maxRaw, retireRaw, versionsRaw, pinnedRaw] = await Promise.all([
-    read(PAGE_BODY_CONFIG_KEYS.segmentedStorage), read(PAGE_BODY_CONFIG_KEYS.maxBytes), read(PAGE_BODY_CONFIG_KEYS.flipRetireMaxRows),
+  const readOrFail = (key: string) => engine.getConfig(key).then(value => ({ value }), () => null);
+  const read = async (key: string) => (await readOrFail(key))?.value ?? null;
+  const [switchRead, maxRead, retireRaw, versionsRaw, pinnedRaw] = await Promise.all([
+    readOrFail(PAGE_BODY_CONFIG_KEYS.segmentedStorage), readOrFail(PAGE_BODY_CONFIG_KEYS.maxBytes), read(PAGE_BODY_CONFIG_KEYS.flipRetireMaxRows),
     read(PAGE_BODY_CONFIG_KEYS.versionsMaxPerPage), read(PAGE_BODY_CONFIG_KEYS.versionsMaxPinnedBytes),
   ]);
-  const segmented = parseSegmentedStorage(switchRaw);
-  const ceiling = segmentedPageCeiling(engine.kind);
+  const setting = switchRead && maxRead ? parseSegmentedStorage(switchRead.value) : 'off';
+  const segmented = segmentedStorageRequested(setting) && (await segmentedWriterBlockers(engine).catch(() => null))?.length === 0;
   return {
     segmented,
-    maxBytes: segmented ? Math.min(positiveInt(maxRaw, ceiling), ceiling) : PAGE_MAX_BYTES,
+    maxBytes: segmented ? segmentedMaxBytes(engine.kind, maxRead!.value) : PAGE_MAX_BYTES,
     flipRetireMaxRows: positiveInt(retireRaw, DEFAULT_FLIP_RETIRE_MAX_ROWS),
     versionsMaxPerPage: positiveInt(versionsRaw, DEFAULT_SEGMENTED_VERSIONS_MAX_PER_PAGE),
     versionsMaxPinnedBytes: positiveInt(pinnedRaw, DEFAULT_SEGMENTED_VERSIONS_MAX_PINNED_BYTES),

@@ -14,13 +14,17 @@
  * snapshot read (the same overlay readPageSnapshot applies), so a withdrawn
  * world fact never shows in a lead. A page the snapshot read no longer
  * returns, or a snapshot read that fails, gets an empty lead (fail closed:
- * a lead is decoration, so the row stays and only its text is withheld). So
- * does a segmented page whose lead holds a facts fence: its overlay applies
- * per window (segment reader), not to a snapshot body.
+ * a lead is decoration, so the row stays and only its text is withheld).
+ * A segmented page has no snapshot body: its row carries the stored
+ * `truth_lead` (the same raw prefix), and a lead that holds a facts fence is
+ * overlaid alone with the page's withdrawal ledger (the snapshot read returns
+ * the ledger and no body), never by reading the page's segments.
  */
 import type { BrainEngine } from '../engine.ts';
+import type { Page } from '../types.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { pageSnapshotKey } from '../page-snapshot-batch.ts';
+import { overlayCanonicalBodies } from '../page-state/snapshot.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { BOUNDED_PREFIX_BYTES, boundedProjectedPrefix } from './document.ts';
 
@@ -54,23 +58,28 @@ export function prefixNeedsOverlay(prefix: string | null | undefined): boolean {
 /**
  * Bounds each row's `compiled_truth` to the raw prefix and, for rows whose
  * prefix holds a facts fence, replaces it with the prefix of the
- * withdrawal-overlaid body (one batched snapshot read for all of them).
+ * withdrawal-overlaid body (one batched snapshot read for all of them; a
+ * segmented page's lead is overlaid alone with its ledger).
  * Returns new row objects; the input rows are not mutated.
  */
 export async function overlaidBoundedRows<T extends { slug: string; source_id: string; compiled_truth: string | null }>(
-  engine: Pick<BrainEngine, 'readPageSnapshotsBatch'>,
+  engine: Pick<BrainEngine, 'readPageSnapshotsBatch' | 'executeRaw'>,
   rows: readonly T[],
 ): Promise<T[]> {
   const bounded = rows.map(row => ({ ...row, compiled_truth: row.compiled_truth == null ? null : boundedRawPrefix(row.compiled_truth) }));
+  const leads = new Map(bounded.filter(row => prefixNeedsOverlay(row.compiled_truth)).map(row => [pageSnapshotKey(row.source_id, row.slug), row.compiled_truth!]));
   const pending = [...new Map(bounded.filter(row => prefixNeedsOverlay(row.compiled_truth))
     .map(row => [pageSnapshotKey(row.source_id, row.slug), { slug: row.slug, sourceId: row.source_id }])).values()];
   if (pending.length === 0) return bounded;
   const overlaid = new Map<string, string>();
+  const query = <R>(sql: string, params?: unknown[]) => engine.executeRaw<R>(sql, params);
   try {
     for (let rest = pending; rest.length > 0;) {
       const batch = await engine.readPageSnapshotsBatch(rest);
       for (const [key, snapshot] of batch.snapshots) {
         if (!isSegmentedPage(snapshot.page)) overlaid.set(key, boundedRawPrefix(snapshot.page.compiled_truth));
+        else overlaid.set(key, boundedRawPrefix((await overlayCanonicalBodies(query, leads.get(key)!, '', snapshot.withdrawals,
+          { sourceId: snapshot.page.source_id, marker: snapshot.globalPurges })).compiled_truth));
       }
       rest = rest.slice(Math.max(1, batch.covered));
     }
@@ -84,7 +93,7 @@ export async function overlaidBoundedRows<T extends { slug: string; source_id: s
 
 /** One page's overlaid raw prefix: the snapshot body when the raw prefix holds a facts fence, else the raw prefix. */
 export async function overlaidBoundedPrefix(
-  engine: Pick<BrainEngine, 'readPageSnapshotsBatch'>,
+  engine: Pick<BrainEngine, 'readPageSnapshotsBatch' | 'executeRaw'>,
   page: { slug: string; source_id: string; compiled_truth: string | null },
 ): Promise<string> {
   const [row] = await overlaidBoundedRows(engine, [page]);
@@ -93,8 +102,15 @@ export async function overlaidBoundedPrefix(
 
 /** One page's sanitized, credential-projected lead text: the bounded overlaid prefix through boundedProjectedPrefix. */
 export async function projectedLead(
-  engine: Pick<BrainEngine, 'readPageSnapshotsBatch'>,
+  engine: Pick<BrainEngine, 'readPageSnapshotsBatch' | 'executeRaw'>,
   page: { slug: string; source_id: string; compiled_truth: string | null },
 ): Promise<string> {
   return boundedProjectedPrefix(await overlaidBoundedPrefix(engine, page));
+}
+
+/** The raw lead source of a page read whole (getPage): its compiled truth, or a segmented page's stored `truth_lead` (its body fields throw). */
+export async function pageLeadSource(engine: Pick<BrainEngine, 'executeRaw'>, page: Pick<Page, 'id' | 'body_storage' | 'compiled_truth'>): Promise<string | null> {
+  if (!isSegmentedPage(page)) return page.compiled_truth;
+  const [row] = await engine.executeRaw<{ truth_lead: string | null }>('SELECT truth_lead FROM pages WHERE id = $1', [page.id]);
+  return row?.truth_lead ?? null;
 }

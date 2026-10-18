@@ -26,8 +26,11 @@ import type { WriteRequest } from '../persistence/model.ts';
 import { DELETION_INVENTORY, OUT_OF_REACH_RESIDUALS, type InventoryEntry } from '../deletion-inventory.ts';
 import type { PurgePlan, PurgeTarget } from './purge.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { segmentedBodyContains } from '../page-body/segment-rewrite.ts';
+import { stagingNeedsTextSql } from '../page-body/schema.ts';
 import { claimForms, quotes, type LedgerPurgeReport } from '../belief/purge.ts';
 import { CARRYING_FIELDS } from '../belief/keys.ts';
+import { relationExists } from '../persistence/rebuildable-cache.ts';
 
 export type StoreCount = Record<string, number>;
 export type StoreStatus = 'deleted' | 'would_remove' | 'retained_inactive' | 'unverified' | 'out_of_reach' | 'out_of_scope' | 'not_present' | 'incomplete';
@@ -66,19 +69,63 @@ export function __setPurgeProbeLimitsForTests(limits: Partial<typeof probeLimits
 }
 
 /**
- * Wave B PR 1: segment text is not probed yet (segment probe in PR 2), so a page-text report over a source
- * holding segmented pages is `unverified` instead of passing on NULL body columns.
+ * Wave B (spec 11): which segmented bodies of the source state one of `needles`, case-insensitively: live pages
+ * (`pages`) or retained versions (`page_versions`), each scanned one segment at a time with the tail of the
+ * previous segment carried over the needle's length (a forced cut can split prose). Bounded like every probe.
  */
-async function unprobedSegmentedPages(engine: BrainEngine, sourceId: string, report: StoreReport): Promise<StoreReport> {
-  if (report.status === 'incomplete' || report.status === 'would_remove') return report;
-  const [row] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND body_storage='segmented'`, [sourceId]);
-  const n = Number(row?.n ?? 0);
-  if (!n) return report;
-  return { ...report, status: 'unverified', reason: 'segmented_body',
-    detail: `${n} page(s) in this source store their body in segments, which this receipt does not search yet; the claim may survive there.` };
+async function segmentedProse(engine: BrainEngine, sourceId: string, needles: readonly string[], deadline: number, store: 'pages' | 'page_versions'):
+  Promise<{ hits: Array<{ slug: string; version_id?: number }> } | { unverified: string }> {
+  const bodies = store === 'pages'
+    ? await engine.executeRaw<{ page_id: number; slug: string; generation: null; version_id: null }>(`SELECT id AS page_id,slug,NULL AS generation,NULL AS version_id FROM pages
+      WHERE source_id=$1 AND deleted_at IS NULL AND body_storage='segmented' ORDER BY id LIMIT $2`, [sourceId, probeLimits.rows + 1])
+    : await engine.executeRaw<{ page_id: number; slug: string; generation: number; version_id: number }>(`SELECT v.page_id,p.slug,v.body_generation AS generation,v.id AS version_id
+      FROM page_versions v JOIN pages p ON p.id=v.page_id WHERE p.source_id=$1 AND v.body_storage='segmented' ORDER BY v.id LIMIT $2`, [sourceId, probeLimits.rows + 1]);
+  if (bodies.length > probeLimits.rows) return { unverified: 'row_bound' };
+  const hits: Array<{ slug: string; version_id?: number }> = [];
+  for (const body of bodies) {
+    const found = await segmentedBodyContains(engine, Number(body.page_id), sourceId, needles,
+      { deadline, ...(body.generation === null ? {} : { generation: Number(body.generation) }) });
+    if (found === 'deadline') return { unverified: 'verification_deadline' };
+    if (found) hits.push({ slug: body.slug, ...(body.version_id === null ? {} : { version_id: Number(body.version_id) }) });
+  }
+  return { hits };
+}
+
+/** A page-text store's report with its segmented bodies folded in: a body still stating the claim is prose, a stopped scan is unverified. */
+async function withSegmentedProse(engine: BrainEngine, report: StoreReport, sourceId: string, needles: readonly string[], deadline: number): Promise<StoreReport> {
+  if (report.status === 'would_remove' || report.status === 'incomplete' || report.status === 'unverified') return report;
+  const scan = await segmentedProse(engine, sourceId, needles, deadline, report.store as 'pages' | 'page_versions');
+  if ('unverified' in scan) return { ...report, status: 'unverified', reason: scan.unverified };
+  if (!scan.hits.length) return report;
+  return { ...report, status: 'out_of_scope', reason: 'source_prose', remaining: (report.remaining ?? 0) + scan.hits.length,
+    items: [...(report.items ?? []), ...scan.hits].slice(0, 20),
+    detail: 'The claim text survives outside a facts fence (page prose); purge the page or edit it to remove it.' };
+}
+
+/**
+ * Segment texts of the source holding the claim's exact bytes: a text no manifest row references any more is a
+ * residual of the sweep (`incomplete`); a referenced one is a body's prose, reported with that body.
+ */
+async function segmentTextReport(engine: BrainEngine, sourceId: string, needles: readonly string[], removed: number, deadline: number): Promise<StoreReport> {
+  const list = needles.filter(Boolean).slice(0, 32);
+  const carrying = `SELECT 1 FROM page_segment_texts t WHERE t.source_id=$1 AND EXISTS (SELECT 1 FROM unnest($2::text[]) n WHERE position(convert_to(n,'UTF8') in t.body)>0)`;
+  const referenced = 'EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.source_id=t.source_id AND m.sha256=t.sha256)';
+  const orphaned = await boundedCount(engine, `${carrying} AND NOT ${referenced}`, [sourceId, list], deadline);
+  if ('unverified' in orphaned) return { store: 'page_segment_texts', status: 'unverified', reason: orphaned.unverified, removed };
+  if (orphaned.count) return { store: 'page_segment_texts', status: 'incomplete', remaining: orphaned.count, removed };
+  const kept = await boundedCount(engine, `${carrying} AND ${referenced}`, [sourceId, list], deadline);
+  if ('unverified' in kept) return { store: 'page_segment_texts', status: 'unverified', reason: kept.unverified, removed };
+  return kept.count
+    ? { store: 'page_segment_texts', status: 'out_of_scope', reason: 'source_prose', remaining: kept.count, removed,
+      detail: 'Segments of live pages or retained versions still state the text outside a facts fence; they are listed under pages and page_versions.' }
+    : { store: 'page_segment_texts', status: removed ? 'deleted' : 'not_present', removed };
 }
 
 type ProbeResult = { count: number } | { unverified: string };
+
+/** #6911: a rebuildable cache table that does not exist holds nothing to verify. */
+const missingCache = (store: string): StoreReport => ({ store, status: 'not_present', removed: 0, reason: 'table_missing',
+  detail: `The ${store} table does not exist on this brain; it is a rebuildable cache, so there was nothing to clear. gbrain doctor reports it under schema_missing_tables.` });
 
 /** One bounded probe: `sql` selects matching rows (no LIMIT); the adapter caps rows and the statement time. */
 async function boundedCount(engine: BrainEngine, sql: string, params: unknown[], deadline: number): Promise<ProbeResult> {
@@ -370,15 +417,17 @@ export async function verifyFactPurge(engine: BrainEngine, input: { target: Purg
   const prose = { status: 'out_of_scope' as const, reason: 'source_prose', detail: 'The claim text survives outside a facts fence (page prose, title or frontmatter); purge the page or edit it to remove it.' };
   await swept('pages', `SELECT 1 FROM pages p WHERE p.source_id=$1 AND p.deleted_at IS NULL AND ${carriesClaimSql('p', 2)}`,
     [src, ...claimNeedles(claim)], plan.pages.length, removed.pages, prose);
-  stores[stores.length - 1] = await unprobedSegmentedPages(engine, src, stores[stores.length - 1]!);
+  stores[stores.length - 1] = await withSegmentedProse(engine, stores[stores.length - 1]!, src, [claim], deadline);
   await swept('content_chunks', `SELECT 1 FROM content_chunks c JOIN pages p ON p.id=c.page_id WHERE p.source_id=$1 AND strpos(lower(c.chunk_text),$2)>0`,
     [src, needle], plan.pages.length, removed.chunks, prose);
   await swept('page_versions', `SELECT 1 FROM page_versions v JOIN pages p ON p.id=v.page_id WHERE p.source_id=$1 AND ${carriesClaimSql('v', 2)}`,
     [src, ...claimNeedles(claim)], plan.versions, removed.page_versions, { ...prose, items: (input.prose ?? []).slice(0, 20) });
+  stores[stores.length - 1] = await withSegmentedProse(engine, stores[stores.length - 1]!, src, [claim], deadline);
   await swept('persistence_requests', `SELECT 1 FROM persistence_requests WHERE source_id=$1 AND (${['intent', 'outcome', 'error_detail', 'error_message']
       .map(c => `strpos(lower(COALESCE(${c}::text,'')),$2)>0 OR strpos(lower(COALESCE(${c}::text,'')),$3)>0`).join(' OR ')})`,
     [src, needle, JSON.stringify(claim).slice(1, -1).toLowerCase()], plan.requests.length, removed.persistence_requests);
-  await swept('query_cache', 'SELECT 1 FROM query_cache WHERE $1::text IS NOT NULL', [src], 0, removed.query_cache);
+  if (!dryRun && !await relationExists(engine, 'query_cache')) stores.push(missingCache('query_cache'));
+  else await swept('query_cache', 'SELECT 1 FROM query_cache WHERE $1::text IS NOT NULL', [src], 0, removed.query_cache);
   const refs = plan.factIds.map(String);
   for (const table of ['decide_review_queue', 'decide_review_proposals'] as const) {
     await swept(table, `SELECT 1 FROM ${table} WHERE source_id=$1 AND (a_ref=ANY($2::text[]) OR b_ref=ANY($2::text[]))`, [src, refs], plan.review[table], plan.review[table]);
@@ -396,6 +445,7 @@ export async function verifyFactPurge(engine: BrainEngine, input: { target: Purg
   if (Number(legacy?.n ?? 0)) stores.push({ store: 'derived_legacy', status: 'unverified', reason: 'legacy_no_derivation_edges', remaining: Number(legacy.n),
     detail: `${legacy.n} model-derived page(s) in this source predate derivation edges, so purge cannot tell whether they restate the claim in other words.` });
   if (!dryRun) {
+    stores.push(await segmentTextReport(engine, src, [claim], removed.page_segment_texts ?? 0, deadline));
     stores.push(...await ledgerReports(engine, src, [claim], input.ledger, deadline));
     stores.push(await effectPayloadReport(engine, src, [claim], deadline, removed.persistence_effects ?? 0));
   }
@@ -408,17 +458,21 @@ export async function verifyFactPurge(engine: BrainEngine, input: { target: Purg
     AND NOT (visibility=$3 AND ($4='*' OR entity_slug=$4))`, [src, target.fact_hash, target.visibility, plan.subject]);
   const files = await pageFilePaths(engine, src, plan.pages.map(page => page.page_id));
   stores.push(...onDiskReports(files.files, claim, dryRun));
+  let vacuumed: string | null = null;
+  if (input.vacuum && !dryRun && engine.kind === 'pglite') {
+    const tables = ['facts', 'takes', 'pages', 'content_chunks', 'page_versions', 'persistence_requests', ...(await relationExists(engine, 'query_cache') ? ['query_cache'] : [])];
+    vacuumed = await engine.executeRaw(`VACUUM ${tables.join(', ')}`).then(() => 'ran', (error: unknown) => `failed (${(error as Error).message})`);
+  }
   const residuals: StoreReport[] = [];
   if (files.root && files.paths.length) residuals.push(await gitResidualCommits(files.root, files.paths, claim));
   for (const r of OUT_OF_REACH_RESIDUALS) {
     if (r.store === 'git_history' && residuals.length) continue;
-    const detail = r.store === 'database_physical' ? `${r.detail}${engine.kind === 'pglite' ? (input.vacuum ? ' VACUUM ran on the touched tables; filesystem blocks and snapshots may still hold old pages.' : ' PGLite has no autovacuum; rerun with --vacuum to compact the touched tables.') : ' On Postgres the operator runs VACUUM; WAL archives, replicas and PITR windows are outside gbrain.'}` : r.detail;
+    const detail = r.store === 'database_physical' ? `${r.detail}${engine.kind === 'pglite' ? (vacuumed === 'ran' ? ' VACUUM ran on the touched tables; filesystem blocks and snapshots may still hold old pages.' : vacuumed ? ` VACUUM of the touched tables ${vacuumed}; rerun with --vacuum.` : ' PGLite has no autovacuum; rerun with --vacuum to compact the touched tables.') : ' On Postgres the operator runs VACUUM; WAL archives, replicas and PITR windows are outside gbrain.'}` : r.detail;
     residuals.push({ store: r.store, status: 'out_of_reach', detail });
   }
   if (Number(other?.n ?? 0)) residuals.push({ store: 'facts_other_scope', status: 'out_of_scope', reason: plan.subject === '*' ? 'other_visibility' : 'other_subject', remaining: Number(other.n),
     detail: `${other.n} fact row(s) state the same claim about another entity or at another visibility; rerun with --all-subjects to purge every entity's copy.` });
   residuals.push(...stores.filter(s => s.reason === 'source_prose' || s.reason === 'probed_reported' || s.store === 'canonical_markdown' && s.status === 'out_of_scope'));
-  if (input.vacuum && !dryRun && engine.kind === 'pglite') await engine.executeRaw('VACUUM facts, takes, pages, content_chunks, page_versions, persistence_requests, query_cache').catch(() => undefined);
   const next = dryRun
     ? ['Review the residuals with the user, then confirm with the token printed above (gbrain forget <id> --purge asks for it on a terminal).']
     : ['Poll completion with gbrain forget --purge --status --request-id <request_id> until it reports complete.'];
@@ -433,7 +487,7 @@ export async function verifyFactPurge(engine: BrainEngine, input: { target: Purg
 }
 
 /** In-process context a page purge keeps for its receipt (never journaled): the page's claims as probe needles, and row ids. */
-export interface PagePurgeContext { needles: string[]; factIds: number[]; pageId: number; paths: string[]; ledgerClaims?: string[]; ledger?: LedgerPurgeReport | null }
+export interface PagePurgeContext { needles: string[]; factIds: number[]; pageId: number; paths: string[]; segmentShas: string[]; ledgerClaims?: string[]; ledger?: LedgerPurgeReport | null }
 
 const outOfReach = (engine: BrainEngine): StoreReport[] => OUT_OF_REACH_RESIDUALS.map(r => ({ store: r.store, status: 'out_of_reach' as const,
   detail: r.store === 'database_physical' ? `${r.detail}${engine.kind === 'pglite' ? ' PGLite has no autovacuum.' : ' On Postgres the operator runs VACUUM; WAL archives, replicas and PITR windows are outside gbrain.'}` : r.detail }));
@@ -465,7 +519,14 @@ export async function verifyPagePurge(engine: BrainEngine, input: { sourceId: st
   await keyed('slug_aliases', 'SELECT 1 FROM slug_aliases WHERE source_id=$1 AND canonical_slug=$2', [src, slug]);
   await keyed('files', 'SELECT 1 FROM files WHERE page_slug=$2 AND (source_id=$1 OR source_id IS NULL)', [src, slug]);
   await keyed('write_gate_holds', 'SELECT 1 FROM write_gate_holds WHERE source_id=$1 AND slug=$2', [src, slug]);
-  await keyed('query_cache', 'SELECT 1 FROM query_cache WHERE $1::text IS NOT NULL', [src]);
+  if (!await relationExists(engine, 'query_cache')) stores.push(missingCache('query_cache'));
+  else await keyed('query_cache', 'SELECT 1 FROM query_cache WHERE $1::text IS NOT NULL', [src]);
+  // The page's own segment texts only: a text of another page holding the same words is that page's body, never a
+  // residue of this purge (an inline page referenced none, so the inventory sweep below must not probe the table).
+  if (context && !context.segmentShas.length) stores.push({ store: 'page_segment_texts', status: 'not_present', removed: removed.page_segment_texts ?? 0 });
+  if (context?.segmentShas.length) await keyed('page_segment_texts', `SELECT 1 FROM page_segment_texts t WHERE t.source_id=$1
+    AND t.sha256=ANY(SELECT decode(h,'hex') FROM unnest($2::text[]) AS h)
+    AND NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.source_id=t.source_id AND m.sha256=t.sha256) AND NOT ${stagingNeedsTextSql('t')}`, [src, context.segmentShas]);
   if (context) {
     const refs = context.factIds.map(String);
     for (const table of ['decide_review_queue', 'decide_review_proposals']) await keyed(table, `SELECT 1 FROM ${table} WHERE source_id=$1 AND (a_ref=ANY($2::text[]) OR b_ref=ANY($2::text[]))`, [src, refs]);
@@ -502,8 +563,14 @@ export async function verifyPagePurge(engine: BrainEngine, input: { sourceId: st
         AND EXISTS (SELECT 1 FROM unnest($2::text[]) n WHERE strpos(lower(t.summary),n)>0 OR strpos(lower(COALESCE(t.detail,'')),n)>0)`,
     };
     const all = new Set<string>();
+    let unverified: string | null = null;
     for (const [store, sql] of Object.entries(proseIn)) {
       const slugs = (await engine.executeRaw<{ slug: string }>(`${sql} ORDER BY 1 LIMIT 20`, [src, lowered])).map(r => r.slug);
+      if (store === 'pages' || store === 'page_versions') {
+        const scan = await segmentedProse(engine, src, needles, deadline, store);
+        if ('unverified' in scan) unverified = scan.unverified;
+        else slugs.push(...new Set(scan.hits.map(hit => hit.slug)));
+      }
       if (!slugs.length) continue;
       slugs.forEach(s => all.add(s));
       const at = stores.findIndex(s => s.store === store);
@@ -512,7 +579,8 @@ export async function verifyPagePurge(engine: BrainEngine, input: { sourceId: st
       if (at >= 0 && stores[at]!.status !== 'incomplete') stores[at] = report; else if (at < 0) stores.push(report);
     }
     stores.push(all.size ? { store: 'source_prose', status: 'out_of_scope', reason: 'source_prose', remaining: all.size, items: [...all].sort(),
-      detail: 'Other pages still state a claim from the purged page in their prose; edit or purge them.' } : await unprobedSegmentedPages(engine, src, { store: 'source_prose', status: 'not_present' }));
+      detail: 'Other pages still state a claim from the purged page in their prose; edit or purge them.' }
+      : unverified ? { store: 'source_prose', status: 'unverified', reason: unverified } : { store: 'source_prose', status: 'not_present' });
   }
   const [source] = await engine.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1', [src]);
   const files = source?.local_path ? (context?.paths ?? []).filter(p => !p.startsWith('/') && !p.includes('..')).map(p => join(source.local_path!, p)) : [];

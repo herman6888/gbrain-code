@@ -74,19 +74,18 @@ describe('prepareSegmentChunks', () => {
     for (const seg of segs) {
       const chunks = await prepareSegmentChunks(seg, { fenceTrust: trustOf(body), fenceBudget: budget });
       const projection = Buffer.from(joinedProjection(bytes, [seg]), 'utf8');
-      const segEnd = seg.byteStart + seg.bytes.length;
       expect(chunks.map(c => c.local_ordinal)).toEqual(chunks.map((_, i) => i));
       const order = chunks.map(kindOf).join(',');
       expect(order).toMatch(/^(prose,)*prose(,code)*(,low)*$/);
       for (const c of chunks) {
-        expect(c.raw_byte_start).toBeGreaterThanOrEqual(seg.byteStart);
-        expect(c.raw_byte_end).toBeLessThanOrEqual(segEnd);
+        expect(c.raw_byte_start).toBeGreaterThanOrEqual(0);
+        expect(c.raw_byte_end).toBeLessThanOrEqual(seg.bytes.length);
         expect(c.raw_byte_end).toBeGreaterThan(c.raw_byte_start);
         if (kindOf(c) !== 'prose') continue;
         expect(c.projected_byte_end!).toBeLessThanOrEqual(projection.length);
         expect(squash(projection.subarray(c.projected_byte_start!, c.projected_byte_end!).toString('utf8'))).toBe(squash(c.chunk_text));
-        if (!overlaps(seg, c.raw_byte_start, c.raw_byte_end)) {
-          expect(squash(bytes.subarray(c.raw_byte_start, c.raw_byte_end).toString('utf8'))).toBe(squash(c.chunk_text));
+        if (!overlaps(seg, seg.byteStart + c.raw_byte_start, seg.byteStart + c.raw_byte_end)) {
+          expect(squash(bytes.subarray(seg.byteStart + c.raw_byte_start, seg.byteStart + c.raw_byte_end).toString('utf8'))).toBe(squash(c.chunk_text));
           checkedRaw++;
         }
       }

@@ -46,32 +46,72 @@ export function currentTextProjectionFilter(alias: string): string {
 }
 
 /**
- * Wave B: the chunk row belongs to its page's live body generation. Staged rows
- * (`body_generation` above the page's) and retired rows are invisible; every
- * inline-page row (`body_generation IS NULL`) passes. Row predicate, no join.
+ * Wave B: the chunk row belongs to its page's live body: an inline row
+ * (`body_generation IS NULL`) of a page that is not segmented, or a segmented
+ * row at or below the page's generation whose occurrence has a live manifest
+ * row. Staged rows (above the page's generation), rows of retired occurrences
+ * (closed by a flip or a demotion, deleted later when the flip deferred their
+ * retirement) and rows of a preparation that never published are invisible
+ * whether or not they were deleted yet. The manifest probe is one primary-key
+ * lookup per segmented row; `page` must expose `body_storage` and `body_generation`.
+ * `manifest: false` (chunkManifestReads) drops the segmented branch, which then
+ * matches no row the reader can see.
  */
-export function chunkGenerationFilter(page: string, chunk: string): string {
-  return `(${chunk}.body_generation IS NULL
+export function chunkGenerationFilter(page: string, chunk: string, manifest = true): string {
+  if (!manifest) return `(${chunk}.body_generation IS NULL AND ${page}.body_storage <> 'segmented')`;
+  return `((${chunk}.body_generation IS NULL AND ${page}.body_storage <> 'segmented')
        OR (${chunk}.body_generation <= ${page}.body_generation
-           AND (${chunk}.retired_generation IS NULL OR ${chunk}.retired_generation > ${page}.body_generation)))`;
+           AND EXISTS (SELECT 1 FROM page_body_manifest lm WHERE lm.page_id = ${chunk}.page_id AND lm.occurrence_id = ${chunk}.occurrence_id
+             AND lm.staging_id IS NULL AND lm.gen_from <= ${page}.body_generation AND (lm.gen_to IS NULL OR lm.gen_to > ${page}.body_generation))))`;
 }
 
-/** `chunkGenerationFilter` for a statement that has no page row joined: inline rows pass without the page lookup. */
-export function chunkGenerationProbe(chunk: string): string {
-  return `(${chunk}.body_generation IS NULL
-       OR EXISTS (SELECT 1 FROM pages gp WHERE gp.id = ${chunk}.page_id AND ${chunkGenerationFilter('gp', chunk)}))`;
+/** `chunkGenerationFilter` for a statement that has no page row joined. */
+export function chunkGenerationProbe(chunk: string, manifest = true): string {
+  return `EXISTS (SELECT 1 FROM pages gp WHERE gp.id = ${chunk}.page_id AND ${chunkGenerationFilter('gp', chunk, manifest)})`;
 }
 
-/** Search-facing chunk visibility: the current text projection and the live body generation. */
+const CHUNK_MANIFEST_ACCESS_SQL = `-- chunk-visibility-ok: whether any chunk row of a segmented body exists, no row is returned
+SELECT has_table_privilege('page_body_manifest', 'SELECT') AS readable,
+  NOT has_table_privilege('page_body_manifest', 'SELECT')
+    AND (EXISTS (SELECT 1 FROM content_chunks WHERE body_generation IS NOT NULL)
+      OR EXISTS (SELECT 1 FROM content_chunks WHERE occurrence_id IS NOT NULL)) AS segmented`;
+const manifestReadable = new WeakSet<object>();
+
+/**
+ * Whether a read's chunk statements name `page_body_manifest`. Postgres checks the privilege on every relation a
+ * statement names, matched or not, so a role without SELECT on it (docs/ENGINES.md, "Segmented page tables") would
+ * fail every chunk read with 42501 although no page is segmented. True on PGLite, for a role that may read the
+ * manifest (kept per engine: a transaction clone probes again, so its SET LOCAL ROLE counts) and for a role that sees
+ * a chunk row of a segmented body (`body_generation` or `occurrence_id` set, both partial-indexed), which then gets
+ * 42501 as documented. Otherwise every chunk row the role sees is an inline row, and the manifest-free forms of
+ * chunkGenerationFilter, chunkGenerationProbe and chunkManifestJoin select exactly the rows the full forms would.
+ * `db` runs the probe: a scoped read passes its transaction, so the probe sees the rows that read sees.
+ */
+export async function chunkManifestReads(engine: Pick<BrainEngine, 'kind' | 'executeRaw'>, db: Pick<BrainEngine, 'executeRaw'> = engine): Promise<boolean> {
+  if (engine.kind !== 'postgres' || manifestReadable.has(engine)) return true;
+  const [access] = await db.executeRaw<{ readable: boolean; segmented: boolean }>(CHUNK_MANIFEST_ACCESS_SQL);
+  if (access?.readable) manifestReadable.add(engine);
+  return access?.readable === true || access?.segmented === true;
+}
+
+/**
+ * Search-facing chunk visibility: the current text projection and the live body generation. A sealed page holds no
+ * rows of a retired occurrence (the flip deletes them in its transaction, or leaves the page unsealed until the
+ * projection job has), so the row predicate needs no manifest probe, whose per-row cost moved vector search off its
+ * HNSW plan (test/e2e/vector-chunk-statistics-postgres.test.ts).
+ */
 export function chunkVisibleFilter(page: string, chunk: string): string {
-  return `(${currentTextProjectionFilter(page)} AND ${chunkGenerationFilter(page, chunk)})`;
+  return `(${currentTextProjectionFilter(page)}
+       AND (${chunk}.body_generation IS NULL OR ${chunk}.body_generation <= ${page}.body_generation))`;
 }
 
 /**
  * The live manifest row of a segmented chunk (no row for an inline chunk), for
  * `chunkDocumentOrder`. LEFT JOIN text; `page` must expose `body_generation`.
+ * `readsManifest: false` (chunkManifestReads) joins no row, as for an inline chunk.
  */
-export function chunkManifestJoin(page: string, chunk: string, manifest: string): string {
+export function chunkManifestJoin(page: string, chunk: string, manifest: string, readsManifest = true): string {
+  if (!readsManifest) return `LEFT JOIN (SELECT NULL::bigint AS byte_start) ${manifest} ON false`;
   return `LEFT JOIN page_body_manifest ${manifest} ON ${chunk}.occurrence_id IS NOT NULL
        AND ${manifest}.page_id = ${chunk}.page_id AND ${manifest}.occurrence_id = ${chunk}.occurrence_id
        AND ${manifest}.staging_id IS NULL AND ${manifest}.gen_from <= ${page}.body_generation

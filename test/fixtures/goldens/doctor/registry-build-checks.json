@@ -350,6 +350,10 @@
         "name": "schema_columns"
       },
       {
+        "category": "meta",
+        "name": "schema_missing_tables"
+      },
+      {
         "category": "ops",
         "name": "rls_event_trigger"
       },
@@ -496,6 +500,10 @@
       {
         "category": "ops",
         "name": "writer_version"
+      },
+      {
+        "category": "ops",
+        "name": "segmented_storage"
       },
       {
         "category": "brain",
@@ -664,6 +672,10 @@
       {
         "category": "ops",
         "name": "global_maintenance_timeouts"
+      },
+      {
+        "category": "ops",
+        "name": "global_maintenance_stalled"
       },
       {
         "category": "ops",
@@ -852,6 +864,10 @@
       {
         "category": "brain",
         "name": "ghost_pages"
+      },
+      {
+        "category": "brain",
+        "name": "origin_twins"
       },
       {
         "category": "brain",

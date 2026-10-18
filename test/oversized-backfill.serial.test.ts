@@ -177,14 +177,15 @@ describe('per-page embedding budget (embed.max_usd_per_page)', () => {
   const stale = (n: number) => Array.from({ length: n }, (_, i) => ({ chunk_index: i, chunk_text: 'x'.repeat(4000) }));
   const page = (id: number) => ({ id, compiled_truth: 'y'.repeat(1_100_000), timeline: '' });
 
-  async function pageId(slug: string): Promise<number> {
-    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'short' });
+  /** The stored page matches the size planPageEmbedding is given: a budget row applies only while the page is large. */
+  async function pageId(slug: string, compiled_truth = 'short'): Promise<number> {
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth });
     return (await engine.getPage(slug))!.id;
   }
 
   test('grants the newest chunks that fit the cap, marks the page capped, and never re-grants spent budget', async () => {
     await withHome(null, async () => {
-      const id = await pageId('notes/capped');
+      const id = await pageId('notes/capped', page(0).compiled_truth);
       await engine.setConfig('embed.max_usd_per_page', '0.0003');
       const first = await planPageEmbedding(engine, page(id), stale(10), { signature: `${MODEL}:${DIMS}` });
       if (first.kind !== 'grant') throw new Error(`expected a grant, got ${first.kind}`);
@@ -216,8 +217,9 @@ describe('per-page embedding budget (embed.max_usd_per_page)', () => {
 
   test('a large page whose head, middle and tail windows are all boilerplate is held instead of embedded', async () => {
     await withHome(null, async () => {
-      const id = await pageId('notes/boilerplate');
-      const decision = await planPageEmbedding(engine, { id, compiled_truth: navRow.repeat(Math.ceil(1_100_000 / navRow.length)) }, stale(3));
+      const body = navRow.repeat(Math.ceil(1_100_000 / navRow.length));
+      const id = await pageId('notes/boilerplate', body);
+      const decision = await planPageEmbedding(engine, { id, compiled_truth: body }, stale(3));
       expect(decision).toEqual({ kind: 'held', reason: 'sampled_markup_heavy' });
       expect(await listBudgetLimitedPages(engine)).toEqual([expect.objectContaining({ slug: 'notes/boilerplate', state: 'held' })]);
     });

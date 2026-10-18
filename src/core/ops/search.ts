@@ -39,7 +39,7 @@ import { TargetTrace, diagnoseProbe, diagnoseTrace, probeTarget, type ExplainTar
 import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, pagePlanHits, resolveEvidencePlan, selectLongPages, unsupportedDelivery, withLongPagePolicy, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
-import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, chunkManifestReads } from '../search/safe-chunks.ts';
 import { expandEngineTypeFilters } from '../schema-pack/query-types.ts';
 import { reconcileTypeFilter } from './search-type-filter.ts';
 import { probeProjectionReadiness } from '../search/projection-readiness.ts';
@@ -558,7 +558,7 @@ async function prepareExplainTarget(
   let probe;
   try {
     probe = await probeTarget((sql, params) => ctx.engine.executeRaw(sql, params), slug,
-      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false });
+      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false }, await chunkManifestReads(ctx.engine));
   } catch {
     return { trace: new TargetTrace({ slug, sourceId }) };
   }

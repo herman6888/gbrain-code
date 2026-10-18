@@ -222,7 +222,7 @@ describe('held removals (W1 #6783 §12 (a))', () => {
       try {
         const slug = 'people/kai-example';
         const filler = Array.from({ length: 20_000 }, (_, i) => `Kai note line ${i} about the acme-example offsite and its agenda.`).join('\n');
-        // takes_* verbs refuse a segmented page, so the takes are added while the page is inline and a publish over 1 MiB promotes it.
+        // The takes are added while the page is inline and a publish over 1 MiB promotes it.
         await run(b.local, 'put_page', { slug, content: page('Kai', 'Kai.\n\n## Timeline\n\n- **2026-01-05** | note — Kai joined acme-example\n- **2026-02-07** | note — Kai moved to Seoul') });
         for (const claim of ['Kai will lead the offsite', 'Kai ships the agenda']) await run(b.local, 'takes_add', { slug, claim, kind: 'bet', holder: 'world', weight: 0.6 });
         const storage = async () => (await engine.executeRaw<{ body_storage: string }>('SELECT body_storage FROM pages WHERE id=$1', [await pageId(b, slug)]))[0]!.body_storage;
@@ -244,9 +244,11 @@ describe('held removals (W1 #6783 §12 (a))', () => {
         const put = await run(b.local, 'put_page', { slug, content: edited, expected_revision: current.revision });
         expect(put.contested?.proposal_refs).toHaveLength(3);
         expect(await storage()).toBe('segmented');
-        // takes_remove refuses a segmented page for every writer before any guard, so it files nothing.
+        // takes_remove reads a segmented page within 24 MiB back whole, as it reads an inline page: the held rewrite of take 2
+        // leaves its database row and the fence apart, so the remove refuses before any guard and files nothing.
         const refused = await run(b.remote, 'takes_remove', { slug, row_num: takes[1]!.row_num }).then(() => null, (error: unknown) => error) as any;
-        expect(refused?.code).toBe('page_body_segmented');
+        expect(refused?.code).toBe('invalid_params');
+        expect(String(refused?.message)).toContain("Row #2's database copy disagrees with the page's takes fence");
         const pending = (await listTrustProposals(engine, { sourceId: b.sourceId })).filter(p => p.status === 'pending');
         expect(pending.map(p => `${p.target_table}:${p.target_id}`).sort()).toEqual([`takes:${takes[0]!.id}`, `takes:${takes[1]!.id}`, `timeline_entries:${timeline[0]!.id}`].sort());
         for (const proposal of pending) expect((await decideTrustProposal(engine, proposal.id, 'accept', owner)).status).toBe('accepted');

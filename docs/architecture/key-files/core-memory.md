@@ -9,7 +9,10 @@ notice). User guide: [core memory](../../guides/core-memory.md).
 
 - `src/core/core-memory.ts`: marking and priority normalization, settings
   (`memory.core.*`), page rendering and budget accounting, `listCorePages`
-  (withdrawal-aware), `renderCoreBlock` (whole-page truncation, notice lines,
+  (withdrawal-aware; a page stored in segments is read back whole up to 24 MiB,
+  through `materializedSnapshot` when withdrawn, and a larger one is left out
+  unread and counted by doctor `core_memory` as `skipped_segmented`,
+  `test/large-pages/segmented-core-list.test.ts`), `renderCoreBlock` (whole-page truncation, notice lines,
   withheld lines), `coreRevision`, the delivery sensitivity policy
   (`applyCoreSensitivity`: credential-like hits withhold, contact details and
   private paths redact) and `loadCoreBlock`, which every delivery lane uses.

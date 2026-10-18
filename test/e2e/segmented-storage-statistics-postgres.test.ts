@@ -1,7 +1,7 @@
 /**
  * Wave B: migration v248 leaves the search statistics complete on an upgraded
  * Postgres brain. Search's chunk visibility predicate reads
- * pages.body_generation and content_chunks.body_generation/retired_generation;
+ * pages.body_generation and content_chunks.body_generation;
  * columns added by ALTER TABLE have no pg_stats rows until ANALYZE, and
  * without them vector search drops its HNSW plan
  * (test/e2e/vector-chunk-statistics-postgres.test.ts).
@@ -15,7 +15,7 @@ import { missingSearchStatistics } from '../../src/core/search/projection-statis
 import { v248 } from '../../src/core/schema-migrations/v248-segmented-page-storage.ts';
 
 const d = hasDatabase() ? describe : describe.skip;
-const GENERATION_COLUMNS = ['pages.body_generation', 'content_chunks.body_generation', 'content_chunks.retired_generation'];
+const GENERATION_COLUMNS = ['pages.body_generation', 'content_chunks.body_generation'];
 
 d('v248 search statistics on Postgres', () => {
   beforeAll(async () => {
@@ -29,7 +29,7 @@ d('v248 search statistics on Postgres', () => {
     await engine.executeRaw(`DELETE FROM pg_statistic s USING pg_attribute a
       WHERE a.attrelid = s.starelid AND a.attnum = s.staattnum
         AND ((a.attrelid = 'pages'::regclass AND a.attname = 'body_generation')
-          OR (a.attrelid = 'content_chunks'::regclass AND a.attname IN ('body_generation', 'retired_generation')))`);
+          OR (a.attrelid = 'content_chunks'::regclass AND a.attname = 'body_generation'))`);
     await engine.executeRaw("UPDATE pg_class SET reltuples = 5000 WHERE oid IN ('pages'::regclass, 'content_chunks'::regclass)");
   }, 60_000);
   afterAll(async () => { await teardownDB(); });

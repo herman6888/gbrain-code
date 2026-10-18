@@ -25,7 +25,10 @@
  * readPageSnapshotsBatch (the batched extract / derived-link snapshot read)
  * adds one: 24 call sites, 24 methods; master pins 25. Cat 40 Hard F2 adds the
  * scoped keyword count and keyword-mode page reads (countKeywordPages,
- * searchKeywordPages): 27 and 27. The golden pins the exact numbers.
+ * searchKeywordPages): 27 and 27. Wave B PR 2 lane X adds keywordBoundedRead
+ * (an unscoped read in one transaction under the keyword statement bound,
+ * for the segmented-region read): 33 and 33.
+ * The golden pins the exact numbers.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -177,8 +180,8 @@ describe('EO4 RLS scope inventory (master)', () => {
     const scoping = astScoping(capture.ast);
 
     const callSites = Object.values(capture.ast).reduce((a, m) => a + m.directCallSites, 0);
-    expect(callSites).toBe(32);
-    expect(Object.values(capture.ast).filter((m) => m.directCallSites > 0).length).toBe(32);
+    expect(callSites).toBe(33);
+    expect(Object.values(capture.ast).filter((m) => m.directCallSites > 0).length).toBe(33);
 
     const byMethod = new Map<string, RuntimeObservation[]>();
     for (const [key, obs] of Object.entries(capture.runtime)) {

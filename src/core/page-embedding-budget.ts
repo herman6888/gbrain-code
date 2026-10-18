@@ -37,7 +37,7 @@ import { JUNK_SAMPLE_CHARS, assessJunkWindows, assessSampledJunk } from './conte
 import type { BodyStorage, ManifestRow } from './page-body/types.ts';
 import { isSegmentedPage, pageBodyBytes } from './page-body/page-shape.ts';
 import { estimateCostFromChars } from './embedding-pricing.ts';
-import { PAGE_INLINE_MAX_BYTES, isLargePageBytes } from './page-size-policy.ts';
+import { PAGE_INLINE_MAX_BYTES, budgetRowAppliesFilter, isLargePageBytes } from './page-size-policy.ts';
 import { isEmbedSkipped } from './embed-skip.ts';
 import { parseUsdLimit, resolveSpendPosture } from './spend-posture.ts';
 import { chunkGenerationFilter } from './search/safe-chunks.ts';
@@ -89,7 +89,7 @@ type BudgetPage = { id: number; body_storage?: BodyStorage | null; body_bytes?: 
 async function segmentedSampleWindows(engine: BrainEngine, pageId: number): Promise<string[]> {
   const manifest = await engine.readManifest(pageId);
   if (manifest.length === 0) return [''];
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
   const read = async (row: ManifestRow) => {
     const texts = await engine.readSegmentTexts(row.sourceId, [row.sha256]);
     return decoder.decode(texts.get(Buffer.from(row.sha256).toString('hex')) ?? new Uint8Array());
@@ -188,7 +188,7 @@ export function estimatePageEmbedUsd(chars: number, signature: string | null | u
 /** Held and capped pages with their stale chunk counts (`gbrain embed --held`); `limit: null` lists every one. */
 export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: { state?: 'held' | 'capped'; sourceId?: string; limit?: number | null } = {}): Promise<PageBudgetReport[]> {
   const params: unknown[] = [opts.limit === undefined ? 1000 : opts.limit];
-  const filters = [`b.state <> 'open'`, 'p.deleted_at IS NULL'];
+  const filters = [budgetRowAppliesFilter('b', 'p'), 'p.deleted_at IS NULL'];
   if (opts.state) filters.push(`b.state = $${params.push(opts.state)}`);
   if (opts.sourceId) filters.push(`p.source_id = $${params.push(opts.sourceId)}`);
   const pending = `(CASE WHEN p.body_storage = 'segmented' THEN cc.${quoteIdentifier((await embeddingWriteTarget(engine)).column.name)} IS NULL ELSE cc.embedded_at IS NULL END)`;
@@ -261,9 +261,10 @@ export function pageSizeState(bytes: number, frontmatter: Record<string, unknown
   if (isEmbedSkipped(frontmatter)) {
     return { embedding: 'skipped', reason: (frontmatter!.embed_skip as { reason?: unknown } | null)?.reason === 'oversized' ? 'oversized' : 'operator_marker', bytes };
   }
-  if (budget?.state === 'held') return { embedding: 'held', reason: budget.reason ?? 'awaiting_approval', bytes };
-  if (budget?.state === 'capped') return { embedding: 'partial', reason: 'spend_cap', bytes };
-  return isLargePageBytes(bytes) || segmented ? { embedding: 'deferred', reason: 'large_page', bytes } : null;
+  const large = isLargePageBytes(bytes);
+  if (large && budget?.state === 'held') return { embedding: 'held', reason: budget.reason ?? 'awaiting_approval', bytes };
+  if (large && budget?.state === 'capped') return { embedding: 'partial', reason: 'spend_cap', bytes };
+  return large || segmented ? { embedding: 'deferred', reason: 'large_page', bytes } : null;
 }
 
 /**

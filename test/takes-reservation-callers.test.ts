@@ -21,6 +21,7 @@ const REVIEWED: Record<string, string> = {
   'src/core/fence-repair/import-step.ts': 'hidden rows feed allocation, which nextFreeRowNum already bases on every raw fence row',
   'src/core/fence-repair/page-checks.ts': 'a reserved number used twice in one fence is a parser collision warning',
   'src/core/fence-repair/refusal.ts': 'same warning and collision checks as page-checks',
+  'src/core/page-body/segment-takes.ts': 'parses a segmented body\'s fence for extract-takes and the canonical projection, which project takes only; it never re-renders, so a reservation stays a reservation',
   'src/core/persistence/canonical-projections.ts': 'projects takes only, so a reservation projects no row and its old row is deleted',
   'src/core/persistence/takes-prepare.ts': 'allocates with nextFreeRowNum, re-renders through upsertTakeRow/supersedeRow/replaceFence, and remove adds the reservation',
   'src/core/repair/accepted-takes.ts': 'reads the archived row at a removed take\'s number (reservations are never takes) and requires the live fence to reserve that number; it re-renders with renderTakesFence keeping every other reservation',

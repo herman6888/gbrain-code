@@ -52,6 +52,8 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  // Wave A inline behaviour: pin segmented storage off (segmented reads of get_page and gbrain get are lane 2a's).
+  await engine.setConfig('pages.segmented_storage', 'off');
   await registerLocalWriter(engine, 'cli');
   await engine.executeRaw(`INSERT INTO oauth_clients(client_id,client_secret_hash,client_name,scope,source_id)
     VALUES($1,'fixture-hash','example-client','read write','default')`, [CLIENT]);

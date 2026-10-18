@@ -73,11 +73,20 @@ describe('put_page receipts', () => {
     expect(small.isError).toBe(false);
     expect(small.body.size_state).toBeUndefined();
 
-    const large = await call('put_page', { slug: 'notes/large', content: markdown('Large', prose(1_100_000)) });
-    expect(large.isError).toBe(false);
-    expect(large.body.chunks).toBeGreaterThan(100);
-    expect(large.body.size_state).toEqual({ embedding: 'deferred', reason: 'large_page', bytes: expect.any(Number) });
-    expect(large.body.size_state.bytes).toBeGreaterThan(1024 ** 2);
+    for (const setting of ['off', 'on']) {
+      await engine.setConfig('pages.segmented_storage', setting);
+      const large = await call('put_page', { slug: `notes/large-${setting}`, content: markdown('Large', prose(1_100_000)) });
+      expect(large.isError).toBe(false);
+      expect((await engine.executeRaw<{ body_storage: string }>('SELECT body_storage FROM pages WHERE slug=$1', [`notes/large-${setting}`]))[0]?.body_storage)
+        .toBe(setting === 'on' ? 'segmented' : 'inline');
+      // Wave B: a new segmented page publishes with its projection pending (chunked by the projection job), not empty.
+      expect(large.body.chunk_skip_reason).toBeUndefined();
+      if (setting === 'off') expect(large.body.chunks).toBeGreaterThan(100);
+      else expect(large.body.chunks > 100 || large.body.projection === 'pending').toBe(true);
+      expect((await engine.getChunks(`notes/large-${setting}`)).length).toBeGreaterThan(100);
+      expect(large.body.size_state).toEqual({ embedding: 'deferred', reason: 'large_page', bytes: expect.any(Number) });
+      expect(large.body.size_state.bytes).toBeGreaterThan(1024 ** 2);
+    }
   }, 120_000);
 
   test('a page over the operator bytes_block keeps its chunks, says skipped: oversized, and its embedding effect calls no provider', async () => {
@@ -128,13 +137,16 @@ describe('embed_skip pages are chunked and never embedded', () => {
 
 describe('remember receipts', () => {
   test('a fact appended to a large entity page carries the page size_state; one on an ordinary page carries none', async () => {
-    expect((await call('put_page', { slug: 'people/alice-example', content: markdown('Alice Example', prose(1_100_000), 'person') })).isError).toBe(false);
+    for (const setting of ['off', 'on']) {
+      await engine.setConfig('pages.segmented_storage', setting);
+      const slug = `people/alice-example-${setting}`;
+      expect((await call('put_page', { slug, content: markdown('Alice Example', prose(1_100_000), 'person') })).isError).toBe(false);
+      const large = await call('remember', { fact: 'Alice Example prefers async standups.', provenance: 'test', entity: slug });
+      expect(large.isError).toBe(false);
+      expect(large.body.size_state).toEqual({ embedding: 'deferred', reason: 'large_page', bytes: expect.any(Number) });
+    }
+
     expect((await call('put_page', { slug: 'people/bob-example', content: markdown('Bob Example', 'A person.\n', 'person') })).isError).toBe(false);
-
-    const large = await call('remember', { fact: 'Alice Example prefers async standups.', provenance: 'test', entity: 'people/alice-example' });
-    expect(large.isError).toBe(false);
-    expect(large.body.size_state).toEqual({ embedding: 'deferred', reason: 'large_page', bytes: expect.any(Number) });
-
     const small = await call('remember', { fact: 'Bob Example lives in Porto.', provenance: 'test', entity: 'people/bob-example' });
     expect(small.isError).toBe(false);
     expect(small.body.size_state).toBeUndefined();

@@ -38,7 +38,7 @@ import { opError } from '../ops/contract.ts';
 import type { BrainEngine } from '../engine.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { EFFECT_BYTES_SQL, retainedReceiptBytes } from './receipt-bytes.ts';
-import { lockCounters } from './journal.ts';
+import { completeWrite, lockCounters } from './journal.ts';
 import { isTerminal, principalKey, requestPrincipal, type WriteRequest } from './model.ts';
 
 export interface IntentRedactionTarget { id: string; principal_kind: string; principal_id: string }
@@ -223,6 +223,41 @@ export function redactJson<T>(value: T, needles: readonly string[]): T {
 export async function findRequestsForSlugs(engine: BrainEngine, sourceId: string, slugs: readonly string[], limit = 10_000): Promise<IntentRedactionTarget[]> {
   return engine.executeRaw<IntentRedactionTarget>(`SELECT id::text AS id,principal_kind,principal_id FROM persistence_requests
     WHERE source_id=$1 AND slug=ANY($2::text[]) AND NOT compacted AND intent IS NOT NULL ORDER BY sequence LIMIT $3`, [sourceId, [...slugs], limit]);
+}
+
+/**
+ * Wave B (spec 11): unfinished requests of `sourceId` whose intent references one of `stagingIds` by
+ * `body_ref` (the request publishes that staged body, so its text lives in the staging, not the intent).
+ */
+export async function findRequestsHoldingStagings(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, stagingIds: readonly string[]): Promise<IntentRedactionTarget[]> {
+  if (!stagingIds.length) return [];
+  return engine.executeRaw<IntentRedactionTarget>(`SELECT id::text AS id,principal_kind,principal_id FROM persistence_requests
+    WHERE source_id=$1 AND state IN ('queued','running','recovering') AND intent->'body_ref'->>'staging_id'=ANY($2::text[]) ORDER BY sequence`, [sourceId, [...stagingIds]]);
+}
+
+/**
+ * Cancel the queued requests of `targets` with `purged_content` inside the purge's transaction (the caller holds their
+ * counter locks): the staged body they would publish is being purged. A request already claimed (running,
+ * recovering, or with a recovery record) refuses the purge with retryable `purge_blocked_pending_recovery`.
+ */
+export async function cancelRequestsHoldingStagings(tx: BrainEngine, targets: readonly IntentRedactionTarget[], exclude?: string): Promise<number> {
+  const ids = targets.map(t => t.id).filter(id => id !== exclude);
+  if (!ids.length) return 0;
+  const rows = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE', [ids]);
+  const blocked = rows.find(row => (!isTerminal(row) && row.state !== 'queued') || row.recovery);
+  if (blocked) {
+    throw opError('purge_blocked_pending_recovery', 'A pending write is publishing a staged body that holds this content, so nothing was purged.',
+      `Request ${blocked.request_id} (${blocked.operation} on ${blocked.slug}, state ${blocked.state}) is publishing the staged body. Wait for it to finish, then retry the purge with the same request id.`,
+      { fix: { argv: ['gbrain', 'write-request', '--', blocked.request_id], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Shows the blocking write\'s state, read-only; retry the purge once it is final.' } });
+  }
+  let cancelled = 0;
+  for (const row of rows) {
+    if (isTerminal(row)) continue;
+    await completeWrite(tx, row, 'cancelled', {}, { code: 'purged_content', message: 'Cancelled: the staged body this request would publish held purged content.' });
+    cancelled++;
+  }
+  return cancelled;
 }
 
 /** The counter keys an affected request set touches; lock them before admitting the purge's own request. */

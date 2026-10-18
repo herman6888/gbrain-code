@@ -10,6 +10,322 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.301.0] - 2026-10-18
+
+**CI only: the unit tests run in 18 shards, sized from fresh master timings, and a budget test now fails before a unit shard can outgrow its job timeout.** Nothing changes for gbrain users.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Measured runtime of the 3,761 unit-matrix files | weights from an older run (about 9,400 s), with 73 newer files, including 54 pathological-input tests, packed at the p75 guess; 10 shards carried about 950 s each and shard 5 was cancelled at the 22-minute timeout with no failing test | re-mined from master's own green run (10,199 s in total, every file measured): 18 shards of at most 567 s |
+| A unit shard growing past its timeout | found only when a master run was cancelled | `test/scripts/unit-shard-budget.test.ts` fails when any shard's mined weight passes 600 s, so twice that plus a minute of setup still ends a minute inside the 22-minute job |
+| `ci:ubicloud` with the unit and slow lanes | measured unit files without checking test.yml's shards | sums its measured durations over the same 18-shard partition and fails a shard that would not fit the job |
+
+### What you need to do
+
+Nothing.
+
+### For contributors
+
+- `test.yml` `test` and e2e.yml `coverage-full-unit` are now 18-shard matrices (`UNIT_SHARDS` in `scripts/sharding.ts`). Required checks are named `test (1)` to `test (18)`, and the coverage manifests expect `shard-1` to `shard-18`.
+- The 22-minute job timeout is unchanged. When the budget test fails, re-mine with `bun run weights:mine --lane unit --run <green master Test run>`, then raise `UNIT_SHARDS` and both matrices to the smallest count that leaves room for new files.
+- Serial weights were re-mined from the same run; the serial lane's four shards keep their 25-minute timeout, which they use a third of.
+
+## [0.60.300.0] - 2026-10-18
+
+**Every stuck state the #6948 sweep found now has an exit: a withdrawal mirror stuck on edited bytes, a crashed pre-kernel PGLite lock, fence rows an older release left in a managed clone, and stuck bundle, transfer and effect recoveries each get a preview-first repair command, and a failed withdrawal mirror no longer blocks the Git and embedding work of its request.** This is GBRA-130 PR 2, the second half of the #6948 bug-class sweep; every row ships with a probe that fails on master and passes here, on PGLite and Postgres. Nothing runs on upgrade.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A withdrawal-mirror effect stuck on edited file bytes | cleared only by hand | `gbrain repair stuck-recovery --keep withdrawn` previews it, backs up the edited bytes, writes the post-withdrawal bytes and finishes the effect; a record older than a later withdrawal on the same page is rebased first, so a forgotten fact never returns to disk |
+| A legacy `.gbrain-lock/` left by a crashed pre-kernel gbrain | blocked the PGLite brain for good | `gbrain pglite-repair --legacy-lock` previews it and, after consent, moves it aside under the kernel lock; it refuses a live holder, a changed plan and a filesystem it can't confirm is local (`filesystem_unverified`), and prints an undo |
+| Fence rows an older release appended to a clone gbrain owns (`sources add --url`) | blocked every pull | `gbrain repair url-clone-fences` keeps the rows in the database and restores the clone file to HEAD |
+| A stuck bundle recovery, transfer or effect variant | no operator exit | each has a previewed resolution, a receipt and a retry path |
+| A failed withdrawal mirror | blocked every Git and embedding sibling of its request | siblings run on the pages the mirror published; Git commits a page only when its bytes match the mirror rendering, skips one the mirror did not rewrite (`withdrawal_not_mirrored`), and waits while the mirror is requeued (`withdrawal_mirror_pending`); parked siblings re-arm when the mirror commits |
+| A worker or entity slug the exporter refuses | the page could not be exported | slugs stay portable; a long or reserved name keeps its identity with a hash tag, and enrichment skips with `entity_slug_taken` when both forms belong to other entities |
+| A run failure carrying an errno, SQLSTATE or typed error whose message also matches provider text | could be recorded as one bad item | structured failures are classified first, so `ENOSPC` stops the run |
+| A session-start or prompt hook whose pack the serve backstop cut short | reported `ok` with an empty block | the pack assembled before the backstop is returned, and the hook records `degraded` with reason `server_budget` |
+
+### What you need to do
+
+Nothing. Each repair previews first and runs only with `--apply --expect <hash>` and your consent.
+
+### For contributors
+
+- The nightly watch reads job pages 50 at a time and retries a GET on a 5xx or a dropped connection (1 s, 3 s, 9 s); a 4xx still fails at once.
+- The crash robot waits for the consumer's claim pass before finishing, the entity-resolve perf guard times its two query shapes alternately, and `eval_drift` refreshes a racy Git index after a timed-out diff.
+
+## [0.60.299.0] - 2026-10-18
+
+**Big pages now just work: `pages.segmented_storage` is on by default, so a page over 1 MiB is stored in segments and reading a piece of it costs the size of that piece, not the whole page.** A 200 MiB transcript, export or log file used to be stuck at the 24 MiB inline limit, and every read or rewrite of a large page moved all of it. Now a page can be up to 256 MiB on Postgres and 128 MiB on PGLite, a window, outline or chunk context reads only its segments, and a rewrite re-indexes only the segments that changed. Pages at or under 1 MiB are stored exactly as before. Forgetting or purging a fact on a large page now rewrites its file too, so the withdrawn text leaves the checkout and its Git history moves on, as it already did for small pages.
+
+### How to use it
+
+Bring a large file in through its file: `gbrain import <dir>` or `gbrain sync` (on a source backed by files, from the file's own place in the checkout). `put_page`, `put_pages`, `capture` and `gbrain put` stdin stay limited to 24 MiB per call.
+
+```bash
+gbrain config set pages.max_bytes 67108864        # lower the page ceiling (here 64 MiB)
+gbrain config set pages.segmented_storage off     # store new pages inline up to 24 MiB again
+```
+
+Pages already stored in segments stay readable with the switch off.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A page over 1 MiB | stored inline, at most 24 MiB, and read whole | stored in segments up to 256 MiB (Postgres) or 128 MiB (PGLite); reads and re-indexing touch only the segments they need |
+| `forget`, `forget_fact` or `purge_fact` on a large page of a source backed by files | the withdrawal mirror and Git effect skipped it (`page_body_segmented`) and its file kept the withdrawn text | the file is rewritten from the segments, one segment at a time, to the bytes `gbrain export` writes, and the Git effect commits it |
+| A facts fence longer than a segment, once its source has a withdrawal | export, the mirror, the Git walk and the drift check refused `page_projection_stale`, so a purge parked with the row still in the file | they read the fence whole (up to 24 MiB) and apply the withdrawals; a longer fence is refused before a purge commits |
+| A purge or forget of a row in a fence whose begin or end marker falls on a segment boundary | refused `withdrawal_provenance` | it commits and the row leaves the segments, the file and Git |
+| A rewrite of a page marked `embed_skip`, `content_flag` or `quarantine` whose body is in segments | skipped or refused `file_database_drift` | the markers are set aside when page and file are compared, as for an inline page |
+| A withdrawal mirror whose staging file hits an I/O error (EIO, ENOSPC) | its recovery record held every write on the worktree, retried every 30 s, never parked | it releases the record and capacity, then retries and parks like any failed mirror |
+| A streamed staging file a crash cut short | blocked the worktree with `unexpected_staging_bytes` | it is written under an in-progress name and renamed when complete, so a partial one is discarded and written again |
+| A managed write the database cancels or times out (SQLSTATE 57014) | released as `database_contention` and prepared again without limit | each cancel counts against `persistence.max_preparation_attempts` (default 2); at the limit it ends `failed` with `write_interrupted`, and a managed sync holds the file for `gbrain sources retry-held` |
+| Managed sync of a file over 24 MiB whose origin another page records (a page renamed with its file) | failed `revision_conflict` and stopped the source's sync | it is imported into that page, as for a smaller file |
+| `gbrain repair stuck-recovery` on a page recovery whose file is over 24 MiB | listed as refused (`recovery_large_file_unsupported`) while it stopped every write on the worktree | previewed with both fingerprints and a bounded summary, backed up, and resolved with `--apply --expect <hash> --keep prior\|disk --yes` |
+| Turning `pages.segmented_storage` off or lowering `pages.max_bytes` with large pages already stored | a delete, restore or withdrawal mirror of such a page could fail `request_too_large` | the default `persistence.limits.worktree_recovery_bytes` leaves room for the largest page in segments; a value you set is kept |
+| Doctor `segmented_storage` when the only old writes holding the switch off are this host's own from before its upgrade | it told you to upgrade this host | once the upgraded gbrain has made the same kind of write, it reports the hold as information with the time it clears |
+
+### What you need to do
+
+Upgrade every host and process that writes to the brain. While any gbrain older than this release (v0.60.290.0 included) wrote in the last 7 days, new pages stay inline and doctor `segmented_storage` names the host to upgrade. Upgrading builds two indexes: migration v259 adds `ingest_log_marked_idx` (0.4 s for 1M `ingest_log` rows on Postgres, 0.5 s on PGLite) and migration v260 adds `pages_segmented_body_bytes_idx`. Postgres builds them online with `CREATE INDEX CONCURRENTLY`; PGLite holds writes until each build ends.
+
+### For contributors
+
+- The stress gate reads measured per-iteration times from `scripts/stress/iteration-weights.json` before the unit-lane weights; `bun scripts/stress/gate.ts mine-iterations <log>…` refreshes it from stress shard logs.
+- `SEGMENTED_WRITER_FLOOR` (`src/core/page-body/writer-floor.ts`) is the `since` of the `segmented_switch_on` BEHAVIOR row, so a restamp edits only that row.
+
+## [0.60.298.0] - 2026-10-18
+
+**One bad item no longer stops the whole unit: 20 per-item loops now isolate a failing page, row, source or upstream item, record it with a typed code and a retry path, and carry on, while a real outage (lost connection, failed transaction, abort, authorization refusal, full disk) still stops the run.** This is GBRA-130 PR 1, the item-isolation half of the #6948 bug-class sweep; every row ships with a probe that fails on master and passes here, on PGLite and Postgres.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| One page's managed link extraction fails | the extraction cursor stalled on it for every page behind it | the page is recorded on `pages.links_extract_failure` (migration v258), held after 3 runs at the same revision and extractor generation, and the cursor moves on; `gbrain extract --stale --retry-held` retries held pages and doctor `links_extraction_lag` names them |
+| One refused or pending transcript part, or one bad ChatGPT/Claude connector conversation | the whole ingest or connector batch aborted | the refusal goes to the connector's failed ledger (quarantined after 3 runs) and a pending part holds the watermark; a page deleted and retention-purged can be imported again, and an owner-purged page still gets `purged_content` |
+| One bad Google contact or calendar event | the sweep, Gmail and the sync token stopped | it becomes a connector item hold; `retry-held` re-fetches it by id, and an item deleted upstream while held is deleted through the ownership-checked path |
+| A synthesize output whose write ended in conflict | the postprocess failed as a whole | it is a per-output conflict with a `write-request` fix; triage cuts are surrogate-safe and a verdict the database refuses is not cached |
+| One page or kind that throws in `gbrain repair` (safe-chunks, v0.60.31, slug-conflicts, `--all`, the content lane) | the repair stopped there | the page is held or the kind is reported and the rest carry on; held failures count toward the breaker and the cursor never moves past them |
+| A persistent typed failure in one global maintenance phase | every later pass retried and stopped on it | the phase keeps a blocker streak and is stamped past; doctor `global_maintenance_stalled` and `autopilot --status` report the stall and `--retry-global` retries it |
+| One bad page, bucket or source in facts expiry, consolidate, pattern grounding or `gbrain maintain` | the whole phase failed | it is isolated; a failed timeline-append grounding is saved and retried on the next run |
+| A poison row in a backfill, an unmanaged purge or the expired-source sweep | the job failed on every retry | the backfill bisects and skips the row with a recorded retry, a failed skip-ledger read stops the run instead of overwriting older records, and the purge and sweep isolate one refused row or source |
+| Most items in a run fail the same way, or nothing succeeds | (new) | `item_failures_systemic` stops the run and holds nothing, so an outage is never recorded as a pile of bad items |
+
+### What you need to do
+
+Nothing. Held items name their retry command in doctor and in each command's output.
+
+### For contributors
+
+- `src/core/item-failure.ts` is the shared classifier (`classifyItemFailure`, `ItemRun`); every adopting loop is listed in `ISOLATE_SITES` and `test/pathological/sites.test.ts` requires an item case and a run case for each.
+- `test/pathological/inventory-deferred.test.ts` lists every inventory row not fixed yet as a named `test.todo`, and `scripts/check-item-allowlist-catches.ts` is a shrink-only guard on catches that swallow per-item failures.
+- `unit-postgres-arms` runs 16 shards instead of 14, so the required checks are named `Unit-lane PostgreSQL arms N/16`.
+
+## [0.60.297.0] - 2026-10-18
+
+**Ten failures in the #6948 class are fixed or ruled out, each proven by a probe that fails on master and passes here: facts no longer land on retired or page-less entity pages, re-keying a fact no longer collides on the ontology index, and one bad item no longer fails or blocks its whole batch.** The sweep covers the GBRA-130 inventory rows B-7, B-9, B-10, C-9, C-23, A-36, A-42, A-51, A-60 and A-65.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Enrichment or `extract_entities` names a person whose page was retired into another | it wrote to the retired alias page | it follows the `superseded_by` chain to the canonical page; an unfollowable chain (no target, or a cycle) is skipped with a reason |
+| A rename, phantom redirect or relink re-keys an ontology fact onto a slug that already holds the same observation | raw `23505` on `idx_facts_ontology_stint_dedup` and the whole write rolled back | the duplicate is dropped first (the active row, then the row at the target, then the oldest survives) and supersession links follow the survivor |
+| An extractor names an organization under `companies/` when its page lives under `orgs/` (#6925) | the fact landed on a page-less slug or stayed unlinked | `companies/`, `orgs/` and `organizations/` resolve as one directory; `projects/` and `people/` keep their own |
+| Facts already stranded on a page-less entity slug | entity recall and trajectories never found them | `gbrain repair facts-rehome` previews each slug with its class and, after you agree, `--apply --expect <hash>` moves exactly the previewed database-only facts. It never runs on upgrade |
+| A put_page fact extraction job died during a provider outage or a config problem | it stayed dead | the next maintenance pass re-submits it once extraction works again (once an hour per job, `facts.absorb_retry.max_resubmits` times, default 3); `gbrain facts retry-dead` lists and resets them and doctor counts them |
+| One entity in a fact extraction batch is refused because its page changed | the whole batch failed on every retry | the other entities' facts are counted and the refused entity is reported |
+| An atom title starts with a dot (#6804) | it minted an ungrammatical `atoms/<date>/.title-…` slug | the dot is stripped, and the next extraction retires an existing dot-led atom |
+| One conversation page in a batch request is refused for a deterministic reason | every page in the batch was blocked | the batch is re-published in halves and only the page that fails alone is blocked |
+| `gbrain repair captured-facts` meets an unreadable corpus file | its session was treated as cleared | the file is listed as `unreadable_corpus_file` and its session is `unclassifiable` |
+| `quarantine clear --force` on a page whose frontmatter lowers its sync tier (#6919) | it promised the page stays cleared | it says the next sync drops the override and how to keep it cleared; `--json` gains `override_survives_sync` |
+
+A-60 (a swallowed belief commit mark) is not real: the ledger's own scan lists the unmarked write, doctor warns, and the reconcile cycle fills the mark. It ships as a regression test.
+
+### What you need to do
+
+Nothing. If facts sit on entity slugs with no page, preview `gbrain repair facts-rehome` and apply it after reviewing.
+
+### For contributors
+
+- Row probes live in `test/pathological/<row>-*.test.ts` and run on PGLite and Postgres. `check:postgres-lanes` counts a `pathologicalArms()` call as a Postgres arm.
+
+## [0.60.296.0] - 2026-10-18
+
+**Several live pages recording one file no longer stop a source's whole managed sync, verified duplicates heal on their own, and no writer can create such a pair any more.** Hotfix for #6948.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A managed sync of a source where two or more live pages record the same file as their origin (duplicate-origin twins) | the run refused `page_identity_changed` and nothing in the source synced | only that file is held `origin_conflict`; every other file syncs, and the hold re-screens on each run |
+| Twins that are verified duplicates: one of them is the page the path names, one body, a readable file, no conflicting frontmatter `id`, one visibility and trust tier, no slug-keyed withdrawals, no file at a twin's own slug path, and nothing the merge would lose | they stayed until a person merged them by hand | right after the managed sync, on the source's owner host, each other page is merged into the canonical one: links in every role, relationship dates, timeline, raw data, user tags, aliases and facts move, its slug becomes an alias, and it is soft-deleted without touching the file (restorable for 72 h). The receipt lists every frontmatter key the twin carried that the file lacks. A run handles at most 200 files in 60 s and 1000 twin pages per source per day, and the mass-delete valve applies. Kill switch: `gbrain config set sync.origin_twins.auto_resolve false` |
+| Any other group of twins | the source stayed stopped | the file stays held with a reason (`no_canonical_claimant`, `content_differs`, `file_unreadable`, `explicit_id_conflict`, `visibility_differs`, `trust_tier_differs`, `twin_has_withdrawals`, `twin_slug_path_occupied`, `twin_evidence_conflicts`). `gbrain repair origin-twins --source <id>` previews every group; `--slug <kept-slug>` keeps one page and detaches the others without deleting them. A merge never raises or lowers a trust tier |
+| A write that would give a second live page an origin another live page records (`put_page`, write-through, an import's origin refresh, sync renames and rename collisions, file and frontmatter repairs, managed sync no-ops, segmented flips, restoring a tombstone) | it wrote a new twin | it refuses `page_identity_changed` (detail `origin_already_claimed`) inside the write's transaction, under a per-origin advisory lock that also covers a scoped source's legacy `<scope>/<origin>` spelling |
+| Readers and repairs that resolve a file to a page (classic sync deletes, fence, frontmatter and file-drift repairs) | took an arbitrary twin | take the page the path names, and refuse when no single page is canonical |
+
+New index `pages_live_origin_key` (one live page per recorded origin). Migration v257 builds it online only on a brain with no twins; on a brain with twins it writes nothing, and doctor `origin_twins` reports "Index pending" until the repair resolves them, after which `gbrain repair origin-twins --source <id> --apply` builds it.
+
+### What you need to do
+
+Nothing on most brains. If doctor `origin_twins` reports "Index pending", run the preview it names (`gbrain repair origin-twins --source <id>`), let the next sync heal the verified groups or apply the preview, and decide the held ones.
+
+### For contributors
+
+- Every origin assignment goes through `src/core/persistence/origin-guard.ts` (`bindOrigin` or `assertOriginUnclaimed` in the same transaction). `bun run check:origin-assignment` (in verify) fails on a new `UPDATE pages SET source_path = <value>`, `INSERT INTO pages (... source_path ...)` or slug rename outside it unless the statement carries `origin-guard-ok: <reason>`.
+- A test that seeds legacy twins drops the index first with `dropOriginIndex` (`test/helpers/origin-index.ts`) and sets the origin with raw SQL; E2E `setupDB` restores the index for the next file.
+
+## [0.60.295.0] - 2026-10-18
+
+**A Git index lock left by a killed git no longer stops a managed brain's Git backups until someone removes it, and large checkouts stop killing git in the first place.** Hotfix for #6932, plus #6936.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A git step of the canonical writer was SIGKILLed after it created `.git/index.lock` (a step past its deadline, a job group killed after its grace, the OOM killer) (#6932) | every later Git effect in that checkout failed `git_index_locked`, then `git_index_stale`, and parked; commits for the whole source stopped until a person removed the lock and ran `gbrain sources writer retry-effects` | while it holds its writer lock, the writer reclaims a lock it can prove abandoned: on Linux with the whole process table visible and a local filesystem, no process has the lock open, no git runs in the checkout or points at it through `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`/`GIT_INDEX_FILE`, and the lock is empty and at least 5 s old, or older than 10 minutes. It then retries the step and gives effects that lock had parked one more attempt. Each reclaim leaves a receipt under `GBRAIN_HOME/persistence/index-lock-reclaims.jsonl` and a log line, and doctor `parked_effects` reports reclaims from the last 7 days |
+| An index lock the writer cannot prove abandoned (a live git, another platform, a container, a network filesystem) | `git_index_stale` told you to remove it if no git was running | the lock still stays, and `git_index_stale` now says why it was kept and carries an `ask_user` fix: check that no git runs in that checkout, remove the lock, then retry the parked effects |
+| A one-file Git effect on a large checkout under heavy I/O (a 48 MB index took 35–39 s for `commit --only` in a throttled test) | each git step had 20 s, then 2 s between SIGTERM and SIGKILL, so a slow git was killed mid-write and left its lock | each step gets 20 s plus 2 s per MiB of index (at most 120 s; 98 s for a 39 MB index) and 10 s to exit after SIGTERM, and read-only steps run with `GIT_OPTIONAL_LOCKS=0`, so `git status` never takes the index lock |
+| An advisor check that throws (#6936) | it was dropped silently: with no other findings the report said the brain looked healthy and `gbrain advisor` exited 0 | the check is reported as a warn finding `collector_failed:<check>` (static text, no error details, nothing `--apply` can run), so the run exits 1; findings from other checks and critical precedence are unchanged |
+
+### What you need to do
+
+Nothing. If doctor `parked_effects` still shows effects parked with `git_index_stale`, its message says why the lock was kept; follow the fix it names.
+
+### For contributors
+
+- `commitGitTargets` and `publishGitEffect` take an optional `GitEffectOwner` (the caller's writer lock). Only callers that pass one can reclaim a lock; the effect worker passes it.
+- `execFileBounded` takes `termGraceMs` (default 2 s).
+- `test/persistence-index-lock-reclaim-6932.test.ts` kills a real `git add` with SIGKILL while it holds the lock. Where the process table isn't fully visible (macOS, containers), the same cases assert the refusal instead.
+
+## [0.60.294.0] - 2026-10-17
+
+**Graph walks are breadth-first: each page and edge comes back once, at its shortest depth, and dense clusters walk in milliseconds.** First step of the graph-traversal plan (HydraDB evaluation, autoplan run-20261017033903).
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A graph walk (`traverse_graph`, `gbrain graph`, `think` graph context) | enumerated every simple path, capped at 20,000 paths; a page came back once per depth some path reached it, and an edge once per depth | visits each page once, at its shortest distance, and returns each edge once (one hop past its shallower walked endpoint); the pages and edges reached are the same |
+| A walk over a densely linked cluster (12-page clique, depth 5) | 44 to 91 ms on Postgres under the path cap (22 s before the cap) | 4 to 9 ms |
+| A walk that reaches a large share of the brain | the 20,000-path cap could stop before deeper pages were reached | stops at 20,000 visited pages, shallowest first; the truncation warning names both caps |
+| `frontierCap` on `traverseGraph` | an approximate per-iteration cap applied before deduplication | an exact per-layer cap on new pages, in (slug, id) order |
+
+Every per-hop filter is unchanged and still applies at every step: soft delete, `excludePrivate` (page and link-origin privacy), source scope, link type and temporal policy.
+
+### What you need to do
+
+Nothing. Callers that relied on a page appearing at several depths now see it once, at its shortest depth.
+
+### For contributors
+
+- `src/core/engine-sql/links.ts`: one breadth-first CTE (`bfsWalkCtes`) serves `traverseGraph` and `traversePathsDetailed` on both engines.
+- `test/traverse-bfs.test.ts` checks the walks against a TypeScript shortest-path reference and the old CTE on seeded random graphs, and checks that a private, out-of-scope, private-origin or soft-deleted page in the middle of a chain stops the walk.
+- The dense-hub fixture (`test/helpers/dense-hub.ts`) now has 12 ring links per spoke, so the row-cap tests still overflow 5,000 edges now that each edge is returned once.
+- `scripts/bench-graph-walk.ts` times the walks on PGLite and, with `GBRAIN_BENCH_DATABASE_URL`, on Postgres.
+- `relationalFanout` still enumerates paths (3 hops at most); moving it to breadth-first changes search ranking and is a follow-up.
+- `test/large-pages/segmented-storage-visibility.test.ts`: the sweep-cost test counts rows at table scans only and analyzes every table the sweep reads, so a planner switching aggregate or join strategy between rounds no longer moves the count by one. A full scan of the source still fails it (12 rows against 20,014).
+
+## [0.60.293.0] - 2026-10-17
+
+**CI only: the unit-lane PostgreSQL arms run in 14 shards, sized from fresh measured timings.** Nothing changes for gbrain users.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Measured runtime of the 316 unit-lane PostgreSQL arm files | the shard weights predated current timings (6,697 s in total), so 12 shards looked like they fit the 570 s per-shard budget | re-mined from a green 24-job persistence-validation run (7,696 s in total): 12 shards would carry about 643 s each, so the lane now runs 14 shards of at most 551 s |
+| A shard that selects no files | its error said `shard N/8` and suggested a 12-shard command | names the real shard count, and the workflow pin test keeps it in step with `ARM_SHARDS` |
+
+### What you need to do
+
+Nothing.
+
+### For contributors
+
+- `persistence-validation.yml` `unit-postgres-arms` is now a 14-shard matrix (`ARM_SHARDS` in `scripts/postgres-unit-arms.ts`). Its required checks are named `Unit-lane PostgreSQL arms N/14 / Bun …`.
+- The 20-minute step timeout and the 570 s budget rule (twice a shard's measured weight still ends a minute inside the step) are unchanged; re-mine `scripts/postgres-arm-weights.json` with `bun scripts/postgres-unit-arms.ts mine <job.log>…` after adding heavy arm files.
+
+## [0.60.292.0] - 2026-10-17
+
+**Writes on a brain whose schema is behind are refused up front, `repair ghost-pages` works on a source with a shared skillpack, and large fact batches no longer stall a managed brain.** Fix wave 19 (#6910, #6904, #6898, #6906, plus two test-infra flakes).
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A managed write while the brain's schema is behind this gbrain build (#6904) | admitted, used up the request id, then failed at publication with `42703`/`42P01` | refused before admission with `migrations_pending` (reason `schema_behind`, not retryable as is) and one fix, `gbrain apply-migrations --yes` as the role that owns the gbrain tables; the same request id commits afterwards, and a replay of an accepted id still reconciles |
+| A publication that fails on a missing table or column | recorded as `owner_exception`, read as a code defect | `storage_error` reason `schema_missing` with a migrate (schema behind) or repair (schema at head: doctor `schema_missing_tables`) next step |
+| `gbrain repair ghost-pages` on a source with an adopted skillpack (#6910) | one `skill_bundle_required` refusal aborted the whole apply | legacy ghosts under `skills/` that no pack skill owns are retired from the database like any other ghost; ghosts on files the pack owns are listed as `ghost_skill_pack_member` with the command that restores their file; one refused page is recorded `refused` and the rest still apply |
+| Preparing many facts for an entity page with a large `## Facts` table (#6898) | the table was re-parsed and re-rendered once per fact: 200 facts on an 8,000-row (1.6 MB) page took 15–22 s, 1,000 facts took minutes, and every later write on that source waited | parsed and rendered once per request: the same 200 facts take 5.6–7.6 s |
+| One batch that gives an entity more than 50 facts | one publication held the brain-wide counter row for every fact (1.75 s for 800 facts on Postgres, past the 1 s lock timeout) | published in parts of at most 50, each its own `extract_facts` request with a part receipt (`publication: partial` or `final_part`); the batch's completion receipt still covers the whole group |
+| Conversation fact extraction | could suggest a retired alias page to the model | suggests the page it redirects to, or nothing |
+| OpenClaw gateways running the context engine under Node (#6906) | the turn-context envelope import failed silently and a hand-kept copy of the line was used | the envelope lives in an import-free module, byte-identical everywhere; a module on the per-turn context path that fails to load prints one stderr line naming it and the error code |
+
+### What you need to do
+
+Nothing. If a write is refused with `migrations_pending`, run `gbrain apply-migrations --yes` (as the role that owns the gbrain tables) and retry the same request.
+
+### For contributors
+
+- `test/child-job-descendants.test.ts`: every fixture process is reaped after each case, so a failed case can no longer hold the runner's stdout pipe open and hang the shard.
+- The #5762 lock-timeout contention case stops the persistence consumer before lifting the injected fault, so a retry after the fault no longer commits under the assertion.
+- `test/openclaw-assemble-node-loadable.test.ts` walks the OpenClaw import graph and fails if it reaches a Bun-only import.
+
+## [0.60.291.0] - 2026-10-17
+
+**A brain that lost its `query_cache` table can finish its nightly purge again.** On a brain where `query_cache` was missing although the schema was at head, every coordinated page purge failed with `42P01`, so the dream cycle's purge phase failed every night with `managed_purge_failed` and the tombstone was never purged (#6911). `apply-migrations` and `db-repair` both reported healthy, because the schema version said the table's migration had run.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Page purge with `query_cache` missing | failed with `42P01` every time (`managed_purge_failed`) | commits; the receipt lists `purge.missing_caches` and shows `query_cache` as `not_present` with reason `table_missing` |
+| Fact purge with `query_cache` missing | failed with `42P01` | commits; the store report shows `query_cache` as `not_present` with reason `table_missing` |
+| Purge with a missing table that holds user data | failed | still fails, because the purge cannot say it removed rows it could not reach |
+| `gbrain doctor` with a missing table | nothing flagged it | `schema_missing_tables`: warn for a rebuildable cache or a table without user data, fail for a user-data table; below head it checks the rebuildable caches, whose absence would wedge `apply-migrations` |
+| Getting the cache back | run the old migration handler by hand | `gbrain repair missing-tables` previews, then `--apply --expect <hash>` recreates it empty in the shape a fully migrated brain has |
+| `gbrain forget --purge --vacuum` on PGLite with the cache missing | the VACUUM failed silently, so nothing was vacuumed | the other tables are vacuumed, and the receipt says whether VACUUM ran or failed |
+
+### What you need to do
+
+Nothing, unless doctor reports `schema_missing_tables`. Then ask your agent: *"Doctor says query_cache is missing. Fix it."* It runs `gbrain repair missing-tables`, shows you the preview, and applies it after you agree. The repair runs only when named; nothing changes on upgrade.
+
+If your nightly purge failed on the missing cache for a while, some deleted pages were parked after five failures and stay unpurged. Doctor `purge_parked_pages` lists them; preview with `gbrain pages purge-deleted --retry-parked --dry-run`, then run it without `--dry-run` after you agree.
+
+If doctor fails `schema_missing_tables` on a table that holds user data, restore that table's rows from a backup **before** you run `gbrain upgrade`, `apply-migrations` or `init --migrate-only`: they recreate a base-schema table empty, which clears the check while the rows stay lost.
+
+## [0.60.290.0] - 2026-10-17
+
+**Every part of gbrain can now read, protect, forget and export pages stored in segments, so large-page storage is ready to turn on in a later release.** Segmented storage (`pages.segmented_storage`) stays off by default, and with it off nothing changes for your brain: pages over 1 MiB are still stored inline up to 24 MiB. This release adds the read side and the safety work that has to exist before the switch can be turned on: reads, row-level security, forget and purge, delete and restore, export and backup, and the derived passes all handle segmented pages. A writer gate keeps the switch off while any recent writer can't read segments.
+
+### What changed
+
+| Area | With segmented storage on | With it off (the default) |
+|---|---|---|
+| Reads (`get_page`, `fetch`, `entity`, evidence, `gbrain get`) | read segmented pages in windows, with withdrawn facts, fences and credentials applied; `body: 'full'` refuses and points at `body: 'auto'` | unchanged |
+| Privacy | row-level security on the six segment tables; `docs/ENGINES.md` has a source-scoped policy recipe | search, `get_page`, `put_page`, `remember`, sync and embedding need no segment-table grant |
+| `forget` and `purge_fact` | work at any page size and never delete text an in-flight write still holds | unchanged |
+| Delete and restore | lossless up to `pages.max_bytes` on file-backed sources | unchanged |
+| Export and backup | segmented pages export byte-identical to inline pages; PGLite backups restore them | unchanged |
+| Derived passes (links, timeline, takes, facts, tags, dedup, sweep, stale extraction) | read segmented pages in blocks; a page the sweep can't fit in its budget is deferred | unchanged |
+| Search | a new page up to 4 MiB is searchable when the write returns; a larger one reports `searchable: "pending"` | unchanged |
+| Tag, timeline, takes and facts writes | `add_tag`/`remove_tag` work at any size; the others work up to 24 MiB and refuse above it, naming the limit | unchanged |
+| `gbrain doctor` | seven whole-body checks report `skipped_segmented: N`; `segmented_storage` reports the writer gate | `segmented_storage` reports the switch as off |
+| Ceilings | 256 MiB on Postgres, 128 MiB on PGLite | 24 MiB |
+
+Migrations v252–v256 add a segment-text GC index, `page_view_digests`, segment-reader marks on write requests, consumers and `ingest_log`, `page_body_staging_texts`, and a chunk retirement index. On Postgres the indexes build `CONCURRENTLY`.
+
+### What you need to do
+
+Nothing. Leave `pages.segmented_storage` unset. `gbrain doctor` shows the switch's state, and the release that turns it on will say so in its notes.
+
 ## [0.60.289.0] - 2026-10-17
 
 **The unit test matrix runs 10 shards instead of 8, so one slow CI runner no longer turns master red.** Master run 39030803745 lost `test (2)` to the 22-minute job timeout. The tests were fine: CPU steal on that runner was 2–3x the usual and every file ran about 1.5x slower. At 8 shards each shard carried about 908s of measured test time, so a normal job took about 16.5 minutes and a 1.5x slower runner overran the timeout. At 10 shards each carries about 727s.

@@ -18,9 +18,10 @@ import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, 
 import { CHECKPOINT_MOVED_MESSAGE, checkpointRevival } from './sync-slug-mode.ts';
 import { managedCursorKey, resolveManagedCursor } from './sync-cursor-key.ts';
 import { isImageFilePath, isMultimodalEnabled } from '../sync.ts';
-import { assertSyncPageOrigin, sameSyncOrigin, syncOriginScope } from './sync-origin.ts';
+import { assertSyncPageOrigin, sameSyncOrigin, sharedOriginExit, syncOriginScope } from './sync-origin.ts';
 import { assertManagedSyncActive, assertSyncDispatchActive, managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncAuthority, type SyncProcessingOptions } from './sync-authority.ts';
 import { prepareManagedSyncMutation, type SyncCursorOptions, type SyncIntent } from './sync-prepare.ts';
+import { streamedSyncBodyRef, type SyncBodyRef } from './sync-streamed.ts';
 import { startClaimPhase } from './claim-phase.ts';
 import { screeningRequest } from './noop-kernel.ts';
 import { noopWaiversEnabled, prescreenedHead, raceSyncBudget, screenWaiver, syncPreparationBudgetMs, unfinishedPageRequestParams, UNFINISHED_PAGE_REQUEST_SQL, waiveNoopEntry, waiveNoopRun, waivePrescreenedRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
@@ -46,7 +47,7 @@ import { laneApplyMsPerMember, lanePolicy, openLanes } from './sync-lanes.ts';
 import { isContentRefusal } from '../import-screen.ts';
 import { isRetryableConnError, isStatementTimeoutError } from '../retry-matcher.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
-import { driftBaselineContent, dryRunScreen, heldImageEntry, isSyncReadBound, loadSyncScreenRun, oversizeHold, pinnedBlob, pinnedContent, pinnedImageBytes, preparationStalledHold, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
+import { driftBaselineContent, dryRunScreen, heldImageEntry, isSyncReadBound, loadSyncScreenRun, originConflictHold, oversizeHold, pinnedBlob, pinnedContent, pinnedImageBytes, preparationStalledHold, prepareTimeFenceHold, screenFrozenImport, streamedRefusalHold, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { frozenImageIntent, sameImageBytes } from './sync-image.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
 import { managedSyncWriteDiagnostic, writeWaitOf } from './sync-write-diagnostic.ts';
@@ -59,7 +60,7 @@ import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
-import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, holdsEscalated, readGitHoldRetryPaths, readGitSourceHolds, readSyncHoldPolicy, recordSyncConversion, releaseDiscoveredHolds, recoveredReport, requestGitHoldRetry, writeGitHold, type FencesTally, type GitHoldCode, type SyncHoldPolicy } from './sync-holds.ts';
+import { outOfAttemptsHold, addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, holdsEscalated, readGitHoldRetryPaths, readGitSourceHolds, readSyncHoldPolicy, recordSyncConversion, releaseDiscoveredHolds, recoveredReport, requestGitHoldRetry, writeGitHold, type FencesTally, type GitHoldCode, type SyncHoldPolicy } from './sync-holds.ts';
 import { withScreeningPaths } from './screening-paths.ts';
 import { withBoundedReadSession } from './bounded-reads.ts';
 import { receiptClass, recordedStop, replaysContentRefusal, replaysUnchangedRefusal, resumableStop, stopRecorded } from './sync-stop-class.ts';
@@ -146,18 +147,18 @@ export interface CursorProgress { startedAt: number; startIndex: number; lastAt:
  * run stops `blocked` / `preparation_systemic`, and the next run re-freezes the entry and schedules the run's earlier
  * stalled holds for a re-screen instead of holding.
  */
-export interface CursorBreaker { stalled: string[]; streak: number; tripped?: { at: string; rule: 'count' | 'consecutive'; stalled: number; streak: number; step: string | null; request_id: string } }
+export interface CursorBreaker { stalled: string[]; streak: number; interrupted?: number; tripped?: { at: string; rule: 'count' | 'consecutive'; stalled: number; streak: number; step: string | null; request_id: string; interrupted?: number } }
 /** The second trip rule: this many consecutive stalled entries with no commit between them. */
 export const BREAKER_STREAK = 5;
 /** The breaker after this receipt: the count rule is `holdsEscalated`'s "greater than" rule over the run's screened imports, the streak rule is `BREAKER_STREAK`. */
-function breakerAfter(cursor: Cursor, done: Pick<WriteRequest, 'request_id' | 'error_detail'>, policy: Pick<SyncHoldPolicy, 'escalateCount' | 'escalatePct'>): CursorBreaker {
+function breakerAfter(cursor: Cursor, done: Pick<WriteRequest, 'request_id' | 'error_code' | 'error_detail'>, policy: Pick<SyncHoldPolicy, 'escalateCount' | 'escalatePct'>): CursorBreaker {
   const prior = cursor.breaker ?? { stalled: [], streak: 0 };
   if (prior.tripped || prior.stalled.includes(done.request_id)) return prior;
-  const stalled = [...prior.stalled, done.request_id], streak = prior.streak + 1;
+  const stalled = [...prior.stalled, done.request_id], streak = prior.streak + 1, interrupted = (prior.interrupted ?? 0) + (done.error_code === 'write_interrupted' ? 1 : 0);
   const screened = cursor.entries.slice(0, cursor.index + 1).filter(entry => entry.action === 'import').length;
   const rule = holdsEscalated(policy, stalled.length, { held: stalled.length, screened }) ? 'count' : streak >= BREAKER_STREAK ? 'consecutive' : null;
   const step = done.error_detail && typeof done.error_detail === 'object' && typeof (done.error_detail as Record<string, unknown>).step === 'string' ? String((done.error_detail as Record<string, unknown>).step) : null;
-  return { stalled, streak, ...(rule ? { tripped: { at: new Date().toISOString(), rule, stalled: stalled.length, streak, step, request_id: done.request_id } } : {}) };
+  return { stalled, streak, interrupted, ...(rule ? { tripped: { at: new Date().toISOString(), rule, stalled: stalled.length, streak, step, request_id: done.request_id, interrupted } } : {}) };
 }
 /** The cursor after a committed page: a commit ends the breaker's consecutive streak. */
 function committedBreaker(cursor: Cursor): Pick<Cursor, 'breaker'> {
@@ -175,15 +176,15 @@ export interface ManagedSyncBreaker {
   fix: import('../agent-output.ts').Action;
 }
 function breakerResult(cursor: Cursor, pending: Pending, done: WriteRequest, remote: boolean): SyncResult {
-  const trip = cursor.breaker!.tripped!;
-  const where = trip.step ? ` at step ${trip.step}` : '';
+  const trip = cursor.breaker!.tripped!, interrupted = trip.interrupted ?? 0, prepared = trip.stalled - interrupted;
+  const causes = [prepared ? `${prepared} could not finish preparing${trip.step ? ` at step ${trip.step}` : ''}` : '', interrupted ? `${interrupted} had their statements ended by the database (write_interrupted)` : ''].filter(Boolean).join(', ');
   const fix: ManagedSyncBreaker['fix'] = { argv: ['gbrain', 'sources', 'writer', 'status', '--source', cursor.sourceId, '--json'], consent: [], actor: remote ? 'host_admin' : 'agent', requires_exclusive: false,
     docs: 'docs/guides/write-refusals.md#preparation_systemic', verify: { argv: ['gbrain', 'sources', 'status', cursor.sourceId, '--json'] },
-    why: `${trip.stalled} write(s) of this sync could not finish preparing${where} (${trip.rule === 'consecutive' ? `${trip.streak} in a row with no page committed between them` : 'more than a source should hold'}), `
+    why: `${trip.stalled} write(s) of this sync ran out of attempts: ${causes} (${trip.rule === 'consecutive' ? `${trip.streak} in a row with no page committed between them` : 'more than a source should hold'}), `
       + 'so the run stopped instead of holding every file: the write owner, not the files, is the likely cause. Writer status (read-only) shows the owner process, its gbrain version and the step '
       + 'each stuck write reached; fix what it names or upgrade gbrain, then rerun the same sync: it re-freezes the stopped entry and re-screens the files this run held.',
-    ...(remote ? { user_message: `A managed sync of source ${cursor.sourceId} stopped because ${trip.stalled} writes could not finish preparing. Please run 'gbrain sources writer status --source ${cursor.sourceId} --json' on the brain host, fix what it names, then rerun the sync.` } : {}) };
-  return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1, failureCodes: [{ code: PREPARATION_STALLED, count: trip.stalled }],
+    ...(remote ? { user_message: `A managed sync of source ${cursor.sourceId} stopped because ${trip.stalled} writes ran out of attempts (${causes}). Please run 'gbrain sources writer status --source ${cursor.sourceId} --json' on the brain host, fix what it names, then rerun the sync.` } : {}) };
+  return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1, failureCodes: [{ code: PREPARATION_STALLED, count: prepared }, { code: 'write_interrupted', count: interrupted }].filter(code => code.count > 0),
     breaker: { code: 'preparation_systemic', rule: trip.rule, stalled: trip.stalled, consecutive: trip.streak, step: trip.step, request_id: trip.request_id, fix },
     ...(remote ? {} : { managedWrite: writeDiagnostic(cursor, pending, done) }) };
 }
@@ -338,7 +339,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
   let frozenSnapshot: PageSnapshot | null | undefined;
   // #5988: company-profile sources never hold; their approved manifest keeps refusing.
   const screening = entry?.action === 'import' && !cursor.companyPlan ? run.screen ?? null : null;
-  let blob: TreeBlob | null = null, oversize: { size: number | null } | undefined;
+  let blob: TreeBlob | null = null, oversize: { size: number | null } | undefined, bodyRef: SyncBodyRef | null = null;
   // #6529: an image entry is frozen as its bytes (base64) for the coordinated image importer when multimodal embedding is on.
   const image = !!entry && entry.action === 'import' && !cursor.companyPlan && isImageFilePath(entry.path);
   let imageBytes: Buffer | null = null;
@@ -352,6 +353,10 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     // are on; `sync.holds=fail` and company-brain cursors keep the refusals.
     const holdsOn = !!run.screen && !cursor.companyPlan;
     if (entry.legacySlugs?.length && !holdsOn) throw syncRunRefusal('page_identity_changed', 'Legacy pages sync cannot import into match the imported file.', retry, `${entry.path} imports as page ${entry.slug}, but pages ${entry.legacySlugs.join(', ')} of source ${cursor.sourceId}, imported from a file of that name, record no file (sync.holds=fail); keep the file's page, remove the others, then sync again.`);
+    if (entry.originConflict) {
+      if (!holdsOn) throw syncRunRefusal('page_identity_changed', 'Several pages claim the same imported origin.', retry, `Pages ${entry.originConflict.claimants.map(page => page.slug).join(', ')} of source ${cursor.sourceId} all record ${entry.path} as their origin (sync.holds=fail); ${sharedOriginExit(cursor.sourceId, entry.originConflict.claimants.map(page => page.slug))} Then sync again.`);
+      return { hold: originConflictHold(entry) };
+    }
     const [occupant, snapshot] = await Promise.all([alreadyImportedAtOrigin(engine, cursor, entry, originScope).catch(error => {
       if (!holdsOn || !(error instanceof OperationError) || error.code !== 'page_identity_changed') throw error;
       return { originFault: error };
@@ -367,13 +372,23 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     }
     let bytes: Buffer | null = null;
     try { bytes = readSyncFile(cursor.root, entry.path); }
-    catch (error) { if (!screening || !isSyncReadBound(error)) throw error; oversize = { size: null }; }
-    if ((screening || image) && !entry.working) {
+    catch (error) {
+      if (!isSyncReadBound(error)) throw error;
+      // Wave B: with segmented storage on, a Markdown file over the read bound is frozen by reference and streamed by its owner.
+      if (entry.action === 'import' && !cursor.companyPlan && !image) {
+        bodyRef = await streamedSyncBodyRef(engine, { root: cursor.root, path: entry.path, target: cursor.target, working: entry.working,
+          blob: () => (blob = pinnedBlob(cursor, entry.path)) });
+        assertActive();
+      }
+      if (!bodyRef && !screening) throw error;
+      if (!bodyRef) oversize = { size: null };
+    }
+    if ((screening || image) && !entry.working && !bodyRef) {
       // #5988: an over-bound pinned blob is held by its size before its content is loaded.
       blob = pinnedBlob(cursor, entry.path);
       if (blob && blob.size > SYNC_READ_BOUND) oversize = { size: blob.size };
     }
-    rawHash = bytes === null ? null : sha256(bytes);
+    rawHash = bodyRef ? bodyRef.sha256 : bytes === null ? null : sha256(bytes);
     if (image && oversize) return { hold: oversizeHold(entry, entry.slug!, entry.pageId ?? null, oversize.size, blob) };
     if (image) imageBytes = pinnedImageBytes(cursor, entry);
     if (entry.action === 'import' && cursor.companyPlan) {
@@ -384,7 +399,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
         `Source ${cursor.sourceId}'s approved company-brain content manifest no longer includes ${entry.path} for this run (its approval changed, or the file is no longer an included path), so nothing was imported for it. If the approval changed, inspect and approve the repository again first (gbrain sources inspect --help).`);
       content = (await readCommittedBlob(cursor.companyPlan.revision!, blob, cursor.companyPlan.limits)).toString('utf8');
       assertActive();
-    } else content = imageBytes ? frozenImageIntent(imageBytes).content : entry.action === 'import' && !oversize ? pinnedContent(cursor, entry) : null;
+    } else content = imageBytes ? frozenImageIntent(imageBytes).content : entry.action === 'import' && !oversize && !bodyRef ? pinnedContent(cursor, entry) : null;
     // #6340: working-tree bytes that differ from the pinned blob but are committed at HEAD (a commit past the pin on a
     // live checkout) are imported as HEAD has them; the pin..HEAD diff later re-imports the same bytes as a no-op.
     // Uncommitted bytes keep the pinned content and reach the publication screen (idea from PR #6323).
@@ -447,7 +462,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
       return { hold: fileDriftHold(entry, slug, pageId, frozenIntent, { sides: entry.drift, revision: snapshot.revision, proof, sharedOrigin: await sharedOriginSurvivor(engine, cursor.sourceId, entry.sourcePath) }) };
     }
     if (screening && !image) {
-      const hold = await screenFrozenImport(engine, { cursor, entry, slug, pageId, snapshot, content, rawHash, lineEndingOnly, blob, oversize,
+      const hold = await screenFrozenImport(engine, { cursor, entry, slug, pageId, snapshot, content, rawHash, lineEndingOnly, blob, oversize, streamed: !!bodyRef,
         retryCommand: checkpointRetryCommand(retry) }, screening);
       assertActive();
       if (hold) return { hold };
@@ -457,7 +472,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
   assertActive();
   if (entry?.action === 'import') await faultPoint('sync:after_freeze', { sourceId: cursor.sourceId, slug, path: entry.path });
   return remember(frozenSnapshot, { requestId: randomUUID(), slug, pageId, ...(occupantRebound ? { rebound: true as const } : {}), intent: { kind: !entry ? 'managed_sync_checkpoint' : entry.action === 'import' ? 'managed_sync_import' : 'managed_sync_delete',
-    expected_revision: revision, sourcePath: entry?.sourcePath ?? null, path: entry?.path ?? null, rawHash, content, lineEndingOnly,
+    expected_revision: revision, sourcePath: entry?.sourcePath ?? null, path: entry?.path ?? null, rawHash, content, lineEndingOnly, ...(bodyRef ? { body_ref: bodyRef } : {}),
     ...(entry?.unownedDeletion ? { unownedDeletion: true } : {}),
     ...(entry?.renameFrom ? { renameFrom: entry.renameFrom } : {}),
     ...(run.observedAt ? { holdObservedAt: run.observedAt } : {}), ...(blob ? { blobOid: blob.oid } : {}), ...(entry && run.embedDeferred ? { embedDeferred: true } : {}),
@@ -553,7 +568,7 @@ const heldWrite = (held: Cursor, hold: HeldEntry, observedAt: string) => (tx: Br
 
 /** #6278: the terminal code an owner stamps on a request whose preparation never settled within its attempts (Lane A, consumer.ts). */
 export const PREPARATION_STALLED = 'preparation_stalled';
-const preparationStalled = (row: Pick<WriteRequest, 'state' | 'error_code'>) => row.state === 'failed' && row.error_code === PREPARATION_STALLED;
+const preparationStalled = (row: Pick<WriteRequest, 'state' | 'error_code'>) => row.state === 'failed' && outOfAttemptsHold(row.error_code);
 /** The run's page requests, as `persistence_requests_sync_run_open` indexes them. */
 const SYNC_PAGE_KINDS_SQL = "intent->>'kind' IN ('managed_sync_import','managed_sync_delete')";
 /** The `gbrain sync` arguments a hold or receipt prints to resume this cursor with its own options. */
@@ -670,7 +685,7 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
       const base: Cursor = { ...withoutPending(blocked), convertedFromFailed: converted }; delete base.breaker;
       const again = await freezeEntry(engine, at(base), key, assertActive, run);
       const rescreen = ((await readGitSourceHolds(engine, { sourceIds: [blocked.sourceId], runId: blocked.runId }))[0]?.holds ?? [])
-        .filter(hold => hold.code === PREPARATION_STALLED).map(hold => hold.path);
+        .filter(hold => outOfAttemptsHold(hold.code)).map(hold => hold.path);
       const inTx = async (tx: BrainEngine) => {
         if (rescreen.length) await requestGitHoldRetry(tx, blocked.sourceId, blocked.incarnation, rescreen);
         if ('hold' in again) await heldWrite(blocked, again.hold, run.observedAt!)(tx);
@@ -741,7 +756,7 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
   const entry = entryOf(cursor, pending);
   if (!entry || entry.path !== pending.intent.path) return null;
   const stalled = preparationStalled(done);
-  const page = pending.intent.kind === 'managed_sync_import' && typeof pending.intent.content === 'string';
+  const page = pending.intent.kind === 'managed_sync_import' && (typeof pending.intent.content === 'string' || !!pending.intent.body_ref);
   if (!stalled && !page && pending.intent.kind !== 'managed_sync_delete') return null;
   let base = withoutPending(cursor);
   if (stalled) {
@@ -758,9 +773,12 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
   const fault = stalled || fence ? null : await receiptPageFaultHold(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, entry, pending, done });
   const observedAt = run.observedAt ?? new Date().toISOString();
   if (!stalled && !fence && !fault && page && fileChangedAfterAdmission(done)) return deferChangedEntry(engine, { cursor, key, pending, assertActive, observedAt, waitMs, base });
-  if (!stalled && !fence && !fault) return null;
+  // Wave B: a file the streamed preparation refuses (a fence, a frontmatter problem) is held with the refusal's code.
+  const streamed = !stalled && !fence && !fault && pending.intent.body_ref && isContentRefusal(done.error_code, null)
+    ? streamedRefusalHold(entry, pending.slug, pending.pageId, done, pending.intent.blobOid) : null;
+  if (!stalled && !fence && !fault && !streamed) return null;
   const hold = stalled ? preparationStalledHold(entry, pending.slug, pending.pageId, done, pending.intent.content ?? null, pending.intent.blobOid, resumeArgsOf(cursor, run))
-    : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid) : fault!;
+    : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid) : fault ?? streamed!;
   return holdUnderGate(engine, { cursor, key, pending, hold, assertActive, observedAt, waitMs, base });
 }
 

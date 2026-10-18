@@ -34,6 +34,8 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  // Wave A inline behaviour: pin segmented storage off (segmented evidence: test/large-pages/segmented-evidence*.test.ts).
+  await engine.setConfig('pages.segmented_storage', 'off');
 }, 120_000);
 afterAll(async () => { await engine.disconnect(); }, 60_000);
 

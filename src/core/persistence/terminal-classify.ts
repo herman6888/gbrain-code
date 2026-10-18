@@ -31,7 +31,9 @@ export type TerminalCategory =
   | 'knock_on' | 'run_replaced' | 'outside_fence'
   | 'operator_cancelled' | 'caller_conflict' | 'file_conflict' | 'canonical_file_missing' | 'fence_unrenderable'
   | 'writer_guard' | 'database_refusal' | 'owner_exception' | 'legacy_publication_refusal'
-  | 'sync_fault' | 'transport' | 'caller_refusal' | 'gbrain_defect' | 'diagnosis_required';
+  | 'sync_fault' | 'transport' | 'caller_refusal' | 'gbrain_defect' | 'diagnosis_required'
+  // #6904: the write met a missing relation or column (42P01 / 42703); the schema is behind this build or lost a table.
+  | 'schema_missing';
 
 /** The receipt columns the classifier reads; every one but `intent_kind` and `error_message` survives compaction. */
 export interface TerminalInput {
@@ -53,6 +55,11 @@ export interface TerminalInput {
   error_message?: string | null;
   /** A reader that computed `terminalKnockOnSql` passes its answer, so the SQL twin and this verdict cannot disagree. */
   knock_on?: boolean;
+  /**
+   * #6904: whether the brain's schema is behind this build now (`readSchemaBehind`), which picks a `schema_missing` verdict's
+   * fix: apply-migrations when behind, the missing-tables check when at head. Absent or null: unknown, the fix is a doctor read.
+   */
+  schema_behind?: boolean | null;
 }
 
 export interface TerminalVerdict {
@@ -211,6 +218,10 @@ function route(input: TerminalInput): Partial_ {
         'Read recent_failures[].error_detail from gbrain sources writer status --probe --json on the brain host, check doctor managed_guard_schema_drift, then retry the write with a new request id (gbrain repair failed-writes replays caller writes).'),
       argv: ['gbrain', 'sources', 'writer', 'status', '--source', source, '--probe', '--json'] } };
   }
+  // #6904: a missing relation or column, classified at publication, or recorded as an owner exception by an older build (its errno).
+  if (reason === 'schema_missing' || (origin === 'owner_exception' && ['42P01', '42703'].includes(stringField(detail, 'errno') ?? ''))) {
+    return schemaMissingVerdict(input, code, origin, stringField(detail, 'missing'));
+  }
   if (origin === 'owner_exception') {
     return { category: 'owner_exception', code, origin, class: 'systemic', safe_actions: ['upgrade'], needs_human: true,
       human_reason: 'The owner raised an unexpected exception while running this write: a gbrain defect.',
@@ -303,6 +314,28 @@ function route(input: TerminalInput): Partial_ {
     escalate: 'never: the caller saw the refusal and its fix',
     action: { argv: terminalInspectArgv(input.request_id ?? '<request_id>'), consent: [], actor: 'agent', requires_exclusive: false,
       why: `The caller's write was refused ${code} and the caller saw why; the receipt carries the diagnosis, read-only.`, verify: { argv: failuresArgv(source) } } };
+}
+
+/** #6904: the schema-missing verdict; the fix depends on whether the schema is behind this build right now. */
+function schemaMissingVerdict(input: TerminalInput, code: string, origin: string | null, missing: string | null): Partial_ {
+  const what = missing ? `the ${missing} relation or column` : 'a relation or column';
+  const verify = { argv: ['gbrain', 'doctor', '--json'] };
+  const base = { category: 'schema_missing' as const, code, origin, class: 'systemic' as const };
+  if (input.schema_behind === true) {
+    return { ...base, safe_actions: ['migrate'], needs_human: false, escalate: 'the schema is still behind after gbrain apply-migrations --yes (doctor schema_version names the failing migration)',
+      action: { argv: ['gbrain', 'apply-migrations', '--yes'], consent: [], actor: 'agent', requires_exclusive: true,
+        why: `The write needed ${what}, which a pending migration adds: the brain schema is behind this gbrain build. Apply the migrations as the database role that owns the gbrain tables, then resubmit the write with a new request id.`,
+        verify, docs: 'docs/guides/write-refusals.md#schema_behind' } };
+  }
+  if (input.schema_behind === false) {
+    const human = `The write needed ${what}, but the schema version is at head: a table or column is missing outside a migration (an older backup restored, a table dropped by hand, or a migration recorded without its change). Doctor's schema_missing_tables check names what is missing and gbrain repair missing-tables previews recreating it; decide with the user before applying.`;
+    return { ...base, safe_actions: ['repair'], needs_human: true, human_reason: human, escalate: 'always: the schema is at head and still lacks what the write needs',
+      action: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false, ask_user: true, user_message: human,
+        why: "Read-only: doctor's schema_missing_tables check lists the missing tables and columns and names the gbrain repair missing-tables preview.", verify } };
+  }
+  return { ...base, safe_actions: ['none'], needs_human: false, escalate: 'doctor reports the schema at head and the write still fails on a missing relation or column',
+    action: { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+      why: `The write needed ${what}. Read-only: when doctor's schema_version reports the schema behind, run gbrain apply-migrations --yes as the database role that owns the gbrain tables and resubmit; when it is at head, its schema_missing_tables check names what is missing (gbrain repair missing-tables previews it).` } };
 }
 
 function faultAction(code: string, input: TerminalInput): Action {
