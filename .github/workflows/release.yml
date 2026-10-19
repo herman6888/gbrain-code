@@ -80,6 +80,8 @@ jobs:
     outputs:
       publish: ${{ steps.gate.outputs.publish }}
       sha: ${{ steps.gate.outputs.sha }}
+      test_reused_run_id: ${{ steps.gate.outputs.test_reused_run_id }}
+      e2e_reused_run_id: ${{ steps.gate.outputs.e2e_reused_run_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
