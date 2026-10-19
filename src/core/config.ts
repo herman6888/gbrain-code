@@ -1406,6 +1406,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Multi-hop chain slots: chain rows leading page 1 when a chain fired (mode.ts reads; 0..10).
   'search.relational_chain_slots',
   'search.diverse_pool_depth', // session-diverse pool before the reranker (mode.ts reads; `off` | 0..100; 0 = off)
+  'search.auto_time_scope', // fork: explicit time cue softly surfaces in-range pages (auto-time-scope.ts; `off` | `reserved` | `partition`)
   // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
   'search.keyword_arm_confidence_floor',
   // Ranker wave (Phase E3): metadata boost gate — `lexical` skips post-fusion metadata boosts when the vector arm was the only voter (mode.ts reads; `always` | `lexical`).

@@ -23,6 +23,7 @@ import { affectsRecall } from '../types.ts';
 export { resolveDateBoundary, resolveSearchDateBounds } from './date-bounds.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 import { embedQuery } from '../embedding.ts';
+import { resolveAutoTimeScope, applyAutoTimeScope } from './auto-time-scope.ts';
 import { loadEmbeddingQueryPrefix } from './query-prefix.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
@@ -1184,8 +1185,15 @@ export async function hybridSearch(
     exactLookupOpts: lexical.exactLookupOpts, multimodal: effectiveModality !== 'text' || unifiedDone,
   }));
   opts?.explainTarget?.observe('reranked', rerankPinned);
+  // Fork extension (auto time scope): explicit time cue in the query softly
+  // surfaces in-range pages; fail-open, explicit since/until wins.
+  const autoTimeScope = await timer.stage('time_scope', () => resolveAutoTimeScope(engine, query, opts ?? {}));
+  const rerankScoped = autoTimeScope
+    ? applyAutoTimeScope(rerankPinned, autoTimeScope, req.limit ?? 10).results
+    : rerankPinned;
+  opts?.explainTarget?.observe('time_scoped', rerankScoped);
   const { returnPool, adaptiveDecision, autocutDecision, relationalSlotDecision } = await timer.stage('post_fusion', () => sizeReturnPool(req, {
-    rerankPinned, deduped, exactLookupOpts: lexical.exactLookupOpts, relationalList, effectiveModality, identityLookups,
+    rerankPinned: rerankScoped, deduped, exactLookupOpts: lexical.exactLookupOpts, relationalList, effectiveModality, identityLookups,
   }));
   opts?.explainTarget?.observe('return_pool', returnPool);
   return timer.stage('post_fusion', () => finalizeHybridResults(req, returnPool, {
