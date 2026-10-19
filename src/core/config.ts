@@ -1409,6 +1409,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.auto_time_scope', // fork: explicit time cue softly surfaces in-range pages (auto-time-scope.ts; `off` | `reserved` | `partition`)
   'search.audit_log', // fork: append retrieval decision JSONL (retrieval-audit.ts; `off` | `on`)
   'search.audit_path', // fork: audit JSONL directory (retrieval-audit.ts; string path)
+  'search.routing_decider_url', // fork: julia JEV systemone endpoint for query routing (routing-decider.ts; '' = rules-only)
+  'search.routing_decider_timeout_ms', // fork: decider timeout, rules take over (routing-decider.ts; int, default 800)
   // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
   'search.keyword_arm_confidence_floor',
   // Ranker wave (Phase E3): metadata boost gate — `lexical` skips post-fusion metadata boosts when the vector arm was the only voter (mode.ts reads; `always` | `lexical`).
