@@ -29,6 +29,7 @@ import { dayInZone } from '../effective-date.ts';
 import { logRetrievalDecision, auditQueryHash } from './retrieval-audit.ts';
 import { getRoutingNeeds, type RouteNeeds } from './routing-decider.ts';
 import { allocateBudgets, DEFAULT_BUDGET_CONFIG, NEEDS, type RetrievalNeed } from './query-router.ts';
+import { getStoppingDecision, DEFAULT_STOPPING_CONFIG } from './stopping-decider.ts';
 import { loadEmbeddingQueryPrefix } from './query-prefix.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
@@ -1229,6 +1230,16 @@ export async function hybridSearch(
  * skipped vector search entirely (no embedding provider configured). In
  * that case the cache is also skipped — there's no embedding to key on.
  */
+/** Round merge for adaptive expansion: keep the best score per page, re-descend. */
+function mergeRoundResults(a: SearchResult[], b: SearchResult[]): SearchResult[] {
+  const best = new Map<string, SearchResult>();
+  for (const r of [...a, ...b]) {
+    const cur = best.get(r.slug);
+    if (!cur || r.score > cur.score) best.set(r.slug, r);
+  }
+  return [...best.values()].sort((x, y) => y.score - x.score);
+}
+
 // Fork extension (Jev-Mem borrowing Phase 2): fire-and-forget decision audit
 // for the public search entry. Records query hash, cache posture, temporal
 // cue, hits and latency to the day-rotated JSONL (retrieval-audit.ts). Never
@@ -1237,7 +1248,7 @@ async function emitRetrievalAudit(
   engine: BrainEngine,
   query: string,
   auditT0: number,
-  extra: { cache: 'hit' | 'miss' | 'disabled'; hits: number; mode?: string | null; routing?: { needs: RouteNeeds; budget: Record<RetrievalNeed, number>; decider: 'julia' | 'fallback' } | null },
+  extra: { cache: 'hit' | 'miss' | 'disabled'; hits: number; mode?: string | null; routing?: { needs: RouteNeeds; budget: Record<RetrievalNeed, number>; decider: 'julia' | 'fallback' } | null; stop?: { round: number; stop_reason: string; decider: 'julia' | 'fallback' } | null },
 ): Promise<void> {
   try {
     const tz = (await engine.getConfig('brain.timezone').catch(() => null))?.trim()
@@ -1256,7 +1267,8 @@ async function emitRetrievalAudit(
         route: extra.routing.needs,
         budget: extra.routing.budget,
       } : {}),
-      decider: extra.routing?.decider ?? 'none',
+      ...(extra.stop ? { round: extra.stop.round, stop_reason: extra.stop.stop_reason } : {}),
+      decider: extra.stop?.decider ?? extra.routing?.decider ?? 'none',
     });
   } catch {
     // swallow
@@ -1352,7 +1364,7 @@ export async function hybridSearchCached(
   // we use a single-element box to keep the type stable.
   const innerMetaBox: { current: HybridSearchMeta | null } = { current: null };
   const userOnMeta = opts?.onMeta;
-  const results = await hybridSearch(engine, query, {
+  const innerOpts: HybridSearchOpts = {
     ...opts,
     ...(routedLimit ? { limit: routedLimit } : {}),
     // v0.42.20.0 (Fix 3) — share the query-embed deadline so the inner embed
@@ -1371,7 +1383,30 @@ export async function hybridSearchCached(
       // Do NOT call userOnMeta here — we'll emit a merged meta below
       // that also carries cache + budget info.
     },
-  });
+  };
+  // Fork extension (Jev-Mem borrowing Phase 4): adaptive stopping —
+  // after each retrieval round an evidence-sufficiency decider (julia with
+  // rule fail-soft) answers stop vs expand; expansion re-retrieves with a
+  // larger limit and merges. Config search.adaptive_stop: off (default) | on.
+  const adaptiveOn = (await engine.getConfig('search.adaptive_stop').catch(() => null))?.trim() === 'on';
+  const maxRounds = adaptiveOn
+    ? Math.max(1, Math.min(5, Number((await engine.getConfig('search.adaptive_stop_max_rounds').catch(() => null))?.trim()) || 3))
+    : 1;
+  let results = await hybridSearch(engine, query, innerOpts);
+  let stopAudit: { round: number; stop_reason: string; decider: 'julia' | 'fallback' } | null = null;
+  if (adaptiveOn) {
+    const stopCfg = { ...DEFAULT_STOPPING_CONFIG, maxRounds };
+    let round = 1;
+    for (;;) {
+      const d = await getStoppingDecision(engine, query, results, round, stopCfg);
+      stopAudit = { round, stop_reason: d.stop_reason, decider: d.decider };
+      if (d.stop) break;
+      round++;
+      const expandLimit = Math.min(100, Math.round((routedLimit ?? (opts?.limit ?? 50)) * 1.5));
+      const more = await hybridSearch(engine, query, { ...innerOpts, limit: expandLimit });
+      results = mergeRoundResults(results, more);
+    }
+  }
   const innerMeta = innerMetaBox.current;
 
   // Token budget pass (no-op when not set).
@@ -1446,7 +1481,7 @@ export async function hybridSearchCached(
   }
 
   void emitRetrievalAudit(engine, query, auditT0, {
-    cache: cacheStatus, hits: budgeted.length, mode: finalMeta.mode ?? null, routing,
+    cache: cacheStatus, hits: budgeted.length, mode: finalMeta.mode ?? null, routing, stop: stopAudit,
   });
 
   return budgeted;

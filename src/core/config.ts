@@ -1413,6 +1413,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.routing_decider_timeout_ms', // fork: decider timeout, rules take over (routing-decider.ts; int, default 800)
   'search.routed_budget', // fork: shrink per-arm fetch limit to routed budget (hybrid.ts; `off` | `on`)
   'search.routed_budget_total', // fork: total candidate budget for allocation (hybrid.ts; int, default 40)
+  'search.adaptive_stop', // fork: retrieve->assess->expand loop after the first round (stopping-decider.ts; `off` | `on`)
+  'search.adaptive_stop_max_rounds', // fork: hard cap on retrieval rounds incl. the first (hybrid.ts; 1..5, default 3)
+  'search.stopping_decider_url', // fork: julia JEV endpoint for stopping questions (stopping-decider.ts; '' = rules-only)
+  'search.stopping_decider_timeout_ms', // fork: stopping decider timeout (stopping-decider.ts; int, default 1000)
   // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
   'search.keyword_arm_confidence_floor',
   // Ranker wave (Phase E3): metadata boost gate — `lexical` skips post-fusion metadata boosts when the vector arm was the only voter (mode.ts reads; `always` | `lexical`).
