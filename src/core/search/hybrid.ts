@@ -27,6 +27,8 @@ import { resolveAutoTimeScope, applyAutoTimeScope } from './auto-time-scope.ts';
 import { parseQueryTimeRange } from './time-range.ts';
 import { dayInZone } from '../effective-date.ts';
 import { logRetrievalDecision, auditQueryHash } from './retrieval-audit.ts';
+import { getRoutingNeeds, type RouteNeeds } from './routing-decider.ts';
+import { allocateBudgets, DEFAULT_BUDGET_CONFIG, NEEDS, type RetrievalNeed } from './query-router.ts';
 import { loadEmbeddingQueryPrefix } from './query-prefix.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
@@ -1235,7 +1237,7 @@ async function emitRetrievalAudit(
   engine: BrainEngine,
   query: string,
   auditT0: number,
-  extra: { cache: 'hit' | 'miss' | 'disabled'; hits: number; mode?: string | null },
+  extra: { cache: 'hit' | 'miss' | 'disabled'; hits: number; mode?: string | null; routing?: { needs: RouteNeeds; budget: Record<RetrievalNeed, number>; decider: 'julia' | 'fallback' } | null },
 ): Promise<void> {
   try {
     const tz = (await engine.getConfig('brain.timezone').catch(() => null))?.trim()
@@ -1250,7 +1252,11 @@ async function emitRetrievalAudit(
       hits: extra.hits,
       latency_ms: Date.now() - auditT0,
       ...(tr ? { temporal: { cue: tr.cue, start: tr.start, end: tr.end } } : {}),
-      decider: 'none',
+      ...(extra.routing ? {
+        route: extra.routing.needs,
+        budget: extra.routing.budget,
+      } : {}),
+      decider: extra.routing?.decider ?? 'none',
     });
   } catch {
     // swallow
@@ -1264,6 +1270,23 @@ export async function hybridSearchCached(
 ): Promise<SearchResult[]> {
   if (opts?.types?.length === 0) return [];
   const auditT0 = Date.now();
+  // Fork extension (Jev-Mem borrowing Phase 3): routed budget — a System-One
+  // classifier (julia with rule fail-soft) scores four retrieval needs, the
+  // largest-remainder allocator turns them into per-arm budgets, and the
+  // pipeline's per-arm fetch limit shrinks to the dominant budget.
+  // Config search.routed_budget: off (default) | on.
+  let routing: { needs: RouteNeeds; budget: Record<RetrievalNeed, number>; decider: 'julia' | 'fallback' } | null = null;
+  let routedLimit: number | undefined;
+  {
+    const routedOn = (await engine.getConfig('search.routed_budget').catch(() => null))?.trim() === 'on';
+    if (routedOn && !opts?.limit) {
+      const decision = await getRoutingNeeds(engine, query);
+      const total = Number((await engine.getConfig('search.routed_budget_total').catch(() => null))?.trim()) || 40;
+      const budget = allocateBudgets(decision.needs, { ...DEFAULT_BUDGET_CONFIG, total });
+      routing = { needs: decision.needs, budget, decider: decision.decider };
+      routedLimit = Math.max(...NEEDS.map((n) => budget[n]), 4);
+    }
+  }
   const timer = opts?._timings ?? UNTIMED;
   const { modeInputForCache, resolvedForCache, knobsHash } = await timer.stage('setup', () => resolveCacheSearchMode(engine, opts));
   const queryPrefix = opts?._queryPrefix ?? await timer.stage('setup', () => loadEmbeddingQueryPrefix(engine));
@@ -1318,7 +1341,7 @@ export async function hybridSearchCached(
   if (semanticCache && !skipCache && queryEmbedding && cacheStatus !== 'disabled') {
     const served = await serveSemanticCacheHit(engine, query, opts, semanticCache, queryEmbedding, resolvedForCache);
     if (served) {
-      void emitRetrievalAudit(engine, query, auditT0, { cache: 'hit', hits: served.length });
+      void emitRetrievalAudit(engine, query, auditT0, { cache: 'hit', hits: served.length, routing });
       return served;
     }
   }
@@ -1331,6 +1354,7 @@ export async function hybridSearchCached(
   const userOnMeta = opts?.onMeta;
   const results = await hybridSearch(engine, query, {
     ...opts,
+    ...(routedLimit ? { limit: routedLimit } : {}),
     // v0.42.20.0 (Fix 3) — share the query-embed deadline so the inner embed
     // doesn't start a fresh 6s budget after the cache-lookup already spent it.
     _queryEmbedDeadline: queryEmbedDl,
@@ -1422,7 +1446,7 @@ export async function hybridSearchCached(
   }
 
   void emitRetrievalAudit(engine, query, auditT0, {
-    cache: cacheStatus, hits: budgeted.length, mode: finalMeta.mode ?? null,
+    cache: cacheStatus, hits: budgeted.length, mode: finalMeta.mode ?? null, routing,
   });
 
   return budgeted;

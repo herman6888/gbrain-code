@@ -1411,6 +1411,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.audit_path', // fork: audit JSONL directory (retrieval-audit.ts; string path)
   'search.routing_decider_url', // fork: julia JEV systemone endpoint for query routing (routing-decider.ts; '' = rules-only)
   'search.routing_decider_timeout_ms', // fork: decider timeout, rules take over (routing-decider.ts; int, default 800)
+  'search.routed_budget', // fork: shrink per-arm fetch limit to routed budget (hybrid.ts; `off` | `on`)
+  'search.routed_budget_total', // fork: total candidate budget for allocation (hybrid.ts; int, default 40)
   // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
   'search.keyword_arm_confidence_floor',
   // Ranker wave (Phase E3): metadata boost gate — `lexical` skips post-fusion metadata boosts when the vector arm was the only voter (mode.ts reads; `always` | `lexical`).
