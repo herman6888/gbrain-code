@@ -105,6 +105,24 @@ const NUM = String.raw`(\d{1,3}|a couple of|a few|couple of|one|two|three|four|f
 const MONTH_RE = String.raw`(january|february|march|april|may|june|july|august|september|sept|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.?`;
 const WEEKDAY_RE = String.raw`(monday|tuesday|wednesday|thursday|friday|saturday|sunday)`;
 
+// CJK helpers: Chinese numerals (1-31), weekday map, week-word regex.
+const CN_DIGITS: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function cnNumber(raw: string): number | null {
+  if (/^\d{1,3}$/.test(raw)) return parseInt(raw, 10);
+  const s = raw.trim();
+  if (!s) return null;
+  if (s === '十') return 10;
+  const m = /^([一二两三四五六七八九])?十([一二三四五六七八九])?$/.exec(s);
+  if (m) return (m[1] ? CN_DIGITS[m[1]] : 1) * 10 + (m[2] ? CN_DIGITS[m[2]] : 0);
+  if (s.length === 1) return CN_DIGITS[s] ?? (s === '卅' ? 30 : null);
+  return null;
+}
+const CN_WEEKDAYS: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 0, 天: 0 };
+const CN_WEEK_RE = String.raw`(?:周|星期|礼拜)`;
+const CN_NUM = String.raw`(\d{1,3}|[一二两三四五六七八九十]{1,3})`;
+const CN_NUM12 = String.raw`(十一|十二|[一二三四五六七八九十])`;
+const CN_NUM31 = String.raw`(三十|二十[一二三四五六七八九]?|廿[一二三四五六七八九]?|十[一二三四五六七八九]?|[一二三四五六七八九])`;
+
 interface Rule {
   re: RegExp;
   resolve: (m: RegExpMatchArray, ref: string, dir: Direction) => (DayRange & { kind: 'relative' | 'absolute'; qualified?: boolean }) | null;
@@ -278,6 +296,114 @@ const RULES: Rule[] = [
     const c = addDays(ref, unit === 'day' ? n : unit === 'week' ? 7 * n : 30 * n);
     const s = unit === 'day' ? 1 : unit === 'week' ? 3 : 15;
     return { start: addDays(c, -s), end: addDays(c, s), kind: 'relative' };
+  } },
+  // -------------------------------------------------------------------------
+  // CJK (Chinese) cues. The brain corpus on this fork is overwhelmingly
+  // Chinese; upstream grammar is English-only. Overlap resolution in
+  // findTimeMentions keeps the longest match (上周五 > 周五, 2026年10月17日 > 10月).
+  // -------------------------------------------------------------------------
+  // 今天/昨天/前天/…/昨晚/刚刚 → single day
+  { re: /(前天|前日|昨天|昨日|昨晚|昨天晚上|昨夜|明天|明日|后天|后日|今晚|今天晚上|今早|今天早上|今晨|今天|今日|刚才|刚刚)/g, resolve: (m, ref) => {
+    const w = m[1];
+    const off = w === '前天' || w === '前日' ? -2
+      : w === '昨天' || w === '昨日' || w === '昨晚' || w === '昨天晚上' || w === '昨夜' ? -1
+      : w === '明天' || w === '明日' ? 1
+      : w === '后天' || w === '后日' ? 2 : 0;
+    const day = addDays(ref, off);
+    return { start: day, end: day, kind: 'relative' };
+  } },
+  // 上(个)星期五 / 这周X / 下星期X / 上上周五
+  { re: new RegExp(String.raw`(上上|上|这|本|下)(?:个)?${CN_WEEK_RE}([一二三四五六日天])(?!([一二三四五六七八九十]|号))`, 'g'), resolve: (m, ref) => {
+    const target = CN_WEEKDAYS[m[2]]; if (target === undefined) return null;
+    const ws = weekStart(ref);
+    const base = m[1] === '上上' ? addDays(ws, -14) : m[1] === '上' ? addDays(ws, -7) : m[1] === '下' ? addDays(ws, 7) : ws;
+    const day = addDays(base, target === 0 ? 6 : target - 1); // weekStart is Monday
+    return { start: day, end: day, kind: 'relative' };
+  } },
+  // 裸 周五/星期五/礼拜五：最近过去的该星期几
+  { re: new RegExp(String.raw`(?:周|星期|礼拜)([一二三四五六日天])`, 'g'), resolve: (m, ref) => {
+    const target = CN_WEEKDAYS[m[1]]; if (target === undefined) return null;
+    const dow = parseDay(ref).getUTCDay();
+    const day = addDays(ref, -((dow - target + 7) % 7));
+    return { start: day, end: day, kind: 'relative', qualified: true };
+  } },
+  // 上周 / 这周 / 下周 / 上上周（整周，周一~周日）
+  { re: new RegExp(String.raw`(上上|上|这|本|下)(?:个)?${CN_WEEK_RE}(?![一二三四五六日天])`, 'g'), resolve: (m, ref) => {
+    const ws = weekStart(ref);
+    const s = m[1] === '上上' ? addDays(ws, -14) : m[1] === '上' ? addDays(ws, -7) : m[1] === '下' ? addDays(ws, 7) : ws;
+    return { start: s, end: addDays(s, 6), kind: 'relative' };
+  } },
+  // 上个月 / 这个月 / 本月 / 下个月 / 上上个月
+  { re: /(上上|上|这|本|下)个?月/g, resolve: (m, ref) => {
+    const r = parseDay(ref); const y = r.getUTCFullYear(); const mo = r.getUTCMonth();
+    const off = m[1] === '上上' ? -2 : m[1] === '上' ? -1 : m[1] === '下' ? 1 : 0;
+    return { ...monthRange(y, mo + off), kind: 'relative' };
+  } },
+  // 前年/去年/今年/明年
+  { re: /(前年|去年|今年|明年)/g, resolve: (m, ref) => {
+    const y = parseDay(ref).getUTCFullYear() + (m[1] === '明年' ? 1 : m[1] === '今年' ? 0 : m[1] === '去年' ? -1 : -2);
+    return { start: ymd(y, 0, 1), end: ymd(y, 11, 31), kind: 'relative' };
+  } },
+  // 最近N天 / 近30天 / 过去一周 / 这三个月（滚动窗口）
+  { re: new RegExp(String.raw`(最近|过去|这|近)\s*${CN_NUM}\s*(天|日|周|星期|个?月|年)`, 'g'), resolve: (m, ref) => {
+    const n = cnNumber(m[2]); if (!n || n <= 0 || n > 400) return null;
+    const unit = m[3];
+    const days = unit === '天' || unit === '日' ? n
+      : unit === '周' || unit === '星期' ? 7 * n
+      : unit.includes('月') ? 30 * n : 365 * n;
+    return { start: addDays(ref, -days), end: ref, kind: 'relative' };
+  } },
+  // N天前 / 两周前 / 三个月前
+  { re: new RegExp(String.raw`${CN_NUM}\s*(天|日|周|星期|个?月|年)前`, 'g'), resolve: (m, ref) => {
+    const n = cnNumber(m[1]); if (!n || n <= 0) return null;
+    const unit = m[2];
+    if (unit === '天' || unit === '日') { const c = addDays(ref, -n); return { start: addDays(c, -1), end: addDays(c, 1), kind: 'relative' }; }
+    if (unit === '周' || unit === '星期') { const c = addDays(ref, -7 * n); return { start: addDays(c, -3), end: addDays(c, 3), kind: 'relative' }; }
+    if (unit.includes('月')) {
+      const r = parseDay(ref);
+      const c = toDay(new Date(Date.UTC(r.getUTCFullYear(), r.getUTCMonth() - n, Math.min(r.getUTCDate(), 28))));
+      return { start: addDays(c, -15), end: addDays(c, 15), kind: 'relative' };
+    }
+    const y = parseDay(ref).getUTCFullYear() - n;
+    return { start: ymd(y, 0, 1), end: ymd(y, 11, 31), kind: 'relative' };
+  } },
+  // 2026年10月17日 / 10月17号（无年份按过去方向补年份）
+  { re: /(?:(\d{4})年)?(\d{1,2})月(\d{1,2})[日号]/g, resolve: (m, ref, dir) => {
+    const mo = +m[2] - 1; const d = +m[3];
+    if (mo < 0 || mo > 11 || d < 1 || d > 31) return null;
+    let year: number; let qualified = false;
+    if (m[1]) year = +m[1];
+    else { ({ year } = pickYearForMonth(mo, ref, dir)); qualified = true; }
+    if (!isRealDay(year, mo, d)) return null;
+    const day = ymd(year, mo, d);
+    return { start: day, end: day, kind: m[1] ? 'absolute' : 'relative', qualified };
+  } },
+  // 十月十七日（中文数字月日，年份按过去方向补）
+  { re: new RegExp(String.raw`${CN_NUM12}月${CN_NUM31}[日号]`, 'g'), resolve: (m, ref, dir) => {
+    const mo = cnNumber(m[1]); const d = cnNumber(m[2]);
+    if (!mo || mo < 1 || mo > 12 || !d || d < 1 || d > 31) return null;
+    const { year } = pickYearForMonth(mo - 1, ref, dir);
+    if (!isRealDay(year, mo - 1, d)) return null;
+    const day = ymd(year, mo - 1, d);
+    return { start: day, end: day, kind: 'relative', qualified: true };
+  } },
+  // 2026年10月
+  { re: /(\d{4})年(\d{1,2})月(?!\d*[日号])/g, resolve: (m) => {
+    const y = +m[1]; const mo = +m[2] - 1;
+    if (mo < 0 || mo > 11) return null;
+    return { ...monthRange(y, mo), kind: 'absolute' };
+  } },
+  // 2026年
+  { re: /((?:19|20|21)\d{2})年/g, resolve: (m) => {
+    const y = +m[1];
+    return { start: ymd(y, 0, 1), end: ymd(y, 11, 31), kind: 'absolute' };
+  } },
+  // 上周末/这周末/下周末/周末（周六~周日）
+  { re: /(上上|上|这|本|下)?周末/g, resolve: (m, ref) => {
+    const ws = weekStart(ref);
+    const off = m[1] === '上上' ? -14 : m[1] === '上' ? -7 : m[1] === '下' ? 7 : 0;
+    const sat = addDays(ws, 5);
+    return { start: addDays(sat, off), end: addDays(sat, off + 1), kind: 'relative', qualified: !m[1] };
   } },
 ];
 

@@ -29,7 +29,7 @@ export interface TimeRangeParse {
 /** Two mentions joined by "and/or/to/through/-" with nothing else between them are one span. */
 function joined(text: string, a: TimeMention, b: TimeMention): boolean {
   const between = text.slice(a.index + a.cue.length, b.index).trim().toLowerCase();
-  return /^(?:and|or|to|through|until|till|-|–|—)$/.test(between);
+  return /^(?:and|or|to|through|until|till|-|–|—|和|与|及|到|至|~)$/.test(between);
 }
 
 export function parseQueryTimeRange(query: string, referenceDate: string): TimeRangeParse {
