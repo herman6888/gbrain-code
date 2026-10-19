@@ -24,6 +24,9 @@ export { resolveDateBoundary, resolveSearchDateBounds } from './date-bounds.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 import { embedQuery } from '../embedding.ts';
 import { resolveAutoTimeScope, applyAutoTimeScope } from './auto-time-scope.ts';
+import { parseQueryTimeRange } from './time-range.ts';
+import { dayInZone } from '../effective-date.ts';
+import { logRetrievalDecision, auditQueryHash } from './retrieval-audit.ts';
 import { loadEmbeddingQueryPrefix } from './query-prefix.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
@@ -1224,12 +1227,43 @@ export async function hybridSearch(
  * skipped vector search entirely (no embedding provider configured). In
  * that case the cache is also skipped — there's no embedding to key on.
  */
+// Fork extension (Jev-Mem borrowing Phase 2): fire-and-forget decision audit
+// for the public search entry. Records query hash, cache posture, temporal
+// cue, hits and latency to the day-rotated JSONL (retrieval-audit.ts). Never
+// awaited, never throws: an audit failure must not affect a search.
+async function emitRetrievalAudit(
+  engine: BrainEngine,
+  query: string,
+  auditT0: number,
+  extra: { cache: 'hit' | 'miss' | 'disabled'; hits: number; mode?: string | null },
+): Promise<void> {
+  try {
+    const tz = (await engine.getConfig('brain.timezone').catch(() => null))?.trim()
+      || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const ref = dayInZone(new Date(), tz);
+    const tr = parseQueryTimeRange(query, ref).range;
+    await logRetrievalDecision(engine, {
+      ts: new Date().toISOString(),
+      query_hash: auditQueryHash(query),
+      ...(extra.mode ? { mode: extra.mode } : {}),
+      cache: extra.cache,
+      hits: extra.hits,
+      latency_ms: Date.now() - auditT0,
+      ...(tr ? { temporal: { cue: tr.cue, start: tr.start, end: tr.end } } : {}),
+      decider: 'none',
+    });
+  } catch {
+    // swallow
+  }
+}
+
 export async function hybridSearchCached(
   engine: BrainEngine,
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
   if (opts?.types?.length === 0) return [];
+  const auditT0 = Date.now();
   const timer = opts?._timings ?? UNTIMED;
   const { modeInputForCache, resolvedForCache, knobsHash } = await timer.stage('setup', () => resolveCacheSearchMode(engine, opts));
   const queryPrefix = opts?._queryPrefix ?? await timer.stage('setup', () => loadEmbeddingQueryPrefix(engine));
@@ -1283,7 +1317,10 @@ export async function hybridSearchCached(
 
   if (semanticCache && !skipCache && queryEmbedding && cacheStatus !== 'disabled') {
     const served = await serveSemanticCacheHit(engine, query, opts, semanticCache, queryEmbedding, resolvedForCache);
-    if (served) return served;
+    if (served) {
+      void emitRetrievalAudit(engine, query, auditT0, { cache: 'hit', hits: served.length });
+      return served;
+    }
   }
 
   // Cache miss (or disabled): run the normal search. We capture meta so
@@ -1383,6 +1420,10 @@ export async function hybridSearchCached(
         .catch(() => { /* swallow */ }),
     );
   }
+
+  void emitRetrievalAudit(engine, query, auditT0, {
+    cache: cacheStatus, hits: budgeted.length, mode: finalMeta.mode ?? null,
+  });
 
   return budgeted;
 }
