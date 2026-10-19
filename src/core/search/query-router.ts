@@ -87,12 +87,16 @@ const CAUSAL_RE = /为什么|为何|原因|根因|因何|由于|因为|导致|�
 const TEMPORAL_ASK_RE = /何时|什么时候|哪天|几点|哪一天|多久|时间线|先后顺序|when\b|timeline/i;
 /** Stable infrastructure/project entity vocabulary observed in this brain. */
 const ENTITY_RE = new RegExp([
-  'gbrain', 'openviking', '\\bov\\b', 'halogen', 'julia', 'kev', 'comfyui', 'openclash',
+  'gbrain', 'openviking', 'ov(?![a-z])', 'halogen', 'julia', 'kev', 'comfyui', 'openclash',
   'easytier', 'omarchy', 'quickshell', 'studio', 'hermes', 'ekko', 'whisper', 'strata',
-  '飞书', 'lark', 'anysearch', 'agent-?reach', 'deepseek', 'pi\\b', 'codex', 'smartdns', 'mosdns',
-  'vless', 'clash', 'xbox', 'core', 'd3-lite', 'decider', 'bge-m3', 'openrouter', 'opencode',
-  '\\.9[018]\\b', '\\.8[09]\\b', '192\\.168\\.8\\.\\d+', '\\bwol\\b', '\\bnas\\b',
-  '\\bvps\\b', '公众号', '小红书', '路由器', '虚拟机', '游戏机', '面板',
+  '飞书', 'lark', 'anysearch', 'agent-?reach', 'deepseek', '(?<![a-z])pi(?![a-z])', 'codex', 'smartdns', 'mosdns',
+  'vless', 'clash', 'xbox', '(?<![a-z])core(?![a-z])', 'd3-lite', 'decider', 'bge-m3', 'openrouter', 'opencode',
+  '\\.9[018]\\b', '\\.8[09]\\b', '192\\.168\\.8\\.\\d+', '(?<![a-z])wol(?![a-z])', '(?<![a-z])nas(?![a-z])',
+  '(?<![a-z])vps(?![a-z])', '(?<![a-z])ssh(?![a-z])', '公众号', '小红书', '路由器', '虚拟机', '游戏机', '面板',
+  'pmbrain', '(?<![a-z])exa(?![a-z])', 'mcporter', 'live-panel', '(?<![a-z])jev',
+  'arctic', 'reddit', 'switch2', '(?<![a-z])xsx(?![a-z])', 'teredo', 'openrig', '电台调频', 'ubuntu',
+  '微博', '知乎', 'b站', '头条', 'strix', '(?<![a-z])gpu(?![a-z])', 'agent-daily-journal', '(?<![a-z])npu(?![a-z])',
+  'reasoning-gate', 'c源', 'wechat-articles', '调度台', '(?<![a-z])cjk(?![a-z])',
 ].join('|'), 'i');
 
 /**
