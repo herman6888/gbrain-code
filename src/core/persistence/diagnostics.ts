@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { journalLimitKey, readJournalLimits } from './limits.ts';
+import { isStagedCounterKey, journalLimitKey, readJournalLimits } from './limits.ts';
 import type { JournalLimits } from './model.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
@@ -119,7 +119,7 @@ function claimPool(engine: BrainEngine, claim: ClaimState, row: ListedConsumer |
 interface Counter { key: string; outstanding_count: string | number; intent_bytes: string | number;
   lifetime_ids: string | number; terminal_bytes: string | number; recovery_bytes: string | number; }
 export function capacityDiagnostics(counters: Counter[], limits: JournalLimits) {
-  return counters.flatMap(counter => {
+  return counters.filter(counter => !isStagedCounterKey(counter.key)).flatMap(counter => {
     const scope = counter.key === 'brain' ? 'brain' : counter.key.startsWith('worktree:') ? 'worktree' : 'principal';
     const resources: Array<readonly [keyof Counter, keyof JournalLimits]> = scope === 'worktree'
       ? [['recovery_bytes', 'worktreeRecoveryBytes']]
@@ -180,7 +180,8 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   // #6278: the budgets, ceiling, attempt limit and switch in effect, next to every running blocker's step age.
   const snapshot = await readWriteSwitchSnapshot(engine).catch(() => null);
   const preparation_policy = snapshot ? { deadlines: snapshot.switches.preparation_deadlines, sync_preparation_ms: snapshot.preparation.syncMs,
-    maintenance_preparation_ms: snapshot.preparation.maintenanceMs, preparation_ceiling_ms: snapshot.preparation.ceilingMs, max_preparation_attempts: snapshot.preparation.maxAttempts } : null;
+    maintenance_preparation_ms: snapshot.preparation.maintenanceMs, preparation_ceiling_ms: snapshot.preparation.ceilingMs, max_preparation_attempts: snapshot.preparation.maxAttempts,
+    max_transient_retries: snapshot.preparation.transientRetries } : null;
   const { persistenceConsumerStatus } = await import('./service.ts');
   // #6317 (C1): the heartbeat rows of this host, read once, so each running claim can name its owner's liveness and pool.
   const { existingLocalHostId } = await import('./identity.ts');

@@ -40,6 +40,7 @@ export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
   { key: 'ocr_failed_other', reason: 'image-OCR run counter (import-file.ts), read by doctor queue_assets' },
   { key: 'ocr_skipped_budget', reason: 'image-OCR run counter (import-file.ts), read by doctor queue_assets' },
   { key: 'page_state.revision_backfill', reason: 'page-state revision backfill progress marker' },
+  { key: 'schema_migration_timeout', reason: 'the last schema migration that ran out of its statement budget, written and cleared by migrate.ts (migration-timeout.ts, #7108)' },
   { key: 'persistence.database_only_sources', reason: 'list maintained by gbrain sources writer activate/deactivate; config unset (which takes any key) is the documented escape hatch' },
   { key: 'persistence.maintenance.last_compaction', reason: 'receipt compaction pass cursor (compaction-pass.ts)' },
   { key: 'persistence.true_up.compacted_through', reason: 'receipt true-up cursor (receipt-true-up.ts)' },
@@ -53,6 +54,7 @@ export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
   { key: 'shared_skills.export.v1.', prefix: true, reason: 'shared-skills migration export receipts' },
   { key: 'shared_skills.content.v1.', prefix: true, reason: 'shared-skills content setup state per source incarnation' },
   { key: 'shared_skills.migration.v1.', prefix: true, reason: 'shared-skills migration checkpoints per source incarnation' },
+  { key: 'shared_skills.migration.v1', reason: 'the shared-skills migration report the 0.53.0 migration writes and apply-migrations --list / doctor read for host work (#6796)' },
   { key: 'shared_skills.bridge_owner.v1.', prefix: true, reason: 'shared-brain bridge ownership claims' },
 ];
 
@@ -84,6 +86,7 @@ export const UNRESOLVED_CONFIG_READS: readonly UnresolvedConfigRead[] = [
   { file: 'src/commands/doctor/skill-checks.ts', expr: 'key', why: P },
   { file: 'src/commands/init-mode-picker.ts', expr: 'k', why: P },
   { file: 'src/commands/models.ts', expr: 'overrideKey', why: 'per-task model override key from the model-tier table (models.* prefix)' },
+  { file: 'src/commands/search.ts', expr: 'parts[3]', why: 'search tune --apply re-reads the key its recommendation just wrote, to reconcile a thrown write (search.* knobs from tune-recommendations.ts apply_command)' },
   { file: 'src/commands/skillpack/harness.ts', expr: 'key', why: P },
   { file: 'src/core/advisor/collect-setup-smells.ts', expr: 'key', why: P },
   { file: 'src/core/config-db-merge.ts', expr: 'key', why: 'listConfigKeys walk filtered to the cycle. and provider_chat_options. prefixes' },

@@ -26,7 +26,7 @@ import {
 import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
 import { setRunEngineSharing, withRunEngineSession } from './migrations/run-engine.ts';
-import { migrationDeclinedError, readDeclinedMigrations } from './migrations/opt-out.ts';
+import { migrationDeclinedError, readDeclinedMigrations, readHostWorkMigrations } from './migrations/opt-out.ts';
 import {
   indexCompletedEntries,
   statusForVersion as ledgerStatusForVersion,
@@ -34,6 +34,8 @@ import {
   isFreshInstallStamp,
   forwardProgressPast,
   isPendingFreshInstall,
+  hostWorkInspectArgv,
+  hostWorkPendingForVersion,
   MAX_CONSECUTIVE_PARTIALS,
   wedgedLedgerHint,
 } from '../core/migration-ledger.ts';
@@ -52,6 +54,7 @@ import {
   schemaPendingError,
   type SchemaPending,
 } from './apply-migrations-schema.ts';
+import { migrationStatementTimeoutMs, readMigrationTimeout, setMigrationStatementTimeoutMs, type MigrationTimeoutRecord } from '../core/migration-timeout.ts';
 
 interface ApplyMigrationsArgs {
   list: boolean;
@@ -80,6 +83,8 @@ interface ApplyMigrationsArgs {
   skipVerify?: boolean;
   /** #4364: exit 1 when the DB pre-flight probe fails instead of proceeding filesystem-only. */
   requireDb: boolean;
+  /** #7108: operator-only statement budget (minutes, 0 = none) for this run's schema migrations. */
+  statementTimeoutMinutes?: number;
   help: boolean;
 }
 
@@ -103,6 +108,11 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
       'Example: gbrain apply-migrations --migration 0.53.0 --accept-reviewed-inventory default=<digest> --yes'), COMMAND);
     accepted[match![1]] = match![2];
   });
+  const budget = val('--statement-timeout');
+  if (has('--statement-timeout') && !/^\d+$/.test(budget ?? '')) {
+    exitCliError(usageError('--statement-timeout takes whole minutes (0 removes the limit) for this run\'s schema migrations.',
+      'Example: gbrain apply-migrations --yes --statement-timeout 120'), COMMAND);
+  }
   if (mode && !['always', 'pain_triggered', 'off'].includes(mode)) {
     exitCliError(usageError(`Invalid --mode "${mode}". Allowed: always, pain_triggered, off.`,
       'Example: gbrain apply-migrations --yes --mode pain_triggered'), COMMAND);
@@ -127,6 +137,7 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     forceAll: has('--force-all') || has('--force'),
     skipVerify: has('--skip-verify'),
     requireDb: has('--require-db'),
+    ...(budget !== undefined && has('--statement-timeout') ? { statementTimeoutMinutes: Number(budget) } : {}),
     help: has('--help') || has('-h'),
   };
 }
@@ -155,6 +166,14 @@ Usage:
                                          pending_fresh_install = setup work a
                                          brain created by gbrain init has not
                                          run yet (expected; apply with --yes).
+                                         applied_pending_host_work = the
+                                         checkpoint is recorded but host work
+                                         (publication, client activation) is
+                                         not done; inspect it with --migration
+                                         <v> --dry-run --json, then --yes
+                                         records it (doctor minions_migration).
+                                         Unenrolled members and opted-out
+                                         sources are not host work.
   gbrain apply-migrations --migration vX.Y.Z
                                          Force-run a specific migration by version.
   gbrain apply-migrations --force-retry vX.Y.Z
@@ -176,6 +195,12 @@ Flags:
   --require-db                           Exit 1 when the database is unreachable
                                          instead of continuing with the
                                          filesystem-only migration plan.
+  --statement-timeout <minutes>          Operator escape hatch (#7108): the statement
+                                         budget for this run's schema migrations
+                                         (default 10; 0 removes it). Each one holds
+                                         its table locks that long, so writes wait.
+                                         Use it only when a migration times out with
+                                         nothing blocking it (doctor schema_version).
   --mode <always|pain_triggered|off>     Set minion_mode without prompting.
   --host-dir <path>                      Include this directory in host-file walk
                                          (default scope: \$HOME/.claude + \$HOME/.openclaw).
@@ -224,6 +249,8 @@ function statusForVersion(
 
 interface Plan {
   applied: Migration[];
+  /** #6796: applied migrations whose ledger row records host work and whose stored report still names some (a subset of applied). */
+  applied_pending_host_work: Migration[];
   partial: Migration[];
   pending: Migration[];
   /** Never run on a brain gbrain init created at or after its version: expected setup work, not an interrupted upgrade. */
@@ -253,8 +280,8 @@ interface Plan {
  * Codex H9: we never compare against `current VERSION >` — that rule would
  * skip v0.11.0 when running v0.11.1. Compare against completed.jsonl.
  */
-function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: string, declined: ReadonlySet<string> = new Set()): Plan {
-  const plan: Plan = { applied: [], partial: [], pending: [], pending_fresh_install: [], skippedFuture: [], wedged: [], wedged_superseded: [], declined: [] };
+function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: string, declined: ReadonlySet<string> = new Set(), hostWork: ReadonlySet<string> = new Set()): Plan {
+  const plan: Plan = { applied: [], applied_pending_host_work: [], partial: [], pending: [], pending_fresh_install: [], skippedFuture: [], wedged: [], wedged_superseded: [], declined: [] };
   const ledger = [...idx.byVersion.values()].flat();
   for (const m of migrations) {
     if (filterVersion && m.version !== filterVersion) continue;
@@ -264,8 +291,10 @@ function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: strin
     }
     if (declined.has(m.version)) { plan.declined.push(m); continue; }
     const status = statusForVersion(m.version, idx);
-    if (status === 'complete') plan.applied.push(m);
-    else if (status === 'partial') plan.partial.push(m);
+    if (status === 'complete') {
+      plan.applied.push(m);
+      if (hostWork.has(m.version) && hostWorkPendingForVersion(m.version, idx.byVersion)) plan.applied_pending_host_work.push(m);
+    } else if (status === 'partial') plan.partial.push(m);
     else if (status === 'wedged') (forwardProgressPast(m.version, ledger) === null ? plan.wedged : plan.wedged_superseded).push(m);
     else if (isPendingFreshInstall(m.version, idx.freshVersion)) plan.pending_fresh_install.push(m);
     else plan.pending.push(m);
@@ -297,7 +326,7 @@ const FINISH_SETUP_ARGV = ['gbrain', 'apply-migrations', '--yes', '--no-autopilo
 
 function listRows(plan: Plan): Array<{ status: string; m: Migration }> {
   return [
-    ...plan.applied.map(m => ({ status: 'applied', m })),
+    ...plan.applied.map(m => ({ status: plan.applied_pending_host_work.includes(m) ? 'applied_pending_host_work' : 'applied', m })),
     ...plan.partial.map(m => ({ status: 'partial', m })),
     ...[...plan.wedged, ...plan.wedged_superseded].map(m => ({ status: 'wedged', m })),
     ...plan.pending.map(m => ({ status: 'pending', m })),
@@ -324,8 +353,12 @@ function printList(plan: Plan, installed: string, dbProbe: DbProbeOutcome): void
   const setup = plan.pending_fresh_install.length;
   for (const m of plan.declined) console.log(`v${m.version} is declined by config (${m.optOut?.key} is false); turn it back on: gbrain config set ${m.optOut?.key} true`);
   for (const m of plan.wedged) console.log(`v${m.version} is wedged (${MAX_CONSECUTIVE_PARTIALS}+ consecutive partial runs). Read ${wedgedLedgerHint()}, fix the cause, then: ${shellQuote(forceRetryArgv(m.version))}`);
+  for (const m of plan.applied_pending_host_work) {
+    console.log(`v${m.version} is applied_pending_host_work: its mechanical checkpoint is recorded, but host publication or client activation is not done. `
+      + `Inspect each source's next step: ${shellQuote(hostWorkInspectArgv(m.version))}; once that work is done, \`gbrain apply-migrations --yes\` records it in the migration's report.`);
+  }
   if (needsWork === 0 && setup === 0 && plan.wedged.length === 0) {
-    console.log('All migrations up to date.');
+    if (plan.applied_pending_host_work.length === 0) console.log('All migrations up to date.');
     return;
   }
   if (needsWork > 0) console.log(`${needsWork} migration(s) need action. Run \`gbrain apply-migrations --yes\` to apply.`);
@@ -352,6 +385,8 @@ function listJson(plan: Plan, idx: CompletedIndex, installed: string, dbProbe: D
     needs_action: plan.pending.length + plan.partial.length,
     ...(plan.wedged.length ? { wedged: plan.wedged.map(m => ({ version: m.version, fix: { argv: forceRetryArgv(m.version), command: shellQuote(forceRetryArgv(m.version)) } })) } : {}),
     pending_fresh_install: plan.pending_fresh_install.length,
+    ...(plan.applied_pending_host_work.length ? { applied_pending_host_work: plan.applied_pending_host_work.map(m => ({ version: m.version,
+      fix: { argv: hostWorkInspectArgv(m.version), command: shellQuote(hostWorkInspectArgv(m.version)) } })) } : {}),
     ...(outstanding > 0 ? { next: { argv: FINISH_SETUP_ARGV, command: shellQuote(FINISH_SETUP_ARGV) } } : {}),
   };
 }
@@ -506,7 +541,18 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 export async function applyMigrations(args: string[]): Promise<{ exitCode: number | undefined; failure?: OperationError }> {
   const cli = parseArgs(args);
   if (cli.help) { printHelp(); return { exitCode: undefined }; }
+  if (cli.statementTimeoutMinutes === undefined) return applyParsed(cli, args);
+  // #7108: the operator's budget covers this run only, whichever way it returns.
+  const prior = migrationStatementTimeoutMs();
+  setMigrationStatementTimeoutMs(cli.statementTimeoutMinutes * 60_000);
+  try {
+    return await applyParsed(cli, args);
+  } finally {
+    setMigrationStatementTimeoutMs(prior);
+  }
+}
 
+async function applyParsed(cli: ApplyMigrationsArgs, args: string[]): Promise<{ exitCode: number | undefined; failure?: OperationError }> {
   const installed = VERSION.replace(/^v/, '').trim() || '0.0.0';
   const report: RunReport = { doc: { status: 'ok', installed } };
 
@@ -673,14 +719,16 @@ async function runLockedMigrations(
   }
 
   // Pre-flight: schema drift (#1530) and the DB probe (#4364); see preflightSchema.
-  const { schemaBehind, dbProbe } = await preflightSchema(cli, migrateSchema);
+  const { schemaBehind, dbProbe, schemaTimeout } = await preflightSchema(cli, migrateSchema);
 
   if (!cli.list && !cli.dryRun) await clearRepoPathWedge(loadCompletedMigrations());
   const completed = loadCompletedMigrations();
   const idx = indexCompleted(completed);
   await setRunEngineSharing(true);
   const declined = await readDeclinedMigrations(loadConfig()!);
-  const plan = buildPlan(idx, installed, cli.specificMigration, declined);
+  const hostWork = cli.list && [...idx.byVersion.keys()].some(v => hostWorkPendingForVersion(v, idx.byVersion))
+    ? await readHostWorkMigrations(loadConfig()!) : new Set<string>();
+  const plan = buildPlan(idx, installed, cli.specificMigration, declined, hostWork);
 
   doc.database = dbProbe;
   doc.plan = Object.fromEntries(Object.entries(plan).map(([state, entries]) => [state, entries.map((migration: Migration) => migration.version)]));
@@ -740,7 +788,7 @@ async function runLockedMigrations(
   const pendingWork = [...plan.partial, ...plan.pending, ...plan.pending_fresh_install];
   const authorized = cli.yes || cli.nonInteractive;
   if (schemaBehind && pendingWork.length === 0 && dbProbe.status === 'connected') {
-    return failSchemaBehind(report, args, await schemaBehindAtPreflight(dbProbe.schemaVer, authorized));
+    return failSchemaBehind(report, args, await schemaBehindAtPreflight(dbProbe.schemaVer, authorized, schemaTimeout));
   }
   const toRun: Migration[] = [...pendingWork, ...plan.applied.filter(migration => migration.reconcile)]
     .sort((left, right) => compareVersions(left.version, right.version));
@@ -901,8 +949,9 @@ function failSchemaBehind(report: RunReport, args: readonly string[], pending: S
 async function preflightSchema(
   cli: ApplyMigrationsArgs,
   migrateSchema: (eng: BrainEngine, from: number) => Promise<{ applied: number; current: number }>,
-): Promise<{ schemaBehind: boolean; dbProbe: DbProbeOutcome }> {
+): Promise<{ schemaBehind: boolean; dbProbe: DbProbeOutcome; schemaTimeout?: MigrationTimeoutRecord }> {
   let schemaBehind = false;
+  let schemaTimeout: MigrationTimeoutRecord | undefined;
   let dbProbe: DbProbeOutcome = { status: 'skipped', reason: 'no probe attempted' };
   // Detect schema migrations (migrate.ts) being behind.
   // apply-migrations historically ran orchestrator migrations only; schema
@@ -936,6 +985,7 @@ async function preflightSchema(
           autoApply: (cli.yes || cli.nonInteractive) && !cli.dryRun && !cli.list,
           run: () => migrateSchema(eng, schemaVer),
         });
+        if (schemaBehind) schemaTimeout = (await readMigrationTimeout(eng, parseInt(await eng.getConfig('version') || String(schemaVer), 10))) ?? undefined;
         await eng.disconnect();
       }
     }
@@ -951,7 +1001,7 @@ async function preflightSchema(
       access: classifyPgAccessError(err, { url: cfg?.database_url ?? null }).reason,
     };
   }
-  return { schemaBehind, dbProbe };
+  return { schemaBehind, dbProbe, schemaTimeout };
 }
 
 /** #6696 C5: the clearing step for a wedged migration; it needs the user, since the cause behind the partial runs must be fixed first. */

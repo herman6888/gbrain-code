@@ -529,9 +529,9 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
 
   // v0.31.1 (Issue #734, CDX-1): parse CLI args BEFORE engine connect so
   // the routing seam below can decide local-vs-remote without paying a
-  // PGLite migration replay on thin-client installs. The arg parser, image
-  // transform, and required-param check are all engine-free; refactoring
-  // them out of the engine try/catch is safe and unlocks routing.
+  // PGLite migration replay on thin-client installs. The arg parser, image transform and required-param
+  // check are engine-free, so they run outside the engine try/catch. Wave B: put --file runs first (cli/commands/append.ts).
+  if (op.name === 'put_page' && subArgs.some(a => /^--file(=|$)/.test(a)) && await (await import('./commands/append.ts')).runPutFile(op, subArgs, { parse: parseOpArgs, connect: () => connectEngine(), format: formatResult })) return;
   const params = parseOpArgs(op, subArgs);
 
   // #3513: stdin fill moved out of parseOpArgs so a non-TTY stdin with no
@@ -1305,7 +1305,7 @@ export function validateCommandFlags(command: string, subArgs: string[]): string
     return findUnknownFlag(subArgs, new Set(legal));
   }
   const op = cliOps.get(command) ?? cliAliases.get(command);
-  if (op) return findUnknownOpFlag(op, subArgs);
+  if (op) return findUnknownOpFlag(op, op.name === 'put_page' ? subArgs.filter((a, i) => !/^--file(=|$)/.test(a) && subArgs[i - 1] !== '--file') : subArgs); // put --file: cli/commands/append.ts
   return null; // unknown command — the dispatcher's own error handles it
 }
 
@@ -2467,7 +2467,8 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
   // LiveServeLockError — instead the sync runs INSIDE the serve over its IPC
   // socket (commands/sync-delegate.ts). Handled === delegated or politely
   // refused (exit verdict set inside); false falls through unchanged.
-  if (command === 'sync' && !syncOperator) {
+  if (command === 'sync' && args[0] === 'trigger' && await (await import('../commands/sync-delegate.ts')).maybeTriggerThroughServe(loadConfig(), args.slice(1))) return null;
+  if (command === 'sync' && !syncOperator && args[0] !== 'trigger') {
     const cfgSync = loadConfig();
     if (await (await import('../commands/sync-persistence-delegate.ts')).maybeDelegateSyncToPersistence(cfgSync, args)) return null;
     if (cfgSync?.engine === 'pglite' && cfgSync.database_path && !cfgSync.database_url) {
@@ -2933,6 +2934,7 @@ const OP_HELP_EXAMPLES: Record<string, string[]> = {
     'gbrain links people/alice-example                    # resolved source (every federated source when unpinned)',
     'gbrain links people/alice-example --source business  # one source',
     'gbrain links people/alice-example --all-sources      # every source',
+    'gbrain links people/alice-example --limit 100        # 500 rows per call by default; --cursor <next_cursor> continues, --all reads every row',
   ],
   get_backlinks: [
     'gbrain backlinks companies/acme-example',

@@ -26,7 +26,9 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry, doctorHealth } from '../context.ts';
 import { embeddingsDisabled } from '../../../core/embedding-disabled.ts';
 import { quoteIdentifier, resolveActiveEmbeddingColumnFromEngine } from '../../../core/search/embedding-column.ts';
-import { agentFix, checkError, infoCheck, keylessEnablementFix } from '../check-fix.ts';
+import { agentFix, checkError, doctorVerify, infoCheck, keylessEnablementFix } from '../check-fix.ts';
+import { readMigrationTimeout } from '../../../core/migration-timeout.ts';
+import { migrationTimeoutAdvice } from '../../../core/migration-timeout-advice.ts';
 import type { MissingTable, MissingTablesReport } from '../../../core/schema-missing-tables.ts';
 
 const MISSING_TABLES_DOCS = 'docs/guides/repair.md#missing-tables';
@@ -215,7 +217,13 @@ async function runSchemaVersion(ctx: DoctorContext): Promise<Check[]> {
   try {
     const version = await engine.getConfig('version');
     schemaVersion = parseInt(version || '0', 10);
-    checks.push({ name: 'schema_version', ...schemaVersionHealth(schemaVersion, LATEST_VERSION) });
+    const timeout = schemaVersion > 0 && schemaVersion < LATEST_VERSION ? await readMigrationTimeout(engine, schemaVersion) : null;
+    if (timeout) {
+      const advice = migrationTimeoutAdvice(timeout, doctorVerify('schema_version'));
+      checks.push({ name: 'schema_version', status: 'warn', message: `Version ${schemaVersion}, latest is ${LATEST_VERSION}. ${advice.message}`, details: { migration_timeout: timeout }, fix: advice.fix });
+    } else {
+      checks.push({ name: 'schema_version', ...schemaVersionHealth(schemaVersion, LATEST_VERSION) });
+    }
 
     // 6b. Schema columns — gbrain#4421/#4425. The ledger counter alone can
     // lie: a PgBouncer transaction-mode pooler can swallow an ALTER TABLE

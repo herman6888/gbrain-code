@@ -74,6 +74,7 @@
     "check:admin-scope-drift": "bash scripts/check-admin-scope-drift.sh",
     "check:cli-exec": "bash scripts/check-cli-executable.sh",
     "check:engine-dynamic-import": "bash scripts/check-engine-dynamic-import.sh",
+    "check:file-url-pathname": "bash scripts/check-file-url-pathname.sh",
     "check:grok-pin": "bash scripts/check-grok-pin.sh",
     "check:opencode-pin": "bash scripts/check-opencode-pin.sh",
     "check:pin-doc-privacy": "bash scripts/check-pin-doc-privacy.sh",
@@ -173,6 +174,8 @@
     "check:shared-tree-git": "bash scripts/check-shared-tree-git.sh",
     "check:bash32": "bash scripts/check-bash32.sh",
     "check:schema-migration-order": "bun scripts/check-schema-migration-order.ts",
+    "check:behavior-since": "bun scripts/check-behavior-since.ts",
+    "check:changelog-headings": "bun scripts/check-changelog-headings.ts",
     "check:compile-autoload": "bash scripts/check-compile-autoload.sh",
     "check:structural-manifest": "bash scripts/check-structural-manifest.sh",
     "regen:all": "bun scripts/regen-all.ts",
@@ -240,7 +243,7 @@
     "bun": ">=1.4.0"
   },
   "license": "MIT",
-  "version": "0.60.311.0",
+  "version": "0.60.324.0",
   "overrides": {
     "@ai-sdk/provider-utils": "4.0.56",
     "@hono/node-server": "^2.0.5",

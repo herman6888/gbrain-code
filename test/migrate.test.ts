@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { LATEST_VERSION, runMigrations, MIGRATIONS, getIdleBlockers, hasPendingMigrations } from '../src/core/migrate.ts';
 import type { IdleBlocker } from '../src/core/migrate.ts';
+import { migrationStatementTimeoutMs } from '../src/core/migration-timeout.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { withColdPglite } from './helpers/with-snapshot.ts';
@@ -1454,7 +1455,8 @@ describe('PR #356 — non-transactional DDL runs via reserved connection', () =>
     expect(runFnIdx).toBeGreaterThan(-1);
     const fnBody = source.slice(runFnIdx, runFnIdx + 2500);
     expect(fnBody).toContain('withReservedConnection');
-    expect(fnBody).toContain("SET statement_timeout = '600000'");
+    expect(fnBody).toContain("SET statement_timeout = '${migrationStatementTimeoutMs()}'");
+    expect(migrationStatementTimeoutMs()).toBe(600_000);
   });
 });
 

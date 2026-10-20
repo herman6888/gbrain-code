@@ -31,7 +31,7 @@ import {
 
 /** Journaled verbs an agent (remote or local) calls directly; their rows are agent_written unless lowered. */
 export const AGENT_WRITE_OPERATIONS: readonly string[] = [
-  'put_page', 'put_pages', 'capture', 'edit_page', 'delete_page', 'restore_page', 'revert_version', 'remember',
+  'put_page', 'put_pages', 'capture', 'edit_page', 'append_page', 'delete_page', 'restore_page', 'revert_version', 'remember',
   'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
   'takes_remove', 'loops_close', 'relink_facts', 'decide_proposal',
 ];
@@ -209,6 +209,9 @@ export function stampTrustMarker(frontmatter: Record<string, unknown>, tier: Tru
   return { ...frontmatter, trust_tier: marker };
 }
 
+/** The source config `ownerImportTrust` reads. */
+export const SOURCE_TRUST_CONFIG_SQL = 'SELECT config FROM sources WHERE id = $1';
+
 /**
  * The tier of a journaled owner-source write of one page (managed sync,
  * import, reconcile, file repair, grandfather): `ownerPageTrust` from the
@@ -216,7 +219,7 @@ export function stampTrustMarker(frontmatter: Record<string, unknown>, tier: Tru
  */
 export async function ownerImportTrust(engine: Pick<BrainEngine, 'executeRaw'>, row: Pick<WriteRequest, 'id' | 'source_id' | 'authority' | 'intent' | 'operation'>,
   frontmatter: Record<string, unknown> | null | undefined, sourceUri?: string | null): Promise<WriteTrust> {
-  const [source] = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>('SELECT config FROM sources WHERE id = $1', [row.source_id]);
+  const [source] = await engine.executeRaw<{ config: Record<string, unknown> | string | null }>(SOURCE_TRUST_CONFIG_SQL, [row.source_id]);
   const config = typeof source?.config === 'string' ? JSON.parse(source.config) as Record<string, unknown> : source?.config ?? null;
   const trust = ownerPageTrust({ frontmatter, sourceConfig: config, channel: requestChannel(row), requestId: row.id, sourceUri });
   return row.authority?.remote === true ? { ...trust, tier: minTrust(trust.tier, 'agent_written') } : trust;
