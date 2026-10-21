@@ -61,6 +61,7 @@
 | [`gbrain repair fences` skipped a file `sync_in_progress` while a sync runs](repair.md#fence-repair-during-a-sync) | nothing: a write in flight or the running sync's frozen manifest still names that file; every other candidate repairs now and the next run picks this one up (`gbrain sync --source <id> --no-pull` finishes the sync) | agent | none | `gbrain doctor --only fence_integrity --json` |
 | [A Google or GitHub item is held (`connector_held_items`)](#held-connector-items) | `gbrain sources status <id>`, fix the cause, then `gbrain sources retry-held <id>` and `gbrain sync --source <id>` | agent, after the user agrees | `egress` (fetches from the provider again) | `gbrain doctor --only connector_held_items --json` |
 | `gbrain google status` exits 1 naming `calendar_unreadable`, doctor warns `google_calendar_readable`, or the sync log prints `[google] calendar_unreadable` (calendar pages stop arriving) | `gbrain google calendars --account <email>` lists the calendars the account can read; then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` ([unreadable calendar](google-connect.md#unreadable-calendar)) | agent, after the user agrees which calendar | none (on a managed brain whose source also syncs Gmail or Contacts, the change re-reads their history: `confirmation_required`, re-run with `--yes` after the user agrees) | `gbrain doctor --only google_calendar_readable --json` is ok |
+| `gbrain google setup` stops with `api_access_blocked`, `gbrain google status` exits 1 listing `api_access.problems`, or doctor warns `google_api_access` (a Google API disabled for the OAuth project, or a scope not granted) | enable each API at the link the report names (the Google Cloud project is in the report), or `gbrain google connect --reauth <email>` for a missing scope; then `gbrain sync --source <source>` ([API access](google-connect.md#api-access)) | user (only the project owner can enable an API) | none | `gbrain google status --json` shows no `api_access.problems` |
 | `gbrain waiting` lists bank, payment or shipping alerts as people waiting on you | upgrade (#5012: mail with `Precedence: bulk/list/junk`, a `List-Id` or a no-reply `Reply-To` opens no reply-owed loop); for loops opened before the upgrade, `gbrain waiting` prints `gbrain loops drop sender <email> --source <id> --dry-run` per sender; preview, then run it without `--dry-run` (cannot be undone), or `gbrain loops mute sender <email>` for a reversible stop ([open loops](open-loops.md#the-surfaces)) | agent, after the user agrees | none to preview | `gbrain waiting --json` no longer lists the sender |
 | [`gbrain migrate --to` refused with `writer_coordinator_required`](../ENGINES.md#engine-migration-refused) | follow the refusal's `fix`: relay its `user_message` (stay on PGLite and share with `gbrain mcp expose`, or leave the brain as it is) | agent, after the user agrees | `persistent_install`, `egress` (for `gbrain mcp expose`) | `gbrain doctor --no-migrate --json` |
 | [A write was refused with a named reason](#write-refused) | the reason's recovery in [write refusal reasons](write-refusals.md) | as the refusal's `fix` | as the refusal's `fix` | the refusal's `verify` |
@@ -684,6 +685,36 @@ the phase, its blocker key and back-off, or the last failed job.
    streak, and a phase that fails for a different reason starts a new one.
 3. Confirm with `gbrain doctor --only global_maintenance_stalled`: it is `ok`
    after a pass completes with the phase passing.
+
+## Content-drift sweep
+
+**Doctor reports `content_drift_sweep` as a warning, or an embed run prints
+`content-drift sweep ... FAILED`?** Every `embed --stale` run, embed job and
+embed-backfill job runs the content-drift sweep: it re-queues chunks whose text
+changed after their vector was computed (`embedded_text_hash` no longer
+matches `md5(chunk_text)`). The sweep examines 5,000 chunk rows per statement
+in id order and commits its cursor with each batch, in the config row
+`embed.content_drift_sweep.<column>.<scope>`, so a pass spans as many runs as
+it needs; one run sweeps for at most 60 seconds. After a pass completes, the
+next starts once `embed.content_drift.pass_interval_hours` have passed (24 by
+default; 0 repeats it every run). A pass that fits in one batch repeats on
+every run. The run's result carries `content_drift` (`contentDrift` on
+embed-backfill): rows checked and invalidated, the cursor, and `state`
+(`complete`, `partial`, `waiting`, `stopped`, `failed`, or `unsupported`
+on a schema before migration v133).
+
+A failed batch commits nothing and leaves the cursor before it; the embed run
+goes on with the rest of its work and the next run retries the batch. Search
+already ignores a vector whose text changed, so a stalled sweep delays
+re-embedding, not answers.
+
+1. Read the error: `gbrain doctor --only content_drift_sweep --json` names the
+   scope, the chunk id and the message.
+2. Fix what it names (a lock held by another session, a statement timeout far
+   below one batch, a database error), then run `gbrain embed --stale`. It
+   spends embedding tokens, so ask the user first.
+3. Confirm with `gbrain doctor --only content_drift_sweep`: it is `ok` once a
+   batch commits.
 
 ## auto_chronicle has no effect
 

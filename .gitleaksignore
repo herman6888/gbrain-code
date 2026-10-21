@@ -45,3 +45,7 @@ a3140831d22a944947ef9cbd72ff7129a3541951:test/large-pages/credential-reseal-segm
 # Large-pages hardening (h): the synthetic marker constant 'quillfeather7731' in test/pathological/lp-h-purge-orphan-segment-text.test.ts
 # (commit 3bf9794) was named TOKEN and reads as generic-api-key; the tree now names it MARKER. History-only fingerprint, not a secret.
 3bf97940832d3c7d9dbc4815cedb30dcc83cb550:test/pathological/lp-h-purge-orphan-segment-text.test.ts:generic-api-key:37
+# #7073 (GBRA-147): synthetic OAuth token literals in test/google-api-access-cmd-7073.serial.test.ts (commit fb1cee45) read as
+# generic-api-key; the tree now builds them at runtime. These history-only fingerprints are not secrets.
+fb1cee45c18357eb43d537715b2a8dc43fafc70f:test/google-api-access-cmd-7073.serial.test.ts:generic-api-key:37
+fb1cee45c18357eb43d537715b2a8dc43fafc70f:test/google-api-access-cmd-7073.serial.test.ts:generic-api-key:55

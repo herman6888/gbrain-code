@@ -74,13 +74,26 @@ const addColumns = (table: string, columns: readonly string[]) =>
   `ALTER TABLE ${table} ${columns.map(column => `ADD COLUMN IF NOT EXISTS ${column} ${typed(column)}`).join(', ')}`;
 
 /**
+ * Set transaction-locally by the facts insert guard (facts/insert-guard-schema.ts)
+ * around its withdrawal stamp, which runs as an UPDATE at the end of the
+ * inserting statement; the per-row guard it replaced stamped the row before
+ * insert, where attribution never saw a change.
+ */
+export const FACT_WITHDRAWAL_STAMP_SETTING = 'gbrain.fact_withdrawal_stamp';
+const FACT_CONTENT_WITHOUT_STAMP = WRITE_ATTRIBUTION_CONTENT_COLUMNS.facts.filter(column => column !== 'expired_at' && column !== 'valid_until');
+
+/**
  * INSERT: stamp created_by and last_mutated_by from the settings; without
  * settings keep supplied values (engine copy, backfill). UPDATE: created_by is
  * immutable once set; last_mutated_by moves only when a content column
  * changed (to NULL when no actor is set: an unattributed writer mutated it).
  * Either pair may be filled while it is still NULL (journal backfill).
+ * Under FACT_WITHDRAWAL_STAMP_SETTING a facts UPDATE that changes only
+ * expired_at and valid_until is not a content change, so last_mutated_by
+ * keeps the inserted (or supplied) values; any other content change still
+ * moves it.
  */
-const STAMP_ROW_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_write_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
+export const STAMP_ROW_FUNCTION = `CREATE OR REPLACE FUNCTION gbrain_stamp_write_attribution() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
 DECLARE req uuid; principal_kind text; principal_id text; changed boolean;
 BEGIN${SETTINGS}
   IF TG_OP = 'INSERT' THEN
@@ -98,6 +111,9 @@ BEGIN${SETTINGS}
     changed := ${contentChanged(table)};`).join('\n  ')}
   ELSE
     RAISE EXCEPTION 'gbrain_stamp_write_attribution is not classified for table %', TG_TABLE_NAME;
+  END IF;
+  IF changed AND TG_TABLE_NAME = 'facts' AND COALESCE(current_setting('${FACT_WITHDRAWAL_STAMP_SETTING}', true), '') = 'on' THEN
+    changed := ${tuple('NEW', FACT_CONTENT_WITHOUT_STAMP)} IS DISTINCT FROM ${tuple('OLD', FACT_CONTENT_WITHOUT_STAMP)};
   END IF;
   IF changed THEN
     NEW.last_write_request_id := req; NEW.last_write_principal_kind := principal_kind; NEW.last_write_principal_id := principal_id;

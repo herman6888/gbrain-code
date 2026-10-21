@@ -41,8 +41,10 @@ export interface DefaultSourcePathInput {
   repoPath: string | null;
   /** True when repoPath exists on disk and is a directory. */
   repoPathIsDir: boolean;
-  /** A non-default source whose own local_path equals repoPath (#2018 leak guard), if any. */
+  /** A non-default source whose own local_path is or contains repoPath under any spelling (#2018 leak guard, #7203), if any. */
   collidingSourceId: string | null;
+  /** Live default-source pages whose source_path also names a live page of collidingSourceId. */
+  sharedPages?: number;
 }
 
 export interface DefaultSourcePathAssessment {
@@ -53,7 +55,7 @@ export interface DefaultSourcePathAssessment {
 export function assessDefaultSourcePath(
   input: DefaultSourcePathInput,
 ): DefaultSourcePathAssessment {
-  const { defaultSource, livePages, fileBackedPages, repoPath, repoPathIsDir, collidingSourceId } = input;
+  const { defaultSource, livePages, fileBackedPages, repoPath, repoPathIsDir, collidingSourceId, sharedPages = 0 } = input;
   if (!defaultSource) {
     // No `default` row at all is a different, more fundamental problem than
     // this check's scope — leave it to whatever check owns sources-table
@@ -81,11 +83,17 @@ export function assessDefaultSourcePath(
     return {
       status: 'warn',
       message:
-        `default source has local_path: null and sync.repo_path (${repoPath}) is source ` +
+        `default source has local_path: null and sync.repo_path (${repoPath}) is, or lies inside, source ` +
         `"${collidingSourceId}"'s own working tree — the #2018 leak guard silently SKIPS every ` +
         `unscoped write-through for the ${livePages} default-source page(s), so \`gbrain put\`/` +
         '`gbrain capture` writes never reach disk. Fix with `gbrain sources set-path default <path>` ' +
-        '(non-destructive pointer repair).',
+        '(non-destructive pointer repair).' +
+        (sharedPages > 0
+          ? ` ${sharedPages} default-source page(s) share a file path with a live "${collidingSourceId}" page: an earlier ` +
+            `write-through under another spelling of this path (a symlink, a trailing slash, a case or /private alias) may have ` +
+            `written them into "${collidingSourceId}"'s tree, where its sync imported them as its own pages. Compare those files ` +
+            'with their default-source pages before deleting anything; nothing was changed.'
+          : ''),
     };
   }
   if (rootResolvable) {

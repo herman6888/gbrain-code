@@ -1,6 +1,7 @@
 import postgres from '#postgres'
 import { claimOwner } from './persistence/claim-phase.ts';
 import { traceSqlOptions } from './sql-trace.ts';
+import { warnPoolerPrepareOffOnce } from './pooler-notice.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
 import { SCHEMA_SQL } from './schema-embedded.generated.ts';
 import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.ts';
@@ -501,7 +502,7 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
     const prepare = resolvePrepare(url);
     const timeouts = resolveSessionTimeouts();
     const opts: Record<string, unknown> = {
-      max: resolvePoolSize(),
+      max: resolvePoolSize(config.pool_max),
       idle_timeout: 20,
       connect_timeout: resolveUrlConnectTimeout(url),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
@@ -522,11 +523,7 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
     opts.connection = { ...timeouts, application_name: gbrainApplicationName() };
     if (typeof prepare === 'boolean') {
       opts.prepare = prepare;
-      if (!prepare) {
-        console.warn(
-          '[gbrain] Prepared statements and statement pipelining disabled (transaction-mode pooler convention: port 6543, ?prepare=false or GBRAIN_PREPARE=0). If your pooler runs in session mode, connect on its session port (Supabase: 5432); GBRAIN_PREPARE=true re-enables prepared statements only, and ?max_pipeline= or PGMAX_PIPELINE sets the pipeline depth.',
-        );
-      }
+      if (!prepare) warnPoolerPrepareOffOnce(url);
     }
     sql = postgres(url, traceSqlOptions(opts, 'module'));
 

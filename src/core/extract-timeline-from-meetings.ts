@@ -15,7 +15,7 @@ import { buildGazetteer, findMentionedEntities, type Gazetteer } from './by-ment
 import { isCrossSourceLinksEnabled } from './link-extraction.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import { parseFrontmatter } from './backfill-effective-date.ts';
-import { isPrivatePage } from './search/private-visibility.ts';
+import { isDerivationPrivate } from './search/private-visibility.ts';
 import { quarantineFilterFragment } from './quarantine.ts';
 import { maintenanceTransaction } from './persistence/attribution.ts';
 import { derivedWriteTrust } from './trust/taint.ts';
@@ -213,7 +213,7 @@ export async function extractTimelineFromMeetings(
     // timelines: the row carries no event_page_id (the (event_page_id, date)
     // unique index allows one row per event, not one per attendee), so the
     // remote private-event filter could never hide it. Fail closed: skip.
-    if (isPrivatePage({ frontmatter })) { privateSkipped++; continue; }
+    if (isDerivationPrivate({ frontmatter })) { privateSkipped++; continue; }
     // put_page-written pages never get effective_date computed (column stays
     // NULL); derive it exactly as `gbrain backfill effective_date` would —
     // same filename recipe (import_filename, else the slug tail) — so a later
@@ -469,7 +469,7 @@ export async function prepareMeetingTimeline(engine: BrainEngine, row: WriteRequ
         [[...new Set(queued.map(r => r.meeting_id))]])).map(m => [Number(m.id), m]));
       const current = queued.filter(r => {
         const meeting = meetings.get(r.meeting_id);
-        return meeting && !isPrivatePage({ frontmatter: parseFrontmatter(meeting.frontmatter) })
+        return meeting && !isDerivationPrivate({ frontmatter: parseFrontmatter(meeting.frontmatter) })
           && r.source === `${MEETING_SOURCE_PREFIX}${meeting.slug}` && r.summary === `Discussed in ${meeting.title}`;
       });
       const tiers = new Map([...meetings.values()].map(m => [Number(m.id), m.trust_tier]));

@@ -82,6 +82,7 @@ import { cachedQueryEmbedding, clearQueryEmbedCache, queryEmbedCacheKey, queryEm
 import { createGuardedGeneration, chatInvocation } from './guarded-generation.ts';
 installAiSdkWarningWriter();
 const guardedGeneration = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS);
+const guardedExpansion = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS, 'gateway.expand');
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -1766,7 +1767,7 @@ async function embedSubBatch(
 ): Promise<{ embeddings: Float32Array[]; reportedTokens: number | null }> {
   try {
     const callTransport = () => invokeAI({ operation: 'gateway.embed', kind: 'embedding', model: `${recipe.id}:${modelId}`,
-      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0 }, () => _embedTransport({
+      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0, estimatedInputTokens: Math.ceil(texts.reduce((n, text) => n + text.length, 0) / (recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN)) }, () => _embedTransport({
       model,
       values: texts,
       providerOptions: providerOpts,
@@ -2519,8 +2520,12 @@ export async function expand(query: string): Promise<string[]> {
     const requestedModelId = getExpansionModel();
     const { model, recipe, modelId } = await resolveExpansionProvider(requestedModelId);
     const modelLabel = `${recipe.id}:${modelId}`;
-    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void =>
-      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, ...normalizeSdkUsage(usage) });
+    // #7176: a successful expansion is also a chat_usage_log row, phase 'expansion'.
+    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void => {
+      const { inputTokens, outputTokens } = normalizeSdkUsage(usage);
+      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, inputTokens, outputTokens });
+      recordChatUsage({ model: modelLabel, provider: recipe.id, phase: 'expansion', usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+    };
     const recordExpansionFailure = (err: unknown, countsAsCall: boolean): void =>
       recordOnTracker(tracker, {
         modelId: modelLabel,
@@ -2539,7 +2544,7 @@ export async function expand(query: string): Promise<string[]> {
     const viaText = async (countsAsCall = true): Promise<string[]> => {
       let textResult: Awaited<ReturnType<GenerateTextFn>>;
       try {
-        textResult = await guardedGeneration(modelLabel, _generateTextTransport, {
+        textResult = await guardedExpansion(modelLabel, _generateTextTransport, {
           model,
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
@@ -2580,7 +2585,7 @@ export async function expand(query: string): Promise<string[]> {
       // generic, so `object` would be `{}`.)
       let result: { object?: unknown; usage?: unknown };
       try {
-        result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Name the schema. On the native-anthropic path the SDK turns the schema
@@ -2614,7 +2619,7 @@ export async function expand(query: string): Promise<string[]> {
       // schema (strict validation), and fall back to the text path if it is
       // rejected at call time so a mis-declared capability never drops expansion.
       try {
-        const result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        const result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Same schema name+description as the native branch above: an
@@ -4442,7 +4447,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   try {
     const transport: RerankTransport = _rerankTransport ?? ((u, init) => fetch(u, init));
     const maxInputTokens = rerankRequestMaxInputTokens(input.query, input.documents);
-    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens }, () => transport(url, {
+    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens, estimatedInputTokens: Math.ceil(rerankChars / (recipe.touchpoints.embedding?.chars_per_token ?? 4)) }, () => transport(url, {
       method: 'POST',
       headers,
       body,

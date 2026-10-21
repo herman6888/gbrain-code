@@ -177,6 +177,7 @@
     "check:behavior-since": "bun scripts/check-behavior-since.ts",
     "check:changelog-headings": "bun scripts/check-changelog-headings.ts",
     "check:compile-autoload": "bash scripts/check-compile-autoload.sh",
+    "check:vendor-postgres": "bash scripts/check-vendor-postgres.sh",
     "check:structural-manifest": "bash scripts/check-structural-manifest.sh",
     "regen:all": "bun scripts/regen-all.ts",
     "release:restamp": "bun scripts/release-restamp.ts",
@@ -205,7 +206,7 @@
     "@electric-sql/pglite": "0.4.3",
     "@jsquash/avif": "^2.1.1",
     "@jsquash/png": "^3.1.1",
-    "@modelcontextprotocol/sdk": "1.31.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "ai": "^6.0.168",
     "chokidar": "^4.0.3",
     "cookie-parser": "^1.4.7",
@@ -243,7 +244,7 @@
     "bun": ">=1.4.0"
   },
   "license": "MIT",
-  "version": "0.60.324.0",
+  "version": "0.60.343.0",
   "overrides": {
     "@ai-sdk/provider-utils": "4.0.56",
     "@hono/node-server": "^2.0.5",
@@ -252,7 +253,7 @@
     "fast-xml-builder": "^1.1.7",
     "fast-xml-parser": "^5.7.0",
     "form-data": "^4.0.6",
-    "hono": "^4.13.5",
+    "hono": "^4.13.11",
     "ip-address": "^10.5.1",
     "qs": "6.16.0",
     "js-yaml": "^4.3.2"

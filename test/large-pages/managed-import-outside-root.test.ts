@@ -83,6 +83,9 @@ test('a file over the ceiling from outside the root is refused with the move in 
     expect(e.fix?.user_message).toContain(`Move ${file} to ${target}`);
     expect(await engine.getPage('notes/big', { sourceId: f.sourceId })).toBeNull();
     renameSync(file, target);
-    expect(await importManagedFile(engine, target, 'notes/big.md', { sourceId: f.sourceId, noEmbed: true })).toMatchObject({ slug: 'notes/big', status: 'imported' });
+    expect(await importManagedFile(engine, target, 'notes/big.md', { sourceId: f.sourceId, noEmbed: true }))
+      .toMatchObject({ slug: 'notes/big', status: 'imported', searchable: 'pending' });
+    // #7106: the import replied at commit; the consumer's stop waits for the projection it left running.
+    await disposePersistenceConsumer(engine);
   }
 }), 600_000);

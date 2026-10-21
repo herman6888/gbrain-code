@@ -56,7 +56,7 @@ import { prepareSemanticCache, resolveCacheSearchMode, semanticCacheSkipped, ser
 import { buildPostFusionOpts, joinVectorSide, resolveEarlyModality, runLexicalAndRelational, startVectorSide } from './hybrid/arms.ts';
 import { searchVectorFallback, searchWithoutEmbeddings } from './hybrid/keyword-only.ts';
 import { factEmbeddingDisabled } from '../embedding-disabled.ts';
-import { capSessionPool, expandStructuralNeighbors, finalizeHybridResults, fuseArms, rerankAndPin, sizeReturnPool } from './hybrid/rank.ts';
+import { capSessionPool, collapsePool, expandStructuralNeighbors, finalizeHybridResults, fuseArms, rerankAndPin, sizeReturnPool } from './hybrid/rank.ts';
 import { type StageTimer, UNTIMED } from './stage-timings.ts';
 
 export const RRF_K = 60;
@@ -1177,7 +1177,7 @@ export async function hybridSearch(
   // aliasing in the postFusionOpts resolver near line ~256.
 
   // Dedup
-  const deduped = await timer.stage('post_fusion', async () => capSessionPool(req, dedupResults(fused, { ...dedupOpts, regions: await segmentRegions(req.engine, fused) })));
+  const deduped = await timer.stage('post_fusion', async () => collapsePool(req, capSessionPool(req, dedupResults(fused, { ...dedupOpts, regions: await segmentRegions(req.engine, fused) }))));
   opts?.explainTarget?.observe('deduped', deduped);
 
   // Auto-escalate: if detail=low returned 0, retry with high. The inner

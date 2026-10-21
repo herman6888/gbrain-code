@@ -42,12 +42,17 @@ describe('append_page in operation lists', () => {
     }
   });
 
-  test('append_page stays out of the owner-edit and remote-mention lists', () => {
+  test('append_page stays out of the owner-edit and whole-page remote-mention lists', () => {
     // Owner edits can release a purge redaction: an append cannot write facts or takes (fence markers are refused).
     expect(list('src/core/belief/ledger.ts', 'const OWNER_EDIT_OPERATIONS')).not.toContain("'append_page'");
-    // A remote mention links effect re-reads the whole page; an append's links follow the incremental derivation instead.
+    // #7122: the whole-page links effect re-reads the page; a remote append queues one scoped to the truth bytes it added,
+    // and none when it added none there (a timeline append).
     const remote = { remote: true, autoLinkTrusted: false } as WriteRequest['authority'];
+    const mentionRange = { start: 10, end: 20, sha256: '0'.repeat(64) };
+    expect(list('src/core/persistence/effect-model.ts', 'export const REMOTE_MENTION_OPERATIONS')).not.toContain("'append_page'");
     expect(queuesMentionLinks({ operation: 'edit_page', authority: remote })).toBe(true);
     expect(queuesMentionLinks({ operation: 'append_page', authority: remote })).toBe(false);
+    expect(queuesMentionLinks({ operation: 'append_page', authority: remote }, { mentionRange })).toBe(true);
+    expect(queuesMentionLinks({ operation: 'append_page', authority: { remote: false } as WriteRequest['authority'] }, { mentionRange })).toBe(false);
   });
 });

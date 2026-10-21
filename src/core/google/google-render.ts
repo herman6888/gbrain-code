@@ -306,6 +306,18 @@ export function renderThreadPage(thread: GmailThreadData): RenderedPage | null {
   return { relPath: threadRelPath(thread), markdown: fm.join('\n') + body.join('\n') + '\n' };
 }
 
+/**
+ * The rendered page with `visibility: private` in its frontmatter (any other
+ * `visibility` line replaced). A re-render of a page that is private today
+ * keeps it private: tighten-only, whoever set the label.
+ */
+export function withPrivateVisibility(markdown: string): string {
+  const match = /^---\n([\s\S]*?)\n---(\n|$)/.exec(markdown);
+  if (!match) return `---\nvisibility: private\n---\n${markdown}`;
+  const lines = match[1]!.split('\n').filter((line) => !/^visibility\s*:/.test(line));
+  return `---\n${[...lines, 'visibility: private'].join('\n')}\n---${markdown.slice(match[0].length - match[2]!.length)}`;
+}
+
 // ── Calendar event page ──────────────────────────────────────────────────────
 
 export function calendarRelPath(ev: CalendarEventData): string {
@@ -333,6 +345,7 @@ export function renderCalendarEventPage(ev: CalendarEventData): RenderedPage | n
     `attendees: ${yamlList(attendees.map((a) => a.email))}`,
     ...(ev.location ? [`location: ${yamlStr(ev.location)}`] : []),
     ...(ev.htmlLink ? [`url: ${yamlStr(ev.htmlLink)}`] : []),
+    ...(ev.private ? ['visibility: private'] : []),
     '---',
   ];
   const body: string[] = [

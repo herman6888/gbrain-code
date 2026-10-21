@@ -66,7 +66,7 @@ import { invalidateQueryCache } from './query-cache-invalidator.ts';
 import { logMutationFailure, logMutationSuccess, type MutationActor, type MutationOp } from './mutate-audit.ts';
 import { runFilePlaneLintRules } from './lint-rules.ts';
 import { withPackLock, type PackLockOpts } from './pack-lock.ts';
-import { BUNDLED_PACK_NAMES as BUNDLED_PACK_NAME_LIST } from './bundled.ts';
+import { BUNDLED_PACK_NAMES as BUNDLED_PACK_NAME_LIST, isValidPackName } from './bundled.ts';
 import type { BrainEngine } from '../engine.ts';
 
 export type PackFileFormat = 'json' | 'yaml';
@@ -144,9 +144,7 @@ export interface MutateOpts extends PackLockOpts {
  * never validated names — so packs like 'my_pack' / 'notes.v2' exist legally
  * and refusing them here would permanently brick their mutation/lint.
  */
-export function isValidPackName(name: string): boolean {
-  return name.length > 0 && name.length <= 128 && /^[a-z0-9][a-z0-9._-]*$/.test(name);
-}
+export { isValidPackName };
 
 /**
  * Locate a user-mutable pack file. Bundled packs (gbrain-base,

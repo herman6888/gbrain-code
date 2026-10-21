@@ -22,6 +22,7 @@
  */
 import type { SearchOpts } from '../types.ts';
 import { buildBestPerPagePoolCte } from './sql-ranking.ts';
+import { frontmatterWhereSql } from './frontmatter-where.ts';
 import { escapeLikePattern, cjkMatchTerms } from '../cjk.ts';
 
 /** Query-shape context shared by both engines' CJK fallback call sites. */
@@ -205,6 +206,7 @@ function shapeFilters(opts: SearchOpts | undefined, params: unknown[]): string {
     params.push(opts.types);
     extraFilter += ` AND p.type = ANY($${params.length}::text[])`;
   }
+  extraFilter += frontmatterWhereSql('p', opts?.where, json => `$${params.push(json)}`);
   if (opts?.exclude_slugs?.length) {
     params.push(opts.exclude_slugs);
     extraFilter += ` AND p.slug != ALL($${params.length}::text[])`;

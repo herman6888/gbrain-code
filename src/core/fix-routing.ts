@@ -107,8 +107,20 @@ export function installCliRouting(provider: () => FixRouting | undefined): void 
   recording = true;
 }
 
+let sourceNoteScope: (() => { resolvedSource?: string } | undefined) | null = null;
+
+/** A resident serve answering for a one-shot CLI (the warm CLI socket) records each request's first source for that CLI, not for itself. */
+export function setSourceNoteScope(scope: () => { resolvedSource?: string } | undefined): void {
+  sourceNoteScope = scope;
+}
+
 /** Called by the source resolver: the first source an invocation resolves is the one its fixes pin. */
 export function noteResolvedSource(sourceId: string): void {
+  const scoped = sourceNoteScope?.();
+  if (scoped) {
+    if (scoped.resolvedSource === undefined && pinnableSource(sourceId)) scoped.resolvedSource = sourceId;
+    return;
+  }
   if (recording && resolvedSource === undefined && pinnableSource(sourceId)) resolvedSource = sourceId;
 }
 

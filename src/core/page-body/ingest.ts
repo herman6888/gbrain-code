@@ -22,7 +22,7 @@ import { readManagedMode } from '../persistence/managed-mode.ts';
 import { maintenanceAttribution, principalAttribution } from '../persistence/attribution.ts';
 import type { Principal } from '../persistence/model.ts';
 import { stepFenceWalk, type FenceWalk } from '../fence-scan.ts';
-import { BODY_LEAD_BYTES, BODY_STAGING_HARD_MS, BODY_STAGING_IDLE_MS, SEGMENTED_CREATE_SEAL_MAX_BYTES, STAGE_BATCH_BYTES } from './limits.ts';
+import { BODY_LEAD_BYTES, BODY_STAGING_HARD_MS, BODY_STAGING_IDLE_MS, PROJECTION_LOCK_HOLD_BYTES, SEGMENTED_CREATE_SEAL_MAX_BYTES, STAGE_BATCH_BYTES } from './limits.ts';
 import type { BodyRegion, BodyStagingKind, BodyStorage, JsonObject, ManifestRow, ManifestRowInput, SegmentChunkInput,
   SegmentedBodyColumns, SegmentTextInput } from './types.ts';
 import { regionTrust, segmentStream, SEGMENTER_VERSION, type StoredRegion } from './segmenter.ts';
@@ -364,9 +364,10 @@ export async function occurrencesWithoutChunks(engine: Pick<BrainEngine, 'execut
 
 /**
  * @internal Work stageOccurrenceChunks does, for the projection tests: segment text batches chunked (`batches`) and
- * chunk rows prepared (`chunks`), whoever stages them (a replace's preparation, a create's, or a projection).
+ * chunk rows prepared (`chunks`), whoever stages them (a replace's preparation, a create's, or a projection), and the
+ * most segment bytes one projection transaction staged under the page lock (`heldBytes`, PROJECTION_LOCK_HOLD_BYTES).
  */
-export const segmentChunkWork = { batches: 0, chunks: 0 };
+export const segmentChunkWork = { batches: 0, chunks: 0, heldBytes: 0 };
 
 /**
  * Chunk occurrences one text batch at a time (texts read back from
@@ -377,13 +378,13 @@ export const segmentChunkWork = { batches: 0, chunks: 0 };
 export async function stageOccurrenceChunks(engine: BrainEngine, input: { pageId: number; sourceId: string; slug: string; generation: number;
   occurrences: readonly ManifestRowInput[]; title: string; frontmatter: JsonObject; flags: JsonObject; chunking: SegmentChunkingContext;
   retiredOccurrences: readonly number[];
-  /** Projection: each batch inserts under the page guard, after re-reading which occurrences still lack rows, so two projections never both chunk one;
-   *  a page whose generation moved past `generation` stops the projection before it inserts. */
+  /** Projection: each batch inserts under the page guard, at most PROJECTION_LOCK_HOLD_BYTES of occurrences per transaction, after re-reading which
+   *  occurrences still lack rows, so two projections never both chunk one; a page whose generation moved past `generation` stops the projection before it inserts. */
   guarded?: boolean;
   /** A create's preparation: the chunks are collected here (its page row does not exist yet) and inserted by the publication. */
   hold?: SegmentChunkInput[];
-  /** Guarded: runs in each batch's transaction before its insert (the projection renews its claim on the page's queue row);
-   *  false when the caller lost its claim: that batch inserts nothing and the staging stops. */
+  /** Guarded: runs in each insert transaction before its insert (the projection renews its claim on the page's queue row);
+   *  false when the caller lost its claim: that transaction inserts nothing and the staging stops. */
   renew?: (tx: BrainEngine) => Promise<boolean> }): Promise<{ rows: number; occurrences: number; indexes: number[] }> {
   if (input.chunking.quarantined || !input.occurrences.length) return { rows: 0, occurrences: 0, indexes: [] };
   const batchBytes = STAGE_BATCH_BYTES[engine.kind];
@@ -424,17 +425,31 @@ export async function stageOccurrenceChunks(engine: BrainEngine, input: { pageId
     if (input.hold) input.hold.push(...chunks);
     else if (chunks.length && !input.guarded) indexes.push(...await engine.stageSegmentChunks(input.pageId, input.generation, chunks));
     let moved = false, lost = false;
-    if (chunks.length && input.guarded) rows -= chunks.length - await engine.transaction(async tx => {
-      await tx.lockPageKeys([{ sourceId: input.sourceId, slug: input.slug }]);
-      const [page] = await tx.executeRaw<{ body_generation: number | string }>('SELECT body_generation FROM pages WHERE id=$1', [input.pageId]);
-      if (Number(page?.body_generation) !== input.generation) { moved = true; return 0; }
-      if (input.renew && !await input.renew(tx)) { lost = true; return 0; }
-      const open = new Set((await occurrencesWithoutChunks(tx, input.pageId, input.generation, batch)).map(row => row.occurrenceId));
-      const still = chunks.filter(chunk => open.has(chunk.occurrence_id));
-      if (still.length) await tx.stageSegmentChunks(input.pageId, input.generation, still);
-      return still.length;
-    });
-    rows += chunks.length;
+    if (input.guarded) {
+      const byOccurrence = new Map<number, SegmentChunkInput[]>();
+      for (const chunk of chunks) {
+        const same = byOccurrence.get(chunk.occurrence_id);
+        if (same) same.push(chunk); else byOccurrence.set(chunk.occurrence_id, [chunk]);
+      }
+      for (let at = 0; at < batch.length && !moved && !lost;) {
+        let stop = at, held = 0;
+        while (stop < batch.length && (stop === at || held + batch[stop]!.byteLen <= PROJECTION_LOCK_HOLD_BYTES)) held += batch[stop++]!.byteLen;
+        const part = batch.slice(at, stop).filter(row => byOccurrence.has(row.occurrenceId));
+        at = stop;
+        if (part.length) rows += await engine.transaction(async tx => {
+          await tx.lockPageKeys([{ sourceId: input.sourceId, slug: input.slug }]);
+          await faultPoint('segmented:projection_insert', { sourceId: input.sourceId, slug: input.slug });
+          const [page] = await tx.executeRaw<{ body_generation: number | string }>('SELECT body_generation FROM pages WHERE id=$1', [input.pageId]);
+          if (Number(page?.body_generation) !== input.generation) { moved = true; return 0; }
+          if (input.renew && !await input.renew(tx)) { lost = true; return 0; }
+          const open = await occurrencesWithoutChunks(tx, input.pageId, input.generation, part);
+          const still = open.flatMap(row => byOccurrence.get(row.occurrenceId)!);
+          if (still.length) await tx.stageSegmentChunks(input.pageId, input.generation, still);
+          segmentChunkWork.heldBytes = Math.max(segmentChunkWork.heldBytes, open.reduce((sum, row) => sum + row.byteLen, 0));
+          return still.length;
+        });
+      }
+    } else rows += chunks.length;
     if (moved || lost) break;
     done += batch.length;
     collectBatchGarbage();

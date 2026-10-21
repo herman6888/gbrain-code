@@ -2183,7 +2183,7 @@ More: [docs/guides/troubleshooting.md#ipc-path-too-long](../../docs/guides/troub
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Hybrid search's CJK keyword arm hit its deadline or candidate cap on a large corpus, so some keyword matches can be missing. | The CJK fallback is an unindexed LIKE scan; the arm is bounded so a large brain cannot stall every hybrid search. An incomplete keyword search is not evidence of absence. | Narrow the search with --source-id (MCP source_id), or ask the user to raise search.cjk_keyword_deadline_ms. Run: gbrain config get search.cjk_keyword_deadline_ms | agent | `gbrain doctor --json` | 1 | no |
+| Hybrid search's keyword arm returned a bounded result on a large corpus (the CJK arm's deadline or candidate cap, or a common-word match ranked from a sample), so some keyword matches can be missing. | The CJK fallback is an unindexed LIKE scan, and a query whose words match hundreds of thousands of chunks ranks a bounded sample of them (an OR retry also keeps only its rarer words); each bound keeps a large brain from stalling every hybrid search. An incomplete keyword search is not evidence of absence. | Add a rarer word or an exact "phrase", or narrow the search with --source-id (MCP source_id) or --types; for CJK text, ask the user to raise search.cjk_keyword_deadline_ms. Run: gbrain config get search.cjk_keyword_deadline_ms | agent | `gbrain doctor --json` | 1 | no |
 
 More: [docs/guides/multi-language-fts.md#cjk-keyword-budget](../../docs/guides/multi-language-fts.md#cjk-keyword-budget)
 

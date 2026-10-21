@@ -29,7 +29,9 @@ export async function resolveSweepExclusion(deps: Pick<GoogleSyncDeps, 'engine' 
   }
   const policy = resolveExcludedLabels(tokens, catalog);
   if (policy.unresolved.length > 0) {
-    deps.log(`[google] loop exclusion: ${policy.unresolved.map((t) => JSON.stringify(t)).join(', ')} ${policy.unresolved.length === 1 ? 'is not a label' : 'are not labels'} of ${deps.cfg.account}; ` +
+    const names = policy.unresolved.map((t) => JSON.stringify(t)).join(', ');
+    deps.log(`[google] loop exclusion: ${catalog === null ? `${names} could not be checked against the labels of ${deps.cfg.account} (the label list failed, see above)`
+      : `${names} ${policy.unresolved.length === 1 ? 'is not a label' : 'are not labels'} of ${deps.cfg.account}`}; ` +
       'no new loop extraction runs for this source until the names resolve (excluded_label_unresolved)');
   }
   try {

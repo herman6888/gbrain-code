@@ -76,7 +76,8 @@ import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
 import { addProjectedTimelineBatch, addProjectedTimelineEntry } from '../core/trust/timeline-projection.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { pathToSlug, slugifyPath, slugifySegment, pruneDir, isSyncable } from '../core/sync.ts';
+import { pathToSlug, slugifyPath, slugifySegment, pruneDir, isSyncable, readMetafilePagesMode, DEFAULT_METAFILE_PAGES_MODE, type MetafilePagesMode } from '../core/sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from '../core/sync-metafile-pages.ts';
 // v0.41.18.0: withRetry + isRetryableConnError + WithRetryOpts moved to
 // src/core/retry.ts as the canonical primitive. Engine methods
 // (addLinksBatch/addTimelineEntriesBatch/upsertChunks) now self-retry via
@@ -287,7 +288,7 @@ interface ExtractResult {
 
 // --- Shared walker ---
 
-export function walkMarkdownFiles(dir: string): { path: string; relPath: string }[] {
+export function walkMarkdownFiles(dir: string, metafilePages: MetafilePagesMode = DEFAULT_METAFILE_PAGES_MODE): { path: string; relPath: string }[] {
   // Descent-time pruning + emit-time isSyncable filter (closes #923, #202).
   // Pre-fix, this walker had only an ad-hoc dot-prefix exclusion and didn't
   // call isSyncable at all — so it descended into `node_modules/`, emitted
@@ -295,7 +296,7 @@ export function walkMarkdownFiles(dir: string): { path: string; relPath: string 
   // (`.raw/`, README.md, etc.). Now: pruneDir skips entire vendor
   // subtrees before recursion (saving IO), and isSyncable filters the emit
   // set against the canonical markdown-strategy rules.
-  const files: { path: string; relPath: string }[] = [];
+  const files: { path: string; relPath: string }[] = [], metafilePage = metafilePagePredicate(metafilePages, diskMetafileHeads(dir));
   function walk(d: string) {
     for (const entry of readdirSync(d)) {
       const full = join(d, entry);
@@ -308,7 +309,7 @@ export function walkMarkdownFiles(dir: string): { path: string; relPath: string 
           walk(full);
         } else if (entry.endsWith('.md') && !entry.startsWith('_')) {
           const rel = relative(dir, full);
-          if (!isSyncable(rel, { strategy: 'markdown' })) continue;
+          if (!isSyncable(rel, { strategy: 'markdown', metafilePage })) continue;
           files.push({ path: full, relPath: rel });
         }
       } catch { /* skip unreadable */ }
@@ -814,7 +815,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   let stampRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
   if (!dryRun && opts.mode === 'all') {
     const stampSourceId = opts.sourceId ?? 'default';
-    const walkRefs = walkMarkdownFiles(opts.dir)
+    const walkRefs = walkMarkdownFiles(opts.dir, await readMetafilePagesMode(engine))
       .map(f => ({ slug: pathToSlug(f.relPath), source_id: stampSourceId }));
     stampRefs = refsWithSnapshotStamps(walkRefs, await snapshotStampTimes(engine, walkRefs));
   }
@@ -1355,7 +1356,7 @@ async function extractForSlugs(
   const lost = new LostWrites();
   const stdoutQuiet = jsonMode || quiet;
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
-  const allFiles = walkMarkdownFiles(brainDir);
+  const allFiles = walkMarkdownFiles(brainDir, await readMetafilePagesMode(engine));
   // Same real-path resolution the sync hooks use (see buildSlugPathIndex).
   // Rebuilding `slug + '.md'` here made the cycle's incremental extract treat
   // every non-slug filename as a deleted file and skip it without a word.
@@ -1531,7 +1532,7 @@ async function extractLinksFromDir(
   lost: LostWrites = new LostWrites(),
 ): Promise<{ created: number; pages: number; processed: string[] }> {
   const stdoutQuiet = jsonMode || quiet;
-  const files = walkMarkdownFiles(brainDir);
+  const files = walkMarkdownFiles(brainDir, await readMetafilePagesMode(engine));
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
   const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
@@ -1621,7 +1622,7 @@ async function extractTimelineFromDir(
 ): Promise<{ created: number; pages: number; processed: string[] }> {
   const processed: string[] = [];
   const stdoutQuiet = jsonMode || quiet;
-  const files = walkMarkdownFiles(brainDir);
+  const files = walkMarkdownFiles(brainDir, await readMetafilePagesMode(engine));
   const quarantined = await quarantinedSlugs(engine, sourceId ?? 'default');
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
@@ -1727,7 +1728,7 @@ export async function extractLinksForSlugs(
   slugs: string[],
   opts?: { sourceId?: string; includeFrontmatter?: boolean },
 ): Promise<ExtractForSlugsResult> {
-  const allFiles = walkMarkdownFiles(repoPath);
+  const allFiles = walkMarkdownFiles(repoPath, await readMetafilePagesMode(engine));
   // Resolve each requested slug to its REAL path (see buildSlugPathIndex).
   // The old reconstructed path missed any file whose name is not already a
   // slug: `existsSync` was false, the page was skipped in silence, and the

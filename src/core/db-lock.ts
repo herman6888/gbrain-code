@@ -205,6 +205,13 @@ export function isLockHolderLive(snap: LockSnapshot, ttlMinutes: number = DEFAUL
  * Empty RETURNING means the existing row is still live. An expired holder
  * (worker crashed without releasing) is auto-superseded by the UPDATE
  * branch.
+ *
+ * On Postgres the handle's release and exit cleanup run on the engine's pool as
+ * it is when they run, never the pool the acquire used: `engine.reconnect()`
+ * ends that pool while the lock is held (a write admission that lost its
+ * connection rebuilds it), and a statement on an ended pool fails
+ * `CONNECTION_ENDED`, which turned a finished sync into a thrown error and left
+ * its lock row behind until the TTL lapsed.
  */
 export async function tryAcquireDbLock(
   engine: BrainEngine,
@@ -264,7 +271,7 @@ export async function tryAcquireDbLock(
     // is lost) and is never compared (#6028).
     const fence = rows[0].fence;
     const deregister = registerCleanup(`db-lock:${lockId}`, async () => {
-      await sql`
+      await (maybePG.sql as any)`
         DELETE FROM gbrain_cycle_locks
         WHERE id = ${lockId} AND holder_pid = ${pid} AND acquisition_token = ${acquisitionToken}::uuid
       `;
@@ -291,7 +298,7 @@ export async function tryAcquireDbLock(
       },
       release: async () => {
         deregister();
-        await sql`
+        await (maybePG.sql as any)`
           DELETE FROM gbrain_cycle_locks
           WHERE id = ${lockId} AND holder_pid = ${pid} AND acquisition_token = ${acquisitionToken}::uuid
         `;

@@ -1,7 +1,7 @@
 /**
  * #6696 B1: doctor tiers and budgets.
  *
- * `--tier ops|standard|deep` selects which registry entries run (see
+ * `--tier ops|quick|standard|deep` selects which registry entries run (see
  * `DoctorTier` in ./context.ts); `--budget-ms <n>` is one absolute end-to-end
  * deadline that starts before the CLI connects (default 4000 for `ops`, none
  * for the other tiers; `--budget-ms 0`: none). A plain non-interactive CLI
@@ -31,9 +31,11 @@ import type { Check, DoctorReport } from '../doctor.ts';
 import { agentFix } from './check-fix.ts';
 import type { DoctorTier } from './context.ts';
 
-export const DOCTOR_TIERS: readonly DoctorTier[] = ['ops', 'standard', 'deep'];
+export const DOCTOR_TIERS: readonly DoctorTier[] = ['ops', 'quick', 'standard', 'deep'];
 /** Default `--budget-ms` for `--tier ops`; the other tiers have no overall deadline unless one is given. */
 export const OPS_BUDGET_MS_DEFAULT = 4000;
+/** #7142: default `--budget-ms` for `--tier quick` (connect included). */
+export const QUICK_BUDGET_MS_DEFAULT = 10_000;
 /** Config key and default of the per-entry budget (standard and deep tiers; ops entries use the overall deadline). */
 export const ENTRY_BUDGET_KEY = 'doctor.entry_budget_ms';
 export const ENTRY_BUDGET_MS_DEFAULT = 15_000;
@@ -84,7 +86,7 @@ export function parseDoctorTier(args: readonly string[]): DoctorTier {
 /** `--budget-ms <n>` (a non-negative integer; 0: no overall budget), else the tier default. */
 export function parseBudgetMs(args: readonly string[], tier: DoctorTier): number | null {
   const raw = flagValue(args, '--budget-ms');
-  if (raw === undefined) return tier === 'ops' ? OPS_BUDGET_MS_DEFAULT : null;
+  if (raw === undefined) return tier === 'ops' ? OPS_BUDGET_MS_DEFAULT : tier === 'quick' ? QUICK_BUDGET_MS_DEFAULT : null;
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 0) {
     throw opError('invalid_params', `--budget-ms must be a whole number of milliseconds, 0 for no overall budget (got ${raw}).`, 'Example: --budget-ms 4000.');
@@ -115,10 +117,11 @@ export function scanDeadline(ctx: { entryDeadlineAt?: number }, ownTimeoutMs: nu
   return Math.min(now + ownTimeoutMs, (ctx.entryDeadlineAt ?? Infinity) - SCAN_REPORT_RESERVE_MS);
 }
 
-/** Whether a registry entry runs at `tier` (`standard` includes `ops`; `deep` includes both). */
+/** Whether a registry entry runs at `tier` (each tier includes the ones before it: ops, quick, standard, deep). */
 export function entryRunsAt(entryTier: DoctorTier | undefined, tier: DoctorTier): boolean {
   const own = entryTier ?? 'standard';
   if (tier === 'ops') return own === 'ops';
+  if (tier === 'quick') return own === 'ops' || own === 'quick';
   if (tier === 'standard') return own !== 'deep';
   return true;
 }
@@ -190,9 +193,13 @@ export function isBudgetUnknown(check: Pick<Check, 'details'>): boolean {
 /** #6696 B1: what the report says about the run's tier and deadline (`--tier` / `--budget-ms` given). */
 export interface DoctorRunSummary { tier: DoctorTier; startedAt: number; budgetMs: number | null }
 
-export function tierFields(checks: Check[], run: DoctorRunSummary): Pick<DoctorReport, 'tier' | 'complete' | 'unknown_sections' | 'elapsed_ms' | 'budget_ms'> {
-  const unknown = checks.filter((c) => c.status !== 'ok' && c.details?.health === 'unknown').map((c) => c.name);
-  return { tier: run.tier, complete: unknown.length === 0, unknown_sections: unknown, elapsed_ms: Date.now() - run.startedAt, budget_ms: run.budgetMs };
+export function tierFields(checks: Check[], run: DoctorRunSummary): Pick<DoctorReport, 'tier' | 'complete' | 'unknown_sections' | 'last_known_sections' | 'elapsed_ms' | 'budget_ms'> {
+  // #7142: the doctor_last_known warning stands for the checks it names; a last known result is known, but not from this run.
+  const unknown = checks.filter((c) => c.status !== 'ok' && c.details?.health === 'unknown')
+    .flatMap((c) => Array.isArray(c.details?.unknown_checks) ? c.details.unknown_checks as string[] : [c.name]);
+  const lastKnown = checks.filter((c) => c.details?.last_known !== undefined).map((c) => c.name);
+  return { tier: run.tier, complete: unknown.length === 0 && lastKnown.length === 0, unknown_sections: unknown,
+    ...(lastKnown.length ? { last_known_sections: lastKnown } : {}), elapsed_ms: Date.now() - run.startedAt, budget_ms: run.budgetMs };
 }
 
 /** The run summary a report carries: when the caller chose a tier or a budget, or the non-interactive default capped the run. */

@@ -398,6 +398,8 @@ export interface PageFilters {
    * read none of those fields (list_pages).
    */
   listColumnsOnly?: boolean;
+  /** #7159: frontmatter equality (search/frontmatter-where.ts). */
+  where?: import('./search/frontmatter-where.ts').FrontmatterWhere;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
@@ -1140,6 +1142,18 @@ export interface SearchResult {
   create_safety?: import('./search/evidence.ts').CreateSafety;
   /** Evidence delivery (`return_unit`): present only when a non-chunk unit applied. */
   delivered?: import('./search/evidence-delivery.ts').DeliveredEvidence;
+  /** Pages folded into this row at result time (search/collapse.ts): a same-slug twin in another source, a redirect stub that points here, or another copy of the same document. */
+  collapsed?: import('./search/collapse.ts').CollapsedRef[];
+  /** A redirect stub whose target could not be returned in its place: the slug it points to (search/collapse.ts). */
+  redirect_to?: string;
+  /** A text row of an image page (its caption or OCR text), so an agent can discount a one-word match (search/rank-priors.ts). */
+  image_page?: true;
+  /** Multiplier the rank priors applied to this row's ordering score (search/rank-priors.ts); absent = 1. */
+  rank_prior?: number;
+  /** The value a reranked list is ordered by: rerank_score times rank_prior (search/rank-priors.ts). */
+  rank_score?: number;
+  /** The fused score when the returned `score` was rewritten to follow rank order (search/score-contract.ts). */
+  fused_score?: number;
 }
 
 /**
@@ -1235,6 +1249,8 @@ export interface SearchOpts extends PageReadPolicy {
   hnswIterativeScan?: import('./search/hnsw-iterative-scan.ts').HnswIterativeScanMode;
   /** #5989: bounded CJK keyword arm (deadline + meta sink); set by hybrid only (engine-sql/cjk-search.ts). */
   cjkKeyword?: import('./engine-sql/cjk-search.ts').CjkKeywordRun;
+  /** GBRA-156: the Postgres keyword arm ranked a bounded sample of its matches, or its OR retry dropped common terms (search/keyword-chunk-match.ts, search/keyword-or-narrow.ts). */
+  onKeywordIncomplete?: (reason: 'candidate_budget') => void;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1261,6 +1277,8 @@ export interface SearchOpts extends PageReadPolicy {
    * entity-only search reuses the parameter.
    */
   types?: PageType[];
+  /** #7159: frontmatter equality, pushed into every SQL leg (search/frontmatter-where.ts). */
+  where?: import('./search/frontmatter-where.ts').FrontmatterWhere;
   exclude_slugs?: string[];
   /**
    * Slug-prefix excludes — additive over DEFAULT_HARD_EXCLUDES (test/,
@@ -2227,6 +2245,8 @@ export interface HybridSearchMeta {
   rerank_gate?: import('./search/hybrid/rerank-gate.ts').RerankGateMeta;
   /** `js_fallback` when the SQL cosine re-score failed and this search computed it in JavaScript (search/cosine-rescore.ts). */
   cosine_rescore?: 'js_fallback';
+  /** Rows folded at result time (search/collapse.ts): twins, redirect stubs and document copies, plus redirect targets read in. Absent when nothing folded. */
+  collapse?: import('./search/collapse.ts').CollapseDecision;
   /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite
@@ -2309,6 +2329,8 @@ export interface EngineConfig {
   keyword_statement_timeout_ms?: number;
   /** PGLite `shared_buffers` for this open (e.g. '32MB'); unset keeps the data directory's setting. */
   pglite_shared_buffers?: string;
+  /** Postgres: connections the module pool may open (a one-shot read: 2); unset keeps GBRAIN_POOL_SIZE or the default. */
+  pool_max?: number;
 }
 
 // Errors

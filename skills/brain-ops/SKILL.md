@@ -35,7 +35,7 @@ provenance; automatic capture is off until the user opts in. Reading this skill
 does not enable capture, delegation, or paid enrichment. A chat-only instruction
 suppresses writes for that turn, including when standing capture is enabled.
 
-> **Convention:** See `skills/conventions/brain-first.md` for the 5-step lookup protocol.
+> **Convention:** See `skills/conventions/brain-first.md` for the lookup chain and copyable retrieval filters.
 > **Convention:** See `skills/conventions/quality.md` for citation and back-link rules.
 
 > **Memory verbs (MEMORY_VERBS v1, gbrain ≥ 0.43).** Over MCP, prefer the five
@@ -131,6 +131,9 @@ Before using ANY external API to research a person, company, or topic:
 6. Check timeline: recent events involving this entity
 
 The brain almost always has something. External APIs fill gaps, not start from scratch.
+Search gbrain before reading, grepping or querying brain files directly; filters
+(`--types`, `--match keyword`, `query --since/--until`, `--source`, `--json`) are
+in the brain-first convention's "Retrieval: gbrain first" block.
 
 **⚠️ NEVER scope/count a corpus with shallow `ls` — query gbrain or `find`.** Federated sources often carry MULTIPLE coexisting directory conventions — a flat legacy layer AND a date-nested `meetings/YYYY/MM/` layer. A non-recursive `ls dir/*.md` sees only one and undercounts massively. Real example: a shallow `ls` of one source's `meetings/` counted 132 files, almost all the user's, and concluded that WAS the corpus — missing thousands of transcripts nested under `meetings/YYYY/MM/`. To count/scope a brain corpus:
   - **Best:** `gbrain sources list` (shows per-source indexed page counts) + `gbrain query`. gbrain indexes ALL federated sources correctly; trust its index, not the filesystem.

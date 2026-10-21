@@ -35,6 +35,7 @@ import { existingLocalHostId } from '../../../core/persistence/identity.ts';
 import { gitDurabilityPolicy } from '../../../core/persistence/git-durability-policy.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { doctorVerify } from '../check-fix.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
 
 export const GIT_CONVERGENCE_WARN_MS = 6 * 3_600_000;
 export const GIT_CONVERGENCE_FAIL_MS = 24 * 3_600_000;
@@ -74,21 +75,34 @@ async function unwatchedDurableRoots(engine: BrainEngine): Promise<Map<string, s
   return roots;
 }
 
-function git(root: string, args: string[]): string | null {
+/** `timedOut` collects the roots where a git call ran past GIT_TIMEOUT_MS (#7145: a timeout is not an empty answer). */
+function git(root: string, args: string[], timedOut?: Set<string>): string | null {
   try { return execFileSync('git', ['-C', root, ...args], { stdio: ['ignore', 'pipe', 'ignore'], timeout: GIT_TIMEOUT_MS }).toString(); }
-  catch { return null; }
+  catch (error) {
+    if ((error as { code?: string }).code === 'ETIMEDOUT') timedOut?.add(root);
+    return null;
+  }
+}
+
+/** #7145: what a bounded probe could not read, as a sentence, plus the matching unknown-health details. */
+function boundReport(timedOut: Set<string>, notProbed: number, total: number) {
+  if (!timedOut.size && !notProbed) return null;
+  const parts = [timedOut.size ? `git did not answer within ${GIT_TIMEOUT_MS / 1000} s in ${[...timedOut].join(', ')}` : '',
+    notProbed ? `only the first ${MAX_ROOTS} of ${total} source checkouts were probed` : ''].filter(Boolean);
+  return { note: `${parts.join('; ')} (no setting), so what those checkouts hold was not read`,
+    details: { ...boundUnknownDetails(timedOut.size ? 'time' : 'roots'), limit: timedOut.size ? GIT_TIMEOUT_MS : MAX_ROOTS, timed_out: [...timedOut] } };
 }
 
 /** `tracked` collects each probed toplevel's modified tracked paths (toplevel-relative). */
-function probe(root: string, sourceIds: string[], now: number, tracked: Map<string, string[]>): RootReport | { root: string; source_ids: string[]; skipped: string } {
-  const top = git(root, ['rev-parse', '--show-toplevel'])?.trim();
-  if (!top) return { root, source_ids: sourceIds, skipped: 'not a git checkout' };
-  const counts = git(top, ['rev-list', '--left-right', '--count', '@{u}...HEAD'])?.trim().split(/\s+/).map(Number);
-  if (!counts || counts.length !== 2 || counts.some(n => !Number.isFinite(n))) return { root: top, source_ids: sourceIds, skipped: 'no upstream branch' };
+function probe(root: string, sourceIds: string[], now: number, tracked: Map<string, string[]>, timedOut: Set<string>): RootReport | { root: string; source_ids: string[]; skipped: string } {
+  const top = git(root, ['rev-parse', '--show-toplevel'], timedOut)?.trim();
+  if (!top) return { root, source_ids: sourceIds, skipped: timedOut.has(root) ? 'git timed out' : 'not a git checkout' };
+  const counts = git(top, ['rev-list', '--left-right', '--count', '@{u}...HEAD'], timedOut)?.trim().split(/\s+/).map(Number);
+  if (!counts || counts.length !== 2 || counts.some(n => !Number.isFinite(n))) return { root: top, source_ids: sourceIds, skipped: timedOut.has(top) ? 'git timed out' : 'no upstream branch' };
   const [behind, ahead] = counts as [number, number];
-  const oldestUnpushed = ahead > 0 ? Number(git(top, ['log', '@{u}..HEAD', '--reverse', '--format=%ct'])?.split('\n')[0]) * 1000 : NaN;
+  const oldestUnpushed = ahead > 0 ? Number(git(top, ['log', '@{u}..HEAD', '--reverse', '--format=%ct'], timedOut)?.split('\n')[0]) * 1000 : NaN;
   const changed: string[] = [];
-  const entries = (git(top, ['status', '--porcelain', '-z']) ?? '').split('\0');
+  const entries = (git(top, ['status', '--porcelain', '-z'], timedOut) ?? '').split('\0');
   for (let i = 0; i < entries.length; i++) {
     if (entries[i].length < 4) continue;
     changed.push(entries[i].slice(3));
@@ -125,8 +139,9 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
   if (!roots.size) return null;
   const byTop = new Map<string, RootReport | { root: string; source_ids: string[]; skipped: string }>();
   const tracked = new Map<string, string[]>();
+  const timedOut = new Set<string>();
   for (const [root, ids] of [...roots].slice(0, MAX_ROOTS)) {
-    const report = probe(root, ids, now, tracked);
+    const report = probe(root, ids, now, tracked, timedOut);
     const prior = byTop.get(report.root);
     byTop.set(report.root, prior ? { ...prior, source_ids: [...prior.source_ids, ...ids] } : report);
   }
@@ -144,12 +159,20 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
   const skipped = [...byTop.values()].filter((r): r is { root: string; source_ids: string[]; skipped: string } => 'skipped' in r);
   const details = { roots: reports, skipped, ...(roots.size > MAX_ROOTS ? { not_probed: roots.size - MAX_ROOTS } : {}),
     warn_after_hours: GIT_CONVERGENCE_WARN_MS / 3_600_000, fail_after_hours: GIT_CONVERGENCE_FAIL_MS / 3_600_000, fetched: false };
-  if (!reports.length) return null;
+  const bound = boundReport(timedOut, Math.max(0, roots.size - MAX_ROOTS), roots.size);
+  if (!reports.length && !bound) return null;
   const bad = reports.filter(r => r.status !== 'ok');
+  if (!bad.length && bound) {
+    return { name: 'git_convergence', status: 'warn', details: { ...details, ...bound.details },
+      message: `Git convergence unknown: ${bound.note}; ${reports.filter(r => !timedOut.has(r.root)).length} other checkout(s) have no unpushed commits or stale uncommitted changes. `
+        + 'Run git status and git log @{u}..HEAD in each checkout named here to read what it holds.' };
+  }
   if (!bad.length) {
     return { name: 'git_convergence', status: 'ok', details,
       message: `${reports.length} Git checkout(s) have no unpushed commits or stale uncommitted changes (compared with the last fetched upstream).` };
   }
+  const boundNote = bound ? ` Not every checkout was read: ${bound.note}.` : '';
+  if (bound) Object.assign(details, { exact: false, limit: bound.details.limit, timed_out: bound.details.timed_out });
   const lines = bad.map(r => `${r.root}${r.source_ids.length ? ` (${r.source_ids.join(', ')})` : ''}: `
     + [r.ahead ? `${r.ahead} commit(s) not on the upstream since ${r.oldest_unpushed_at}` : '', r.dirty && r.oldest_dirty_at ? `${r.dirty} uncommitted change(s), oldest from ${r.oldest_dirty_at}` : '']
       .filter(Boolean).join('; '));
@@ -165,7 +188,7 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
     const push: Action = { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', uncommitted.root], consent: [], actor: 'agent', requires_exclusive: false,
       why: 'Publishes the commit just made without moving the checkout.', verify: doctorVerify('git_convergence') };
     return { name: 'git_convergence', status, details,
-      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${uncommitted.root} is a managed checkout with Git durability on, ${pages.length} tracked file(s) modified under its source root (${pages.slice(0, 5).join(', ')}${pages.length > 5 ? ', ...' : ''}) and no Git effect queued, running or parked, so no effect will commit them (#7091: earlier releases committed no edits to tracked pages when the source root sits below the repository top). Review and commit them with plain git, then push with the keep-checkout publish. ${remedy}; this compares with the last fetched upstream and does not fetch.`,
+      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${uncommitted.root} is a managed checkout with Git durability on, ${pages.length} tracked file(s) modified under its source root (${pages.slice(0, 5).join(', ')}${pages.length > 5 ? ', ...' : ''}) and no Git effect queued, running or parked, so no effect will commit them (#7091: earlier releases committed no edits to tracked pages when the source root sits below the repository top). Review and commit them with plain git, then push with the keep-checkout publish. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
       fix: { ask_user: true, argv: ['git', '-C', uncommitted.root, 'commit', '-m', 'gbrain: persist canonical memory update', '--', ...pages], consent: [], actor: 'user', requires_exclusive: false,
         why: `These tracked files under a durable managed source root differ from the last commit and no Git effect will commit them; committing writes them to the checkout's history, so the user reviews them first.${stranded.length > 1 ? ` ${stranded.length - 1} other checkout(s) are stranded too, see details.roots (stranded).` : ''}`,
         user_message: `${pages.length} page file(s) in ${uncommitted.root} were edited but never committed (${pages.slice(0, 5).join(', ')}${pages.length > 5 ? ', ...' : ''}), so they are not on the remote. Commit them and push?`,
@@ -174,13 +197,13 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
   if (stranded.length) {
     const first = stranded[0]!;
     return { name: 'git_convergence', status, details,
-      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${stranded.map(r => r.root).join(', ')} ${stranded.length === 1 ? 'is a managed checkout' : 'are managed checkouts'} with Git durability on and no Git effect queued, running or parked, so no effect will push ${stranded.length === 1 ? 'its' : 'their'} commits; push them with the keep-checkout publish, which merges a moved remote in memory and never moves the checkout. ${remedy}; this compares with the last fetched upstream and does not fetch.`,
+      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${stranded.map(r => r.root).join(', ')} ${stranded.length === 1 ? 'is a managed checkout' : 'are managed checkouts'} with Git durability on and no Git effect queued, running or parked, so no effect will push ${stranded.length === 1 ? 'its' : 'their'} commits; push them with the keep-checkout publish, which merges a moved remote in memory and never moves the checkout. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
       fix: { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', first.root], consent: [], actor: 'agent', requires_exclusive: false,
         why: `${first.root} has ${first.ahead} commit(s) not on its upstream and no Git effect left to push them (#7089); this publishes the commits already on the branch and commits nothing. A conflict with the remote is reported with the user's choice as its fix.${stranded.length > 1 ? ` ${stranded.length - 1} other checkout(s) need the same, see details.roots (stranded).` : ''}`,
         verify: doctorVerify('git_convergence') } };
   }
   return { name: 'git_convergence', status, details,
-    message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${remedy}; this compares with the last fetched upstream and does not fetch.` };
+    message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}` };
 }
 
 /**
@@ -196,15 +219,21 @@ export async function trackedOwnershipMarkerCheck(engine: BrainEngine): Promise<
   const tracked: Array<{ root: string; source_ids: string[]; paths: string[] }> = [];
   let checkouts = 0;
   const seen = new Set<string>();
+  const timedOut = new Set<string>();
   for (const [root, ids] of [...roots].slice(0, MAX_ROOTS)) {
-    const top = git(root, ['rev-parse', '--show-toplevel'])?.trim();
+    const top = git(root, ['rev-parse', '--show-toplevel'], timedOut)?.trim();
     if (!top || seen.has(top)) continue;
     seen.add(top);
     checkouts++;
-    const paths = (git(top, ['ls-files', '-z', '--cached']) ?? '').split('\0').filter(path => path && isPhysicalRootMetadata(path.slice(path.lastIndexOf('/') + 1)));
+    const paths = (git(top, ['ls-files', '-z', '--cached'], timedOut) ?? '').split('\0').filter(path => path && isPhysicalRootMetadata(path.slice(path.lastIndexOf('/') + 1)));
     if (paths.length) tracked.push({ root: top, source_ids: ids, paths });
   }
   const details = { checkouts, tracked, ...(roots.size > MAX_ROOTS ? { not_probed: roots.size - MAX_ROOTS } : {}) };
+  const bound = boundReport(timedOut, Math.max(0, roots.size - MAX_ROOTS), roots.size);
+  if (!tracked.length && bound) {
+    return { name: 'tracked_ownership_marker', status: 'warn', details: { ...details, ...bound.details },
+      message: `Tracked ownership markers unknown: ${bound.note}. Run git ls-files in each checkout named here to read its index.` };
+  }
   if (!tracked.length) {
     return { name: 'tracked_ownership_marker', status: 'ok', details,
       message: `${checkouts} Git checkout(s) track no ownership marker (markers on disk stay untracked and are denied on push).` };

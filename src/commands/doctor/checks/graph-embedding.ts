@@ -429,6 +429,8 @@ export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): 
  */
 export const JUNK_HUB_EDGE_THRESHOLD = 1000;
 export const JUNK_HUB_MAX_CHUNKS = 2;
+/** Pages `junk_entity_hubs` lists before it reports a floor. */
+const JUNK_HUB_LIMIT = 20;
 
 /**
  * #4222 junk_entity_hubs doctor check.
@@ -461,7 +463,7 @@ export async function checkJunkEntityHubs(
   const edgeThreshold = opts?.edgeThreshold ?? JUNK_HUB_EDGE_THRESHOLD;
   const maxChunks = opts?.maxChunks ?? JUNK_HUB_MAX_CHUNKS;
   try {
-    const rows = await engine.executeRaw<{
+    const listed = await engine.executeRaw<{
       slug: string;
       source_id: string | null;
       edges: number;
@@ -499,9 +501,13 @@ export async function checkJunkEntityHubs(
        WHERE COALESCE(cc.chunks, 0) <= $2
          AND COALESCE(p.frontmatter ->> 'junk_hub_exempt', 'false') <> 'true'
        ORDER BY ec.edges DESC
-       LIMIT 20`,
+       LIMIT ${JUNK_HUB_LIMIT + 1}`,
       [edgeThreshold, maxChunks],
     );
+    // #7145: a full list means more pages match; the counts below are then floors.
+    const capped = listed.length > JUNK_HUB_LIMIT;
+    const rows = listed.slice(0, JUNK_HUB_LIMIT);
+    const plus = capped ? '+' : '';
 
     if (rows.length === 0) {
       return {
@@ -520,7 +526,7 @@ export async function checkJunkEntityHubs(
     const parts: string[] = [];
     if (hubs.length > 0) {
       parts.push(
-        `${hubs.length} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
+        `${hubs.length}${plus} near-empty page(s) with >${edgeThreshold} edges — likely generic-token entities ` +
         `("Will", "Info") minted by an extractor and inflated by mention auto-links:\n${hubs.map(line).join('\n')}\n` +
         `Review each page and merge/delete deliberately (nothing is auto-deleted). ` +
         `New accretion is already gated: enrichEntity refuses generic single-token mints and ` +
@@ -536,7 +542,7 @@ export async function checkJunkEntityHubs(
     const withTwin = twins.filter(r => r.canonical_twin_source !== null).length;
     if (twins.length > 0) {
       parts.push(
-        `${twins.length} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
+        `${twins.length}${plus} connector contact page(s) with >${edgeThreshold} edges:\n${twins.map(line).join('\n')}\n` +
         `These are not junk: a connector renders each contact as its own page, and mentions in that source link to it ` +
         `before a page of the same name elsewhere unless link_resolution.cross_source is on. ` +
         `${withTwin} of them ${withTwin === 1 ? 'has' : 'have'} a canonical twin in another source. ` +
@@ -561,6 +567,8 @@ export async function checkJunkEntityHubs(
       message: parts.join('\n'),
       ...twinFix,
       details: {
+        exact: !capped,
+        ...(capped ? { limit: JUNK_HUB_LIMIT } : {}),
         hubs: hubs.map(r => ({
           slug: r.slug,
           source_id: r.source_id ?? 'default',

@@ -111,9 +111,12 @@ async function stuckLarge(engine: BrainEngine, seed: number): Promise<Stuck> {
     throw Object.assign(new Error('simulated serialization failure'), { code: '40001' });
   });
   const expected_revision = (await engine.readPageSnapshot(slug, { sourceId }))!.revision;
-  try { await submitPageMutation(ctx, { operation: 'delete_page', params: { slug, expected_revision, request_id: randomUUID() } }).catch(() => undefined); }
-  finally { installFaultHook(undefined); }
-  await disposePersistenceConsumer(engine);
+  // The hook stays until the consumer is disposed: a delete that outlasts the reply wait (a pending receipt) is still
+  // publishing, and must meet the interruption rather than commit without it.
+  try {
+    await submitPageMutation(ctx, { operation: 'delete_page', params: { slug, expected_revision, request_id: randomUUID() } }).catch(() => undefined);
+    await disposePersistenceConsumer(engine);
+  } finally { installFaultHook(undefined); }
   const [row] = await engine.executeRaw<{ id: string; request_id: string; state: string; blocked_reason: string | null; error_code: string | null; recovery: any }>(
     "SELECT id::text, request_id::text, state, blocked_reason, error_code, recovery FROM persistence_requests WHERE source_id=$1 AND operation='delete_page' ORDER BY sequence DESC LIMIT 1", [sourceId]);
   expect(row).toMatchObject({ state: 'recovering', blocked_reason: 'unexpected_file_bytes', error_code: null });

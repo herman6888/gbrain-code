@@ -114,6 +114,7 @@ created: YYYY-MM-DD
 updated: YYYY-MM-DD
 tags: []
 access: <per your brain's access policy>
+visibility: <private for anything remote agents must not read; omit for world>
 ---
 
 # Title

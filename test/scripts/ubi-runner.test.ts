@@ -194,6 +194,20 @@ describe("stale sweep and ownership", () => {
     expect(api.events).toEqual([`destroy ubirun-t1-${OLD}-aaaaaaaa`, `removed ubirun-t1-${OLD}-aaaaaaaa`]);
   });
 
+  it("list --mine and gc also cover VMs this machine created under another owner tag", async () => {
+    const api = serve({ seed });
+    const other = `ubirun-other-${OLD}-cccccccc`;
+    execFileSync("mkdir", ["-p", join(dir, "state", other)]);
+    writeFileSync(join(dir, "state", other, "env"), `NAME=${other}\nLOCATION=eu-central-h1\n`);
+    const mine = await run(["list", "--mine"], { UBI_OWNER: "t1" });
+    expect(mine.stdout.trim().split("\n").map((l) => l.split(/\s+/)[1])).toEqual([`ubirun-t1-${OLD}-aaaaaaaa`, `ubirun-t1-${NOW}-bbbbbbbb`, other]);
+    expect(mine.stderr).toContain("list --mine: owner tag t1 plus VMs this machine created (also under: other)");
+    const gc = await run(["gc", "1"], { UBI_OWNER: "t1" });
+    expect(gc.code).toBe(0);
+    expect(api.events.filter((e) => e.startsWith("destroy ")).sort()).toEqual([`destroy ubirun-t1-${OLD}-aaaaaaaa`, `destroy ${other}`].sort());
+    expect(api.vms.has(`ubirun-${OLD}-dddddddd`)).toBe(true);
+  });
+
   it("list --mine shows only the caller's VMs; usage sums vCPUs by owner", async () => {
     serve({ seed });
     const mine = await run(["list", "--mine"], { UBI_OWNER: "t1" });

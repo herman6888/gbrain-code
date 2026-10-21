@@ -42,7 +42,7 @@ const withdrawals = async (engine: BrainEngine) => Number((await engine.executeR
 /** 1a: a remote forget of an unlinked fact never names or withdraws a linked copy on a page the caller cannot read. */
 export async function unlinkedForgetKeepsHiddenCopies(engine: BrainEngine): Promise<void> {
   await seedPages(engine);
-  const hidden = await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-co', provenance: 'meeting notes' }, 'local');
+  const hidden = await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-co', provenance: 'meeting notes', visibility: 'world' }, 'local');
   expect(hidden.body.status).toBe('inserted');
   const unlinked = await call(engine, 'remember', { fact: CLAIM, provenance: 'call notes', infer_entity: false });
   const id = unlinked.body.id;
@@ -57,7 +57,7 @@ export async function unlinkedForgetKeepsHiddenCopies(engine: BrainEngine): Prom
   // Fail closed: a call that does not say it is local is treated as remote.
   expect((await call(engine, 'forget', { id: String(id) }, 'unset')).body.message).toBe(GENERIC_CLAIM_LINKED(id));
   // One fixed text whatever the number of hidden copies.
-  await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-two', provenance: 'meeting notes' }, 'local');
+  await call(engine, 'remember', { fact: CLAIM, entity: 'crm/hidden-two', provenance: 'meeting notes', visibility: 'world' }, 'local');
   const two = await call(engine, 'forget', { id: String(id) });
   expect(two.body.message).toBe(one.body.message);
   expect(two.body.suggestion).toBe(one.body.suggestion);

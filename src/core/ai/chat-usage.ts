@@ -7,9 +7,12 @@
  * model + token usage. This module:
  *
  *   - attributes a best-effort PHASE via AsyncLocalStorage (`withChatPhase`):
- *     the minion worker wraps handler execution in `job:<name>`; direct CLI /
- *     op callers record with phase NULL unless they opt in. Attribution is
- *     advisory — a missing phase never blocks the record.
+ *     the minion worker wraps handler execution in `job:<name>`; `think`
+ *     records as `think` when nothing outside set a phase
+ *     (`withDefaultChatPhase`); query expansion always records as
+ *     `expansion` (#7176); other direct CLI / op callers record with phase
+ *     NULL unless they opt in. Attribution is advisory — a missing phase never
+ *     blocks the record.
  *   - prices the call from CANONICAL_PRICING (`estimateChatCostUsd`),
  *     including cache_read/cache_write tokens at the provider's cache rates
  *     when the table carries them (Anthropic), falling back to the input
@@ -19,7 +22,7 @@
  *     closed engine, disk pressure) must never break a chat call.
  *
  * Coverage contract (surfaced verbatim by the `get_usage` op): only
- * gateway.chat() calls are logged. The subagent raw-SDK path, embeddings
+ * gateway.chat() and gateway.expand() calls are logged. The subagent raw-SDK path, embeddings
  * (embedding-pricing.ts owns those), and calls made before the sink was
  * registered or before migration v140 are NOT covered. Failed chat calls are
  * not logged either — the budget tracker (budget-tracker.ts) remains the
@@ -55,6 +58,11 @@ const __chatPhaseStore = new AsyncLocalStorage<string>();
 /** Run `fn` with every gateway.chat() inside it attributed to `phase`. */
 export function withChatPhase<T>(phase: string, fn: () => T): T {
   return __chatPhaseStore.run(phase, fn);
+}
+
+/** Like `withChatPhase`, but an enclosing phase (`job:<name>`, `phase:synthesize`) wins. */
+export function withDefaultChatPhase<T>(phase: string, fn: () => T): T {
+  return currentChatPhase() === null ? withChatPhase(phase, fn) : fn();
 }
 
 export function currentChatPhase(): string | null {
@@ -154,6 +162,8 @@ export function estimateChatCostUsd(
 export function recordChatUsage(input: {
   model: string;
   provider?: string | null;
+  /** An operation's own phase (`expansion`), over the ambient one. */
+  phase?: string;
   usage: {
     input_tokens: number;
     output_tokens: number;
@@ -182,7 +192,7 @@ export function recordChatUsage(input: {
     const record: ChatUsageRecord = {
       model: input.model,
       provider: input.provider ?? null,
-      phase: currentChatPhase(),
+      phase: input.phase ?? currentChatPhase(),
       input_tokens: Math.max(0, Math.round(input.usage.input_tokens || 0)),
       output_tokens: Math.max(0, Math.round(input.usage.output_tokens || 0)),
       cache_read_tokens: Math.max(0, Math.round(input.usage.cache_read_tokens || 0)),

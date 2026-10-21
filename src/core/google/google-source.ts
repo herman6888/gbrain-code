@@ -1,5 +1,6 @@
 import { withConnectorSync, rethrowConnectorWriteError, pendingConnectorResult, type ManagedConnectorSync } from '../persistence/connector-sync.ts';
 import { resolveGoogleAccount } from '../persistence/connector-account.ts';
+import { googleApiProblem, googleUserinfo } from './api-access.ts';
 import { ConnectorHoldSession, connectorHoldsResult } from '../connectors/connector-hold-session.ts';
 import { carryLegacyFailCounts } from '../connectors/item-holds.ts';
 /**
@@ -58,6 +59,7 @@ import {
   ALL_GOOGLE_SERVICES,
   isGmailHoldKey,
   type GmailThreadData,
+  type GoogleApiProblem,
   type GoogleService,
   type GoogleSourceConfig,
   type GoogleSourceState,
@@ -154,7 +156,8 @@ async function saveGoogleState(deps: GoogleSyncDeps, state: GoogleSourceState): 
 /** #5867/#5868 state a partial managed run still publishes (E20): never the Gmail cursor. */
 function loopRecoveryState(state: GoogleSourceState): Record<string, unknown> {
   const fields = { loop_grace_holds: state.loop_grace_holds, loop_grace_backfill_done: state.loop_grace_backfill_done, loops_catchup: state.loops_catchup,
-    loop_withheld_senders: state.loop_withheld_senders, loop_automated_backfill_done: state.loop_automated_backfill_done, calendar_unreadable: state.calendar_unreadable };
+    loop_withheld_senders: state.loop_withheld_senders, loop_automated_backfill_done: state.loop_automated_backfill_done, calendar_unreadable: state.calendar_unreadable,
+    api_access: state.api_access };
   return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 }
 
@@ -789,7 +792,7 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
   const activeServices = grantedScopes.length > 0 ? grantedServices : cfg.services;
   // #5686: every enabled service reads as the pinned account; checked before any service runs.
   if (managed) {
-    const email = await resolveGoogleAccount({ gmail, calendar, people }, activeServices, opts.signal);
+    const { email } = await resolveGoogleAccount({ gmail, calendar, people, userinfo: googleUserinfo(tokens, fetchImpl ?? fetch) }, activeServices, opts.signal);
     await managed.assertAccount(email ? { kind: 'google', email } : null);
   }
 
@@ -805,13 +808,22 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
 
   try {
     const serviceErrors: string[] = [];
+    // #7073: services this run could not reach, and those it reached, for the stored api_access record.
+    const apiProblems: GoogleApiProblem[] = (grantedScopes.length > 0 ? missingServices : []).flatMap((svc) => googleApiProblem(svc, new CredentialError('scope_missing')) ?? []);
+    const reached = new Set<GoogleService>();
+    const serviceFailed = (svc: GoogleService, e: unknown): void => {
+      const problem = googleApiProblem(svc, e);
+      if (problem) apiProblems.push(problem);
+    };
 
     if (activeServices.includes('contacts')) {
       const stop = startHeartbeat(progress, 'contacts sweep');
       try {
         await sweepContacts(deps, people, state, activePack, summary, countedSlugs, holds);
+        reached.add('contacts');
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        serviceFailed('contacts', e);
         serviceErrors.push(`contacts: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (isCredentialError(e)) log(e.toHuman());
@@ -825,8 +837,10 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
       const stop = startHeartbeat(progress, 'calendar sweep');
       try {
         await sweepCalendar(deps, calendar, state, activePack, summary, countedSlugs, holds);
+        reached.add('calendar');
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        serviceFailed('calendar', e);
         serviceErrors.push(`calendar: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (isCredentialError(e)) log(e.toHuman());
@@ -850,9 +864,11 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
             await managed.saveState(state, true, new Date(state.gmail_newest_ms ?? Date.now()).toISOString());
           }
         });
+        reached.add('gmail');
         if (opts.full) await reconcileGmailDeletes(deps, gmail, summary);
       } catch (e) {
         if (managed) rethrowConnectorWriteError(e);
+        serviceFailed('gmail', e);
         serviceErrors.push(`gmail: ${e instanceof Error ? e.message : String(e)}`);
         summary.status = 'partial';
         if (isCredentialError(e)) log(e.toHuman());
@@ -863,6 +879,11 @@ async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: Go
     }
 
     summary.pagesAffected = [...new Set(summary.pagesAffected)];
+    const settled = new Set<GoogleService>([...reached, ...apiProblems.map((p) => p.service)]);
+    const keptProblems = (state.api_access?.problems ?? []).filter((p) => !settled.has(p.service) && cfg.services.includes(p.service));
+    const problems = [...apiProblems, ...keptProblems];
+    if (problems.length > 0 && JSON.stringify(problems) !== JSON.stringify(state.api_access?.problems)) state.api_access = { problems, at: new Date().toISOString() };
+    else if (problems.length === 0 && state.api_access) state.api_access = null;
     if (grantedScopes.length > 0 && missingServices.length > 0) summary.status = 'partial';
     if (opts.signal?.aborted) summary.status = 'partial';
     if (opts.full && summary.status === 'synced') state.last_full_at = new Date().toISOString();

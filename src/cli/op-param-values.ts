@@ -28,3 +28,45 @@ export function opParamValue(op: Operation, key: string, def: ParamDef | undefin
   }
   return raw;
 }
+
+/**
+ * The value for one `--flag value` token. A `cliKeyValue` object param
+ * (`--where key=value`) collects every repetition into a list that
+ * `opStructuredValue` turns into the object; every other flag is one value.
+ */
+export function opFlagValue(op: Operation, key: string, def: ParamDef | undefined, raw: string, prev: unknown): unknown {
+  if (def?.cliKeyValue) return [...(Array.isArray(prev) ? prev : []), raw];
+  return opParamValue(op, key, def, raw);
+}
+
+/**
+ * An object/array param from its CLI text: JSON, or for a string-item array
+ * a comma list (`--types person,company`), or for a `cliKeyValue` object
+ * repeated `key=value` pairs, where `key=a,b` is a list and a repeated key
+ * merges. Other values pass through.
+ */
+export function opStructuredValue(key: string, def: ParamDef, value: unknown): unknown {
+  const flag = `--${key.replace(/_/g, '-')}`;
+  if (def.cliKeyValue && Array.isArray(value) && !(value.length === 1 && String(value[0]).trimStart().startsWith('{'))) {
+    const out: Record<string, string | string[]> = {};
+    for (const pair of value as string[]) {
+      const eq = pair.indexOf('=');
+      const name = eq > 0 ? pair.slice(0, eq).trim() : '';
+      if (!name) {
+        throw usageError(`${flag} takes key=value; got '${inertText(pair, 40)}'.`,
+          `Pass ${flag} key=value, repeated for more keys (all must match), e.g. ${flag} status=active ${flag} stage=seed,series-a.`);
+      }
+      const values = [...[out[name] ?? []].flat(), ...pair.slice(eq + 1).split(',').map(v => v.trim())];
+      out[name] = values.length === 1 ? values[0]! : values;
+    }
+    return out;
+  }
+  const text = def.cliKeyValue && Array.isArray(value) ? value[0] : value;
+  if ((def.type !== 'object' && def.type !== 'array') || typeof text !== 'string') return value;
+  if (def.type === 'array' && def.items?.type === 'string' && !text.trimStart().startsWith('[')) return text.split(',').map(v => v.trim()).filter(Boolean);
+  const jsonError = () => usageError(`${flag} requires a JSON ${def.type}.`, `Pass JSON, e.g. ${flag} '${def.type === 'array' ? '["a","b"]' : '{"key":"value"}'}'.`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { throw jsonError(); }
+  if (def.type === 'array' ? !Array.isArray(parsed) : parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw jsonError();
+  return parsed;
+}

@@ -42,7 +42,7 @@ export const persistenceCapacityEntry: DoctorEntry = {
 async function runTerminalFailures(ctx: DoctorContext): Promise<Check[]> {
   const checks: Check[] = [];
   ctx.progress.heartbeat('persistence_terminal_failures');
-  const check = await terminalFailuresCheck(connectedEngine(ctx), doctorSourceIds(ctx));
+  const check = await terminalFailuresCheck(connectedEngine(ctx), doctorSourceIds(ctx), { remote: ctx.remote === true });
   if (check) checks.push({ ...check, name: 'persistence_terminal_failures' });
   return checks;
 }

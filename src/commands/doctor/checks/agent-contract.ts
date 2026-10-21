@@ -95,7 +95,8 @@ export function agentContractCheck(events: readonly Event[], now = Date.now()): 
 
 async function runAgentContract(): Promise<Check[]> {
   const checks: Check[] = [];
-  checks.push(agentContractCheck(readAgentContractEvents()));
+  // #7145: the whole log (size-bounded on write), so the window is judged on every event in it, not the newest 500.
+  checks.push(agentContractCheck(readAgentContractEvents(Infinity)));
   return checks;
 }
 

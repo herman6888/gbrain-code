@@ -1075,10 +1075,17 @@ at most 200 characters. When an unexpected exception in the owner failed a
 write (`storage_error` with a generic public message; the class and frame stay owner-only),
 the line also carries `class=`, `errno=` and `frame=` (the top gbrain source
 frame, repo-relative, for example `src/core/persistence/page-prepare.ts:120`):
-the owner diagnostics the receipt points at. The stored receipt keeps the same
-identifiers (never the error message) owner-side in `error_detail`, with the
-build that ran the attempt; `gbrain write-request <id>` names an owner on
-another build than the CLI (`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
+the owner diagnostics the receipt points at. For a database server error it
+adds `error_text=`, `statement=` and `position=` (#7112): the server's primary
+message with every quoted value replaced by `…` (an object name such as a
+column, a relation or the token a syntax error stopped at is kept), the first
+line of the failing statement with its literals replaced, never its
+parameters, and the error's character position. A PL/pgSQL `RAISE` keeps no
+text, because it can carry page values. The stored receipt keeps the same
+identifiers (never an application error's message) owner-side in `error_detail`, with the
+build that ran the attempt; on the brain host `gbrain write-request <id> --json`
+prints that `error_detail`, and names an owner on another build than the CLI
+(`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
 `first_conn_ms` is the time from phase start until the phase obtained a
 connection; `checkout=not_observed conn_wait_ms=<n>` means it had not obtained
 one after `n` milliseconds (a saturated pool or pooler, not a slow query); and

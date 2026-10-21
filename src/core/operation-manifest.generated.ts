@@ -512,7 +512,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "list_pages",
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; truncated: continue with updated_after + updated_after_slug from the last row.",
+    "description": "List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. Default 50; truncated: continue with updated_after + updated_after_slug from the last row.",
     "params": {
       "type": {
         "type": "string",
@@ -551,6 +551,17 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "include_deleted": {
         "type": "boolean",
         "description": "Include soft-deleted pages."
+      },
+      "slug_prefix": {
+        "type": "string",
+        "description": "Literal slug prefix, e.g. 'deals/'.",
+        "fullSurfaceOnly": true
+      },
+      "where": {
+        "type": "object",
+        "cliKeyValue": true,
+        "fullSurfaceOnly": true,
+        "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any."
       },
       "source_id": {
         "type": "string",
@@ -1267,6 +1278,12 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         },
         "description": "Page types, e.g. ['person']."
       },
+      "where": {
+        "type": "object",
+        "cliKeyValue": true,
+        "fullSurfaceOnly": true,
+        "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any."
+      },
       "snippet_chars": {
         "type": "number",
         "description": "Chars per row (0 = full)."
@@ -1344,7 +1361,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "query",
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; expand adds multi-query expansion (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
+    "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; adds fact rows. expand: one LLM call (expansion recovers synonyms; rarely helps). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper. Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
     "params": {
       "query": {
         "type": "string",
@@ -1374,6 +1391,12 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         },
         "description": "Page types, e.g. ['person']."
       },
+      "where": {
+        "type": "object",
+        "cliKeyValue": true,
+        "fullSurfaceOnly": true,
+        "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any."
+      },
       "snippet_chars": {
         "type": "number",
         "description": "Chars per row (0 = full)."
@@ -1399,7 +1422,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "expand": {
         "type": "boolean",
-        "description": "Default off; search.expansion overrides."
+        "description": "Default off; one LLM call, rarely helps."
       },
       "detail": {
         "type": "string",
@@ -4505,6 +4528,34 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "name": "sources_inspect",
       "hidden": true
     }
+  },
+  {
+    "name": "sources_resolve_path",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Read-only: what gbrain did with each file path of a source, by its own rules. Per path: the slug sync gives it, whether sync skips it (metafile, excluded, pruned) and why, its sync hold, its page with chunk and embedding counts, whether search finds it now, and the command that moves it on. A deleted path is checked by the page that records it as its origin, never by slug. Use it in landing checks instead of re-implementing slugging. Confined to the caller's source scope.",
+    "params": {
+      "id": {
+        "type": "string",
+        "required": true,
+        "description": "Source id, as listed by sources_list (e.g. 'default')."
+      },
+      "paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "required": true,
+        "description": "File paths relative to the source root (or to the Git top level), at most 200, e.g. the paths a commit changed."
+      }
+    },
+    "scope": "read",
+    "cliHints": {
+      "name": "sources_resolve_path",
+      "hidden": true
+    },
+    "area": "sources"
   },
   {
     "name": "request_tools",

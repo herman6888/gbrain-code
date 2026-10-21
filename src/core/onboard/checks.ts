@@ -30,6 +30,7 @@ import { loadConfig } from '../config.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../types.ts';
 import { ORPHANED_ALIAS_COUNTS_SQL, SOFT_DELETED_ALIAS_COUNT_SQL } from '../repair/aliases.ts';
 import { repairPreviewCommand } from '../repair/registry.ts';
+import { isMissingSchemaObject } from '../utils.ts';
 
 /** Shared shape returned by all four checks. */
 export interface OnboardCheckResult {
@@ -161,7 +162,7 @@ async function sampleVisibleEntityCoverage(
   sampleClause: string,
   feature: CoverageFeature,
   filter: EntityTypeFilter,
-): Promise<EntityCoverageSample> {
+): Promise<EntityCoverageSample | { error: string }> {
   try {
     const sql = visibleEntityCoverageSql(feature, filter, sampleClause);
     const result = await engine.executeRaw(sql.text, sql.params);
@@ -175,9 +176,15 @@ async function sampleVisibleEntityCoverage(
     // impossible percentages or feed a negative value into sqrt().
     const matched = Math.min(sampleSize, finiteCount(row.matched));
     return { matched, sampleSize };
-  } catch {
-    return { matched: 0, sampleSize: 0 };
+  } catch (error) {
+    return { error: redactConnectionInfo(error instanceof Error ? error.message : String(error)) };
   }
+}
+
+/** #7145: a coverage read that failed or sampled no row measured nothing, so it is not "0% coverage". */
+function unmeasuredCoverage(name: string, sample: EntityCoverageSample | { error: string }): OnboardCheckResult {
+  const why = 'error' in sample ? `the coverage read failed (${sample.error})` : 'the sampled read returned no entity page';
+  return { check: { name, status: 'warn', message: `Coverage unknown: ${why}; rerun doctor.`, details: { health: 'unknown', reason: 'error' in sample ? 'error' : 'empty_sample' } }, remediations: [] };
 }
 
 function coverageWithConfidence(sample: EntityCoverageSample): { coverage: number; ci: number } {
@@ -341,6 +348,7 @@ export async function checkEntityLinkCoverage(
     LINK_COVERAGE_FEATURE,
     entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('entity_link_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
 
   const pct = Math.round(coverage * 100);
@@ -422,6 +430,7 @@ export async function checkTimelineCoverage(
     TIMELINE_COVERAGE_FEATURE,
     entityTypes.filter,
   );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('timeline_coverage', sample);
   const { coverage, ci } = coverageWithConfidence(sample);
   const pct = Math.round(coverage * 100);
   const ciPct = (ci * 100).toFixed(1);
@@ -746,7 +755,13 @@ export async function checkDanglingAliases(
     orphaned = await engine.executeRaw(ORPHANED_ALIAS_COUNTS_SQL);
     const [row] = await engine.executeRaw<typeof soft>(SOFT_DELETED_ALIAS_COUNT_SQL);
     if (row) soft = row;
-  } catch { /* pre-v105 brain or unreadable alias tables: nothing to report */ }
+  } catch (error) {
+    // #7145: only a pre-v105 brain (no alias tables) has nothing to report; any other failure is unknown, not clear.
+    if (!isMissingSchemaObject(error, 'table', ['slug_aliases', 'page_aliases'])) {
+      return { check: { name: 'dangling_aliases', status: 'warn', details: { health: 'unknown' },
+        message: `Dangling aliases unknown: the alias read failed (${redactConnectionInfo(error instanceof Error ? error.message : String(error))}); rerun doctor.` }, remediations: [] };
+    }
+  }
   const slugAliases = orphaned.reduce((sum, row) => sum + Number(row.slug_redirects), 0) + Number(soft.slug_redirects);
   const pageAliases = orphaned.reduce((sum, row) => sum + Number(row.page_aliases), 0) + Number(soft.page_aliases);
   const n = slugAliases + pageAliases;

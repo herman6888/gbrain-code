@@ -24,21 +24,24 @@
  * collapse: a regexp measured +37 ms); the tier's JS `normalizeAlias` recheck
  * stays authoritative, so a mismatch can only miss, never promote.
  *
- * Remote predicate (title FTS; diagnosis credited to PR #5853 by morven-ai):
- * safe-chunks callers must match the title alone, which used to mean a
- * per-row `to_tsvector(title)` that no index serves (a scan of every page in
- * scope). `pages.search_vector` carries the title, and only the title, at
- * weight A (schema trigger, `reindex-search-vector`, page-state projection),
- * so the remote arm matches `search_vector @@ q_a`, where `q_a` is the
- * websearch query with every lexeme labeled `:A`. That is served by
- * `idx_pages_search`, and negated or phrase terms are evaluated on title
- * lexemes only, so timeline text can never change which titles a remote
- * caller sees. Ranking uses the weight-A slice (`ts_filter(..., '{a}')`).
- * Remote matching follows the language `search_vector` was built with;
- * `gbrain reindex-search-vector` rebuilds it after an FTS language change.
- * A page with a NULL `search_vector` is absent from the remote arm (the
- * BEFORE INSERT/UPDATE trigger keeps it non-NULL). The local arm keeps
- * ranking the whole `search_vector` (title weight A dominates).
+ * Title predicate (title FTS; diagnosis credited to PR #5853 by morven-ai):
+ * remote callers and every OR re-run match the title alone, which used to mean a per-row
+ * `to_tsvector(title)` that no index serves (a scan of every page in scope).
+ * `pages.search_vector` carries the title, and only the title, at weight A
+ * (schema trigger, `reindex-search-vector`, page-state projection), so the
+ * arm matches `search_vector @@ q_a`, where `q_a` is the websearch query
+ * with every lexeme labeled `:A`. That is served by `idx_pages_search`, and
+ * negated or phrase terms are evaluated on title lexemes only, so timeline
+ * text (weight C) never changes which titles they see. Ranking uses the
+ * weight-A slice (`ts_filter(..., '{a}')`). Matching follows the language
+ * `search_vector` was built with; `gbrain reindex-search-vector` rebuilds it
+ * after an FTS language change. A page with a NULL `search_vector` is absent
+ * from the arm (the BEFORE INSERT/UPDATE trigger keeps it non-NULL). Local
+ * callers' strict query still matches and ranks the whole vector (title weight
+ * A dominates); their OR re-run matches titles only, like remote callers,
+ * because matching the whole vector let a date in a question pull every dated
+ * timeline into `ts_rank_cd`: 3-5 s on a large brain (#7135, diagnosed by
+ * @veltri-23 in #7136).
  */
 import type { SearchOpts, SearchResult } from '../types.ts';
 import { searchLimitCap } from '../search/eval-pool-depth.ts';
@@ -70,7 +73,7 @@ export async function searchTitles(
   if (opts?.limit && opts.limit > searchLimitCap()) {
     console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${searchLimitCap()}`);
   }
-  const statementFor = (chunkManifest: boolean) => buildSearchTitlesStatement(query, opts, { ...dialect, chunkManifest });
+  const statementFor = (chunkManifest: boolean, relaxed = false) => buildSearchTitlesStatement(query, opts, { ...dialect, chunkManifest, relaxed });
   const statement = statementFor(true);
   const run = (queryText: string, relaxed: boolean) => {
     const preferIndex = relaxed && dialect.relaxedPrefersIndex && !statement.safeChunks;
@@ -80,7 +83,7 @@ export async function searchTitles(
     };
     const params = [...statement.params];
     params[0] = queryText;
-    return scoped(async exec => (await exec.unsafe(statementFor(await dialect.chunkManifest?.(exec) ?? true).sql, params)).rows,
+    return scoped(async exec => (await exec.unsafe(statementFor(await dialect.chunkManifest?.(exec) ?? true, relaxed).sql, params)).rows,
       Object.keys(settings).length ? settings : undefined);
   };
 

@@ -32,6 +32,7 @@ import {
 } from '../core/creds/vault.ts';
 import {
   GOOGLE_PROVIDER,
+  GOOGLE_SERVICE_SCOPES,
   GoogleTokenProvider,
   apiEnableLink,
   buildAuthUrl,
@@ -58,7 +59,7 @@ import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 
 // ── Shared bits ──────────────────────────────────────────────────────────────
 
-import { ALL_GOOGLE_SERVICES, type GoogleService } from '../core/google/types.ts';
+import { ALL_GOOGLE_SERVICES, type GoogleApiProblem, type GoogleService } from '../core/google/types.ts';
 import { sourceCalendarReadability, type CalendarProbe, type CalendarReadability } from './google-calendar-status.ts';
 
 export const GOOGLE_SERVICES = ALL_GOOGLE_SERVICES;
@@ -677,6 +678,7 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
   // Linked sources: best-effort, engine optional. #5012 item 9: each one that
   // syncs Calendar reports whether its configured calendar is readable.
   let linkedSources: Array<{ id: string; account: string | null; calendar?: CalendarReadability }> = [];
+  const linkedServices = new Map<string, Set<GoogleService>>();
   try {
     const { loadConfig, toEngineConfig } = await import('../core/config.ts');
     const cfg = loadConfig();
@@ -702,6 +704,9 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
               ? (JSON.parse(r.config) as Record<string, unknown>)
               : ((r.config ?? {}) as Record<string, unknown>);
           if (c.kind !== 'google') continue;
+          const { parseGoogleSourceConfig } = await import('../core/google/source-config.ts');
+          const sourceCfg = parseGoogleSourceConfig(c, '');
+          for (const service of sourceCfg.services) linkedServices.set(sourceCfg.account, (linkedServices.get(sourceCfg.account) ?? new Set()).add(service));
           const calendar = await sourceCalendarReadability(engine, { ...r, config: c }, calendarProbe).catch(() => null);
           linkedSources.push({ id: r.id, account: typeof c.g_account === 'string' ? c.g_account : null, ...(calendar ? { calendar } : {}) });
         }
@@ -713,13 +718,30 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
     /* no engine — vault-only status */
   }
 
+  // #7073: every service a linked source syncs (else every granted one) is
+  // probed at once, so each disabled API or missing scope is named together.
+  if (probe) {
+    const { googleIdentityClients, probeGoogleApiAccess } = await import('../core/google/api-access.ts');
+    const { cliRenderContext, renderAction } = await import('../core/agent-output.ts');
+    for (const [i, m] of metas.entries()) {
+      const row = accounts[i]!;
+      if (row.refresh_probe !== 'ok') continue;
+      const account = m.account ?? m.id;
+      const granted = GOOGLE_SERVICES.filter((service) => !m.scopes?.length || m.scopes.includes(GOOGLE_SERVICE_SCOPES[service]));
+      const services = [...(linkedServices.get(account) ?? granted)];
+      const entry = await vault.get(m.id);
+      const access = await probeGoogleApiAccess(googleIdentityClients(new GoogleTokenProvider(vault, m.id), entry?.meta.client_id), account, services, m.scopes ?? []);
+      row.api_access = { ...access, ...(access.fix ? { fix: renderAction(access.fix, cliRenderContext()) } : {}) };
+    }
+  }
+  const apiBlocked = accounts.filter((a) => ((a.api_access as { problems?: unknown[] } | undefined)?.problems?.length ?? 0) > 0);
   const unreadableCalendars = linkedSources.filter((s) => s.calendar?.code === 'calendar_unreadable');
-  if (unreadableCalendars.length > 0) setCliExitVerdict(1);
+  if (unreadableCalendars.length > 0 || apiBlocked.length > 0) setCliExitVerdict(1);
   if (json) {
     process.stdout.write(
       JSON.stringify(
         {
-          ok: unreadableCalendars.length === 0,
+          ok: unreadableCalendars.length === 0 && apiBlocked.length === 0,
           status: accounts.length > 0 ? 'connected' : 'not_connected',
           client_on_file: client !== null,
           accounts,
@@ -750,6 +772,13 @@ export async function runGoogleStatus(args: string[]): Promise<void> {
       const err = a.refresh_error as { fix?: string };
       if (err.fix) process.stdout.write(`  fix: ${err.fix}\n`);
     }
+    const access = a.api_access as { problems: GoogleApiProblem[]; fix?: { user_message?: string } } | undefined;
+    for (const p of access?.problems ?? []) {
+      process.stdout.write(p.code === 'api_not_enabled'
+        ? `  ${p.service}: api_not_enabled — ${p.api_title} (${p.api}) is disabled for project ${p.project ?? 'unknown'}; enable: ${p.enable_url}\n`
+        : `  ${p.service}: scope_missing — the credential was not granted ${p.service} access\n`);
+    }
+    if (access?.fix?.user_message) process.stdout.write(`  fix: ${access.fix.user_message}\n`);
   }
   if (linkedSources.length > 0) {
     process.stdout.write(

@@ -25,6 +25,8 @@ import { TERMINAL_FIXED_IN } from '../src/core/persistence/terminal-classify.ts'
 import { terminalFailuresCheck } from '../src/commands/doctor/checks/persistence-requests.ts';
 import { categorizeCheck } from '../src/core/doctor-categories.ts';
 import { WAVE_CHECKS } from '../src/commands/doctor/wave-checks.ts';
+import { runRemoteDoctorTier } from '../src/commands/doctor/remote-tier.ts';
+import type { OperationContext } from '../src/core/ops/contract.ts';
 
 let engine: BrainEngine;
 
@@ -171,6 +173,56 @@ for (const kind of testBackends()) describe(`the aggregate, doctor and the drill
     const defect = (await terminalFailuresCheck(engine))!;
     expect(defect.status).toBe('warn');
     expect(defect.message).toContain('owner_exception/storage_error ×1');
+  });
+
+  test('#7146: doctor ranks the rows: blocking with what it blocks and its fix, then unresolved groups with drill-downs, then historical', async () => {
+    const blocker = await seed({ slug: 'notes/held', state: 'committed', recovery: { version: 1, path: '/nonexistent/x.md', root: '/nonexistent', beforeHash: null, afterHash: 'a' } });
+    for (let i = 0; i < 3; i++) await seed({ slug: `notes/r${i}`, state: 'conflict', code: 'revision_conflict', hoursAgo: 30 + i });
+    await seed({ slug: 'notes/drift', state: 'conflict', code: 'source_changed', message: 'The canonical file contains an uncoordinated local edit.', hoursAgo: 60 });
+    await seed({ slug: 'notes/boom', state: 'failed', code: 'storage_error', detail: { origin: 'owner_exception', error_class: 'TypeError' }, hoursAgo: 10 });
+    for (let i = 0; i < 2; i++) await seed({ slug: `sync/k${i}`, operation: 'submit_job', state: 'cancelled', code: 'cancelled', detail: knockOnDetail('lane_fault', null), build: '0.60.200.0', hoursAgo: 30 });
+    const check = (await terminalFailuresCheck(engine))!;
+    expect(check.status).toBe('warn');
+    const ranked = (check.details as { ranked: { blocking: Array<Record<string, unknown>>; unresolved: { rows: number; pages: number; groups: Array<Record<string, unknown>>; group_by: string[][] }; historical: { rows: number } } }).ranked;
+    expect(ranked.blocking).toEqual([{ kind: 'recovery', request_id: blocker, source_id: SOURCE, slug: 'notes/held', category: 'recovery_pending', needs_human: false, blocks: 'source',
+      fix: ['gbrain', 'sync', '--source', SOURCE, '--no-pull', '--json'] }]);
+    // Defect classes lead the unresolved groups, then by row count; each names its exact drill-down.
+    expect(ranked.unresolved).toMatchObject({ rows: 5, pages: 5, group_by: [['gbrain', 'sources', 'writer', 'failures', SOURCE, '--group-by', 'category', '--json']] });
+    expect(ranked.unresolved.groups.map(g => [g.category, g.rows, g.defect])).toEqual([['owner_exception', 1, true], ['caller_conflict', 3, false], ['file_conflict', 1, false]]);
+    expect(ranked.unresolved.groups[0]!.drill_down).toEqual(['gbrain', 'sources', 'writer', 'failures', SOURCE, '--category', 'owner_exception', '--code', 'storage_error', '--origin', 'owner_exception', '--json']);
+    expect(ranked.historical).toEqual({ rows: 2 });
+    const blockingAt = check.message.indexOf('Blocking now (1)');
+    const unresolvedAt = check.message.indexOf('Unresolved, not blocking: 5 row(s) on 5 page(s) in 3 group(s): owner_exception/storage_error ×1 on tf-a (gbrain defect)');
+    const historicalAt = check.message.indexOf('Historical: 2 row(s)');
+    expect(blockingAt).toBeGreaterThanOrEqual(0);
+    expect(unresolvedAt).toBeGreaterThan(blockingAt);
+    expect(historicalAt).toBeGreaterThan(unresolvedAt);
+    expect(check.message).toContain(`recovery record ${blocker} (notes/held) on source ${SOURCE} blocks every queued write on the source's root; fix: gbrain sync --source ${SOURCE} --no-pull --json`);
+    expect(check.message).toContain(`Group them: gbrain sources writer failures ${SOURCE} --group-by category --json`);
+
+    // A remote caller sees the ranking, never a page slug or file path, and is sent to the brain host.
+    const remote = (await terminalFailuresCheck(engine, undefined, { remote: true }))!;
+    expect(remote.status).toBe('warn');
+    expect(JSON.stringify({ message: remote.message, details: remote.details, fix: remote.fix })).not.toMatch(/notes\/|sync\/k|nonexistent/);
+    expect((remote.details as { ranked: { blocking: unknown[] } }).ranked.blocking).toEqual([expect.objectContaining({ request_id: blocker, blocks: 'source', fix: null })]);
+    expect(remote.fix).toMatchObject({ argv: ['gbrain', 'doctor', '--only', 'persistence_terminal_failures', '--json'], actor: 'user' });
+
+    // Only historical rows left: ok, as information.
+    await engine.executeRaw("DELETE FROM persistence_requests WHERE slug NOT LIKE 'sync/k%'");
+    const quiet = (await terminalFailuresCheck(engine))!;
+    expect(quiet).toMatchObject({ status: 'ok', severity: 'info' });
+    expect(quiet.message).toContain('Historical: 2 row(s)');
+  });
+
+  if (kind === 'postgres') test('#7146: run_doctor (tier ops, remote caller) confines the ranked rows: no page slug or file path', async () => {
+    const blocker = await seed({ slug: 'notes/held', state: 'committed', recovery: { version: 1, path: '/nonexistent/x.md', root: '/nonexistent', beforeHash: null, afterHash: 'a' } });
+    await seed({ slug: 'notes/r0', state: 'conflict', code: 'revision_conflict', hoursAgo: 30 });
+    const ctx = { engine, remote: true, transport: 'http', sourceId: SOURCE, config: {} as never, logger: { info() {}, warn() {}, error() {} } } as unknown as OperationContext;
+    const report = await runRemoteDoctorTier(ctx, { only: ['persistence_terminal_failures'] });
+    const check = report.checks.find(c => c.name === 'persistence_terminal_failures')!;
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain(`recovery record ${blocker} on source ${SOURCE}`);
+    expect(JSON.stringify(check)).not.toMatch(/notes\/|nonexistent/);
   });
 
   // #6824: the old tests only replace page writes or repeat an identical digest. Connector retries

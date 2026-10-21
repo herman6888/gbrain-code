@@ -181,15 +181,25 @@ function dedupBySource(results: SearchResult[], keyOf: (r: SearchResult) => stri
  */
 function dedupByTextSimilarity(results: SearchResult[], threshold: number): SearchResult[] {
   const kept: SearchResult[] = [];
-  const keptWordsByPage = new Map<string, Set<string>[]>();
+  const keptByPage = new Map<string, SearchResult[]>();
+  // Word sets are built only for chunks that share a page with a kept chunk:
+  // most results are alone on their page, and a widened result row can hold a
+  // whole page body (GBRA-156).
+  const wordSets = new Map<SearchResult, Set<string>>();
+  const wordsOf = (r: SearchResult) => {
+    let words = wordSets.get(r);
+    if (!words) wordSets.set(r, words = new Set(r.chunk_text.toLowerCase().split(/\s+/)));
+    return words;
+  };
 
   for (const r of results) {
-    const rWords = new Set(r.chunk_text.toLowerCase().split(/\s+/));
     const k = pageKey(r);
-    const samePageKept = keptWordsByPage.get(k) ?? [];
+    const samePageKept = keptByPage.get(k) ?? [];
     let tooSimilar = false;
 
-    for (const kWords of samePageKept) {
+    for (const keptResult of samePageKept) {
+      const rWords = wordsOf(r);
+      const kWords = wordsOf(keptResult);
       // |A ∩ B| by iterating the smaller set; |A ∪ B| = |A| + |B| - |A ∩ B|.
       // Same value as building intersection/union Sets, without allocating.
       const [smaller, larger] = rWords.size <= kWords.size ? [rWords, kWords] : [kWords, rWords];
@@ -206,8 +216,8 @@ function dedupByTextSimilarity(results: SearchResult[], threshold: number): Sear
 
     if (!tooSimilar) {
       kept.push(r);
-      samePageKept.push(rWords);
-      keptWordsByPage.set(k, samePageKept);
+      samePageKept.push(r);
+      keptByPage.set(k, samePageKept);
     }
   }
 

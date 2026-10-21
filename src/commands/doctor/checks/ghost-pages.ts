@@ -21,7 +21,8 @@
 import type { Check } from '../../doctor.ts';
 import { agentFix, checkError } from '../check-fix.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { readGhostPages } from '../../../core/ghost-pages.ts';
+import { GHOST_CHECK_LIMIT, GHOST_SCAN_LIMIT, readGhostPages } from '../../../core/ghost-pages.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
 import { SKILL_PACK_MEMBER_CODE, skillPathDetail } from '../../../core/repair/ghost-pages.ts';
 
 const DOCS = 'docs/guides/repair.md#ghost-pages';
@@ -65,8 +66,15 @@ async function runGhostPages(ctx: DoctorContext): Promise<Check[]> {
           : 'Not applicable: no source has a canonical checkout, so no page owns a file that could be missing.' });
       return checks;
     }
+    // #7145: a scan stopped at its page or candidate bound is not clear past it.
+    if (summary.truncated) {
+      checks.push({ name: 'ghost_pages', status: 'warn', details: { ...details, ...boundUnknownDetails('rows'), limit: GHOST_SCAN_LIMIT, candidate_limit: GHOST_CHECK_LIMIT },
+        message: `Ghost pages unknown: the scan stopped at its bound (${GHOST_SCAN_LIMIT} live pages or ${GHOST_CHECK_LIMIT} unconfirmed candidates per source; no setting) after ${summary.inspected} page(s), `
+          + `so pages past it were not checked; none of those inspected is missing its canonical file.${skillNote}` });
+      return checks;
+    }
     checks.push({ name: 'ghost_pages', status: 'ok', details,
-      message: `No live page is missing its canonical file (${summary.inspected} page(s) inspected${summary.truncated ? '; bounded, more not checked' : ''}).${skillNote}` });
+      message: `No live page is missing its canonical file (${summary.inspected} page(s) inspected).${skillNote}` });
   } catch (error) {
     checks.push(checkError('ghost_pages', 'check live pages for a missing canonical file', error, { details: { count: 'unknown', health: 'unknown', docs: DOCS } }));
   }

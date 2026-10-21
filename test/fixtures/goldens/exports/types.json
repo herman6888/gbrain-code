@@ -148,7 +148,7 @@
           "listChunklessPagesWithContent: (opts?: { batchSize?: number; afterPageId?: number; sourceId?: string; }) => Promise<ChunklessPageRow[]>",
           "listConfigKeys: (prefix: string) => Promise<string[]>",
           "listCorpusSample: (opts: CorpusSampleOpts) => Promise<DomainBankRow[]>",
-          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
+          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; slugs?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
           "listEnrichCandidates: (opts: EnrichCandidatesOpts) => Promise<EnrichCandidate[]>",
           "listEvalCandidates: (filter?: { since?: Date; limit?: number; tool?: \"query\" | \"search\"; }) => Promise<EvalCandidate[]>",
           "listEvalCaptureFailures: (filter?: { since?: Date; }) => Promise<EvalCaptureFailure[]>",
@@ -590,7 +590,8 @@
           "database_url?: string | undefined",
           "engine?: \"postgres\" | \"pglite\" | undefined",
           "keyword_statement_timeout_ms?: number | undefined",
-          "pglite_shared_buffers?: string | undefined"
+          "pglite_shared_buffers?: string | undefined",
+          "pool_max?: number | undefined"
         ],
         "name": "EngineConfig"
       },
@@ -747,6 +748,7 @@
           "answerability?: AnswerabilityVerdict | undefined",
           "autocut?: AutocutDecision | undefined",
           "cache?: { status: \"hit\" | \"miss\" | \"disabled\"; similarity?: number; age_seconds?: number; } | undefined",
+          "collapse?: CollapseDecision | undefined",
           "cosine_rescore?: \"js_fallback\" | undefined",
           "decide?: Partial<Record<\"rerank\" | \"intent\" | \"evidence\" | \"answerable\" | \"injection\" | \"recall_needed\" | \"triage\" | \"grounding\" | \"conflict\", DecideSlotMeta>> | undefined",
           "degraded?: DegradedStageEntry[] | undefined",
@@ -962,7 +964,8 @@
           "tag?: string | undefined",
           "type?: string | undefined",
           "updatedAfterKeyset?: { updatedAt: string; slug: string; } | undefined",
-          "updated_after?: string | undefined"
+          "updated_after?: string | undefined",
+          "where?: FrontmatterWhere | undefined"
         ],
         "name": "PageFilters"
       },
@@ -1064,6 +1067,7 @@
           "allocateBodyOccurrenceIds: (count: number) => Promise<number[]>",
           "batchLoadEmotionalInputs: (slugs?: string[]) => Promise<EmotionalWeightInputRow[]>",
           "connect: (config: EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager; }) => Promise<void>",
+          "connectedDatabaseUrl: string | undefined",
           "connectionManager: ConnectionManager | null",
           "consolidateFact: (id: number, takeId: number) => Promise<void>",
           "countChunklessPagesWithContent: (opts?: { sourceId?: string; }) => Promise<number>",
@@ -1150,7 +1154,7 @@
           "listChunklessPagesWithContent: (opts?: { batchSize?: number; afterPageId?: number; sourceId?: string; }) => Promise<ChunklessPageRow[]>",
           "listConfigKeys: (prefix: string) => Promise<string[]>",
           "listCorpusSample: (opts: CorpusSampleOpts) => Promise<DomainBankRow[]>",
-          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
+          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; slugs?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
           "listEnrichCandidates: (opts: EnrichCandidatesOpts) => Promise<EnrichCandidate[]>",
           "listEvalCandidates: (filter?: { since?: Date; limit?: number; tool?: \"query\" | \"search\"; }) => Promise<EvalCandidate[]>",
           "listEvalCaptureFailures: (filter?: { since?: Date; }) => Promise<EvalCaptureFailure[]>",
@@ -1437,6 +1441,7 @@
           "minTrust?: \"user_confirmed\" | \"operator_curated\" | \"tool_observed\" | \"agent_written\" | \"unknown\" | \"external_untrusted\" | undefined",
           "nearSymbol?: string | undefined",
           "offset?: number | undefined",
+          "onKeywordIncomplete?: ((reason: \"candidate_budget\") => void) | undefined",
           "onVectorPoolMeta?: ((m: VectorPoolMeta) => void) | undefined",
           "orFallback?: boolean | undefined",
           "rankQuery?: string | undefined",
@@ -1464,7 +1469,8 @@
           "until?: string | undefined",
           "useCache?: boolean | undefined",
           "vectorLegacyGuard?: boolean | undefined",
-          "walkDepth?: number | undefined"
+          "walkDepth?: number | undefined",
+          "where?: FrontmatterWhere | undefined"
         ],
         "name": "SearchOpts"
       },
@@ -1482,6 +1488,7 @@
           "chunk_index: number",
           "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
+          "collapsed?: CollapsedRef[] | undefined",
           "content_flag?: { reason: string; detail: string; } | undefined",
           "content_hash?: string | null | undefined",
           "cosine?: number | undefined",
@@ -1499,6 +1506,7 @@
           "fact_row?: { id: number; valid_from: string; valid_until: string | null; } | undefined",
           "feedback_boost?: number | undefined",
           "follow_up?: { op: \"recall\"; args: Record<string, string>; } | undefined",
+          "fused_score?: number | undefined",
           "generated_demotion?: number | undefined",
           "graph_adjacency_boost?: number | undefined",
           "graph_adjacency_hits?: number | undefined",
@@ -1506,6 +1514,7 @@
           "graph_cross_source_hits?: number | undefined",
           "graph_session_demoted?: boolean | undefined",
           "graph_session_prefix?: string | undefined",
+          "image_page?: true | undefined",
           "injection_p?: number | undefined",
           "injection_suspected?: true | undefined",
           "keyword_hit?: boolean | undefined",
@@ -1517,7 +1526,10 @@
           "page_id: number",
           "page_slug?: string | undefined",
           "provenance?: \"generated\" | undefined",
+          "rank_prior?: number | undefined",
+          "rank_score?: number | undefined",
           "recency_boost?: number | undefined",
+          "redirect_to?: string | undefined",
           "relational?: RelationalEvidence | undefined",
           "relational_hop?: number | undefined",
           "relational_path?: string[] | undefined",
@@ -2492,6 +2504,7 @@
         "kind": "interface",
         "members": [
           "cacheWriteTtl?: \"5m\" | \"1h\" | undefined",
+          "estimatedInputTokens?: number | undefined",
           "kind: \"embedding\" | \"rerank\" | \"chat\" | \"transcription\" | \"multimodal\" | \"decide\"",
           "maxInputTokens?: number | undefined",
           "maxOutputTokens?: number | undefined",
@@ -2618,6 +2631,13 @@
         "name": "withAIInvocationGuard",
         "signature": [
           "<T>(guard: AIInvocationGuard, run: () => Promise<T>, opts?: { inherit?: boolean; }) => Promise<T>"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "withAIInvocationMeter",
+        "signature": [
+          "<T>(meter: AIInvocationObserver, run: () => Promise<T>) => Promise<T>"
         ]
       },
       {
@@ -2778,6 +2798,7 @@
           "search?: { adaptive_return?: boolean; adaptive_return_entity_max?: number; adaptive_return_other_max?: number; adaptive_return_min_keep?: number; vector_legacy_guard?: boolean; hnsw_iterative_scan?: string; cjk_keyword_deadline_ms?: number; keyword_statement_timeout_ms?: number; } | undefined",
           "search_embedding_column?: string | undefined",
           "self_upgrade?: { mode?: \"auto\" | \"notify\" | \"off\"; mode_prompted?: boolean; quiet_hours?: { start?: number; end?: number; tz?: string; }; failed_versions?: string[]; attempting_version?: string; last_check_ts?: number; last_applied_version?: string; } | undefined",
+          "serve_cli_socket?: boolean | undefined",
           "storage?: unknown",
           "together_api_key?: string | undefined",
           "voyage_api_key?: string | undefined"
@@ -2796,6 +2817,13 @@
         "name": "KNOWN_CONFIG_KEY_PREFIXES",
         "signature": [
           "readonly string[]"
+        ]
+      },
+      {
+        "kind": "variable",
+        "name": "MERGED_CONFIG_BY_ENGINE",
+        "signature": [
+          "WeakMap<object, GBrainConfig>"
         ]
       },
       {
@@ -3446,7 +3474,7 @@
           "listChunklessPagesWithContent: (opts?: { batchSize?: number; afterPageId?: number; sourceId?: string; }) => Promise<ChunklessPageRow[]>",
           "listConfigKeys: (prefix: string) => Promise<string[]>",
           "listCorpusSample: (opts: CorpusSampleOpts) => Promise<DomainBankRow[]>",
-          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
+          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; slugs?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
           "listEnrichCandidates: (opts: EnrichCandidatesOpts) => Promise<EnrichCandidate[]>",
           "listEvalCandidates: (filter?: { since?: Date; limit?: number; tool?: \"query\" | \"search\"; }) => Promise<EvalCandidate[]>",
           "listEvalCaptureFailures: (filter?: { since?: Date; }) => Promise<EvalCaptureFailure[]>",
@@ -4564,7 +4592,7 @@
         "kind": "function",
         "name": "walkMarkdownFiles",
         "signature": [
-          "(dir: string) => { path: string; relPath: string; }[]"
+          "(dir: string, metafilePages?: MetafilePagesMode) => { path: string; relPath: string; }[]"
         ]
       },
       {
@@ -4615,10 +4643,14 @@
           "frontmatter_recovery?: { quoted: boolean; comment_value: boolean; } | undefined",
           "gate?: WriteGateAssessment | undefined",
           "parsedPage?: ParsedPage | undefined",
+          "projection?: \"pending\" | undefined",
           "quarantined?: boolean | undefined",
           "refusal?: ContentRefusal | undefined",
+          "request_id?: string | undefined",
           "resealed?: { pendingChunks: number; pendingChars: number; } | undefined",
           "searchable?: boolean | \"pending\" | undefined",
+          "searchable_fix?: Record<string, unknown> | undefined",
+          "searchable_retry_after_ms?: number | undefined",
           "skip_reason?: \"purged_content\" | \"content_rejected\" | \"file_too_large\" | \"frontmatter_slug_conflict\" | \"invalid_fence\" | \"invalid_frontmatter\" | \"parser_regression\" | \"rename_held\" | \"write_gate_rejected\" | \"malformed_path\" | \"slug_collision\" | undefined",
           "slug: string",
           "status: \"error\" | \"imported\" | \"skipped\"",
@@ -6465,6 +6497,7 @@
       {
         "kind": "interface",
         "members": [
+          "cliKeyValue?: boolean | undefined",
           "default?: unknown",
           "description?: string | undefined",
           "enum?: string[] | undefined",
@@ -6726,7 +6759,7 @@
           "listChunklessPagesWithContent: (opts?: { batchSize?: number; afterPageId?: number; sourceId?: string; }) => Promise<ChunklessPageRow[]>",
           "listConfigKeys: (prefix: string) => Promise<string[]>",
           "listCorpusSample: (opts: CorpusSampleOpts) => Promise<DomainBankRow[]>",
-          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
+          "listEmbeddingStateRows: (opts: { sourceIds?: string[]; slugs?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number; }) => Promise<EmbeddingStateRow[]>",
           "listEnrichCandidates: (opts: EnrichCandidatesOpts) => Promise<EnrichCandidate[]>",
           "listEvalCandidates: (filter?: { since?: Date; limit?: number; tool?: \"query\" | \"search\"; }) => Promise<EvalCandidate[]>",
           "listEvalCaptureFailures: (filter?: { since?: Date; }) => Promise<EvalCaptureFailure[]>",
@@ -7904,6 +7937,7 @@
           "mode?: string | undefined",
           "nearSymbol?: string | undefined",
           "offset?: number | undefined",
+          "onKeywordIncomplete?: ((reason: \"candidate_budget\") => void) | undefined",
           "onMeta?: ((meta: HybridSearchMeta) => void) | undefined",
           "onQueryEmbedding?: ((embedding: Float32Array) => void) | undefined",
           "onRelationalMeta?: ((meta: RelationalArmMeta) => void) | undefined",
@@ -7939,7 +7973,8 @@
           "until?: string | undefined",
           "useCache?: boolean | undefined",
           "vectorLegacyGuard?: boolean | undefined",
-          "walkDepth?: number | undefined"
+          "walkDepth?: number | undefined",
+          "where?: FrontmatterWhere | undefined"
         ],
         "name": "HybridSearchOpts"
       },
@@ -8841,7 +8876,8 @@
           "database_url?: string | undefined",
           "engine?: \"postgres\" | \"pglite\" | undefined",
           "keyword_statement_timeout_ms?: number | undefined",
-          "pglite_shared_buffers?: string | undefined"
+          "pglite_shared_buffers?: string | undefined",
+          "pool_max?: number | undefined"
         ],
         "name": "EngineConfig"
       },
@@ -8998,6 +9034,7 @@
           "answerability?: AnswerabilityVerdict | undefined",
           "autocut?: AutocutDecision | undefined",
           "cache?: { status: \"hit\" | \"miss\" | \"disabled\"; similarity?: number; age_seconds?: number; } | undefined",
+          "collapse?: CollapseDecision | undefined",
           "cosine_rescore?: \"js_fallback\" | undefined",
           "decide?: Partial<Record<\"rerank\" | \"intent\" | \"evidence\" | \"answerable\" | \"injection\" | \"recall_needed\" | \"triage\" | \"grounding\" | \"conflict\", DecideSlotMeta>> | undefined",
           "degraded?: DegradedStageEntry[] | undefined",
@@ -9213,7 +9250,8 @@
           "tag?: string | undefined",
           "type?: string | undefined",
           "updatedAfterKeyset?: { updatedAt: string; slug: string; } | undefined",
-          "updated_after?: string | undefined"
+          "updated_after?: string | undefined",
+          "where?: FrontmatterWhere | undefined"
         ],
         "name": "PageFilters"
       },
@@ -9441,6 +9479,7 @@
           "minTrust?: \"user_confirmed\" | \"operator_curated\" | \"tool_observed\" | \"agent_written\" | \"unknown\" | \"external_untrusted\" | undefined",
           "nearSymbol?: string | undefined",
           "offset?: number | undefined",
+          "onKeywordIncomplete?: ((reason: \"candidate_budget\") => void) | undefined",
           "onVectorPoolMeta?: ((m: VectorPoolMeta) => void) | undefined",
           "orFallback?: boolean | undefined",
           "rankQuery?: string | undefined",
@@ -9468,7 +9507,8 @@
           "until?: string | undefined",
           "useCache?: boolean | undefined",
           "vectorLegacyGuard?: boolean | undefined",
-          "walkDepth?: number | undefined"
+          "walkDepth?: number | undefined",
+          "where?: FrontmatterWhere | undefined"
         ],
         "name": "SearchOpts"
       },
@@ -9486,6 +9526,7 @@
           "chunk_index: number",
           "chunk_source: \"timeline\" | \"compiled_truth\" | \"fenced_code\"",
           "chunk_text: string",
+          "collapsed?: CollapsedRef[] | undefined",
           "content_flag?: { reason: string; detail: string; } | undefined",
           "content_hash?: string | null | undefined",
           "cosine?: number | undefined",
@@ -9503,6 +9544,7 @@
           "fact_row?: { id: number; valid_from: string; valid_until: string | null; } | undefined",
           "feedback_boost?: number | undefined",
           "follow_up?: { op: \"recall\"; args: Record<string, string>; } | undefined",
+          "fused_score?: number | undefined",
           "generated_demotion?: number | undefined",
           "graph_adjacency_boost?: number | undefined",
           "graph_adjacency_hits?: number | undefined",
@@ -9510,6 +9552,7 @@
           "graph_cross_source_hits?: number | undefined",
           "graph_session_demoted?: boolean | undefined",
           "graph_session_prefix?: string | undefined",
+          "image_page?: true | undefined",
           "injection_p?: number | undefined",
           "injection_suspected?: true | undefined",
           "keyword_hit?: boolean | undefined",
@@ -9521,7 +9564,10 @@
           "page_id: number",
           "page_slug?: string | undefined",
           "provenance?: \"generated\" | undefined",
+          "rank_prior?: number | undefined",
+          "rank_score?: number | undefined",
           "recency_boost?: number | undefined",
+          "redirect_to?: string | undefined",
           "relational?: RelationalEvidence | undefined",
           "relational_hop?: number | undefined",
           "relational_path?: string[] | undefined",

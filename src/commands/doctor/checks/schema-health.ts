@@ -311,6 +311,7 @@ function missingTablesFields(report: MissingTablesReport): Omit<Check, 'name'> {
 export const schemaVersionEntry: DoctorEntry = {
   name: 'schema_version',
   emits: ['schema_version', 'schema_columns', 'schema_missing_tables'],
+  tier: 'quick',
   run: runSchemaVersion,
 };
 

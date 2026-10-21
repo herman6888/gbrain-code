@@ -15,7 +15,10 @@
  * kernel waiver applies; a missing file always admits. The preparer's own
  * `validate` must hold. Anything else is submitted as before:
  *   - a page with a request still pending or recovering (the stored page is
- *     not yet what that request will publish);
+ *     not yet what that request will publish). A request that has ended holds
+ *     nothing here even while its recovery record awaits the post-commit
+ *     staging cleanup (a waiter learns of the commit first): its canonical
+ *     file and page are final;
  *   - a segmented (large) page: its publication decides the no-op;
  *   - a missing, deleted or changed page, or any failure of the screen.
  */
@@ -33,7 +36,7 @@ export async function unchangedPutPage(ctx: OperationContext, params: Record<str
   if (!snapshot || snapshot.page.deleted_at || isSegmentedPage(snapshot.page)) return false;
   try {
     const [pending] = await ctx.engine.executeRaw(`SELECT 1 FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent IS NOT NULL AND NOT compacted
-      AND (state NOT IN ('committed','conflict','failed','cancelled') OR recovery IS NOT NULL) LIMIT 1`, [params.source_id, params.slug.toLowerCase()]);
+      AND state NOT IN ('committed','conflict','failed','cancelled') LIMIT 1`, [params.source_id, params.slug.toLowerCase()]);
     if (pending) return false;
     const prepared = await preparePageAdmission(ctx, { operation: 'put_page', params });
     if (prepared.prior) return false;

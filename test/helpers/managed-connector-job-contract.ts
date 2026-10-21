@@ -148,6 +148,7 @@ export const HANDLER_COVERAGE: Record<string, { covered: ContractCase } | { exem
   'lint': { exempt: 'filesystem lint for checkout sources' },
   'lint-fix': { exempt: 'filesystem lint fix for checkout sources' },
   'orphans': { exempt: 'read-only orphan report' },
+  'doctor-refresh': { exempt: 'read-only doctor checks; records last known results in op_checkpoints (#7142)' },
   'patterns': { exempt: 'dream patterns phase over synthesis output, not connector pages' },
   'purge': { exempt: 'operator purge of deleted pages; covered by purge tests' },
   'recompute_emotional_weight': { exempt: 'writes pages.emotional_weight, a physical projection column outside the guard' },

@@ -22,6 +22,7 @@ import { escapeLikePattern, buildVisibilityClause } from '../../../core/search/s
 import { safeChunksFilter } from '../../../core/search/safe-chunks.ts';
 import type { Check } from '../../doctor.ts';
 import { checkError, doctorVerify, withSkippedSegmented } from '../check-fix.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
 import { pricingSetArgv } from '../../../core/budget/no-pricing.ts';
 
 // --- v0.36.1.0 calibration doctor checks (T12) ---
@@ -290,11 +291,14 @@ export async function checkLinkResolutionOpportunity(
     const sampledNote = totalPages > SAMPLE_LIMIT
       ? ` (scanned the ${SAMPLE_LIMIT} most-recent of ${totalPages} pages)`
       : '';
+    // #7145: a sample is not the brain: every verdict below names it and carries exact: false.
+    const sampleDetails = totalPages > SAMPLE_LIMIT ? { exact: false, bound: 'sample', limit: SAMPLE_LIMIT, sampled: sampled.length, total_pages: totalPages } : undefined;
     const deadline = Date.now() + 60_000;
+    let stoppedAtDeadline = false;
     const hb = progress ? startHeartbeat(progress, `scanning ${sampled.length} pages for bare wikilinks…`) : null;
     try {
       for (const row of sampled) {
-        if (Date.now() > deadline) break; // backstop; in-memory scan rarely hits it
+        if (Date.now() > deadline) { stoppedAtDeadline = true; break; } // backstop; in-memory scan rarely hits it
         const content = (row.compiled_truth ?? '') + '\n' + (row.timeline ?? '');
         for (const e of extractEntityRefs(content)) {
           if (!e.needsResolution) continue;
@@ -313,14 +317,19 @@ export async function checkLinkResolutionOpportunity(
       hb?.();
     }
 
+    if (stoppedAtDeadline) {
+      return result({ name, status: 'warn', details: { ...boundUnknownDetails('time'), limit: 60_000, bare_wikilinks_so_far: bareCount },
+        message: `Link resolution opportunity unknown: the scan stopped at its 60 s limit before reading every sampled page${sampledNote}; ${bareCount} bare wikilink(s) seen so far.` });
+    }
     if (bareCount === 0) {
-      return result({ name, status: 'ok', message: 'No bare wikilinks found' });
+      return result({ name, status: 'ok', message: `No bare wikilinks found${sampledNote}`, ...(sampleDetails ? { details: sampleDetails } : {}) });
     }
     if (wouldResolveCount === 0) {
       return result({
         name,
         status: 'ok',
-        message: `${bareCount} bare wikilink(s) found, but none have basename matches in the brain.`,
+        message: `${bareCount} bare wikilink(s) found${sampledNote}, but none have basename matches in the brain.`,
+        ...(sampleDetails ? { details: sampleDetails } : {}),
       });
     }
     const ratio = wouldResolveCount / bareCount;
@@ -333,6 +342,7 @@ export async function checkLinkResolutionOpportunity(
           `${wouldResolveCount} of ${bareCount} bare wikilinks (${pct}%) would resolve to ` +
           `${distinctTargets.size} distinct page(s) under global_basename mode${sampledNote}. ` +
           `Enable with: gbrain config set link_resolution.global_basename true`,
+        ...(sampleDetails ? { details: sampleDetails } : {}),
       });
     }
     const pct = Math.round(ratio * 100);
@@ -340,6 +350,7 @@ export async function checkLinkResolutionOpportunity(
       name,
       status: 'ok',
       message: `${wouldResolveCount}/${bareCount} bare wikilinks (${pct}%) would resolve — below the 20% / 5-link threshold for surfacing a hint${sampledNote}.`,
+      ...(sampleDetails ? { details: sampleDetails } : {}),
     });
   } catch (e) {
     return {

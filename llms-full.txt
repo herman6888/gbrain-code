@@ -422,6 +422,8 @@ put_pages with one request_id per batch and wait_ms 25000."*
 - **Links.** For remote writes, `[[wikilinks]]` in a page body that point at
   pages already in the same source become plain `mentions` links after the
   commit, and a batch links pages to each other once its last page commits.
+  `append_page` links what the appended text mentions the same way, without
+  re-reading the rest of the page.
   The batch receipt's `links` field shows when they have landed; agents do
   not add them by hand. Typed links still need `add_link`. Turn this off with
   `gbrain config set mcp.remote_auto_links false`.
@@ -1805,6 +1807,14 @@ Bun blocks gbrain's postinstall on `bun install -g` (`Blocked 1 postinstall`); a
 
 ## Memory operating protocol
 
+**Retrieval: gbrain first.** For anything in the brain, run `gbrain search` (names,
+codes, phrases) or `gbrain query` (questions), then `gbrain get <slug>` on a hit.
+Don't grep, cat or SQL the brain checkout first. Filters agents miss:
+`--types '["meeting"]'`, `--match keyword` (every matching page), `--since`/`--until`
+on `query`, `--source <id>`, `--limit`, `--json`; `gbrain backlinks <slug>` and
+`gbrain timeline <slug>` for links and dated events. Copyable examples:
+[brain-first](skills/conventions/brain-first.md#retrieval-gbrain-first).
+
 Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
 
 Durable preferences and facts belong in shared memory when the user wants them
@@ -2951,6 +2961,11 @@ gbrain search "a phrase from an imported page" --json
 Only after enabling the selected embedding provider, run `gbrain embed --stale`.
 Use `gbrain query` for expanded retrieval only when its provider use is intended;
 `--no-expand` opts out of expansion independently of the mode.
+
+Once imported, retrieve through gbrain rather than the files: search, then
+`gbrain get <slug>`. Filters (`--types`, `--match keyword`, `query --since/--until`,
+`--source`, `--json`) are in
+[Retrieval: gbrain first](skills/conventions/brain-first.md#retrieval-gbrain-first).
 
 ## Step 4.5: Wire the Knowledge Graph
 
@@ -4803,7 +4818,7 @@ When multiple skills could match:
 
 These apply to ALL brain-writing skills:
 - `skills/conventions/quality.md` — citations, back-links, notability gate
-- `skills/conventions/brain-first.md` — check brain before external APIs
+- `skills/conventions/brain-first.md` — search gbrain before external APIs, brain files or SQL; copyable retrieval filters
 - `skills/conventions/brain-routing.md` — which brain (DB) and which source (repo) to target; cross-brain federation is latent-space only
 - `skills/conventions/schema-evolution.md` — when to add a type vs alias vs prefix (read before `schema-author`)
 - `skills/conventions/line-grammar.md` — typed relation lines (`- works_at [[companies/x]]`), fact lines and `@effective[...)` ranges in compiled truth
@@ -6361,10 +6376,17 @@ at most 200 characters. When an unexpected exception in the owner failed a
 write (`storage_error` with a generic public message; the class and frame stay owner-only),
 the line also carries `class=`, `errno=` and `frame=` (the top gbrain source
 frame, repo-relative, for example `src/core/persistence/page-prepare.ts:120`):
-the owner diagnostics the receipt points at. The stored receipt keeps the same
-identifiers (never the error message) owner-side in `error_detail`, with the
-build that ran the attempt; `gbrain write-request <id>` names an owner on
-another build than the CLI (`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
+the owner diagnostics the receipt points at. For a database server error it
+adds `error_text=`, `statement=` and `position=` (#7112): the server's primary
+message with every quoted value replaced by `…` (an object name such as a
+column, a relation or the token a syntax error stopped at is kept), the first
+line of the failing statement with its literals replaced, never its
+parameters, and the error's character position. A PL/pgSQL `RAISE` keeps no
+text, because it can carry page values. The stored receipt keeps the same
+identifiers (never an application error's message) owner-side in `error_detail`, with the
+build that ran the attempt; on the brain host `gbrain write-request <id> --json`
+prints that `error_detail`, and names an owner on another build than the CLI
+(`owner_build`) and the restart to run. Connection-wait evidence follows on Postgres:
 `first_conn_ms` is the time from phase start until the phase obtained a
 connection; `checkout=not_observed conn_wait_ms=<n>` means it had not obtained
 one after `n` milliseconds (a saturated pool or pooler, not a slow query); and
@@ -6903,7 +6925,8 @@ Timing knobs the drain uses:
 
 - **Tunables** you set and keep: `sync.bulk_size`, `sync.lanes`, `sync.exclude`, `sync.include_hidden`,
   `sync.include_working_tree`, `sync.holds`, `sync.write_through`, `sync.cost_gate_min_usd`, `sync.on_commit`,
-  `sync.freshness_target_seconds` ([on-commit sync](on-commit-sync.md)).
+  `sync.freshness_target_seconds` ([on-commit sync](on-commit-sync.md)), `sync.metafile_pages`
+  ([what gets synced](#what-gets-synced)).
 - **Rollback keys**, the way back a notice or migration promised: `sync.job_drain`, `sync.foreground_priority`,
   `sync.federated_v2`, `sync.waive_batch`, `sync.bulk`. Each one set to `false` restores the earlier behavior, and
   stays honored until at least 2027-01-14 (`CONFIG_ROLLBACK_WINDOWS` in `src/core/wire-skew.ts`). They are not
@@ -7092,7 +7115,20 @@ Triggers sync on push events for instant sync (<5s).
 Sync only indexes "syncable" markdown files. These are excluded by design:
 - Hidden paths (`.git/`, `.raw/`, etc.) and vendored/generated trees
   (`node_modules/`, `dist/`, `build/`, `venv/`)
-- Meta files: `README.md`, `index.md`, `schema.md`, `log.md`, `RESOLVER.md`
+- Meta files: `README.md`, `index.md`, `schema.md`, `log.md`, `RESOLVER.md` at any depth
+  (and `AGENTS.md`, `CLAUDE.md` at the source root), unless the file is a typed page (below)
+
+A meta-named file below the source root whose frontmatter has a `type:` or
+`title:` (for example `projects/acme-example/index.md` starting with
+`---\ntype: project\n---`) is an ordinary page: incremental sync, `sync --full`,
+the bulk import and managed sync all import it, edits refresh it and deleting
+the file soft-deletes its page. A bare one (no frontmatter, or neither key) and
+every meta file at the source root stay skipped, and a page an older gbrain
+indexed at such a path is kept (#1433). This is `sync.metafile_pages`:
+`typed` (the default) or `off`, which skips every meta file as before
+(`gbrain config set sync.metafile_pages off`). The first sync after the upgrade,
+or after setting it back to `typed`, imports the typed files already in the
+tree once; it deletes or rewrites nothing else.
 
 A dot-directory you deliberately keep content in (say `.decisions/`) can be
 waived back in with `--include-hidden '<glob>'` on `gbrain sync` — the glob
@@ -9024,7 +9060,10 @@ Save ONE fact with mandatory attribution.
   (local CLI reads only; session hooks push world facts only, so a private
   fact never reaches a new agent session, and a local private save carries the
   `private_fact_not_pushed` notice saying so). The init quickstart carries the
-  consent line.
+  consent line. An omitted `visibility` saves `private` when the target page is
+  private (by `visibility` or a privacy alias such as `access: private`) or the
+  operator set `facts.default_visibility` to private; a save never lands wider
+  than the page it is written into.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —
@@ -10435,6 +10474,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | [`gbrain repair fences` skipped a file `sync_in_progress` while a sync runs](repair.md#fence-repair-during-a-sync) | nothing: a write in flight or the running sync's frozen manifest still names that file; every other candidate repairs now and the next run picks this one up (`gbrain sync --source <id> --no-pull` finishes the sync) | agent | none | `gbrain doctor --only fence_integrity --json` |
 | [A Google or GitHub item is held (`connector_held_items`)](#held-connector-items) | `gbrain sources status <id>`, fix the cause, then `gbrain sources retry-held <id>` and `gbrain sync --source <id>` | agent, after the user agrees | `egress` (fetches from the provider again) | `gbrain doctor --only connector_held_items --json` |
 | `gbrain google status` exits 1 naming `calendar_unreadable`, doctor warns `google_calendar_readable`, or the sync log prints `[google] calendar_unreadable` (calendar pages stop arriving) | `gbrain google calendars --account <email>` lists the calendars the account can read; then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` ([unreadable calendar](google-connect.md#unreadable-calendar)) | agent, after the user agrees which calendar | none (on a managed brain whose source also syncs Gmail or Contacts, the change re-reads their history: `confirmation_required`, re-run with `--yes` after the user agrees) | `gbrain doctor --only google_calendar_readable --json` is ok |
+| `gbrain google setup` stops with `api_access_blocked`, `gbrain google status` exits 1 listing `api_access.problems`, or doctor warns `google_api_access` (a Google API disabled for the OAuth project, or a scope not granted) | enable each API at the link the report names (the Google Cloud project is in the report), or `gbrain google connect --reauth <email>` for a missing scope; then `gbrain sync --source <source>` ([API access](google-connect.md#api-access)) | user (only the project owner can enable an API) | none | `gbrain google status --json` shows no `api_access.problems` |
 | `gbrain waiting` lists bank, payment or shipping alerts as people waiting on you | upgrade (#5012: mail with `Precedence: bulk/list/junk`, a `List-Id` or a no-reply `Reply-To` opens no reply-owed loop); for loops opened before the upgrade, `gbrain waiting` prints `gbrain loops drop sender <email> --source <id> --dry-run` per sender; preview, then run it without `--dry-run` (cannot be undone), or `gbrain loops mute sender <email>` for a reversible stop ([open loops](open-loops.md#the-surfaces)) | agent, after the user agrees | none to preview | `gbrain waiting --json` no longer lists the sender |
 | [`gbrain migrate --to` refused with `writer_coordinator_required`](../ENGINES.md#engine-migration-refused) | follow the refusal's `fix`: relay its `user_message` (stay on PGLite and share with `gbrain mcp expose`, or leave the brain as it is) | agent, after the user agrees | `persistent_install`, `egress` (for `gbrain mcp expose`) | `gbrain doctor --no-migrate --json` |
 | [A write was refused with a named reason](#write-refused) | the reason's recovery in [write refusal reasons](write-refusals.md) | as the refusal's `fix` | as the refusal's `fix` | the refusal's `verify` |
@@ -11058,6 +11098,36 @@ the phase, its blocker key and back-off, or the last failed job.
    streak, and a phase that fails for a different reason starts a new one.
 3. Confirm with `gbrain doctor --only global_maintenance_stalled`: it is `ok`
    after a pass completes with the phase passing.
+
+## Content-drift sweep
+
+**Doctor reports `content_drift_sweep` as a warning, or an embed run prints
+`content-drift sweep ... FAILED`?** Every `embed --stale` run, embed job and
+embed-backfill job runs the content-drift sweep: it re-queues chunks whose text
+changed after their vector was computed (`embedded_text_hash` no longer
+matches `md5(chunk_text)`). The sweep examines 5,000 chunk rows per statement
+in id order and commits its cursor with each batch, in the config row
+`embed.content_drift_sweep.<column>.<scope>`, so a pass spans as many runs as
+it needs; one run sweeps for at most 60 seconds. After a pass completes, the
+next starts once `embed.content_drift.pass_interval_hours` have passed (24 by
+default; 0 repeats it every run). A pass that fits in one batch repeats on
+every run. The run's result carries `content_drift` (`contentDrift` on
+embed-backfill): rows checked and invalidated, the cursor, and `state`
+(`complete`, `partial`, `waiting`, `stopped`, `failed`, or `unsupported`
+on a schema before migration v133).
+
+A failed batch commits nothing and leaves the cursor before it; the embed run
+goes on with the rest of its work and the next run retries the batch. Search
+already ignores a vector whose text changed, so a stalled sweep delays
+re-embedding, not answers.
+
+1. Read the error: `gbrain doctor --only content_drift_sweep --json` names the
+   scope, the chunk id and the message.
+2. Fix what it names (a lock held by another session, a statement timeout far
+   below one batch, a database error), then run `gbrain embed --stale`. It
+   spends embedding tokens, so ask the user first.
+3. Confirm with `gbrain doctor --only content_drift_sweep`: it is `ok` once a
+   batch commits.
 
 ## auto_chronicle has no effect
 

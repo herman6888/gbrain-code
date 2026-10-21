@@ -31,7 +31,7 @@ export async function runRemoteDoctorTier(ctx: OperationContext, p: Record<strin
   if (p.tier === 'ops' || (only && only.every((n) => ops.has(n)))) {
     const args = ['--json', '--tier', 'ops', ...(only ? ['--only', only.join(',')] : [])];
     const deadline = startDoctorDeadline(args);
-    const checks = await buildChecks(ctx.engine, args, undefined, undefined, deadline, { sourceIds });
+    const checks = await buildChecks(ctx.engine, args, undefined, undefined, deadline, { sourceIds, remote: ctx.remote !== false });
     return computeDoctorReport(checks, { engine: ctx.engine.kind, render, run: { tier: 'ops', startedAt: deadline.startedAt, budgetMs: deadline.budgetMs } });
   }
   const report = await doctorReportRemote(ctx.engine, { sourceIds, remote: ctx.remote, render });

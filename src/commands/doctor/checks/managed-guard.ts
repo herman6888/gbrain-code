@@ -43,24 +43,51 @@ export const GUARDED_TABLE_COLUMNS: Readonly<Record<string, readonly string[]>> 
 /**
  * #5983/#5974: a column gbrain never creates on a guarded table means another
  * tool or a manual migration changed the schema the managed-writer guard reads.
- * A `source_id` on tags, timeline_entries or takes made every coordinated write
- * to them fail before v0.60.38.0.
+ * #7145: each extra column is named as table.column and classified by what it
+ * does to gbrain: `blocks_inserts` (NOT NULL with no default, so every gbrain
+ * INSERT into that table fails: fail), `guard_source_column` (a `source_id` on
+ * tags, timeline_entries or takes: builds before v0.60.38.0 resolved the row's
+ * source from it, so a process still running one refuses every coordinated
+ * write there: warn) or `harmless` (nullable or defaulted, and gbrain neither
+ * reads nor writes it: ok, information). The worst class decides the status.
  */
 export async function checkManagedGuardSchemaDrift(engine: BrainEngine): Promise<Check> {
   const name = 'managed_guard_schema_drift';
   try {
-    const rows = await engine.executeRaw<{ table_name: string; column_name: string }>(
-      `SELECT table_name,column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1::text[])
-       ORDER BY table_name,ordinal_position`, [[...GUARDED_TABLES]]);
-    const extra = rows.filter(row => !GUARDED_TABLE_COLUMNS[row.table_name]?.includes(row.column_name)).map(row => `${row.table_name}.${row.column_name}`);
-    const pageChildSource = extra.filter(column => PAGE_CHILD_TABLES.some(table => column === `${table}.source_id`));
-    const details = { extra_columns: extra, page_child_source_columns: pageChildSource, runbook: RUNBOOK };
+    const rows = await engine.executeRaw<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null; is_identity: string | null; is_generated: string | null }>(
+      `SELECT table_name,column_name,is_nullable,column_default,is_identity,is_generated FROM information_schema.columns
+       WHERE table_schema=current_schema() AND table_name=ANY($1::text[]) ORDER BY table_name,ordinal_position`, [[...GUARDED_TABLES]]);
+    const columns = rows.filter(row => !GUARDED_TABLE_COLUMNS[row.table_name]?.includes(row.column_name)).map(row => {
+      const column = `${row.table_name}.${row.column_name}`;
+      if (row.is_nullable === 'NO' && row.column_default === null && row.is_identity !== 'YES' && (row.is_generated ?? 'NEVER') === 'NEVER') {
+        return { column, class: 'blocks_inserts' as const,
+          why: 'NOT NULL with no default: every row gbrain inserts into this table leaves it empty, so the insert fails.',
+          next: `ask the user, then give it a default (ALTER TABLE ${row.table_name} ALTER COLUMN ${row.column_name} SET DEFAULT <value>) or allow NULL (ALTER TABLE ${row.table_name} ALTER COLUMN ${row.column_name} DROP NOT NULL).` };
+      }
+      if (row.column_name === 'source_id' && PAGE_CHILD_TABLES.includes(row.table_name)) {
+        return { column, class: 'guard_source_column' as const,
+          why: 'Builds before v0.60.38.0 resolve the row\'s source from it, so a gbrain process still running one refuses every coordinated tag, timeline or take write with writer_coordinator_required; this build resolves the row through its page.',
+          next: 'upgrade or restart every process running gbrain on this brain (gbrain sources writer status --json names their versions).' };
+      }
+      return { column, class: 'harmless' as const, why: 'Nullable or defaulted, and gbrain neither reads nor writes it.', next: 'nothing for gbrain.' };
+    });
+    const extra = columns.map(c => c.column);
+    const pageChildSource = columns.filter(c => c.class === 'guard_source_column').map(c => c.column);
+    const blocking = columns.filter(c => c.class === 'blocks_inserts');
+    const details = { extra_columns: extra, columns, page_child_source_columns: pageChildSource, runbook: RUNBOOK };
     if (!extra.length) return { name, status: 'ok', message: 'Guarded tables carry only the columns gbrain creates.', details };
-    return { name, status: 'warn', details, message: `${extra.length} column(s) on managed-writer-guarded tables were not created by gbrain: ${extra.join(', ')}. `
-      + (pageChildSource.length ? `${pageChildSource.join(', ')} made every coordinated tag, timeline or take write fail with writer_coordinator_required before v0.60.38.0; `
-        + 'this release ignores it and resolves those rows through their page. ' : '')
-      + 'Another tool or a manual migration changed this schema. Find out what added the columns before anything else writes there; '
-      + `do not drop them without asking the user, because another tool may read them. Recovery after the fix: ${RUNBOOK}.` };
+    const lead = `${extra.length} column(s) on managed-writer-guarded tables were not created by gbrain: ${columns.map(c => `${c.column} (${c.class})`).join(', ')}.`;
+    if (!blocking.length && !pageChildSource.length) {
+      return { name, status: 'ok', severity: 'info', details,
+        message: `${lead} Each is nullable or defaulted and gbrain neither reads nor writes it, so no gbrain write is affected. Another tool or a manual migration added it; keep it unless the user decides otherwise.` };
+    }
+    return { name, status: blocking.length ? 'fail' : 'warn', details, fix_unavailable_reason: 'operator_judgement',
+      message: `${lead} `
+        + (blocking.length ? `${blocking.map(c => c.column).join(', ')}: NOT NULL with no default, so every gbrain insert into ${blocking.length === 1 ? 'that table' : 'those tables'} fails; ${blocking[0]!.next} ` : '')
+        + (pageChildSource.length ? `${pageChildSource.join(', ')} made every coordinated tag, timeline or take write fail with writer_coordinator_required before v0.60.38.0; `
+          + 'this release ignores it and resolves those rows through their page, but a process still on an older build does not: upgrade or restart it. ' : '')
+        + 'Another tool or a manual migration changed this schema. Find out what added the columns before anything else writes there; '
+        + `do not drop them without asking the user, because another tool may read them. details.columns gives each column's class and next step. Recovery after the fix: ${RUNBOOK}.` };
   } catch (error) {
     return { name, status: 'warn', message: `Guarded table columns could not be read: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
       details: { health: 'unknown', runbook: RUNBOOK } };

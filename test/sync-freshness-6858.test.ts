@@ -99,7 +99,7 @@ describe('sync freshness (#6858 ask 6)', () => {
       const f = await managedSource(engine, 60);
       const [fresh] = await readSyncFreshness(engine, { sourceIds: [f.id] });
       expect(fresh).toEqual({ source_id: f.id, window_hours: 24, commit_to_searchable: { samples: 0, p50_seconds: null, p95_seconds: null },
-        commit_to_embedded: { samples: 0, p50_seconds: null, p95_seconds: null, pending: 0 }, commits: 0, unresolved_commits: 0 });
+        commit_to_embedded: { samples: 0, p50_seconds: null, p95_seconds: null, pending: 0 }, commits: 0, unresolved_commits: 0, behind: null });
       expect(formatSyncFreshness(fresh!)).toBe('no commit→searchable samples in the last 24 h');
       await engine.setConfig('sync.on_commit', 'true');
       expect(await doctor(engine)).toMatchObject({ name: 'managed_sync_latency', status: 'ok', message: expect.stringContaining('No commit→searchable samples') });
@@ -124,7 +124,7 @@ describe('sync freshness (#6858 ask 6)', () => {
       // searchable: [10, 20, 30, 400] -> p50 25, p95 30 + 0.85 * 370; embedded: [18, 22] (the page waiting on a chunk is pending).
       expect(fresh, name).toEqual({ source_id: f.id, window_hours: 24, commits: 1, unresolved_commits: 0,
         commit_to_searchable: { samples: 4, p50_seconds: 25, p95_seconds: 344.5 },
-        commit_to_embedded: { samples: 2, p50_seconds: 20, p95_seconds: 21.8, pending: 1 } });
+        commit_to_embedded: { samples: 2, p50_seconds: 20, p95_seconds: 21.8, pending: 1 }, behind: null });
       expect(formatSyncFreshness(fresh!)).toBe('commit→searchable p50 25s, p95 5.7m (4 page(s), last 24 h); commit→embedded p50 20s, p95 21.8s (2 page(s), 1 pending)');
     }
   }), 120_000);

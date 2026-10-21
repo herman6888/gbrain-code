@@ -19,7 +19,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
-import { MASS_RECONCILE_MIN_PAGES, MASS_RECONCILE_RATIO, massReconcileAllowed } from '../sync-reconcile.ts';
+import { massReconcileAllowed, readSyncDeleteCaps, syncDeleteTrip, type SyncDeleteCaps, type SyncDeleteTrip } from '../sync-reconcile.ts';
 import { syncClassAction, type SyncClass, type SyncClassAction } from './sync-classify.ts';
 import { readBlobs } from './sync-git-stream.ts';
 import type { ShadowLevel, ShadowPath } from './sync-pass.ts';
@@ -59,7 +59,7 @@ export interface ConvergenceReceipt {
   db_ahead_by_prefix: Record<string, number>; full_skipped_db_ahead: number;
   legacy_unverified: number; legacy_pageless: number;
   deletes: { count: number; reconcilable: number; ratio: number; verdict: 'apply' | 'withheld' | 'allowed_by_env'; set_hash: string | null; samples: string[] };
-  deletes_withheld: { count: number; ratio: number; set_hash: string | null; samples: string[] } | null;
+  deletes_withheld: { count: number; ratio: number; set_hash: string | null; samples: string[]; trip?: SyncDeleteTrip; caps?: SyncDeleteCaps } | null;
   samples: Partial<Record<ConvergenceClassKey, ConvergenceSample[]>>;
   settle_mismatch: string[]; episode: null; admission: null; last_full_at: null;
   redacted: boolean; duration_ms: number; timings_ms: Record<string, number>; statements: number;
@@ -94,7 +94,10 @@ export async function buildConvergenceReceipt(engine: BrainEngine, level: Shadow
   let keepDbSeen = 0;
   const deletes = level.paths.filter(entry => entry.result.cls === 'delete' && !entry.result.inFlight);
   const ratio = level.reconcilable ? deletes.length / level.reconcilable : 0;
-  const tripped = level.reconcilable > MASS_RECONCILE_MIN_PAGES && deletes.length > level.reconcilable * MASS_RECONCILE_RATIO;
+  // #7130: the same limits the pass applies (sync-pass-apply.ts): the 50% valve and the absolute caps.
+  const caps = deletes.length ? await readSyncDeleteCaps(engine, level.sourceId) : null;
+  const trip = caps ? syncDeleteTrip(deletes.length, level.reconcilable, caps) : null;
+  const tripped = trip !== null;
   const verdict = !tripped ? 'apply' : massReconcileAllowed() ? 'allowed_by_env' : 'withheld';
   for (const entry of level.paths) {
     let key: ConvergenceClassKey = entry.result.inFlight ? 'in_flight' : entry.result.cls;
@@ -175,7 +178,7 @@ export async function buildConvergenceReceipt(engine: BrainEngine, level: Shadow
     db_ahead: dbAhead, db_ahead_by_prefix: dbAhead.by_prefix, full_skipped_db_ahead: fullSkipped,
     legacy_twin_pairs: twins, legacy_unverified: counts.legacy_unverified ?? 0, legacy_pageless: level.paths.filter(entry => entry.legacyPageless && entry.result.cls === 'legacy_same').length,
     deletes: { count: deletes.length, reconcilable: level.reconcilable, ratio: Math.round(ratio * 1000) / 1000, verdict, set_hash: setHash, samples: deleteSamples },
-    deletes_withheld: verdict === 'withheld' ? { count: deletes.length, ratio: Math.round(ratio * 1000) / 1000, set_hash: setHash, samples: deleteSamples } : null,
+    deletes_withheld: verdict === 'withheld' ? { count: deletes.length, ratio: Math.round(ratio * 1000) / 1000, set_hash: setHash, samples: deleteSamples, trip: trip!, caps: caps! } : null,
     samples, settle_mismatch: [], episode: null, admission: null, last_full_at: null, redacted: opts.redactPaths,
     duration_ms: Math.round(level.timings_ms.total ?? 0), timings_ms: { ...level.timings_ms, screen: screenMs, legacy_twins: twinsMs, receipt: Math.round((performance.now() - started) * 10) / 10 },
     statements: level.statements,

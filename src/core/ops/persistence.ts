@@ -128,6 +128,8 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
     operation: row.operation, source_id: row.source_id, slug: row.slug,
     ...await liveSearchable(ctx, { request_id: row.request_id, state: row.state, source_id: row.source_id, slug: row.slug, searchable: row.outcome?.searchable }),
     ...(mismatch ? { owner_build: mismatch } : {}),
+    // #7112: the owner-side detail (an owner exception's class, errno, frame, redacted database error text and statement) for a trusted local reader only.
+    ...(ctx.remote === false && row.error_detail ? { error_detail: row.error_detail } : {}),
     ...(diagnostic ? { write_error: row.error_code, write_error_message: diagnostic.message, write_error_reason: diagnostic.reason, suggestion: diagnostic.suggestion } : {}),
     ...(terminal ? { diagnosis: { category: terminal.category, public_category: terminal.public_category, code: terminal.code, class: terminal.class, safe_actions: terminal.safe_actions, needs_human: terminal.needs_human,
       ...(terminal.human_reason ? { human_reason: terminal.human_reason } : {}), escalate: terminal.escalate, historical: terminal.historical,

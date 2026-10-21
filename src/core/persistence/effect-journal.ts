@@ -20,8 +20,8 @@ import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
 
 /**
  * `snapshot` is the publication's final read of the page, including deleted rows, in this transaction.
- * A remote put_page/capture/edit_page also queues a `links` effect, in one statement that inserts
- * nothing while `auto_link` or `mcp.remote_auto_links` is off (unset is on).
+ * A remote put_page/capture/edit_page also queues a `links` effect (an append_page to the compiled truth, one scoped
+ * to its appended bytes), in one statement that inserts nothing while `auto_link` or `mcp.remote_auto_links` is off (unset is on).
  */
 export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest & Partial<Pick<WriteRequest, 'operation' | 'intent' | 'authority' | 'principal_kind' | 'principal_id'>>, snapshot: PageSnapshot | null,
   outcome: Record<string, unknown>, prepared?: PreparedMutation,
@@ -54,7 +54,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
       else queue('facts-backstop', { visibility: await resolveDefaultVisibility(tx) });
     }
     // The links effect is inserted with the others, gated in SQL on auto_link and mcp.remote_auto_links.
-    if (queuesMentionLinks(row)) queued.push({ kind: 'links', data: { ...data }, gated: true });
+    if (queuesMentionLinks(row, prepared)) queued.push({ kind: 'links', data: { ...data, ...(prepared?.mentionRange ? { range: prepared.mentionRange } : {}) }, gated: true });
     // #5876: the Life Chronicle decision is a ledger row, not an effect; the `chronicle` cycle phase executes it.
     await recordChronicleDecision(tx, row, snapshot, outcome);
   }
@@ -70,10 +70,13 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
   }
 }
 
-/** Whether a publication of this request queues a mention `links` effect: a remote page write without trusted auto-linking. */
-export function queuesMentionLinks(row: Partial<Pick<WriteRequest, 'operation' | 'authority'>>): boolean {
-  return !!row.authority && !!row.operation && REMOTE_MENTION_OPERATIONS.includes(row.operation)
-    && !(row.authority.autoLinkTrusted ?? !row.authority.remote);
+/**
+ * Whether a publication of this request queues a mention `links` effect: a remote page write without trusted
+ * auto-linking. #7122: an append_page queues one only when it appended to the compiled truth (`mentionRange`).
+ */
+export function queuesMentionLinks(row: Partial<Pick<WriteRequest, 'operation' | 'authority'>>, prepared?: Pick<PreparedMutation, 'mentionRange'>): boolean {
+  if (!row.authority || !row.operation || (row.authority.autoLinkTrusted ?? !row.authority.remote)) return false;
+  return REMOTE_MENTION_OPERATIONS.includes(row.operation) || (row.operation === 'append_page' && !!prepared?.mentionRange);
 }
 
 /**

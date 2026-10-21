@@ -8,7 +8,8 @@ import { join } from 'path';
 import { promptYesNo } from './confirm-prompt.ts';
 import type { BrainEngine } from './engine.ts';
 import { collectSyncableFiles } from '../commands/import.ts';
-import { isSyncable } from './sync.ts';
+import { DEFAULT_METAFILE_PAGES_MODE, isSyncable, readMetafilePagesMode, type MetafilePagesMode } from './sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from './sync-metafile-pages.ts';
 // v0.42.42.0 (#2139): `buildDetachedWorkingTreeManifest` relocated to
 // `src/core/sync-delta.ts` (re-imported below) so the inline cost estimator
 // prices detached sources through the same code the executor imports them with.
@@ -232,7 +233,7 @@ export function estimateInlineNewTokens(
     chunker_version: string | null;
   }>,
   currentChunkerVersion: string,
-  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean } = {},
+  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean; metafilePages?: MetafilePagesMode } = {},
 ): InlineEstimate {
   let tokens = 0;
   let changedSources = 0;
@@ -316,7 +317,7 @@ export function estimateInlineNewTokens(
       ceiling(localPath, strategy, 'git_unavailable');
       continue;
     }
-    const syncOpts = { strategy };
+    const syncOpts = { strategy, metafilePage: metafilePagePredicate(opts.metafilePages ?? DEFAULT_METAFILE_PAGES_MODE, diskMetafileHeads(localPath)) };
     const changedPaths = unique([
       ...delta.manifest.added.filter(p => isSyncable(p, syncOpts)),
       ...delta.manifest.modified.filter(p => isSyncable(p, syncOpts)),
@@ -551,6 +552,7 @@ export async function runInlineCostGate(
   const inline = estimateInlineNewTokens(sources, chunkerStamp(), {
     forceFullTree: ctx.includeGitignored === true,
     chunkerDriftWalks: full === true || !(await readManagedMode(engine).catch(() => false)),
+    metafilePages: await readMetafilePagesMode(engine),
   });
   // D7A: `--full` runs `performFullSync` → `runEmbedCore({stale:true})`, which
   // sweeps the pre-existing stale backlog INLINE on top of the delta. Price it.

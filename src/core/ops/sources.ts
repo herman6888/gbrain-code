@@ -333,6 +333,29 @@ const sources_inspect: Operation = {
   cliHints: { name: 'sources_inspect', hidden: true },
 };
 
+const sources_resolve_path: Operation = {
+  name: 'sources_resolve_path',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Read-only: what gbrain did with each file path of a source, by its own rules. Per path: the slug sync gives it, whether ' +
+    'sync skips it (metafile, excluded, pruned) and why, its sync hold, its page with chunk and embedding counts, whether ' +
+    'search finds it now, and the command that moves it on. A deleted path is checked by the page that records it as its ' +
+    'origin, never by slug. Use it in landing checks instead of re-implementing slugging. Confined to the caller\'s source scope.',
+  params: {
+    id: { type: 'string', required: true, description: "Source id, as listed by sources_list (e.g. 'default')." },
+    paths: { type: 'array', items: { type: 'string' }, required: true, description: 'File paths relative to the source root (or to the Git top level), at most 200, e.g. the paths a commit changed.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    assertSourceInCallerScope(ctx, p.id as string);
+    const { resolveSourcePaths } = await import('../persistence/resolve-paths.ts');
+    return resolveSourcePaths(ctx.engine, p.id as string, (p.paths as unknown[] ?? []).map(String));
+  },
+  cliHints: { name: 'sources_resolve_path', hidden: true },
+};
+
 export const sourcesOperations: Operation[] = [
-  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect, sources_resolve_path,
 ];

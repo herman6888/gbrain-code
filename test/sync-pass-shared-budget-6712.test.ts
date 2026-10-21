@@ -21,6 +21,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installFaultHook } from '../src/core/persistence/fault-points.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { readIndexLevel } from '../src/core/persistence/sync-git-stream.ts';
 import { readShadowLevel } from '../src/core/persistence/sync-pass.ts';
 import { resolveManagedSyncContext } from '../src/core/persistence/sync-discovery.ts';
@@ -59,6 +60,8 @@ for (const backend of testBackends()) {
   describe(`#6712 PR 4b: a level's Git and I⋈P reads share one loop budget (${backend})`, () => {
     test('a fetch result that lands in a Git chunk\'s turn waits a turn before its take; no stretch passes the bound', () => managedBrain(async ({ engine }) => {
       expect((await performManagedSync(engine, { sourceId: 'default', noPull: true, noEmbed: true, noExtract: true })).status).toBe('first_sync');
+      // The consumer the sync started is not part of the level: its timer's query would run in the turn the take resumes in.
+      await disposePersistenceConsumer(engine);
       const context = await resolveManagedSyncContext(engine, { sourceId: 'default', noPull: true, dryRun: true });
       let open: () => void = () => {};
       const chunk = new Promise<void>(resolve => { open = resolve; });

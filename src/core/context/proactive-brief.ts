@@ -24,6 +24,7 @@ import { pageEligibleSql, projectionEligibleSql } from '../eligibility/sql.ts';
 import type { ReadEligibility } from '../eligibility/policy.ts';
 import { renderTrustedInline, trustFields } from '../eligibility/labels.ts';
 import { redactFindings } from '../secret-scan.ts';
+import { neutralizeForPrompt } from '../think/sanitize.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../takes-fence.ts';
 import { protectedRegions } from '../fence-scan.ts';
@@ -564,12 +565,13 @@ function sameContent(a: BriefItem, b: BriefItem): boolean {
 
 /**
  * Stored text as data: secret-redacted BEFORE collapsing and clipping (so a
- * cut can't split a credential past the scanner), one line, no comment or
- * code delimiters, quoted, with the existing trust label where the row has a
- * tier (agent-written text keeps its data envelope).
+ * cut can't split a credential past the scanner), injection phrases
+ * neutralized, one line, no comment or code delimiters, quoted, with the
+ * existing trust label where the row has a tier (agent-written text keeps its
+ * data envelope).
  */
 function renderStored(raw: string, tier?: unknown, writeOrigin?: unknown): string {
-  const redacted = redactFindings(raw ?? '', { highEntropy: true }).text;
+  const redacted = neutralizeForPrompt(redactFindings(raw ?? '', { highEntropy: true }).text).text;
   const body = `“${oneLine(redacted).replace(/[“”]/g, '"').slice(0, BRIEF_ITEM_MAX_CHARS)}”`;
   return tier ? renderTrustedInline(body, trustFields(tier, writeOrigin)) : body;
 }

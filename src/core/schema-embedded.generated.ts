@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS sources (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- #7112: text -> jsonb, NULL when the text is not valid jsonb. The portable
+-- (Postgres 15+) guard for casting a double-encoded config or payload string;
+-- IS JSON and pg_input_is_valid() are Postgres 16+. Migration v263 installs it
+-- on existing brains.
+CREATE OR REPLACE FUNCTION gbrain_try_jsonb(input text) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, public AS \$fn\$
+BEGIN
+  RETURN input::jsonb;
+EXCEPTION WHEN data_exception THEN
+  RETURN NULL;
+END \$fn\$;
+
 -- Seed the default source. 'default' is federated=true for backward compat
 -- (pre-v0.17 brains behave exactly as before — every page appears in search).
 -- Pre-existing sync.repo_path / sync.last_commit are copied in by the v16

@@ -27,6 +27,7 @@
 services:
   postgres-1:
     image: pgvector/pgvector:pg16
+    shm_size: 1g
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -43,6 +44,7 @@ services:
 
   postgres-2:
     image: pgvector/pgvector:pg16
+    shm_size: 1g
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -59,6 +61,7 @@ services:
 
   postgres-3:
     image: pgvector/pgvector:pg16
+    shm_size: 1g
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -75,6 +78,7 @@ services:
 
   postgres-4:
     image: pgvector/pgvector:pg16
+    shm_size: 1g
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

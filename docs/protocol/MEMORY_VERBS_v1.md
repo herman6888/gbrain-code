@@ -289,7 +289,10 @@ Save ONE fact with mandatory attribution.
   (local CLI reads only; session hooks push world facts only, so a private
   fact never reaches a new agent session, and a local private save carries the
   `private_fact_not_pushed` notice saying so). The init quickstart carries the
-  consent line.
+  consent line. An omitted `visibility` saves `private` when the target page is
+  private (by `visibility` or a privacy alias such as `access: private`) or the
+  operator set `facts.default_visibility` to private; a save never lands wider
+  than the page it is written into.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —

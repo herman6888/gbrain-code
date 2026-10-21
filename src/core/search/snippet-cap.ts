@@ -20,6 +20,21 @@
 /** Default snippet budget (chars) for subagent callers when config is unset. */
 export const DEFAULT_AGENT_SNIPPET_CHARS = 300;
 
+/**
+ * #7164: the most chunk text one search/query row returns when the caller set
+ * no snippet cap. The chunker stores at most a few thousand characters per
+ * chunk; a chunk written before that cap can hold tens of thousands, which a
+ * caller asking for ten rows never budgeted for. The marker names the window read
+ * that returns the rest; `snippet_chars: 0` returns full text.
+ */
+export const RESULT_CHUNK_CHARS = 8000;
+
+/** The cap for one call: an explicit `snippet_chars` (0 = full text) wins, then the resolved snippet cap, then RESULT_CHUNK_CHARS. */
+export function resultChunkCap(snippetChars: unknown, snippetCap: number): number {
+  if (typeof snippetChars === 'number' && Number.isFinite(snippetChars)) return snippetCap;
+  return snippetCap > 0 ? snippetCap : RESULT_CHUNK_CHARS;
+}
+
 export function buildSnippetMarker(slug: string | undefined, droppedChars: number, followUp?: { op: string; args: Record<string, string> }, chunkId?: number): string {
   // Large pages: a hit past the first chunk points at its own window (get_page around_chunk_id), not at the whole page.
   if (!followUp && slug && Number.isSafeInteger(chunkId) && (chunkId as number) > 0) {

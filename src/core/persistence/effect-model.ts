@@ -8,8 +8,13 @@ export type EffectKind = 'git' | 'embedding' | 'withdrawal-mirror' | 'facts-back
 export const REMOTE_AUTO_LINKS_KEY = 'mcp.remote_auto_links';
 /** link_source owned by the `links` effect; reconciliation of this producer never touches other producers' edges. */
 export const REMOTE_MENTION_LINK_SOURCE = 'mcp-remote-mention';
-/** Operations whose remote publications queue a `links` effect. */
+/**
+ * Operations whose remote publications queue a whole-page `links` effect. #7122: a remote append_page queues one
+ * scoped to the truth bytes it appended (`data.range`, effect-links.ts), so it never re-reads the page.
+ */
 export const REMOTE_MENTION_OPERATIONS: readonly string[] = ['put_page', 'capture', 'edit_page'];
+/** #7122: the stored truth-region bytes [start, end) an append added and their SHA-256, the only text its `links` effect reads. */
+export interface AppendedRange { start: number; end: number; sha256: string }
 /**
  * Commit metadata a trusted local preparer attaches to a page file target
  * (a fence or content repair): the subject when the file commits alone, its
@@ -68,6 +73,8 @@ export interface PersistenceEffect {
   data: { version?: 2; targets?: WithdrawalTarget[]; slug?: string; page_id?: number; relative_path?: string; expected_hash?: string | null; after_slug?: string; source_id?: string; source_scan?: boolean; visibility?: 'private' | 'world'; embedding_attempt_base?: number; embedding_retry_base?: number;
     /** Wave B: the occurrences a segmented write added; its embedding effect embeds only their chunk rows. */
     occurrence_ids?: number[];
+    /** #7122: an append's `links` effect mines only these appended truth bytes and never removes an edge. */
+    range?: AppendedRange;
     /** A single-file Git target's GitCommitNote, when its preparer gave one. */
     commit_subject?: string;
     commit_line?: string;

@@ -19,7 +19,8 @@ import { relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { estimateCostFromChars } from '../embedding-pricing.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
-import { isSyncable, matchesAnyGlob } from '../sync.ts';
+import { isSyncable, matchesAnyGlob, type MetafilePagesMode } from '../sync.ts';
+import { gitMetafileHeads, metafilePagePredicate } from '../sync-metafile-pages.ts';
 import { parseUsdLimit } from '../spend-posture.ts';
 import { digest } from './digest.ts';
 import { faultPointNow } from './fault-points.ts';
@@ -36,13 +37,13 @@ function universeOf(selection: SyncSelection, scope: string) {
 const sameUniverse = (a: SyncSelection, b: SyncSelection, scope: string) => JSON.stringify(universeOf(a, scope)) === JSON.stringify(universeOf(b, scope));
 
 /** Whether a Git-root path is in the universe of `selection` (the eligibility of sync-pass.ts `readShadowLevel`). */
-export function selectionEligible(selection: SyncSelection, scope: string, slugMode: 'git-root' | 'source-root'): (gitPath: string) => boolean {
+export function selectionEligible(selection: SyncSelection, scope: string, slugMode: 'git-root' | 'source-root', metafilePage?: (gitPath: string) => boolean): (gitPath: string) => boolean {
   const { sub, includeHidden, strategy } = universeOf(selection, scope);
   return gitPath => {
     if (sub && !gitPath.startsWith(`${sub}/`)) return false;
     const sourceRelative = sub ? gitPath.slice(sub.length + 1) : gitPath;
     return !matchesAnyGlob(sourceRelative, selection.exclude) && !isReservedSkillBundlePath(slugMode === 'source-root' ? sourceRelative : gitPath)
-      && isSyncable(gitPath, { strategy: strategy as 'markdown', includeHidden });
+      && isSyncable(gitPath, { strategy: strategy as 'markdown', includeHidden, metafilePage });
   };
 }
 
@@ -55,14 +56,16 @@ export interface EpisodeClosure {
   released: number;
 }
 
-type ClosureInput = { episode: SyncSelection; pass: SyncSelection; configuredSelection: SyncSelection; configured: boolean; scope: string; slugMode: 'git-root' | 'source-root' };
+type ClosureInput = { episode: SyncSelection; pass: SyncSelection; configuredSelection: SyncSelection; configured: boolean; scope: string; slugMode: 'git-root' | 'source-root';
+  /** GBRA-150: whether a metafile-named path of `T` is a page (`sync.metafile_pages`); the same answer in every universe. */
+  metafilePage?: (gitPath: string) => boolean };
 interface ClosureTally { included: boolean; covers: boolean; released: number }
 
 /** One stretch of design §6's closure test: `paths` folded into `tally`. */
 function tallyClosure(input: ClosureInput, paths: Iterable<string>, tally: ClosureTally): ClosureTally {
-  const inE = selectionEligible(input.episode, input.scope, input.slugMode);
-  const inPass = selectionEligible(input.pass, input.scope, input.slugMode);
-  const inConfig = selectionEligible(input.configuredSelection, input.scope, input.slugMode);
+  const inE = selectionEligible(input.episode, input.scope, input.slugMode, input.metafilePage);
+  const inPass = selectionEligible(input.pass, input.scope, input.slugMode, input.metafilePage);
+  const inConfig = selectionEligible(input.configuredSelection, input.scope, input.slugMode, input.metafilePage);
   for (const path of paths) {
     const e = inE(path), c = inConfig(path);
     if (e && !inPass(path)) tally.included = false;
@@ -89,11 +92,13 @@ export function episodeClosure(input: ClosureInput & { treePaths: Iterable<strin
  * every path answers alike on both sides, so the closure is known without the walk.
  */
 export async function passEpisodeClosure(input: { gitRoot: string; root: string; head: string; slugMode: 'git-root' | 'source-root'; episode: PassEpisode; pass: SyncSelection;
-  configuredSelection: SyncSelection; configured: boolean;
+  configuredSelection: SyncSelection; configured: boolean; metafilePages?: MetafilePagesMode;
   /** The walk of `head`'s tree (default `walkTreeLevel`); a test replays one recorded listing instead of a `git` process per call. */
   walk?: (visit: (path: string) => void) => Promise<void> }): Promise<EpisodeClosure> {
   const scope = relative(realpathSync.native(input.gitRoot), realpathSync.native(input.root)).split(sep).join('/');
-  const closure: ClosureInput = { episode: input.episode.selection, pass: input.pass, configuredSelection: input.configuredSelection, configured: input.configured, scope, slugMode: input.slugMode };
+  const closure: ClosureInput = { episode: input.episode.selection, pass: input.pass, configuredSelection: input.configuredSelection, configured: input.configured, scope, slugMode: input.slugMode,
+    metafilePage: metafilePagePredicate(input.metafilePages ?? 'off', gitMetafileHeads(input.gitRoot, [input.head]).read,
+      path => scope && path.startsWith(`${scope}/`) ? path.slice(scope.length + 1) : path) };
   const tally: ClosureTally = { included: true, covers: true, released: 0 };
   if (sameUniverse(closure.episode, input.configured ? closure.configuredSelection : closure.pass, scope)) return closureOf(input.configured, tally);
   let stretch: string[] = [];
@@ -114,7 +119,7 @@ const CLOSURE_STRETCH = 2_048;
 export function passClosureMemo(): typeof passEpisodeClosure {
   let last: { key: string; closure: Promise<EpisodeClosure> } | null = null;
   return input => {
-    const key = JSON.stringify([input.gitRoot, input.root, input.head, input.slugMode, input.episode.selection, input.pass, input.configured, input.configuredSelection]);
+    const key = JSON.stringify([input.gitRoot, input.root, input.head, input.slugMode, input.episode.selection, input.pass, input.configured, input.configuredSelection, input.metafilePages]);
     if (last?.key !== key) last = { key, closure: passEpisodeClosure(input) };
     return last.closure;
   };

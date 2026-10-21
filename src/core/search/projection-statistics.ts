@@ -12,14 +12,16 @@ ANALYZE pages(text_projection_revision, knowledge_revision);
 
 type ProjectionStatisticsState = 'collected' | 'undefined' | 'uninspectable' | 'uncollected';
 
-async function readProjectionStatistics(engine: Pick<BrainEngine, 'executeRaw'>): Promise<ProjectionStatisticsState> {
-  const rows = await engine.executeRaw<{
-    expression: string;
-    correct_table: boolean;
-    sampled_rows: number;
-    can_inspect: boolean;
-    collected: boolean;
-  }>(`SELECT pg_get_expr(e.stxexprs, e.stxrelid) AS expression,
+interface ProjectionStatisticsRow {
+  expression: string | null;
+  correct_table: boolean | null;
+  sampled_rows: number | null;
+  can_inspect: boolean | null;
+  collected: boolean | null;
+}
+
+/** The projection statistics' definition and collection state; `$${n}` binds PROJECTION_STATISTICS_NAME. */
+const projectionStatisticsSql = (n: number) => `SELECT pg_get_expr(e.stxexprs, e.stxrelid) AS expression,
        e.stxrelid = 'pages'::regclass AS correct_table,
        p.reltuples AS sampled_rows,
        has_table_privilege(p.oid, 'SELECT') AND NOT row_security_active(p.oid) AS can_inspect,
@@ -29,8 +31,14 @@ async function readProjectionStatistics(engine: Pick<BrainEngine, 'executeRaw'>)
        ON x.statistics_schemaname = (SELECT nspname FROM pg_namespace WHERE oid = e.stxnamespace)
        AND x.statistics_name = e.stxname
        AND x.expr = pg_get_expr(e.stxexprs, e.stxrelid)
-     WHERE p.oid = 'pages'::regclass AND e.stxname = $1`, [PROJECTION_STATISTICS_NAME]);
-  const state = rows[0];
+     WHERE p.oid = 'pages'::regclass AND e.stxname = $${n}`;
+
+async function readProjectionStatistics(engine: Pick<BrainEngine, 'executeRaw'>): Promise<ProjectionStatisticsState> {
+  const rows = await engine.executeRaw<ProjectionStatisticsRow>(projectionStatisticsSql(1), [PROJECTION_STATISTICS_NAME]);
+  return projectionStatisticsState(rows[0]);
+}
+
+function projectionStatisticsState(state: ProjectionStatisticsRow | undefined): ProjectionStatisticsState {
   if (!state || !state.correct_table || state.expression !== '(text_projection_revision = knowledge_revision)') return 'undefined';
   if (!state.can_inspect) return 'uninspectable';
   if (Number(state.sampled_rows) < 0 || (Number(state.sampled_rows) > 0 && !state.collected)) return 'uncollected';
@@ -178,6 +186,15 @@ const MISSING_SEARCH_STATISTICS_SQL = `SELECT r.tablename || '.' || r.attname AS
  ORDER BY r.position`;
 
 /**
+ * The three reads behind `missingSearchStatistics` in one statement (#7147: each is a round trip, and the search guard
+ * runs it on every cold CLI search): the missing columns in order, pages' sampled rows, and the projection statistics'
+ * state ($3), which only counts when pages holds SEARCH_STATISTICS_MIN_ROWS rows.
+ */
+const SEARCH_STATISTICS_STATE_SQL = `SELECT ARRAY(${MISSING_SEARCH_STATISTICS_SQL}) AS missing,
+       (SELECT reltuples::float8 FROM pg_class WHERE oid = 'pages'::regclass) AS pages_rows, projection.*
+  FROM (SELECT 1) AS one LEFT JOIN LATERAL (${projectionStatisticsSql(3)} LIMIT 1) AS projection ON true`;
+
+/**
  * Postgres: the planner statistics search needs that are absent, as `table.column` (plus PROJECTION_STATISTICS_NAME
  * when the projection statistics are not collected on such a table). Empty when every one exists, the tables hold fewer
  * than SEARCH_STATISTICS_MIN_ROWS sampled rows, or this role
@@ -189,10 +206,10 @@ const MISSING_SEARCH_STATISTICS_SQL = `SELECT r.tablename || '.' || r.attname AS
 export async function missingSearchStatistics(engine: Pick<BrainEngine, 'executeRaw' | 'kind'>): Promise<string[]> {
   if (engine.kind !== 'postgres') return [];
   const pairs = Object.entries(SEARCH_STATISTICS_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column] as const));
-  const rows = await engine.executeRaw<{ col: string }>(MISSING_SEARCH_STATISTICS_SQL, [pairs.map(p => p[0]), pairs.map(p => p[1])]);
-  const missing = rows.map(row => row.col);
-  const [pages] = await engine.executeRaw<{ reltuples: number }>(`SELECT reltuples::float8 AS reltuples FROM pg_class WHERE oid = 'pages'::regclass`);
-  if (Number(pages?.reltuples ?? -1) >= SEARCH_STATISTICS_MIN_ROWS && await readProjectionStatistics(engine) === 'uncollected') missing.push(PROJECTION_STATISTICS_NAME);
+  const [state] = await engine.executeRaw<ProjectionStatisticsRow & { missing: string[] | null; pages_rows: number | null }>(
+    SEARCH_STATISTICS_STATE_SQL, [pairs.map(p => p[0]), pairs.map(p => p[1]), PROJECTION_STATISTICS_NAME]);
+  const missing = [...(state?.missing ?? [])];
+  if (Number(state?.pages_rows ?? -1) >= SEARCH_STATISTICS_MIN_ROWS && projectionStatisticsState(state) === 'uncollected') missing.push(PROJECTION_STATISTICS_NAME);
   return missing;
 }
 

@@ -140,6 +140,7 @@ const LEDGER: Record<string, string> = {
   sources_list: 'test/sources-mcp.test.ts',
   sources_remove: 'test/sources-mcp.test.ts',
   sources_status: 'test/sources-mcp.test.ts',
+  sources_resolve_path: 'test/sources-resolve-path.test.ts',
   request_tools: 'test/request-tools.test.ts',
   get_recent_salience: 'test/salience-source-scope.test.ts',
   find_anomalies: 'test/salience-source-scope.test.ts',

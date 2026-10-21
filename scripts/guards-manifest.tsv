@@ -49,6 +49,7 @@ check-compile-autoload.sh	scanner	yes	every `bun build --compile` invocation (CL
 check-admin-build.sh	buildfresh	exempt	runs the admin build; the build is the test
 check-admin-embedded.sh	buildfresh	exempt	embed freshness diff; not in verify CHECKS: duplicates check:admin-build's build
 check-admin-scope-drift.sh	buildfresh	exempt	regenerates + diffs
+check-vendor-postgres.sh	buildfresh	exempt	rebuilds vendor/postgres (src, cjs/src, cf/src) from the pinned upstream tarball plus patches/postgres@3.4.9.patch and diffs every byte; networked (fails under CI, a recorded skip offline)
 check-bootstrap-templates.sh	buildfresh	exempt	regenerates template tree + diffs
 check-plugin-tree.sh	buildfresh	exempt	regenerates the plugin tree + diffs (curation record validated by the generator)
 check-eval-glossary-fresh.sh	buildfresh	exempt	regenerates + diffs

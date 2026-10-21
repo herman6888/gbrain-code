@@ -256,6 +256,8 @@ export interface ParamDef {
   properties?: Record<string, ParamDef>;
   /** Advertised on the full MCP surface only (keeps the starter tool list inside its size budget). */
   fullSurfaceOnly?: boolean;
+  /** An object param the CLI takes as repeated `--flag key=value` (`key=a,b` is a list); MCP passes the object. */
+  cliKeyValue?: boolean;
 }
 
 export interface Logger {

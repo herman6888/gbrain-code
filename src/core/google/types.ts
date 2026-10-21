@@ -10,6 +10,27 @@ export type GoogleService = 'gmail' | 'calendar' | 'contacts';
 
 export const ALL_GOOGLE_SERVICES: readonly GoogleService[] = ['gmail', 'calendar', 'contacts'];
 
+/** The Google Cloud API behind each service: the name the console enables and its title. */
+export const GOOGLE_SERVICE_API: Record<GoogleService, { api: string; title: string }> = {
+  gmail: { api: 'gmail.googleapis.com', title: 'Gmail API' },
+  calendar: { api: 'calendar-json.googleapis.com', title: 'Google Calendar API' },
+  contacts: { api: 'people.googleapis.com', title: 'People API' },
+};
+
+/**
+ * #7073: a service the credential cannot reach because its API is disabled
+ * for the OAuth client's project (`api_not_enabled`, with the project and the
+ * enable link Google returned) or its scope was not granted (`scope_missing`).
+ */
+export interface GoogleApiProblem {
+  service: GoogleService;
+  code: 'api_not_enabled' | 'scope_missing';
+  api: string;
+  api_title: string;
+  project: string | null;
+  enable_url: string | null;
+}
+
 /** The account's primary calendar — the Calendar API's own alias, and the default a google source sweeps. */
 /** Where a Google source renders its contact pages unless `g_contacts_dir` says otherwise. */
 export const DEFAULT_CONTACTS_DIR = 'people';
@@ -130,6 +151,12 @@ export interface GoogleSourceState {
    * list. `gbrain doctor` and `gbrain google status --no-probe` read it.
    */
   calendar_unreadable?: CalendarUnreadable | null;
+  /**
+   * #7073: services the last sweep could not reach (API disabled, scope not
+   * granted). A service leaves it when its sweep reaches the API again.
+   * `gbrain doctor` (google_api_access) reads it with no network call.
+   */
+  api_access?: { problems: GoogleApiProblem[]; at: string } | null;
   calendar_sync_token: string | null;
   /**
    * Calendar id `calendar_sync_token` was minted for. A token is only valid
@@ -326,6 +353,8 @@ export interface CalendarEventData {
   htmlLink: string | null;
   status: string;
   account: string;
+  /** Google marks the event `private` or `confidential`: its page is `visibility: private`. */
+  private?: boolean;
 }
 
 export interface ContactData {

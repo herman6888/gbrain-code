@@ -138,7 +138,7 @@ export {
 import type { DoctorContext, DoctorTier } from './doctor/context.ts';
 import { doctorRunSummary, parseDoctorTier, startDoctorDeadline, tierFields, type DoctorDeadline, type DoctorRunSummary } from './doctor/budget.ts';
 export { doctorRunSummary, type DoctorRunSummary } from './doctor/budget.ts';
-import { runDoctorRegistry, parseOnlyChecks } from './doctor/registry.ts';
+import { runDoctorRegistry, parseOnlyChecks, doctorRefreshRegistry } from './doctor/registry.ts';
 import { finalizeCheckFixes, fixLine, unknownScoreCategories, type CheckAgentFields } from './doctor/check-fix.ts';
 import { throttleDoctorHeartbeat } from './doctor/heartbeat.ts';
 import type { RenderContext } from '../core/agent-output.ts';
@@ -247,6 +247,8 @@ export interface DoctorReport {
   tier?: DoctorTier;
   complete?: boolean;
   unknown_sections?: string[];
+  /** #7142: checks reported from their last known result (with its age in `details.last_known`), not measured by this run. */
+  last_known_sections?: string[];
   elapsed_ms?: number;
   budget_ms?: number | null;
 }
@@ -396,7 +398,7 @@ export async function buildChecks(
   connectError?: unknown,
   // #6696: the run's deadline (started by the CLI before connecting) and a remote caller's readable sources.
   deadline: DoctorDeadline = startDoctorDeadline(args),
-  remoteScope: { sourceIds?: string[] } = {},
+  remoteScope: { sourceIds?: string[]; remote?: boolean; lastKnown?: 'cli' | 'refresh'; entryBudgetOverrideMs?: number; refreshOnly?: boolean } = {},
 ): Promise<Check[]> {
   const jsonOutput = args.includes('--json');
   const fastMode = args.includes('--fast');
@@ -473,10 +475,12 @@ export async function buildChecks(
     only: parseOnlyChecks(args),
     tier: parseDoctorTier(args),
     deadline,
-    ...(remoteScope.sourceIds ? { sourceIds: remoteScope.sourceIds } : {}),
+    ...(remoteScope.sourceIds ? { sourceIds: remoteScope.sourceIds } : {}), ...(remoteScope.remote ? { remote: true } : {}),
+    ...(remoteScope.lastKnown ? { lastKnown: remoteScope.lastKnown } : {}),
+    ...(remoteScope.entryBudgetOverrideMs ? { entryBudgetOverrideMs: remoteScope.entryBudgetOverrideMs } : {}),
   };
 
-  return runDoctorRegistry(ctx);
+  return runDoctorRegistry(ctx, remoteScope.refreshOnly ? doctorRefreshRegistry() : undefined);
 }
 
 /**
@@ -517,7 +521,7 @@ export async function runDoctor(
   }
 
   if (args.includes('--probe') && !(await (await import('./doctor/probe-consent.ts')).authorizeProviderProbe(engine, args, jsonOutput))) return;
-  const checks = await buildChecks(engine, args, dbSource, connectError, deadline);
+  const checks = await buildChecks(engine, args, dbSource, connectError, deadline, { lastKnown: 'cli' });
   const run = doctorRunSummary(args, deadline);
   const hasFail = outputResults(checks, jsonOutput, { engine: engine?.kind, db_url_source: dbSource ?? null, run });
 
@@ -615,7 +619,7 @@ function outputResults(
   console.log(`Ops checks:    ${report.category_scores.ops}/100`);
   console.log(`Meta checks:   ${report.category_scores.meta}/100`);
   if (brainScoreLine) console.log(brainScoreLine);
-  if (report.tier) console.log(`Tier: ${report.tier}, ${report.complete ? 'complete' : `incomplete (unknown: ${report.unknown_sections!.join(', ')})`}, ${report.elapsed_ms} ms${report.budget_ms ? ` of ${report.budget_ms} ms` : ''}`);
+  if (report.tier) console.log(`Tier: ${report.tier}, ${report.complete ? 'complete' : `incomplete (${[report.unknown_sections!.length ? `unknown: ${report.unknown_sections!.join(', ')}` : '', report.last_known_sections?.length ? `${report.last_known_sections.length} from last known results` : ''].filter(Boolean).join('; ')})`}, ${report.elapsed_ms} ms${report.budget_ms ? ` of ${report.budget_ms} ms` : ''}`);
   console.log('');
 
   if (hasFail) {

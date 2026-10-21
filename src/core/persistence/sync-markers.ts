@@ -24,6 +24,7 @@ import { getWorktreeBinding, managedPersistenceEnabled } from './ownership.ts';
 import { readSyncFile } from './sync-discovery.ts';
 import { readSyncImportProvenance } from './sync-holds.ts';
 import { syncOriginPath } from './sync-origin.ts';
+import type { SyncDeleteCaps, SyncDeleteTrip } from '../sync-reconcile.ts';
 import { SYNC_DELETES_WITHHELD_OP, SYNC_ORIGIN_DELETED_OP, passFingerprint } from './sync-pass-row.ts';
 
 type Exec = Pick<BrainEngine, 'executeRaw'>;
@@ -137,6 +138,9 @@ export interface DeletesWithheld {
   /** `deleteSetHash` of the withheld paths: the record matches a later trip only while the set is the same. */
   set_hash: string;
   samples: string[];
+  /** #7130: the limit the set went over (absent on a record written before the caps: the 50% valve). */
+  trip?: SyncDeleteTrip;
+  caps?: SyncDeleteCaps;
   at: string;
 }
 
@@ -147,9 +151,9 @@ export function deleteSetHash(paths: Iterable<string>): string {
 
 /** Writes (or refreshes) the source's withheld mass-delete record inside `tx`; keeps the first `DELETES_WITHHELD_SAMPLES` samples. */
 export async function writeDeletesWithheld(tx: Exec, input: { sourceId: string; incarnation: string; target: string; count: number; reconcilable: number; ratio: number;
-  set_hash: string; samples: readonly string[] }): Promise<DeletesWithheld> {
+  set_hash: string; samples: readonly string[]; trip?: SyncDeleteTrip; caps?: SyncDeleteCaps }): Promise<DeletesWithheld> {
   const value: DeletesWithheld = { source_id: input.sourceId, incarnation: input.incarnation, target: input.target, count: input.count, reconcilable: input.reconcilable,
-    ratio: input.ratio, set_hash: input.set_hash, samples: input.samples.slice(0, DELETES_WITHHELD_SAMPLES), at: new Date().toISOString() };
+    ratio: input.ratio, set_hash: input.set_hash, samples: input.samples.slice(0, DELETES_WITHHELD_SAMPLES), ...(input.trip ? { trip: input.trip } : {}), ...(input.caps ? { caps: input.caps } : {}), at: new Date().toISOString() };
   await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys,updated_at) VALUES($1,$2,jsonb_build_array($3::text::jsonb),now())
     ON CONFLICT (op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys, updated_at=now()`,
   [SYNC_DELETES_WITHHELD_OP, passFingerprint(input.sourceId, input.incarnation), JSON.stringify(value)]);

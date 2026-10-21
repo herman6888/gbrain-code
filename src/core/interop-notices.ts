@@ -52,7 +52,7 @@ export const DEGRADED_STAGE_GUIDANCE: Readonly<Record<RecallStage, StageGuidance
   keyword_relaxed_carried: { why: 'keyword matching was relaxed to find anything at all', fix: null },
   safe_index_pending: { why: 'some pages in scope are still being safety-indexed for agent readers and are withheld until that finishes', fix: 'doctor' },
   vector_candidates_incomplete: { why: 'vector search hit its candidate limit or deadline, so some semantic matches can be missing', fix: null },
-  keyword_candidates_incomplete: { why: 'CJK keyword matching hit its deadline or its candidate cap on a large corpus, so some keyword matches can be missing; narrow the search with source_id (the CLI source-id flag), or ask the user to raise search.cjk_keyword_deadline_ms (milliseconds, default 3000)', fix: null },
+  keyword_candidates_incomplete: { why: 'keyword matching returned a bounded result on a large corpus (the CJK deadline or candidate cap, or common words ranked from a sample), so some keyword matches can be missing; add a rarer word or an exact phrase, narrow with source_id (the CLI source-id flag) or types, or for CJK text ask the user to raise search.cjk_keyword_deadline_ms (milliseconds, default 3000)', fix: null },
   projection_pending: { why: 'recently written pages are not in the search index yet', fix: 'doctor' },
   projection_by_design: { why: 'some image pages in scope hold protected OCR content and stay out of the search index by design; nothing is pending', fix: null },
   projection_status_unknown: { why: 'whether recent writes are in the search index could not be checked', fix: 'doctor' },

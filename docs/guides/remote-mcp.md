@@ -409,6 +409,8 @@ put_pages with one request_id per batch and wait_ms 25000."*
 - **Links.** For remote writes, `[[wikilinks]]` in a page body that point at
   pages already in the same source become plain `mentions` links after the
   commit, and a batch links pages to each other once its last page commits.
+  `append_page` links what the appended text mentions the same way, without
+  re-reading the rest of the page.
   The batch receipt's `links` field shows when they have landed; agents do
   not add them by hand. Typed links still need `add_link`. Turn this off with
   `gbrain config set mcp.remote_auto_links false`.

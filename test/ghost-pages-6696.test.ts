@@ -25,7 +25,7 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { installFaultHook } from '../src/core/persistence/fault-points.ts';
 import { liveFileDrift } from '../src/core/persistence/drift-conflicts.ts';
 import { classifyTerminal } from '../src/core/persistence/terminal-classify.ts';
-import { readGhostPages, ghostPageNow } from '../src/core/ghost-pages.ts';
+import { readGhostPages, ghostPageNow, __setGhostScanLimitForTests } from '../src/core/ghost-pages.ts';
 import { resolveRepairScope } from '../src/core/repair/core.ts';
 import { AUTO_REPAIR_REGISTRY, EXPLICIT_REPAIR_REGISTRY, repairForCheck, repairRunner, repairSpec } from '../src/core/repair/registry.ts';
 import { runRepairCommand } from '../src/commands/repair.ts';
@@ -143,6 +143,18 @@ for (const backend of testBackends()) describe(`#6696 B5 ghost pages (${backend}
     expect(check.message).toContain(`gbrain repair ghost-pages --source ${f.sourceId}`);
     expect(categorizeCheck('ghost_pages')).toBe('brain');
     expect(repairForCheck('ghost_pages')?.kind).toBe('ghost-pages');
+  }));
+
+  test('#7145: doctor ghost_pages stopped at its page bound before any ghost is health unknown, not clear', () => fixture(async f => {
+    await seed(f);
+    __setGhostScanLimitForTests(2);
+    try {
+      const [check] = await ghostPagesEntry.run({ engine } as never) as Array<Record<string, any>>;
+      expect(check).toMatchObject({ name: 'ghost_pages', status: 'warn', details: { count: 0, truncated: true, health: 'unknown', reason: 'bound', bound: 'rows', exact: false } });
+      expect(check.message).toContain('Ghost pages unknown: the scan stopped at its bound');
+    } finally {
+      __setGhostScanLimitForTests(null);
+    }
   }));
 
   test('off the owner host doctor is ok/info, pages ghosts and the repair refuse not_owner_host', () => fixture(async f => {

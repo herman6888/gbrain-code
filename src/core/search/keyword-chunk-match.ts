@@ -16,6 +16,29 @@
  *
  * `ftsLang` must already be validated (getFtsLanguage); `$1` is the websearch text.
  */
+/**
+ * Most matching chunks the Postgres keyword statement ranks (GBRA-156).
+ * ts_rank runs on every row it is given, so a query whose terms match
+ * hundreds of thousands of chunks (one common word on a 2M-chunk brain)
+ * spent 3-8 s ranking and ran into the keyword statement timeout, which
+ * returns no rows at all. The statement takes the first matching chunks
+ * that pass its filters, up to this bound, and ranks those; a match set under
+ * the bound ranks exactly as before. When the bound applies the caller is
+ * told (SearchOpts.onKeywordIncomplete), and hybrid reports
+ * `keyword_candidates_incomplete`, because the rows come from a sample.
+ */
+export const KEYWORD_RANK_CANDIDATES = 50_000;
+
+/**
+ * Transaction-local settings for the keyword statement. At the 4 MB
+ * `work_mem` default, the bitmap over a common word's matches goes lossy, so
+ * the heap scan rechecks every row's tsvector, and the bounded candidate sort
+ * spills to disk: a remote caller's bounded any-word retry took 6.6 s on the
+ * 2M-chunk bench against 1.4 s at 32 MB (128 MB measured the same). The
+ * bound keeps the memory this can use per statement small.
+ */
+export const KEYWORD_STATEMENT_SETTINGS = { work_mem: '32MB' } as const;
+
 export function buildKeywordChunkMatch(
   ftsLang: string,
   excludePrivate: boolean | undefined,

@@ -414,8 +414,8 @@
             "params": [
               "array<>"
             ],
-            "sql": "UPDATE content_chunks cc SET \"embedding\" = NULL, embedded_at = NULL, embedded_text_hash = NULL, embedding_pending_since = now() FROM pages p WHERE cc.page_id = p.id AND p.source_id=ANY($1::text[]) AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived) AND p.deleted_at IS NULL AND cc.\"embedding\" IS NOT NULL AND cc.embedded_text_hash IS NOT NULL AND cc.embedded_text_hash <> md5(cc.chunk_text) AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open' AND (CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END) > 1048576) RETURNING cc.page_id",
-            "textSha256": "0fb0f0109e484923bce97a50af889d1656cea824024ea92f6c40fee587797d11"
+            "sql": "WITH b AS (SELECT id FROM content_chunks WHERE id > 0 ORDER BY id LIMIT 5000), w AS (UPDATE content_chunks cc SET \"embedding\" = NULL, embedded_at = NULL, embedded_text_hash = NULL, embedding_pending_since = now() FROM b, pages p WHERE cc.id = b.id AND cc.page_id = p.id AND p.source_id=ANY($1::text[]) AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived) AND p.deleted_at IS NULL AND cc.\"embedding\" IS NOT NULL AND cc.embedded_text_hash IS NOT NULL AND cc.embedded_text_hash <> md5(cc.chunk_text) AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open' AND (CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END) > 1048576) RETURNING 1) SELECT (SELECT max(id) FROM b) AS last_id, (SELECT count(*) FROM b)::int AS checked, (SELECT count(*) FROM w)::int AS drifted",
+            "textSha256": "e4ab4d9f62a62d4acbe361aee22049a5f8dbe556ce2eb5822c5eba6c8ee4b262"
           },
           {
             "event": "commit",
@@ -448,8 +448,8 @@
               "array<>",
               "string"
             ],
-            "sql": "UPDATE content_chunks cc SET \"embedding\" = NULL, embedded_at = NULL, embedded_text_hash = NULL, embedding_pending_since = now() FROM pages p WHERE cc.page_id = p.id AND p.source_id=ANY($1::text[]) AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived) AND p.deleted_at IS NULL AND cc.\"embedding\" IS NOT NULL AND cc.embedded_text_hash IS NOT NULL AND cc.embedded_text_hash <> md5(cc.chunk_text) AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open' AND (CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END) > 1048576) AND p.source_id = $2 RETURNING cc.page_id",
-            "textSha256": "69ae8c768a3a7efcd985c7980cb3166fe36b15ecc3da10672b1d0953a11a797f"
+            "sql": "WITH b AS (SELECT id FROM content_chunks WHERE id > 0 ORDER BY id LIMIT 5000), w AS (UPDATE content_chunks cc SET \"embedding\" = NULL, embedded_at = NULL, embedded_text_hash = NULL, embedding_pending_since = now() FROM b, pages p WHERE cc.id = b.id AND cc.page_id = p.id AND p.source_id=ANY($1::text[]) AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived) AND p.deleted_at IS NULL AND cc.\"embedding\" IS NOT NULL AND cc.embedded_text_hash IS NOT NULL AND cc.embedded_text_hash <> md5(cc.chunk_text) AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT EXISTS (SELECT 1 FROM page_embedding_budget peb WHERE peb.page_id = p.id AND peb.state <> 'open' AND (CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END) > 1048576) AND p.source_id = $2 RETURNING 1) SELECT (SELECT max(id) FROM b) AS last_id, (SELECT count(*) FROM b)::int AS checked, (SELECT count(*) FROM w)::int AS drifted",
+            "textSha256": "364dd0839c4cecd030d0a136025343116458e060b6f36c9ba9d099736c249858"
           },
           {
             "event": "commit",

@@ -253,6 +253,12 @@ function estimatedOrphanRatioCheck(est: OrphanEstimate, cutoff: number, srcId: s
   const pct = (est.ratio * 100).toFixed(0);
   const deep = ['gbrain', 'doctor', '--tier', 'deep', '--only', 'orphan_ratio', ...(srcId ? ['--source', srcId] : []), '--json'];
   const details = { exact: false, estimated: true, ...est, full_scan_max_pages: cutoff, config_key: ORPHAN_FULL_SCAN_KEY, exact_command: deep.join(' ') };
+  // #7145: a sample with no linkable page estimated nothing; 0/0 is not 0%.
+  if (est.sample_linkable === 0) {
+    return { name: 'orphan_ratio', status: 'warn', details: { ...details, health: 'unknown', reason: 'empty_sample' },
+      message: `Orphan ratio unknown${srcId ? ` in source '${srcId}'` : ''}: the ${est.sample_pages}-page sample of ${est.live_pages} live pages held no linkable page. Exact figure: ${deep.join(' ')}.`,
+      fix: agentFix(deep, 'Read-only: the exact orphan ratio from the full scan.', 'orphan_ratio') };
+  }
   const message = `Orphan ratio about ${pct}%${srcId ? ` in source '${srcId}'` : ''} (estimated: ${est.sample_orphans}/${est.sample_linkable} linkable pages in a `
     + `${est.sample_pages}-page sample of ${est.live_pages} live pages; the full scan runs above ${cutoff} pages only with --tier deep: ${deep.join(' ')}).`;
   if (est.ratio <= 0.5) return { name: 'orphan_ratio', status: 'ok', message, details };
@@ -345,11 +351,13 @@ export const timelineHistoryEntry: DoctorEntry = {
     'stale_embedding_effects',
     'google_file_modes',
     'google_calendar_readable',
+    'google_api_access',
     'atom_retirements_restorable',
     'extractor_facts_expired',
     'conversation_label_facts',
     'conversation_outcomes_stale',
     'captured_facts_active',
+    'facts_redaction_marker',
     'loop_facts_drift',
     'ontology_facts_fenced',
     'stale_frontmatter_keys',

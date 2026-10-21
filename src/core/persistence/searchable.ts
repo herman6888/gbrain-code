@@ -18,6 +18,16 @@ export function searchableRetryAfterMs(bodyBytes: number): number {
   return Math.min(5_000, Math.max(1_000, Math.round(bodyBytes / 4_000)));
 }
 
+/**
+ * #7106: the outcome fields of a managed import's or sync's segmented publication (`complete`: it sealed): `searchable`,
+ * and `projection: 'pending'` while the projection is built after commit. A pending outcome is settled at commit
+ * (PublicationHooks.projectionPending); its receipt turns `searchable: true` once the build seals the page.
+ */
+export function segmentedOutcome(segmented: { complete: boolean } | undefined, quarantined: boolean): Record<string, unknown> {
+  if (!segmented) return {};
+  return { searchable: quarantined ? false : segmented.complete ? true : 'pending', ...(segmented.complete ? {} : { projection: 'pending' }) };
+}
+
 /** Whether search sees a segmented page now: its text projection is sealed at its current revision. */
 export async function segmentedPageSearchable(engine: OperationContext['engine'], sourceId: string, slug: string): Promise<true | 'pending'> {
   const [page] = await engine.executeRaw<{ sealed: boolean }>(`SELECT text_projection_revision=knowledge_revision AS sealed FROM pages

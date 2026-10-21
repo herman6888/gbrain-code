@@ -341,6 +341,11 @@ Only after enabling the selected embedding provider, run `gbrain embed --stale`.
 Use `gbrain query` for expanded retrieval only when its provider use is intended;
 `--no-expand` opts out of expansion independently of the mode.
 
+Once imported, retrieve through gbrain rather than the files: search, then
+`gbrain get <slug>`. Filters (`--types`, `--match keyword`, `query --since/--until`,
+`--source`, `--json`) are in
+[Retrieval: gbrain first](skills/conventions/brain-first.md#retrieval-gbrain-first).
+
 ## Step 4.5: Wire the Knowledge Graph
 
 If the user already had a brain repo (Step 3 imported existing markdown), backfill

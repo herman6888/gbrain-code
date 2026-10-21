@@ -14,6 +14,9 @@ import { ALLOWED_TYPES, isConversationFactsEligiblePage, requireParseableConvers
 import type { Check } from '../../doctor.ts';
 import { checkError } from '../check-fix.ts';
 
+/** Newest pages read per conversation type. */
+const TYPE_SAMPLE = 50;
+
 export async function computeConversationFormatCoverageCheck(
   engine: BrainEngine,
 ): Promise<Check> {
@@ -28,8 +31,10 @@ export async function computeConversationFormatCoverageCheck(
     const sample: import('../../../core/types.ts').Page[] = [];
     // #5330: sample only pages the extractor would claim.
     const strict = await requireParseableConversationFlag(engine);
+    let capped = false;
     for (const t of allowedTypes) {
-      const slice = await engine.listPages({ limit: 50, type: t as import('../../../core/types.ts').PageType });
+      const slice = await engine.listPages({ limit: TYPE_SAMPLE, type: t as import('../../../core/types.ts').PageType });
+      if (slice.length >= TYPE_SAMPLE) capped = true;
       sample.push(...slice.filter(page => isConversationFactsEligiblePage(page, allowedTypes, strict)));
     }
     if (sample.length === 0) {
@@ -66,6 +71,9 @@ export async function computeConversationFormatCoverageCheck(
       if (result.phase === 'no_match') unmatched++;
     }
     const candidates = sample.length - summaryOnly - oversized;
+    // #7145: a sample is named as one, in the text and in details.
+    const sampleNote = capped ? ` (a sample of up to ${TYPE_SAMPLE} pages per conversation type)` : '';
+    const details = { sampled: sample.length, exact: !capped, ...(capped ? { bound: 'sample', limit: TYPE_SAMPLE } : {}) };
     const unmatchedPct = candidates > 0 ? (unmatched / candidates) * 100 : 0;
     const breakdown = Object.entries(hitsByPattern)
       .sort(([, a], [, b]) => b - a)
@@ -76,15 +84,17 @@ export async function computeConversationFormatCoverageCheck(
         name,
         status: 'warn',
         message:
-          `${unmatched}/${candidates} transcript-bearing conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
+          `${unmatched}/${candidates} transcript-bearing conversation pages${sampleNote} (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
           `Breakdown: ${breakdown}. ` +
           `Investigate: gbrain conversation-parser scan <slug>`,
+        details,
       };
     }
     return {
       name,
       status: 'ok',
-      message: `${sample.length} pages: ${breakdown}`,
+      message: `${sample.length} pages${sampleNote}: ${breakdown}`,
+      details,
     };
   } catch (err) {
     return checkError(name, 'check conversation format coverage', err);

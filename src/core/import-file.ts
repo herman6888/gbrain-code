@@ -149,8 +149,10 @@ export interface ImportResult {
   /** Which flag tier fired, when `flagged` (`instruction_like`: the #5575 write gate). */
   flag_reason?: 'markup_heavy' | 'oversized' | 'instruction_like';
   gate?: WriteGateAssessment; // #5575: the write-gate assessment, when the caller passed writeGate
-  /** Wave B, a segmented write imported outside the coordinator: whether search sees it on return (searchable.ts). */
+  /** Wave B: whether search sees a segmented write on return (searchable.ts), outside the coordinator or through a managed import. */
   searchable?: boolean | 'pending';
+  /** #7106: a managed import of a new segmented page over 4 MiB replies at commit; read receipt `request_id` again after `searchable_retry_after_ms` (`searchable_fix`) until `searchable` is true. */
+  projection?: 'pending'; request_id?: string; searchable_retry_after_ms?: number; searchable_fix?: Record<string, unknown>;
   /** #5050: unchanged content below the safe-chunk fence was re-sealed; chunks left to embed. */
   resealed?: { pendingChunks: number; pendingChars: number };
   /**

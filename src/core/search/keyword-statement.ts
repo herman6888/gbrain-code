@@ -22,6 +22,7 @@
 import type { SearchOpts } from '../types.ts';
 import { escapeLikePattern, hasCJK, cjkMatchTerms } from '../cjk.ts';
 import { getFtsLanguage } from '../fts-language.ts';
+import { frontmatterWhereSql } from './frontmatter-where.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import { buildHardExcludeClause, buildSourceFactorCase, buildVisibilityClause } from './sql-ranking.ts';
 
@@ -69,6 +70,7 @@ export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): 
   if (opts?.symbolKind) filters += add(opts.symbolKind, n => `cc.symbol_type = ${n}`);
   if (opts?.type) filters += add(opts.type, n => `p.type = ${n}`);
   if (opts?.types?.length) filters += add(opts.types, n => `p.type = ANY(${n}::text[])`);
+  filters += frontmatterWhereSql('p', opts?.where, json => `$${params.push(json)}`);
   if (opts?.exclude_slugs?.length) filters += add(opts.exclude_slugs, n => `p.slug != ALL(${n}::text[])`);
   const dated = `COALESCE(p.effective_date, p.updated_at, p.created_at)`;
   if (opts?.afterDate) filters += add(opts.afterDate, n => `${dated} ${opts.afterDateInclusive ? '>=' : '>'} ${n}::text::timestamptz`);

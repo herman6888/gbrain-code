@@ -16,11 +16,12 @@
  */
 import { execFileSync } from '../spawn.ts';
 import { gitChildEnv } from '../git-env.ts';
-import { existsSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { opError } from '../ops/contract.ts';
-import { isSyncable, type SyncStrategy } from '../sync.ts';
+import { isNestedSkipMetafile, isSyncable, readMetafilePagesMode, type MetafilePagesMode, type SyncStrategy } from '../sync.ts';
+import { diskMetafileHeads, firstMetafileHead, gitMetafileHeads, metafilePagePredicate } from '../sync-metafile-pages.ts';
 import { resolveSourceLocalFilePath } from '../markdown.ts';
 import { resolvePageWriteTarget, scannerSlugRootMode } from '../write-through.ts';
 import { managedPersistenceEnabled } from './ownership.ts';
@@ -53,9 +54,16 @@ export function inSyncableTree(path: string): boolean {
  */
 export async function absentRecordedFile(engine: BrainEngine, sourceId: string, page: { slug: string; source_path?: string | null }): Promise<string | null> {
   const sourcePath = page.source_path?.trim();
-  if (!sourcePath || !isSyncable(sourcePath)) return null;
+  if (!sourcePath || !isSyncable(sourcePath, { metafilePage: isNestedSkipMetafile })) return null;
   const target = await resolvePageWriteTarget(engine, page.slug, sourceId, { includeDeleted: true });
-  return target.ok && !inSyncableTree(target.filePath) ? sourcePath : null;
+  if (!target.ok || inSyncableTree(target.filePath)) return null;
+  if (!isNestedSkipMetafile(sourcePath)) return sourcePath;
+  // GBRA-150: a nested metafile's page is reconciled only when it is typed (as last committed, since its file is gone).
+  const [source] = await engine.executeRaw<{ local_path: string | null; last_commit: string | null }>('SELECT local_path, last_commit FROM sources WHERE id=$1', [sourceId]);
+  const root = source?.local_path;
+  if (!root || !existsSync(root)) return null;
+  const metafilePage = recordedMetafilePage(await readMetafilePagesMode(engine), root, source.last_commit, () => relative(root, target.filePath).split('\\').join('/'));
+  return metafilePage(sourcePath) ? sourcePath : null;
 }
 
 /**
@@ -97,8 +105,25 @@ export async function detachRestoredPage(tx: SqlEngine, row: Pick<WriteRequest, 
 
 /** Live pages of a source read per scan; past it the result says `truncated`. */
 export const MISSING_FILES_SCAN_LIMIT = 50_000;
+let scanLimit = MISSING_FILES_SCAN_LIMIT;
+/** Tests only: a smaller per-source scan limit (null restores the default). */
+export function __setMissingFilesScanLimitForTests(limit: number | null): void { scanLimit = limit ?? MISSING_FILES_SCAN_LIMIT; }
 
-export interface MissingRecordedFiles { source_id: string; pages: Array<{ slug: string; source_path: string }>; inspected: number; truncated: boolean }
+export interface MissingRecordedFiles { source_id: string; pages: Array<{ slug: string; source_path: string }>; inspected: number; truncated: boolean; limit: number }
+
+/**
+ * GBRA-150: whether a recorded nested metafile is a page the way `sync --full` judges it: its file under `root`, else its
+ * blob at the source's last synced commit. `toFile` maps a recorded `source_path` to its root-relative file.
+ */
+function recordedMetafilePage(metafilePages: MetafilePagesMode, root: string, lastCommit: string | null, toFile: (path: string) => string): (path: string) => boolean {
+  let gitRoot: string | null = null;
+  try { gitRoot = execFileSync('git', ['-C', root, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitChildEnv() }).trim(); } catch { /* not a checkout */ }
+  const lastSynced = gitRoot ? gitMetafileHeads(gitRoot, [lastCommit]) : null;
+  const rootInGit = gitRoot ? relative(gitRoot, realpathSync(root)).split('\\').join('/') : '';
+  const disk = diskMetafileHeads(root);
+  return metafilePagePredicate(metafilePages, firstMetafileHead(path => disk(toFile(path)),
+    path => lastSynced?.read(rootInGit ? `${rootInGit}/${toFile(path)}` : toFile(path))), toFile);
+}
 
 /**
  * #6609: the live pages of a classic source (a `local_path` checkout on this
@@ -108,24 +133,27 @@ export interface MissingRecordedFiles { source_id: string; pages: Array<{ slug: 
  */
 export async function scanMissingRecordedFiles(engine: BrainEngine, sourceId: string): Promise<MissingRecordedFiles | null> {
   if (await managedPersistenceEnabled(engine)) return null;
-  const [source] = await engine.executeRaw<{ local_path: string | null; strategy: SyncStrategy | null }>(
-    "SELECT local_path, config->>'strategy' AS strategy FROM sources WHERE id=$1 AND archived IS NOT TRUE", [sourceId]);
+  const [source] = await engine.executeRaw<{ local_path: string | null; strategy: SyncStrategy | null; last_commit: string | null }>(
+    "SELECT local_path, config->>'strategy' AS strategy, last_commit FROM sources WHERE id=$1 AND archived IS NOT TRUE", [sourceId]);
   const root = source?.local_path;
   if (!root || !existsSync(root) || !statSync(root).isDirectory()) return null;
   const strategy = source.strategy ?? 'markdown';
   const rows = await engine.executeRaw<{ slug: string; source_path: string }>(
     `SELECT slug, source_path FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND NULLIF(btrim(source_path), '') IS NOT NULL
-      ORDER BY id LIMIT ${MISSING_FILES_SCAN_LIMIT + 1}`, [sourceId]);
-  const truncated = rows.length > MISSING_FILES_SCAN_LIMIT;
-  const inspected = rows.slice(0, MISSING_FILES_SCAN_LIMIT).filter(row => isSyncable(row.source_path, { strategy }));
-  const result: MissingRecordedFiles = { source_id: sourceId, pages: [], inspected: inspected.length, truncated };
+      ORDER BY id LIMIT ${scanLimit + 1}`, [sourceId]);
+  const truncated = rows.length > scanLimit;
+  const mode = await scannerSlugRootMode(engine, sourceId, root);
+  const fileOf = (row: { slug: string; source_path: string }) => resolveSourceLocalFilePath(root, row.source_path, row.slug, mode) ?? join(root, row.source_path);
+  const files = new Map(rows.map(row => [row.source_path, relative(root, fileOf(row)).split('\\').join('/')]));
+  const metafilePages = await readMetafilePagesMode(engine);
+  const metafilePage = recordedMetafilePage(metafilePages, root, source.last_commit, path => files.get(path) ?? path);
+  const inspected = rows.slice(0, scanLimit).filter(row => isSyncable(row.source_path, { strategy, metafilePage }));
+  const result: MissingRecordedFiles = { source_id: sourceId, pages: [], inspected: inspected.length, truncated, limit: scanLimit };
   if (!inspected.length) return result;
   const { collectSyncableFiles } = await import('../../commands/import.ts');
-  const mode = await scannerSlugRootMode(engine, sourceId, root);
-  const present = new Set(collectSyncableFiles(root, { strategy }).map(file => resolve(file)));
+  const present = new Set(collectSyncableFiles(root, { strategy, metafilePages }).map(file => resolve(file)));
   for (const row of inspected) {
-    const path = resolveSourceLocalFilePath(root, row.source_path, row.slug, mode) ?? join(root, row.source_path);
-    if (!present.has(resolve(path))) result.pages.push({ slug: row.slug, source_path: row.source_path });
+    if (!present.has(resolve(fileOf(row)))) result.pages.push({ slug: row.slug, source_path: row.source_path });
   }
   return result;
 }

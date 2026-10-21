@@ -48,20 +48,20 @@ afterAll(async () => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 }, 60_000);
 
-/** A classic source `id` whose checkout holds `people/<name>.md`, synced, then the file untracked and ignored, and synced again (page soft-deleted). */
-async function untrackedPage(id: string, name: string): Promise<{ dir: string; slug: string }> {
+/** A classic source `id` whose checkout holds `people/<name>.md` (or `<file>`), synced, then the file untracked and ignored, and synced again (page soft-deleted). */
+async function untrackedPage(id: string, name: string, file = `people/${name}.md`): Promise<{ dir: string; slug: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'restore-detach-'));
   dirs.push(dir);
   execSync('git init -q && git config user.email t@example.com && git config user.name t', { cwd: dir });
-  mkdirSync(join(dir, 'people'), { recursive: true });
-  writeFileSync(join(dir, 'people', `${name}.md`), `---\ntype: person\ntitle: ${name}\n---\n# ${name}\n\nA fixture.\n`);
+  mkdirSync(join(dir, file, '..'), { recursive: true });
+  writeFileSync(join(dir, file), `---\ntype: person\ntitle: ${name}\n---\n# ${name}\n\nA fixture.\n`);
   execSync('git add -A && git commit -qm seed', { cwd: dir });
   await runSources(engine, ['add', id, '--path', dir, '--no-federated']);
   await performSync(engine, { repoPath: dir, sourceId: id, noPull: true, noEmbed: true });
-  appendFileSync(join(dir, '.gitignore'), `/people/${name}.md\n`);
-  execSync(`git rm -q --cached people/${name}.md && git add .gitignore && git commit -qm untrack`, { cwd: dir });
+  appendFileSync(join(dir, '.gitignore'), `/${file}\n`);
+  execSync(`git rm -q --cached ${file} && git add .gitignore && git commit -qm untrack`, { cwd: dir });
   await performSync(engine, { repoPath: dir, sourceId: id, noPull: true, noEmbed: true });
-  return { dir, slug: `people/${name}` };
+  return { dir, slug: file.replace(/\.md$/, '').toLowerCase() };
 }
 
 function ctx(sourceId: string): OperationContext {
@@ -97,6 +97,15 @@ describe('#6609 restore of a page whose recorded file is gone', () => {
       mcp: { tool: 'restore_page', arguments: { slug, source_id: 'refuse', detach: true } } });
     expect(error.suggestion).toContain(`put ${slug}.md back in the checkout`);
     expect(await pageRow('refuse', slug)).toEqual({ source_path: `${slug}.md`, database_only_reason: null, live: false });
+  }, 60_000);
+
+  test('GBRA-150: a typed nested metafile page (sync.metafile_pages typed) refuses the same way', async () => {
+    const { slug } = await untrackedPage('metafile', 'acme-example', 'projects/acme-example/index.md');
+    expect(await pageRow('metafile', slug)).toEqual({ source_path: 'projects/acme-example/index.md', database_only_reason: null, live: false });
+    const error = await refusal(restore('metafile', slug));
+    expect(error.code).toBe('source_changed');
+    expect(error.detail).toBe('canonical_file_absent');
+    expect(await pageRow('metafile', slug)).toEqual({ source_path: 'projects/acme-example/index.md', database_only_reason: null, live: false });
   }, 60_000);
 
   test('detach restores it database-only, a full sync keeps it live, and its file synced back re-binds it', async () => {

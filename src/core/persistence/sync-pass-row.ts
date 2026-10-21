@@ -75,8 +75,11 @@ export interface ManagedSyncPassValue {
     /** When the current run of unhealthy endings (`blocked`, `not_converged`) began; kept across them, cleared at `synced`/`up_to_date`. The §3.7 readers age a stuck source from it. */
     stuck_since?: string | null;
     faults: Record<string, { level: string | null; class: string; attempts: number }>;
-    /** #6712 PR 4b (design §2.7): when the incarnation's first full round swept every `legacy_unverified` page; later passes sweep at most 500. */
-    legacy_sweep?: { first_full_at: string };
+    /**
+     * #6712 PR 4b (design §2.7): when the incarnation's first full sweep reached every `legacy_unverified` page. Each pass sweeps
+     * at most 500, from `cursor` (#7189: the last path a committed slice screened), so a stopped pass's next one resumes.
+     */
+    legacy_sweep?: { first_full_at?: string; cursor?: string };
     /** #6712 PR 4b (design §2.7 (b1)): when the incarnation's legacy markers were written; until then each pass's first round writes them (idempotent). */
     legacy_markers_at?: string;
     /** #6712 PR 4b (design §2.6): the set hash of a withheld mass delete; with the env valve set the next tick runs a full round to apply it. */

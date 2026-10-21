@@ -61,6 +61,7 @@ import { addFencesNormalized, clearGitHold, clearGitHoldRetryPaths, countGitHold
 import { clearSyncSlice, writeSyncSlice, type SyncSliceState } from './sync-slices.ts';
 import { CHECKPOINT_MOVED_MESSAGE, emptySyncScope, pinnedSlugModeMismatch, slugModeMismatchCause } from './sync-slug-mode.ts';
 import { readPagePurgeTombstones } from './page-purge.ts';
+import { recordSyncDeleteTombstone } from './sync-delete-tombstones.ts';
 import { fenceWhere } from '../fence-repair/refusal.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
 import { fencesNormalizeEnabled } from '../fence-repair/config.ts';
@@ -69,6 +70,8 @@ import { fenceFixesWire } from '../fence-repair/tier1.ts';
 import type { FenceFix } from '../fence-repair/types.ts';
 import { VERSION } from '../../version.ts';
 import { bindOrigin } from './origin-guard.ts';
+import { segmentedOutcome } from './searchable.ts';
+import { isQuarantined } from '../quarantine.ts';
 
 /** The options that select a managed sync cursor (its key), recorded so a refusal can print the exact retry. */
 export interface SyncCursorOptions { full: boolean; workingTree: boolean; srcSubpath: string | null; exclude: string[]; includeHidden: string[]; strategy: string | null }
@@ -650,6 +653,12 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   return p?.kind === 'managed_sync_import' && p.stamp?.fold && at.root && !screening ? foldPassCheckpoint(prepared, { row, p, root: at.root }) : prepared;
 }
 
+/** #6722 and #7106: what a committed sync write left the page's embedding and search index in, for its receipt. */
+async function syncWriteState(tx: BrainEngine, row: WriteRequest, page: Parameters<typeof sizeStateField>[3],
+  segmented: Parameters<typeof segmentedOutcome>[0], frontmatter: Parameters<typeof isQuarantined>[0]): Promise<Record<string, unknown>> {
+  return { ...await sizeStateField(tx, row.source_id, row.slug, page), ...segmentedOutcome(segmented, isQuarantined(frontmatter)) };
+}
+
 async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock: ClaimPhaseClock | undefined,
   screening: { unsaved: true } | undefined, at: { root?: string }): Promise<SyncPreparedMutation> {
   const engine = boundedReads(unbounded, clock);
@@ -767,7 +776,10 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
   }
   if (p.kind === 'managed_sync_delete') return { observedRevision: snapshot?.revision ?? null, noop: !snapshot || snapshot.page.deleted_at != null,
     trust: await ownerImportTrust(engine, row, snapshot?.page.frontmatter, p.sourcePath), validate, apply: async (tx, preimage) => {
-      if (snapshot && snapshot.page.deleted_at == null) { await tx.createVersion(row.slug, preimage ? { ...source, preimage } : source); await tx.softDeletePage(row.slug, source); }
+      if (snapshot && snapshot.page.deleted_at == null) {
+        await tx.createVersion(row.slug, preimage ? { ...source, preimage } : source); await tx.softDeletePage(row.slug, source);
+        await recordSyncDeleteTombstone(tx, row, p); // #7130: the automatic purge holds this tombstone
+      }
       await releaseHold(tx);
       return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop: !snapshot || snapshot.page.deleted_at != null };
     } };
@@ -938,10 +950,9 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
           ...syncDiskProvenance(writeback ? Buffer.from(canonicalFile) : syncDiskBytes(root, p.path!, p.content!, p.rawHash), p.target) }); },
       ]);
       preparedImport.postimage = final;
-      // #6722: a large or embed_skip page says what this write left its embedding in.
-      const sizeState = applied.noop ? {} : await sizeStateField(tx, row.source_id, row.slug, live?.page);
+      const writeState = applied.noop ? {} : await syncWriteState(tx, row, live?.page, installed?.segmented, applied.parsedPage?.frontmatter);
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
-        chunks: applied.result.chunks, noop: applied.noop && !moved, imported_file: true, ...(moved ? { renamed_from: moved.slug } : {}), ...sizeState,
+        chunks: applied.result.chunks, noop: applied.noop && !moved, imported_file: true, ...(moved ? { renamed_from: moved.slug } : {}), ...writeState,
         ...(recovery?.length ? { recovered_frontmatter: true } : {}), ...(commentValue ? { comment_value: true } : {}),
         ...(fenceFixes.length ? { fences_normalized: fenceFixesWire(fenceFixes) } : {}) };
     } };

@@ -102,8 +102,8 @@ for (const kind of testBackends()) {
       expect(e.canonicalCode).toBe('page_body_segmented');
       expect(e.writeError).toBe('page_body_segmented');
       expect(e.message).toContain(slug);
-      expect(e.fix?.mcp).toEqual({ tool: 'remember', arguments: { fact: '<FACT>', provenance: '<PROVENANCE>', infer_entity: false } });
-      expect(e.fix?.argv).toEqual(['gbrain', 'remember', '<FACT>', '--provenance', '<PROVENANCE>', '--infer-entity', 'false']);
+      expect(e.fix?.mcp).toEqual({ tool: 'remember', arguments: { fact: '<FACT>', provenance: '<PROVENANCE>', infer_entity: false, visibility: 'world', kind: 'fact' } });
+      expect(e.fix?.argv).toEqual(['gbrain', 'remember', '<FACT>', '--provenance', '<PROVENANCE>', '--infer-entity', 'false', '--visibility', 'world', '--kind', 'fact']);
       const render: RenderContext = { transport: 'stdio', surface: 'full', isCallable: () => true, preapproved: () => false, routing: { brain: 'host', source: sourceId } };
       const envelope = toAgentError(e, { transport: 'stdio', op: 'remember', mutating: true, idempotent: true, render }) as unknown as Record<string, any>;
       expect(envelope.code).toBe('page_body_segmented');

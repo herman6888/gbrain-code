@@ -35,6 +35,7 @@ import { stagingNeedsTextSql } from '../page-body/schema.ts';
 import { atomRetirementPurgeHold } from '../persistence/atom-retirement-hold.ts';
 import { createPageVersion } from '../page-state/versions.ts';
 import { renderFragment, sqlFragment, trustedSql } from './fragment.ts';
+import { frontmatterWhereFragment } from '../search/frontmatter-where.ts';
 import { quoteIdentifier, resolveWriteColumnFromConfigRows } from '../search/embedding-column.ts';
 import { pickCanonicalOrigin } from '../persistence/origin-guard.ts';
 
@@ -496,6 +497,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const effectiveBeforeCondition = filters?.effective_before
       ? sqlFragment`AND p.effective_date <= ${filters.effective_before}::timestamptz`
       : sqlFragment``;
+    const whereCondition = frontmatterWhereFragment(filters?.where);
 
     // v0.29: ORDER BY threading via PAGE_SORT_SQL whitelist (no SQL injection).
     const sortKey = filters?.sort && PAGE_SORT_SQL[filters.sort] ? filters.sort : 'updated_desc';
@@ -508,7 +510,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition}${excludedSlugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
+        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition}${excludedSlugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}${whereCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);

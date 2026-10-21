@@ -42,6 +42,8 @@ const KEPT_FIELDS: ReadonlySet<string> = new Set([
   'evidence_omitted',
   // #5575 A6: every row says how much it deserves influence.
   'trust_tier', 'origin', 'unconfirmed',
+  // Result-time collapse and rank priors: folded pages, an unfollowed redirect, an image page's text row.
+  'collapsed', 'redirect_to', 'image_page',
   // Present only when the caller asked for `explain: true`.
   'score_details',
 ]);

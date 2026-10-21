@@ -24,7 +24,8 @@ import { FULL_ROBOT_SECONDS, ROBOT_TOPOLOGY, restrict, runRobotPhase, type Robot
 import { robotFailure, robotFullGate, runValidation, spawnWorker } from '../scripts/persistence/validate.ts';
 import { faultPoint, installFaultHook, type FaultDetail, type FaultPoint } from '../src/core/persistence/fault-points.ts';
 import { shrinkRun } from '../scripts/persistence/shrink.ts';
-import { finish, runSchedule, runSteps, seamCounter } from '../scripts/persistence/crash-robot.ts';
+import { finish, fixedChunks, LEVEL_CHUNK_BYTES, runSchedule, runSteps, seamCounter } from '../scripts/persistence/crash-robot.ts';
+import type { hardenedGitStream } from '../src/core/hardened-git.ts';
 import { installLockOrderTrace, lockOrderReport } from '../scripts/persistence/lock-order.ts';
 import { prepareTopology } from '../scripts/persistence/history-fixture.ts';
 import { claimPersistenceEffect, releaseAbandonedClaims } from '../src/core/persistence/effect-journal.ts';
@@ -431,6 +432,65 @@ process.stdout.write('{"event":"continued"}\\n');
       ]);
     } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
   }, 90_000);
+
+  test('#7124: sync round seams count in round slots, so a run whose pass makes one round fewer still reaches every slot the count role saw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-rounds-'));
+    const path = join(dir, 'rounds.ts');
+    // Count role: the direct write lands mid-pass, so pass 1 defers its page to round 2 and confirms in round 3. Run: it
+    // lands before the pass, so pass 1 confirms in round 2. Pass 2 is the same in both. A large read arrives in two chunks.
+    writeFileSync(path, `import { faultPoint, installFaultHook } from ${JSON.stringify(join(import.meta.dir, '../src/core/persistence/fault-points.ts'))};
+import { robotFaultHook, seamCounter } from ${JSON.stringify(join(import.meta.dir, '../scripts/persistence/crash-robot.ts'))};
+const counted = seamCounter(); const counts: Record<string, number> = {};
+installFaultHook((point, detail) => { const advanced = counted(point, detail); if (advanced) counts[point] = (counts[point] ?? 0) + advanced; });
+const round = async (n: number, reads: string[], work: boolean) => {
+  await faultPoint('sync:round_start', { sourceId: 'robot-0', round: n });
+  for (const read of reads) await faultPoint('sync:level_chunk', { read });
+  await faultPoint('sync:level_read', { sourceId: 'robot-0', round: n });
+  if (work) await faultPoint('sync:batch_entries', { sourceId: 'robot-0' });
+};
+const pass = async (rounds: boolean[]) => { for (const [i, work] of rounds.entries()) await round(i + 1, i ? ['ls-files'] : ['ls-tree', 'ls-tree', 'ls-files'], work); };
+await pass([true, true, false]); await pass([true, false]);
+process.stdout.write(JSON.stringify({ event: 'counts', counts }) + '\\n');
+installFaultHook(robotFaultHook({ point: 'sync:level_chunk', nth: counts['sync:level_chunk'] }));
+await pass([true, false]); await pass([true, false]);
+process.stdout.write('{"event":"continued"}\\n');
+`);
+    const child = Bun.spawn([process.execPath, '--no-env-file', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const lines: Record<string, unknown>[] = [];
+      const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let pending = '';
+      const deadline = Date.now() + 60_000;
+      while (lines.length < 2 && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), Bun.sleep(deadline - Date.now()).then(() => null)]);
+        if (!chunk || chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+          lines.push(JSON.parse(pending.slice(0, newline))); pending = pending.slice(newline + 1);
+        }
+      }
+      reader.releaseLock();
+      expect(lines).toEqual([
+        { event: 'counts', counts: { 'sync:round_start': 4, 'sync:level_chunk': 8, 'sync:level_read': 4, 'sync:batch_entries': 2 } },
+        { event: 'fault', point: 'sync:level_chunk', nth: 8, detail: { read: 'ls-files' } },
+      ]);
+    } finally { child.kill('SIGKILL'); await child.exited; rmSync(dir, { recursive: true, force: true }); }
+  }, 90_000);
+
+  test('#7124: robot workers cut a Git level read at fixed offsets, so its chunk ordinals do not follow the pipe', async () => {
+    const bytes = Buffer.from(Array.from({ length: 1300 }, (_, i) => i % 251));
+    const cut = async (sizes: number[]) => {
+      const pieces: Buffer[] = [];
+      const runner = (async (_root: string, _args: string[], opts: { onChunk?: (chunk: Buffer) => void | Promise<void> }) => {
+        let at = 0;
+        for (const size of sizes) { await opts.onChunk!(bytes.subarray(at, at + size)); at += size; }
+        return { ok: true, bytes: at, endsWithNul: false } as never;
+      }) as unknown as typeof hardenedGitStream;
+      await fixedChunks(runner)('/', ['ls-tree'], { timeoutMs: 1000, onChunk: async chunk => { await Bun.sleep(1); pieces.push(chunk); } });
+      return pieces.map(piece => piece.length);
+    };
+    expect(await cut([1300])).toEqual([LEVEL_CHUNK_BYTES, LEVEL_CHUNK_BYTES, 1300 - 2 * LEVEL_CHUNK_BYTES]);
+    expect(await cut([7, 600, 1, 692])).toEqual(await cut([1300]));
+  });
 
   test('#6957: finish waits for the claim pass after its probe, so the last claim epoch a count role sees is reached in every run', async () => {
     await robotBrain(async ({ world }) => {

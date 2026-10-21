@@ -18,7 +18,11 @@ import {
 } from './core-health.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { withSkippedSegmented } from '../check-fix.ts';
+import { checkError, withSkippedSegmented } from '../check-fix.ts';
+import { isMissingSchemaObject } from '../../../core/utils.ts';
+
+/** Pages `markdown_body_completeness` lists before it reports a floor. */
+const LISTED_PAGE_LIMIT = 100;
 
 async function runIntegrity(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -330,8 +334,10 @@ async function runMarkdownBody(ctx: DoctorContext): Promise<Check[]> {
          AND length(rd.data ->> 'content') > 1000
          AND length(p.compiled_truth) < length(rd.data ->> 'content') * 0.3
          AND (rd.data ->> 'content') ~ '(^|\n)##+ '
-       LIMIT 100`,
+       LIMIT ${LISTED_PAGE_LIMIT + 1}`,
     );
+    // #7145: a full list means more pages match; the count is then a floor.
+    const capped = rows.length > LISTED_PAGE_LIMIT;
     // Decision #10: a segmented page's compiled_truth is NULL, so the length comparison above passes it by.
     const [segmented] = await engine.executeRaw<{ n: number }>(
       `SELECT COUNT(DISTINCT p.id)::int AS n
@@ -350,12 +356,15 @@ async function runMarkdownBody(ctx: DoctorContext): Promise<Check[]> {
       checks.push(withSkippedSegmented({
         name: 'markdown_body_completeness',
         status: 'warn',
-        message: `${rows.length} page(s) appear truncated (sample: ${sample}). Re-import: edit each page body, then run gbrain sync (see docs/integrations/reliability-repair.md)`,
+        details: { count: Math.min(rows.length, LISTED_PAGE_LIMIT), exact: !capped, ...(capped ? { limit: LISTED_PAGE_LIMIT } : {}) },
+        message: `${capped ? `At least ${LISTED_PAGE_LIMIT}` : rows.length} page(s) appear truncated (sample: ${sample}). Re-import: edit each page body, then run gbrain sync (see docs/integrations/reliability-repair.md)`,
       }, skipped));
     }
-  } catch {
-    // pages_raw.raw_data may not exist on older schemas; best-effort.
-    checks.push({ name: 'markdown_body_completeness', status: 'ok', message: 'Skipped (raw_data unavailable)' });
+  } catch (error) {
+    // raw_data may not exist on older schemas; any other failure (#7145) is not a clean result.
+    checks.push(isMissingSchemaObject(error, 'table', 'raw_data')
+      ? { name: 'markdown_body_completeness', status: 'ok', message: 'Skipped (raw_data unavailable)' }
+      : checkError('markdown_body_completeness', 'check for truncated bodies', error, { details: { health: 'unknown' } }));
   } finally {
     mbcHb();
   }

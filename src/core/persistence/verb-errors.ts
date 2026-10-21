@@ -148,20 +148,31 @@ const SEGMENTED_WRITE_SUGGESTION = 'The target page stores its body in segments 
   + 'For remember: save the claim without an entity (omit entity, infer_entity: false); it is filed under memory/unattributed, and remembering it with entity once that page accepts fact rows replaces that copy. '
   + "Read the page with get_page body: 'auto' or a window.";
 
-/** The next step of a `remember` refused because its entity page stores its body in segments: save the claim unattributed. */
-export function segmentedRememberFix(): Action {
-  return { argv: ['gbrain', 'remember', '<FACT>', '--provenance', '<PROVENANCE>', '--infer-entity', 'false'],
-    mcp: { tool: 'remember', arguments: { fact: '<FACT>', provenance: '<PROVENANCE>', infer_entity: false } },
-    inputs: [{ name: 'FACT', how: 'The claim you tried to remember, unchanged.' }, { name: 'PROVENANCE', how: 'The same provenance you passed.' }],
+/** What the unattributed retry must keep from the refused call, so the retry is never broader than the original. */
+export interface RememberCarry { visibility: 'world' | 'private'; kind?: string; ttl?: string; valid_from?: string }
+
+/**
+ * The next step of a `remember` refused because its entity page stores its body in segments: save the claim unattributed.
+ * With `carry` the retry names the refused call's resolved visibility, kind, ttl and valid_from; without it (a receipt-only
+ * refusal) visibility is an input the caller must fill, never left to the world default.
+ */
+export function segmentedRememberFix(carry?: RememberCarry): Action {
+  const extra: Record<string, string> = carry ? { visibility: carry.visibility, ...(carry.kind ? { kind: carry.kind } : {}),
+    ...(carry.ttl ? { ttl: carry.ttl } : {}), ...(carry.valid_from ? { valid_from: carry.valid_from } : {}) } : { visibility: '<VISIBILITY>' };
+  return { argv: ['gbrain', 'remember', '<FACT>', '--provenance', '<PROVENANCE>', '--infer-entity', 'false',
+    ...Object.entries(extra).flatMap(([key, value]) => [`--${key.replace('_', '-')}`, value])],
+    mcp: { tool: 'remember', arguments: { fact: '<FACT>', provenance: '<PROVENANCE>', infer_entity: false, ...extra } },
+    inputs: [{ name: 'FACT', how: 'The claim you tried to remember, unchanged.' }, { name: 'PROVENANCE', how: 'The same provenance you passed.' },
+      ...(carry ? [] : [{ name: 'VISIBILITY', how: 'The visibility you passed. If you passed none: private when the entity page is private or you are unsure, else world.' }])],
     consent: [], actor: 'agent', requires_exclusive: false,
     why: "Saves the claim without an entity: the entity page's facts fence cannot take a row while its body is stored in segments over 24 MiB. Remembering it with entity later replaces this copy." };
 }
 
 /** A `remember` whose entity (named or inferred) stores its body in segments: refused before admission with the unattributed-save fix. */
-export function segmentedRememberRefusal(slug: string, sourceId: string, inferred: boolean): OperationError {
+export function segmentedRememberRefusal(slug: string, sourceId: string, inferred: boolean, carry?: RememberCarry): OperationError {
   return opError('page_body_segmented',
     `remember: the entity page ${slug} (source ${sourceId})${inferred ? ', inferred from a mention in the fact,' : ''} stores its body in segments over the 24 MiB limit up to which remember reads it whole, so remember cannot add a row to its facts fence. Nothing was saved.`,
-    SEGMENTED_WRITE_SUGGESTION, { fix: segmentedRememberFix() });
+    SEGMENTED_WRITE_SUGGESTION, { fix: segmentedRememberFix(carry) });
 }
 
 const PURGED_SUGGESTION = 'Do not retry the same content. If it is still true, write it in new words; only the owner can clear a purge tombstone on the brain host.';

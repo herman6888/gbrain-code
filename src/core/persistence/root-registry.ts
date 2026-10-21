@@ -97,21 +97,45 @@ function resolveFilesystemPath(path: string, realpath: (path: string) => string)
     }
   }
 }
+const rootRank = (record: ManagedRootRecord) => [record.worktree_id ? 0 : 1, record.worktree_id, record.source_id, record.source_incarnation, record.topology_generation]
+  .map(value => value == null ? '\u{10FFFF}' : String(value));
+/**
+ * #7203: one record per filesystem identity. Aliases of one directory (a
+ * symlink, macOS /var vs /private/var, a case variant) collapse to its
+ * canonical path, and a bound worktree row outranks an unbound source path
+ * regardless of spelling or input order.
+ */
+export function canonicalManagedRoots(records: ManagedRootRecord[]): ManagedRootRecord[] {
+  const byRoot = new Map<string, ManagedRootRecord>();
+  for (const record of records) {
+    const root = canonicalFilesystemPath(record.local_path);
+    const held = byRoot.get(root);
+    if (held) {
+      const [next, current] = [rootRank(record), rootRank(held)];
+      const at = next.findIndex((value, i) => value !== current[i]);
+      if (at < 0 || next[at]! > current[at]!) continue;
+    }
+    byRoot.set(root, { ...record, local_path: root });
+  }
+  return [...byRoot.values()];
+}
 /**
  * One private immutable path identity per brain/root; topology metadata can be
  * refreshed but stale roots stay fenced until an explicit verified drain clears
  * them. Per-root files prevent independent registration from dropping siblings.
+ * Returns the canonical records it holds, one per root.
  */
-export function recordManagedRoots(brainId: string, records: ManagedRootRecord[], modeEpoch?: number): void {
+export function recordManagedRoots(brainId: string, records: ManagedRootRecord[], modeEpoch?: number): ManagedRootRecord[] {
   if (!/^[a-f0-9-]{36}$/i.test(brainId)) {
     throw opError('storage_error', 'Invalid managed-root brain identity.',
       'The managed-root registry was given a brain identity that is not a UUID, so nothing was recorded. This is an internal fault: run gbrain doctor --json and report it to the user.');
   }
-  if (!records.length) return;
+  const canonical = canonicalManagedRoots(records);
+  if (!canonical.length) return canonical;
   const directory = registryDirectory(); mkdirSync(directory, { recursive: true, mode: 0o700 }); ensureMode(directory, 0o700);
   let changed = false;
-  for (const record of records) {
-    const root = canonicalFilesystemPath(record.local_path);
+  for (const record of canonical) {
+    const root = record.local_path;
     const key = createHash('sha256').update(root).digest('hex');
     const file = join(directory, `${brainId}.${key}.json`);
     const value = JSON.stringify({ version: 1, brain_id: brainId, root, ...record, local_path: root,
@@ -125,6 +149,7 @@ export function recordManagedRoots(brainId: string, records: ManagedRootRecord[]
     }
   }
   if (changed) flushDirectory(directory);
+  return canonical;
 }
 /** Available before connect, including while another process owns local PGLite. */
 export function registeredManagedRoots(): string[] {

@@ -4,9 +4,12 @@
  *
  * 1. Protects: on a managed brain with `pages.segmented_storage` on, a file
  *    over PAGE_MAX_BYTES inside the canonical root imports through its owner
- *    with an intent that holds a `body_ref` (sha256, bytes) and no content; the
- *    page round-trips byte-identical from its manifest, `content_hash` equals
- *    `contentHash`, and the canonical file is left untouched. A file within
+ *    with an intent that holds a `body_ref` (sha256, bytes) and no content; it
+ *    replies at commit with `searchable: 'pending'` (#7106: a new page over 4 MiB
+ *    is projected after commit) and seals once the build the owner tracks ends
+ *    (the consumer's stop waits for it); the page round-trips byte-identical
+ *    from its manifest, `content_hash` equals `contentHash`, and the canonical
+ *    file is left untouched. A file within
  *    the ceiling stages its segments in the owner's preparation (the writer
  *    guard admits it) and publishes segmented. Segment GC on a managed brain
  *    collects an abandoned preparation's staged rows under the guard. A file that
@@ -99,7 +102,8 @@ describe('managed import over the single-string ceiling', () => {
       writeFileSync(file, content);
       const before = statSync(file);
       const result = await importManagedFile(engine, file, 'notes/huge.md', { sourceId: f.sourceId, noEmbed: true });
-      expect(result).toMatchObject({ slug: 'notes/huge', status: 'imported' });
+      expect(result).toMatchObject({ slug: 'notes/huge', status: 'imported', searchable: 'pending', projection: 'pending' });
+      await disposePersistenceConsumer(engine);
       const parsed = parseMarkdown(content, 'notes/huge.md');
       const { page, body, hash } = await reconstructedPage(engine, 'notes/huge', f.sourceId);
       expect(page.body_storage).toBe('segmented');
@@ -110,9 +114,10 @@ describe('managed import over the single-string ceiling', () => {
       const after = statSync(file);
       expect(after.mtimeMs).toBe(before.mtimeMs);
       expect(sha256(readFileSync(file))).toBe(sha256(Buffer.from(content)));
-      const [request] = await engine.executeRaw<{ intent_bytes: string; intent: Record<string, unknown>; state: string }>(
-        `SELECT intent_bytes::text AS intent_bytes, intent, state FROM persistence_requests WHERE source_id=$1 AND slug=$2`, [f.sourceId, 'notes/huge']);
+      const [request] = await engine.executeRaw<{ intent_bytes: string; intent: Record<string, unknown>; state: string; outcome: Record<string, unknown> }>(
+        `SELECT intent_bytes::text AS intent_bytes, intent, state, outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2`, [f.sourceId, 'notes/huge']);
       expect(request!.state).toBe('committed');
+      expect(request!.outcome).toMatchObject({ searchable: 'pending', projection: 'pending' });
       expect(Number(request!.intent_bytes)).toBeLessThan(16 * 1024);
       expect(request!.intent.content).toBeUndefined();
       expect(request!.intent.body_ref).toMatchObject({ kind: 'input_file', sha256: sha256(Buffer.from(content)), bytes: Buffer.byteLength(content) });

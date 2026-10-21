@@ -18,7 +18,8 @@ import { realpathSync } from 'node:fs';
 import { relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { hardenedGitStream, hardenedStreamComplete, NulRecordSplitter } from '../hardened-git.ts';
-import { matchesAnyGlob, isSyncable } from '../sync.ts';
+import { matchesAnyGlob, isSyncable, readMetafilePagesMode } from '../sync.ts';
+import { levelMetafilePages } from '../sync-metafile-pages.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { resolveSlugRootMode } from '../sync-anchor.ts';
 import { resolveSlugForPath } from '../sync.ts';
@@ -34,8 +35,9 @@ import { confirmedSyncDelta } from '../sync-rename-identity.ts';
 import { holdBasisMoved, holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, SYNC_IMPORT_PROVENANCE_OP, syncImportParser, syncImportParsers,
   type GitHoldRecord, type SyncImportParser, type SyncImportProvenance } from './sync-holds.ts';
 import { movedDriftHolds, sameParser } from './sync-prescreen.ts';
-import { sameSyncOrigin, selectOriginClaimant, syncOriginPath } from './sync-origin.ts';
+import { sameSyncOrigin, selectOriginClaimant, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
 import { hashWorkingLevel, probeDirtiness, readBlobs, readIndexDelta, readIndexLevel, readTreeLevel, workingChanged, type GitIndexEntry, type GitTreeEntry, type WorkingStatCache } from './sync-git-stream.ts';
+import { readOriginEvidence } from './sync-origin-evidence.ts';
 import { classifySyncPath, syncPassKind, type SyncClassified, type SyncIdleBlocker, type SyncPathState } from './sync-classify.ts';
 import { buildConvergenceReceipt, readOnlySameContentScreen, type ConvergenceReceipt, type ConvergenceScreen } from './sync-convergence.ts';
 import { readManagedMode } from './ownership.ts';
@@ -564,6 +566,18 @@ async function readUntracked(gitRoot: string, scope: string): Promise<string[]> 
 
 const timer = () => { const started = performance.now(); return () => Math.round((performance.now() - started) * 10) / 10; };
 
+/** #7130: an absent file is deletion evidence only when Git once committed it (sync-origin-evidence.ts); read for those paths alone. */
+async function reclassifyByOrigin(gitRoot: string, tips: Array<string | null | undefined>, paths: ShadowPath[], step: LoopYield): Promise<boolean> {
+  const absent = await filterYielding(paths, entry => (entry.result.cls === 'delete' || entry.result.cls === 'delete_drift') && entry.state.originEvidence === undefined, step);
+  if (!absent.length) return false;
+  const evidence = await readOriginEvidence(gitRoot, tips, absent.map(entry => entry.path));
+  for (const entry of absent) {
+    const state = { ...entry.state, originEvidence: evidence.get(entry.path) ?? 'unknown' as const };
+    Object.assign(entry, { state, result: classifySyncPath(state) });
+  }
+  return true;
+}
+
 /**
  * The shadow level of a managed source: every path classified, nothing written. Null for a company-brain source, which
  * keeps its frozen manifest (design v3.2 §3.6).
@@ -582,12 +596,13 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
   const settings = await readLevelSettings(engine, context, scope, input);
   timings.setup = t();
   if (!settings) return null;
-  const { slugMode, exclude, pack, mirror, strategy, includeHidden, keepDbPrefixes, workingConfig } = settings;
+  const { slugMode, exclude, pack, mirror, strategy, includeHidden, keepDbPrefixes, workingConfig, metafilePages } = settings;
   const sourceRelative = (gitPath: string) => (scope ? gitPath.slice(scope.length + 1) : gitPath);
+  let metafilePage: (gitPath: string) => boolean = () => false;
   // Eligibility of a path outside the cached tree (every path of the tree is eligible); origins validate per call: a
   // 600k-path level keeps no per-path memo of either.
   const selected = (gitPath: string) => (!scope || gitPath.startsWith(`${scope}/`)) && !matchesAnyGlob(sourceRelative(gitPath), exclude)
-    && !isReservedSkillBundlePath(slugMode === 'source-root' ? sourceRelative(gitPath) : gitPath) && isSyncable(gitPath, { strategy: strategy as 'markdown', includeHidden });
+    && !isReservedSkillBundlePath(slugMode === 'source-root' ? sourceRelative(gitPath) : gitPath) && isSyncable(gitPath, { strategy: strategy as 'markdown', includeHidden, metafilePage });
   // #5032: a Windows-unstorable ':' path, and the other side of a rename touching one, take no part in the level.
   let colonRefused = new Set<string>();
   const eligible = (gitPath: string) => selected(gitPath) && !isWindowsColonTarget(gitPath) && !colonRefused.has(gitPath);
@@ -597,12 +612,7 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
   // #5610: a source-root page whose stored origin is the legacy Git-root spelling (`<scope>/<origin>`) names `<origin>`, by
   // the one rule discovery and preparation use (sameSyncOrigin; it refuses an origin that could name two files).
   const originScope = { sourceId, root, scope, slugMode };
-  const pageOrigin = (sourcePath: string, slug: string): string => {
-    const recorded = originPath(sourcePath);
-    if (slugMode !== 'source-root' || !scope || !recorded.startsWith(`${scope}/`)) return recorded;
-    const stripped = recorded.slice(scope.length + 1);
-    return sameSyncOrigin(recorded, stripped, originScope, slug) ? stripped : recorded;
-  };
+  const pageOrigin = (sourcePath: string, slug: string): string => scopedPageOrigin(originPath(sourcePath), slug, originScope);
   const step = turnYield();
 
   t = timer();
@@ -610,9 +620,11 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
   const working = detached || (input.workingTree ?? workingConfig === 'true');
   const mode: 'committed' | 'working' = working ? 'working' : 'committed';
   timings.rev_parse = t();
+  const levelMetafiles = levelMetafilePages(metafilePages, gitRoot, [head, context.source.last_commit], working ? nativeGitRoot : null, scope);
+  metafilePage = levelMetafiles.metafilePage;
 
   // A commit's tree never changes: the pass's next round at the same commit and selection reuses the eligible tree.
-  const treeKey = JSON.stringify([gitRoot, head, scope, slugMode, strategy, exclude, includeHidden]);
+  const treeKey = JSON.stringify([gitRoot, head, scope, slugMode, strategy, exclude, includeHidden, metafilePages, mode]);
   const cache = input.pass?.cache;
   // The previous round's classification leaves the cache before anything can fail (only a complete round's is stored).
   let priorClassified = cache?.classified?.treeKey === treeKey ? cache.classified : undefined;
@@ -623,7 +635,7 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
     if (cache?.tree?.key === treeKey) return cache.tree;
     if (cache) cache.tree = undefined;
     const tree = new Map<string, GitTreeEntry>(), colon: string[] = [];
-    for (const [path, entry] of await readTreeLevel(gitRoot, head, scope, step)) {
+    for (const [path, entry] of levelMetafiles.primeTree(await readTreeLevel(gitRoot, head, scope, step))) {
       if (isWindowsColonTarget(path)) colon.push(path);
       else if (eligible(path)) tree.set(path, entry);
       if (step.due()) await step.pause();
@@ -834,6 +846,9 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
     timings.classify += t();
   }
 
+  t = timer();
+  if (await reclassifyByOrigin(gitRoot, [head, baselineCommit], paths, step)) timings.origin = t();
+
   // Adoption by hash needs the level's bytes: committed mode reads the blobs of the candidates that could adopt.
   const needBytes = await filterYielding(paths, entry => !['matched', 'held', 'dirty'].includes(entry.result.cls) && entry.state.levelSha256 === null && entry.state.level !== null
     && entry.state.attested?.hash && entry.state.page?.live, step);
@@ -866,10 +881,18 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
     rescreenDue: holds.filter(hold => holdRescreenDue(hold, retry.has(hold.path))).map(hold => toGit(hold.path)), workingCache: hashed?.cache ?? null };
 }
 
+/** A recorded page origin as the level names it: a source-root page's legacy Git-root spelling loses its scope (#5610). */
+function scopedPageOrigin(recorded: string, slug: string, originScope: SyncOriginScope): string {
+  const { scope, slugMode } = originScope;
+  if (slugMode !== 'source-root' || !scope || !recorded.startsWith(`${scope}/`)) return recorded;
+  const stripped = recorded.slice(scope.length + 1);
+  return sameSyncOrigin(recorded, stripped, originScope, slug) ? stripped : recorded;
+}
+
 /** The level's settings, one round trip each and all in flight together; null for a company-brain source. */
 async function readLevelSettings(engine: BrainEngine, context: ManagedSyncContext, scope: string, input: { workingTree?: boolean; pass?: PassLevelInput }) {
   const { sourceId, root } = context;
-  const [company, slugModeRead, excludeRead, includeHiddenRead, workingRead, packRead, mirrorRead] = await Promise.allSettled([
+  const [company, slugModeRead, excludeRead, includeHiddenRead, workingRead, packRead, mirrorRead, metafilePagesRead] = await Promise.allSettled([
     currentCompanyBrainSync(sourceId) ? Promise.resolve(true) : getCompanyBrainProfile(engine, sourceId).then(profile => !!profile),
     scope && input.pass?.slugMode ? Promise.resolve(input.pass.slugMode) : scope ? resolveSlugRootMode(engine, { sourceId, explicitGitRoot: false, slugPrefix: resolveSlugForPath(join(scope, 'x.md')).slice(0, -2), dryRun: true }) : Promise.resolve('git-root' as const),
     syncExcludePatterns(engine, [...input.pass?.exclude ?? []]),
@@ -877,11 +900,12 @@ async function readLevelSettings(engine: BrainEngine, context: ManagedSyncContex
     input.workingTree === undefined ? engine.getConfig('sync.include_working_tree') : Promise.resolve(null),
     input.pass?.noSchemaPack ? Promise.resolve(null) : loadActivePackForEngine(engine, { remote: false, sourceId }).catch(() => null),
     sourceMirrorReadOnly(engine, sourceId),
+    readMetafilePagesMode(engine),
   ]);
   const settled = <T>(read: PromiseSettledResult<T>): T => { if (read.status === 'rejected') throw read.reason; return read.value; };
   if (settled(company)) return null;
   return { slugMode: settled(slugModeRead), exclude: settled(excludeRead), pack: settled(packRead), mirror: settled(mirrorRead), workingConfig: settled(workingRead),
-    strategy: input.pass?.strategy ?? (context.source.config?.strategy as string | undefined) ?? 'markdown',
+    metafilePages: settled(metafilePagesRead), strategy: input.pass?.strategy ?? (context.source.config?.strategy as string | undefined) ?? 'markdown',
     includeHidden: [...new Set([...input.pass?.includeHidden ?? [], ...(settled(includeHiddenRead) ?? '').split(/[\n,]/).map(v => v.trim()).filter(Boolean)].map(v => v.endsWith('/') ? `${v}**` : v))],
     keepDbPrefixes: (() => { try { return loadStorageConfig(root)?.keep_db ?? []; } catch { return []; } })() };
 }

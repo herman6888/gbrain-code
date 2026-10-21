@@ -1,6 +1,8 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
-import { loadSyncFailures, unacknowledgedSyncFailures, decideSyncFailureSeverity, type SyncFailure } from '../../../core/sync-failure-ledger.ts';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { loadSyncFailures, unacknowledgedSyncFailures, decideSyncFailureSeverity, isSkippablePath, type SyncFailure } from '../../../core/sync-failure-ledger.ts';
 import { formatManagedSyncFailure, managedSyncRetryCommand, readManagedSyncFailures } from '../../../core/persistence/sync-failures.ts';
 import { resolveHoursEnv } from '../../../core/env-number.ts';
 import { makeRemediationStep } from '../../../core/remediation-step.ts';
@@ -9,6 +11,7 @@ import { readManagedMode } from '../../../core/persistence/ownership.ts';
 import { legacyLedgerNote } from '../../../core/persistence/legacy-sync-failures.ts';
 import { classifyRecordedFault } from '../../../core/persistence/terminal-classify.ts';
 import { agentFix } from '../check-fix.ts';
+import { syncGitAsync } from '../../../core/persistence/sync-discovery.ts';
 import { readUpstreamDivergences } from '../../../core/sync-upstream-rewrite.ts';
 
 /** #6518 [R18 vi]: the fast check cannot verify a mirror row; a warning there is uncertainty, never recovery. */
@@ -29,18 +32,22 @@ export async function checkSyncFailures(engine: BrainEngine | null, opts: { sour
 
 async function checkRecordedSyncFailures(engine: BrainEngine | null, opts: { sourceIds?: string[]; remote?: boolean }): Promise<Check | null> {
   // #5452: sync refuses an archived source, so its failures cannot be cleared and are not a live health signal.
-  const archived = new Set(engine ? (await engine.executeRaw<{ id: string }>('SELECT id FROM sources WHERE archived = true')).map(row => row.id) : []);
+  const sources = engine ? await engine.executeRaw<{ id: string; local_path: string | null; archived: boolean }>('SELECT id, local_path, archived FROM sources') : [];
+  const archived = new Set(sources.filter(row => row.archived).map(row => row.id));
   const allManaged = engine ? await readManagedSyncFailures(engine, opts.sourceIds) : [];
   let ledger: SyncFailure[] = [];
   try { ledger = loadSyncFailures().filter(row => !opts.sourceIds || opts.sourceIds.includes(row.source_id)); } catch { }
   // With an engine the durable rows are the authority and the mirror is ignored; without one (#6518 [R18 iii]) the
   // mirror rows are reported apart, as unverifiable, while unmanaged ledger failures keep their own severity.
-  const allLegacy = ledger.filter(row => !row.managed_cursor_key);
+  // #7144: an unmanaged row no sync can retry or clear (its source is not registered, or its file is gone from a
+  // source's checkout after it failed) is set aside; such rows came from test fixtures written into a real ledger.
+  const { rows: allLegacy, unregistered, absent } = await setAsideUnreachableRows(ledger.filter(row => !row.managed_cursor_key), engine ? sources : null);
+  const setAsideNote = unregistered + absent ? ` ${unregistered + absent} local-ledger row(s) ignored because no sync can retry or clear them (${[unregistered ? `${unregistered} on a source that is not registered` : '', absent ? `${absent} whose file was deleted from its source after it failed` : ''].filter(Boolean).join(', ')}).` : '';
   const mirrorRows = engine ? [] : ledger.filter(row => row.managed_cursor_key && (row.state === 'open' || row.state === 'auto_skipped'));
   const managed = allManaged.filter(row => !archived.has(row.source_id));
   const legacy = allLegacy.filter(row => !archived.has(row.source_id));
   const archivedCount = allManaged.length - managed.length + allLegacy.length - legacy.length;
-  const archivedNote = archivedCount ? ` ${archivedCount} failure(s) on archived source(s) ignored; restore a source to retry them.` : '';
+  const archivedNote = (archivedCount ? ` ${archivedCount} failure(s) on archived source(s) ignored; restore a source to retry them.` : '') + setAsideNote;
   const mirrorNote = mirrorRows.length ? ` ${MIRROR_UNVERIFIED(mirrorRows.length)}` : '';
   const entries: SyncFailure[] = [...legacy, ...managed.map(row => ({ source_id: row.source_id, path: row.path, code: row.code, error: row.message,
     commit: row.target ?? '', first_seen: row.first_seen, ts: row.first_seen, attempts: row.attempts, state: 'open' as const }))];
@@ -69,7 +76,7 @@ async function checkRecordedSyncFailures(engine: BrainEngine | null, opts: { sou
         ...(opts.remote === false && orphans.length ? { details: { orphans } } : {}), ...orphanFix };
     }
     if (mirrorRows.length) return { name: 'sync_failures', status: 'warn', message: `No unresolved unmanaged sync failures.${mirrorNote}${archivedNote}` };
-    return entries.length || archivedCount ? { name: 'sync_failures', status: 'ok', message: `${entries.length ? 'All historical sync failures are acknowledged.' : 'No sync failures on active sources.'}${archivedNote}` } : null;
+    return entries.length || archivedCount || setAsideNote ? { name: 'sync_failures', status: 'ok', message: `${entries.length ? 'All historical sync failures are acknowledged.' : 'No sync failures on active sources.'}${archivedNote}` } : null;
   }
   const summary = `${severity.unresolved} unresolved sync failure(s)${severity.auto_skipped ? ` (${severity.auto_skipped} auto-skipped — pages NOT indexed)` : ''}.${archivedNote}`;
   if (opts.remote !== false) return { name: 'sync_failures', status: severity.status, message: summary + ' Ask the host operator to inspect doctor and repair the accepted sync; no paths or receipt details are exposed remotely.' + remoteOrphanNote + unreadNote + mirrorNote };
@@ -100,4 +107,38 @@ async function checkRecordedSyncFailures(engine: BrainEngine | null, opts: { sou
   return { name: 'sync_failures', status: severity.status, message: `${summary} ${details.join('; ')} ${recovery}${legacyNote}`,
     remediation, remediation_status: remediation ? 'remediable' : 'blocked', ...(orphans.length || failures.length ? { details: { ...(orphans.length ? { orphans } : {}), ...(failures.length ? { failures } : {}) } } : {}), ...orphanFix,
     ...(engine ? {} : { message: `${summary} Durable sync state is unavailable without a database connection; the local ledger is only a compatibility mirror.${mirrorNote}` }) };
+}
+
+/** Bound of the rows one source's Git reads classify; the rest keep their grade. */
+const SET_ASIDE_SCAN_MAX = 2_000;
+
+/**
+ * #7144: unmanaged ledger rows split into those a sync can still retry and counts of the ones it never can: a row on a
+ * source that is not registered, or a row whose file this source's own history knows (its commit is in the checkout)
+ * and that is gone from both the working tree and HEAD, so the file was deleted after it failed. A row whose commit
+ * the checkout does not know (a replaced source, #6543) or that Git cannot read keeps its grade.
+ */
+async function setAsideUnreachableRows(rows: SyncFailure[], sources: Array<{ id: string; local_path: string | null }> | null): Promise<{ rows: SyncFailure[]; unregistered: number; absent: number }> {
+  if (!sources) return { rows, unregistered: 0, absent: 0 };
+  const roots = new Map(sources.map(source => [source.id, source.local_path]));
+  const unregistered = rows.filter(row => !roots.has(row.source_id));
+  const deleted = new Set<SyncFailure>();
+  const candidates = new Map<string, SyncFailure[]>();
+  for (const row of rows) {
+    const root = roots.get(row.source_id);
+    if (!root || !row.commit || !isSkippablePath(row.path) || !existsSync(root) || existsSync(join(root, row.path))) continue;
+    const list = candidates.get(root) ?? [];
+    if (list.length < SET_ASIDE_SCAN_MAX) candidates.set(root, [...list, row]);
+  }
+  for (const [root, list] of candidates) {
+    try {
+      const atHead = new Set((await syncGitAsync(root, ['ls-tree', '-r', '--name-only', 'HEAD', '--', ...new Set(list.map(row => row.path))])).split('\n').filter(Boolean));
+      const known = new Map<string, boolean>();
+      for (const commit of new Set(list.map(row => row.commit))) {
+        known.set(commit, await syncGitAsync(root, ['cat-file', '-t', commit]).then(type => type.trim() === 'commit', () => false));
+      }
+      for (const row of list) if (known.get(row.commit) && !atHead.has(row.path)) deleted.add(row);
+    } catch { /* not a Git checkout, or Git failed: these rows keep their grade */ }
+  }
+  return { rows: rows.filter(row => roots.has(row.source_id) && !deleted.has(row)), unregistered: unregistered.length, absent: deleted.size };
 }

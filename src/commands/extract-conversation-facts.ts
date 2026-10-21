@@ -104,7 +104,7 @@ import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup, classifyRunStop } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, ALLOWED_TYPE_ALIASES, isConversationFactsEligiblePage, pageTypesForAllowed, requireParseableConversationFlag, type AllowedType } from '../core/facts/conversation-types.ts';
 import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE, stampExtractorVersion } from '../core/facts/audit-sources.ts';
-import { resolveDefaultVisibility, type FactVisibility } from '../core/facts/visibility.ts';
+import { resolveDefaultVisibility, tightenToPage, type FactVisibility } from '../core/facts/visibility.ts';
 import {
   emptySaveTimeResolutionCounts,
   formatSaveTimeResolutionCounts,
@@ -1014,7 +1014,8 @@ async function processPage(
   let segmentsThisPage = 0;
   const pageRows: Array<NewFact & { row_num: number; source_markdown_slug: string }> = [];
   const pageResolution = emptySaveTimeResolutionCounts();
-  const entityHints = await conversationEntityHints(state.engine, state.sourceId, page.slug, state.factVisibility); // #6731
+  const factVisibility = tightenToPage(state.factVisibility, page);
+  const entityHints = await conversationEntityHints(state.engine, state.sourceId, page.slug, factVisibility); // #6731
 
   for (const seg of segments) {
     if (state.segmentLimit > 0 && segmentsThisPage >= state.segmentLimit) break;
@@ -1076,8 +1077,8 @@ async function processPage(
       // (above) ran every fact through the shipped resolver cascade (#3729/#4052),
       // so master's per-row resolveEntitySlug mapper (#4567's independent fix for
       // the same issue) is superseded rather than layered on top.
-      const rows = await inferConversationSubjects(state.engine, state.sourceId, state.factVisibility, extracted.map((fact, i) => ({ // #6764
-        ...fact, visibility: state.factVisibility,
+      const rows = await inferConversationSubjects(state.engine, state.sourceId, factVisibility, extracted.map((fact, i) => ({ // #6764
+        ...fact, visibility: factVisibility,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
         source: PER_SEGMENT_SOURCE_PREFIX,

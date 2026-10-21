@@ -13,6 +13,7 @@ import type { Check } from '../../doctor.ts';
 import { checkError, doctorVerify } from '../check-fix.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { scanMissingRecordedFiles, type MissingRecordedFiles } from '../../../core/persistence/detached-pages.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
 
 const DOCS = 'docs/storage-tiering.md#restoring-a-page-whose-file-is-gone';
 
@@ -35,15 +36,24 @@ async function runMissingRecordedFiles(ctx: DoctorContext): Promise<Check[]> {
         message: 'Not applicable: no source is a classic checkout on this host (managed sources are checked by ghost_pages).' });
       return checks;
     }
+    const truncated = scans.filter(scan => scan.truncated).map(scan => scan.source_id);
+    const limit = scans[0]?.limit;
+    // #7145: a source read only up to MISSING_FILES_SCAN_LIMIT pages is not clear past it.
+    if (!count && truncated.length) {
+      checks.push({ name: 'missing_recorded_files', status: 'warn', details: { ...details, ...boundUnknownDetails('rows'), limit },
+        message: `Unknown: the scan stops at ${limit} live pages per source (MISSING_FILES_SCAN_LIMIT, no setting) and ${truncated.join(', ')} ${truncated.length === 1 ? 'has' : 'have'} more, `
+          + `so pages past it were not checked. None of the ${scans.reduce((sum, scan) => sum + scan.inspected, 0)} page(s) inspected records a file missing from its checkout.` });
+      return checks;
+    }
     if (!count) {
       checks.push({ name: 'missing_recorded_files', status: 'ok', details,
-        message: `Every live page's recorded file is in its checkout (${scans.reduce((sum, scan) => sum + scan.inspected, 0)} page(s) inspected${scans.some(scan => scan.truncated) ? '; bounded, more not checked' : ''}).` });
+        message: `Every live page's recorded file is in its checkout (${scans.reduce((sum, scan) => sum + scan.inspected, 0)} page(s) inspected).` });
       return checks;
     }
     const first = found[0]!;
     const sample = first.pages[0]!;
-    checks.push({ name: 'missing_recorded_files', status: 'warn', details,
-      message: `${count} live page(s) record a canonical file that is not in their checkout, so the next gbrain sync --full soft-deletes them `
+    checks.push({ name: 'missing_recorded_files', status: 'warn', details: { ...details, exact: !truncated.length },
+      message: `${truncated.length ? 'At least ' : ''}${count} live page(s) record a canonical file that is not in their checkout, so the next gbrain sync --full soft-deletes them `
         + `(${found.map(scan => `${scan.source_id}: ${scan.pages.length}`).join('; ')}; e.g. ${found.flatMap(scan => scan.pages.slice(0, 3).map(page => `${scan.source_id}:${page.slug} (${page.source_path})`)).slice(0, 5).join(', ')}). `
         + 'A page restored after its file left the checkout is the usual cause. To keep one with its file, put the file back, commit it and run gbrain sync; '
         + `to keep it database-only, run gbrain delete ${sample.slug} --source-id ${first.source_id}, then gbrain restore ${sample.slug} --source-id ${first.source_id} --detach. A page whose file you removed on purpose needs nothing.`,

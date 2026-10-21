@@ -11,6 +11,13 @@
  * the cut, at S1's xmax and at S1's own id, frozen and bootstrap xmins, rows newer than S2's own id, no recorded snapshot,
  * and the 32-bit wrap: \`age\` counts back from this transaction's real id, the 64-bit ids are that id's low word placed in
  * a synthetic epoch, and rows below it cross into the previous epoch's top words.
+ *
+ * Every snapshot \`xmax\` is one PostgreSQL can report: it never takes the low words 0-2, since GetSnapshotData advances
+ * \`latestCompletedXid\` past them (TransactionIdAdvance, \`Assert(TransactionIdIsNormal(xmax))\`), so after txid
+ * \`2^33 - 1\` the next snapshot's \`xmax\` is \`2^33 + 3\`. A drawn \`xmax\` of exactly \`2^33\` made S1's cut the invalid xid,
+ * whose \`age\` is the largest, and failed this comparison on an impossible snapshot whenever the applied migrations moved
+ * \`now\` onto it. The drawn layouts depend on \`now\`, so a fixed sweep also pins S1's \`xmax\` around the epoch boundary
+ * below \`now\`, at the same offsets whatever \`now\` is.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -42,19 +49,25 @@ function rng(seed: number) {
 }
 /** A real txid never takes the special low words 0 (invalid), 1 (bootstrap) or 2 (frozen). */
 const normal = (id: bigint) => id % W > 2n;
+/** A snapshot's \`xmax\` at \`id\`: PostgreSQL advances it past the special low words, as it does every new txid (TransactionIdAdvance). */
+const xmax = (id: bigint) => (normal(id) ? id : id - id % W + 3n);
 
 interface Layout { hi: bigint; lo: bigint; cut: bigint | null; xip: bigint[]; own: bigint | null; rows: string[]; crossing: boolean }
 
-/** One layout around \`now\` (this transaction's real id): every 64-bit id is shifted by \`epoch\` words, keeping its low word. */
-function layout(now: bigint, seed: number): Layout {
+/**
+ * One layout around \`now\` (this transaction's real id): every 64-bit id is shifted by \`epoch\` words, keeping its low word.
+ * \`at\` pins S1's \`xmax\` to that offset from the epoch boundary below \`now\` instead of drawing it.
+ */
+function layout(now: bigint, seed: number, at?: bigint): Layout {
   const r = rng(seed);
   const epoch = BigInt(r.pick([1, 2, 7, 1 << 20]));
   const shift = epoch * W;
   const base = shift + now;
-  const hi = base + BigInt(r.int(1, 800));
+  const hi = xmax(base + BigInt(r.int(1, 800)));
   // How far below S2 S1 sits: near, past the 32-bit wrap below the real id, or near the 2^31 bound.
   const reach = r.pick([BigInt(r.int(5, 2000)), now % W + BigInt(r.int(1, 5000)), SPAN - BigInt(r.int(5000, 20000))]);
-  const s1Max = base + BigInt(r.int(-1500, 400)) - (r.chance(0.5) ? reach : 0n);
+  const drawn = base + BigInt(r.int(-1500, 400)) - (r.chance(0.5) ? reach : 0n);
+  const s1Max = xmax(at === undefined ? drawn : shift + at);
   const shape = r.pick(['empty', 'listed', 'idle-older', 'no-snapshot'] as const);
   const xip: bigint[] = [];
   if (shape === 'listed' || shape === 'idle-older') for (let i = r.int(1, 5); i > 0; i--) xip.push(s1Max - BigInt(r.int(1, 1500)));
@@ -98,23 +111,27 @@ for (const backend of backends) {
   describe('GBRA-108: the fold proof\'s 32-bit xid arms (' + backend + ')', () => {
     test('agree with the 64-bit form on every row of every generated layout', async () => {
       const engine = engines.find(([kind]) => kind === backend)![1];
-      const seen = { rows: 0, bySnapshot: 0, changedBySnapshot: 0, crossing: 0, idleOlder: 0, noSnapshot: 0 };
+      const seen = { rows: 0, bySnapshot: 0, changedBySnapshot: 0, crossing: 0, idleOlder: 0, noSnapshot: 0, cutAtBoundary: 0 };
       const disagreements: string[] = [];
       await engine.transaction(async tx => {
         // \`age\` counts back from this transaction's own id once it has one.
         const [{ now }] = await tx.executeRaw<{ now: string }>('SELECT txid_current()::text AS now');
-        for (let seed = 1; seed <= 400; seed++) {
-          const l = layout(BigInt(now), seed);
+        // The drawn layouts, then S1's \`xmax\` pinned around the epoch boundary below \`now\` (wherever the applied migrations put it).
+        const runs = [...Array.from({ length: 400 }, (_, i) => ({ seed: i + 1, at: undefined as bigint | undefined })),
+          ...[-2n, -1n, 0n, 1n, 2n, 3n, 4n, 5n].flatMap(at => Array.from({ length: 40 }, (_, i) => ({ seed: 1000 + i, at })))];
+        for (const { seed, at } of runs) {
+          const l = layout(BigInt(now), seed, at);
           const rows = await tx.executeRaw<{ n: number; xid32: boolean; id64: boolean; by_lo: boolean }>(VERDICTS,
             [String(l.hi), String(l.lo), l.cut === null ? null : String(l.cut), '{' + l.xip.join(',') + '}', l.own === null ? null : String(l.own), '{' + l.rows.join(',') + '}']);
           expect(rows.length).toBe(l.rows.length);
           for (const row of rows) {
             seen.rows++;
             if (!row.by_lo) { seen.bySnapshot++; if (!row.id64) seen.changedBySnapshot++; }
-            if (row.xid32 !== row.id64) disagreements.push('seed ' + seed + ' xmin ' + l.rows[row.n - 1] + ': 32-bit ' + row.xid32 + ', 64-bit ' + row.id64 + ' ' + JSON.stringify(l, (_k, v) => typeof v === 'bigint' ? String(v) : v));
+            if (row.xid32 !== row.id64) disagreements.push('seed ' + seed + (at === undefined ? '' : ' at ' + at) + ' xmin ' + l.rows[row.n - 1] + ': 32-bit ' + row.xid32 + ', 64-bit ' + row.id64 + ' ' + JSON.stringify(l, (_k, v) => typeof v === 'bigint' ? String(v) : v));
           }
           if (l.crossing) seen.crossing++;
           if (l.cut === null) seen.noSnapshot++;
+          if (l.crossing && l.cut !== null && l.cut % W === 3n) seen.cutAtBoundary++;
           if (l.xip.length && l.lo < l.hi - 1_000_000n) seen.idleOlder++;
         }
       });
@@ -126,6 +143,7 @@ for (const backend of backends) {
       expect(seen.crossing).toBeGreaterThan(20);
       expect(seen.idleOlder).toBeGreaterThan(20);
       expect(seen.noSnapshot).toBeGreaterThan(20);
+      expect(seen.cutAtBoundary).toBeGreaterThan(20);
     }, 180_000);
   });
 }

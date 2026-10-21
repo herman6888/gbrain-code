@@ -224,7 +224,8 @@ export function semanticCacheSkipped(opts: HybridSearchOpts | undefined, semanti
   // #3985: type-filtered requests skip the cache — `types` is not part of
   // knobsHash, so a filtered result set could be served to an unfiltered
   // lookup (and vice versa). Mirrors the #3442 date-filter bypass.
-  const typeFiltered = Boolean(opts?.type) || (opts?.types?.length ?? 0) > 0;
+  // #7159: a frontmatter filter is not in knobsHash either.
+  const typeFiltered = Boolean(opts?.type) || (opts?.types?.length ?? 0) > 0 || opts?.where !== undefined;
   // Offset pages are cache-hostile until the pre-slice POOL itself is what's
   // stored: the cache holds the already offset/limit-sliced page (bare
   // hybridSearch slices before returning), so a hit for any other offset

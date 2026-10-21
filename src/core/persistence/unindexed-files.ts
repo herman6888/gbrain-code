@@ -21,6 +21,8 @@
  * `README.md` and the other `isSyncMetafile` names) that would otherwise be eligible
  * and whose frontmatter has a `type:` or `title:` is counted separately as
  * `metafile_skipped`: read-only, never scheduled, because sync skips it again.
+ * That happens only under `sync.metafile_pages off` (GBRA-150): under the default
+ * `typed` such a nested file is eligible, so it is found and scheduled like any file.
  * Each found file is screened read-only (the import screen's codes, or
  * `clean`) up to a cap. A time or count budget stops the scan with
  * `complete: false` and a cursor (the last Git path examined, in tree order),
@@ -42,9 +44,8 @@ import type { BrainEngine } from '../engine.ts';
 import type { SyncOpts } from '../../commands/sync.ts';
 import { spawn } from '../spawn.ts';
 import { gitChildEnv } from '../git-env.ts';
-import { isSyncMetafile, matchesAnyGlob, resolveSlugForPath } from '../sync.ts';
+import { isSyncMetafile, matchesAnyGlob, metafileIsPage, resolveSlugForPath } from '../sync.ts';
 import { screenImportContent } from '../import-screen.ts';
-import { parseMarkdownHead } from '../markdown.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { loadSyncEligibility, resolveManagedSyncContext, syncExcludePatterns, type ManagedSyncContext } from './sync-discovery.ts';
 import { heldGitPaths, readGitHoldRetryPaths, requestGitHoldRetry } from './sync-holds.ts';
@@ -182,7 +183,7 @@ export async function findUnindexedFiles(engine: BrainEngine, sourceId: string, 
   const now = opts.now ?? Date.now;
   const keep = opts.keep ?? UNINDEXED_SCHEDULE_CAP;
   const screenLimit = opts.screenLimit ?? UNINDEXED_SCREEN_LIMIT;
-  const { scope, slugMode, eligible, sourcePath } = await loadSyncEligibility(engine, context);
+  const { scope, slugMode, eligible, sourcePath, metafileHeads } = await loadSyncEligibility(engine, context);
   const exclude = await syncExcludePatterns(engine);
   const scan: UnindexedScan = { source_id: sourceId, incarnation, target: context.source.last_commit, eligibility: eligibilityKey(scope, slugMode, exclude), complete: true, cursor: null, scanned: 0, unindexed: 0,
     slug_taken: 0, deleted_page: 0, scheduled: 0, by_code: {}, samples: [], metafile_skipped: 0, metafile_samples: [], files: [], scheduled_paths: [] };
@@ -193,6 +194,7 @@ export async function findUnindexedFiles(engine: BrainEngine, sourceId: string, 
   const pastDeadline = () => opts.deadlineAt !== undefined && now() >= opts.deadlineAt;
   let screened = 0;
   for await (const batch of treeBatches(gitRoot, scan.target, scope, opts.cursor ?? null, opts.batch ?? BATCH)) {
+    metafileHeads.prime(batch);
     const rows = batch.filter(entry => eligible(entry.path) && !isWindowsColonTarget(entry.path)).map(entry => {
       const root = scope ? entry.path.slice(scope.length + 1) : entry.path;
       return { ...entry, root, origin: sourcePath(entry.path), legacy: slugMode === 'source-root' && scope ? entry.path : null };
@@ -205,8 +207,7 @@ export async function findUnindexedFiles(engine: BrainEngine, sourceId: string, 
       const unread = metafiles.filter(entry => !indexed.has(sourcePath(entry.path))).slice(0, Math.max(0, screenLimit - screened));
       screened += unread.length;
       visitBlobSlices(gitRoot, unread, (entry, content) => {
-        const frontmatter = parseMarkdownHead(content ?? '').frontmatter;
-        if (frontmatter.type == null && frontmatter.title == null) return;
+        if (!metafileIsPage(scope ? entry.path.slice(scope.length + 1) : entry.path, content, 'typed')) return;
         scan.metafile_skipped++;
         if (scan.metafile_samples.length < UNINDEXED_SAMPLE_LIMIT) scan.metafile_samples.push(scope ? entry.path.slice(scope.length + 1) : entry.path);
       }, () => false);

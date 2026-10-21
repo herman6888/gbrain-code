@@ -37,7 +37,7 @@ import { sealSegmentedPage } from '../persistence/segmented-apply.ts';
 import { PROJECTION_RETRY_READY_SQL, SEGMENTED_JOB_PROBES, SEGMENTED_PROJECTION_CLAIM, SEGMENTED_PROJECTION_CLAIMED_SQL, SEGMENTED_PROJECTION_LEASE_SECONDS,
   type ProjectionRebuildFailure } from '../page-state/projections.ts';
 import { occurrencesWithoutChunks, stageOccurrenceChunks } from './ingest.ts';
-import { DEFAULT_FLIP_RETIRE_MAX_ROWS } from './limits.ts';
+import { PROJECTION_RETIRE_MAX_ROWS } from './limits.ts';
 import type { JsonObject } from './types.ts';
 import { assertGenerationTiles } from './body-tiling.ts';
 
@@ -90,8 +90,8 @@ export async function hasStaleChunks(engine: Pick<BrainEngine, 'executeRaw'>, pa
 }
 
 /**
- * Delete, in bounded batches, chunk rows the live generation does not hold: other occurrences, inline rows, older
- * duplicates. Each batch re-reads the page under its page lock and deletes only while the page is still segmented at
+ * Delete, in batches of PROJECTION_RETIRE_MAX_ROWS, chunk rows the live generation does not hold: other occurrences, inline
+ * rows, older duplicates. Each batch re-reads the page under its page lock and deletes only while the page is still segmented at
  * `generation` (a demotion's inline rows are the page's live chunks); `moved` when it was not.
  */
 async function retireStaleChunks(engine: BrainEngine, ref: { sourceId: string; slug: string }, pageId: number, generation: number,
@@ -103,11 +103,11 @@ async function retireStaleChunks(engine: BrainEngine, ref: { sourceId: string; s
       const [page] = await tx.executeRaw<{ body_generation: number | string; body_storage: string }>('SELECT body_generation, body_storage FROM pages WHERE id=$1', [pageId]);
       if (page?.body_storage !== 'segmented' || Number(page.body_generation) !== generation) return null;
       return (await tx.executeRaw<{ id: number }>(`DELETE FROM content_chunks c WHERE c.id=ANY(ARRAY(${STALE_CHUNKS_SQL} LIMIT $4)) RETURNING c.id`,
-        [pageId, generation, live, DEFAULT_FLIP_RETIRE_MAX_ROWS])).length;
+        [pageId, generation, live, PROJECTION_RETIRE_MAX_ROWS])).length;
     });
     if (deleted === null) return { retired, moved: true };
     retired += deleted;
-    if (deleted < DEFAULT_FLIP_RETIRE_MAX_ROWS) return { retired, moved: false };
+    if (deleted < PROJECTION_RETIRE_MAX_ROWS) return { retired, moved: false };
     if (engine.kind === 'pglite') await new Promise(resolve => setImmediate(resolve));
   }
 }

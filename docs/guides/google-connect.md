@@ -215,6 +215,47 @@ gbrain sync --source <source>
 gbrain doctor --only google_calendar_readable --json # verify
 ```
 
+### API access
+
+Each service reads through its own Google Cloud API: Gmail through
+`gmail.googleapis.com`, Calendar through `calendar-json.googleapis.com` and
+Contacts through `people.googleapis.com`. Every one must be enabled once in
+the project that owns your OAuth client, and its scope must be granted at
+consent. When one is not:
+
+- `gbrain google setup` probes every service it is about to register before
+  it registers anything. A disabled API or an ungranted scope stops setup
+  with one report (exit 2, `status: api_access_blocked` under `--json`)
+  that names each API, the Google Cloud project, and the enable link from
+  Google's own error, plus the narrower `--services` command for the
+  services that already work;
+- `gbrain google status` probes the services each linked source syncs
+  (every granted service when no source is linked yet) and reports them under
+  `accounts[].api_access` (`problems` and a `fix`), with `ok: false` and
+  exit 1 while any remains;
+- the sync records the services it could not reach in the source's state.
+  The other services keep syncing and the run is `partial`; a service leaves
+  the record once its sweep reaches the API again. `gbrain doctor` warns
+  `google_api_access` from that record, with no network call.
+
+The fix's `next` is `ask_user` when an API is disabled (only the project
+owner can enable it in the console) and `tell_user_to_run` with
+`gbrain google connect --reauth <email>` when only a scope is missing.
+
+```bash
+gbrain google status --json   # names every disabled API with its enable link
+# enable each one at its link, or reauth for a missing scope, then:
+gbrain google status --json   # verify: api_access.problems is empty
+gbrain sync --source <source>
+```
+
+A managed source resolves its account before any service runs. When no
+enabled service can name the account (Gmail profile, Calendar primary
+calendar, People `me`), it asks the OAuth userinfo endpoint, which the
+`email` scope gbrain always requests can read. So a disabled API is reported
+as itself, and `connector_account_changed` means a credential that resolved
+to a different account than the source is pinned to.
+
 ## Calendar window
 
 Calendar pages cover events from `--history-days` ago up to 60 days from
@@ -421,8 +462,8 @@ gbrain sources add gmail-work --kind google --account you@example.com \
 What changes vs the vault flow: `gbrain google status`'s refresh probe and
 `gbrain doctor`'s `google_oauth` check cover vault accounts only (your
 external tool owns token health); the scope preflight trusts `--services`
-(a token missing a scope surfaces as `api_not_enabled`/`upstream` per sweep
-instead of `scope_missing`); send-as aliases are fetched live when the token
+(a token missing a scope surfaces per sweep as Google's 403, reported as
+`scope_missing`, rather than up front); send-as aliases are fetched live when the token
 allows it, otherwise identity degrades to the account address alone. The
 token command runs locally at sync time with your shell — it lives in local
 source config, is never reachable over MCP, and is the same trust class as a
@@ -453,9 +494,9 @@ attached. The catalog (also emitted as structured JSON with `--json`):
 | `code_reused` | Authorization code used twice | Re-run connect (codes are single-use) |
 | `invalid_client` | Client secret rotated/deleted in the console | Download the current JSON, reconnect |
 | `no_refresh_token` | Google returned no refresh token | Re-run connect; if persistent, revoke at <https://myaccount.google.com/permissions> and reconnect |
-| `api_not_enabled` | An API isn't enabled in your project | The error carries the exact enable link (project pre-selected) |
+| `api_not_enabled` | An API isn't enabled in your project | The error carries the project and the enable link from Google's error; `gbrain google status` names every disabled API at once (see [API access](#api-access)) |
 | `rate_limited` | Google quota hit | Automatic backoff; nothing to do |
-| `scope_missing` | Connected with narrower `--scopes` than needed | `gbrain google connect --reauth <email>` |
+| `scope_missing` | Connected with narrower `--scopes` than needed, or Google answered a request with "insufficient authentication scopes" | `gbrain google connect --reauth <email>` |
 | `relay_unreachable` / `relay_session_expired` / `claim_already_used` / `relay_disabled` | Hosted fast-path (gbrain.io relay) issues | BYO connect always works: `gbrain google connect` |
 | `not_connected` | No vault entry for the account | `gbrain google connect` |
 | `calendar_unreadable` | Google answered the source's calendar read with HTTP 403 or 404: the account cannot read that calendar | `gbrain google calendars --account <email>`, then `gbrain sources set-calendar <source> <calendar-id>`; see [Unreadable calendar](#unreadable-calendar) |

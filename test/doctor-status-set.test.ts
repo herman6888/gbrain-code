@@ -18,7 +18,7 @@ import { buildChecks, computeDoctorReport, type Check } from '../src/commands/do
 import { checkError, finalizeCheckFixes, infoCheck } from '../src/commands/doctor/check-fix.ts';
 import { doctorCheckNames, onlyNeedsEngine, parseOnlyChecks } from '../src/commands/doctor/registry.ts';
 import { throttleDoctorHeartbeat } from '../src/commands/doctor/heartbeat.ts';
-import { agentContractCheck } from '../src/commands/doctor/checks/agent-contract.ts';
+import { agentContractCheck, agentContractEntry } from '../src/commands/doctor/checks/agent-contract.ts';
 import { readAgentContractEvents, recordAgentContractEvent } from '../src/core/agent-contract-log.ts';
 import { VERSION } from '../src/version.ts';
 import { backupCoachingDue } from '../src/core/backup/status-file.ts';
@@ -265,3 +265,15 @@ describe('#6758 agent_contract: events from other builds are history, counted ap
   });
 });
 
+
+test('#7145: agent_contract judges the whole 7-day window, not only the newest 500 events', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-agent-contract-window-'));
+  try {
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      recordAgentContractEvent({ transport: 'cli', command: 'example-op', code: 'internal_error' });
+      for (let i = 0; i < 600; i++) recordAgentContractEvent({ transport: 'cli', command: 'example-op', code: 'not_found', has_suggestion: true });
+      const [check] = await agentContractEntry.run({} as never) as Check[];
+      expect(check).toMatchObject({ name: 'agent_contract', status: 'warn', details: { internal_errors: 1, events: 601 } });
+    });
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});

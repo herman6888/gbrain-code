@@ -6,7 +6,11 @@
  *    sha256, size and pinned blob; no content in the journal) and its owner
  *    streams it into a segmented page that round-trips byte-identical, with
  *    the canonical file untouched; on a source at a repository subdirectory
- *    (git-root slugs), on an edit, on a full walk and on a rename. A file the
+ *    (git-root slugs), on an edit, on a full walk and on a rename. A new page
+ *    commits with `searchable: 'pending'` on its receipt (#7106: a new page over
+ *    4 MiB is projected after commit) and seals once the build the owner tracks
+ *    ends (the consumer's stop waits for it); an edit or a rename with an edit
+ *    is sealed when it commits. A file the
  *    streamed path refuses (a facts fence) is held `file_too_large` and the
  *    run checkpoints, as before. A dry run lists the file as screened only by
  *    its owner (`page_body_segmented`), not as a hold. With the switch off the
@@ -82,13 +86,18 @@ async function sync(engine: BrainEngine, opts: { sourceId: string; full?: boolea
 }
 
 async function syncRequest(engine: BrainEngine, sourceId: string, slug: string) {
-  const [row] = await engine.executeRaw<{ intent_bytes: string; intent: Record<string, unknown>; state: string }>(
-    `SELECT intent_bytes::text AS intent_bytes, intent, state FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent->>'kind'='managed_sync_import'
+  const [row] = await engine.executeRaw<{ intent_bytes: string; intent: Record<string, unknown>; state: string; outcome: Record<string, unknown> | null }>(
+    `SELECT intent_bytes::text AS intent_bytes, intent, state, outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent->>'kind'='managed_sync_import'
       ORDER BY sequence DESC LIMIT 1`, [sourceId, slug]);
   return row;
 }
 
-async function expectStreamed(engine: BrainEngine, sourceId: string, slug: string, content: string, path: string) {
+/** `created`: a new page, whose receipt says its projection is pending at commit; the consumer's stop waits for that build. */
+async function expectStreamed(engine: BrainEngine, sourceId: string, slug: string, content: string, path: string, created = false) {
+  if (created) {
+    expect((await syncRequest(engine, sourceId, slug))!.outcome).toMatchObject({ status: 'created', searchable: 'pending', projection: 'pending' });
+    await disposePersistenceConsumer(engine);
+  }
   const parsed = parseMarkdown(content, path);
   const { page, body, hash } = await reconstructedPage(engine, slug, sourceId);
   expect(page.body_storage).toBe('segmented');
@@ -116,7 +125,7 @@ describe('managed sync over the single-string ceiling', () => {
       expect(preview.would_hold).toBeUndefined();
       expect(preview.screen_skipped).toEqual([{ path: 'notes/huge.md', code: 'page_body_segmented' }]);
       expect(await sync(engine, { sourceId: f.sourceId })).toMatchObject({ status: 'first_sync', filesImported: 2 });
-      await expectStreamed(engine, f.sourceId, 'notes/huge', huge, 'notes/huge.md');
+      await expectStreamed(engine, f.sourceId, 'notes/huge', huge, 'notes/huge.md', true);
       expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
       expect(sha256(readFileSync(file))).toBe(sha256(Buffer.from(huge)));
       expect((await readGitSourceHolds(engine, { sourceIds: [f.sourceId] }))[0]?.holds ?? []).toEqual([]);
@@ -156,7 +165,7 @@ describe('managed sync over the single-string ceiling', () => {
       await engine.setConfig('pages.segmented_storage', 'on');
       const f = await fixture(engine, { 'notes/huge.md': huge }, 'brain');
       expect(await sync(engine, { sourceId: f.sourceId })).toMatchObject({ status: 'first_sync', filesImported: 1 });
-      const page = await expectStreamed(engine, f.sourceId, 'brain/notes/huge', huge, 'brain/notes/huge.md');
+      const page = await expectStreamed(engine, f.sourceId, 'brain/notes/huge', huge, 'brain/notes/huge.md', true);
       expect((await engine.executeRaw<{ source_path: string }>('SELECT source_path FROM pages WHERE id=$1', [page.id]))[0]!.source_path).toBe('brain/notes/huge.md');
       await disposePersistenceConsumer(engine);
     }
@@ -168,7 +177,7 @@ describe('managed sync over the single-string ceiling', () => {
       const f = await fixture(engine, { 'notes/small.md': '---\ntitle: Small\n---\nA small note.\n' });
       writeFileSync(join(f.root, 'notes/huge.md'), huge);
       expect((await sync(engine, { sourceId: f.sourceId, workingTree: true })).status).not.toBe('failed');
-      await expectStreamed(engine, f.sourceId, 'notes/huge', huge, 'notes/huge.md');
+      await expectStreamed(engine, f.sourceId, 'notes/huge', huge, 'notes/huge.md', true);
       expect((await syncRequest(engine, f.sourceId, 'notes/huge'))!.intent.body_ref).toMatchObject({ kind: 'input_file' });
       await disposePersistenceConsumer(engine);
     }

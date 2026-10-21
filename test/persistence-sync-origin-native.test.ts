@@ -506,6 +506,8 @@ check('a pass never infers a missing page origin from its slug: the origin-less 
   await gitAsync(f.root, 'commit', '-qm', 'Remove the synthetic source file');
   await engine.executeRaw('UPDATE pages SET source_path=NULL WHERE id=$1', [f.snapshot.page.id]);
   const before = (await engine.readPageSnapshot(f.slug, { sourceId: f.id }))!;
+  // An older binary left the deletion for the pass, not for a consumer: the one the first sync started would claim it first.
+  await disposePersistenceConsumer(engine);
   const legacy = await legacyDeletion(engine, f, true);
   const result = await performManagedSync(engine, { ...f.opts, full: false });
   expect(result).toMatchObject({ status: 'synced', deleted: 0 });

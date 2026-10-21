@@ -30,6 +30,7 @@ const GREEN = {
   JSONB: 'success',
   TIER1: 'success',
   BACKEND_MATRIX: 'success',
+  POSTGRES15: 'success',
   TIER2: 'success',
   PREPARE: 'success',
   SELECTED: 'success',
@@ -142,7 +143,7 @@ describe('#5903 e2e-status accepts a skipped tier2 only under GBRAIN_PAID_LANES=
   });
 
   test("the variable at '0' does not excuse any other skipped lane", () => {
-    for (const key of ['JSONB', 'TIER1', 'BACKEND_MATRIX', 'PREPARE', 'SELECTED'] as const) {
+    for (const key of ['JSONB', 'TIER1', 'BACKEND_MATRIX', 'POSTGRES15', 'PREPARE', 'SELECTED'] as const) {
       const r = runAggregate({ [key]: 'skipped', GBRAIN_PAID_LANES: '0' });
       expect(r.status).toBe(1);
       expect(r.stdout).toContain('got skipped');

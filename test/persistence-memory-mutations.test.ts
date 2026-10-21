@@ -68,6 +68,7 @@ describe('journaled memory publication, both engines', () => {
         visibility: 'world', fence: true, valid_from: new Date().toISOString(), valid_until: null };
       const row = await admitWrite(engine, { principal: authority.principal, operation: 'remember', sourceId,
         sourceIncarnation: snapshot.sourceIncarnation, slug, pageId: snapshot.page.id, callerIntent: intent, intent, authority, requestId: randomUUID() });
+      let entered = false;
       let aborted = false;
       const release = Promise.withResolvers<void>();
       const provider = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: async () => {
@@ -76,13 +77,26 @@ describe('journaled memory publication, both engines', () => {
       } });
       configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: { OPENAI_API_KEY: 'sk-test' } });
       __setEmbedTransportForTests(async options => {
+        entered = true;
         try { return await (await fetch(provider.url, { signal: options.abortSignal })).json() as never; }
         catch (error) { aborted = options.abortSignal!.aborted; throw error; }
       });
-      const consumer = new PersistenceConsumer(engine, context(engine).config, prepareMemoryMutation, { pollMs: 60000, preparationMs: 50 });
+      // The 50 ms budget is wall-clock from the claim, so on a loaded machine it can pass before the preparer reaches the
+      // provider; the provider abort is pinned on a signal aborted once the call is in flight, the budget on the consumer's own signal.
+      const cancel = new AbortController();
+      let preparation: Promise<unknown> | undefined;
+      const consumer = new PersistenceConsumer(engine, context(engine).config,
+        (e, current, config, signal) => preparation = prepareMemoryMutation(e, current, config, signal), { pollMs: 60000, preparationMs: 50 });
       try {
+        const direct = prepareMemoryMutation(engine, row, context(engine).config, cancel.signal);
+        await waitFor(() => entered);
+        cancel.abort({ code: 'preparation_deadline' });
+        await expect(direct).rejects.toEqual({ code: 'preparation_deadline' });
+        expect(aborted).toBe(true);
         consumer.start();
-        await waitFor(() => aborted && consumer.status().active_preparations === 0);
+        await waitFor(() => preparation !== undefined);
+        await expect(preparation).rejects.toEqual({ code: 'preparation_deadline' });
+        await waitFor(() => consumer.status().active_preparations === 0);
         expect((await getWriteRequestById(engine, row.id))?.state).toBe('queued');
         expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND fact=$2', [sourceId, intent.fact])).toHaveLength(0);
       } finally { release.resolve(); provider.stop(true); await consumer.stop(); __setEmbedTransportForTests(null); configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} }); }

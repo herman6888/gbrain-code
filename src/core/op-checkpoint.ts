@@ -5,6 +5,7 @@ import { FENCE_REPAIR_ATTEMPT_OP } from './fence-repair/attempts.ts';
 import { FENCE_CANDIDATE_OP, FENCE_SCAN_OP } from './fence-repair/census-store.ts';
 import { FENCE_UNCOMMITTED_OP } from './fence-repair/uncommitted.ts';
 import { SYNC_PASS_ROW_OPS } from './persistence/sync-pass-row.ts';
+import { SYNC_DELETE_TOMBSTONE_OP } from './persistence/sync-delete-tombstones.ts';
 
 /** Max paths per append-INSERT round-trip; bounds the param-array size. */
 const APPEND_CHUNK = 1000;
@@ -499,7 +500,8 @@ export function syncFingerprint(p: { sourceId?: string; lastCommit: string }): s
  * resolution audit entries never expire (#5988, #6650); a managed purge's
  * tombstone failure records and parks (#6741, purge-parks.ts) leave only with
  * their tombstone, its purge or a rearm; an open #6729 rename-identity downgrade
- * record stays until its pair is settled or its old page is restored or purged.
+ * record stays until its pair is settled or its old page is restored or purged, and a #7130 managed sync
+ * deletion record while its tombstone (same page id and deleted_at) exists.
  */
 export async function purgeStaleCheckpoints(
   engine: BrainEngine,
@@ -517,6 +519,8 @@ export async function purgeStaleCheckpoints(
            AND op<>'connector-hold-retry'
            AND op<>'stuck-recovery-resolution'
            AND op<>'sync-admission'
+           AND NOT (op='${SYNC_DELETE_TOMBSTONE_OP}' AND EXISTS (
+             SELECT 1 FROM pages p WHERE p.id::text=op_checkpoints.fingerprint AND p.deleted_at=(op_checkpoints.completed_keys->0->>'deleted_at')::timestamptz))
            AND op<>'purge-deleted-park'
            AND NOT (op='sync-identity-downgrade' AND completed_keys->0->>'disposition' IS NULL AND EXISTS (
              SELECT 1 FROM pages p WHERE p.id::text=op_checkpoints.fingerprint AND p.deleted_at=(op_checkpoints.completed_keys->0->>'old_deleted_at')::timestamptz))

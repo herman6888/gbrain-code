@@ -700,7 +700,22 @@ function assignmentValueIsSecretShaped(value: string): boolean {
   return !(value.startsWith('/') && !LEGACY_ASSIGNMENT_VALUE_RE.test(value));
 }
 
+/**
+ * One compiled set per option combination. scanInternal is synchronous and
+ * resets each pattern's lastIndex before every line, so the 'g' regexes are
+ * safe to share; recompiling them per call cost a search response about a
+ * millisecond per scanned field (GBRA-156).
+ */
+const compiledPatterns = new Map<string, CompiledPattern[]>();
+
 function compilePatterns(opts: ScanOpts): CompiledPattern[] {
+  const key = `${opts.highEntropy === true}|${opts.labeledCredentials === true}`;
+  let compiled = compiledPatterns.get(key);
+  if (!compiled) compiledPatterns.set(key, compiled = buildPatterns(opts));
+  return compiled;
+}
+
+function buildPatterns(opts: ScanOpts): CompiledPattern[] {
   const out: CompiledPattern[] = CORE_PATTERNS.map((p) => ({
     name: p.name,
     // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- p.source is a compile-time literal from CORE_PATTERNS (never caller input); every pattern uses bounded quantifiers, pinned by test/secret-scan-perf.test.ts

@@ -12,21 +12,25 @@
  *    under backfill burst load is common and self-clearing; giving up after
  *    two tries used to poison threads that would have succeeded a few
  *    seconds later.
- *  - 403 accessNotConfigured → CredentialError 'api_not_enabled' with the
- *    exact enable deep link (project number extracted from the client id)
+ *  - 403 accessNotConfigured / SERVICE_DISABLED → GoogleApiDisabledError
+ *    ('api_not_enabled') naming the API, the project and the enable link
+ *    Google put in the error body (the client id's project number otherwise)
+ *  - 403 insufficient authentication scopes → CredentialError 'scope_missing'
  *  - uniform pageToken pagination with a safety cap
  *  - fetchImpl injectable for tests
  */
 
 import { CredentialError } from '../creds/errors.ts';
 import type { GoogleAccessProvider } from './access.ts';
-import { apiEnableLink } from '../creds/providers/google.ts';
+import { apiEnableLink, projectNumberFromClientId } from '../creds/providers/google.ts';
 import { parseRetryAfterMs } from '../github-source.ts';
 import { readBoundedHttpBody } from '../guarded-http.ts';
 import {
   bareAddress,
   DEFAULT_CALENDAR_ID,
+  GOOGLE_SERVICE_API,
   splitAddressList,
+  type GoogleService,
   type CalendarEventData,
   type ContactData,
   type GmailMessageMeta,
@@ -78,7 +82,7 @@ interface GoogleErrorBody {
     status?: string;
     message?: string;
     errors?: Array<{ reason?: string }>;
-    details?: Array<{ '@type'?: string; reason?: string }>;
+    details?: Array<{ '@type'?: string; reason?: string; metadata?: Record<string, unknown>; links?: Array<{ url?: unknown }> }>;
   };
 }
 
@@ -127,8 +131,12 @@ export class GoogleApiClient {
       if (res.status === 403) {
         const reason = body.error?.errors?.[0]?.reason ?? '';
         const msg = body.error?.message ?? '';
-        if (reason === 'accessNotConfigured' || /has not been used|is disabled/i.test(msg)) {
-          throw new CredentialError('api_not_enabled', apiEnableLink(apiHint, this.clientId));
+        const errorInfo = body.error?.details?.find(detail => detail?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo');
+        if (reason === 'accessNotConfigured' || errorInfo?.reason === 'SERVICE_DISABLED' || /has not been used|is disabled/i.test(msg)) {
+          throw googleApiDisabledError(body, apiHint, this.clientId);
+        }
+        if (reason === 'insufficientPermissions' || errorInfo?.reason === 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' || /insufficient authentication scopes/i.test(msg)) {
+          throw new CredentialError('scope_missing', undefined, `HTTP 403 on ${apiHint}: ${msg || reason}`);
         }
         if (reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded' || /rate/i.test(msg)) {
           // fall through to the retry-after sleep below
@@ -195,6 +203,45 @@ export class GoogleApiClient {
     if (opts.partialOk) return out;
     throw new CredentialError('upstream', `: pagination cap (${cap}) hit on ${apiHint}`);
   }
+}
+
+const SERVICE_FOR_HINT: Record<ApiHint, GoogleService> = { gmail: 'gmail', 'calendar-json': 'calendar', people: 'contacts' };
+
+/** Only a Google Cloud console link is relayed from an error body; anything else falls back to the derived link. */
+function consoleUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && (url.hostname === 'console.developers.google.com' || url.hostname === 'console.cloud.google.com') ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #7073: an API disabled for the OAuth client's project. Carries the API, its
+ * title, the project and the enable link from Google's ErrorInfo (the Help
+ * link or the message when ErrorInfo is absent), so setup, status and doctor
+ * can name every disabled API with its own link.
+ */
+export class GoogleApiDisabledError extends CredentialError {
+  constructor(readonly api: string, readonly apiTitle: string, readonly project: string | null, readonly enableUrl: string) {
+    super('api_not_enabled', enableUrl);
+    this.name = 'GoogleApiDisabledError';
+  }
+}
+
+function googleApiDisabledError(body: GoogleErrorBody, apiHint: ApiHint, clientId: string | undefined): GoogleApiDisabledError {
+  const details = body.error?.details ?? [];
+  const metadata = details.find(detail => detail?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo')?.metadata ?? {};
+  const text = (key: string): string | null => typeof metadata[key] === 'string' && (metadata[key] as string).trim() ? (metadata[key] as string).trim() : null;
+  const helpUrl = details.flatMap(detail => detail?.links ?? []).map(link => consoleUrl(link?.url)).find(url => url !== null) ?? null;
+  const messageUrl = consoleUrl(body.error?.message?.match(/https:\/\/\S+/)?.[0]?.replace(/[.,;)]+$/, ''));
+  const consumer = text('consumer')?.replace(/^projects\//, '') ?? text('containerInfo');
+  const project = consumer ?? body.error?.message?.match(/in project (\d+)/)?.[1] ?? (clientId ? projectNumberFromClientId(clientId) : null);
+  const fallback = GOOGLE_SERVICE_API[SERVICE_FOR_HINT[apiHint]];
+  return new GoogleApiDisabledError(text('service') ?? fallback.api, text('serviceTitle') ?? fallback.title, project,
+    consoleUrl(metadata.activationUrl) ?? helpUrl ?? messageUrl ?? apiEnableLink(apiHint, clientId));
 }
 
 /** Gmail 404-on-historyId / Calendar-People 410-on-syncToken. */
@@ -523,6 +570,7 @@ interface RawCalendarEvent {
   location?: string;
   hangoutLink?: string;
   htmlLink?: string;
+  visibility?: string;
 }
 
 function calendarEvent(e: RawCalendarEvent, account: string): CalendarEventData {
@@ -546,6 +594,7 @@ function calendarEvent(e: RawCalendarEvent, account: string): CalendarEventData 
     htmlLink: e.htmlLink ?? null,
     status: e.status ?? 'confirmed',
     account,
+    private: e.visibility === 'private' || e.visibility === 'confidential',
   };
 }
 

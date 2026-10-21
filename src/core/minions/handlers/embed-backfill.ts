@@ -45,6 +45,7 @@ import {
 import { pricingSetCommand } from '../../budget/no-pricing.ts';
 import { getEmbeddingModel, withBudgetTracker } from '../../ai/gateway.ts';
 import { embedStaleForSource } from '../../embed-stale.ts';
+import type { ContentDriftSweepStatus } from '../../content-drift-sweep.ts';
 import { createEmbedStallWatchdog, resolveEmbedStallAbortSeconds } from '../../embed-stall.ts';
 import { currentEmbeddingSignature } from '../../embedding.ts';
 import { readEmbedBackfillBlockers } from '../../embed-backfill-stall.ts';
@@ -89,6 +90,8 @@ export interface EmbedBackfillResult {
   invalidated: number;
   /** #4283: set when drifted chunks existed but the embedder probe failed. */
   invalidationSkipped?: 'embedder_probe_failed';
+  /** #7117: this run's content-drift sweep: counts, cursor, pass state, error. */
+  contentDrift?: ContentDriftSweepStatus;
   /** $USD spent inside this job (from BudgetTracker.totalSpent). */
   spentUsd: number;
   /** Set when status === 'budget_exhausted'. */
@@ -356,6 +359,7 @@ export function makeEmbedBackfillHandler(
           pagesProcessed: result.pagesProcessed,
           invalidated: result.invalidated,
           ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
+          ...(result.contentDrift && { contentDrift: result.contentDrift }),
           spentUsd: tracker.totalSpent,
         };
       }
@@ -404,6 +408,7 @@ export function makeEmbedBackfillHandler(
         pagesProcessed: result.pagesProcessed,
         invalidated: result.invalidated,
         ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
+        ...(result.contentDrift && { contentDrift: result.contentDrift }),
         spentUsd: tracker.totalSpent,
         ...(await budgetLimitedField(engine, sourceId, currentEmbeddingSignature())),
       };

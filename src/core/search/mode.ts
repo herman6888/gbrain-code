@@ -412,6 +412,20 @@ export interface ModeBundle {
    */
   diverse_pool_depth: number;
   /**
+   * Result-time collapse (search/collapse.ts, #4612 #7153 #7154): a same-slug
+   * twin in another source, a redirect stub and copies of one document fold
+   * into the best-ranked row, which lists them in `collapsed`. On in every
+   * bundle. Override: `search.collapse` (boolean).
+   */
+  collapse: boolean;
+  /**
+   * Rank priors after the reranker (search/rank-priors.ts, #7155 #7162
+   * #6058): organization over person when the query names no person, weak
+   * OCR matches, dated over undated rows on 'when' questions. On in every
+   * bundle. Override: `search.rank_priors` (boolean).
+   */
+  rank_priors: boolean;
+  /**
    * Ranker wave (Phase E2, Cat 13) — arm-confidence-weighted fusion of the
    * LEXICAL arms (arm-confidence.ts). When the keyword arm's scale-free
    * confidence `margin_ratio = top / (top + second)` over its returned rows
@@ -518,6 +532,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relational_orient_onehop: false,
     relational_chain_slots: 10,
     diverse_pool_depth: 0,
+    collapse: true,
+    rank_priors: true,
     autocut_jump: 0.2,
     autocut_min_top: 0.35,
     autocut_min_keep: 1,
@@ -587,6 +603,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relational_orient_onehop: false,
     relational_chain_slots: 10,
     diverse_pool_depth: 0,
+    collapse: true,
+    rank_priors: true,
     autocut_jump: 0.2,
     autocut_min_top: 0.35,
     autocut_min_keep: 1,
@@ -656,6 +674,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relational_orient_onehop: false,
     relational_chain_slots: 10,
     diverse_pool_depth: 0,
+    collapse: true,
+    rank_priors: true,
     autocut_jump: 0.2,
     autocut_min_top: 0.35,
     autocut_min_keep: 1,
@@ -728,6 +748,8 @@ export interface SearchKeyOverrides {
   relational_orient_onehop?: boolean | null;
   relational_chain_slots?: number;
   diverse_pool_depth?: number;
+  collapse?: boolean;
+  rank_priors?: boolean;
   // Ranker wave (Phase E2) — keyword-arm confidence floor override (null = off; (0, 1]).
   keyword_arm_confidence_floor?: number | null;
   // Ranker wave (Phase E3) — metadata boost gate override (`always` | `lexical`).
@@ -799,6 +821,8 @@ export interface SearchPerCallOpts {
   relational_orient_onehop?: boolean | null;
   relational_chain_slots?: number;
   diverse_pool_depth?: number;
+  collapse?: boolean;
+  rank_priors?: boolean;
   // Ranker wave (Phase E2) — keyword-arm confidence floor per-call override (null = off; (0, 1]).
   keyword_arm_confidence_floor?: number | null;
   // Ranker wave (Phase E3) — metadata boost gate per-call override (`always` | `lexical`).
@@ -910,6 +934,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     relational_orient_onehop: pick('relational_orient_onehop'),
     relational_chain_slots: pick('relational_chain_slots'),
     diverse_pool_depth: pick('diverse_pool_depth'),
+    collapse: pick('collapse'),
+    rank_priors: pick('rank_priors'),
     keyword_arm_confidence_floor: pick('keyword_arm_confidence_floor'),
     metadata_boost_gate: pick('metadata_boost_gate'),
     resolved_mode,
@@ -1267,6 +1293,9 @@ export function knobsHash(
     ...(knobs.relational_planner && knobs.relational_chain_slots ? [`rcs=${knobs.relational_chain_slots}`] : []),
     // Session-diverse pool (append-only, emitted only when on, so every off key is unchanged).
     ...(knobs.diverse_pool_depth ? [`dpd=${knobs.diverse_pool_depth}`] : []),
+    // Collapse and rank priors (append-only, emitted only when turned off).
+    ...(knobs.collapse === false ? ['col=0'] : []),
+    ...(knobs.rank_priors === false ? ['rpr=0'] : []),
   ];
   // #5691 (append-only, no version bump): only a non-empty query prefix adds
   // a part, so every row written without one keeps its key.
@@ -1509,6 +1538,10 @@ export function loadOverridesFromConfig(
   if (rcs !== undefined) out.relational_chain_slots = rcs;
   const dpd = normalizeDiversePoolDepth(get('search.diverse_pool_depth'));
   if (dpd !== undefined) out.diverse_pool_depth = dpd;
+  const col = parseBoolKnob(get('search.collapse'));
+  if (col !== undefined) out.collapse = col;
+  const rpr = parseBoolKnob(get('search.rank_priors'));
+  if (rpr !== undefined) out.rank_priors = rpr;
   // Ranker wave (Phase E2) — keyword-arm confidence floor: the literal
   // `off`/`null` pins the knob off (null); a number in (0, 1] is the floor;
   // anything else falls through to the bundle. ONE range contract with the
@@ -1583,6 +1616,8 @@ export const KNOB_CONFIG_KEY: Readonly<Record<keyof ModeBundle, string>> = Objec
   relational_orient_onehop: 'search.relational_orient_onehop',
   relational_chain_slots: 'search.relational_chain_slots',
   diverse_pool_depth: 'search.diverse_pool_depth',
+  collapse: 'search.collapse',
+  rank_priors: 'search.rank_priors',
   keyword_arm_confidence_floor: 'search.keyword_arm_confidence_floor',
   metadata_boost_gate: 'search.metadata_boost_gate',
 });

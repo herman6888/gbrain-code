@@ -448,9 +448,21 @@ const _warnedKeys = new Set<string>();
  * Test seam: `_resetWarnOnceForTests()` clears the set so per-process
  * warn-once contracts can be reasserted across test cases.
  */
+let warnOnceScope: (() => Set<string> | undefined) | null = null;
+
+/**
+ * A resident serve answering for a one-shot CLI (the warm CLI socket) gives
+ * each request its own once-set, so the CLI sees the warnings its own process
+ * would have printed.
+ */
+export function setWarnOnceScope(scope: () => Set<string> | undefined): void {
+  warnOnceScope = scope;
+}
+
 export function warnOncePerProcess(key: string, message: string): void {
-  if (_warnedKeys.has(key)) return;
-  _warnedKeys.add(key);
+  const warned = warnOnceScope?.() ?? _warnedKeys;
+  if (warned.has(key)) return;
+  warned.add(key);
   console.warn(message);
 }
 

@@ -72,6 +72,8 @@ import { preparePageAdvisories, remoteLinkHint, pageNoopAdvisories, timelineRows
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget, nativeFileTarget } from './native-file-target.ts';
 import { isSourceDbOnlySlug } from './source-storage.ts';
+import { gitIgnoresUntracked } from './sync-origin-evidence.ts';
+import { gitDurabilityPolicy } from './git-durability-policy.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { DERIVE_PHASE_DB_ONLY_DEFAULTS } from '../storage-config.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
@@ -252,6 +254,8 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   content: string | Uint8Array | StreamedFileContent | null, hostId?: string, options: { allowMissing?: boolean; deleting?: boolean; capture?: { path: string; hash: string }; activePack?: ParseOpts['activePack']; remote?: boolean;
     /** #6368: a tombstone purge whose file matches these sync.exclude globs (relative to the source root) owns no file. */
     excludeTombstone?: { patterns: string[]; onExcluded: (path: string) => void };
+    /** #7130: a new page's put_page/capture whose file target .gitignore excludes publishes database-only instead. */
+    newPageIgnoredDatabaseOnly?: boolean;
     /** #6517: a delete whose file another live page of the source records owns no file; the census target and claimants are reported. */
     sharedOrigin?: { onShared: (shared: SharedOrigin) => void };
     /** Runs between the pieces of a segmented page's file comparison (an effect's claim renewal). */
@@ -293,6 +297,14 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   if (!isWriteTargetContained(path, root)) throw opError('source_changed', 'The canonical file target is outside its registered source.',
     `The file of ${row.slug} resolves outside source ${row.source_id}'s registered root (a symlinked directory or a moved checkout), so nothing was written. Inspect the owner before resubmitting; how to repair the checkout is the user's decision.`,
     { fix: ownerStatusFix(row.source_id) });
+  // #7130: a canonical file under a path the checkout's .gitignore excludes would never be committed, so the page would be
+  // file-backed by a file no history holds (and a later sync could read its absence as a deletion). The write publishes
+  // to the database only and binds no file; a declared db_only page keeps its cache file as before. Only a new page whose
+  // target file does not exist yet: an existing page keeps its file (and its drift checks and storage refusals), and only a
+  // person's detach turns it database-only. A Git-durable source keeps writing the file: its Git effect cannot commit an
+  // ignored target and parks it (`git_target_unsafe`), which already shows the page needs a decision.
+  if (options.newPageIgnoredDatabaseOnly && !snapshot && content !== null && !existsSync(path) && !isSourceDbOnlySlug(root, row.slug, 'not_db_only') && await gitIgnoresUntracked(root, relative(root, path).split(sep).join('/'))
+    && !(await gitDurabilityPolicy(binding, root)).durable) return undefined;
   if (options.excludeTombstone && snapshot?.page.deleted_at) {
     const rel = relative(root, path).split(sep).join('/');
     if (matchesAnyGlob(rel, options.excludeTombstone.patterns)) { options.excludeTombstone.onExcluded(rel); return undefined; }
@@ -864,7 +876,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
     async () => noop || targetDeleted ? pageNoopAdvisories(row) : !ordinaryPage ? remoteLinkHint(row) : preparePageAdvisories(engine,row,ready.parsedPage,snapshot),
     async () => !noop && !targetDeleted && autoLinkedPage && (row.authority.autoLinkTrusted ?? !row.authority.remote) && await isAutoLinkEnabled(engine)
       ? prepareAutomaticLinks(engine,row.slug,ready.parsedPage,row.source_id,options.coordinated === true) : undefined,
-    () => prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile, activePack, remote: row.authority.remote }),
+    () => prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile, activePack, remote: row.authority.remote, newPageIgnoredDatabaseOnly: true }),
     // Always-loaded core tier: owner-only marking, brain-wide budget, remote-edit policy (core-guard.ts).
     async () => noop ? null : prepareCoreGuard(engine, { row, snapshot, incoming: targetDeleted ? null : ready.parsedPage }),
   ]) as [Awaited<ReturnType<typeof prepareCanonicalProjections>> | undefined, Record<string, unknown>,

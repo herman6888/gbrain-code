@@ -19,7 +19,7 @@ import { moveHeldPglite } from './maintenance.ts';
 import { withFilesystemPublication } from './filesystem-guard.ts';
 import { flushDirectory } from '../fs-durable.ts';
 import type { BrainEngine } from '../engine.ts';
-import { GRADUATION_RUN_SETTING, graduationTablePresent, readGraduationRow } from './graduation-schema.ts';
+import { GRADUATION_RUN_SETTING, graduationTablePresent, readGraduationConnectRow } from './graduation-schema.ts';
 import type { GraduationPathState, IntentMarker, ManifestState, TargetIdentity, Tombstone } from './engine-graduation.types.ts';
 
 
@@ -334,7 +334,7 @@ function exemptRun(runId: string, env: NodeJS.ProcessEnv): boolean {
  * otherwise `graduation_interrupted`.
  */
 export async function assertGraduationConnectAllowed(engine: BrainEngine, env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const row = await readGraduationRow(engine);
+  const row = await readGraduationConnectRow(engine);
   if (!row || exemptRun(row.run_id, env)) return;
   if (row.role === 'target') {
     if (row.state === 'authoritative') return;

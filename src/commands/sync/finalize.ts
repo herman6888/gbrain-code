@@ -10,6 +10,7 @@ import type { BrainEngine } from '../../core/engine.ts';
 import { clearOpCheckpoint } from '../../core/op-checkpoint.ts';
 import { commitTimeMs } from '../../core/source-health.ts';
 import { writeSyncAnchor, writeChunkerVersion } from '../../core/sync-anchor.ts';
+import { recordMetafilePagesApplied } from '../../core/sync-metafile-pages.ts';
 import { git } from '../../core/sync-git.ts';
 import { buildPartialResult } from '../../core/sync-lock.ts';
 import {
@@ -34,10 +35,10 @@ import type { SyncPlan, SyncRun } from './sync-run.ts';
 
 export async function finishWithoutChanges(
   engine: BrainEngine,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'malformedSkipped' | 'totalChanges' | 'holds' | 'gitlinks'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'malformedSkipped' | 'totalChanges' | 'holds' | 'gitlinks' | 'metafilePages'>,
   swept: number,
 ): Promise<SyncResult | undefined> {
-  const { opts, company, gitContextRoot, lastCommit, pin, pullFailed, ckpt, malformedSkipped, totalChanges } = plan;
+  const { opts, company, gitContextRoot, lastCommit, pin, pullFailed, ckpt, malformedSkipped, totalChanges, metafilePages } = plan;
   if (totalChanges === 0) {
     await settleLegacyHolds(engine, plan.holds);
     // #3068: same guard as the git-HEAD-equality gate above — a failed pull
@@ -69,6 +70,7 @@ export async function finishWithoutChanges(
     await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot);
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
+    if (!company) await recordMetafilePagesApplied(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, metafilePages);
     if (!company) { await clearOpCheckpoint(engine, ckpt.paths); await clearOpCheckpoint(engine, ckpt.target); }
     // A commit whose ONLY changes are malformed filenames lands here with
     // totalChanges === 0 — the anchor advances past those files forever, so
@@ -282,11 +284,11 @@ function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitCon
 
 async function applyBookmarkGate(
   run: SyncRun,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered' | 'holds'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered' | 'holds' | 'metafilePages'>,
   headVerificationSucceeded: boolean,
 ): Promise<{ done: SyncResult } | { gate: Awaited<ReturnType<typeof applySyncFailureGate>> }> {
   const { engine, succeededPaths, failedFiles, pagesAffected } = run;
-  const { opts, company, gitContextRoot, anchorPath, lastCommit, pin, ckpt, filtered } = plan;
+  const { opts, company, gitContextRoot, anchorPath, lastCommit, pin, ckpt, filtered, metafilePages } = plan;
   // issue #1939 — gate the bookmark through the shared failure ledger.
   //   • Fresh failures still BLOCK (fail-closed): the next sync re-walks the
   //     diff and re-attempts. Escape hatch: --skip-failed.
@@ -309,6 +311,7 @@ async function applyBookmarkGate(
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', anchorPath);
     await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
+    if (!company) await recordMetafilePagesApplied(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, metafilePages);
     if (!company) { await clearOpCheckpoint(engine, ckpt.paths); await clearOpCheckpoint(engine, ckpt.target); }
   };
 

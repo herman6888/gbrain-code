@@ -13,6 +13,7 @@ import { doctorCapacityForecast, forecastOrNull } from '../capacity-memo.ts';
 import { withStatementDeadline } from '../../../core/statement-deadline.ts';
 import { DEFERRED_READ_LABEL, repeatedPostprocessDeferrals } from '../../../core/cycle/synthesize-postprocess-deferral.ts';
 import { PERSISTENCE_REQUEST_ID_INDEX } from '../../../core/persistence/schema.ts';
+import type { TerminalSourceSummary } from '../../../core/persistence/terminal-failures.ts';
 
 const WINDOW_DAYS = 7;
 const SAMPLE = 10_000;
@@ -273,20 +274,58 @@ export async function lostCallerWritesCheck(engine: BrainEngine, sourceIds?: str
 }
 
 /**
+ * #7146: the rows ranked by what they block. Blocking first, each with what it holds (a recovery record holds every
+ * queued write on its source's root, named by its page; a checkpoint blocker holds the source's managed-sync
+ * checkpoint) and its fix; then the unresolved rows that block nothing, grouped by source, category, code and origin
+ * with counts and the exact drill-down, defect classes first; then the historical rows as a count. A remote caller
+ * (`remote`) is shown no page slug: the blockers lose their `slug` and the message names request ids and sources only.
+ */
+function rankTerminalFailures(sources: TerminalSourceSummary[], remote: boolean, tf: Pick<typeof import('../../../core/persistence/terminal-failures.ts'), 'terminalFailuresArgv' | 'NO_ORIGIN'>) {
+  const { terminalFailuresArgv, NO_ORIGIN } = tf;
+  const blocking = sources.flatMap(s => s.active_blockers).map(b => ({ kind: b.kind, request_id: b.request_id, source_id: b.source_id, ...(!remote && b.slug ? { slug: b.slug } : {}),
+    category: b.category, needs_human: b.needs_human, blocks: b.kind === 'checkpoint' ? 'sync_checkpoint' as const : 'source' as const,
+    fix: remote ? null : b.action.argv ?? null }));
+  const groups = sources.flatMap(s => s.categories.filter(c => c.unresolved > 0).map(c => ({ source_id: s.source_id, category: c.category, code: c.code, origin: c.origin, rows: c.unresolved,
+    defect: s.defects.some(d => d.category === c.category && d.code === c.code && d.origin === c.origin), needs_human: c.needs_human,
+    drill_down: terminalFailuresArgv({ sourceId: s.source_id, category: c.category, code: c.code, origin: c.origin ?? NO_ORIGIN }) })))
+    .sort((a, b) => Number(b.defect) - Number(a.defect) || b.rows - a.rows || a.source_id.localeCompare(b.source_id) || a.category.localeCompare(b.category));
+  const unresolved = { rows: sources.reduce((n, s) => n + s.unresolved.rows, 0), pages: sources.reduce((n, s) => n + s.unresolved.distinct_slugs, 0), groups,
+    group_by: sources.filter(s => s.unresolved.rows > 0).map(s => terminalFailuresArgv({ sourceId: s.source_id, groupBy: 'category' })) };
+  const historical = { rows: sources.reduce((n, s) => n + s.historical_rows, 0) };
+  const lines: string[] = [];
+  if (blocking.length) {
+    const shown = blocking.slice(0, 5).map(b => `${b.kind === 'recovery' ? 'recovery record' : 'checkpoint blocker'} ${b.request_id}${'slug' in b ? ` (${b.slug})` : ''} on source ${b.source_id} `
+      + `blocks ${b.blocks === 'sync_checkpoint' ? 'the managed-sync checkpoint of the source' : 'every queued write on the source\'s root'}${b.fix ? `; fix: ${b.fix.join(' ')}` : ''}`);
+    lines.push(`Blocking now (${blocking.length}): ${shown.join('; ')}${blocking.length > 5 ? `; +${blocking.length - 5} more in details.ranked.blocking` : ''}.`);
+  }
+  if (unresolved.rows) {
+    const shown = groups.slice(0, 3).map(g => `${g.category}/${g.code} ×${g.rows} on ${g.source_id}${g.defect ? ' (gbrain defect)' : g.needs_human ? ' (needs a person)' : ''}`);
+    lines.push(`Unresolved, not blocking: ${unresolved.rows} row(s) on ${unresolved.pages} page(s) in ${groups.length} group(s): ${shown.join('; ')}${groups.length > 3 ? `; +${groups.length - 3} more group(s)` : ''}. `
+      + `Group them: ${unresolved.group_by.slice(0, 2).map(argv => argv.join(' ')).join('; ')} (each group carries its fix and drill-down).`);
+  }
+  if (historical.rows) lines.push(`Historical: ${historical.rows} row(s) a later write superseded or an older build wrote; nothing to do.`);
+  return { ranked: { blocking, unresolved, historical }, text: lines.join(' ') };
+}
+
+/**
  * #6650 (L3): terminal write receipts that did not commit, read at doctor time (`terminal-failures.ts`, one bounded
  * aggregate; `terminal-classify.ts` names each class and its fix). Warns on any active blocker (a receipt still holding
  * a publication recovery record, which holds its root, or a receipt PR A's `checkpoint_blockers` names) and on an
  * unresolved gbrain-defect class, whatever the trend; the spike check (the last 24 h against the zero-filled median of
  * the 7 days before, `persistence.terminal_failures.spike_factor` / `spike_min`) is secondary. Rows written by a build
- * older than the release that fixed their class, and rows a later request made moot, are historical and never warn.
- * Archived sources are skipped; with no engine (the fast path) there is nothing to read.
+ * older than the release that fixed their class, and rows a later request made moot, are historical and never warn:
+ * with nothing else, the check is ok as information. #7146: `details.ranked` and the message rank the rows (blocking,
+ * unresolved, historical; `rankTerminalFailures`). Archived sources are skipped; with no engine (the fast path) there
+ * is nothing to read.
  */
-export async function terminalFailuresCheck(engine: BrainEngine | null, sourceIds?: string[]): Promise<Check | null> {
+export async function terminalFailuresCheck(engine: BrainEngine | null, sourceIds?: string[], opts: { remote?: boolean } = {}): Promise<Check | null> {
   if (!engine) return null;
   const name = 'persistence_terminal_failures';
   const docs = 'docs/guides/troubleshooting.md#terminal-write-failures';
+  const remote = opts.remote === true;
   try {
-    const { readTerminalFailureSummary, readTerminalThresholds, readCheckpointBlockerMap, isSpike, sevenDayMedian, TERMINAL_WINDOW_KEY, TERMINAL_SPIKE_FACTOR_KEY, TERMINAL_SPIKE_MIN_KEY } = await import('../../../core/persistence/terminal-failures.ts');
+    const tf = await import('../../../core/persistence/terminal-failures.ts');
+    const { readTerminalFailureSummary, readTerminalThresholds, readCheckpointBlockerMap, isSpike, sevenDayMedian, TERMINAL_WINDOW_KEY, TERMINAL_SPIKE_FACTOR_KEY, TERMINAL_SPIKE_MIN_KEY } = tf;
     const thresholds = await readTerminalThresholds(engine);
     const checkpointBlockers = await readCheckpointBlockerMap(engine, sourceIds);
     const summary = await readTerminalFailureSummary(engine, { sourceIds, thresholds, checkpointBlockers });
@@ -305,25 +344,27 @@ export async function terminalFailuresCheck(engine: BrainEngine | null, sourceId
     const daily = Array.from({ length: 7 }, (_, i) => sources.reduce((n, s) => n + (s.daily_7d[i] ?? 0), 0));
     const spike = isSpike(last24h, daily, thresholds);
     const oldest = sources.reduce<number | null>((max, s) => s.unresolved.oldest_age_seconds === null ? max : Math.max(max ?? 0, s.unresolved.oldest_age_seconds), null);
-    const details = { count: blockers.length + defects.reduce((n, d) => n + d.rows, 0), active_blockers: blockers.map(({ action: _a, ...b }) => b),
+    const { ranked, text: ranking } = rankTerminalFailures(sources, remote, tf);
+    const details = { count: blockers.length + defects.reduce((n, d) => n + d.rows, 0), active_blockers: blockers.map(({ action: _a, slug, ...b }) => ({ ...b, ...(!remote && slug ? { slug } : {}) })),
       unresolved: { rows: unresolved, distinct_slugs: sources.reduce((n, s) => n + s.unresolved.distinct_slugs, 0), distinct_intents: sources.reduce((n, s) => n + s.unresolved.distinct_intents, 0),
         oldest_age_seconds: oldest },
       historical_rows: historical, new_last_24h: last24h, spike: { last_24h: last24h, median_7d: sevenDayMedian(daily), daily_7d: daily, spiking: spike },
       defects: defects.map(({ action: _a, ...d }) => d), sources: sources.map(s => ({ source_id: s.source_id, active_blockers: s.active_blockers.length, unresolved: s.unresolved.rows,
-        historical: s.historical_rows, new_last_24h: s.new_last_24h, categories: s.categories })), window_days: summary.window_days, config, docs };
-    const counts = `${blockers.length} active blocker(s), ${unresolved} unresolved row(s) (${details.unresolved.distinct_slugs} page(s), ${details.unresolved.distinct_intents} intent(s)`
-      + `${oldest !== null ? `, oldest ${Math.round(oldest / 3600)} h` : ''}), ${historical} historical non-blocking, ${last24h} in the last 24 h`;
+        historical: s.historical_rows, new_last_24h: s.new_last_24h, categories: s.categories })), ranked, window_days: summary.window_days, config, docs };
+    const counts = `${ranking}${ranking ? ' ' : ''}${last24h} ended in the last 24 h; window ${summary.window_days} d${oldest !== null ? `, oldest unresolved ${Math.round(oldest / 3600)} h` : ''}.`;
+    // A remote caller is told to run the local check, which names each page and its fix; its actions can carry slugs and paths.
+    const hostFix = { argv: ['gbrain', 'doctor', '--only', name, '--json'], consent: [], actor: 'user' as const, requires_exclusive: false, docs,
+      why: 'Run on the brain host: the local report names each blocking page and its fix (a remote caller is not shown page slugs or file paths).' };
     if (blockers.length) {
       const first = blockers[0]!;
-      return { name, status: 'warn', details, fix: { ...first.action, verify: doctorVerify(name) },
-        message: `${blockers.length} write receipt(s) block work right now (${blockers.slice(0, 3).map(b => `${b.kind === 'recovery' ? 'recovery record' : 'checkpoint blocker'} ${b.request_id}`
-          + `${b.slug ? ` (${b.slug})` : ''} on source ${b.source_id}`).join('; ')}). ${counts} in the last ${summary.window_days} d. ${first.action.why}` };
+      return { name, status: 'warn', details, fix: remote ? hostFix : { ...first.action, verify: doctorVerify(name) },
+        message: `${blockers.length} write receipt(s) block work right now. ${counts}${remote ? '' : ` ${first.action.why}`}` };
     }
     if (defects.length) {
       const first = defects[0]!;
-      return { name, status: 'warn', details, fix: { ...first.action, verify: doctorVerify(name) },
+      return { name, status: 'warn', details, fix: remote ? hostFix : { ...first.action, verify: doctorVerify(name) },
         message: `${defects.reduce((n, d) => n + d.rows, 0)} unresolved write receipt(s) in the last ${summary.window_days} d are a gbrain-defect class (${defects.slice(0, 3)
-          .map(d => `${d.category}/${d.code} ×${d.rows} on ${d.source_id}`).join('; ')}). ${counts}. ${first.human_reason ?? first.action.why}` };
+          .map(d => `${d.category}/${d.code} ×${d.rows} on ${d.source_id}`).join('; ')}). ${counts} ${first.human_reason ?? (remote ? hostFix.why : first.action.why)}` };
     }
     const drill = (sourceId: string) => ['gbrain', 'sources', 'writer', 'failures', sourceId, '--group-by', 'category', '--json'];
     if (spike) {
@@ -336,15 +377,18 @@ export async function terminalFailuresCheck(engine: BrainEngine | null, sourceId
         return { name, status: 'warn', details: { ...details, spike: { ...details.spike, older_builds: { rows: older, builds } } },
           fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', owner, '--json'], 'Read-only: names the write owner of the source, its process and the gbrain version it runs.', name, { docs }),
           message: `${last24h} write receipt(s) ended without committing in the last 24 h, above ${thresholds.spikeFactor}× the 7-day median (${sevenDayMedian(daily)}/day), but ${older} of them `
-            + `were written by gbrain ${builds.join(', ') || 'an older build'}, older than the release that fixed their class: an older write owner is still producing these; upgrade or restart it. ${counts}.` };
+            + `were written by gbrain ${builds.join(', ') || 'an older build'}, older than the release that fixed their class: an older write owner is still producing these; upgrade or restart it. ${counts}` };
       }
       return { name, status: 'warn', details,
         fix: agentFix(drill(busiest.source_id), 'Read-only: groups the source\'s unresolved receipts by code, origin and category, each with its fix and drill-down filter.', name, { docs }),
         message: `${last24h} write receipt(s) ended without committing in the last 24 h, above ${thresholds.spikeFactor}× the 7-day median (${sevenDayMedian(daily)}/day; `
-          + `${TERMINAL_SPIKE_FACTOR_KEY}, ${TERMINAL_SPIKE_MIN_KEY}=${thresholds.spikeMin}). ${counts}. Group them: ${drill(busiest.source_id).join(' ')}` };
+          + `${TERMINAL_SPIKE_FACTOR_KEY}, ${TERMINAL_SPIKE_MIN_KEY}=${thresholds.spikeMin}). ${counts} Group them: ${drill(busiest.source_id).join(' ')}` };
+    }
+    if (!unresolved && historical) {
+      return { name, status: 'ok', severity: 'info', details, message: `No write receipt blocks work and none is unresolved. ${counts}` };
     }
     return { name, status: 'ok', details,
-      message: unresolved + historical ? `No write receipt blocks work and no gbrain-defect class is unresolved. ${counts} in the last ${summary.window_days} d.`
+      message: unresolved + historical ? `No write receipt blocks work and no gbrain-defect class is unresolved. ${counts}`
         : `No terminal write failures in the last ${summary.window_days} d.` };
   } catch (error) {
     return checkError(name, 'read terminal write failures', error, { details: { health: 'unknown', docs } });

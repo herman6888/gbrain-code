@@ -37,6 +37,7 @@ import { bodyBlocks } from '../page-body/segment-blocks.ts';
 import { parseTakesFenceBlocks, type StreamedTakes } from '../page-body/segment-takes.ts';
 import type { BodyStorage } from '../page-body/types.ts';
 import { walkMarkdownFiles } from '../../commands/extract.ts';
+import { readMetafilePagesMode } from '../sync.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { withWriteTrust } from '../persistence/context.ts';
 import { derivedWriteTrust, recordTaintEdges } from '../trust/taint.ts';
@@ -257,7 +258,7 @@ export async function extractTakesFromFs(
   const dryRun = opts.dryRun ?? false;
   const slugFilter = opts.slugs && opts.slugs.length > 0 ? new Set(opts.slugs) : null;
 
-  const files = walkMarkdownFiles(opts.repoPath);
+  const files = walkMarkdownFiles(opts.repoPath, await readMetafilePagesMode(engine));
   const buffer: TakeBatchInput[] = [];
 
   for (const { path, relPath } of files) {

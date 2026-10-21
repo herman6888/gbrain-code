@@ -223,6 +223,8 @@ CHECKS=(
   "check:regen-all"
   # v0.50.5.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
   "check:compile-autoload"
+  # The vendored postgres driver's three copies equal pinned upstream plus its patch (networked; a recorded skip offline).
+  "check:vendor-postgres"
 )
 
 # ──────────────────────────────────────────────────────────────────────────

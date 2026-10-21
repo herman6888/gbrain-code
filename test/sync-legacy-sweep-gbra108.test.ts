@@ -143,7 +143,7 @@ for (const backend of testBackends()) {
       installFaultHook(undefined);
       // The first slice's records committed before the stop; the pass recorded no full sweep.
       expect(await recorded(engine)).toBe(LEGACY_SWEEP_SLICE);
-      expect((await passRow(engine))?.obligations.legacy_sweep ?? null).toBeNull();
+      expect((await passRow(engine))?.obligations.legacy_sweep).toEqual({ cursor: `notes/n${String(LEGACY_SWEEP_SLICE - 1).padStart(3, '0')}.md` });
 
       expect((await performManagedSync(engine, OPTS)).status).not.toBe('blocked_by_failures');
       const row = await passRow(engine);

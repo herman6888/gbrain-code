@@ -240,12 +240,14 @@ test('#6735 the committed-sibling lookup reads at most one row per non-committed
 test('#5762 a lock timeout in the validation stays transient contention', async () => each(async engine => {
   const f = await fixture(engine);
   const restore = failValidation(engine, 'lock');
-  try { expect(await performManagedSync(engine, f.opts)).toMatchObject({ status: 'partial', reason: 'writer_pending' }); }
+  // The checkpoint as the pass left it, read under the pass's drain lease. A later attempt of the same request, after the
+  // pass released the lease, is refused revision_conflict (PASS_LEASE_LOST_MESSAGE) by design, so the row is not read afterwards.
+  let result: Awaited<ReturnType<typeof performManagedSync>> | undefined;
+  try { result = await performManagedSync(engine, f.opts); }
   finally { await disposePersistenceConsumer(engine); restore(); }
-  const [checkpoint] = await engine.executeRaw<{ state: string; error_code: string | null }>(
-    "SELECT state,error_code FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_checkpoint'", [f.id]);
-  expect(checkpoint.error_code).toBeNull();
-  expect(['queued', 'running']).toContain(checkpoint.state);
+  // Not terminal (no checkpoint_validation_timeout): released as transient contention and still pending.
+  expect(result).toMatchObject({ status: 'partial', reason: 'writer_pending', managedWrite: { write_error: 'write_pending', reason: 'database_contention' } });
+  expect(['queued', 'running']).toContain(result!.managedWrite!.write_request.state);
   expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
 }), 180_000);
 

@@ -222,8 +222,9 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
         WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash <> ''
         GROUP BY source_id, content_hash
        HAVING count(*) > 1
-        LIMIT 50`,
+        LIMIT 51`,
     );
+    const capped = rows.length > 50, atLeast = capped ? 'At least ' : ''; // #7145: a 51st group makes the counts floors
     if (rows.length === 0) {
       return { name, status: 'ok', message: 'No same-source content-hash duplicate groups' };
     }
@@ -232,7 +233,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     const samples: string[] = [];
     let otherGroupCount = 0;
     const otherSamples: string[] = [];
-    for (const r of rows) {
+    for (const r of rows.slice(0, 50)) {
       const slugs = String(r.slugs).split('|');
       const bare = slugs.filter(s => !s.includes('/'));
       const prefixed = slugs.filter(s => s.includes('/'));
@@ -257,14 +258,14 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
       const sourceNote = pairSources.size === 1 ? '' : ` (pairs span sources ${[...pairSources].sort().join(', ')}; run it once per pair with that pair's source)`;
       const fix = `Fix: GBRAIN_SOURCE=${source} gbrain delete <bare-slug> --force for each pair${sourceNote}.`;
       parts.push(
-        `${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — ` +
+        `${atLeast}${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — ` +
         `usually an import run from the wrong root, which drops the path prefix). ` +
         `Sample: ${samples.join('; ')}. ${fix}`,
       );
     }
     if (otherGroupCount > 0) {
       parts.push(
-        `${otherGroupCount} duplicate-content group(s) with distinct slugs (no bare/nested wrong-root shape). ` +
+        `${atLeast}${otherGroupCount} duplicate-content group(s) with distinct slugs (no bare/nested wrong-root shape). ` +
         `Sample: ${otherSamples.join('; ')}. Review which slug is canonical and consolidate manually — ` +
         `no automatic delete hint (either copy may be the one links point at).`,
       );
@@ -272,10 +273,10 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     return {
       name,
       status: 'warn',
-      message: parts.join(' '),
+      message: parts.join(' ') + (capped ? ' Only the first 50 duplicate groups were read (no setting); fix these and rerun to see the rest.' : ''),
       details: {
         pair_count: pairCount,
-        hash_groups: rows.length,
+        hash_groups: Math.min(rows.length, 50), exact: !capped, ...(capped ? { limit: 50 } : {}),
         sample_pairs: samples,
         distinct_slug_group_count: otherGroupCount,
         sample_distinct_slug_groups: otherSamples,

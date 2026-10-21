@@ -595,28 +595,55 @@ export async function invalidateStaleSignatureEmbeddings(
     });
   }
 
-export async function invalidateContentDriftEmbeddings(
+/** Chunk rows one content-drift batch examines; each batch is one short statement. */
+export const CONTENT_DRIFT_BATCH_ROWS = 5_000;
+
+export interface ContentDriftBatch {
+  /** Candidate rows the batch examined (at most `limit`). */
+  checked: number;
+  /** Rows whose vector it invalidated. */
+  drifted: number;
+  /** Highest chunk id it examined; null when no row lies past `afterChunkId`. */
+  lastChunkId: number | null;
+}
+
+/**
+ * #4246 / #7117: one bounded step of the content-drift sweep. NULL the
+ * embeddings whose stored embed-time hash no longer matches md5(chunk_text)
+ * (the vector was computed from a PREVIOUS content revision), among the
+ * `limit` chunk rows with the lowest ids above `afterChunkId`. The candidate
+ * set is bounded by the primary key before any hash is computed, so a batch
+ * costs the same on a healthy corpus as on a drifted one. Feeds the
+ * NULL-embedding cursor (mirrors the signature invalidation above).
+ * GRANDFATHER: NULL hash (pre-v133 rows) untouched so upgrades don't trigger
+ * a corpus-wide re-embed spike. embed_skip pages excluded: the stale
+ * selectors can't re-embed them, so NULLing would strand them. S2: keyed on
+ * the registry-ACTIVE column (the caller resolves it with the loud resolver).
+ * The cursor and limit are inlined, not bound, so a prepared statement never
+ * switches to a generic plan that scans the whole table (migration-preludes.ts).
+ */
+export async function invalidateContentDriftBatch(
   inTransaction: ChunkTransactionRunner,
   column: string,
-  opts?: { sourceId?: string },
-): Promise<number> {
-    // #4246: NULL embeddings whose stored embed-time hash no longer matches
-    // md5(chunk_text) — the vector was computed from a PREVIOUS content
-    // revision. Feeds the NULL-embedding cursor (mirrors the signature
-    // invalidation above). GRANDFATHER: NULL hash (pre-v133 rows) untouched
-    // so upgrades don't trigger a corpus-wide re-embed spike. embed_skip
-    // pages excluded — the stale selectors can't re-embed them, so NULLing
-    // would strand them (same never-NULL-what-nothing-re-embeds rule as
-    // embedding-invalidation.ts). S2: keyed on the registry-ACTIVE column
-    // (the engine resolves it with the loud resolver).
+  opts: { afterChunkId: number; limit: number; sourceId?: string },
+): Promise<ContentDriftBatch> {
+    const after = Math.trunc(opts.afterChunkId);
+    const limit = Math.trunc(opts.limit);
+    if (!Number.isFinite(after) || !Number.isFinite(limit) || after < 0 || limit < 1) {
+      throw new Error(`invalid content-drift batch window: after ${opts.afterChunkId}, limit ${opts.limit}`);
+    }
     const colId = trustedSql(quoteIdentifier(column));
-    const srcClause = opts?.sourceId !== undefined ? sqlFragment` AND p.source_id = ${opts.sourceId}` : sqlFragment``;
+    const window = trustedSql(`id > ${after} ORDER BY id LIMIT ${limit}`);
+    const srcClause = opts.sourceId !== undefined ? sqlFragment` AND p.source_id = ${opts.sourceId}` : sqlFragment``;
     return inTransaction(async tx => {
-      const sources = await lockEmbeddingSources(tx, opts?.sourceId);
-      const { text, params } = renderFragment(sqlFragment`UPDATE content_chunks cc
+      const sources = await lockEmbeddingSources(tx, opts.sourceId);
+      // chunk-visibility-ok: the drift sweep visits every chunk row by id; the UPDATE's predicates decide eligibility
+      const { text, params } = renderFragment(sqlFragment`WITH b AS (SELECT id FROM content_chunks WHERE ${window}),
+             w AS (UPDATE content_chunks cc
             SET ${colId} = NULL, embedded_at = NULL, embedded_text_hash = NULL, embedding_pending_since = now()
-           FROM pages p
-          WHERE cc.page_id = p.id
+           FROM b, pages p
+          WHERE cc.id = b.id
+            AND cc.page_id = p.id
             AND p.source_id=ANY(${sources}::text[])
             AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)
             AND p.deleted_at IS NULL
@@ -624,9 +651,37 @@ export async function invalidateContentDriftEmbeddings(
             AND cc.embedded_text_hash IS NOT NULL
             AND cc.embedded_text_hash <> md5(cc.chunk_text)
             AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip') AND NOT ${budgetLimited}${srcClause}
-          RETURNING cc.page_id`);
-      return (await tx.executeRaw(text, params)).length;
+          RETURNING 1)
+        SELECT (SELECT max(id) FROM b) AS last_id, (SELECT count(*) FROM b)::int AS checked, (SELECT count(*) FROM w)::int AS drifted`);
+      const [row] = await tx.executeRaw<{ last_id: number | string | null; checked: number | string; drifted: number | string }>(text, params);
+      return {
+        checked: Number(row?.checked ?? 0),
+        drifted: Number(row?.drifted ?? 0),
+        lastChunkId: row?.last_id == null ? null : Number(row.last_id),
+      };
     });
+  }
+
+/**
+ * A whole content-drift pass with no saved cursor, as consecutive bounded
+ * batches (`invalidateContentDriftBatch`), each in its own transaction from
+ * `inTransaction`; a batch shorter than its limit ends the pass. Returns the
+ * chunk count invalidated. The embed paths run the
+ * resumable, budgeted pass in content-drift-sweep.ts instead.
+ */
+export async function invalidateContentDriftEmbeddings(
+  inTransaction: ChunkTransactionRunner,
+  column: string,
+  opts?: { sourceId?: string },
+): Promise<number> {
+    let afterChunkId = 0;
+    let drifted = 0;
+    for (;;) {
+      const batch = await invalidateContentDriftBatch(inTransaction, column, { ...opts, afterChunkId, limit: CONTENT_DRIFT_BATCH_ROWS });
+      drifted += batch.drifted;
+      if (batch.lastChunkId === null || batch.checked < CONTENT_DRIFT_BATCH_ROWS) return drifted;
+      afterChunkId = batch.lastChunkId;
+    }
   }
 
 export async function listStaleChunks(exec: ScopedRead, column: string, opts?: {
@@ -946,8 +1001,8 @@ const normalizeStateRow = compileRowNormalizer<EmbeddingStateRow>({ chunks: 'big
  * prints, to report completeness).
  */
 export async function listEmbeddingStateRows(exec: ScopedRead, column: string,
-  opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number }): Promise<EmbeddingStateRow[]> {
-  const scope = embeddingStateScope(opts.sourceIds);
+  opts: { sourceIds?: string[]; slugs?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number }): Promise<EmbeddingStateRow[]> {
+  const scope = opts.slugs ? sqlFragment`${embeddingStateScope(opts.sourceIds)} AND p.slug = ANY(${opts.slugs}::text[])` : embeddingStateScope(opts.sourceIds);
   const { rows } = await exec.run(sqlFragment`
     SELECT r.slug, r.source_id, r.state, r.chunks, r.bytes, r.embed_skip_reason, r.marker_bytes, r.quarantine_reason, r.deleted_at, r.overdue
       FROM (

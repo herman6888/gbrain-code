@@ -53,12 +53,14 @@ async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<voi
   if (dryRun) {
     // Read-only: the same predicate and DB now() clock as the real purge; only the verb differs.
     if (json) {
-      console.log(JSON.stringify({ dry_run: true, older_than_hours: olderThanHours, count: selection.count, slugs: selection.slugs, ...notes }, null, 2));
+      console.log(JSON.stringify({ dry_run: true, older_than_hours: olderThanHours, count: selection.count, slugs: selection.slugs, sync_unreviewed: selection.sync_unreviewed, ...notes }, null, 2));
       return;
     }
     console.log(`(dry-run) Would purge ${selection.count} page(s) soft-deleted more than ${olderThanHours}h ago.`);
+    // #7130: the automatic purge keeps these; a purged page can only come back from a backup.
+    if (selection.sync_unreviewed) console.log(`  ${selection.sync_unreviewed} of them were deleted by a managed sync, not a person, and no live page has their content; restore any you need first (gbrain restore <slug> --source-id <id> --force). A purged page can only come back from a backup.`);
     for (const p of selection.pages ?? []) console.log(`  ${p.slug}  deleted_at=${p.deleted_at.toISOString()}`);
-    for (const c of selection.candidates) console.log(`  ${c.source_id}/${c.slug}${c.park ? ' (parked; retried once more)' : ''}`);
+    for (const c of selection.candidates) console.log(`  ${c.source_id}/${c.slug}${c.park ? ' (parked; retried once more)' : ''}${c.sync_unreviewed ? ' (deleted by a managed sync; no live twin)' : ''}`);
     for (const p of selection.parked.filter(park => !park.retried)) console.log(`  parked: ${p.source_id}/${p.slug} after ${p.failures} failures (${p.code ?? 'error'}); skipped unless --retry-parked`);
     for (const b of selection.blocked.filter(entry => entry.code === 'writer_not_active')) console.log(`  waiting: ${b.source_id}/${b.slug}: ${b.reason}`);
     return;
@@ -75,7 +77,7 @@ async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<voi
     }
     return;
   }
-  const authorized = await consentGate(purgeConsentRequest(selection.count, olderThanHours, json, args, retryParked, retried), { json });
+  const authorized = await consentGate(purgeConsentRequest(selection.count, olderThanHours, json, args, retryParked, retried, selection.sync_unreviewed), { json });
   if (!authorized) return;
 
   const result = await purgeDeletedPagesCoordinated(engine, olderThanHours, { retryParked });

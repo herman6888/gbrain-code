@@ -7,7 +7,9 @@
  *    running with a reference-only intent and its staging prepared; once the
  *    dead claim lapses, the next run's owner prepares the request again from
  *    its `body_ref` (re-streaming and re-verifying the file) and publishes the
- *    page byte-identical, and segment GC collects the dead staging.
+ *    page byte-identical (its receipt says `searchable: 'pending'`, #7106; it
+ *    seals once the build the owner tracks ends, which the consumer's stop
+ *    waits for), and segment GC collects the dead staging.
  * 2. Fails when: the journal needs the body to re-prepare, the dead staging
  *    blocks the re-preparation, or GC keeps it.
  * Seams: test/fixtures/convergence-fault-kill.ts preloaded into the child (the
@@ -93,6 +95,10 @@ test('an owner killed between preparation and publication: the next run re-prepa
   let result = await performManagedSync(engine, { sourceId, noPull: true, noEmbed: true });
   for (let pass = 0; result.status === 'partial' && pass < 30; pass++) result = await performManagedSync(engine, { sourceId, noPull: true, noEmbed: true });
   expect(result.status).toBe('first_sync');
+  const [receipt] = await engine.executeRaw<{ outcome: Record<string, unknown> }>(
+    "SELECT outcome FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_import'", [sourceId]);
+  expect(receipt!.outcome).toMatchObject({ status: 'created', searchable: 'pending', projection: 'pending' });
+  await disposePersistenceConsumer(engine);
   const { page, body, hash } = await reconstructedPage(engine, 'notes/huge', sourceId);
   expect(page.body_storage).toBe('segmented');
   expect(body.compiled_truth).toBe(parseMarkdown(huge, 'notes/huge.md').compiled_truth);

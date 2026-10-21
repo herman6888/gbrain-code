@@ -37,6 +37,8 @@ import { recordSyncImportProvenance, type SyncImportProvenanceBase } from './syn
 import type { WriteRequest } from './model.ts';
 import type { SyncIntent, SyncPreparedMutation } from './sync-prepare.ts';
 import { bindOrigin } from './origin-guard.ts';
+import { segmentedOutcome } from './searchable.ts';
+import { isQuarantined } from '../quarantine.ts';
 
 /** A frozen Markdown file over the single-string ceiling: the bytes the owner streams and verifies. */
 export interface SyncBodyRef { kind: 'git_blob' | 'input_file'; sha256: string; bytes: number; blob_oid: string }
@@ -123,7 +125,7 @@ export async function prepareManagedSyncStreamed(engine: BrainEngine, row: Write
       // The page moves first, keeping its id, links and history; the import prepared at the new path then applies to it.
       if (renamed && await tx.updateSlug(renamed.slug, row.slug, source) !== 1) throw refuse('page_identity_changed', 'The renamed page could not move to its new slug.',
         `Page ${renamed.slug} could not move to ${row.slug}.`);
-      await prepared.apply(tx);
+      const applied = await prepared.apply(tx);
       // An unchanged body keeps its chunks (the no-op required a sealed page), so the move's new revision is sealed here.
       if (renamed && prepared.noop) await sealSegmentedPage(tx, renamed.pageId);
       await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: p.sourcePath });
@@ -138,7 +140,7 @@ export async function prepareManagedSyncStreamed(engine: BrainEngine, row: Write
       const live = final && final.page.deleted_at == null ? final.page : null;
       return { status: renamed ? 'renamed' : prepared.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: prepared.result.chunks, noop: prepared.noop && !renamed, imported_file: true, ...(renamed ? { renamed_from: renamed.slug } : {}),
-        ...(prepared.noop ? {} : await sizeStateField(tx, row.source_id, row.slug, live)) };
+        ...(prepared.noop ? {} : { ...await sizeStateField(tx, row.source_id, row.slug, live), ...segmentedOutcome(applied?.segmented, isQuarantined(prepared.frontmatter)) }) };
     } };
   return mutation;
 }

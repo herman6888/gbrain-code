@@ -55,6 +55,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'withScopedReadTransaction': OOS.helper,
   'jitOffRead': OOS.helper,
   'connect': OOS.lifecycle,
+  'connectedDatabaseUrl': OOS.lifecycle,
   'disconnect': OOS.lifecycle,
   'disconnectInternal': OOS.helper,
   'initSchema': OOS.lifecycle,

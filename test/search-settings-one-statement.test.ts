@@ -119,15 +119,16 @@ describe('PostgresEngine.searchKeyword: statements per search transaction', () =
     return { engine, transactions };
   }
 
-  test('strict attempt: settings then query; OR fallback: the same two, with enable_seqscan off in the one settings statement', async () => {
+  test('strict attempt: settings then query; OR fallback: the same two, with enable_seqscan off in the one settings statement (work_mem in both, GBRA-156)', async () => {
     const { engine, transactions } = recordingEngine();
     expect(await engine.searchKeyword('alpha beta', { orFallback: true })).toEqual([]);
     expect(transactions).toHaveLength(2);
     const [strict, relaxed] = transactions.map(statements => statements.map(s => s.sql.trim().split('\n')[0]!.slice(0, 60)));
     expect(strict).toEqual(["SELECT set_config('jit', $1, true), set_config('statement_ti", 'WITH ranked_chunks AS (']);
     expect(relaxed).toEqual(["SELECT set_config('jit', $1, true), set_config('statement_ti", 'WITH ranked_chunks AS (']);
-    expect(transactions[0]![0]!.params).toEqual(['off', '8000ms']);
-    expect(transactions[1]![0]!.sql).toBe("SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true), set_config('enable_seqscan', $3, true)");
-    expect(transactions[1]![0]!.params).toEqual(['off', '8000ms', 'off']);
+    expect(transactions[0]![0]!.sql).toBe("SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true), set_config('work_mem', $3, true)");
+    expect(transactions[0]![0]!.params).toEqual(['off', '8000ms', '32MB']);
+    expect(transactions[1]![0]!.sql).toBe("SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true), set_config('enable_seqscan', $3, true), set_config('work_mem', $4, true)");
+    expect(transactions[1]![0]!.params).toEqual(['off', '8000ms', 'off', '32MB']);
   });
 });

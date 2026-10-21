@@ -50,6 +50,7 @@ import { proactiveEligibility } from '../eligibility/registry.ts';
 import { pageActivationVerdicts, pageKey, suppressionSummary, type SuppressionSummary } from '../eligibility/activation.ts';
 import { renderTrustedInline, trustFields, type TrustFields } from '../eligibility/labels.ts';
 import { TURN_CONTEXT_ENVELOPE } from './turn-context-envelope.ts';
+import { neutralizeForPrompt } from '../think/sanitize.ts';
 
 /**
  * v0.45.7 ambient recall (issue #1). The per-turn assembler is extended into the
@@ -508,7 +509,7 @@ function render(
     lines.push('', '## Hot memory (recent facts)');
     for (const f of facts) {
       const ent = f.entity_slug ? ` [${f.entity_slug}]` : '';
-      lines.push(`- ${f.trust_tier ? renderTrustedInline(f.fact, labelOf(f)) : f.fact}${ent} (${f.confidence.toFixed(2)})`);
+      lines.push(`- ${f.trust_tier ? renderTrustedInline(neutralizeForPrompt(f.fact).text, labelOf(f)) : neutralizeForPrompt(f.fact).text}${ent} (${f.confidence.toFixed(2)})`);
     }
   }
   return lines.join('\n');
@@ -916,7 +917,7 @@ export const renderCardLine = (c: EntityCard, home?: string): string =>
 export const renderThreadLine = (t: EntityOpenThread): string =>
   `- [${t.kind}] ${labeled(t, t.text)}${t.date ? ` (${t.date})` : ''}`;
 export const renderFactLine = (f: TurnContextFact): string =>
-  `- ${f.attributed_to === 'assistant' ? '(assistant said) ' : ''}${labeled(f, f.fact)}${f.entity_slug ? ` [${f.entity_slug}]` : ''} (${f.confidence.toFixed(2)})`;
+  `- ${f.attributed_to === 'assistant' ? '(assistant said) ' : ''}${labeled(f, neutralizeForPrompt(f.fact).text)}${f.entity_slug ? ` [${f.entity_slug}]` : ''} (${f.confidence.toFixed(2)})`;
 export const renderPageLine = (p: DeltaPage): string => `- **${labeled(p, p.title)}** → \`${p.slug}\` (${p.updated_at})`;
 
 /** One card's newer-mentions block: a line naming the entity and its page date, then one line per page. [] when there are none. */

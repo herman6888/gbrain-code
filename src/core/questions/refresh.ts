@@ -31,6 +31,7 @@ import { entityAnchoredPages, prefixAnchoredPages } from '../search/entity-ancho
 import { quarantinedProvenanceFilterFragment, quarantineFilterFragment } from '../quarantine.ts';
 import { FACT_HASH_SQL, OWNER_BODY_HASH_SQL, TAKE_HASH_SQL, TIMELINE_HASH_SQL, evaluateAnswer, type EvidenceKind } from './freshness.ts';
 import { ownerClaims, readQuestionPage } from './pages.ts';
+import { neutralizeForPrompt } from '../think/sanitize.ts';
 import { acquireLease, getPin, pinId, releaseLease, type AnswerSentence, type PinRow } from './store.ts';
 
 export type BlockedReason = 'no_model_key' | 'budget_exhausted' | 'no_worker' | 'refresh_failed' | 'awaiting_consent';
@@ -207,7 +208,7 @@ export async function retrieveEvidence(engine: BrainEngine, pin: PinRow): Promis
        ORDER BY f.valid_from DESC, f.id DESC LIMIT ${MAX_FACTS}`, [pin.source_id, entitySlugs]);
     for (const f of facts) {
       push({ kind: 'fact', source_id: pin.source_id, page_id: null, page_slug: f.entity_slug, page_generation: null, page_revision: null,
-        item_id: Number(f.id), content_hash: f.hash, text: `[fact about ${f.entity_slug ?? 'unknown'}, from ${String(f.valid_from).slice(0, 10)}] ${f.fact}` });
+        item_id: Number(f.id), content_hash: f.hash, text: `[fact about ${f.entity_slug ?? 'unknown'}, from ${String(f.valid_from).slice(0, 10)}] ${neutralizeForPrompt(f.fact).text}` });
     }
   }
   if (pageIds.length > 0) {

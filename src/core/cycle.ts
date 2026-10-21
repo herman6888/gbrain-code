@@ -1678,7 +1678,7 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
         // In dry-run, this counts pages with stale chunks that would
         // have been processed (same semantic as a real run).
         pages_embedded_count: dryRun ? result.pages_processed : embeddedCount > 0 ? result.pages_processed : 0,
-        failures: result.failures,
+        failures: result.failures, ...(result.content_drift ? { content_drift: result.content_drift } : {}),
         ...(failed ? { failure_samples: result.failure_samples, fix: embedBackfillFix({ backlog: result.failures, verifyCheck: 'embeddings' }) } : {}),
       },
     };
@@ -1698,7 +1698,8 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
  * v0.26.5 — purge phase. Hard-deletes:
  *  - source rows where `archived = true AND archive_expires_at <= now()`
  *    (paired with the cascade FK to `pages`, this also drops the source's pages)
- *  - page rows where `deleted_at` is older than 72h
+ *  - page rows where `deleted_at` is older than `purge.retention_hours` (default 72h), except
+ *    managed sync tombstones with no live twin (#7130), which wait for `gbrain pages purge-deleted`
  *
  * Cascade on `pages` covers `content_chunks`, `page_links`, `chunk_relations`.
  * `dryRun` short-circuits — no DELETEs are issued.
@@ -1753,13 +1754,15 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         details: { dry_run: true, purged_sources_count: 0, purged_pages_count: 0, purged_orphan_clones_count: 0 },
       };
     }
-    const [{ purgeExpiredSources }, { purgeDeletedPagesCoordinated, purgePhaseNote, purgePhaseStatus }] = await Promise.all([import('./destructive-guard.ts'), import('./persistence/purge-deleted.ts')]);
+    const [{ purgeExpiredSources }, { purgeDeletedPagesCoordinated, purgePhaseNote, purgePhaseStatus }, { readPurgeRetentionHours }] = await Promise.all([import('./destructive-guard.ts'), import('./persistence/purge-deleted.ts'), import('./sync-reconcile.ts')]);
     // gbrain#4115: {purged, blocked} — a RESTRICT-FK-held source (revoked
     // oauth_client, v64) is reported and skipped instead of aborting the sweep.
     const purgeResult = await purgeExpiredSources(engine);
     const purgedSources = purgeResult.purged;
-    const purgedPages = await purgeDeletedPagesCoordinated(engine, SOFT_DELETE_TTL_HOURS_FOR_PURGE); // #5405: coordinated on managed brains
-    const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    const retentionHours = await readPurgeRetentionHours(engine); // #7130: purge.retention_hours (default 72, never less)
+    // #5405: coordinated on managed brains; #7130: `automatic` keeps managed sync tombstones with no live twin.
+    const purgedPages = await purgeDeletedPagesCoordinated(engine, retentionHours, { automatic: true });
+    const purgedClones = await purgeOrphanClones(retentionHours);
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
     // 7-day TTL is deliberately generous; any reasonable long-running op
     // finishes inside that window. Cheap (few KB per row).
@@ -1845,10 +1848,6 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     };
   }
 }
-
-/** v0.26.5: matches SOFT_DELETE_TTL_HOURS in destructive-guard.ts. Inlined here
- *  to avoid a static import (purge phase is only loaded in the autopilot path). */
-const SOFT_DELETE_TTL_HOURS_FOR_PURGE = 72;
 
 async function runPhaseOrphans(engine: BrainEngine, sourceId?: string): Promise<PhaseResult> {
   try {

@@ -73,7 +73,7 @@ export const DATABASE_REFUSAL_HINT = 'This is not a content conflict: a gbrain p
 /** #5974: another database trigger (named in write_error_detail.raiser) refused the write. */
 /** #6719: an owner exception's recorded identity (class, errno, frame, build) does not name its cause; nothing proves the database refused it. */
 export const ownerExceptionHint = (requestId: string) => 'An unexpected owner exception ended this write and nothing was committed; its cause is unknown from the recorded identity alone. '
-  + `On the brain host run gbrain write-request ${requestId} --json and read error_detail (error_class, errno, frame, attempt.consumer_version) beside the persistence consumer log; `
+  + `On the brain host run gbrain write-request ${requestId} --json and read error_detail (error_class, errno, frame, attempt.consumer_version, and for a database error its redacted error_text, statement and position) beside the persistence consumer log; `
   + 'report that identity and the gbrain version on the issue tracker, and upgrade when a fix ships. Do not replay the old intent to diagnose it.';
 
 /** #6719: an origin that names no database refusal (or none at all) stays unknown rather than read as a trigger. */

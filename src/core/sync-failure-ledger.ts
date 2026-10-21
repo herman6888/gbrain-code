@@ -15,7 +15,7 @@
 //      forever — without ever silently dropping a FRESH failure, and
 //      never auto-skipping an infra sentinel like `<head>`.
 //
-// This module is a LEAF (imports only fs/path/crypto/config and the import-free
+// This module is a LEAF (imports only fs/os/path/crypto/config and the import-free
 // ai/errors.ts) so it can be
 // re-exported from sync.ts without a circular dependency. The state lives
 // in `~/.gbrain/sync-failures.jsonl`, one JSON object per line.
@@ -51,7 +51,9 @@ import {
   closeSync as _closeSync,
   unlinkSync as _unlinkSync,
   statSync as _statSync,
+  mkdtempSync as _mkdtempSync,
 } from 'fs';
+import { tmpdir as _tmpdir } from 'os';
 import { join as _joinPath } from 'path';
 import { gbrainPath as _gbrainPath } from './config.ts';
 import { createHash as _createHash } from 'crypto';
@@ -405,7 +407,27 @@ export function formatFailedFileList(
  * unset-fallback behavior directly).
  */
 function _failuresDir(): string {
-  return process.env.GBRAIN_SYNC_FAILURES_DIR || _gbrainPath();
+  if (process.env.GBRAIN_SYNC_FAILURES_DIR) return process.env.GBRAIN_SYNC_FAILURES_DIR;
+  if (process.env.NODE_ENV === 'test' && !process.env.GBRAIN_HOME) return _testScratchDir();
+  return _gbrainPath();
+}
+
+let _testScratch: string | null = null;
+
+/**
+ * #7144: `bun test` loads `bunfig.toml` (and so every isolation preload) only
+ * from the directory it starts in, so a run started in `test/` or outside the
+ * repo set neither GBRAIN_SYNC_FAILURES_DIR nor GBRAIN_HOME, and broken-fixture
+ * sync tests appended their rows (`srcE / notes/bad.md SLUG_MISMATCH`) to the
+ * operator's real ledger. Bun sets NODE_ENV=test for every test run, so with
+ * neither override a test process gets its own scratch ledger instead.
+ */
+function _testScratchDir(): string {
+  if (!_testScratch) {
+    _testScratch = _mkdtempSync(_joinPath(_tmpdir(), 'gbrain-test-syncfail-'));
+    process.stderr.write(`[sync-failures] NODE_ENV=test without GBRAIN_SYNC_FAILURES_DIR or GBRAIN_HOME (bun test started outside the repo root?): this run's sync failure ledger is ${_testScratch}, not the real one.\n`);
+  }
+  return _testScratch;
 }
 
 export function syncFailuresPath(): string {

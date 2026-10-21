@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 252798,
-    "stdoutSha256": "71b348f0e16ec33eeb7b856a2fa24821a5f971503416d541e00226572381ab56",
+    "stdoutBytes": 254763,
+    "stdoutSha256": "f6d6005ad68241f8e95fac4a2f61f62b074fd5a0a76206e8e410a02d425692df",
     "toolNames": [
       "remember",
       "entity",
@@ -120,6 +120,7 @@
       "sources_remove",
       "sources_status",
       "sources_inspect",
+      "sources_resolve_path",
       "request_tools",
       "get_recent_salience",
       "find_anomalies",
@@ -718,7 +719,7 @@
         "scope": "write"
       },
       {
-        "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; truncated: continue with updated_after + updated_after_slug from the last row.",
+        "description": "List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. Default 50; truncated: continue with updated_after + updated_after_slug from the last row.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -727,12 +728,14 @@
           "include_deleted": "boolean?",
           "limit": "number?",
           "offset": "number?",
+          "slug_prefix": "string?",
           "sort": "string?",
           "source_id": "string?",
           "tag": "string?",
           "type": "string?",
           "updated_after": "string?",
-          "updated_after_slug": "string?"
+          "updated_after_slug": "string?",
+          "where": "object?"
         },
         "required_scopes": [],
         "schema": {
@@ -748,6 +751,10 @@
             "offset": {
               "description": "Rows to skip.",
               "type": "number"
+            },
+            "slug_prefix": {
+              "description": "Literal slug prefix, e.g. 'deals/'.",
+              "type": "string"
             },
             "sort": {
               "description": "Default updated_desc.",
@@ -778,6 +785,10 @@
             "updated_after_slug": {
               "description": "Last row's slug (with updated_after).",
               "type": "string"
+            },
+            "where": {
+              "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any.",
+              "type": "object"
             }
           },
           "required": [],
@@ -1587,7 +1598,8 @@
           "snippet_chars": "number?",
           "source_id": "string?",
           "token_budget": "number?",
-          "types": "array?"
+          "types": "array?",
+          "where": "object?"
         },
         "required_scopes": [],
         "schema": {
@@ -1691,6 +1703,10 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "where": {
+              "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any.",
+              "type": "object"
             }
           },
           "required": [
@@ -1701,7 +1717,7 @@
         "scope": "read"
       },
       {
-        "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; expand adds multi-query expansion (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
+        "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; adds fact rows. expand: one LLM call (expansion recovers synonyms; rarely helps). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper. Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1737,7 +1753,8 @@
           "token_budget": "number?",
           "types": "array?",
           "until": "string?",
-          "walk_depth": "number?"
+          "walk_depth": "number?",
+          "where": "object?"
         },
         "required_scopes": [],
         "schema": {
@@ -1769,7 +1786,7 @@
               "type": "string"
             },
             "expand": {
-              "description": "Default off; search.expansion overrides.",
+              "description": "Default off; one LLM call, rarely helps.",
               "type": "boolean"
             },
             "explain": {
@@ -1903,6 +1920,10 @@
             "walk_depth": {
               "description": "Code walk depth 1-2.",
               "type": "number"
+            },
+            "where": {
+              "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any.",
+              "type": "object"
             }
           },
           "required": [],
@@ -5420,6 +5441,39 @@
           },
           "required": [
             "path"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
+      },
+      {
+        "description": "Read-only: what gbrain did with each file path of a source, by its own rules. Per path: the slug sync gives it, whether sync skips it (metafile, excluded, pruned) and why, its sync hold, its page with chunk and embedding counts, whether search finds it now, and the command that moves it on. A deleted path is checked by the page that records it as its origin, never by slug. Use it in landing checks instead of re-implementing slugging. Confined to the caller's source scope.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "sources_resolve_path",
+        "parameters": {
+          "id": "string",
+          "paths": "array"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "id": {
+              "description": "Source id, as listed by sources_list (e.g. 'default').",
+              "type": "string"
+            },
+            "paths": {
+              "description": "File paths relative to the source root (or to the Git top level), at most 200, e.g. the paths a commit changed.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "paths"
           ],
           "type": "object"
         },

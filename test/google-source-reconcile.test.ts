@@ -1491,6 +1491,9 @@ describe('loops_extract enqueue completeness', () => {
           const { result: byName, err } = await capturedStderr(() => sweep(dir, fx, vault, { full: true }));
           expect(byName.loops_enqueue).toMatchObject({ enqueued: 0, skipped_reason: 'excluded_label_unresolved' });
           expect(err).toContain("could not read the account's labels");
+          // #7073: a failed list never claims the name is not a label of the account.
+          expect(err).toContain('"Newsletters" could not be checked against the labels of a@example.com (the label list failed');
+          expect(err).not.toContain('is not a label');
         });
       } finally {
         await engine.setConfig('loops.extraction_exclude_labels', '');

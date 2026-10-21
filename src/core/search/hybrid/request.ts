@@ -92,6 +92,10 @@ export interface HybridRequest {
   rerankMeta?: { model_resolved: string };
   /** Set by the relational arm when the multi-hop planner ran (meta.relational_plan). */
   relationalPlan?: import('../relational-recall.ts').RelationalPlanMeta;
+  /** Set by the collapse stage when it folded or read in a row (meta.collapse). */
+  collapse?: import('../collapse.ts').CollapseDecision;
+  /** Page facts the collapse stage read, reused by its second pass after the identity tiers. */
+  collapseFacts?: Map<number, import('../collapse.ts').PageFacts>;
   /** The op's stage-timing collector (`opts._timings`), or the no-op timer. */
   timer: StageTimer;
 }
@@ -232,6 +236,8 @@ export async function resolveHybridRequest(
     // type filter to SQL level so the limit budget goes to candidate-typed
     // pages instead of being eaten by note/transcript/article pages.
     types: opts?.types,
+    // #7159: frontmatter equality, pushed into the same legs.
+    where: opts?.where,
     // Exact-slug and prefix exclusions are caller contract too (grade-takes
     // passes exclude_slugs; SDK callers pass prefix excludes); dropping them
     // here silently ignored them on every arm.
@@ -287,6 +293,7 @@ export async function resolveHybridRequest(
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
     // do NOT set this. Knob: search.keywordOrFallback (rationale: ModeBundle).
     orFallback: resolvedMode.keywordOrFallback,
+    onKeywordIncomplete: (reason) => pushDegraded(degraded, 'keyword_candidates_incomplete', reason),
     // v0.46.15: collect searchVector's bounded-escalation exhaustion signal —
     // engines have no telemetry sink (R2-10); hybrid owns the meta emit.
     // ACCUMULATES across vector calls (adversarial F8): expansion runs N
@@ -364,10 +371,11 @@ export function emitHybridMeta(req: HybridRequest, armMeta: HybridSearchMeta): v
   const rawMeta = req.keywordCandidates ? { ...armMeta, keyword_candidates: req.keywordCandidates } : armMeta;
   const decide = decideMetaFor(req.decide);
   const answerability = req.decide?.answerability;
-  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan
+  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan || req.collapse
     ? {
         ...rawMeta, ...(decide ? { decide } : {}), ...(req.rerankMeta ? { rerank: req.rerankMeta } : {}),
         ...(answerability ? { answerability } : {}), ...(req.relationalPlan ? { relational_plan: req.relationalPlan } : {}),
+        ...(req.collapse ? { collapse: req.collapse } : {}),
       }
     : rawMeta;
   try {

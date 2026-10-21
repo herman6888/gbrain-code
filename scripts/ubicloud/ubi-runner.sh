@@ -39,6 +39,12 @@
 # Stale-VM sweeps are off by default. With UBI_GC_HOURS set to a positive
 # number, every `up` first destroys this owner's VMs older than that; `gc HOURS`
 # runs the same sweep on demand. Neither ever touches another owner's VMs.
+#
+# "This owner's VMs" (`list --mine`, `gc`, the `up` sweep) are the VMs tagged
+# with the caller's owner tag plus every VM this machine created under any tag:
+# `up` keeps a VM's state here until `down` confirms it gone, so a run started
+# with UBI_OWNER=x whose teardown never ran is still found by a later call that
+# did not export the same UBI_OWNER.
 set -Eeuo pipefail
 # Keep heredoc bodies on temp files, not the pipe window (test/heredoc-pipe-deadlock.test.ts).
 BASH_COMPAT=50
@@ -170,15 +176,22 @@ vm_rows() {
   done
 }
 
+# mine_rows: vm_rows for the VMs tagged with this owner or created from this machine (their `up` state is still here).
+mine_rows() {
+  local loc name owner
+  vm_rows | while read -r loc name owner; do
+    if [ "$owner" = "$OWNER" ] || [ -f "$(state_dir "$name")/env" ]; then echo "$loc $name $owner"; fi
+  done
+}
+
 cmd_gc() {
   local hours=${1:-$GC_HOURS} now loc name owner
   if ! [[ "$hours" =~ ^[0-9]+$ ]] || [ "$hours" -eq 0 ]; then die "gc: give HOURS > 0 (or set UBI_GC_HOURS)"; fi
   now=$(date +%s)
-  vm_rows | while read -r loc name owner; do
-    [ "$owner" = "$OWNER" ] || continue
+  mine_rows | while read -r loc name owner; do
     [[ "$name" =~ -([0-9]{10})- ]] || continue
     if [ $(( (now - BASH_REMATCH[1]) / 3600 )) -ge "$hours" ]; then
-      log "destroying stale $loc/$name (owner $OWNER, older than ${hours}h)"
+      log "destroying stale $loc/$name (owner $owner, older than ${hours}h)"
       cmd_down "$name" -l "$loc" || log "failed to destroy $loc/$name"
     fi
   done
@@ -187,7 +200,12 @@ cmd_gc() {
 cmd_list() {
   case ${1:-} in
     "") cli vm list ;;
-    --mine) vm_rows | awk -v o="$OWNER" '$3==o {print $1 "  " $2}' ;;
+    --mine)
+      local rows others
+      rows=$(mine_rows)
+      others=$(printf '%s\n' "$rows" | awk -v o="$OWNER" 'NF && $3!=o {print $3}' | sort -u | paste -sd, -)
+      log "list --mine: owner tag $OWNER plus VMs this machine created${others:+ (also under: $others)}"
+      [ -z "$rows" ] || printf '%s\n' "$rows" | awk '{print $1 "  " $2}' ;;
     *) die "list: unknown option $1 (use --mine)" ;;
   esac
 }

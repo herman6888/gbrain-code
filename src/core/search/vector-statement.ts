@@ -61,6 +61,7 @@ import type { SearchOpts } from '../types.ts';
 import { hnswIndexExpected } from '../vector-index.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
 import { buildVectorCastFragment, normalizeEngineColumn } from './embedding-column.ts';
+import { frontmatterWhereClauses } from './frontmatter-where.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import { buildBestPerPagePoolCte, buildHardExcludeClause, buildSourceFactorCase, buildVisibilityClause } from './sql-ranking.ts';
 import { chunkGenerationProbe } from './safe-chunks.ts';
@@ -304,6 +305,7 @@ export function buildVectorSearchStatement(input: VectorSearchStatementInput): V
   if (opts?.type) filters.push(`AND p.type = ${bind(opts.type)}`);
   // v0.33: multi-type filter for whoknows, AND-applied with `type`.
   if (opts?.types && opts.types.length > 0) filters.push(`AND p.type = ANY(${bind(opts.types)}::text[])`);
+  filters.push(...frontmatterWhereClauses('p', opts?.where, bind));
   if (opts?.exclude_slugs?.length) filters.push(`AND p.slug != ALL(${bind(opts.exclude_slugs)}::text[])`);
   if (opts?.language) filters.push(`AND cc.language = ${bind(opts.language)}`);
   if (opts?.symbolKind) filters.push(`AND cc.symbol_type = ${bind(opts.symbolKind)}`);
@@ -333,7 +335,7 @@ export function buildVectorSearchStatement(input: VectorSearchStatementInput): V
   // the caller narrowing the search; the walk would usually come back short,
   // so those keep the joined statement alone.
   const share = input.scope?.share, chunks = input.scope?.chunks;
-  const narrowed = !!(opts?.type || opts?.types?.length || opts?.afterDate || opts?.beforeDate)
+  const narrowed = !!(opts?.type || opts?.types?.length || opts?.where || opts?.afterDate || opts?.beforeDate)
     || (share !== undefined && share < INDEX_WALK_MIN_SCOPE_SHARE);
   const scopeScan = relaxed && share !== undefined && share < SCOPE_SCAN_MAX_SHARE && chunks !== undefined && chunks <= SCOPE_SCAN_MAX_CHUNKS;
   const walk = relaxed && !narrowed && !(scopeScan && chunks! <= SCOPE_SCAN_FIRST_MAX_CHUNKS);

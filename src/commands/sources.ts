@@ -1921,6 +1921,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'set-path':   { const { runSetPath } = await import('./sources-set-path.ts'); return runSetPath(engine, rest); }
     case 'shared-skills': { const { runSourcesSharedSkills } = await import('./sources-shared-skills.ts'); return runSourcesSharedSkills(engine, rest); }
     case 'retry-held': { const { runRetryHeld } = await import('./sources-retry-held.ts'); return runRetryHeld(engine, rest); }
+    case 'resolve-path': { const { runResolvePath } = await import('./sources-resolve-path.ts'); return runResolvePath(engine, rest); }
     case 'reset-upstream': { const { runResetUpstream } = await import('./sources-reset-upstream.ts'); return runResetUpstream(engine, rest); }
     case 'audit':      return runAudit(engine, rest);
     // v0.46 github-source demo (offline, privacy-clean fixtures)
@@ -2016,6 +2017,8 @@ Subcommands:
                                     Runs nothing now. Most Git holds re-screen by themselves (file changed or deleted, newer gbrain); fix
                                     frontmatter holds with gbrain repair frontmatter --source <id>; preview fence holds (invalid_fence) with gbrain repair fences --source <id>.
                                     --unindexed instead schedules committed files with no page and no hold (doctor unindexed_files).
+  resolve-path <id> <path...> [--stdin] [--json]
+                                    Read-only: the slug, skip, hold, page and search state gbrain gives each file path (for landing checks).
   reset-upstream <id> --expect-local <sha> --expect-upstream <sha> [--dry-run] [--json]  After an upstream force-push (upstream_rewritten): back up HEAD, reset to upstream.
   shared-skills <id> on|off|status [--json]
                                     Opt a source out of (or back into) shared-skills adoption; status explains its effective policy.

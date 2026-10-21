@@ -44,6 +44,7 @@ export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
   { key: 'persistence.database_only_sources', reason: 'list maintained by gbrain sources writer activate/deactivate; config unset (which takes any key) is the documented escape hatch' },
   { key: 'persistence.maintenance.last_compaction', reason: 'receipt compaction pass cursor (compaction-pass.ts)' },
   { key: 'persistence.true_up.compacted_through', reason: 'receipt true-up cursor (receipt-true-up.ts)' },
+  { key: 'sync.metafile_pages.applied.', prefix: true, reason: 'per-source marker of the sync.metafile_pages mode a classic sync last applied, so a flip to typed backfills once (sync-metafile-pages.ts)' },
   { key: 'sync.slug_root_mode', reason: 'legacy unsourced slug-root mode stamped by sync (sync-anchor.ts); sourced brains keep it on the sources row' },
   { key: 'transcripts.secret_audit', reason: 'cached transcript secret-audit result (transcripts/secret-audit.ts)' },
   { key: 'trust.backfill_completed_at', reason: 'memory-trust backfill completion marker' },

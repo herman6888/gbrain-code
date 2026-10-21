@@ -1085,3 +1085,19 @@ describe('PeopleClient', () => {
     expect((thrown as GoogleCursorExpiredError).status).toBe(410);
   });
 });
+
+// ── Calendar event privacy (fail closed) ─────────────────────────────────────
+
+describe('CalendarClient event privacy', () => {
+  test('Google private and confidential events map to private; default and public do not', async () => {
+    const h = makeHarness(() => json({
+      items: ['private', 'confidential', 'default', 'public', undefined].map((visibility, i) => ({
+        id: `ev${i}`, summary: `Event ${i}`, start: { dateTime: '2026-10-01T10:00:00Z' }, end: { dateTime: '2026-10-01T11:00:00Z' },
+        ...(visibility ? { visibility } : {}),
+      })),
+      nextSyncToken: 'sync-1',
+    }));
+    const { events } = await new CalendarClient(h.tokens, h.fetchImpl).listEvents('a@example.com', { timeMinIso: '2026-09-01T00:00:00Z' });
+    expect(events.map((e) => [e.id, e.private])).toEqual([['ev0', true], ['ev1', true], ['ev2', false], ['ev3', false], ['ev4', false]]);
+  });
+});

@@ -238,7 +238,7 @@ export async function runServe(
   // 'verbs' exposes exactly the seven protocol verbs (the quickstart surface);
   // 'starter' the ~20-op daily-driver set; 'full' keeps every operation.
   const { parseSurfaceFlag, resolveSurfaceWithSource, resolveStdioSurface, parseAccessFlag, SURFACE_SOURCE_LABEL } = await import('../mcp/surface.ts');
-  const { loadConfig } = await import('../core/config.ts');
+  const { loadConfig, MERGED_CONFIG_BY_ENGINE } = await import('../core/config.ts');
   const surfaceFlag = parseSurfaceFlag(args);
   const resolved = isHttp ? resolveSurfaceWithSource(surfaceFlag, loadConfig()) : resolveStdioSurface(surfaceFlag, loadConfig());
   const surface = resolved.surface;
@@ -278,6 +278,8 @@ export async function runServe(
   // binding is deliberate or unambiguous — sole-source brains are a pure
   // no-op. Stdio-only: the OAuth HTTP path scopes writes per token instead.
   const sourceGuard = args.includes('--source-guard');
+  // Opt-in warm CLI socket (core/cli-socket/server.ts): off, the serve loads nothing and reads nothing for it.
+  const cliSocketOn = args.includes('--cli-socket') || MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_cli_socket === true;
   if (sourceGuard && isHttp) {
     // Loud posture warning (the --log-full-params precedent): the guard is a
     // stdio-lane mechanism; HTTP writes are scoped per token instead. An
@@ -368,11 +370,13 @@ export async function runServe(
     const { armCorpusDrain } = await import('../core/sweep.ts');
     const corpusDrain = (opts.armCorpusDrain ?? armCorpusDrain)(engine, { sourceId: process.env.GBRAIN_SOURCE || undefined });
 
+    const cliSocket = cliSocketOn ? await (await import('../core/cli-socket/server.ts')).startCliSocket(engine, httpLog) : null;
     try {
       await runHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken, printAdminToken, surface, adoptServer: opts.adoptServer });
     } finally {
       stallWatchdog?.dispose();
       corpusDrain?.cancel();
+      cliSocket?.close();
     }
 
     await finishHttpServe(engine, opts);
@@ -453,6 +457,8 @@ export async function runServe(
     // earlier flips stdin into flowing mode and can consume a fast client's
     // initialize frame before the SDK sees it.
     activateStdioIdleActivityTracking();
+    // Opt-in warm CLI socket; bound after the stdout redirect so a request's captured console output keeps its stream.
+    if (cliSocketOn) void import('../core/cli-socket/server.ts').then(m => m.startCliSocket(engine, opts.log ?? ((msg: string) => console.error(msg))));
   } finally {
     if (bootDeadline) clearTimeout(bootDeadline);
     stopProgressWatch();

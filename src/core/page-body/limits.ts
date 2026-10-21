@@ -68,6 +68,25 @@ export const STAGE_BATCH_BYTES: Readonly<Record<'postgres' | 'pglite', number>> 
 };
 
 /**
+ * Segment bytes one projection transaction chunks into rows while it holds the page's key lock (ingest.ts
+ * `stageOccurrenceChunks`, guarded); an occurrence larger than this (up to SEGMENT_MAX_BYTES) goes alone, because an
+ * occurrence's rows commit together: a build resumes at the occurrences that have none. A write to the page takes the
+ * same lock inside its publication under `lock_timeout` 1 s (protocol.ts `declareDurablePersistence`); a longer wait
+ * fails the publication with 55P03 and the write prepares again, which for a file over the single-string ceiling
+ * copies its prior file again. A source-exclusive write anywhere on the source (a managed sync import or checkpoint,
+ * a purge: `SELECT ... FROM sources ... FOR UPDATE`) waits for that transaction too, under the same 1 s bound,
+ * because the transaction's `page_write_guards` insert holds a key-share lock on the source row. The row insert is
+ * nearly all of the hold: about 0.19 s per MiB of segment bytes on an idle 4-core Postgres 16 and 0.29 s on PGLite (a conversation page, ~290 chunk rows per MiB, each with its
+ * `to_tsvector`). A whole STAGE_BATCH_BYTES batch held the lock 0.7 s idle and 1.6 s on a loaded host, past the
+ * writer's bound. At 512 KiB the hold is about 0.1 s on Postgres (0.15 s on PGLite), a tenth of that bound, so a
+ * host ten times slower still publishes the waiting write in one attempt, and the largest occurrence (1 MiB, ~0.2 s)
+ * leaves five times. Between transactions the build releases the lock and the queued write takes it first:
+ * background chunking yields to writes. Each transaction adds a generation read, a claim renewal and one probe per
+ * occurrence (a few ms) per 512 KiB.
+ */
+export const PROJECTION_LOCK_HOLD_BYTES = 512 * 1024;
+
+/**
  * Chunk rows the generation flip deletes inside the publication transaction; above it the page publishes unsealed and a
  * projection job deletes the rest, this many rows per statement. Deleting leaves `idx_chunks_embedding` (HNSW) alone
  * (marking rows retired rewrote each entry: 20,000 embedded rows took 129 s on PGLite). `scripts/bench-large-pages.ts
@@ -75,6 +94,17 @@ export const STAGE_BATCH_BYTES: Readonly<Record<'postgres' | 'pglite', number>> 
  * under the publication's 5 s statement timeout.
  */
 export const DEFAULT_FLIP_RETIRE_MAX_ROWS = 20_000;
+
+/**
+ * Chunk rows a projection deletes per transaction while it holds the page's key lock (projection.ts
+ * `retireStaleChunks`), for the same reason as PROJECTION_LOCK_HOLD_BYTES: a write to the page waits for that lock
+ * under its 1 s `lock_timeout`. A delete costs about 25 us per embedded row on Postgres and 44 us on PGLite (the
+ * DEFAULT_FLIP_RETIRE_MAX_ROWS bench above; 18 us and 27 us unembedded), so the flip's 20,000 rows would hold the lock
+ * 0.5 s and 0.9 s idle. 2,500 rows hold it about 0.06 s and 0.11 s, a tenth of the writer's bound. Each statement walks
+ * the page's occurrences from the first until it has its rows (one index probe each, STALE_CHUNKS_SQL), so retiring R
+ * rows of a page of O occurrences takes R / 2,500 + 1 statements of at most O probes each.
+ */
+export const PROJECTION_RETIRE_MAX_ROWS = 2_500;
 
 /**
  * A segmented create of at most this many body bytes is searchable when its write commits: it chunks during preparation

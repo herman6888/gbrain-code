@@ -88,6 +88,7 @@ async function runQueueHealth(ctx: DoctorContext): Promise<Check[]> {
 export const queueHealthEntry: DoctorEntry = {
   name: 'queue_health',
   emits: ['queue_health', 'subagent_capability', 'facts_health'],
+  tier: 'quick',
   run: runQueueHealth,
 };
 
@@ -121,16 +122,18 @@ async function runIndexAudit(ctx: DoctorContext): Promise<Check[]> {
            WHERE schemaname = 'public'
              AND idx_scan = 0
            ORDER BY pg_relation_size(indexrelid) DESC
-           LIMIT 20
+           LIMIT 21
         `;
         if (rows.length === 0) {
           checks.push({ name: 'index_audit', status: 'ok', message: 'All public indexes have recorded scans' });
         } else {
-          const list = rows.map((r: any) => `${r.index}(${r.size})`).join(', ');
+          // #7145: 21 rows means more than the 20 listed.
+          const list = rows.slice(0, 20).map((r: any) => `${r.index}(${r.size})`).join(', ');
           checks.push({
             name: 'index_audit',
             status: 'warn',
-            message: `${rows.length} zero-scan index(es): ${list}. ` +
+            details: { exact: rows.length <= 20 },
+            message: `${rows.length > 20 ? '20+' : rows.length} zero-scan index(es): ${list}. ` +
                      `Consider investigating whether they're used on YOUR workload (fresh brains naturally show zero scans until queries accumulate). ` +
                      `Do not drop without confirming.`,
           });

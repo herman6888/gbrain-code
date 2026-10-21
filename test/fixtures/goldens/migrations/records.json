@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 257,
+    "count": 259,
     "gaps": [
       17,
       18,
@@ -72,7 +72,7 @@
       "tableRows": "906d2413b13d76a06d5910885e47ed5c544be4ff3a2266e83146715721b24270",
       "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67"
     },
-    "latest": 262,
+    "latest": 264,
     "records": [
       {
         "handler": {
@@ -2908,8 +2908,8 @@
         "idempotent": true,
         "name": "f1_write_attribution",
         "sql": {
-          "length": 15269,
-          "sha256": "6ed235b09ce8b18a25cf065fa32321472485ad16b2af17f90e292d01881b3ead"
+          "length": 16337,
+          "sha256": "a39e3a157993c7308a6ff5ba71da3a29f723d9ff69a9c2029e9541ba9678f8ac"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3227,8 +3227,8 @@
         "idempotent": true,
         "name": "facts_attributed_to",
         "sql": {
-          "length": 9118,
-          "sha256": "2e772deed199aba5dc05c6b9f88b70c57a6b50dc724d60b0e9eca684c66f63ba"
+          "length": 10186,
+          "sha256": "87e2f77b99e6081776216ea01fa59602f5253f257600935e150f7f8c4123d2c4"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -4175,6 +4175,32 @@
         "transaction": "absent",
         "verify": "absent",
         "version": 262
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "try_jsonb_function",
+        "sql": {
+          "length": 241,
+          "sha256": "ca16373eb5df962e15b59ed33ebffd4469d09ee873039600929e1b9145638272"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 263
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "set_based_fact_insert_guards",
+        "sql": {
+          "length": 8343,
+          "sha256": "d01ea4d8a212485932351ad8473d54ef7d0b65f4d5b59b1ba34e4b63bf20b4bb"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 264
       }
     ],
     "versions": [
@@ -4434,7 +4460,9 @@
       259,
       260,
       261,
-      262
+      262,
+      263,
+      264
     ]
   },
   "normalizer": "migrations-record-v1"

@@ -60,7 +60,7 @@ import { dispositionOf, PAGE_REMOVAL_OPERATIONS, supersessionOrderSql, supersess
 import { afterCursor, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairPlan, type RepairScope } from './core.ts';
 
 const REPLAYABLE = ['put_page', 'add_timeline_entry', 'remember'];
-const REMEMBER_PREPARED_KEYS = ['entity_slug', 'fence', 'valid_from', 'valid_until', 'entity_inferred', 'entity_warning'];
+const REMEMBER_PREPARED_KEYS = ['entity_slug', 'fence', 'valid_from', 'valid_until', 'entity_inferred', 'entity_warning', 'visibility_defaulted'];
 const REMOTE_PREPARED_KEYS = ['source_kind', 'source_uri', 'ingested_via'];
 const PAGE_REMOVALS = PAGE_REMOVAL_OPERATIONS;
 const GUARD_REFUSAL = `(r.state='failed' AND (r.error_code='writer_coordinator_required'

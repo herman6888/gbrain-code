@@ -16,6 +16,8 @@ import { type RelationalEvidenceSlotDecision, ensureRelationalEvidenceSlot } fro
 import { type RelationalRerankPinDecision, pinRelationalRows } from '../relational-rerank-pin.ts';
 import { applyFeedbackStage } from '../feedback-boost.ts';
 import { capPerSession } from '../diverse-pool.ts';
+import { collapseResults } from '../collapse.ts';
+import { applyRankPriors } from '../rank-priors.ts';
 import { type RerankFailedReason, type RerankPassThroughReason, type RerankSkipReason, applyReranker } from '../rerank.ts';
 import type { RerankMeta } from '../../ai/gateway.ts';
 import { applyEvidenceGate, recordRerankReceipts, startRerankShadow } from '../decide-stage.ts';
@@ -251,6 +253,30 @@ export function capSessionPool(req: HybridRequest, deduped: SearchResult[]): Sea
   return req.resolvedMode.diverse_pool_depth > 0 ? capPerSession(deduped) : deduped;
 }
 
+/**
+ * Result-time collapse (search.collapse, collapse.ts): twins, redirect stubs and document copies take one slot.
+ * Runs before the reranker reads the pool, and again after the identity tiers, which inject pages by title,
+ * slug or alias (a stub titled with the entity's name, or each twin). The second pass reuses the page facts.
+ */
+export async function collapsePool(req: HybridRequest, rows: SearchResult[]): Promise<SearchResult[]> {
+  if (!req.resolvedMode.collapse) return rows;
+  req.collapseFacts ??= new Map();
+  return collapseResults(req.engine, rows, {
+    ...req.aliasHopOpts,
+    facts: req.collapseFacts,
+    onDecision: (d) => {
+      if (d.twins + d.redirects + d.families + d.redirect_reads === 0) return;
+      const prev = req.collapse ?? { twins: 0, redirects: 0, families: 0, redirect_reads: 0 };
+      req.collapse = { twins: prev.twins + d.twins, redirects: prev.redirects + d.redirects, families: prev.families + d.families, redirect_reads: prev.redirect_reads + d.redirect_reads };
+    },
+  });
+}
+
+/** Rank priors (search.rank_priors, rank-priors.ts) on the reranked (or fused) order. */
+export function prioritize(req: HybridRequest, rows: SearchResult[]): SearchResult[] {
+  return req.resolvedMode.rank_priors ? applyRankPriors(rows, req.query) : rows;
+}
+
 /** Cross-encoder rerank (fail-open), then the relational-row pin; the W3 rerank gate grades the same candidates. */
 export async function rerankAndPin(
   req: HybridRequest,
@@ -331,7 +357,7 @@ export async function rerankAndPin(
   const rerankPinned = reranked !== deduped && effectiveModality !== 'image'
     ? pinRelationalRows(ordered, relationalList, { max: resolvedMode.relational_rerank_pin, fusedOrder: deduped, onPin: (d) => { relationalRerankPin = d; } })
     : ordered;
-  return { rerankPinned, relationalRerankPin, rerankGate, identityLookups: gate.lookups };
+  return { rerankPinned: prioritize(req, rerankPinned), relationalRerankPin, rerankGate, identityLookups: gate.lookups };
 }
 
 /** Alias hop + exact-lookup tier, evidence stamp, adaptive return, autocut and the relational evidence slot. */
@@ -358,9 +384,9 @@ export async function sizeReturnPool(
   // the already-fetched title arm (no extra queries); pure no-op for
   // non-lookup-shaped queries. Runs after the alias hop so all three
   // identity surfaces (alias, slug, title) share the same injection shape.
-  const aliasHopped = identityLookups
+  const aliasHopped = await collapsePool(req, identityLookups
     ? applyExactLookupHits(preExact, identityLookups.exactHits)
-    : await applyExactLookupTier(engine, preExact, query, exactLookupOpts);
+    : await applyExactLookupTier(engine, preExact, query, exactLookupOpts));
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
   // decision keys off WHY a page matched, not a raw blended score. Stamp on

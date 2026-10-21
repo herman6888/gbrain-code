@@ -30,6 +30,7 @@ import { resolveCitations, type ParsedCitation } from './cite-render.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
 import { resolveModel } from '../model-config.ts';
 import { chat as gatewayChat, probeChatModel, isThinkingModel, type ChatResult } from '../ai/gateway.ts';
+import { withDefaultChatPhase } from '../ai/chat-usage.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
@@ -1285,14 +1286,15 @@ async function tryBuildGatewayClient(
 
       let result: ChatResult;
       try {
-        result = await gatewayChat({
+        // #7176: chat_usage_log rows for think say so, unless a job or cycle phase already does.
+        result = await withDefaultChatPhase('think', () => gatewayChat({
           model: modelStr,
           system,
           messages,
           maxTokens: params.max_tokens,
           // An explicit --model is a hard requirement (#1698), never a hop.
           ...(opts.explicitModel || opts.allowFallback === false ? { allowFallback: false } : {}),
-        });
+        }));
       } catch (e) {
         // AIConfigError at chat time = e.g. key revoked mid-run. For an EXPLICIT
         // model the user typed, this is a hard error (rethrow) — the early gate

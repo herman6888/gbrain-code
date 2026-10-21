@@ -13,7 +13,7 @@
  * still inside the window and a brain keyless by choice are information.
  */
 import type { Check } from '../../doctor.ts';
-import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
+import { connectedEngine, cheapTier, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { agentFix, checkError, doctorVerify, infoCheck, keylessEnablementFix } from '../check-fix.ts';
 import { EMBEDDING_STATE_DOCS, embeddingStateFix, readEmbeddingState, type EmbeddingState } from '../../../core/embedding-state.ts';
 
@@ -27,7 +27,7 @@ async function runEmbeddingState(ctx: DoctorContext): Promise<Check[]> {
   const checks: Check[] = [];
   ctx.progress.heartbeat('embedding_state');
   try {
-    const state = await readEmbeddingState(engine, { mode: ctx.tier === 'ops' ? 'ops' : 'full', ...(ctx.sourceIds ? { sourceIds: ctx.sourceIds } : {}) });
+    const state = await readEmbeddingState(engine, { mode: cheapTier(ctx.tier) ? 'ops' : 'full', ...(ctx.sourceIds ? { sourceIds: ctx.sourceIds } : {}) });
     const details: Record<string, unknown> = { ...state, exact: state.basis === 'exact' };
     if (state.status === 'unknown') {
       checks.push({ name: 'embedding_state', status: 'warn',

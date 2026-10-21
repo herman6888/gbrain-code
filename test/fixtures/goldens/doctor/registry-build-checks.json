@@ -302,6 +302,10 @@
         "name": "partial_embedding"
       },
       {
+        "category": "brain",
+        "name": "sync_landing_gaps"
+      },
+      {
         "category": "ops",
         "name": "pgvector"
       },
@@ -534,6 +538,10 @@
         "name": "google_calendar_readable"
       },
       {
+        "category": "ops",
+        "name": "google_api_access"
+      },
+      {
         "category": "brain",
         "name": "atom_retirements_restorable"
       },
@@ -552,6 +560,10 @@
       {
         "category": "brain",
         "name": "captured_facts_active"
+      },
+      {
+        "category": "brain",
+        "name": "facts_redaction_marker"
       },
       {
         "category": "brain",
@@ -688,6 +700,10 @@
       {
         "category": "ops",
         "name": "embed_backfill_stalled"
+      },
+      {
+        "category": "ops",
+        "name": "content_drift_sweep"
       },
       {
         "category": "ops",
@@ -892,6 +908,10 @@
       {
         "category": "brain",
         "name": "missing_recorded_files"
+      },
+      {
+        "category": "brain",
+        "name": "uncommitted_sync_deletions"
       },
       {
         "category": "brain",

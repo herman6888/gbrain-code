@@ -30,6 +30,8 @@ export interface CliOptions {
    * the reranker. Has no effect on other commands.
    */
   explain: boolean;
+  /** `--timings` on `gbrain search/query`: per-phase `timings_ms` and model-call `cost` (cli/search-timings.ts). */
+  timings?: boolean;
   /**
    * `--brain <id>` — which BRAIN (database) this invocation targets: 'host'
    * or a mount id from ~/.gbrain/mounts.json. Parsed here (stripped before
@@ -131,6 +133,9 @@ export const TIMEOUT_OWNING_COMMANDS = new Set(['sync', 'remote']);
  */
 export const EXPLAIN_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask', 'call']);
 
+/** Commands whose result formatter reads the global `--timings`; every other command gets the flag back in place. */
+export const TIMINGS_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask']);
+
 /**
  * #6625: command routes whose own parser reads `--wait` (a duration such as
  * `5m`, not the #5232 write wait in seconds). For these the global parser
@@ -151,6 +156,7 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     | { plain: string }
     | { timeoutValue: string; equalsForm: boolean }
     | { explainFlag: true }
+    | { timingsFlag: true }
     | { waitValue: string | undefined };
   const slots: Slot[] = [];
 
@@ -197,6 +203,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     }
     if (a.startsWith('--timeout=')) {
       slots.push({ timeoutValue: a.slice('--timeout='.length), equalsForm: true });
+      continue;
+    }
+    if (a === '--timings') {
+      slots.push({ timingsFlag: true });
       continue;
     }
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
@@ -303,6 +313,11 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       } else {
         deferredExplain.push('--explain');
       }
+      continue;
+    }
+    if ('timingsFlag' in s) {
+      if (commandSlot !== undefined && TIMINGS_CLAIMING_COMMANDS.has(commandSlot.plain)) cliOpts.timings = true;
+      else rest.push('--timings');
       continue;
     }
     if ('waitValue' in s) {

@@ -8,7 +8,8 @@ import { opError, OperationError, type OperationContext } from '../ops/contract.
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
-import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission } from './page-mutations.ts';
+import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission,
+  withLiveSearchable } from './page-mutations.ts';
 import { admitBatch } from './page-batch.ts';
 import { writeOutcomeUnknown } from './admission-retry.ts';
 import { assertPersistenceAccepting, waitForWrites } from './service.ts';
@@ -213,6 +214,9 @@ async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
       const value = outcome.value;
       done(member.i, { slug: String(value.slug), status: value.status as ImportResult['status'], chunks: Number(value.chunks ?? 0),
         ...(typeof value.error === 'string' ? { error: value.error } : {}),
+        ...(value.searchable !== undefined ? { searchable: value.searchable as ImportResult['searchable'] } : {}),
+        ...(value.searchable === 'pending' ? { projection: 'pending' as const, request_id: String(value.request_id),
+          searchable_retry_after_ms: Number(value.searchable_retry_after_ms), searchable_fix: value.searchable_fix as ImportResult['searchable_fix'] } : {}),
         ...(value.type_warning ? { type_warning: value.type_warning as ImportResult['type_warning'] } : {}) });
       return;
     }
@@ -266,14 +270,15 @@ async function submitManagedImports(ctx: OperationContext, batch: string, params
   }
   rows.sort((a, b) => a.index - b.index);
   const done = await waitForWrites(ctx.engine, rows.map(entry => entry.row), ctx.config, IMPORT_WAIT_MS * rows.length);
-  rows.forEach((entry, position) => {
+  await Promise.all(rows.map(async (entry, position) => {
     try {
-      const response = pendingAwareResponse(ctx, done[position]!);
+      // #7106: a new segmented page over 4 MiB replies at commit with `searchable: 'pending'`, read live here.
+      const response = await withLiveSearchable(ctx, pendingAwareResponse(ctx, done[position]!));
       if (entry.admitted) emitFenceNotice(ctx, response, done[position]!.slug);
       settled[entry.index] = { status: 'fulfilled', value: { ...response, ...(entry.typeWarning ? { type_warning: entry.typeWarning } : {}),
         ...(entry.slugAdvisory ? { slug_advisory: entry.slugAdvisory } : {}) } };
     } catch (reason) { settled[entry.index] = { status: 'rejected', reason }; }
-  });
+  }));
   return settled;
 }
 

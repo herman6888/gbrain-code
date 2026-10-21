@@ -14,6 +14,8 @@ import type { WriteRequest } from './model.ts';
 
 export type PublicationBoundary = Parameters<NonNullable<PublicationHooks['boundary']>>[0];
 export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${EffectKind}:mid` | 'effect:embedding:settle'
+  // An embedding effect that read its page at its own revision, before it reads the page's text projection (effects.ts `embedPage`).
+  | 'effect:embedding:page_read'
   | 'effect_recovery:before_clear' | 'publication_recovery:before_clear'
   // A streamed (version 2) withdrawal mirror (effect-recovery.ts): once its record is durable and before its file is
   // streamed into the publication stage, and after that step (the stage written and flushed, or left as it was found),
@@ -77,6 +79,9 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
   // texts, then its claim renewal and insert), and after a projection staged its chunks (before its seal).
   | 'segmented:texts_staged' | 'segmented:manifest_staged' | 'segmented:chunks_staged' | 'segmented:flipped' | 'segmented:projection_batch'
   | 'segmented:projection_staged'
+  // Inside each projection insert transaction, once it holds the page's key lock and before it checks the generation and
+  // claim (ingest.ts `stageOccurrenceChunks`): a write to the page that arrives now waits for that transaction.
+  | 'segmented:projection_insert'
   // A prior file over the single-string ceiling copied to its before stage (large-file.ts `stageBeforeCopy`): after the copy is
   // written under its temporary name (unverified, unflushed: a crash during the copy) and once it is flushed, before its rename.
   | 'large_file:stage_copying' | 'large_file:stage_flushed'

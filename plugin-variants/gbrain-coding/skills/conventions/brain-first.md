@@ -5,6 +5,43 @@
 Sub-agents and fresh sessions inherit gbrain tools but not the knowledge of
 when and how to use them. This file is that knowledge.
 
+## Retrieval: gbrain first
+
+For anything in the brain, search gbrain, then read the page a hit names. Don't
+`grep`, `rg` or `cat` the brain checkout, or run SQL over pages and
+frontmatter, before gbrain: gbrain reads the index across sources, ranks results,
+filters by type, date and source, and returns the slug to read next. Use the
+files only when gbrain is unreachable or for an edit not yet synced.
+
+Prefer the gbrain MCP tools (`search`, `query`, `get_page`, `recall`) when your
+harness has the server connected: it stays connected, so each call skips the
+CLI's startup, which costs seconds per call on a large pooled Postgres brain.
+The CLI commands below take the same filters.
+
+```bash
+gbrain search "Acme Example"                                    # names, codes, exact phrases
+gbrain search '"ZEBRA-42" OR "inventory sync"' --match keyword  # every page with any term (instead of grep)
+gbrain query "why did the launch move"                          # questions and concepts
+gbrain search "launch" --types '["meeting","person"]'           # only these page types
+gbrain query "launch" --since 2026-09-01 --until 2026-09-30     # date window (also --since 30d)
+gbrain search "launch" --source source-a --limit 5 --json 2>/dev/null | jq -r '.[].slug'
+gbrain get companies/acme-example                               # read the page a hit points to
+gbrain recall "Alice Example"                                   # facts saved with remember
+gbrain backlinks companies/acme-example --type meeting          # pages that link here (instead of grepping a slug)
+gbrain timeline companies/acme-example --since 2026-10-01       # dated events on one page
+gbrain list --type meeting --limit 50                           # enumerate by type or --tag (instead of SQL)
+```
+
+- `--types` takes a JSON array. `--since`/`--until` are `query` flags
+  (YYYY-MM-DD or 7d/2w/1y) and match each page's effective date: its
+  frontmatter date, else when it was imported.
+- Keyword search matches words, not slugs: search `"Acme Example"`, and use
+  `backlinks` to find pages linking to `companies/acme-example`.
+- Without `--source`, a search reads the resolved source (a notice names it
+  when it routes); `--source __all__` searches every source.
+- Notices and `[AGENT]` blocks go to stderr, so `--json` stdout is clean JSON.
+  Read a degraded notice before concluding the brain has nothing.
+
 ## Available GBrain Tools
 
 Your tool inventory includes these (prefixed `gbrain__` in OpenClaw):

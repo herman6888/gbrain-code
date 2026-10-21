@@ -81,8 +81,9 @@ export function passStatusNext(sourceId: string, reason: PassStatusReason, row: 
           why: `The last ${row.value.obligations.not_converged_streak} passes of ${sourceId} ended not converged; another sync will not change that. Report what doctor shows with the gbrain version (read-only).` }
         : { ...sync, why: 'The last pass ran out of rounds before every path settled; the same sync continues from the current level.' };
     case 'deletes_withheld':
-      return { argv: ['gbrain', 'sync', '--source', sourceId, '--dry-run', '--json'], consent: [], actor: 'user', requires_exclusive: false, verify,
-        user_message: `Sync of ${sourceId} withheld a mass delete (more than half of its file-backed pages). If the checkout is the wrong one or incomplete, restore it and sync again; if the deletion is intended, run GBRAIN_ALLOW_MASS_RECONCILE=1 gbrain sync --source ${sourceId} on the brain host.`,
+      // #7130: deleting pages is the user's decision, never an agent's: next is ask_user whatever the actor.
+      return { ask_user: true, argv: ['gbrain', 'sync', '--source', sourceId, '--dry-run', '--json'], consent: [], actor: 'user', requires_exclusive: false, verify,
+        user_message: `Sync of ${sourceId} withheld a bulk delete (over half of its file-backed pages, or over sync.max_deletes / sync.max_delete_ratio); nothing was deleted. Review the withheld set in the dry run. If the checkout is the wrong one or incomplete, restore it and sync again; if the deletion is intended, run GBRAIN_ALLOW_MASS_RECONCILE=1 gbrain sync --source ${sourceId} on the brain host.`,
         why: 'The dry run lists the withheld set and its hash (read-only); everything else of the source is synced.' };
     case 'admission_paused':
       return { argv: ['gbrain', 'config', 'set', 'sync.admission', 'normal'], consent: [], actor: 'user', requires_exclusive: false, verify,

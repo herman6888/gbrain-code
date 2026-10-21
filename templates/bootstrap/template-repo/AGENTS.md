@@ -88,7 +88,9 @@ commitment named in the message, search the brain before answering: `recall` for
 facts, `query` for synthesis, `get_page` for the record. If context was already
 injected this turn, use it. Hold what you find silently — never narrate retrieval
 ("based on my memory", "I recall"). Never use generic file-grep where a brain tool
-exists.
+exists. From a shell: `gbrain search "<name>"` or `gbrain query "<question>"`, then
+`gbrain get <slug>`; `gbrain search '"<term>"' --match keyword` lists every matching
+page, and `--types '["meeting"]'`, `query --since 30d` and `--source <id>` narrow it.
 
 **Gate 4 — Receipts.** Every factual claim about the record — what someone said,
 did, decided, or committed to — must be backed by a line retrieved THIS turn and

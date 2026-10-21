@@ -471,8 +471,8 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
 
   it('ok-path truncation honesty: 100 live + 1 never-classified is NOT a clean bill of health', async () => {
     // First 100 candidates classify 'live' (future lease + fresh updated_at);
-    // the 101st never gets classified. Status stays ok but the message and
-    // details must still surface the unclassified remainder.
+    // the 101st never gets classified. #7145: that is health unknown (warn),
+    // and the message and details still surface the unclassified remainder.
     await base.executeRaw(
       `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_lease_until)
        SELECT '{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-live-' || i, 'waiting',
@@ -480,7 +480,8 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
          FROM generate_series(1, 101) AS i`,
     );
     const check = await computeOrphanedPrivateQueueCheck(pgLike);
-    expect(check.status).toBe('ok');
+    expect(check.status).toBe('warn');
+    expect(check.details).toMatchObject({ health: 'unknown', reason: 'bound', bound: 'rows', limit: 100 });
     expect(check.message).toContain('unclassified');
     expect((check.details as any).unclassified_candidates).toBe(1);
     expect((check.details as any).suppressed_by_live_lease).toBe(100);

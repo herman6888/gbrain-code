@@ -84,6 +84,7 @@ describe('embedStaleForSource', () => {
       chunksProcessed: 0,
       pagesProcessed: 0,
       invalidated: 0,
+      contentDrift: expect.objectContaining({ scope: 'source:default', state: 'complete', checked: 0, drifted: 0, batches: 1 }),
       lastCursor: null,
       done: true,
       aborted: false,

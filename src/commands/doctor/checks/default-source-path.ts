@@ -16,6 +16,7 @@ import { existsSync, statSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { assessDefaultSourcePath } from '../../../core/default-source-path-check.ts';
+import { otherSourceOwning } from '../../../core/write-through.ts';
 
 export async function defaultSourceLocalPathCheck(engine: BrainEngine): Promise<Check | null> {
   const [defaultSource] = await engine.executeRaw<{ local_path: string | null }>(
@@ -27,6 +28,7 @@ export async function defaultSourceLocalPathCheck(engine: BrainEngine): Promise<
   let repoPath: string | null = null;
   let repoPathIsDir = false;
   let collidingSourceId: string | null = null;
+  let sharedPages = 0;
   // Only gather the fallback-topology inputs when the pointer is actually
   // null — the set case resolves from the row alone.
   if (defaultSource && !defaultSource.local_path) {
@@ -47,11 +49,16 @@ export async function defaultSourceLocalPathCheck(engine: BrainEngine): Promise<
       }
       // Mirror resolvePageWriteTarget's #2018 leak guard: sync.repo_path
       // being another source's own working tree silently skips the write.
-      const collide = await engine.executeRaw<{ id: string }>(
-        `SELECT id FROM sources WHERE id <> 'default' AND local_path = $1 LIMIT 1`,
-        [repoPath],
-      );
-      collidingSourceId = collide[0]?.id ?? null;
+      collidingSourceId = await otherSourceOwning(engine, 'default', repoPath);
+      if (collidingSourceId) {
+        const [shared] = await engine.executeRaw<{ n: number }>(
+          `SELECT COUNT(*)::int AS n FROM pages a
+            WHERE a.source_id = 'default' AND a.deleted_at IS NULL AND a.source_path IS NOT NULL
+              AND EXISTS (SELECT 1 FROM pages b WHERE b.source_id = $1 AND b.source_path = a.source_path AND b.deleted_at IS NULL)`,
+          [collidingSourceId],
+        );
+        sharedPages = Number(shared?.n ?? 0);
+      }
     }
   }
 
@@ -62,6 +69,7 @@ export async function defaultSourceLocalPathCheck(engine: BrainEngine): Promise<
     repoPath,
     repoPathIsDir,
     collidingSourceId,
+    sharedPages,
   });
   if (assessment.status === 'skip') return null;
   return {

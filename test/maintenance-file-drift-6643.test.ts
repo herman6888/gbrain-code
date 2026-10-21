@@ -313,6 +313,41 @@ for (const backend of testBackends()) describe(`#6643 maintenance file drift (${
     expect((await liveFileDrift(engine, sourceId, 'notes/two')).still_present).toBe(true);
     await expect(apply()).rejects.toMatchObject({ code: 'preview_changed' });
   }), 240_000);
+
+  /** #7145: moves the request sequence past the doctor window, so every receipt written so far is older than it. */
+  const pastWindow = async (ctx: OperationContext, slug: string) => {
+    await engine.executeRaw(`SELECT setval(pg_get_serial_sequence('persistence_requests','sequence'), (SELECT max(sequence) FROM persistence_requests) + 30000)`);
+    await put(ctx, slug, '---\ntype: note\ntitle: Later\n---\nA later write.\n');
+  };
+
+  test('#7145: a drifted page whose only receipt is older than the doctor window is still reported', () => fixture(async ({ root, sourceId, ctx }) => {
+    await put(ctx, 'notes/alpha', '---\ntype: note\ntitle: Alpha\n---\nAlpha.\n');
+    drift(root, 'notes/alpha', text => `${text}\nEdited in the file only.\n`);
+    await refusedWrite(ctx, 'notes/alpha', 'One.');
+    await pastWindow(ctx, 'notes/later');
+    const doctor = await maintenanceWriteDriftCheck(engine, [sourceId]);
+    expect(doctor).toMatchObject({ name: 'maintenance_write_drift', status: 'warn', details: { count: 1 } });
+    expect(doctor.details!.sources).toEqual([expect.objectContaining({ source_id: sourceId, drifted: 1, unchecked: 0 })]);
+  }), 240_000);
+
+  test('#7145: candidates past the live-check limit make a clear result unknown, not ok', () => fixture(async ({ root, sourceId, ctx }) => {
+    await put(ctx, 'notes/alpha', '---\ntype: note\ntitle: Alpha\n---\nAlpha.\n');
+    const original = readFileSync(join(root, 'notes/alpha.md'), 'utf8');
+    drift(root, 'notes/alpha', text => `${text}\nEdited in the file only.\n`);
+    await refusedWrite(ctx, 'notes/alpha', 'One.');
+    writeFileSync(join(root, 'notes/alpha.md'), original);
+    await engine.executeRaw(`INSERT INTO persistence_requests (principal_kind, principal_id, request_id, operation, source_id, source_incarnation, slug, digest, authority,
+        state, intent_bytes, terminal_reservation, error_code, error_message)
+      SELECT r.principal_kind, r.principal_id, gen_random_uuid(), r.operation, r.source_id, r.source_incarnation, 'notes/zz-' || lpad(n::text, 3, '0'), r.digest, r.authority,
+        r.state, r.intent_bytes, r.terminal_reservation, r.error_code, r.error_message
+      FROM persistence_requests r, generate_series(1, 105) n WHERE r.source_id=$1 AND r.state='conflict' AND r.slug='notes/alpha'`, [sourceId]);
+    const doctor = await maintenanceWriteDriftCheck(engine, [sourceId]);
+    expect(doctor).toMatchObject({ name: 'maintenance_write_drift', status: 'warn',
+      details: { count: 0, exact: false, health: 'unknown', reason: 'bound', bound: 'rows', limit: 100 } });
+    expect(doctor.details!.unchecked).toBeGreaterThan(0);
+    expect(doctor.message).toContain('Maintenance write drift unknown');
+    expect(doctor.message).toContain('--window 1000000');
+  }), 240_000);
 });
 
 describe('#6643 file-drift pure rules', () => {

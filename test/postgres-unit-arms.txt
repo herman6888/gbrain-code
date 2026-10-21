@@ -16,6 +16,7 @@ test/alias-source-cascade-5094.test.ts
 test/attribution-backfill-history.test.ts
 test/backstop-same-page-shadow-managed-6333.test.ts
 test/behavior-change-notice.test.ts
+test/belief-ledger-append-owner.test.ts
 test/belief-ledger-coverage.test.ts
 test/belief-ledger-group.test.ts
 test/belief-ledger-identity.test.ts
@@ -44,6 +45,7 @@ test/company-brain-runtime.test.ts
 test/consolidate-same-instant-6023.test.ts
 test/conversation-facts-oversized-sidecar.test.ts
 test/cycle/synthesize-concepts-merge.test.ts
+test/db-lock-reconnect.test.ts
 test/decide/conflict-proposals-managed.test.ts
 test/declared-lineage-visibility.test.ts
 test/derived-link-reconciliation.test.ts
@@ -63,6 +65,7 @@ test/extract-timeline-from-meetings-managed.test.ts
 test/extraction-watermark-atoms.test.ts
 test/fact-fence-adoption-exits.test.ts
 test/fact-purge-lookup-timeout-6511.test.ts
+test/facts-insert-guards-7105.test.ts
 test/facts-publication-large-fence-6898.test.ts
 test/fence-repair-receipts.test.ts
 test/forecast-journal.test.ts
@@ -90,6 +93,7 @@ test/keyword-timeout-negative-cache-6495.test.ts
 test/lane-apply-pipelining.test.ts
 test/large-pages/append-concurrency.test.ts
 test/large-pages/append-cost.test.ts
+test/large-pages/append-mention-links.test.ts
 test/large-pages/chunk-retirement-plan.test.ts
 test/large-pages/chunk-visibility.test.ts
 test/large-pages/contextual-reembed-segmented.test.ts
@@ -102,6 +106,7 @@ test/large-pages/gbra117-segmented-classes-window.test.ts
 test/large-pages/held-budget-count-list.test.ts
 test/large-pages/held-budget-shrink.test.ts
 test/large-pages/managed-import-outside-root.test.ts
+test/large-pages/managed-import-projection-pending.test.ts
 test/large-pages/managed-links-timeline-heap.test.ts
 test/large-pages/managed-streamed-import.test.ts
 test/large-pages/managed-sync-segmented-rename.test.ts
@@ -111,6 +116,7 @@ test/large-pages/page-purge-segments.test.ts
 test/large-pages/pinned-segmented-reads.test.ts
 test/large-pages/projection-claim-ownership.test.ts
 test/large-pages/projection-demotion-race.test.ts
+test/large-pages/projection-lock-hold.test.ts
 test/large-pages/projection-parity.test.ts
 test/large-pages/publication-seal-bounded.test.ts
 test/large-pages/purge-fact-inflight-staging.test.ts
@@ -196,6 +202,7 @@ test/managed-facts-withdrawal-recovery-6506.test.ts
 test/managed-facts-withdrawn-skip-6506.test.ts
 test/managed-lint.test.ts
 test/managed-maintenance-links.test.ts
+test/managed-root-aliases-7203.test.ts
 test/managed-sweep-corpus-windows.test.ts
 test/managed-sweep-refused-window-retry.test.ts
 test/managed-sweep-timeline.test.ts
@@ -351,6 +358,7 @@ test/persistence-sync-cursor-strategy-6696.test.ts
 test/persistence-sync-fence-holds.test.ts
 test/persistence-sync-holds.test.ts
 test/persistence-sync-lease.test.ts
+test/persistence-sync-metafile-pages.test.ts
 test/persistence-write-interrupted.test.ts
 test/persistence-write-stall.test.ts
 test/persistence-writer-fences.test.ts
@@ -359,6 +367,7 @@ test/purge-fact.test.ts
 test/purge-global-marker.test.ts
 test/purge-missing-cache-6911.test.ts
 test/purge-read-surfaces.test.ts
+test/purge-sync-tombstone-hold-7130.test.ts
 test/recall-page-fill.test.ts
 test/receipt-compaction-newest-sync-gbra130.test.ts
 test/remediation-manual-only.test.ts
@@ -388,11 +397,13 @@ test/shared-skills-writer-boundary.test.ts
 test/source-lifecycle-dry-run-physical-root-6849.test.ts
 test/source-retire-missing-checkout.test.ts
 test/source-row-diagnostics.test.ts
+test/sources-resolve-path.test.ts
 test/stats-health-source-scope.test.ts
 test/sync-absent-from-worktree-s27.test.ts
 test/sync-admission-6712.test.ts
 test/sync-capacity-preflight.test.ts
 test/sync-checkpoint-moved-6834.test.ts
+test/sync-discovery-legacy-origin-7130.test.ts
 test/sync-drain-claims.test.ts
 test/sync-drain-effect-recovery-blocked.test.ts
 test/sync-drain-head-blocked-6543.test.ts
@@ -408,9 +419,11 @@ test/sync-group-member-order.test.ts
 test/sync-handler-drain-6706.test.ts
 test/sync-import-provenance-disk.test.ts
 test/sync-inexact-rename-6729.test.ts
+test/sync-landing-gaps.test.ts
 test/sync-legacy-holds.test.ts
 test/sync-legacy-retry-actions-6696.test.ts
 test/sync-legacy-slug-adoption-6727.test.ts
+test/sync-legacy-sweep-resume-7189.test.ts
 test/sync-origin-live-wins-6517.test.ts
 test/sync-page-identity-hold-gbra130.test.ts
 test/sync-page-write-failed-gbra130.test.ts
@@ -422,6 +435,7 @@ test/sync-slug-root-mode-6694.test.ts
 test/sync-staged-catchup.test.ts
 test/sync-status-failure-detail-6513.test.ts
 test/sync-unblock-repair-error-gbra130.test.ts
+test/sync-uncommitted-origin-7130.test.ts
 test/sync-unreadable-file-gbra130.test.ts
 test/sync-waiver-budget.test.ts
 test/sync-waiver-run-imports.test.ts
@@ -435,8 +449,10 @@ test/trust-owner-actions.test.ts
 test/unbound-source-6536.test.ts
 test/unindexed-files.test.ts
 test/vector-manifest-probe-bound.test.ts
+test/visibility-fail-closed-derived-writes.test.ts
 test/withdrawal-overlay-concurrency.test.ts
 test/withdrawal-publication-file.test.ts
 test/worktree-refresh-recovery-row-gbra130.test.ts
+test/write-through-leak-guard-alias-7203.test.ts
 test/writer-status-movement-not-read-gbra130.test.ts
 test/writer-status-owner-backends.test.ts

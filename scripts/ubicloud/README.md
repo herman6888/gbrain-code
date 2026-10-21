@@ -72,7 +72,10 @@ operation so the machine stays awake. After any interrupted run, check
 destroys your own VMs older than HOURS). A gate VM nobody reaps still dies
 once its expiry passes and the operator reaper next runs with `--apply`.
 
-`ubi-runner.sh list --mine` lists your VMs. `ubi-runner.sh usage` prints VMs
+`ubi-runner.sh list --mine` lists your VMs: those tagged with your owner tag
+and every VM this machine created under any tag (its local state stays until
+`down` confirms it gone), so a run started with a different `UBI_OWNER` is still
+listed; stderr names the tags it covered. `ubi-runner.sh usage` prints VMs
 and vCPUs per owner across the project, which shows who holds the shared quota.
 
 Each VM runs `scripts/ubicloud/setup-ci-vm.sh`: the pinned Bun from

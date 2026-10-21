@@ -197,6 +197,7 @@ const SWEEP: Record<string, Row> = {
   whoami: { args: {} },
   sources_list: { args: {} },
   sources_status: { args: { id: SRC } },
+  sources_resolve_path: { skip: 'needs a Git checkout of the source; returns paths, slugs, states and counts, never page text; test/sources-resolve-path.test.ts owns it' },
   sources_inspect: { skip: 'local-only inspection of a committed Git repository directory; returns repo metadata, owned by the sources suites' },
   request_tools: { args: { tools: ['get_page'] } },
   connectors_status: { args: {}, remote: false },

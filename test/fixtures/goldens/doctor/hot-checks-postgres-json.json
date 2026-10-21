@@ -603,6 +603,18 @@
               "docs": "docs/guides/troubleshooting.md#terminal-write-failures",
               "historical_rows": 0,
               "new_last_24h": 0,
+              "ranked": {
+                "blocking": [],
+                "historical": {
+                  "rows": 0
+                },
+                "unresolved": {
+                  "group_by": [],
+                  "groups": [],
+                  "pages": 0,
+                  "rows": 0
+                }
+              },
               "sources": [],
               "spike": {
                 "daily_7d": [
@@ -878,6 +890,51 @@
             "status": "ok"
           },
           {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/resolve-paths.md#synced-but-not-searchable",
+              "sources": [
+                {
+                  "after_seconds": 300,
+                  "by_state": {},
+                  "checked": 0,
+                  "complete": true,
+                  "gaps": 0,
+                  "pages": [],
+                  "source_id": "default",
+                  "status": "ok",
+                  "window_hours": 24
+                },
+                {
+                  "after_seconds": 300,
+                  "by_state": {},
+                  "checked": 0,
+                  "complete": true,
+                  "gaps": 0,
+                  "pages": [],
+                  "source_id": "notes",
+                  "status": "ok",
+                  "window_hours": 24
+                },
+                {
+                  "after_seconds": 300,
+                  "by_state": {},
+                  "checked": 0,
+                  "complete": true,
+                  "gaps": 0,
+                  "pages": [],
+                  "source_id": "plain",
+                  "status": "ok",
+                  "window_hours": 24
+                }
+              ]
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every page managed sync committed past its freshness target in the last 24 h is searchable.",
+            "name": "sync_landing_gaps",
+            "status": "ok"
+          },
+          {
             "category": "ops",
             "elapsed_ms": "<volatile>",
             "message": "Extension installed",
@@ -998,6 +1055,7 @@
           {
             "category": "ops",
             "details": {
+              "columns": [],
               "extra_columns": [],
               "page_child_source_columns": [],
               "runbook": "docs/guides/write-refusals.md#managed-guard-page-children"
@@ -1333,16 +1391,22 @@
           {
             "category": "brain",
             "details": {
+              "alias_pages_without_visibility": 0,
               "count": "exact",
+              "fact_ids_truncated": false,
               "looser_atoms": 0,
               "looser_concepts": 0,
+              "looser_events": 0,
+              "remotely_readable_fact_ids": [],
               "repair": "visibility",
               "truncated": false,
               "unstamped_atoms": 0,
-              "unstamped_concepts": 0
+              "unstamped_concepts": 0,
+              "world_facts_from_private_sources": 0,
+              "world_facts_remotely_readable": 0
             },
             "elapsed_ms": "<volatile>",
-            "message": "Every extracted atom and synthesized concept carries an explicit visibility no looser than its origin.",
+            "message": "Every derived page and fact carries a visibility no looser than its source, and no page relies on a privacy alias alone.",
             "name": "derived_visibility",
             "status": "ok"
           },
@@ -1814,6 +1878,18 @@
             "status": "ok"
           },
           {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/google-connect.md#api-access",
+              "sources": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No Google source recorded a disabled API or missing scope at its last sync.",
+            "name": "google_api_access",
+            "status": "ok"
+          },
+          {
             "category": "brain",
             "details": {
               "by_source": [],
@@ -1887,6 +1963,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
             "name": "captured_facts_active",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "affected": 0,
+              "docs": "docs/guides/repair.md#redacted-facts",
+              "repair": "redacted-facts"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No active fact holds a redaction marker.",
+            "name": "facts_redaction_marker",
             "status": "ok"
           },
           {
@@ -2071,6 +2159,11 @@
           },
           {
             "category": "brain",
+            "details": {
+              "count": 18,
+              "exact": true,
+              "partial": false
+            },
             "elapsed_ms": "<volatile>",
             "fix_unavailable_reason": "unstructured",
             "message": "18 frontmatter issue(s). notes: 17 (YAML_PARSE=8, EMPTY_FRONTMATTER=1, MISSING_CLOSE=2, NESTED_QUOTES=1, NON_STRING_FIELD=2, NULL_BYTES=2, SLUG_MISMATCH=1); plain: 1 (YAML_PARSE=1). Fix: gbrain repair frontmatter --source <id> previews the line fix for every file it can repair (and names the manual fix for the rest, such as a missing opening ---); on an unmanaged checkout gbrain frontmatter validate <source-path> --fix applies the same safe fixes",
@@ -2250,6 +2343,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No automatic embed-backfill is repeating the same failure.",
             "name": "embed_backfill_stalled",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "code": "content_drift_sweep",
+              "docs": "docs/guides/troubleshooting.md#content-drift-sweep",
+              "scopes": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The content-drift sweep has not run yet; it runs inside embed --stale and the embed jobs.",
+            "name": "content_drift_sweep",
             "status": "ok"
           },
           {
@@ -2564,6 +2669,7 @@
               "on_commit": false,
               "sources": [
                 {
+                  "behind": null,
                   "commit_to_embedded": {
                     "p50_seconds": null,
                     "p95_seconds": null,
@@ -2581,6 +2687,10 @@
                   "window_hours": 24
                 },
                 {
+                  "behind": {
+                    "commits": 0,
+                    "oldest_seconds": null
+                  },
                   "commit_to_embedded": {
                     "p50_seconds": null,
                     "p95_seconds": null,
@@ -2598,6 +2708,7 @@
                   "window_hours": 24
                 },
                 {
+                  "behind": null,
                   "commit_to_embedded": {
                     "p50_seconds": null,
                     "p95_seconds": null,
@@ -3314,6 +3425,54 @@
             "name": "missing_recorded_files",
             "readiness_state": "not_applicable",
             "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "by_source": [
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "default",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "notes",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "plain",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                }
+              ],
+              "count": 0,
+              "docs": "docs/guides/repair.md#uncommitted-deletions",
+              "exact": true,
+              "other_writer_count": 0,
+              "purged": "Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create taken before the purge) can bring them back.",
+              "samples": [],
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No soft-deleted page was removed by a sync while Git never held its file (0 tombstone(s) checked).",
+            "name": "uncommitted_sync_deletions",
             "status": "ok"
           },
           {
@@ -4955,6 +5114,18 @@
               "docs": "docs/guides/troubleshooting.md#terminal-write-failures",
               "historical_rows": 0,
               "new_last_24h": 0,
+              "ranked": {
+                "blocking": [],
+                "historical": {
+                  "rows": 0
+                },
+                "unresolved": {
+                  "group_by": [],
+                  "groups": [],
+                  "pages": 0,
+                  "rows": 0
+                }
+              },
               "sources": [],
               "spike": {
                 "daily_7d": [
@@ -5230,6 +5401,51 @@
             "status": "ok"
           },
           {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/resolve-paths.md#synced-but-not-searchable",
+              "sources": [
+                {
+                  "after_seconds": 300,
+                  "by_state": {},
+                  "checked": 0,
+                  "complete": true,
+                  "gaps": 0,
+                  "pages": [],
+                  "source_id": "default",
+                  "status": "ok",
+                  "window_hours": 24
+                },
+                {
+                  "after_seconds": 300,
+                  "by_state": {},
+                  "checked": 0,
+                  "complete": true,
+                  "gaps": 0,
+                  "pages": [],
+                  "source_id": "notes",
+                  "status": "ok",
+                  "window_hours": 24
+                },
+                {
+                  "after_seconds": 300,
+                  "by_state": {},
+                  "checked": 0,
+                  "complete": true,
+                  "gaps": 0,
+                  "pages": [],
+                  "source_id": "plain",
+                  "status": "ok",
+                  "window_hours": 24
+                }
+              ]
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Every page managed sync committed past its freshness target in the last 24 h is searchable.",
+            "name": "sync_landing_gaps",
+            "status": "ok"
+          },
+          {
             "category": "ops",
             "elapsed_ms": "<volatile>",
             "message": "Extension installed",
@@ -5350,6 +5566,7 @@
           {
             "category": "ops",
             "details": {
+              "columns": [],
               "extra_columns": [],
               "page_child_source_columns": [],
               "runbook": "docs/guides/write-refusals.md#managed-guard-page-children"
@@ -5685,16 +5902,22 @@
           {
             "category": "brain",
             "details": {
+              "alias_pages_without_visibility": 0,
               "count": "exact",
+              "fact_ids_truncated": false,
               "looser_atoms": 0,
               "looser_concepts": 0,
+              "looser_events": 0,
+              "remotely_readable_fact_ids": [],
               "repair": "visibility",
               "truncated": false,
               "unstamped_atoms": 0,
-              "unstamped_concepts": 0
+              "unstamped_concepts": 0,
+              "world_facts_from_private_sources": 0,
+              "world_facts_remotely_readable": 0
             },
             "elapsed_ms": "<volatile>",
-            "message": "Every extracted atom and synthesized concept carries an explicit visibility no looser than its origin.",
+            "message": "Every derived page and fact carries a visibility no looser than its source, and no page relies on a privacy alias alone.",
             "name": "derived_visibility",
             "status": "ok"
           },
@@ -6166,6 +6389,18 @@
             "status": "ok"
           },
           {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/google-connect.md#api-access",
+              "sources": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No Google source recorded a disabled API or missing scope at its last sync.",
+            "name": "google_api_access",
+            "status": "ok"
+          },
+          {
             "category": "brain",
             "details": {
               "by_source": [],
@@ -6239,6 +6474,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
             "name": "captured_facts_active",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "affected": 0,
+              "docs": "docs/guides/repair.md#redacted-facts",
+              "repair": "redacted-facts"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No active fact holds a redaction marker.",
+            "name": "facts_redaction_marker",
             "status": "ok"
           },
           {
@@ -6423,6 +6670,11 @@
           },
           {
             "category": "brain",
+            "details": {
+              "count": 20,
+              "exact": true,
+              "partial": false
+            },
             "elapsed_ms": "<volatile>",
             "fix_unavailable_reason": "unstructured",
             "message": "20 frontmatter issue(s). notes: 19 (YAML_PARSE=9, EMPTY_FRONTMATTER=1, NESTED_QUOTES=2, MISSING_CLOSE=2, NON_STRING_FIELD=2, NULL_BYTES=2, SLUG_MISMATCH=1); plain: 1 (YAML_PARSE=1). Fix: gbrain repair frontmatter --source <id> previews the line fix for every file it can repair (and names the manual fix for the rest, such as a missing opening ---); on an unmanaged checkout gbrain frontmatter validate <source-path> --fix applies the same safe fixes",
@@ -6602,6 +6854,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No automatic embed-backfill is repeating the same failure.",
             "name": "embed_backfill_stalled",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "code": "content_drift_sweep",
+              "docs": "docs/guides/troubleshooting.md#content-drift-sweep",
+              "scopes": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The content-drift sweep has not run yet; it runs inside embed --stale and the embed jobs.",
+            "name": "content_drift_sweep",
             "status": "ok"
           },
           {
@@ -6916,6 +7180,7 @@
               "on_commit": false,
               "sources": [
                 {
+                  "behind": null,
                   "commit_to_embedded": {
                     "p50_seconds": null,
                     "p95_seconds": null,
@@ -6933,6 +7198,10 @@
                   "window_hours": 24
                 },
                 {
+                  "behind": {
+                    "commits": 0,
+                    "oldest_seconds": null
+                  },
                   "commit_to_embedded": {
                     "p50_seconds": null,
                     "p95_seconds": null,
@@ -6950,6 +7219,7 @@
                   "window_hours": 24
                 },
                 {
+                  "behind": null,
                   "commit_to_embedded": {
                     "p50_seconds": null,
                     "p95_seconds": null,
@@ -7666,6 +7936,54 @@
             "name": "missing_recorded_files",
             "readiness_state": "not_applicable",
             "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "by_source": [
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "default",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "notes",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "plain",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                }
+              ],
+              "count": 0,
+              "docs": "docs/guides/repair.md#uncommitted-deletions",
+              "exact": true,
+              "other_writer_count": 0,
+              "purged": "Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create taken before the purge) can bring them back.",
+              "samples": [],
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No soft-deleted page was removed by a sync while Git never held its file (0 tombstone(s) checked).",
+            "name": "uncommitted_sync_deletions",
             "status": "ok"
           },
           {

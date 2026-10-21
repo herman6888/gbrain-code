@@ -17,7 +17,7 @@
  */
 import type { BrainEngine } from '../../core/engine.ts';
 import type { currentCompanyBrainSync } from '../../core/company-brain/profile.ts';
-import type { SyncManifest, isSyncable } from '../../core/sync.ts';
+import type { MetafilePagesMode, SyncManifest, isSyncable } from '../../core/sync.ts';
 import type { TypeWarningCount } from '../../core/schema-pack/type-usage.ts';
 import { appendCompleted, appendCompletedOnce, type OpCheckpointKey } from '../../core/op-checkpoint.ts';
 import { registerCleanup } from '../../core/process-cleanup.ts';
@@ -70,7 +70,9 @@ export interface SyncPlan {
   readonly uncommittedDrift: { added: number; modified: number; deleted: number } | undefined;
   readonly inScope: (p: string) => boolean;
   readonly isSelectedForRun: (path: string, options?: SyncOptionsForFilter) => boolean;
-  readonly syncOpts: { strategy: SyncOpts['strategy']; includeHidden: SyncOpts['includeHidden'] };
+  readonly syncOpts: { strategy: SyncOpts['strategy']; includeHidden: SyncOpts['includeHidden']; metafilePage: (path: string) => boolean };
+  /** GBRA-150: the run's `sync.metafile_pages`, recorded with the bookmark so a mode the source has not applied backfills once. */
+  readonly metafilePages: MetafilePagesMode;
   /** Manifest path -> the mode's canonical page path (slug/source_path base). */
   readonly modePath: (p: string) => string;
   /** #5988: the run's content holds (null for company-brain sources); its re-screen paths join the import drain. */

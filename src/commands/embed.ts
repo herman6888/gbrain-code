@@ -28,6 +28,7 @@ import { StaleChunkProgress } from '../core/embed-stale-progress.ts';
 import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
 import { writeCliError } from '../cli/cli-error.ts';
 import { countRestampOnlyChunks, invalidateStaleSignatureEmbeddingsGuarded } from '../core/embedding-invalidation.ts';
+import { contentDriftSweepLine, runContentDriftSweep, type ContentDriftSweepStatus } from '../core/content-drift-sweep.ts';
 import { loadConfig, type GBrainConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { embedBudgetStopVerdict, noteEmbedBudgetStop } from '../core/embed-budget-stop.ts';
@@ -376,6 +377,8 @@ export interface EmbedResult {
   budget_reason?: string;
   /** #5885: the takes pass of a `stale` drain, when it ran. Its failures are also counted in `failures`. */
   takes?: EmbedTakesResult;
+  /** #7117: the content-drift sweep of a `stale` drain (core/content-drift-sweep.ts): counts, cursor, pass state, error. */
+  content_drift?: ContentDriftSweepStatus;
 }
 
 /**
@@ -1846,18 +1849,14 @@ async function embedAllStale(
   // bounded by real content edits (config-independent, unlike signature
   // drift) and those vectors point at stale text either way. NULL hash
   // (pre-v133 rows) is grandfathered.
+  // #7117: bounded batches, a saved cursor and a per-run time budget (core/content-drift-sweep.ts);
+  // a failed batch is reported, never thrown, so the NULL-only loop still runs.
   if (!dryRun) {
-    try {
-      const drifted = staleOpts?.assertOwned ? await engine.transaction(async tx => {
-        await staleOpts?.assertOwned?.(tx);
-        return tx.invalidateContentDriftEmbeddings(sourceId ? { sourceId } : undefined);
-      }) : await engine.invalidateContentDriftEmbeddings(sourceId ? { sourceId } : undefined);
-      if (drifted > 0 && !staleOpts?.quiet) {
-        slog(`[embed] invalidated ${drifted} chunk(s) whose text changed after embedding (content drift)`);
-      }
-    } catch {
-      // Best-effort (pre-v133 schema mid-upgrade); the NULL-only loop still runs.
-    }
+    result.content_drift = await runContentDriftSweep(engine, { ...(sourceId && { sourceId }), signal: externalSignal,
+      assertOwned: staleOpts?.assertOwned, ...(BUDGET_MS !== null && { deadline: overallStartedAt + BUDGET_MS }) });
+    const line = contentDriftSweepLine(result.content_drift, !!staleOpts?.quiet);
+    if (line) serr(`  [embed] ${line}`);
+    if (isAborted(externalSignal)) return;
   }
 
   // Pre-flight: 0 stale chunks → nothing to do, no further DB reads.

@@ -634,6 +634,45 @@ describe('runLoopsExtract', () => {
     expect(Number(awaiting[0].n)).toBe(0);
   });
 
+  test('#7125: ordinary words reach the model, and a neutralized span the model copies is stored as the thread wrote it', async () => {
+    const slug = 'emails/2026/08/2026-08-24-restore-thread-55667788';
+    await engine.putPage(
+      slug,
+      {
+        type: 'email',
+        title: 'Re: vendor contract',
+        compiled_truth: 'Alice: The Business System (ABS) review is done. Our counsel said to ignore previous instructions about the vendor, '
+          + 'so I will send the signed copy by Friday.\n',
+        frontmatter: { thread_id: 'thread-55667788', date: '2026-08-24T10:00:00Z' },
+      },
+      { sourceId: SRC },
+    );
+    chatImpl = async () => ({
+      text: JSON.stringify({
+        commitments: [{
+          direction: 'owed_to_me',
+          text: 'Alice to send the signed copy by Friday',
+          counterparty_name: 'Alice Example',
+          counterparty_email: 'alice@example.com',
+          due_iso: null,
+          quote: 'Our counsel said to [redacted] about the vendor, so I will send the signed copy by Friday.',
+        }],
+        decisions_pending: [],
+      }),
+      stopReason: 'end',
+    });
+    lastChatReq = null;
+    const r = await runLoopsExtract(engine, { slug, sourceId: SRC });
+    expect(r.status).toBe('extracted');
+    const content = lastChatReq!.messages![0].content;
+    expect(content).toContain('The Business System (ABS) review is done.');
+    expect(content).not.toMatch(/ignore\s+previous\s+instructions/i);
+    const [row] = await engine.executeRaw<{ evidence: string }>(
+      'SELECT evidence::text AS evidence FROM open_loops WHERE source_id = $1 AND page_slug = $2', [SRC, slug]);
+    expect(JSON.parse(row!.evidence)).toEqual([{ page_slug: slug,
+      quote: 'Our counsel said to ignore previous instructions about the vendor, so I will send the signed copy by Friday.' }]);
+  });
+
   test('verbatim evidence: a fabricated quote is BLANKED (loop lands, edge label falls back to text); a genuine quote survives whitespace-normalized', async () => {
     const slug = 'emails/2026/08/2026-08-23-verbatim-thread-11223344';
     await engine.putPage(

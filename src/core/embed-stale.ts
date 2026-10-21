@@ -34,6 +34,7 @@ import {
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { resolveStaleEmbedConcurrency } from './embed-concurrency.ts';
 import { AbortError } from './abort-check.ts';
+import { contentDriftSweepLine, runContentDriftSweep, type ContentDriftSweepStatus } from './content-drift-sweep.ts';
 import { meterPageBatch, spendGrant } from './page-embedding-budget.ts';
 import { chunkGenerationFilter, chunkVisibleFilter } from './search/safe-chunks.ts';
 import { embedSegmentedPage, embedSegmentedRows, readSegmentedEmbedPage, type SegmentedEmbedOpts } from './page-body/segmented-embedding.ts';
@@ -144,6 +145,8 @@ export interface EmbedStaleResult {
    * NULL-embedding-only staleness instead of destroying working vectors.
    */
   invalidationSkipped?: 'embedder_probe_failed';
+  /** #7117: this run's content-drift sweep (core/content-drift-sweep.ts); its invalidations are in `invalidated`. */
+  contentDrift?: ContentDriftSweepStatus;
   /** Last cursor reached. null iff zero stale chunks existed at start. */
   lastCursor: StaleCursor | null;
   /** True iff the loop exited because every stale chunk was processed. */
@@ -486,21 +489,18 @@ export async function embedStaleForSource(
   // bounded by real content edits (config-independent, unlike signature
   // drift) and those vectors point at stale text either way. NULL hash
   // (pre-v133 rows) is grandfathered.
-  try {
-    if (stopped()) return { ...result, aborted: true };
-    result.invalidated += opts.assertOwned ? await engine.transaction(async tx => {
-      await opts.assertOwned!(tx);
-      if (stopped()) throw new AbortError();
-      const invalidated = await tx.invalidateContentDriftEmbeddings({ sourceId });
-      await opts.assertOwned!(tx);
-      if (stopped()) throw new AbortError();
-      return invalidated;
-    }) : await engine.invalidateContentDriftEmbeddings({ sourceId });
-  } catch {
-    if (stopped()) return { ...result, aborted: true };
-    await opts.assertOwned?.();
-    // Non-fatal: fall through to the NULL-only stale loop.
-  }
+  // #7117: bounded batches with a saved cursor (core/content-drift-sweep.ts).
+  // A failed batch is reported in the result and on stderr, not thrown, and
+  // the NULL-only loop still runs; a lost lease propagates.
+  if (stopped()) return { ...result, aborted: true };
+  const sweep = await runContentDriftSweep(engine, {
+    sourceId, signal, deadline: opts.deadline, stopped,
+    assertOwned: opts.assertOwned,
+  });
+  result.contentDrift = sweep;
+  result.invalidated += sweep.drifted;
+  if (sweep.state === 'failed') process.stderr.write(`\n  [embed-stale] ${contentDriftSweepLine(sweep, true)}\n`);
+  if (stopped()) return { ...result, aborted: true };
 
   for (;;) {
     if (stopped()) {

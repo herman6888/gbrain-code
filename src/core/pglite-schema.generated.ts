@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS sources (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE OR REPLACE FUNCTION gbrain_try_jsonb(input text) RETURNS jsonb
+  LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, public AS \$fn\$
+BEGIN
+  RETURN input::jsonb;
+EXCEPTION WHEN data_exception THEN
+  RETURN NULL;
+END \$fn\$;
+
 INSERT INTO sources (id, name, config)
   SELECT 'default', 'default', '{"federated": true}'::jsonb
   WHERE NOT EXISTS (SELECT 1 FROM sources WHERE id = 'default')

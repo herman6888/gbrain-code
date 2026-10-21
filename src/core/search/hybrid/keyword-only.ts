@@ -17,6 +17,7 @@ import { enforceTokenBudget } from '../token-budget.ts';
 import { pushDegraded, stampBudgetStage } from './degraded.ts';
 import { stampEvidence } from '../evidence.ts';
 import { applyEvidenceGate } from '../decide-stage.ts';
+import { collapsePool, prioritize } from './rank.ts';
 import { warnOncePerProcess } from '../../utils.ts';
 
 /** No embedding provider (and no multimodal route): keyword + title + relational only. */
@@ -59,11 +60,11 @@ export async function searchWithoutEmbeddings(
   // T3/T4 — alias hop + evidence stamp even without an embedding provider
   // (the named-thing fix is most valuable exactly when vector is unavailable).
   trace?.observe('fused', noEmbedResults);
-  const noEmbedDeduped = dedupResults(noEmbedResults, { regions: await segmentRegions(engine, noEmbedResults) });
+  const noEmbedDeduped = prioritize(req, await collapsePool(req, dedupResults(noEmbedResults, { regions: await segmentRegions(engine, noEmbedResults) })));
   trace?.observe('deduped', noEmbedDeduped);
   const noEmbedPreExact = await applyAliasHop(engine, noEmbedDeduped, query, aliasHopOpts);
   // #1663 — structural exact-lookup tier (slug / exact-title identity).
-  const noEmbedHopped = await applyExactLookupTier(engine, noEmbedPreExact, query, exactLookupOpts);
+  const noEmbedHopped = await collapsePool(req, await applyExactLookupTier(engine, noEmbedPreExact, query, exactLookupOpts));
   stampEvidence(noEmbedHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
   // System One S3 evidence gate (no-op when the slot is off), at the fused path's position.
   const noEmbedGated = await applyEvidenceGate(req.decide, query, noEmbedHopped);
@@ -180,11 +181,11 @@ export async function searchVectorFallback(
     fallbackResults = await applyFeedbackStage(engine, fallbackResults, { reranked: false });
   }
   trace?.observe('fused', fallbackResults);
-  const kwDeduped = dedupResults(fallbackResults, { regions: await segmentRegions(engine, fallbackResults) });
+  const kwDeduped = prioritize(req, await collapsePool(req, dedupResults(fallbackResults, { regions: await segmentRegions(engine, fallbackResults) })));
   trace?.observe('deduped', kwDeduped);
   const kwPreExact = await applyAliasHop(engine, kwDeduped, query, aliasHopOpts);
   // #1663 — structural exact-lookup tier (slug / exact-title identity).
-  const kwHopped = await applyExactLookupTier(engine, kwPreExact, query, exactLookupOpts);
+  const kwHopped = await collapsePool(req, await applyExactLookupTier(engine, kwPreExact, query, exactLookupOpts));
   stampEvidence(kwHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
   // System One S3 evidence gate (no-op when the slot is off), at the fused path's position.
   const kwGated = await applyEvidenceGate(req.decide, query, kwHopped);

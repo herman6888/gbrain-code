@@ -27,6 +27,7 @@ import { unindexedFilesEntry } from '../src/commands/doctor/checks/unindexed-fil
 import { runUnindexedFilesPhase } from '../src/core/cycle/unindexed-files.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
+import { SYNC_METAFILE_PAGES_KEY } from '../src/core/sync.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const backends = testBackends();
@@ -171,7 +172,13 @@ test('a file whose path slug belongs to a database-only page is not indexed: it 
   expect(scan).toMatchObject({ unindexed: 1, slug_taken: 1, samples: [{ path: 'notes/db-only.md', code: 'clean', slug_taken: true }] });
 }), 240_000);
 
-test('a titled file named like folder scaffolding is reported as metafile_skipped, never scheduled, and only an info finding with a user fix', () => each(async engine => {
+test('under sync.metafile_pages off, a titled file named like folder scaffolding is reported as metafile_skipped, never scheduled, and only an info finding with a user fix', () => each(async engine => {
+  // GBRA-150: the default (typed) imports such a file; off keeps the old skip, which this report names.
+  await engine.setConfig(SYNC_METAFILE_PAGES_KEY, 'off');
+  try { await titledScaffoldingSkipped(engine); } finally { await engine.executeRaw('DELETE FROM config WHERE key=$1', [SYNC_METAFILE_PAGES_KEY]); }
+}), 240_000);
+
+async function titledScaffoldingSkipped(engine: BrainEngine) {
   const s = await source(engine, { 'notes/a.md': note('A') });
   await s.sync();
   await s.legacy({ 'investors/fund-a/index.md': '---\ntitle: Fund A\ntype: company\n---\nA synthetic fund overview.\n', 'notes/README.md': 'Plain scaffolding, no frontmatter.\n' });
@@ -186,6 +193,23 @@ test('a titled file named like folder scaffolding is reported as metafile_skippe
   expect(fix).toMatchObject({ actor: 'user', argv: ['gbrain', 'sync', '--source', s.id, '--no-pull'] });
   expect(fix.user_message).toContain('investors/fund-a/index.md -> investors/fund-a.md');
   expect(fix.user_message).toContain('on purpose');
+  git(s.repo, 'mv', 'investors/fund-a/index.md', 'investors/fund-a.md');
+  commit(s.repo);
+  await runSyncStep(engine, s.id, fix, s.sync);
+  expect(await engine.getPage('investors/fund-a', { sourceId: s.id })).not.toBeNull();
+}
+
+test('under the default sync.metafile_pages typed, a titled nested index.md is an unindexed file a sync imports, not metafile_skipped', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A') });
+  await s.sync();
+  await s.legacy({ 'investors/fund-a/index.md': '---\ntitle: Fund A\ntype: company\n---\nA synthetic fund overview.\n', 'notes/README.md': 'Plain scaffolding, no frontmatter.\n' });
+  const scan = await findUnindexedFiles(engine, s.id);
+  expect(scan).toMatchObject({ complete: true, scanned: 2, unindexed: 1, metafile_skipped: 0, metafile_samples: [] });
+  expect(scan.files.map(file => file.path)).toEqual(['investors/fund-a/index.md']);
+  expect(await retryUnindexed(engine, s.id)).toMatchObject({ scheduled: 1 });
+  await s.sync();
+  expect(await engine.getPage('investors/fund-a/index', { sourceId: s.id })).not.toBeNull();
+  expect(await engine.getPage('notes/readme', { sourceId: s.id })).toBeNull();
 }), 240_000);
 
 test('a bounded scan that stops early is incomplete and never clean; later passes resume and cover the late paths', () => each(async engine => {

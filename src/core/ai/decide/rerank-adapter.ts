@@ -81,7 +81,7 @@ export async function rerankViaDecide(input: RerankInput, deps: RerankViaDecideD
     await runBatches(plan.length, async (i) => {
       const batch = plan[i]!;
       const response = await invokeAI(
-        { operation: 'gateway.rerank', kind: 'rerank', model: deps.model, maxInputTokens: batch.estimatedInputTokens },
+        { operation: 'gateway.rerank', kind: 'rerank', model: deps.model, maxInputTokens: batch.estimatedInputTokens, estimatedInputTokens: batch.estimatedInputTokens },
         () => deps.transport(deps.url, { method: 'POST', headers: deps.headers, body: bodies[i]!, signal: ctrl.signal }),
         responseInvocationUsage,
       );

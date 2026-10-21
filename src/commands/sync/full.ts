@@ -22,7 +22,10 @@ import {
   isEmbeddingInfraCode,
   DEFAULT_SOURCE_ID,
   RENAME_SENTINEL_PREFIX,
+  readMetafilePagesMode,
+  type MetafilePagesMode,
 } from '../../core/sync.ts';
+import { diskMetafileHeads, firstMetafileHead, gitMetafileHeads, metafilePagePredicate, recordMetafilePagesApplied } from '../../core/sync-metafile-pages.ts';
 import { chunkerStamp } from '../../core/chunkers/code.ts';
 import { autoConcurrency } from '../../core/sync-concurrency.ts';
 import { slog, serr } from '../../core/console-prefix.ts';
@@ -40,6 +43,9 @@ import {
   planReconcileDeletes,
   listEverCommittedPaths,
   massReconcileAllowed,
+  readSyncDeleteCaps,
+  syncDeleteTrip,
+  syncDeleteTripText,
 } from '../../core/sync-reconcile.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import { heldRenameOrigins, holdRefusedImport, moveHeldRenames, noteScreenedImport, settleFullSyncHolds, wouldHoldFields, type LegacyHolds } from './holds.ts';
@@ -78,7 +84,11 @@ export async function performFullSync(
   // files were waiting.
   // #5988: paths are relative to the slug base, the same keys holds and the ledger use.
   const holdRoot = slugRoot ?? syncScopeRoot;
-  if (opts.dryRun) return fullSyncDryRun(engine, syncScopeRoot, headCommit, opts, { holds, holdRoot });
+  // GBRA-150: one sync.metafile_pages read for every walk below; the commit a gone file was last synced at is read
+  // before the bookmark advances, so the reconcile judges a deleted typed metafile by its last synced bytes.
+  const metafilePages = await readMetafilePagesMode(engine);
+  const previousCommit = await readSyncAnchor(engine, opts.sourceId, 'last_commit');
+  if (opts.dryRun) return fullSyncDryRun(engine, syncScopeRoot, headCommit, { ...opts, metafilePages }, { holds, holdRoot });
 
   // v0.22.13 (PR #490 A1 + Q5): full sync is always "large" by definition
   // (entire working tree). Auto-concurrency fires unconditionally for Postgres;
@@ -150,7 +160,7 @@ export async function performFullSync(
   const fullFailureSet = new Set(result.failures.map(f => f.path));
   if (holds?.existing.size || holds?.retryPaths.size) {
     const walked = new Set(collectSyncableFiles(syncScopeRoot, { strategy: opts.strategy ?? 'markdown', includeGitignored: opts.includeGitignored,
-      includeHidden: opts.includeHidden }).map(abs => relative(holdRoot, abs)));
+      includeHidden: opts.includeHidden, metafilePages }).map(abs => relative(holdRoot, abs)));
     await settleFullSyncHolds(engine, holds, { root: holdRoot, walked, failed: fullFailureSet });
   }
   const fullSucceeded = loadSyncFailures()
@@ -163,6 +173,7 @@ export async function performFullSync(
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', anchorPath);
     await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
+    await recordMetafilePagesApplied(engine, fullSourceId, metafilePages);
   };
 
   const fullGate = await applySyncFailureGate({
@@ -192,7 +203,7 @@ export async function performFullSync(
     );
   }
 
-  const reconciledDeletes = await reconcileFullSyncDeletes(engine, opts, { company, gitContextRoot, syncScopeRoot, slugRoot });
+  const reconciledDeletes = await reconcileFullSyncDeletes(engine, opts, { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit });
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,
   // so a `<rename:…>` sentinel whose stale row the reconcile just removed
@@ -246,7 +257,7 @@ export async function performFullSync(
   };
 }
 
-async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCommit: string, opts: SyncOpts,
+async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCommit: string, opts: SyncOpts & { metafilePages: MetafilePagesMode },
   hold: { holds: LegacyHolds | null; holdRoot: string }): Promise<SyncResult> {
   const dryRunMalformed: string[] = [];
   let allFiles = collectSyncableFiles(syncScopeRoot, {
@@ -254,6 +265,7 @@ async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCo
     includeGitignored: opts.includeGitignored,
     onExcluded: (rel) => { dryRunMalformed.push(rel); },
     includeHidden: opts.includeHidden,
+    metafilePages: opts.metafilePages,
   });
   if (opts.exclude && opts.exclude.length > 0) {
     allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(syncScopeRoot, abs), opts.exclude));
@@ -359,9 +371,10 @@ async function reportBlockedFullSync(
 async function reconcileFullSyncDeletes(
   engine: BrainEngine,
   opts: SyncOpts,
-  input: { company: ReturnType<typeof currentCompanyBrainSync>; gitContextRoot: string; syncScopeRoot: string; slugRoot: string | undefined },
+  input: { company: ReturnType<typeof currentCompanyBrainSync>; gitContextRoot: string; syncScopeRoot: string; slugRoot: string | undefined;
+    metafilePages: MetafilePagesMode; previousCommit: string | null },
 ): Promise<number> {
-  const { company, gitContextRoot, syncScopeRoot, slugRoot } = input;
+  const { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit } = input;
   // #1970 (F-A): runImport is import-only — it never purges pages whose backing
   // file was deleted since the last sync. A full re-import is authoritative for
   // the whole tree, so reconcile deletes here too (this is what makes the
@@ -384,7 +397,15 @@ async function reconcileFullSyncDeletes(
   let reconciledDeletes = 0;
   if (opts.sourceId) {
     const sid = opts.sourceId;
-    const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+    // GBRA-150: a metafile-named row is reconcilable exactly when the walk would collect its file: its bytes on disk, or,
+    // for a file gone since the last sync, its blob at that commit. A bare or root one keeps its page (#1433).
+    const scopeGitPath = gitRelativePath(gitContextRoot, syncScopeRoot);
+    const rowRoot = slugRoot ?? syncScopeRoot;
+    const lastSynced = gitMetafileHeads(gitContextRoot, [previousCommit]);
+    const metafilePage = metafilePagePredicate(metafilePages,
+      firstMetafileHead(diskMetafileHeads(rowRoot), path => lastSynced.read(slugRoot || !scopeGitPath ? path : `${scopeGitPath}/${path}`)),
+      path => slugRoot && scopeGitPath && path.startsWith(`${scopeGitPath}/`) ? path.slice(scopeGitPath.length + 1) : path);
+    const reconcileSyncOpts = { ...(opts.strategy ? { strategy: opts.strategy } : {}), metafilePage };
     // collectSyncableFiles returns ABSOLUTE paths; source_path is stored
     // repo-relative (importFile uses `relative(dir, filePath)`), so relativize
     // to the same form before membership-testing — otherwise every page looks
@@ -406,8 +427,9 @@ async function reconcileFullSyncDeletes(
       strategy: opts.strategy ?? 'markdown',
       includeGitignored: opts.includeGitignored,
       includeHidden: opts.includeHidden,
+      metafilePages,
     })
-      .map(abs => relative(slugRoot ?? syncScopeRoot, abs));
+      .map(abs => relative(rowRoot, abs));
     // #5988 (E13): the old page of a held rename keeps its origin until the
     // renamed file imports; its file being gone does not make it stale.
     const heldOrigins = await heldRenameOrigins(engine, sid);
@@ -475,6 +497,19 @@ async function reconcileFullSyncDeletes(
           if (sp && !everCommitted.has(sp.replace(/\\/g, '/'))) dbOnlySlugs.push(slug);
           else deletableSlugs.push(slug);
         }
+      } else if (!company) {
+        // #7130: Git could not list the history (a dangling ref fails `git log --all`), so no stale page is proven
+        // committed; deleting them would treat a never-committed page's absence as a deletion. Keep them all.
+        serr(`\n  WARNING: kept ${plan.staleSlugs.length} stale page(s) of source '${sid}': Git could not list the history that proves their files were committed and removed (run git -C ${gitContextRoot} log --all to see why). No pages were deleted.`);
+        deletableSlugs = [];
+      }
+      // #7130: the absolute caps (sync.max_deletes, sync.max_delete_ratio) brake a full reconcile below the 50% valve too.
+      const caps = await readSyncDeleteCaps(engine, sid);
+      const trip = syncDeleteTrip(deletableSlugs.length, plan.reconcilableCount, caps);
+      if (trip && !massReconcileAllowed()) {
+        serr(`\n  WARNING: refusing to reconcile-delete ${deletableSlugs.length} of ${plan.reconcilableCount} file-backed page(s) for source '${sid}' (${syncDeleteTripText(trip, caps)}). ` +
+          `No pages were deleted. Check the checkout first; if the removal is intended, raise the cap (gbrain config set ${trip === 'max_deletes' ? 'sync.max_deletes' : 'sync.max_delete_ratio'}.source.${sid} <value>) or re-run with GBRAIN_ALLOW_MASS_RECONCILE=1.`);
+        deletableSlugs = [];
       }
       if (dbOnlySlugs.length > 0) {
         let reExported = 0;

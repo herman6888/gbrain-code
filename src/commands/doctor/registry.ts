@@ -86,6 +86,7 @@ import { imageEmbeddingCoverageEntry } from './checks/image-embedding-coverage.t
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { globalMaintenanceStalledEntry } from './checks/global-maintenance-stalled.ts';
 import { embedBackfillStalledEntry } from './checks/embed-backfill-stalled.ts';
+import { contentDriftSweepEntry } from './checks/content-drift-sweep.ts';
 import { connectorAccountMismatchEntry } from './checks/connector-account-mismatch.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
@@ -121,8 +122,10 @@ import { ghostPagesEntry } from './checks/ghost-pages.ts';
 import { originTwinsEntry } from './checks/origin-twins.ts';
 import { renameIdentityDowngradesEntry } from './checks/rename-identity-downgrades.ts';
 import { unindexedFilesEntry } from './checks/unindexed-files.ts';
+import { syncLandingGapsEntry } from './checks/landing-gaps.ts';
 import { purgeParkedPagesEntry } from './checks/purge-parks.ts';
 import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
+import { uncommittedSyncDeletionsEntry } from './checks/uncommitted-sync-deletions.ts';
 import { overwrittenEditsEntry } from './checks/overwritten-edits.ts';
 import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
 import { managedSyncLatencyEntry } from './checks/managed-sync-latency.ts';
@@ -139,15 +142,17 @@ import {
   soakCountersEntry,
   schemaPackConsistencyEntry,
 } from './checks/ops-sections.ts';
-import { STOP_DOCTOR, type DoctorContext, type DoctorEntry, type DoctorTier } from './context.ts';
+import { STOP_DOCTOR, cheapTier, type DoctorContext, type DoctorEntry, type DoctorTier } from './context.ts';
 import {
   BUDGET_EXPIRED, DoctorBudgetError, budgetExpired, type BudgetExpired, ENTRY_BUDGET_KEY, ENTRY_BUDGET_MS_DEFAULT, budgetUnknownCheck, entryRunsAt,
-  opsNotApplicableCheck, raceBudget, startDeferredDeadline,
+  isBudgetUnknown, opsNotApplicableCheck, raceBudget, startDeferredDeadline,
 } from './budget.ts';
 import { StatementDeadlineError, deadlineBoundEngine, withStatementDeadline, type StatementDeadline } from '../../core/statement-deadline.ts';
 import type { Check } from '../doctor.ts';
 import { infoCheck } from './check-fix.ts';
 import { withGitListingCache } from '../../core/git-visible-files.ts';
+import type { BrainEngine } from '../../core/engine.ts';
+import { applyLastKnown, lastKnownMode, queueRefresh, readLastKnown, unmeasuredCheck, writeLastKnown, type EntryOutcome, type LastKnownMode } from './last-known.ts';
 
 export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   resolverHealthEntry,
@@ -187,6 +192,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   // #6803 C2: then the cheap incident checks, before any full scan (CHEAP_INCIDENT_CHECKS, pinned by name in test/doctor-entry-deadline-6803.test.ts).
   linksExtractionLagEntry,
   partialEmbeddingEntry,
+  syncLandingGapsEntry,
   pgvectorEntry,
   rlsEntry,
   schemaVersionEntry,
@@ -224,6 +230,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   globalMaintenanceTimeoutsEntry,
   globalMaintenanceStalledEntry,
   embedBackfillStalledEntry,
+  contentDriftSweepEntry,
   connectorAccountMismatchEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
@@ -258,6 +265,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   renameIdentityDowngradesEntry,
   purgeParkedPagesEntry,
   missingRecordedFilesEntry,
+  uncommittedSyncDeletionsEntry,
   unindexedFilesEntry,
   overwrittenEditsEntry,
   syncConfigKeysEntry,
@@ -274,6 +282,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
  */
 export const CHEAP_INCIDENT_CHECKS: ReadonlySet<string> = new Set([
   'persistence_capacity', 'managed_sync_not_moving', 'managed_sync_blocked', 'text_projection_readiness', 'partial_embedding', 'links_extraction_lag',
+  // GBRA-150: bounded receipt and page reads, so a brain whose default run cannot finish still names its landing gaps.
+  'sync_landing_gaps',
 ]);
 
 const CONNECTION_LANE: ReadonlySet<DoctorEntry> = new Set([offlineConnectionEntry, dbChecksGateEntry, connectionEntry, connectionGateEntry]);
@@ -286,6 +296,12 @@ export function doctorCheckNames(): Set<string> {
 /** #6696 B1: every check an ops-tier entry can emit (what `--tier ops` and `run_doctor` `tier: ops` report). */
 export function opsCheckNames(): Set<string> {
   return new Set(DOCTOR_CHECK_REGISTRY.filter((e) => e.tier === 'ops').flatMap((e) => e.emits));
+}
+
+/** #7142: what the doctor-refresh job runs: the connection lane, then every standard-tier entry after the connection gate (filesystem entries depend on the caller's environment, so only the CLI records them). */
+export function doctorRefreshRegistry(): DoctorEntry[] {
+  const gateAt = DOCTOR_CHECK_REGISTRY.indexOf(connectionGateEntry);
+  return DOCTOR_CHECK_REGISTRY.filter((entry, i) => CONNECTION_LANE.has(entry) || (i > gateAt && entryRunsAt(entry.tier, 'standard')));
 }
 
 /** `--only a,b` / `--only=a,b` (repeatable) → the requested check names, or null when absent. */
@@ -346,14 +362,20 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
   return withGitListingCache(async () => {
     const tier = ctx.tier ?? 'standard';
     startDeferredDeadline(ctx.deadline);
+    const rawEngine = ctx.engine;
     if (ctx.engine) ctx.engine = deadlineBoundEngine(ctx.engine);
+    const lastKnown = lastKnownMode(ctx);
+    const outcomes: EntryOutcome[] = [];
     const memo = new Map<string, Promise<unknown>>();
     const gateAt = entries.indexOf(connectionGateEntry);
     const checks: Check[] = [];
     let entryBudgetMs: number | null = null;
     for (const entry of entries) {
       if (!selected(entry, ctx.only)) continue;
-      if (!CONNECTION_LANE.has(entry) && !entryRunsAt(entry.tier, tier)) continue;
+      if (!CONNECTION_LANE.has(entry) && !entryRunsAt(entry.tier, tier)) {
+        if (lastKnown && entryRunsAt(entry.tier, 'standard')) outcomes.push({ entry, state: 'not_run', checks: [], elapsed_ms: 0 });
+        continue;
+      }
       const started = Date.now();
       const emitted = entry.emits.filter((n) => !ctx.only || ctx.only.has(n));
       if (tier === 'ops' && entry.opsPglite === 'not_applicable' && ctx.engine?.kind === 'pglite') {
@@ -363,11 +385,12 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
       if (entryBudgetMs === null && ctx.engine && !ctx.fastMode && !ctx.connectionFailed && gateAt >= 0 && entries.indexOf(entry) > gateAt) {
         entryBudgetMs = await readEntryBudget(ctx);
       }
-      const overallOnly = tier === 'ops' || (!!ctx.only && ctx.deadline?.explicit === true);
+      const overallOnly = cheapTier(tier) || (!!ctx.only && ctx.deadline?.explicit === true);
       const budgetMs = entryBudget(ctx, overallOnly, CONNECTION_LANE.has(entry) ? null : entryBudgetMs, started);
       const limit = budgetMs !== null && ctx.deadline?.deadlineAt != null && (overallOnly || entryBudgetMs === null || started + budgetMs >= ctx.deadline.deadlineAt) ? 'overall' : 'entry';
       if (budgetMs !== null && budgetMs <= 0) {
         checks.push(...emitted.map((n) => budgetUnknownCheck(n, 0, ctx.deadline?.budgetMs ?? 0, 'overall')));
+        if (lastKnown && !CONNECTION_LANE.has(entry)) outcomes.push({ entry, state: 'expired', checks: [], elapsed_ms: 0 });
         continue;
       }
       const scope: StatementDeadline = { startedAt: started, deadlineAt: budgetMs === null ? null : started + budgetMs, expired: false, memo, runDeadlineAt: ctx.deadline?.deadlineAt ?? null };
@@ -380,6 +403,7 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
       if (budgetExpired(result) || (scope.expired && result !== STOP_DOCTOR)) {
         const shown = limit === 'overall' ? ctx.deadline?.budgetMs ?? budgetMs ?? 0 : budgetMs ?? 0;
         checks.push(...emitted.map((n) => budgetUnknownCheck(n, elapsed, shown, limit)));
+        if (lastKnown && !CONNECTION_LANE.has(entry)) outcomes.push({ entry, state: 'expired', checks: [], elapsed_ms: elapsed });
         continue;
       }
       if (result === STOP_DOCTOR) {
@@ -394,23 +418,40 @@ export function runDoctorRegistry(ctx: DoctorContext, entries: readonly DoctorEn
         return ctx.only ? onlyResult(checks, ctx.only, true) : checks;
       }
       const pastDeadline = ctx.deadline?.deadlineAt != null && Date.now() >= ctx.deadline.deadlineAt;
-      checks.push(...result.map((c) => {
+      const produced = result.map((c) => {
         if (pastDeadline && c.details?.health === 'unknown' && c.details.reason === undefined) {
           const unknown = budgetUnknownCheck(c.name, elapsed, ctx.deadline!.budgetMs ?? 0, 'overall');
           return { ...unknown, details: { ...unknown.details, cause: c.message } };
         }
         return c.elapsed_ms === undefined ? { ...c, elapsed_ms: elapsed } : c;
-      }));
+      });
+      checks.push(...produced);
+      if (lastKnown && !CONNECTION_LANE.has(entry)) {
+        outcomes.push({ entry, state: produced.some(isBudgetUnknown) ? 'expired' : 'done', checks: produced, elapsed_ms: elapsed });
+      }
     }
     ctx.progress.finish();
+    if (lastKnown && rawEngine && !ctx.connectionFailed) return withLastKnown(rawEngine, checks, outcomes, lastKnown);
     return ctx.only ? onlyResult(checks, ctx.only, false) : checks;
   });
+}
+
+/** #7142: report last known results for the entries this run did not finish, record the ones it did, and queue a refresh of the rest. */
+async function withLastKnown(engine: BrainEngine, checks: Check[], outcomes: EntryOutcome[], mode: LastKnownMode): Promise<Check[]> {
+  const unfinished = outcomes.some((o) => o.state !== 'done');
+  const cache = unfinished ? await readLastKnown(engine) : new Map();
+  if (mode.record) await writeLastKnown(engine, outcomes);
+  if (!unfinished) return checks;
+  const applied = applyLastKnown(checks, outcomes, cache);
+  const job = mode.refresh && applied.refresh.length && engine.kind === 'postgres' ? await queueRefresh(engine) : null;
+  const unmeasured = unmeasuredCheck(applied.stale, cache, job, engine.kind);
+  return unmeasured ? [...applied.checks, unmeasured] : applied.checks;
 }
 
 /** The time this entry may take: the per-entry budget (unless only the overall deadline applies) clipped to the overall deadline; null: unbounded. */
 function entryBudget(ctx: DoctorContext, overallOnly: boolean, perEntry: number | null, now: number): number | null {
   const overall = ctx.deadline?.deadlineAt != null ? ctx.deadline.deadlineAt - now : null;
-  const own = overallOnly ? null : perEntry;
+  const own = overallOnly ? null : ctx.entryBudgetOverrideMs ?? perEntry;
   if (overall === null) return own;
   return own === null ? overall : Math.min(own, overall);
 }

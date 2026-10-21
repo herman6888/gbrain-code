@@ -4,13 +4,15 @@
  * Pure function: given a conversation turn, return an array of NewFact rows
  * ready for the engine.insertFact path. Pipeline:
  *
- *   1. Sanitize turn_text via INJECTION_PATTERNS (reuses the takes/think
- *      sanitizer — single source of truth for prompt-injection defense).
+ *   1. Neutralize injection in the prompt copy of turn_text via
+ *      INJECTION_PATTERNS (reuses the takes/think sanitizer — single source
+ *      of truth for prompt-injection defense).
  *   2. Anti-loop check: if the turn was sourced from a `dream_generated:true`
  *      page, skip (returns []).
  *   3. Call Haiku via `gateway.chat()` with a tight extraction prompt.
  *   4. Parse the strict-JSON response (4-strategy fallback for malformed).
- *   5. Sanitize each extracted fact's text on the way OUT.
+ *   5. Restore, from the raw turn, any neutralized span the model copied into
+ *      a fact (#7125): stored text is never rewritten by the sanitizer.
  *   6. Compute embeddings synchronously per-fact via `gateway.embed()` so
  *      classifier paths have them available immediately.
  *   7. Return an array of NewFact for the caller to insert.
@@ -26,7 +28,7 @@ import { chat, embedOne, isAvailable, getEmbeddingModel } from '../ai/gateway.ts
 import { classifyGlobalLlmError } from '../ai/errors.ts';
 import { stripReasoningBlocks } from '../llm-json.ts';
 import type { ChatResult } from '../ai/gateway.ts';
-import { INJECTION_PATTERNS } from '../think/sanitize.ts';
+import { INJECTION_PATTERNS, restoreNeutralized } from '../think/sanitize.ts';
 import { resolveModelDetailed, type ResolveSource } from '../model-config.ts';
 import { normalizeModelId, splitProviderModelId } from '../model-id.ts';
 import type { BrainEngine, NewFact, FactKind, FactAttribution } from '../engine.ts';
@@ -606,8 +608,9 @@ export async function extractFactsFromTurnWithOutcome(
   if (input.isDreamGenerated) return { ok: true, facts: [] };
   if (!input.turnText) return { ok: true, facts: [] };
 
-  // Anti-loop + sanitization.
-  let cleaned = input.turnText.slice(0, MAX_TURN_TEXT_CHARS);
+  // Anti-loop + sanitization of the prompt copy only (#7125).
+  const rawTurn = input.turnText.slice(0, MAX_TURN_TEXT_CHARS);
+  let cleaned = rawTurn;
   for (const p of INJECTION_PATTERNS) cleaned = cleaned.replace(p.rx, p.replacement);
   cleaned = cleaned.trim();
   if (!cleaned) return { ok: true, facts: [] };
@@ -780,10 +783,11 @@ export async function extractFactsFromTurnWithOutcome(
       e.name = 'AbortError';
       throw e;
     }
-    let factText = candidate.fact.trim();
+    // #7125: the fact is stored, so it is never rewritten by the sanitizer; a
+    // neutralized span the model copied from the prompt is restored from the
+    // raw turn when the turn proves it. Prompt renderers neutralize on output.
+    let factText = restoreNeutralized(candidate.fact.trim(), rawTurn).text;
     if (!factText) continue;
-    // Sanitize on the way OUT too.
-    for (const p of INJECTION_PATTERNS) factText = factText.replace(p.rx, p.replacement);
     if (factText.length > 500) factText = factText.slice(0, 497) + '...';
     const kind = ALL_EXTRACT_KINDS.includes(candidate.kind as FactKind)
       ? (candidate.kind as FactKind)

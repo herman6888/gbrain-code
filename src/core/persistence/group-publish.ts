@@ -61,7 +61,7 @@ import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-gu
 import { isStreamedContent } from './large-file.ts';
 import { sharedReadFailure } from './bounded-reads.ts';
 import { chargedInterruption, decoratePublicationOutcome, finishPreparationStalled, finishUnpublishedFailure, pageRecoveryRecord, persistenceFileHash, preparationAbortReason,
-  publicationPostimage, publishMutation, publishPersistenceFile, recoverPublication, releaseChargedInterruption, type PreparedMutation } from './coordinator.ts';
+  publicationPostimage, publishMutation, publishPersistenceFile, recoverPublication, releaseChargedInterruption, type PreparedMutation, type PublicationHooks } from './coordinator.ts';
 import { withAttempt } from './publication-failure.ts';
 import { transientInterruption, type TransientInterruption } from './transient-retry.ts';
 import { pipelined } from '../page-state/transactions.ts';
@@ -206,6 +206,8 @@ export interface GroupHooks {
   rolledBack?(rows: WriteRequest[]): Promise<void>;
   /** Right after the commit, before the recovery records are cleared: the committed rows, for waiters. */
   committed?(rows: WriteRequest[]): void;
+  /** A single write that falls back to publishMutation: its PublicationHooks.projectionPending. */
+  projectionPending?: PublicationHooks['projectionPending'];
 }
 
 /**
@@ -446,10 +448,11 @@ function seam(name: PublicationBoundary, row: WriteRequest): Promise<void> {
  */
 export async function publishSingleWrite(engine: BrainEngine, row: WriteRequest, prepared: PreparedMutation, hostId = localHostId(), hooks: GroupHooks = {},
   transaction?: TransactionRunner): Promise<WriteRequest> {
+  const single: PublicationHooks = hooks.projectionPending ? { projectionPending: hooks.projectionPending } : {};
   if (engine.kind !== 'postgres' || !singleWrite(row) || !groupable(row, prepared) || !await writeSwitchOn(engine, 'single_write_group').catch(() => true)) {
-    return publishMutation(engine, row, prepared, hostId);
+    return publishMutation(engine, row, prepared, hostId, single);
   }
-  try { assertMutationProtocol(row); } catch { return publishMutation(engine, row, prepared, hostId); }
+  try { assertMutationProtocol(row); } catch { return publishMutation(engine, row, prepared, hostId, single); }
   const result = await publishGroup(engine, [row], [prepared], hostId, hooks, null, transaction);
   if (result.done) return result.done[0]!;
   let current = await getWriteRequestById(engine, row.id);
@@ -459,7 +462,7 @@ export async function publishSingleWrite(engine: BrainEngine, row: WriteRequest,
     current = reclaimed;
   } else if (!current || current.execution_token !== row.execution_token) return current ?? row;
   if (current.state !== 'running' || current.recovery) return current;
-  return publishMutation(engine, current, prepared, hostId);
+  return publishMutation(engine, current, prepared, hostId, single);
 }
 
 /** A group publication: its committed receipts, or why it did not commit and, for a member's own refusal, which member. */

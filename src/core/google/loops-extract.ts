@@ -383,12 +383,13 @@ export async function runLoopsExtract(
   }
 
   // Injection hardening: same sanitation the facts extractor applies.
-  const { INJECTION_PATTERNS } = await import('../think/sanitize.ts');
+  const { INJECTION_PATTERNS, restoreNeutralized } = await import('../think/sanitize.ts');
   // Open-loop extraction is recency-sensitive: the newest outer messages can
   // fulfil an older promise or add a fresh one. Keeping the oldest 12k silently
   // hid the latest reply on long threads. Bound the same payload size, but keep
   // the tail so the newest evidence is always visible to the judge.
-  let content = (page.compiled_truth ?? '').slice(-12_000);
+  const rawContent = (page.compiled_truth ?? '').slice(-12_000);
+  let content = rawContent;
   for (const p of INJECTION_PATTERNS) content = content.replace(p.rx, p.replacement);
 
   let text: string;
@@ -440,11 +441,18 @@ export async function runLoopsExtract(
   // hallucinated or prompt-injected "quote" is dropped (the loop still
   // lands; fabricated evidence never presents). Whitespace-normalized match:
   // models legitimately collapse newlines inside a quoted sentence.
+  // #7125: the loop text and quote are stored, so a neutralized span the model
+  // copied from the prompt is restored from the raw thread first, and the
+  // quote is checked against the raw thread.
   const wsNorm = (s: string): string => s.replace(/\s+/g, ' ').trim();
-  const haystack = wsNorm(content);
-  const verbatim = (q: string): string => (q && haystack.includes(wsNorm(q)) ? q : '');
-  for (const c of extraction.commitments) c.quote = verbatim(c.quote);
-  for (const d of extraction.decisions_pending) d.quote = verbatim(d.quote);
+  const haystack = wsNorm(rawContent);
+  const restore = (s: string): string => restoreNeutralized(s, rawContent).text;
+  const verbatim = (q: string): string => {
+    const restored = q ? restore(q) : q;
+    return restored && haystack.includes(wsNorm(restored)) ? restored : '';
+  };
+  for (const c of extraction.commitments) { c.text = restore(c.text); c.quote = verbatim(c.quote); }
+  for (const d of extraction.decisions_pending) { d.text = restore(d.text); d.quote = verbatim(d.quote); }
 
   const loopIds: number[] = [];
   const messageDate = typeof fm.date === 'string' ? fm.date : new Date().toISOString();

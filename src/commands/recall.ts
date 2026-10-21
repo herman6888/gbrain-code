@@ -60,7 +60,7 @@ const KIND_ICON: Record<FactKind, string> = {
   idea: '💡',
 };
 
-interface ParsedFlags {
+export interface ParsedFlags {
   entity: string | null;
   since: Date | null;
   sessionId: string | null;
@@ -94,7 +94,7 @@ const WATCH_THIN_CLIENT_WARN_THRESHOLD = 30;
 const WATCH_MAX_CONSECUTIVE_FAILURES = 5;
 const DEFAULT_FALLBACK_HOURS = 24;
 
-function parseFlags(args: string[]): ParsedFlags {
+export function parseFlags(args: string[]): ParsedFlags {
   const out: ParsedFlags = {
     entity: null,
     since: null,
@@ -216,7 +216,7 @@ export function recallNeedsLocalEngine(args: string[]): boolean {
   return flags.budgetPolicy === null && flags.question === null && (flags.query !== null || flags.budgetTokens !== null);
 }
 
-function validateAndNormalizeFlags(flags: ParsedFlags): void {
+export function validateAndNormalizeFlags(flags: ParsedFlags): void {
   if (flags.sinceLastRun && flags.since) {
     process.stderr.write('Error: --since-last-run and --since are mutually exclusive.\n');
     process.exit(2);
@@ -249,6 +249,7 @@ async function resolveSourceForRecall(
   // cannot distinguish "user asked for the default source" from "user
   // passed no source flag".
   sourceExplicit: boolean,
+  routing: RecallRouting = callerRouting(),
 ): Promise<string> {
   if (thinClient) {
     // #5535: an explicit `--source default` is a real selector, not an
@@ -270,7 +271,7 @@ async function resolveSourceForRecall(
     // #5535: pass the flag's literal value (including 'default') when it
     // was explicit so tier 1 of the resolver wins; null only when the flag
     // was omitted, which keeps the env/dotfile/config-default chain.
-    return await resolveSourceId(engine, sourceExplicit || flagValue !== 'default' ? flagValue : null);
+    return await resolveSourceId(engine, sourceExplicit || flagValue !== 'default' ? flagValue : null, routing.cwd, { env: routing.env });
   } catch (e) {
     process.stderr.write(
       `[recall] source not registered: ${flagValue}. Falling back to literal value.\n`,
@@ -308,42 +309,11 @@ Withdraw a fact with gbrain forget <fact-id>.
 export async function runRecall(engine: BrainEngine, args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) { process.stdout.write(RECALL_HELP); return; }
   const flags = parseFlags(args);
-  if (flags.budgetPolicy !== null || flags.question !== null) {
-    const { MEMORY_VERBS_VERSION, operationsByName, verbError } = await import('../core/operations.ts');
-    const { validateParams } = await import('../mcp/validate-params.ts');
-    const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
-    const option = flags.budgetPolicy !== null ? '--budget-policy' : '--question';
+  if (isOneShotRecall(flags)) {
     try {
-      const error = (flags.budgetPolicy !== null ? validateParams(operationsByName.recall, { budget_policy: flags.budgetPolicy }) : null)
-        ?? (flags.watchSeconds !== null || flags.sinceLastRun || flags.rollup || flags.asContext
-          ? `${option} cannot be combined with --watch, --since-last-run, --rollup, or --as-context.` : null);
-      if (error) throw verbError('invalid_params', error, flags.budgetPolicy !== null
-        ? 'Use --budget-policy facts_first or query_first on a one-shot recall, or omit the policy for CLI-only behavior.'
-        : 'Use --question on a one-shot recall, or drop it for the watch, cursor, rollup and context renders.');
-      const selector = flags.sourceExplicit ? flags.source : process.env.GBRAIN_SOURCE || undefined;
-      if (selector !== undefined && !SOURCE_ID_RE.test(selector)) {
-        throw verbError('invalid_params', 'recall requires a concrete source id matching [a-z0-9-]{1,32}.',
-          'Choose a registered source id, or omit the source selector to use your existing scope.', 'source_id');
-      }
-      const thinClient = isThinClient(loadConfig());
-      const sourceId = resolveSourceIdEngineFree(flags.sourceExplicit ? flags.source : null)
-        ?? (thinClient ? undefined : await resolveSourceId(engine, null));
-      await runRecallVerb(engine, flags, sourceId);
+      renderRecallVerbResult(flags, await oneShotRecallResult(engine, flags));
     } catch (error) {
-      if (error instanceof RemoteMcpError) {
-        const { setCliExitVerdict, writeStdoutFinal } = await import('../core/cli-force-exit.ts');
-        const detail = { protocol_version: MEMORY_VERBS_VERSION, ...error.toJSON() };
-        if (flags.json) await writeStdoutFinal(JSON.stringify(detail, null, 2) + '\n');
-        console.error(`Error [${detail.error}]: ${detail.message}`);
-        if (detail.suggestion) console.error(`Fix: ${detail.suggestion}`);
-        setCliExitVerdict(1);
-        return;
-      }
-      if (error instanceof SourceTargetError) {
-        error = verbError('not_found', error.message,
-          'Choose an active source with the source selector, or repair your local source configuration.', 'unknown_source');
-      }
-      if (!await reportPersistenceCliError(error, flags.json)) throw error;
+      await reportOneShotRecallError(error, flags);
     }
     return;
   }
@@ -364,7 +334,7 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
   // MEMORY_VERBS v1 [c4]: the verb params route through the recall OP so the
   // CLI and MCP exercise the same arm (query/budget packing/superset envelope).
   if (flags.query !== null || flags.budgetTokens !== null || flags.question !== null) {
-    await runRecallVerb(engine, flags, sourceId);
+    renderRecallVerbResult(flags, await recallVerbResult(engine, flags, sourceId));
     return;
   }
 
@@ -375,12 +345,95 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
   await runRecallOnce(engine, flags, sourceId, thinClient, 'briefing');
 }
 
+/** The caller's GBRAIN_SOURCE and cwd for source resolution; the warm CLI socket passes the CLI's, never the serve's. */
+export interface RecallRouting { cwd: string; env: string | undefined }
+
+function callerRouting(): RecallRouting {
+  return { cwd: process.cwd(), env: process.env.GBRAIN_SOURCE };
+}
+
+/** MEMORY_VERBS v1 one-shot recall (`--budget-policy` or `--question`). */
+export function isOneShotRecall(flags: ParsedFlags): boolean {
+  return flags.budgetPolicy !== null || flags.question !== null;
+}
+
+/** The recall forms that run the recall op (and only it) before rendering: one-shot, `--query`, `--budget-tokens`. */
+export function isRecallVerbForm(flags: ParsedFlags): boolean {
+  return isOneShotRecall(flags) || flags.query !== null || flags.budgetTokens !== null;
+}
+
+/** One-shot recall: validates the combination, resolves the source and runs the recall op. */
+export async function oneShotRecallResult(engine: BrainEngine, flags: ParsedFlags, routing: RecallRouting = callerRouting()): Promise<RecallVerbResult> {
+  const { operationsByName, verbError } = await import('../core/operations.ts');
+  const { validateParams } = await import('../mcp/validate-params.ts');
+  const option = flags.budgetPolicy !== null ? '--budget-policy' : '--question';
+  const error = (flags.budgetPolicy !== null ? validateParams(operationsByName.recall, { budget_policy: flags.budgetPolicy }) : null)
+    ?? (flags.watchSeconds !== null || flags.sinceLastRun || flags.rollup || flags.asContext
+      ? `${option} cannot be combined with --watch, --since-last-run, --rollup, or --as-context.` : null);
+  if (error) throw verbError('invalid_params', error, flags.budgetPolicy !== null
+    ? 'Use --budget-policy facts_first or query_first on a one-shot recall, or omit the policy for CLI-only behavior.'
+    : 'Use --question on a one-shot recall, or drop it for the watch, cursor, rollup and context renders.');
+  const selector = flags.sourceExplicit ? flags.source : routing.env || undefined;
+  if (selector !== undefined && !SOURCE_ID_RE.test(selector)) {
+    throw verbError('invalid_params', 'recall requires a concrete source id matching [a-z0-9-]{1,32}.',
+      'Choose a registered source id, or omit the source selector to use your existing scope.', 'source_id');
+  }
+  const thinClient = isThinClient(loadConfig());
+  const sourceId = resolveSourceIdEngineFree(flags.sourceExplicit ? flags.source : null, routing.cwd, { env: routing.env })
+    ?? (thinClient ? undefined : await resolveSourceId(engine, null, routing.cwd, { env: routing.env }));
+  return recallVerbResult(engine, flags, sourceId);
+}
+
+/** How a one-shot recall failure is reported (exit code and envelope); rethrows what it does not own. */
+export async function reportOneShotRecallError(error: unknown, flags: ParsedFlags): Promise<void> {
+  const { MEMORY_VERBS_VERSION, verbError } = await import('../core/operations.ts');
+  const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
+  if (error instanceof RemoteMcpError) {
+    const { setCliExitVerdict, writeStdoutFinal } = await import('../core/cli-force-exit.ts');
+    const detail = { protocol_version: MEMORY_VERBS_VERSION, ...error.toJSON() };
+    if (flags.json) await writeStdoutFinal(JSON.stringify(detail, null, 2) + '\n');
+    console.error(`Error [${detail.error}]: ${detail.message}`);
+    if (detail.suggestion) console.error(`Fix: ${detail.suggestion}`);
+    setCliExitVerdict(1);
+    return;
+  }
+  if (error instanceof SourceTargetError) {
+    error = verbError('not_found', error.message,
+      'Choose an active source with the source selector, or repair your local source configuration.', 'unknown_source');
+  }
+  if (!await reportPersistenceCliError(error, flags.json)) throw error;
+}
+
+/**
+ * The recall op result for a verb form, without printing: the source a
+ * non-one-shot form resolves (with its stderr fallback notice) and the op.
+ * The warm CLI socket's serve-side half; the CLI renders what it returns.
+ */
+export async function recallVerbForCaller(engine: BrainEngine, args: string[], routing: RecallRouting): Promise<RecallVerbResult | null> {
+  const flags = parseFlags(args);
+  if (!isRecallVerbForm(flags)) return null;
+  if (isOneShotRecall(flags)) return oneShotRecallResult(engine, flags, routing);
+  return recallVerbResult(engine, flags, await resolveSourceForRecall(engine, flags.source, false, flags.sourceExplicit, routing));
+}
+
+export type RecallVerbResult = {
+  facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string; relevance?: number }>;
+  facts_order?: 'relevance' | 'newest';
+  facts_degraded?: { reason?: string; unembedded?: number };
+  results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
+  search_degraded?: string;
+  budget_tokens?: number;
+  budget_used?: number;
+  dropped_count?: number;
+};
+
 /**
  * MEMORY_VERBS v1 — `gbrain recall --query ... [--budget-tokens N]` routes
- * through the recall OP (same code path MCP exercises) and renders facts +
- * search results with the budget footer. `--json` prints the raw envelope.
+ * through the recall OP (same code path MCP exercises); renderRecallVerbResult
+ * prints facts + search results with the budget footer. `--json` prints the
+ * raw envelope.
  */
-async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?: string): Promise<void> {
+async function recallVerbResult(engine: BrainEngine, flags: ParsedFlags, sourceId?: string): Promise<RecallVerbResult> {
   const { operationsByName } = await import('../core/operations.ts');
   const op = operationsByName['recall'];
   const ctx = {
@@ -413,19 +466,12 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?:
       ...(flags.pending ? { include_pending: true } : {}),
     } : {}),
   };
-  const result = (oneShot && isThinClient(ctx.config)
+  return (oneShot && isThinClient(ctx.config)
     ? unpackToolResult(await callRemoteTool(ctx.config, 'recall', params, { timeoutMs: 30_000 }))
-    : await op.handler(ctx, params)) as {
-    facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string; relevance?: number }>;
-    facts_order?: 'relevance' | 'newest';
-    facts_degraded?: { reason?: string; unembedded?: number };
-    results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
-    search_degraded?: string;
-    budget_tokens?: number;
-    budget_used?: number;
-    dropped_count?: number;
-  };
+    : await op.handler(ctx, params)) as RecallVerbResult;
+}
 
+export function renderRecallVerbResult(flags: ParsedFlags, result: RecallVerbResult): void {
   // An older server ignores `question` (warn-mode params) and answers without facts_order.
   const unranked = flags.question !== null && result.facts_order !== 'relevance'
     ? 'note: this brain did not rank facts by the question (its server predates question ranking); facts are newest first.' : null;
@@ -496,7 +542,8 @@ async function keylessQuestionFallback(engine: BrainEngine, flags: ParsedFlags, 
     return false;
   }
   process.stderr.write(`[recall] no entity or fact text matched '${question}'; ranked facts by relevance to it as a question (keyword-only: this brain has no embeddings).\n`);
-  await runRecallVerb(engine, { ...flags, entity: null, question }, sourceId);
+  const questionFlags = { ...flags, entity: null, question };
+  renderRecallVerbResult(questionFlags, await recallVerbResult(engine, questionFlags, sourceId));
   return true;
 }
 

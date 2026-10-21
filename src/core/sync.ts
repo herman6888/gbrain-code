@@ -64,6 +64,12 @@ interface SyncableOptions {
    * and isn't waivable.
    */
   includeHidden?: string[];
+  /**
+   * Whether a path named like scaffolding (`isSyncMetafile`) is imported as a page all the same: a caller's
+   * `metafilePagePredicate` (`sync-metafile-pages.ts`), which reads the file's head under the brain's
+   * `sync.metafile_pages`. Consulted only for metafile-named paths; absent, every one is skipped.
+   */
+  metafilePage?: (path: string) => boolean;
 }
 
 // v0.19.0 shipped a 9-extension allowlist (ts/tsx/js/jsx/mjs/cjs/py/rb/go). The
@@ -566,12 +572,69 @@ export const SYNC_SKIP_FILES = ['schema.md', 'index.md', 'log.md', 'README.md', 
  */
 export const SYNC_ROOT_SKIP_FILES = ['AGENTS.md', 'CLAUDE.md'] as const;
 
-/** Whether a repo-relative path is directory scaffolding sync never imports (`SYNC_SKIP_FILES` anywhere, `SYNC_ROOT_SKIP_FILES` at the root). */
+/**
+ * Whether a repo-relative path is named like directory scaffolding (`SYNC_SKIP_FILES` anywhere, `SYNC_ROOT_SKIP_FILES`
+ * at the root). Sync skips such a file unless `metafileIsPage` says its head makes it a page.
+ */
 export function isSyncMetafile(path: string): boolean {
   const segments = path.split('/');
   const basename = segments[segments.length - 1] || '';
   return (SYNC_SKIP_FILES as readonly string[]).includes(basename)
     || (segments.length === 1 && (SYNC_ROOT_SKIP_FILES as readonly string[]).includes(basename));
+}
+
+/**
+ * GBRA-150 (maintainer-approved default, 2026-10-20): `sync.metafile_pages` decides whether a nested
+ * `SYNC_SKIP_FILES` file whose frontmatter has a `type:` or `title:` is a page. `typed` imports it like any page;
+ * `off` skips every metafile as before. Root-level metafiles and bare scaffolding are skipped in both modes.
+ */
+export const SYNC_METAFILE_PAGES_KEY = 'sync.metafile_pages';
+export type MetafilePagesMode = 'typed' | 'off';
+export const METAFILE_PAGES_MODES: readonly MetafilePagesMode[] = ['typed', 'off'];
+/** The one default: flipping it back to `'off'` restores the skip-every-metafile behavior everywhere. */
+export const DEFAULT_METAFILE_PAGES_MODE: MetafilePagesMode = 'typed';
+/** Bytes of a file's head the decision reads; a frontmatter block that does not close within it reads as bare. */
+export const METAFILE_HEAD_BYTES = 64 * 1024;
+
+/** A stored `sync.metafile_pages` value as a mode (case-insensitive); anything else is the default. */
+export function parseMetafilePagesMode(value: string | null | undefined): MetafilePagesMode {
+  const normalized = value?.trim().toLowerCase();
+  return (METAFILE_PAGES_MODES as readonly string[]).includes(normalized ?? '') ? normalized as MetafilePagesMode : DEFAULT_METAFILE_PAGES_MODE;
+}
+
+/** The brain's `sync.metafile_pages` mode; an unreadable config reads as the default. */
+export async function readMetafilePagesMode(engine: Pick<BrainEngine, 'getConfig'>): Promise<MetafilePagesMode> {
+  try { return parseMetafilePagesMode(await engine.getConfig(SYNC_METAFILE_PAGES_KEY)); } catch { return DEFAULT_METAFILE_PAGES_MODE; }
+}
+
+/** A `SYNC_SKIP_FILES` name below the root of its source: the only metafiles whose head can make them pages. */
+export function isNestedSkipMetafile(path: string): boolean {
+  const segments = path.split('/');
+  return segments.length > 1 && (SYNC_SKIP_FILES as readonly string[]).includes(segments[segments.length - 1] ?? '');
+}
+
+const METAFILE_PAGE_KEY_RE = /^(?:type|title|"type"|"title"|'type'|'title')[ \t]*:(?:[ \t]+(.*))?$/;
+
+/**
+ * Whether the file at `path` (relative to its source root) is imported as a page although it is named like scaffolding:
+ * a non-root `SYNC_SKIP_FILES` name under mode `typed` whose head opens with a closed frontmatter fence holding a
+ * top-level `type:` or `title:` key with a value. `head` is the file's text (only the first `METAFILE_HEAD_BYTES`
+ * characters are read); undefined (absent or unreadable) is bare. Every other path returns false.
+ */
+export function metafileIsPage(path: string, head: string | undefined, mode: MetafilePagesMode): boolean {
+  if (mode !== 'typed' || head === undefined || !isNestedSkipMetafile(path)) return false;
+  const lines = head.slice(0, METAFILE_HEAD_BYTES).replace(/^\uFEFF/, '').split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length && lines[i]!.trim() === '') i++;
+  if (lines[i]?.trimEnd() !== '---') return false;
+  let typed = false;
+  for (i++; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (/^---[ \t]*$/.test(line)) return typed;
+    const value = METAFILE_PAGE_KEY_RE.exec(line)?.[1]?.trim();
+    if (value && !value.startsWith('#') && !/^(?:null|~)$/i.test(value)) typed = true;
+  }
+  return false;
 }
 
 /**
@@ -600,8 +663,8 @@ function classifySync(path: string, opts: SyncableOptions = {}): SyncableReason 
   // `isPathPruned`'s doc comment for exactly what is and isn't waivable.
   if (isPathPruned(path, opts.includeHidden)) return 'pruned-dir';
 
-  // Skip meta files that aren't pages
-  if (isSyncMetafile(path)) return 'metafile';
+  // Skip meta files that aren't pages (a typed nested one is a page when the caller's predicate says so)
+  if (isSyncMetafile(path) && !opts.metafilePage?.(path)) return 'metafile';
 
   if (opts.include && opts.include.length > 0 && !matchesAnyGlob(path, opts.include)) return 'include-glob-miss';
   if (opts.exclude && opts.exclude.length > 0 && matchesAnyGlob(path, opts.exclude)) return 'exclude-glob-hit';

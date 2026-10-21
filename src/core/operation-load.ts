@@ -71,7 +71,7 @@ const OP_AREAS: Record<string, string> = {
   advisor: 'advisor',
   // sources
   sources_add: 'sources', sources_list: 'sources', sources_remove: 'sources',
-  sources_status: 'sources',
+  sources_status: 'sources', sources_resolve_path: 'sources',
   // sync (localOnly)
   sync_brain: 'sync',
   // ingest log

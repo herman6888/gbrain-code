@@ -8,9 +8,10 @@
  *    a rerun waits on that write instead of admitting a duplicate; a pending
  *    write that ends without committing is re-queued; a page deleted and
  *    retention-purged since its write is created again instead of answered
- *    with the old committed receipt, while an owner purge still refuses it
- *    purged_content; the connector watermark never passes a pending or
- *    failed conversation.
+ *    with the old committed receipt (an identical rerun then admits nothing,
+ *    even before that write's recovery record is cleared), while an owner
+ *    purge still refuses it purged_content; the connector watermark never
+ *    passes a pending or failed conversation.
  * 2. Regression: the per-part catch treating anything but /too large|invalid
  *    byte sequence/ as a run abort, a random request id per run, or a
  *    committed receipt replayed for a page that no longer exists.
@@ -32,6 +33,7 @@ import { connectorSourceKey } from '../../src/core/connectors/config-keys.ts';
 import { CHATGPT_BASE_URL } from '../../src/core/connectors/providers/chatgpt.ts';
 import { waitForWrites } from '../../src/core/persistence/service.ts';
 import { purgeDeletedPagesCoordinated } from '../../src/core/persistence/purge-deleted.ts';
+import { installFaultHook } from '../../src/core/persistence/fault-points.ts';
 import { operations } from '../../src/core/operations.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { chatgptHandler, newFixtureState, startFixture, type FixtureConversation, type FixtureState } from '../fixtures/connectors/fixture-server.ts';
@@ -145,6 +147,49 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       const rerun = await ingest(engine, ctx, path);
       expect(rerun).toMatchObject({ sessionsImported: 1, sessionsErrored: 0, pages: { imported: 0, skipped: 1 } });
       expect((await putPageRequests(engine)).length).toBe(2);
+    }, { databaseUrl }), 180_000);
+
+    // Postgres publishes a single write as a group of one and hands the waiter its commit before clearing the recovery record.
+    if (backend === 'postgres') test('recovery: a rerun while the re-created write is committed but its recovery record is not yet cleared still admits nothing', async () => managedBrain(async ({ engine, ctx, root }) => {
+      const path = exportFile(root, { 'c-1': 'one' });
+      await ingest(engine, ctx, path);
+      const { slug } = await slugOf(engine, 'c-1');
+      const snapshot = await engine.readPageSnapshot(slug, { sourceId: 'default' });
+      await operations.find(op => op.name === 'delete_page')!.handler(ctx, { slug, expected_revision: snapshot!.revision, request_id: crypto.randomUUID() });
+      expect((await purgeDeletedPagesCoordinated(engine, 0)).slugs).toEqual([slug]);
+      // The re-creation's request row is held from its commit, so the post-commit recovery clear waits until the rerun has screened.
+      let release!: () => void;
+      const released = new Promise<void>(resolve => { release = resolve; });
+      let held: Promise<unknown> | undefined;
+      const executeRaw = engine.executeRaw;
+      try {
+        installFaultHook(async (point, detail) => {
+          if (point !== 'publication:after_commit' || detail.operation !== 'put_page' || held) return;
+          let locked!: () => void;
+          const acquired = new Promise<void>(resolve => { locked = resolve; });
+          held = engine.transaction(async tx => {
+            await tx.executeRaw('SELECT 1 FROM persistence_requests WHERE request_id=$1::uuid FOR UPDATE', [detail.requestId]);
+            locked();
+            await released;
+          });
+          await acquired;
+        });
+        await ingest(engine, ctx, path);
+        expect((await putPageRequests(engine)).map(row => [row.state, row.recovery !== null])).toEqual([['committed', false], ['committed', true]]);
+        engine.executeRaw = (async function (this: BrainEngine, ...args: Parameters<BrainEngine['executeRaw']>) {
+          const rows = await executeRaw.apply(this, args);
+          if (args[0].includes('intent IS NOT NULL AND NOT compacted')) release();
+          return rows;
+        }) as BrainEngine['executeRaw'];
+        const rerun = await ingest(engine, ctx, path);
+        expect(rerun).toMatchObject({ sessionsImported: 1, sessionsErrored: 0, pages: { imported: 0, skipped: 1 } });
+        expect((await putPageRequests(engine)).length).toBe(2);
+      } finally {
+        engine.executeRaw = executeRaw;
+        installFaultHook(undefined);
+        release();
+        await held;
+      }
     }, { databaseUrl }), 180_000);
 
     test('item: an identical re-ingest after the owner purged the page is refused purged_content, never replayed or re-created', async () => managedBrain(async ({ engine, ctx, root }) => {

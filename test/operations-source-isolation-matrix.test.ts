@@ -205,6 +205,7 @@ const MATRIX: Row[] = [
     expectScoped: () => {
       throw new Error('sources_status must fail closed (not_found) for out-of-scope ids under any untrusted ctx');
     } },
+  { name: 'sources_resolve_path', mode: 'skip', reason: 'needs a Git checkout of the source; the not_found confinement of an out-of-scope id (assertSourceInCallerScope, as sources_status) is pinned in test/sources-resolve-path.test.ts' },
   { name: 'schema_stats', mode: 'isolated', args: {} },
   { name: 'schema_review_orphans', mode: 'isolated', args: { limit: 50 } },
 

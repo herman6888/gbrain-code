@@ -38,6 +38,10 @@ import { join } from 'node:path';
 //   - facts/withdrawal-schema.ts — its insert/update trigger reapplies an
 //     already-recorded user withdrawal when derived facts are rebuilt; it
 //     cannot invent a withdrawal or infer one from a contradiction.
+//   - facts/insert-guard-schema.ts — the statement-level form of that same
+//     insert trigger (#7105): it clamps valid_until only on rows the current
+//     INSERT wrote that match an already-recorded fact_withdrawals row, the
+//     same rule; it never reads contradiction findings.
 //   - persistence/canonical-projections.ts — restores explicit valid_until
 //     from the accepted canonical Markdown fence, including version reverts,
 //     in the guarded page publication transaction. This copies user-authored
@@ -70,6 +74,7 @@ const VALID_UNTIL_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/core/cycle/extract-facts.ts',
   'src/core/cycle/phases/consolidate.ts',
   'src/core/facts/forget.ts',
+  'src/core/facts/insert-guard-schema.ts',
   'src/core/facts/proposal-supersede.ts',
   'src/core/facts/withdrawal.ts',
   'src/core/facts/withdrawal-schema.ts',

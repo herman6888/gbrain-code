@@ -168,7 +168,8 @@ for (const kind of testBackends()) {
           const started = Date.now();
           const checks = await runDoctorRegistry(ctxFor(slowCount, ['--json', '--scope=brain']), [connectionGateEntry, frontmatterEntry]);
           const fm = byName(checks, 'frontmatter_integrity')!;
-          expect(fm.details?.health, JSON.stringify(fm)).not.toBe('unknown');
+          // #7145: the scan's own partial result (a floor, health unknown past its time bound), not the runner's budget unknown.
+          expect(fm.details, JSON.stringify(fm)).toMatchObject({ partial: true, exact: false, health: 'unknown', reason: 'bound', bound: 'time' });
           expect(fm.message).toMatch(/partial|NOT SCANNED/i);
           expect(fm.message).toContain('fm-example: NOT SCANNED');
           expect(Date.now() - started).toBeLessThan(600 + 400);

@@ -170,6 +170,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "sources_remove": [load_sources, "sourcesOperations"],
   "sources_status": [load_sources, "sourcesOperations"],
   "sources_inspect": [load_sources, "sourcesOperations"],
+  "sources_resolve_path": [load_sources, "sourcesOperations"],
   "request_tools": [load_request_tools, "requestToolsOperations"],
   "get_recent_salience": [load_salience, "salienceOperations"],
   "find_anomalies": [load_salience, "salienceOperations"],

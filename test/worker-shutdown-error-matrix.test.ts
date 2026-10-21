@@ -46,7 +46,12 @@ const ERRORS: Record<string, (ctx: MinionJobContext) => unknown> = {
 
 type WorkerInternals = { queue: MinionQueue; inFlight: Map<number, unknown>; gracefulShutdown(reason: string): void };
 
-/** `holdClaimResult`: park the committed claim's result until the trigger has fired, so the trigger lands before launchJob. */
+/**
+ * Without `holdClaimResult` the trigger fires once the handler is running: a
+ * row already `active` in the database may still be in the claim round trip,
+ * where the watchdog would see a late claim instead of a job running alone.
+ * `holdClaimResult`: park the committed claim's result until the trigger has fired, so the trigger lands before launchJob.
+ */
 async function runCase(engine: BrainEngine, trigger: Trigger, kind: keyof typeof ERRORS, holdClaimResult = false) {
   const queue = new MinionQueue(engine);
   const worker = new MinionWorker(engine, { pollInterval: 10, lockDuration: 60_000, healthCheckInterval: 0, stalledInterval: 600_000 });
@@ -54,7 +59,9 @@ async function runCase(engine: BrainEngine, trigger: Trigger, kind: keyof typeof
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const name = `matrix-${trigger}-${kind}${holdClaimResult ? '-held' : ''}`;
-  worker.register(name, async (ctx) => { await gate; throw ERRORS[kind]!(ctx); });
+  let handlerStarted!: () => void;
+  const started = new Promise<void>(resolve => { handlerStarted = resolve; });
+  worker.register(name, async (ctx) => { handlerStarted(); await gate; throw ERRORS[kind]!(ctx); });
   const job = await queue.add(name, {}, { max_attempts: 3 }, { allowProtectedSubmit: true });
   let releaseClaim = () => {};
   let claimCommitted: Promise<void> | null = null;
@@ -75,7 +82,7 @@ async function runCase(engine: BrainEngine, trigger: Trigger, kind: keyof typeof
     expect((await queue.getJob(job.id))?.status).toBe('active');
     expect(internals.inFlight.size).toBe(0);
   } else {
-    for (let i = 0; i < 400 && (await queue.getJob(job.id))?.status !== 'active'; i++) await Bun.sleep(10);
+    await started;
   }
   if (trigger === 'requestShutdown') worker.requestShutdown();
   else if (trigger === 'watchdog') internals.gracefulShutdown('watchdog');

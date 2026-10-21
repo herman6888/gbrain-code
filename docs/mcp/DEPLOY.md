@@ -71,6 +71,12 @@ catalog, `--surface verbs` exposes exactly the seven-verb memory protocol
 `delta` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) and `--surface
 starter` sits between (40 ops: the verbs plus the daily-driver set).
 
+On a Postgres brain, `gbrain serve --cli-socket` (off by default; or
+`gbrain config set serve.cli_socket true`) also lets this serve answer the
+same user's CLI `search`, `query`, `get` and op-backed `recall` over a
+private Unix socket, so agents that shell out to the CLI skip a cold database
+connection per call ([warm CLI socket](../guides/cli-socket.md)).
+
 `--surface` is the callable ceiling. To keep every operation callable while
 listing fewer tools to the agent, set `mcp.advertised_surface`:
 
