@@ -6,6 +6,7 @@
  */
 import type { Notice } from '../agent-output.ts';
 import { OperationError } from '../ops/contract.ts';
+import { isCliSocketIdentity, type CliSocketIdentity } from './identity.ts';
 
 export const CLI_SOCKET_PROTOCOL = 1;
 export const MAX_REQUEST_BYTES = 256 * 1024;
@@ -32,14 +33,15 @@ export interface CliSocketRouting {
 
 export type CliSocketRequest = {
   v: 1;
-  identity: string;
+  identity: CliSocketIdentity;
   /** The command word the cold path would print in its timeout line. */
   command: string;
   routing: CliSocketRouting;
   cli: { quiet: boolean; timeout_ms: number | null };
 } & ({ kind: 'op'; op: CliSocketOp; params: Record<string, unknown> } | { kind: 'recall'; args: string[] });
 
-export type HandshakeFrame = { v: 1; accepted: true } | { v: 1; accepted: false; reason: string };
+/** A refusal for `identity_mismatch` names the identity part that differed in `mismatch` (cliSocketIdentityMismatch), never its value. */
+export type HandshakeFrame = { v: 1; accepted: true } | { v: 1; accepted: false; reason: string; mismatch?: string };
 
 export type OutputChunk = ['stdout' | 'stderr', string];
 
@@ -58,7 +60,8 @@ function record(value: unknown): value is Record<string, unknown> {
 /** Shape check for the serve's handshake line. */
 export function isHandshakeFrame(value: unknown): value is HandshakeFrame {
   if (!record(value) || value.v !== CLI_SOCKET_PROTOCOL) return false;
-  return value.accepted === true || (value.accepted === false && typeof value.reason === 'string');
+  return value.accepted === true
+    || (value.accepted === false && typeof value.reason === 'string' && (value.mismatch === undefined || typeof value.mismatch === 'string'));
 }
 
 function isAnswered(value: Record<string, unknown>): boolean {
@@ -86,7 +89,7 @@ export function isResultFrame(value: unknown): value is ResultFrame {
 
 /** Shape check for an inbound request; anything else is refused before it reaches the engine. */
 export function isCliSocketRequest(value: unknown): value is CliSocketRequest {
-  if (!record(value) || value.v !== CLI_SOCKET_PROTOCOL || typeof value.identity !== 'string' || typeof value.command !== 'string') return false;
+  if (!record(value) || value.v !== CLI_SOCKET_PROTOCOL || !isCliSocketIdentity(value.identity) || typeof value.command !== 'string') return false;
   const routing = value.routing;
   if (!record(routing) || typeof routing.cwd !== 'string' || !routing.cwd.startsWith('/')
     || !(routing.source_env === null || typeof routing.source_env === 'string')) return false;

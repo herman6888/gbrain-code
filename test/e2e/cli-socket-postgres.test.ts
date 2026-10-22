@@ -132,6 +132,14 @@ describe.skipIf(!DATABASE_URL)('warm CLI socket (postgres)', () => {
     await stopServe();
   }, 90_000);
 
+  test('without a socket, GBRAIN_DEBUG names the missing socket and the read runs cold', async () => {
+    expect(existsSync(socketPath)).toBe(false);
+    const run = await cli(READS.search!, { GBRAIN_DEBUG: '1' });
+    expect(run.stderr).toContain(`[cli-socket] cold path: no socket at ${socketPath}; start the serve with gbrain serve --cli-socket or set serve.cli_socket true`);
+    expect(run.stderr).not.toContain('[cli-socket] warm:');
+    expect({ stdout: run.stdout, exitCode: run.exitCode }).toEqual({ stdout: cold.get('search')!.stdout, exitCode: cold.get('search')!.exitCode });
+  }, 90_000);
+
   test('serve.cli_socket true opens it without the flag (read from the connect-time config merge)', async () => {
     expect((await cli(['config', 'set', 'serve.cli_socket', 'true'])).exitCode).toBe(0);
     try {
@@ -161,8 +169,10 @@ describe.skipIf(!DATABASE_URL)('warm CLI socket (postgres)', () => {
     for (const [name, args] of Object.entries(READS)) {
       const warm = await cli(args, { GBRAIN_DEBUG: '1' });
       expect(warm.stderr, `${name} took the cold path`).not.toContain('[cli-socket] cold path');
+      expect(warm.stderr).toContain(`[cli-socket] warm: ${args[0]} answered by the serve socket at ${socketPath}\n`);
       const expected = cold.get(name)!;
-      expect({ name, ...warm }).toEqual({ name, ...expected });
+      const output = { ...warm, stderr: warm.stderr.replace(`[cli-socket] warm: ${args[0]} answered by the serve socket at ${socketPath}\n`, '') };
+      expect({ name, ...output }).toEqual({ name, ...expected });
     }
     expect(cold.get('get missing')!.exitCode).not.toBe(0);
   }, 180_000);
@@ -204,7 +214,7 @@ describe.skipIf(!DATABASE_URL)('warm CLI socket (postgres)', () => {
     writeFileSync(configFile, JSON.stringify({ ...JSON.parse(original), search_mode_note: 'edited-after-bind' }));
     try {
       const run = await cli(READS.search!, { GBRAIN_DEBUG: '1' });
-      expect(run.stderr).toContain('[cli-socket] cold path: refused (identity_mismatch)');
+      expect(run.stderr).toContain('[cli-socket] cold path: refused (identity_mismatch): config contents');
       expect(run.stdout).toBe(cold.get('search')!.stdout);
       expect(run.exitCode).toBe(0);
     } finally {
@@ -216,17 +226,35 @@ describe.skipIf(!DATABASE_URL)('warm CLI socket (postgres)', () => {
     const identity = cliSocketIdentity({ config: { engine: 'postgres', database_url: databaseUrl }, brainId: 'host', configDir: join(otherHome, '.gbrain'), configFile: join(otherHome, '.gbrain', 'config.json'), version: VERSION, env });
     const outcome = await exchangeCliSocket(socketPath, { v: 1, identity, command: 'search', kind: 'op', op: 'search', params: { query: WORD },
       routing: { cwd: process.cwd(), source_env: null }, cli: { quiet: false, timeout_ms: null } }, 30_000);
-    expect(outcome).toEqual({ reason: 'refused (identity_mismatch)' });
+    expect(outcome).toEqual({ reason: 'refused (identity_mismatch): config home' });
     rmSync(otherHome, { recursive: true, force: true });
   }, 90_000);
 
   test('a CLI whose behavior env differs from the serve\'s (GBRAIN_* settings, provider keys present, a provider endpoint value) is refused and falls back', async () => {
-    const extras: Record<string, string>[] = [{ GBRAIN_CONTRIBUTOR_MODE: '1' }, { VOYAGE_API_KEY: 'synthetic-fixture-value' }, { LMSTUDIO_BASE_URL: 'https://lmstudio.acme-example.test/v1' }];
-    for (const extra of extras) {
+    const extras: Array<[Record<string, string>, string]> = [[{ GBRAIN_CONTRIBUTOR_MODE: '1' }, 'env GBRAIN_CONTRIBUTOR_MODE'], [{ VOYAGE_API_KEY: 'synthetic-fixture-value' }, 'provider key VOYAGE_API_KEY'],
+      [{ LMSTUDIO_BASE_URL: 'https://lmstudio.acme-example.test/v1' }, 'env LMSTUDIO_BASE_URL']];
+    for (const [extra, part] of extras) {
       const run = await cli(READS.search!, { GBRAIN_DEBUG: '1', ...extra });
-      expect(run.stderr).toContain('[cli-socket] cold path: refused (identity_mismatch)');
+      expect(run.stderr).toContain(`[cli-socket] cold path: refused (identity_mismatch): ${part}`);
       expect(run.stdout).toBe(cold.get('search')!.stdout);
     }
+  }, 90_000);
+
+  test('a CLI that differs only in connection sizing and driver-only URL parameters is answered warm', async () => {
+    const lane = `${databaseUrl}${databaseUrl.includes('?') ? '&' : '?'}prepare=false&application_name=cli-lane-example`;
+    const trace = traceFile();
+    const run = await cli(READS.search!, { GBRAIN_DEBUG: '1', GBRAIN_SQL_TRACE: trace, GBRAIN_POOL_SIZE: '3', GBRAIN_DIRECT_POOL_SIZE: '1', GBRAIN_DATABASE_URL: lane });
+    expect(run.stderr).not.toContain('[cli-socket] cold path');
+    expect(roundTrips(trace)).toBe(0);
+    expect({ stdout: run.stdout, exitCode: run.exitCode }).toEqual({ stdout: cold.get('search')!.stdout, exitCode: 0 });
+  }, 90_000);
+
+  test('a CLI that resolves the same home through HOME, without the serve\'s GBRAIN_HOME, is answered warm', async () => {
+    const trace = traceFile();
+    const run = await cli(READS.search!, { GBRAIN_DEBUG: '1', GBRAIN_SQL_TRACE: trace, GBRAIN_HOME: '' });
+    expect(run.stderr).not.toContain('[cli-socket] cold path');
+    expect(roundTrips(trace)).toBe(0);
+    expect({ stdout: run.stdout, exitCode: run.exitCode }).toEqual({ stdout: cold.get('search')!.stdout, exitCode: 0 });
   }, 90_000);
 
   test('a CLI with its own GBRAIN_SOURCE is answered warm, with that source applied', async () => {

@@ -5,7 +5,6 @@
  * is read from the kernel and compared with this process's uid before a byte
  * is parsed; a platform where that cannot be read never opens the listener.
  */
-import { timingSafeEqual } from 'node:crypto';
 import { lstatSync, unlinkSync } from 'node:fs';
 import net, { type Socket } from 'node:net';
 import type { BrainEngine } from '../engine.ts';
@@ -16,7 +15,7 @@ import { tryAcquireNativeLock } from '../persistence/native-lock.ts';
 import { VERSION } from '../../version.ts';
 import { executeCliSocketRequest, type ExecutedRequest } from './execute.ts';
 import { CliSocketUnsafeError, cliSocketDir, cliSocketPath, ensurePrivateDir, privateSocketProblem, socketPathFits, verifyBoundSocket } from './fs-guard.ts';
-import { cliSocketIdentity } from './identity.ts';
+import { cliSocketIdentity, cliSocketIdentityMismatch, type CliSocketIdentity } from './identity.ts';
 import { installOutputCapture } from './output-capture.ts';
 import { peerCredSupport, peerUid, type PeerCredSupport } from './peer-cred.ts';
 import { FrameReader, isCliSocketRequest, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_ROUND_TRIP_MS, REQUEST_READ_TIMEOUT_MS,
@@ -33,7 +32,7 @@ export interface CliSocketServerOptions {
   /** Test seams; production derives each from this process. */
   peerCred?: PeerCredSupport;
   home?: string;
-  identity?: string;
+  identity?: CliSocketIdentity;
   uid?: () => number | undefined;
   brainId?: () => string;
   execute?: (request: CliSocketRequest) => Promise<ExecutedRequest>;
@@ -48,12 +47,6 @@ export interface CliSocketServerOptions {
 export async function startCliSocket(engine: BrainEngine, log: (line: string) => void): Promise<CliSocketBinding | null> {
   try { return await startCliSocketServer({ engine, log }); }
   catch (error) { log(`[gbrain serve] cli-socket: not started: ${(error as Error).message}`); return null; }
-}
-
-function sameToken(a: string, b: string): boolean {
-  const left = Buffer.from(a);
-  const right = Buffer.from(b);
-  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function frame(value: HandshakeFrame | ResultFrame): string {
@@ -139,6 +132,7 @@ export async function startCliSocketServer(opts: CliSocketServerOptions): Promis
   let active = 0;
   let closing = false;
   const rejectedUids = new Set<number | null>();
+  const loggedMismatches = new Set<string>();
   const server = net.createServer(socket => {
     socket.on('error', () => {});
     if (closing || sockets.size >= MAX_CONNECTIONS) { socket.destroy(); return; }
@@ -165,7 +159,12 @@ export async function startCliSocketServer(opts: CliSocketServerOptions): Promis
         let request: unknown;
         try { request = JSON.parse(frames[0]!); } catch { request = null; }
         if (!isCliSocketRequest(request)) { socket.end(frame({ v: 1, accepted: false, reason: 'malformed_request' })); return; }
-        if (!sameToken(request.identity, identity)) { socket.end(frame({ v: 1, accepted: false, reason: 'identity_mismatch' })); return; }
+        const mismatch = cliSocketIdentityMismatch(identity, request.identity);
+        if (mismatch) {
+          if (!loggedMismatches.has(mismatch)) { loggedMismatches.add(mismatch); log(`refused a CLI call: identity_mismatch (${mismatch} differs from this serve's); that CLI takes its cold path.`); }
+          socket.end(frame({ v: 1, accepted: false, reason: 'identity_mismatch', mismatch }));
+          return;
+        }
         if (active >= MAX_ACTIVE_REQUESTS) { socket.end(frame({ v: 1, accepted: false, reason: 'busy' })); return; }
         // Active until the request's own work settles, not until it answered: a timed-out handler still holds its slot.
         active++;

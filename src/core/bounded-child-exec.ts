@@ -33,6 +33,8 @@ export interface BoundedExecOptions {
   maxBuffer?: number;
   signal?: AbortSignal;
   termGraceMs?: number;
+  /** 'buffer' returns stdout and stderr as raw bytes (NUL-delimited git listings); default 'utf8'. */
+  encoding?: 'utf8' | 'buffer';
 }
 
 /**
@@ -51,11 +53,14 @@ export interface BoundedExecOptions {
  * uninterruptible I/O or memory reclaim acts on SIGTERM only seconds later, so
  * git callers pass a longer `termGraceMs` (#6932).
  */
-export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string; stderr: string }> {
-  const { timeout, signal, termGraceMs = BOUNDED_EXEC_TERM_GRACE_MS, ...rest } = options;
+export function execFileBounded(file: string, args: string[], options: BoundedExecOptions & { encoding: 'buffer' }): Promise<{ error: ExecFileException | null; stdout: Buffer; stderr: Buffer }>;
+export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string; stderr: string }>;
+export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string | Buffer; stderr: string | Buffer }> {
+  const { timeout, signal, termGraceMs = BOUNDED_EXEC_TERM_GRACE_MS, encoding = 'utf8', ...rest } = options;
+  const empty = encoding === 'buffer' ? Buffer.alloc(0) : '';
   return new Promise(resolve => {
     let settled = false;
-    const finish = (error: ExecFileException | null, stdout: string, stderr = '') => {
+    const finish = (error: ExecFileException | null, stdout: string | Buffer, stderr: string | Buffer = empty) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -68,12 +73,12 @@ export function execFileBounded(file: string, args: string[], options: BoundedEx
     const settleStopped = () => {
       clearTimeout(escalation);
       clearInterval(poll);
-      finish(stopped, '', '');
+      finish(stopped, empty, empty);
     };
-    const child = execFile(file, args, { ...rest, encoding: 'utf8' }, (error, stdout, stderr) => {
+    const child = execFile(file, args, { ...rest, encoding: encoding as BufferEncoding }, (error: ExecFileException | null, stdout: string | Buffer, stderr: string | Buffer) => {
       clearTimeout(escalation);
       clearInterval(poll);
-      if (stopped) finish(stopped, '', '');
+      if (stopped) finish(stopped, empty, empty);
       else finish(error, stdout, stderr);
     });
     const stop = (message: string, code: string) => {

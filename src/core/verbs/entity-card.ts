@@ -29,7 +29,10 @@ import { isQuarantined } from '../quarantine.ts';
 import { loadPageTrust } from '../eligibility/stamp.ts';
 import { loadRelationshipNotes, relationshipNoteKey } from '../link-relationship-notes.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
-import { slugify } from '../entities/resolve.ts';
+import { isIdentityEntity, slugify } from '../entities/resolve.ts';
+import { nameVariantsEnabled, readPossibleDuplicates, resolveNameVariant, type PossibleDuplicate } from './entity-variants.ts';
+import { readTextMentions, type TextMentions } from './entity-text-mentions.ts';
+import type { NameMatchKind } from '../entities/name-variants.ts';
 import { exactMatchPreference } from '../entities/exact-match-preference.ts';
 import { safeSynopsis } from '../context/retrieval-reflex.ts';
 import { stampEvidence, markKeywordHits } from '../search/evidence.ts';
@@ -48,6 +51,8 @@ const EDGE_CAP = 10;
 const OPEN_THREADS_CAP = 3;
 const OPEN_THREAD_TIMELINE_WINDOW_DAYS = 90;
 const SUGGESTION_CAP = 3;
+/** Keyword hits read for near-miss suggestions before keeping entity pages only. */
+const NEAR_MISS_POOL = 20;
 const FACT_FETCH_CAP = 100;
 export const RECENT_FACTS_CAP = 5;
 
@@ -146,6 +151,12 @@ export interface EntityCard {
   quarantined?: true;
   /** #5575 CEO-20 (additive): the entity page carries an unconfirmed instruction-family write-gate flag. */
   unconfirmed?: true;
+  /** #7160 (additive): the card resolved through a name variant (nickname, initial, title, reordering, typo or surname), not an exact name. */
+  match?: EntityNameMatch;
+  /** #7160 (additive): title-prefixed person pages that likely name the same person (reported only, never merged). `entity` verb only. */
+  possible_duplicates?: PossibleDuplicate[];
+  /** #7161 (additive): on a card with no backlinks and no facts while mention coverage is incomplete, pages whose text contains the title (unlinked text matches, newest first). `entity` verb only. */
+  text_mentions?: TextMentions;
 }
 
 export interface ReferenceGroupView {
@@ -154,6 +165,13 @@ export interface ReferenceGroupView {
   rows: Array<Omit<ReferenceRow, 'source_id'>>;
   /** The call that returns the rest of a truncated group (`requires_surface` when this connection cannot call it). */
   next?: { tool: 'get_backlinks'; arguments: Record<string, unknown>; requires_surface?: 'starter' };
+}
+
+/** #7160: how a name-variant arm matched (absent on alias, exact and suffix hits). */
+export interface EntityNameMatch {
+  kind: NameMatchKind;
+  /** The name as asked. */
+  via: string;
 }
 
 export interface EntitySuggestion {
@@ -170,6 +188,10 @@ export interface EntityCardResult {
   suggestions?: EntitySuggestion[];
   /** On a miss with `includeReferences`: the source's mention coverage (a miss may be a not-yet-indexed name). */
   coverage?: MentionCoverage;
+  /** #7161: on a miss with `includeReferences`, pages whose text contains the name (unlinked text matches, newest first). */
+  text_mentions?: TextMentions;
+  /** #7160: on a miss, the name matched several entity pages as a variant (listed in suggestions); pick one rather than create a page. */
+  ambiguous?: true;
   /** #6723: the source of the resolved page (absent on a miss). */
   source_id?: string;
   /**
@@ -211,6 +233,12 @@ export interface EntityCardOpts {
    * the entity verb passes it for remote callers, like get_page.
    */
   omitQuarantined?: boolean;
+  /**
+   * #7160: run the name-variant arm after the precision arms miss. The
+   * `entity` verb and `entity names` ask for it; proactive cards
+   * (context_pack, delta) never resolve a guessed name.
+   */
+  variants?: boolean;
 }
 
 export interface CardPageRow {
@@ -226,6 +254,10 @@ export interface CardPageRow {
   updated_at: Date | string | null;
   last_retrieved_at: Date | string | null;
 }
+
+/** The card's page-row projection over `pages` (bounded body prefix, last retrieval). */
+const CARD_ROW_COLUMNS = `slug, source_id, title, type, frontmatter, ${boundedBodyPrefixSql('pages')} AS compiled_truth, updated_at,
+              GREATEST(last_retrieved_at, (SELECT r.last_retrieved_at FROM page_retrievals r WHERE r.page_id = pages.id)) AS last_retrieved_at`;
 
 /** Resolution arm rank: lower = higher confidence (frozen precedence ladder). */
 const ARM_ALIAS = 0;
@@ -262,8 +294,8 @@ export async function entityLookupScope(engine: BrainEngine, sourceId: string, r
  * page `omitQuarantined` leaves out (no suggestion names it).
  */
 export type EntityCandidates =
-  | { kind: 'hit'; row: CardPageRow; runnersUp: EntitySuggestion[] }
-  | { kind: 'miss'; suggestions: EntitySuggestion[] }
+  | { kind: 'hit'; row: CardPageRow; runnersUp: EntitySuggestion[]; match?: EntityNameMatch }
+  | { kind: 'miss'; suggestions: EntitySuggestion[]; ambiguous?: true }
   | { kind: 'withheld' };
 
 /** Resolve a trimmed, non-empty name to its candidates. Every arm is fail-soft. */
@@ -272,7 +304,7 @@ export async function selectEntityCandidates(
   sourceId: string,
   trimmed: string,
   scope: EntityLookupScope,
-  opts: { omitQuarantined?: boolean; suggest?: boolean } = {},
+  opts: { omitQuarantined?: boolean; suggest?: boolean; variants?: boolean } = {},
 ): Promise<EntityCandidates> {
   const { privatePagesFilterFragment } = await import('../search/private-visibility.ts');
   // Predicate text lives ONCE (private-visibility.ts) — both card queries
@@ -310,8 +342,7 @@ export async function selectEntityCandidates(
   let rows: CardPageRow[] = [];
   try {
     rows = await engine.executeRaw<CardPageRow>(
-      `SELECT slug, source_id, title, type, frontmatter, ${boundedBodyPrefixSql('pages')} AS compiled_truth, updated_at,
-              GREATEST(last_retrieved_at, (SELECT r.last_retrieved_at FROM page_retrievals r WHERE r.page_id = pages.id)) AS last_retrieved_at
+      `SELECT ${CARD_ROW_COLUMNS}
          FROM pages
         WHERE deleted_at IS NULL
           AND source_id = $1
@@ -335,8 +366,7 @@ export async function selectEntityCandidates(
   if (missing.length) {
     try {
       const extra = await engine.executeRaw<CardPageRow>(
-        `SELECT slug, source_id, title, type, frontmatter, ${boundedBodyPrefixSql('pages')} AS compiled_truth, updated_at,
-              GREATEST(last_retrieved_at, (SELECT r.last_retrieved_at FROM page_retrievals r WHERE r.page_id = pages.id)) AS last_retrieved_at
+        `SELECT ${CARD_ROW_COLUMNS}
            FROM pages
           WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])${privatePredicate}`,
         [sourceId, missing],
@@ -369,7 +399,26 @@ export async function selectEntityCandidates(
     candidates.splice(0, candidates.length, ...live);
   }
   if (candidates.length === 0) {
-    return { kind: 'miss', suggestions: opts.suggest === false ? [] : await nearMissSuggestions(engine, sourceId, trimmed, scope.excludePrivate) };
+    // #7160: the name-variant arm, after every precision arm missed.
+    const variants = opts.variants && await nameVariantsEnabled(engine)
+      ? await resolveNameVariant<CardPageRow>(engine, sourceId, trimmed, {
+        selectColumns: CARD_ROW_COLUMNS, privatePredicate, entityTypes: scope.entityTypes, omitQuarantined: opts.omitQuarantined,
+        retirementPrivacy: scope.excludePrivate ? ` AND ${privatePagesFilterFragment('p')}` : '' })
+      : { matches: [] };
+    const variantSuggestions = (matches: typeof variants.matches): EntitySuggestion[] => matches.map(m => ({
+      slug: m.row.slug, title: m.row.title ?? m.row.slug, create_safety: 'exists', source_id: sourceId }));
+    if (variants.hit) {
+      const hit = variants.hit;
+      const [row] = await overlaidBoundedRows(engine, [hit.row]);
+      return { kind: 'hit', row, match: { kind: hit.kind, via: trimmed },
+        runnersUp: variantSuggestions(variants.matches.filter(m => m.row.slug !== hit.row.slug)).slice(0, SUGGESTION_CAP) };
+    }
+    const ambiguous = variants.matches.length > 0 ? { ambiguous: true as const } : {};
+    if (opts.suggest === false) return { kind: 'miss', suggestions: [], ...ambiguous };
+    const seen = new Set<string>();
+    const suggestions = [...variantSuggestions(variants.matches), ...await nearMissSuggestions(engine, sourceId, trimmed, scope)]
+      .filter(x => !seen.has(x.slug) && (seen.add(x.slug), true));
+    return { kind: 'miss', suggestions: suggestions.slice(0, SUGGESTION_CAP), ...ambiguous };
   }
 
   // Large pages: the hit carries a bounded, withdrawal-overlaid body prefix (its summary and lead read only that).
@@ -399,15 +448,26 @@ export async function selectAcrossSources(
   sources: readonly string[],
   trimmed: string,
   remote: boolean,
-  opts: { omitQuarantined?: boolean; scopes?: Map<string, Promise<EntityLookupScope>> } = {},
+  opts: { omitQuarantined?: boolean; scopes?: Map<string, Promise<EntityLookupScope>>; variants?: boolean } = {},
 ): Promise<{ sourceId: string; scope: EntityLookupScope; selected: EntityCandidates }> {
   let first: { sourceId: string; scope: EntityLookupScope; selected: EntityCandidates } | undefined;
+  const variantHits: Array<{ sourceId: string; scope: EntityLookupScope; selected: Extract<EntityCandidates, { kind: 'hit' }> }> = [];
+  let variantAmbiguous = false;
   for (const sourceId of sources) {
     if (opts.scopes && !opts.scopes.has(sourceId)) opts.scopes.set(sourceId, entityLookupScope(engine, sourceId, remote));
     const scope = await (opts.scopes?.get(sourceId) ?? entityLookupScope(engine, sourceId, remote));
-    const selected = await selectEntityCandidates(engine, sourceId, trimmed, scope, { omitQuarantined: opts.omitQuarantined, suggest: first === undefined });
-    if (selected.kind === 'hit') return { sourceId, scope, selected };
+    const selected = await selectEntityCandidates(engine, sourceId, trimmed, scope, { omitQuarantined: opts.omitQuarantined, suggest: first === undefined, variants: opts.variants });
+    // #7160: an exact hit in any source beats a name-variant guess, and a guess must be unique across every source read.
+    if (selected.kind === 'hit' && !selected.match) return { sourceId, scope, selected };
+    if (selected.kind === 'hit') variantHits.push({ sourceId, scope, selected });
+    if (selected.kind === 'miss' && selected.ambiguous) variantAmbiguous = true;
     first ??= { sourceId, scope, selected };
+  }
+  if (variantHits.length === 1 && !variantAmbiguous) return variantHits[0]!;
+  if (variantHits.length && first) {
+    const hitSuggestions = variantHits.map(v => ({ slug: v.selected.row.slug, title: v.selected.row.title ?? v.selected.row.slug, create_safety: 'exists', source_id: v.sourceId }));
+    const rest = first.selected.kind === 'miss' ? first.selected.suggestions : [];
+    return { ...first, selected: { kind: 'miss', ambiguous: true, suggestions: [...hitSuggestions, ...rest].slice(0, SUGGESTION_CAP) } };
   }
   return first!;
 }
@@ -424,21 +484,41 @@ export async function buildEntityCard(
   // Covers entity, context_pack, and delta (all route through buildEntityCard).
   // #6723: the source with the hit owns the card; every read below uses it.
   const sources = opts.sources?.length ? opts.sources : [sourceId];
-  const { sourceId: hitSource, scope, selected } = await selectAcrossSources(engine, sources, trimmed, opts.remote, { omitQuarantined: opts.omitQuarantined });
+  const { sourceId: hitSource, scope, selected } = await selectAcrossSources(engine, sources, trimmed, opts.remote, { omitQuarantined: opts.omitQuarantined, variants: opts.variants });
   if (selected.kind === 'withheld') return { found: false, suggestions: [] };
   if (selected.kind === 'miss') {
+    const ambiguous = selected.ambiguous ? { ambiguous: selected.ambiguous } : {};
+    if (!opts.includeReferences) return { found: false, suggestions: selected.suggestions, ...ambiguous };
+    const textMentions = await readTextMentions(engine, sources, trimmed, { remote: opts.remote, excludePrivate: scope.excludePrivate, omitQuarantined: opts.omitQuarantined });
     return {
       found: false, suggestions: selected.suggestions,
-      ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [...sources]).catch(() => undefined) } : {}),
+      coverage: await readMentionCoverage(engine, [...sources]).catch(() => undefined),
+      ...(textMentions?.total || textMentions?.unread ? { text_mentions: textMentions } : {}),
+      ...ambiguous,
     };
   }
 
-  const { row, runnersUp } = selected;
+  const { row, runnersUp, match } = selected;
   const { card, facts: factRows } = await assembleCard(engine, hitSource, row, opts.remote, scope.excludePrivate, opts.eligibility ?? {});
+  if (match) card.match = match;
   if (opts.includeReferences) {
     Object.assign(card, await cardReferences(engine, hitSource, row, opts, scope.excludePrivate, scope.entityTypes),
       await readCardIdentity(engine, hitSource, row, { excludePrivate: scope.excludePrivate, excludeQuarantined: opts.omitQuarantined === true, surfaceCeiling: opts.surfaceCeiling, aka: card.aka }));
     await attachCardRecords(engine, hitSource, card, opts, scope.excludePrivate);
+    if (await nameVariantsEnabled(engine)) {
+      const { privatePagesFilterFragment } = await import('../search/private-visibility.ts');
+      const duplicates = await readPossibleDuplicates<CardPageRow>(engine, hitSource, row, {
+        selectColumns: CARD_ROW_COLUMNS, entityTypes: scope.entityTypes, omitQuarantined: opts.omitQuarantined,
+        privatePredicate: scope.excludePrivate ? ` AND ${privatePagesFilterFragment('pages')}` : '',
+        retirementPrivacy: scope.excludePrivate ? ` AND ${privatePagesFilterFragment('p')}` : '' });
+      if (duplicates.length) card.possible_duplicates = duplicates;
+    }
+    // #7161: a thin card while mentions are behind may be a stale stub; show where the name appears in text.
+    if (card.backlink_count === 0 && card.active_fact_count === 0 && card.coverage && card.coverage.state !== 'complete') {
+      const textMentions = await readTextMentions(engine, [hitSource], row.title || trimmed,
+        { remote: opts.remote, excludePrivate: scope.excludePrivate, omitQuarantined: opts.omitQuarantined, exclude: [row.slug] });
+      if (textMentions?.total || textMentions?.unread) card.text_mentions = textMentions;
+    }
   }
   return {
     found: true,
@@ -730,11 +810,14 @@ async function nearMissSuggestions(
   engine: BrainEngine,
   sourceId: string,
   name: string,
-  excludePrivate = false,
+  scope: Pick<EntityLookupScope, 'excludePrivate' | 'entityTypes'>,
 ): Promise<EntitySuggestion[]> {
   try {
-    const raw = await engine.searchKeyword(name, { limit: SUGGESTION_CAP, sourceId, excludePrivate });
-    const results = raw as SearchResult[];
+    // #7160: over-fetch keyword hits and keep entity pages only; index, digest and note pages are never "did you mean".
+    const raw = await engine.searchKeyword(name, { limit: NEAR_MISS_POOL, sourceId, excludePrivate: scope.excludePrivate });
+    const results = (raw as SearchResult[])
+      .filter((r, i, all) => (isIdentityEntity(r.slug, r.type) || scope.entityTypes.has(r.type ?? '')) && all.findIndex(o => o.slug === r.slug) === i)
+      .slice(0, SUGGESTION_CAP);
     // #3783 — direct FTS path: every row is a keyword hit by construction.
     markKeywordHits(results);
     stampEvidence(results);

@@ -38,6 +38,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSpawnInvocation } from './spawn-helpers.ts';
 import { SpendEnforcementUnavailableError, childSpendEnforcementReady } from './spend-authorization.ts';
+import { CHILD_PARENT_BUILD_ENV, parentBuildEnvValue } from './child-readiness.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 import {
   UnrecoverableError,
@@ -208,6 +209,7 @@ async function runJobChildProcess(opts: RunJobInChildOpts): Promise<unknown> {
     [CHILD_ENV.resultPath]: resultPath,
     [CHILD_ENV.isChild]: '1',
     [CHILD_ENV.parentPid]: String(process.pid),
+    [CHILD_PARENT_BUILD_ENV]: parentBuildEnvValue(opts.spendAuthorized === true),
     GBRAIN_POOL_SIZE: String(childPoolSize),
     GBRAIN_DIRECT_POOL_SIZE: '1',
   };

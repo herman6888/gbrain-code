@@ -178,9 +178,16 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`the drift c
       const snapshot = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
       bodyDigestWork.fileBytes = 0;
       let refusal: { code?: string; message: string } | undefined;
-      try {
-        await submitPageMutation(ctx, { operation: 'delete_page', params: { slug, expected_revision: snapshot!.revision, request_id: randomUUID() } });
-      } catch (error) { refusal = { code: (error as { code?: string }).code, message: (error as Error).message }; }
+      // A preparation that outlasts the reply wait (a pending receipt) still ends in its refusal: the same request is
+      // asked again until it settles. The new page's background index build can overlap this delete since #7106.
+      const params = { slug, expected_revision: snapshot!.revision, request_id: randomUUID() };
+      for (;;) {
+        try { await submitPageMutation(ctx, { operation: 'delete_page', params }); break; }
+        catch (error) {
+          if ((error as { code?: string }).code === 'write_pending') { await Bun.sleep(1000); continue; }
+          refusal = { code: (error as { code?: string }).code, message: (error as Error).message }; break;
+        }
+      }
       expect(refusal?.code).toBe('page_body_segmented');
       expect(refusal?.message).toContain(`over the ${FENCE_MAX_BYTES}-byte bound`);
       const fenceRead = bodyDigestWork.fileBytes - fileBytes - regionBytes - 2 * (Buffer.byteLength(before) - start);

@@ -47,7 +47,8 @@ import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { repairAdmissionWindow, repairPublicationOwner, settleRepairReceipts, type PendingRepair } from './settle.ts';
 import { RECEIPT_RESERVATION_FLOOR } from '../persistence/receipt-bytes.ts';
 import { readFix } from '../ops/op-fix.ts';
-import { ItemRun, type ItemFailure } from '../item-failure.ts';
+import { classifyItemFailure, ItemRun, type ItemFailure } from '../item-failure.ts';
+import type { ProgressReporter } from '../progress.ts';
 
 export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'accepted-takes', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'atoms-restore', 'extractor-facts', 'conversation-labels', 'captured-facts', 'redacted-facts', 'loop-facts', 'ontology-facts', 'facts-rehome', 'consolidate-ties', 'orphan-children', 'failed-writes', 'split-facts', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'managed-sync-orphans', 'content-receipt-root', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'ghost-pages', 'origin-twins', 'receipt-compaction', 'aliases', 'rename-identity', 'overwritten-edits', 'legacy-twins', 'missing-tables', 'url-clone-fences', 'segmented-mirror', 'uncommitted-deletions'] as const;
 export type RepairKind = typeof REPAIR_KINDS[number];
@@ -107,6 +108,10 @@ export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmb
   since?: string;
   /** #6712 PR 4b `file-drift`: the source's held `file_drift` pages, of one side and (for `deleted`) one state. */
   held?: boolean; side?: string; state?: string;
+  /** GBRA-133 `file-drift --held --side deleted --state file_gone`: only holds of this deletion provenance (`--provenance`). */
+  provenance?: string;
+  /** `file-drift --held`: the window starts after the held file this `next_cursor` names (`--cursor`); `progress` reports the preview's pages, and an apply's items, on stderr. */
+  cursor?: string; progress?: ProgressReporter;
   /** `stuck-recovery`: the version an apply keeps, and the one request a run selects. */
   keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string;
   /** `receipt-compaction` (#6696 A9): the age (`72h`, `30d`), failures too, and compaction inside the retention window. */
@@ -114,7 +119,9 @@ export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmb
   /** `rename-identity` (#6729): the old slug that disambiguates a pair (`--from`), and the close disposition (`--close`). */
   from?: string; close?: boolean;
   /** `uncommitted-deletions` (#7130): the preview window starts below this page id (`--after`). */
-  afterPage?: number }
+  afterPage?: number;
+  /** `visibility`: the preview window's size (`--limit`); an apply still stops after `--limit` items. */
+  limit?: number }
 
 export interface RepairHandler {
   kind: RepairKind;
@@ -310,8 +317,13 @@ export async function runRepair(ctx: OperationContext, handler: RepairHandler, s
   opts: { apply: boolean; limit?: number; embeddingModel?: string; sourceFlag?: string; embed?: boolean; applyArgs?: string[];
     explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[]; slugs?: string[]; noLlm?: boolean;
     prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string; held?: boolean; side?: string; state?: string;
+    provenance?: string; cursor?: string; progress?: ProgressReporter;
     keep?: 'prior' | 'disk' | 'withdrawn'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean; from?: string; close?: boolean; afterPage?: number;
     spec?: Pick<RepairKindSpec, 'explicit_only' | 'consent' | 'spends'>; maxLlmUsd?: number; deadline?: number; now?: () => number;
+    /** GBRA-133: the CLI's termination signal; the apply stops before the next item with a result instead of dying mid-run. */
+    stop?: AbortSignal;
+    /** GBRA-133: the CLI's apply records a database refusal as a stop with a result; other callers (cycle, remediation) keep the rethrow. */
+    recordDatabaseStops?: boolean;
     /** Test seam: who publishes this run's admissions (default: this process's consumer, else a live full one on this host). */
     publicationOwner?: () => Promise<{ alive: boolean; owner: string }> }): Promise<RepairResult> {
   // #6696 (A5): an approved local repair is the operator's own write; a maintenance cycle's background scope still wins.
@@ -332,9 +344,11 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
     ...(opts.prefer ? { prefer: opts.prefer } : {}), ...(opts.requests?.length ? { requests: opts.requests } : {}),
     ...(opts.allDrifted ? { allDrifted: true } : {}), ...(opts.driftClass ? { driftClass: opts.driftClass } : {}), ...(opts.since ? { since: opts.since } : {}),
     ...(opts.held ? { held: true } : {}), ...(opts.side ? { side: opts.side } : {}), ...(opts.state ? { state: opts.state } : {}),
+    ...(opts.provenance ? { provenance: opts.provenance } : {}), ...(opts.cursor ? { cursor: opts.cursor } : {}), ...(opts.progress ? { progress: opts.progress } : {}),
     ...(opts.keep ? { keep: opts.keep } : {}), ...(opts.requestId ? { requestId: opts.requestId } : {}),
     ...(opts.olderThan ? { olderThan: opts.olderThan } : {}), ...(opts.includeFailures ? { includeFailures: true } : {}), ...(opts.force ? { force: true } : {}),
-    ...(opts.from ? { from: opts.from } : {}), ...(opts.close ? { close: true } : {}), ...(opts.afterPage !== undefined ? { afterPage: opts.afterPage } : {}) };
+    ...(opts.from ? { from: opts.from } : {}), ...(opts.close ? { close: true } : {}), ...(opts.afterPage !== undefined ? { afterPage: opts.afterPage } : {}),
+    ...(opts.limit !== undefined ? { limit: opts.limit } : {}) };
   const plan = await handler.plan(ctx.engine, scope, resumed, planOpts);
   const pending = opts.limit !== undefined ? plan.items.slice(0, opts.limit) : plan.items;
   const counters = await capacity(ctx);
@@ -361,6 +375,7 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
         ...(opts.requests ?? []).flatMap(id => ['--request', id]),
         ...(opts.allDrifted ? ['--all-drifted'] : []), ...(opts.driftClass ? ['--class', opts.driftClass] : []), ...(opts.since ? ['--since', opts.since] : []),
         ...(opts.held ? ['--held'] : []), ...(opts.side ? ['--side', opts.side] : []), ...(opts.state ? ['--state', opts.state] : []),
+        ...(opts.provenance ? ['--provenance', opts.provenance] : []), ...(opts.cursor ? ['--cursor', opts.cursor] : []),
         ...(opts.prefer ? ['--prefer', opts.prefer] : [])].map(arg => ` ${shellQuote([arg])}`).join('')}`
       + `${opts.includeAmbiguous ? ' --include-ambiguous' : ''}${llm && opts.noLlm ? ' --no-llm' : ''}${llm && opts.maxLlmUsd !== undefined ? ` --max-usd ${opts.maxLlmUsd}` : ''}`
       + ` --apply${plan.preview_hash ? ` --expect ${plan.preview_hash}` : ''}${spec?.consent === 'destructive' ? ' --yes' : ''}`,
@@ -371,6 +386,7 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
   const finish = async (): Promise<RepairResult> => {
     if (failedItems.length && handler.onItemFailures && result.stopped?.reason !== 'item_failures_systemic') await handler.onItemFailures(ctx, failedItems);
     if (handler.report) Object.assign(result, await handler.report(ctx, scope, result, planOpts));
+    if (opts.apply) opts.progress?.finish();
     return result;
   };
   if (!opts.apply) {
@@ -416,13 +432,19 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
     result.stopped = stopped;
     return finish();
   };
+  if (opts.apply) opts.progress?.start(`repair.${handler.kind}.apply`, pending.length);
   for (const [index, item] of pending.entries()) {
     const remaining = pending.length - index;
+    opts.progress?.tick(1, `${item.source_id}:${item.slug}`);
     // A preview-bound kind may retire its approved set with its last item, so every earlier receipt settles before that item runs.
     const lastApproved = !!opts.expect && index === plan.items.length - 1;
     if (unresolved.length && (unresolved.length >= window || lastApproved) && !await settle(lastApproved ? 0 : window - 1)) {
       result.stopped = pendingStop(settleMs ? `; nothing published for ${Math.round(settleMs / 1000)}s` : '');
       return finish();
+    }
+    if (opts.stop?.aborted) {
+      return stopAfterSettle({ reason: 'interrupted', message: `Stopped before ${item.source_id}:${item.slug}: this process received ${String(opts.stop.reason ?? 'a termination signal')} `
+        + `(${remaining} item(s) still pending; the items before it stay applied). Rerun \`${result.apply_command}\` to resume.` });
     }
     if (opts.deadline !== undefined && now() >= opts.deadline) {
       return stopAfterSettle({ reason: 'time_budget', message: `Stopped before ${item.source_id}:${item.slug}: this run reached its time budget (${remaining} item(s) still pending). `
@@ -493,6 +515,16 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
       if (writerHeld(error)) {
         return stopAfterSettle({ reason: error.code, message: `The canonical writer for source '${item.source_id}' is held (${error.code}). `
           + `Inspect it with: gbrain sources writer status ${item.source_id} — then rerun \`${result.apply_command}\` to resume.` });
+      }
+      // GBRA-133: a deadlock, a serialization failure or a lost database connection stops the run with what it applied and
+      // the resume command in the result (the cursor stays before this item), instead of ending the command with no record.
+      const database = opts.recordDatabaseStops ? classifyItemFailure(error) : null;
+      if (database && database.scope === 'run' && (database.code === 'database_contention' || database.code === 'connection_lost')) {
+        const sqlstate = (error as { code?: unknown } | null)?.code;
+        return stopAfterSettle({ reason: database.code, message: redactConnectionInfo(`Stopped at ${item.source_id}:${item.slug}: the database refused this item`
+          + `${typeof sqlstate === 'string' ? ` (${sqlstate})` : ''}: ${database.message.slice(0, 300)}. The items before it stay applied `
+          + `(${remaining} item(s) still pending). Rerun \`${result.apply_command}\` to resume from this item.`),
+          fix: readFix(`Previews ${handler.kind} again (read-only) to show whether the database accepts work again.`, { argv: ['gbrain', 'repair', handler.kind, ...(opts.sourceFlag ? ['--source', opts.sourceFlag] : []), '--json'] }) });
       }
       // An apply bound to an approved preview (`--expect`) applies that set or answers why not; only the kinds' own refusals continue it.
       if (opts.expect && !(error instanceof OperationError && REPAIR_ITEM_FAILURE_CODES.has(error.code))) throw error;

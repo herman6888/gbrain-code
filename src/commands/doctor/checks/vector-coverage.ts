@@ -10,7 +10,8 @@
  */
 import { loadConfig } from '../../../core/config.ts';
 import { AUDIT_ROW_SOURCES } from '../../../core/facts/audit-sources.ts';
-import { eligibleFactEmbedding, partiallyEmbeddedFact, staleFactEmbedding } from '../../../core/facts/embedding-identity.ts';
+import { eligibleFactEmbedding, partiallyEmbeddedFact, staleFactEmbedding, readOversizedStaleFacts, oversizedFactLine, OVERSIZED_FACT_FIX } from '../../../core/facts/embedding-identity.ts';
+import { resolveMaxChunkTokens } from '../../../core/embedding-input-limit.ts';
 import { EMBED_MAX_CHARS } from '../../../core/ai/embed-batch-plan.ts';
 import { takesAutoEmbedEnabled } from '../../../core/embed-takes.ts';
 import type { Check } from '../../doctor.ts';
@@ -59,8 +60,13 @@ async function runFactTakeVectors(ctx: DoctorContext): Promise<Check[]> {
     }
     const sum = (key: keyof Omit<SourceVectors, 'source_id'>) => bySource.reduce((n, r) => n + r[key], 0);
     const partiallyEmbedded = factRows.filter(r => sources.some(s => s.id === r.source_id)).reduce((n, r) => n + Number(r.partial), 0);
+    const maxTokens = resolveMaxChunkTokens();
+    const oversized = sum('facts_stale') ? await readOversizedStaleFacts(engine, { sourceId: ctx.orphanRatioSourceId ?? undefined, model, dims, maxTokens }) : [];
     const facts = { missing: sum('facts_missing'), other_model: sum('facts_stale') - sum('facts_missing'), stale: sum('facts_stale'),
-      partially_embedded: partiallyEmbedded };
+      partially_embedded: partiallyEmbedded, oversized: oversized.length };
+    const oversizedNote = oversized.length
+      ? ` ${oversized.length} of the stale fact(s) are longer than the embedding input limit (${maxTokens} tokens), so gbrain embed --facts skips them instead of truncating (first: ${oversizedFactLine(oversized[0]!, maxTokens)}). ${OVERSIZED_FACT_FIX} gbrain embed --held --dry-run lists them.`
+      : '';
     const partialNote = partiallyEmbedded
       ? ` ${partiallyEmbedded} fact(s) are partially embedded: longer than ${EMBED_MAX_CHARS} characters, so their vector covers only the start of the fact. They stay current and are never re-embedded or charged again.`
       : '';
@@ -81,7 +87,7 @@ async function runFactTakeVectors(ctx: DoctorContext): Promise<Check[]> {
       status: 'warn',
       message: `${facts.stale} active fact(s) and ${takes.stale} active take(s) have no ${model} (${dims}d) vector for their current text ` +
         `(facts: ${facts.missing} missing, ${facts.other_model} from another model or text; takes: ${takes.missing_or_changed} missing or claim changed, ${takes.other_model} from another model). ` +
-        `Vector dedup, consolidation and semantic take search skip them. Fix: ${fix.join('; ')}${partialNote && `.${partialNote}`}`,
+        `Vector dedup, consolidation and semantic take search skip them. Fix: ${fix.join('; ')}${partialNote && `.${partialNote}`}${oversizedNote}`,
       details: { code: 'stale_vectors', applicable: true, model, dims, facts, takes, by_source: bySource,
         cause: 'facts and takes without a current-model vector', fix, docs: VECTOR_COVERAGE_DOCS },
       fix: factSources.length

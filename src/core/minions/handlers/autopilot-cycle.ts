@@ -4,6 +4,7 @@
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
 import { resolveJobPull } from './job-pull.ts';
+import { reportJobProgress } from './job-progress.ts';
 import { isConnectorSourceKind } from '../../persistence/connector-identity.ts';
 import { CONNECTOR_SOURCE_PHASES } from '../../cycle/phase-scope.ts';
 
@@ -160,6 +161,8 @@ export function makeAutopilotCycleHandler(engine: BrainEngine): MinionHandler {
       // #6803: a connector cycle has no sync phase; its incremental set is the source's pages changed since its last cycle.
       ...(connectorSource ? { sourceChangedSince: lastSourceCycleAt } : {}),
       ...(effectivePhases !== undefined ? { phases: effectivePhases as any } : {}),
+      // #7241: the phase in progress, for `gbrain jobs get` / get_job_progress while the cycle runs.
+      onPhaseStart: (phase, index, count) => reportJobProgress(job, { phase, phase_index: index, phase_count: count, started_at: new Date().toISOString() }),
       yieldBetweenPhases: async () => {
         // Yield to the event loop so worker lock-renewal can fire.
         await new Promise<void>(r => setImmediate(r));

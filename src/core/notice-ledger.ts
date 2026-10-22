@@ -16,6 +16,12 @@
  * - Mute applies to `coaching` and `info` only: globally for the local owner
  *   (`gbrain notices mute <code>`), per client on remote transports
  *   (`mute_notice`). Persisted under GBRAIN_HOME.
+ * - A notice carrying `escalation` (#7165 coverage notices: held_files and a
+ *   projection-only degraded_recall) shows once per session per key for
+ *   COVERAGE_NOTICE_WINDOW_MS, per-call code or not, and again at once when its
+ *   level rises materially (`coverageWorsened`). HTTP applies it only with a
+ *   transport-resolved session id. One-shot CLI calls share the window through
+ *   `admitAcrossCliCalls` (GBRAIN_HOME/notices/coverage.json).
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -29,6 +35,24 @@ export const COACHING_BUDGET_PER_SESSION = 2;
 export const MUTEABLE_ASK_CODES: ReadonlySet<string> = new Set(['first_run_decisions']);
 /** Notices that describe THIS call's result (never deduped unless the notice carries a `dedupe_key`): the diagnosis must ride every affected call. */
 export const PER_CALL_NOTICE_CODES: ReadonlySet<string> = new Set(['degraded_recall', 'hidden_tool_content', 'empty_retrieval', 'unknown_param', 'listing_truncated', 'former_relationships_hidden', 'source_binding_narrowed', 'local_transcripts', 'held_files', 'relational_chain', 'mention_index', 'delta_incomplete', 'identity_siblings_capped', 'references_unavailable', 'record_types_undeclared', 'alias_fanout', 'facts_unembedded']);
+
+/** How long a shown coverage state (a notice's `escalation`) stays shown. */
+export const COVERAGE_NOTICE_WINDOW_MS = 30 * 60 * 1000;
+
+/** Material worsening over `floor`, the lowest level seen since the notice last showed: up by 10% and at least 1. */
+export function coverageWorsened(floor: number, level: number): boolean {
+  return level >= floor + Math.max(1, Math.ceil(floor * 0.1));
+}
+
+interface EscalationMark { floor: number; at: number }
+
+/** Show or suppress one escalating notice given its last mark; the returned mark replaces it. */
+function escalate(prev: EscalationMark | undefined, level: number, now: number): { show: boolean; mark: EscalationMark } {
+  if (prev && now - prev.at < COVERAGE_NOTICE_WINDOW_MS && !coverageWorsened(prev.floor, level)) {
+    return { show: false, mark: { floor: Math.min(prev.floor, level), at: prev.at } };
+  }
+  return { show: true, mark: { floor: level, at: now } };
+}
 
 /** Notices whose producer already deduped them with `claim` on its own key; admit applies mute only. */
 export const SELF_DEDUPED_NOTICE_CODES: ReadonlySet<string> = new Set(['grant_blocked_operations']);
@@ -47,6 +71,7 @@ export class NoticeLedger {
   private tallies = new Map<string, { n: number; at: number }>();
   private claimed = new Map<string, number>();
   private memo = new Map<string, { value: unknown; at: number }>();
+  private escalations = new Map<string, EscalationMark>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -96,6 +121,13 @@ export class NoticeLedger {
     const session = this.session(audience);
     for (const n of notices) {
       if ((n.kind === 'coaching' || n.kind === 'info' || MUTEABLE_ASK_CODES.has(n.code)) && muted.has(n.code)) continue;
+      if (n.escalation && (audience.transport !== 'http' || audience.sessionId)) {
+        const key = `${session}|${n.code}|${n.escalation.key}`;
+        const { show, mark } = escalate(this.escalations.get(key), n.escalation.level, this.now());
+        this.escalations.delete(key);
+        this.escalations.set(key, mark);
+        if (!show) continue;
+      }
       const always = (PER_CALL_NOTICE_CODES.has(n.code) && n.dedupe_key === undefined) || SELF_DEDUPED_NOTICE_CODES.has(n.code)
         || (audience.transport === 'http' && (n.kind === 'degraded' || n.kind === 'safety'));
       const key = n.dedupe_key === undefined ? `${session}|${n.code}` : `${session}|${n.code}|${n.dedupe_key}`;
@@ -114,6 +146,7 @@ export class NoticeLedger {
     }
     this.prune(this.seen, at => at);
     this.prune(this.coaching, v => v.at);
+    this.prune(this.escalations, v => v.at);
     return out;
   }
 }
@@ -125,6 +158,42 @@ export function processNoticeLedger(): NoticeLedger {
   return processLedger;
 }
 export function __resetProcessNoticeLedgerForTests(): void { processLedger = null; }
+
+// ── coverage window for one-shot CLI calls ─────────────────────────────────
+
+const CLI_COVERAGE_MARKS_MAX = 200;
+
+export function coverageNoticePath(): string {
+  return gbrainPath('notices', 'coverage.json');
+}
+
+/**
+ * #7165: whether an escalating notice shows in this CLI call, given what earlier
+ * calls under this GBRAIN_HOME showed within COVERAGE_NOTICE_WINDOW_MS. `key`
+ * names the brain, the code and the escalation key. A store that cannot be
+ * written shows it. Never throws.
+ */
+export function admitAcrossCliCalls(key: string, level: number, now: number = Date.now()): boolean {
+  let marks: Record<string, EscalationMark> = {};
+  try {
+    const raw = JSON.parse(readFileSync(coverageNoticePath(), 'utf8')) as { marks?: Record<string, EscalationMark> };
+    if (raw.marks && typeof raw.marks === 'object') marks = raw.marks;
+  } catch { /* no marks yet */ }
+  const { show, mark } = escalate(marks[key], level, now);
+  const kept = Object.entries({ ...marks, [key]: mark })
+    .filter(([, m]) => typeof m?.at === 'number' && typeof m.floor === 'number' && now - m.at < COVERAGE_NOTICE_WINDOW_MS)
+    .sort((a, b) => b[1].at - a[1].at).slice(0, CLI_COVERAGE_MARKS_MAX);
+  try {
+    const path = coverageNoticePath();
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify({ marks: Object.fromEntries(kept) })}\n`, { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch {
+    return true;
+  }
+  return show;
+}
 
 // ── mute store ──────────────────────────────────────────────────────────────
 

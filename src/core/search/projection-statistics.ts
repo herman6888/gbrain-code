@@ -234,10 +234,12 @@ async function statisticsStillCurrent(engine: BrainEngine, changedPages: number)
   if (!Number.isFinite(changedPages)) return false;
   // PGLite has no autovacuum, and its full ANALYZE is what covers the tables outside the planner-stats deltas: a brain
   // under 500 pages (where it is cheap), or a table holding rows it never sampled or grown more than 10% (+8 pages)
-  // past the size it last sampled, refreshes.
+  // past the size it last sampled, refreshes. planner_stats_deltas is the accounting of those deltas: every write pass
+  // grows it, so counting it ran a full ANALYZE (~0.8 s at 10k pages, holding PGLite's one thread) after every sync.
   const [state] = await engine.executeRaw<{ reltuples: number; columns: boolean }>(
     `SELECT c.reltuples::float8 AS reltuples,
             $1::text = 'postgres' OR NOT EXISTS (SELECT 1 FROM pg_class t WHERE t.relnamespace = c.relnamespace AND t.relkind = 'r' AND pg_relation_size(t.oid) > 0
+              AND t.relname <> 'planner_stats_deltas'
               AND (t.reltuples < 0 OR pg_relation_size(t.oid) / current_setting('block_size')::int > t.relpages * 1.1 + 8)) AS columns
        FROM pg_class c WHERE c.oid = 'pages'::regclass`, [engine.kind]);
   const rows = Number(state?.reltuples ?? -1);

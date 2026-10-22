@@ -103,19 +103,28 @@ export async function runRememberBatch(ctx: OperationContext, p: Record<string, 
       });
     } catch (e) {
       if (!(e instanceof OperationError)) throw e;
+      // #7248: an accepted item still publishing is pending, not failed; resending it would save it twice.
+      if (e.writeError === 'write_pending' && e.writeRequest) {
+        results.push({ index, request_id: child, status: 'pending', state: e.writeRequest.state, retry_after_ms: e.writeRequest.retry_after_ms ?? null,
+          ...(e.writeRequest.target ? { target: e.writeRequest.target } : {}) });
+        continue;
+      }
       results.push({ index, request_id: child, status: 'failed', error: { code: e.code, message: e.message, ...(e.detail ? { detail: e.detail } : {}), ...(e.suggestion ? { suggestion: e.suggestion } : {}), ...(e.withdrawn ? { withdrawn: e.withdrawn } : {}) } });
     }
   }
   const failed = results.filter(r => r.status === 'failed').length;
+  const pending = results.filter(r => r.status === 'pending').length;
   return {
     protocol_version: 1,
     request_id: requestId,
     ...(clientRequestId ? { client_request_id: clientRequestId } : {}),
     items: results,
-    saved: results.length - failed,
+    saved: results.length - failed - pending,
     failed,
+    ...(pending ? { pending } : {}),
     partial: failed > 0 && failed < results.length,
     ...(hints.size ? { hints: [...hints] } : {}),
-    ...(failed > 0 ? { next: 'Fix each failed item as its error says, then send only the failed items in a new remember call with a new request_id; the saved items are already stored.' } : {}),
+    ...(failed > 0 ? { next: 'Fix each failed item as its error says, then send only the failed items in a new remember call with a new request_id; the saved items are already stored.' }
+      : pending > 0 ? { next: 'Pending items are accepted and still publishing: poll get_write_request with each pending item\'s request_id; do not send them again.' } : {}),
   };
 }

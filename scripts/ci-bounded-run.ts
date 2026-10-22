@@ -9,7 +9,7 @@
  * `playwright install --with-deps chromium` on admin-browser). This runs the
  * command in its own process group and ends an attempt (SIGTERM to the group,
  * so `sudo apt-get` under it is relayed the signal, then SIGKILL after a grace
- * period) when it stalls: still running at `--attempt-s`, or silent on stdout
+ * period, and the attempt ends only once that whole group is gone) when it stalls: still running at `--attempt-s`, or silent on stdout
  * and stderr for `--idle-s`. A stalled attempt is retried once after a pause,
  * and a second failure stops with a named `::error::`. `--total-s` caps every
  * attempt and pause together, so a slow download that keeps printing progress
@@ -25,7 +25,7 @@
  * Usage: bun scripts/ci-bounded-run.ts (--attempt-s <n> | --total-s <n>) [--idle-s <n>] [--retry-s <n>] [--hint <text>] -- <command> [args...]
  */
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 export interface BoundedRun {
   argv: string[];
@@ -44,6 +44,28 @@ export interface BoundedRun {
 }
 
 const ATTEMPTS = 2;
+
+/** Whether process group `pgid` still has a member that is not a zombie: a SIGKILLed process dies only when it next runs. */
+function groupLive(pgid: number): boolean {
+  if (process.platform !== 'linux') {
+    try { process.kill(-pgid, 0); return true; } catch { return false; }
+  }
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+      const [state, , pgrp] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (Number(pgrp) === pgid && !['Z', 'X'].includes(state!)) return true;
+    } catch { /* gone between the listing and the read */ }
+  }
+  return false;
+}
+
+/** Waits, at most `boundMs`, until a killed attempt's whole group is gone, so no retry or exit overlaps what it left running. */
+async function groupGone(pgid: number, boundMs: number): Promise<void> {
+  const until = Date.now() + boundMs;
+  while (groupLive(pgid) && Date.now() < until) await Bun.sleep(10);
+}
 
 type Ending = 'exit' | 'attempt' | 'idle' | 'budget';
 
@@ -80,7 +102,11 @@ function attempt(run: BoundedRun, boundMs: number, budgetBound: boolean): Promis
   const settle = () => { clearTimeout(bound); clearTimeout(kill); clearTimeout(idle); };
   return new Promise(resolve => {
     child.once('error', () => { settle(); resolve({ code: 127, ending }); });
-    child.once('exit', code => { settle(); if (ending !== 'exit') signal('SIGKILL'); resolve({ code, ending }); });
+    child.once('exit', async code => {
+      settle();
+      if (ending !== 'exit') { signal('SIGKILL'); if (grouped && child.pid) await groupGone(child.pid, (run.graceSeconds ?? 10) * 1000); }
+      resolve({ code, ending });
+    });
   });
 }
 

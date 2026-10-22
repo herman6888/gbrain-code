@@ -38,6 +38,7 @@ import { makeSyncHandler } from '../core/minions/handlers/sync.ts';
 import { makeUnifyTypesHandler } from '../core/minions/handlers/unify-types.ts';
 import { runJobsAuthorizeLegacy } from './jobs/authorize-legacy.ts';
 import { runJobsSubmit } from './jobs/submit.ts';
+import { runJobsWait } from './jobs/wait.ts';
 import { runJobsList } from './jobs/list.ts';
 import { runJobsGet } from './jobs/get.ts';
 import { runJobsCancel } from './jobs/cancel.ts';
@@ -166,8 +167,10 @@ USAGE
                             [--redact-secrets]   (shell only; scrubs inherit
                                                   values from stdout/stderr)
   gbrain jobs list [--status S] [--queue Q] [--limit N] [--json]
+  gbrain jobs list --finished-since ISO|CURSOR [--queue Q] [--name N] [--json]
   gbrain jobs list --group SPEND_GROUP [--json]
   gbrain jobs get <id> [--json]
+  gbrain jobs wait <id> [--timeout 10m] [--json]  (exit 0 completed, 1 failed/dead/cancelled, 124 still running)
   gbrain jobs cancel <id> | --group SPEND_GROUP
   gbrain jobs cancel --select "status=waiting|paused,name=synthesize" [--expect <hash> --yes] [--json]
   gbrain jobs retry <id>
@@ -412,6 +415,22 @@ parents that return to waiting, and the preview hash. The apply cancels exactly
 the previewed set; a selection that would cascade to a job outside it refuses.
 Stop producers and workers and cancel active jobs (gbrain jobs cancel <id>) first.
 `,
+  wait: `gbrain jobs wait — block until a job is completed, failed, dead or cancelled
+
+USAGE
+  gbrain jobs wait <id> [--timeout 10m] [--json]
+
+OPTIONS
+  --timeout DUR  Stop waiting after DUR (60, 60s, 10m, 1h; default 24h). The
+                 job is never cancelled; it keeps running.
+  --json         Print the final row like \`jobs get --json\`.
+
+EXIT CODES
+  0    completed
+  1    failed, dead or cancelled (error_text on stderr), or no such job
+  2    usage error
+  124  the timeout elapsed and the job is still running
+`,
   prune: `gbrain jobs prune — delete old terminal jobs
 
 USAGE
@@ -431,6 +450,7 @@ const JOBS_SUBCOMMANDS: Record<string, (ctx: JobsCommandContext) => Promise<void
   submit: runJobsSubmit,
   list: runJobsList,
   get: runJobsGet,
+  wait: runJobsWait,
   cancel: runJobsCancel,
   retry: runJobsRetry,
   delete: runJobsDelete,
@@ -470,7 +490,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
   // routing bug upstream of this function — refuse instead of crashing
   // inside MinionQueue.
   const localSupervisorStatus = sub === 'supervisor' && args[1] === 'status';
-  if (!engineOrNull && sub !== 'list' && sub !== 'get' && !localSupervisorStatus) {
+  if (!engineOrNull && sub !== 'list' && sub !== 'get' && sub !== 'wait' && !localSupervisorStatus) {
     console.error(`\`gbrain jobs ${sub ?? ''}\` needs a local engine and cannot run on a thin client.`);
     process.exit(1);
   }

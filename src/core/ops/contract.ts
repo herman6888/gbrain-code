@@ -258,6 +258,8 @@ export interface ParamDef {
   fullSurfaceOnly?: boolean;
   /** An object param the CLI takes as repeated `--flag key=value` (`key=a,b` is a list); MCP passes the object. */
   cliKeyValue?: boolean;
+  /** An object window the CLI also takes as `N-M` (inclusive) or `N`: the [start, length] member names. */
+  cliRange?: readonly [string, string];
 }
 
 export interface Logger {

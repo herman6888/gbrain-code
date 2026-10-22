@@ -75,24 +75,40 @@ The CLI falls back to its normal path, silently, when:
   twice; pass a shorter `--timeout` or set `GBRAIN_CLI_SOCKET=0` for those;
 - the serve answers with a frame the CLI cannot fully read or render (nothing
   is printed from it);
-- the serve was started for a different brain or environment: the CLI sends a
-  token built from the brain (host or mount), the database target (without
-  the password), the config home, the config file (path and content), the
-  gbrain version and a digest of the environment that changes answers or
-  where query text is sent (every `GBRAIN_*` setting except
-  `GBRAIN_CLI_SOCKET`, `GBRAIN_DEBUG`, `GBRAIN_SQL_TRACE` and
-  `GBRAIN_SOURCE`, which every request carries and the serve resolves for that
-  call; which provider API keys are set, never their values; and the values of
-  the provider routing settings: base URLs, endpoints, deployments, API
-  versions, org, project and group ids), and the serve answers only an
-  identical one. Editing
-  `config.json`, changing those variables or upgrading gbrain while a serve
-  runs sends CLI calls to the normal path until the serve restarts with the
-  same settings;
+- the serve was started for a different brain or environment. The CLI sends
+  its identity and the serve compares it part by part with its own: the brain
+  (host or mount), the gbrain version, the config home, the config file (path
+  and content), the database target and the read-behavior environment. The
+  database target is the host, database, user and `options` parameter, never
+  the password or driver-only parameters such as `prepare=`, `sslmode` or
+  `application_name`. The port must match too, except on a Supabase Supavisor
+  pooler host (`*.pooler.supabase.com`), where the same host and user name the
+  same database, so a serve on the session lane (5432) answers CLI calls made
+  on the transaction lane (6543). On any other host another port is another
+  server and is refused. The read-behavior environment is an explicit list of
+  the `GBRAIN_*` settings that can change an answer or where query text goes
+  (`READ_BEHAVIOR_ENV` in `src/core/cli-socket/identity.ts`: models,
+  embeddings, search tuning, visibility, timeouts, schema pack, AI call log,
+  contributor capture and the like), which provider API keys are set (never
+  their values), and the values of the provider routing settings (base URLs,
+  endpoints, deployments, API versions, org, project and group ids).
+  Connection sizing and driver settings (`GBRAIN_POOL_SIZE`,
+  `GBRAIN_DIRECT_POOL_SIZE`, `GBRAIN_PREPARE`, ...), the database URL
+  variables and `GBRAIN_SOURCE` (which every request carries and the serve
+  resolves for that call) may differ. `GBRAIN_HOME` and `GBRAIN_BRAIN_ID`
+  count by the config home and brain they resolve to, so a serve that exports
+  `GBRAIN_HOME` matches a CLI that reaches the same home through `HOME`. Editing `config.json`, changing a listed
+  variable or upgrading gbrain while a serve runs sends CLI calls to the normal
+  path until the serve restarts with the same settings. The refusal names the
+  part that differed, never its value: `refused (identity_mismatch): database
+  port`, `env GBRAIN_MODEL`, `provider key VOYAGE_API_KEY`, `config
+  contents`, and the serve logs each distinct one once;
 - the CLI targets a mount brain (`--brain <mount>` and the other mount tiers).
 
 `GBRAIN_DEBUG=1` prints one `[cli-socket] cold path: <reason>` line on stderr
-whenever a call falls back. `GBRAIN_CLI_SOCKET=0` makes a CLI call skip the
+whenever a call falls back, including when no socket exists (`no socket at
+<path>`, with how to start one), and one `[cli-socket] warm: <command>
+answered by the serve socket at <path>` line when the serve answers. `GBRAIN_CLI_SOCKET=0` makes a CLI call skip the
 socket entirely, for comparisons and benchmarks.
 
 ## Security

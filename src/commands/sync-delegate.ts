@@ -511,7 +511,7 @@ export type ManagedDelegationOutcome =
  * #6543: only a forced rung (the serve cannot take the run) really runs a consumer beside the serve; on the others this
  * process admits its writes and, with persistence.single_consumer on, the serve's consumer publishes them.
  */
-const fallbackLine = (pid: number, cause: string, forced: boolean, fix = 'Restart that serve on this gbrain version to run the catch-up inside it.'): string => forced
+const ownConsumerLine = (pid: number, cause: string, forced: boolean, fix = 'Restart that serve on this gbrain version to run the catch-up inside it.'): string => forced
   ? `[sync] ${cause}; this run uses its own consumer beside the serve (PID ${pid}). ${fix}`
   : `[sync] ${cause}; this run does not delegate to the serve (PID ${pid}): it admits its own writes, and with persistence.single_consumer on the serve's consumer publishes them. ${fix}`;
 
@@ -530,9 +530,13 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   // waiter-only behind the serve it bypassed. A healthy serve beside a kill switch or an unsupported flag keeps consuming.
   const own = async (reason: Extract<ManagedDelegationOutcome, { kind: 'own_consumer' }>['reason'], line: string | null = null, force = false): Promise<ManagedDelegationOutcome> => {
     if (line) serr(line);
-    if (force) (await import('../core/persistence/consumer-election.ts')).forceOwnConsumer(reason);
+    // #7167: a dry run writes nothing, so it starts no consumer of its own.
+    if (force && !opts.dryRun) (await import('../core/persistence/consumer-election.ts')).forceOwnConsumer(reason);
     return { kind: 'own_consumer', reason, line };
   };
+  // #7167: a dry run that is not delegated previews in this process and writes nothing; it neither admits writes nor runs a consumer.
+  const fallbackLine = (pid: number, cause: string, forced: boolean, fix?: string): string => opts.dryRun
+    ? `[sync] ${cause}; this dry run previews in this process instead of the serve (PID ${pid}) and writes nothing.` : ownConsumerLine(pid, cause, forced, fix);
   // 0. Opt-outs bypass the ladder before anything is probed or classified.
   if (args.includes('--no-delegate') || env.GBRAIN_SYNC_NO_DELEGATE === '1') return own('opted_out', null, true);
   const { resolveBrainId } = await import('../core/brain-resolver.ts');
@@ -544,7 +548,9 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   const sourceId = opts.sourceId ?? 'default';
   // 1. Only a managed source has the two-consumer problem; classic sync keeps its own path.
   const { readManagedMode } = await import('../core/persistence/managed-mode.ts');
-  if (!await readManagedMode(engine)) return own('not_managed');
+  const dispatch = await import('../core/sync-dispatch-read.ts');
+  const routing = await dispatch.syncDispatchRow(engine, sourceId);
+  if (!(routing ? dispatch.dispatchManagedMode(routing) : await readManagedMode(engine))) return own('not_managed');
   // #6696 C2: a flag the managed source refuses never reaches the serve; the refusal names it before any probe or socket call.
   const { managedForbiddenFlag, managedSyncFlagRefusal } = await import('../core/persistence/managed-sync-flags.ts');
   const forbidden = managedForbiddenFlag(opts);
@@ -580,6 +586,7 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
     return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false));
   }
   // 5. The hand-off: this CLI's durable writer registration (the one its own consumer would run under).
+  dispatch.endSyncDispatchRead();
   const { registerLocalWriter } = await import('../core/persistence/identity.ts');
   const local = await registerLocalWriter(engine, 'cli');
   const registration: SyncStartRegistration = { id: local.id, credential: local.credential, lane: 'cli' };

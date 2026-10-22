@@ -21,6 +21,8 @@ export interface SyncResult {
   managedWrite?: import('../core/persistence/sync-run.ts').ManagedSyncWriteDiagnostic;
   /** #6643: the request a rediscovery that retries a recorded failure waits for (its producer and slug), instead of a silent no-op. */
   retryWait?: import('../core/persistence/sync-run.ts').RetryWait;
+  /** #7167: a managed dry run's read of the source's writer: open write requests (queued, running or recovering) and the oldest one's age. */
+  writer?: import('../core/persistence/sync-dry-run-writer.ts').DryRunWriterState;
   /** #6712 PR 1: another drainer holds (or took) the source's drain lease; `resumable`, nothing admitted by this run. */
   leaseHeld?: import('../core/persistence/sync-lease.ts').DrainLeaseHeld;
   /**

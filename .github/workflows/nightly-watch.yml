@@ -50,6 +50,7 @@ on:
       - Heavy Tests
       - Scale tier
       - Convergence nightly
+      - Sync freshness gate
       - macOS 26 validation
       - Semgrep
       - OSV-Scanner

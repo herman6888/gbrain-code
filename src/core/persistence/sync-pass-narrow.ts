@@ -104,24 +104,34 @@ async function fullDomain(input: DomainInput): Promise<LevelDomain> {
 }
 
 async function patchedDomain(input: DomainInput, prior: NonNullable<DomainInput['prior']>): Promise<LevelDomain> {
-  const { pages, tree, inLevel } = input, { cache, changed } = prior, { byOrigin, claimants, domain } = cache;
+  const { pages, tree, inLevel, step } = input, { cache, changed } = prior, { byOrigin, claimants, domain } = cache;
   const slots = new Map<number, string | null>(), touched = new Set<string>();
-  for (const row of changed.rewritten) if (!isWindowsColonTarget(row.sourcePath)) touched.add(prior.oldKey(row.sourcePath, row.slug));
-  for (const row of changed.rewritten) slots.set(row.slot, null);
+  // A first sync's confirm round patches every page the pass wrote: each loop yields as a full build's does.
+  for (const row of changed.rewritten) { if (step.due()) await step.pause(); if (!isWindowsColonTarget(row.sourcePath)) touched.add(prior.oldKey(row.sourcePath, row.slug)); slots.set(row.slot, null); }
   for (let i = changed.from; i < pages.length; i++) slots.set(i, null);
-  for (const slot of slots.keys()) if (!isWindowsColonTarget(pages.sourcePath[slot]!)) { const key = input.keyOf(slot); slots.set(slot, key); touched.add(key); }
+  // Each origin's re-read slots, gathered once (a scan of every slot per origin was quadratic: 10k slots, 10^8 steps).
+  const slotsOf = new Map<string, number[]>();
+  for (const slot of slots.keys()) {
+    if (step.due()) await step.pause();
+    if (isWindowsColonTarget(pages.sourcePath[slot]!)) continue;
+    const key = input.keyOf(slot);
+    slots.set(slot, key); touched.add(key);
+    const same = slotsOf.get(key); if (same) same.push(slot); else slotsOf.set(key, [slot]);
+  }
   for (const key of touched) {
+    if (step.due()) await step.pause();
     const rows = (claimants.get(key) ?? (byOrigin.has(key) ? [byOrigin.get(key)!] : [])).filter(row => !slots.has(row));
-    for (const [slot, now] of slots) if (now === key) rows.push(slot);
+    rows.push(...slotsOf.get(key) ?? []);
     rows.sort((a, b) => a - b);
     let win: number | undefined;
     for (const row of rows) if (claimBeats(pages, row, win)) win = row;
     if (win === undefined) byOrigin.delete(key); else byOrigin.set(key, win);
     if (rows.length > 1) claimants.set(key, rows); else claimants.delete(key);
   }
-  for (const [slot, key] of slots) if (key !== null) shareBlob(pages, slot, tree, key);
+  for (const [slot, key] of slots) { if (step.due()) await step.pause(); if (key !== null) shareBlob(pages, slot, tree, key); }
   for (const path of cache.markerOnly) { domain.delete(path); touched.add(path); }
   for (const key of touched) {
+    if (step.due()) await step.pause();
     const at = byOrigin.get(key), claimed = at !== undefined && inLevel(key);
     if (tree.has(key) || claimed) domain.add(key); else domain.delete(key);
     if (at === undefined || (claimed && !pages.deleted(at))) cache.unreconciled.delete(key); else cache.unreconciled.add(key);
@@ -129,7 +139,7 @@ async function patchedDomain(input: DomainInput, prior: NonNullable<DomainInput[
   const markerOnly: string[] = [];
   for (const path of input.markerPaths) if (inLevel(path) && !domain.has(path)) { domain.add(path); markerOnly.push(path); }
   for (const path of markerOnly) touched.add(path);
-  for (const path of touched) if (domain.has(path) && fold(path) !== path) cache.unfolded.add(path); else cache.unfolded.delete(path);
+  for (const path of touched) { if (step.due()) await step.pause(); if (domain.has(path) && fold(path) !== path) cache.unfolded.add(path); else cache.unfolded.delete(path); }
   const next = { ...cache, table: pages, markerOnly };
   return { ...next, ...await spellingTwins(input, next), touched };
 }

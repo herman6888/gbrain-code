@@ -30,7 +30,7 @@ import { outOfAttemptsHold, fenceAutoRepairFor, holdRepairSteps, readGitHoldRetr
 import { readManagedSyncBacklog } from '../core/persistence/sync-drain.ts';
 import type { FenceAutoRepair } from '../core/fence-repair/hold-fix.ts';
 import { companyBrainProfile } from '../core/company-brain/policy.ts';
-import { findUnindexedFiles, refreshUnindexedFiles, UNINDEXED_SCAN_BUDGET_MS, type UnindexedScan } from '../core/persistence/unindexed-files.ts';
+import { findUnindexedFiles, refreshUnindexedFiles, unindexedScanBudgetMs, type UnindexedScan } from '../core/persistence/unindexed-files.ts';
 
 export interface RetryHeldReceipt {
   source_id: string;
@@ -145,7 +145,7 @@ export async function retryUnindexed(engine: BrainEngine, sourceId: string, opts
     `Source ${sourceId} is a ${source.config?.kind != null ? 'connector' : 'company-brain'} source; --unindexed applies to managed Git sources only.`,
     `Run gbrain sources retry-held ${sourceId} without --unindexed to re-attempt its held items.`);
   const dryRun = opts.dryRun === true;
-  const deadlineAt = Date.now() + (opts.budgetMs ?? UNINDEXED_SCAN_BUDGET_MS);
+  const deadlineAt = Date.now() + (opts.budgetMs ?? await unindexedScanBudgetMs(engine, sourceId));
   let scan: UnindexedScan, scheduled: string[] = [];
   if (dryRun) scan = await findUnindexedFiles(engine, sourceId, { deadlineAt });
   else ({ scan, scheduled } = await refreshUnindexedFiles(engine, sourceId, { deadlineAt }));

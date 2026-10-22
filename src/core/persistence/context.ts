@@ -3,6 +3,7 @@ import type { BrainEngine } from '../engine.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import type { WriteAttribution } from './attribution.ts';
 import { readPersistenceBrain } from './managed-mode.ts';
+import { settleAtCommit } from '../page-state/transactions.ts';
 import { isTrustTier, nestWriteTrust, trustRankSql, type TrustTier, type WriteTrust } from '../trust/tier.ts';
 import type { TrustTable } from '../trust/schema.ts';
 
@@ -87,7 +88,8 @@ export async function withCoordinatedWrite<T>(engine: BrainEngine, sourceIds: st
     });
   } catch (error) { failed = true; throw error; }
   finally {
-    try { await applySettings(engine, names, previous); }
+    // GBRA-133: after a success on Postgres the restore shares the transaction's COMMIT round trip (settleAtCommit).
+    try { await (failed ? applySettings(engine, names, previous) : settleAtCommit(engine, applySettings(engine, names, previous))); }
     catch (error) { if (!failed) throw error; }
   }
 }

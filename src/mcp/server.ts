@@ -16,6 +16,7 @@ import { noticeBlock, renderNotice, type Notice } from '../core/agent-output.ts'
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { parseResultRowsMode, resolveResultRowsMode } from './result-rows.ts';
 import { loadConfig } from '../core/config.ts';
+import { requestConfigRows, withRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
 import { installInstructionsResolver, readInstructionContent, resolveMcpInstructions } from './instructions.ts';
 import { instructionReadiness, stdioCapabilityReadiness } from './initialize-context.ts';
@@ -105,6 +106,7 @@ function deferredBoot(opts: { degraded: boolean }) {
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
   cwd: string = process.cwd(),
+  opts: { warmConfig?: boolean } = {},
 ): Promise<{
   sourceId: string;
   localFederatedSourceIds?: string[];
@@ -131,7 +133,9 @@ export async function resolveMcpStdioSourceScope(
   }
   try {
     const { resolveSourceWithTier, localFederatedSourceIds, explicitReadBinding } = await import('../core/source-resolver.ts');
-    const resolved = await resolveSourceWithTier(engine, null, cwd);
+    // GBRA-156: a tool call resolves inside the request's config snapshot (which dispatch reuses for a read op), so
+    // `warmConfig` reads the config table beside the source rows: one round trip before the op.
+    const [resolved] = await Promise.all([resolveSourceWithTier(engine, null, cwd), opts.warmConfig ? requestConfigRows(engine) : undefined]);
     const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
     // #5081: the admission set is optional; a failed lookup must not discard
     // the resolved binding (the catch below would fall back to 'default').
@@ -438,7 +442,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // The MCP SDK's response type widened in 1.29 to allow a managed-task wrapper;
   // gbrain ops are synchronous, so we return the legacy `{ content, isError? }`
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
-  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(async () => {
+  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(() => withRequestConfigSnapshot(engine, async () => {
     const { name, arguments: params } = request.params;
     const [{ dispatchToolCall, dispatchRenderContext, requestMetaSessionId }, { getBrainHotMemoryMeta }] = await gate.awaitCall();
     // F4: status-only mode answers gbrain_status and refuses the rest until
@@ -452,7 +456,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // as local CLI dispatch: GBRAIN_SOURCE, then .gbrain-source, then the
     // non-explicit fallback tiers. Non-explicit tiers may widen to federated
     // local reads; explicit/env/dotfile scopes stay scalar.
-    const sourceScope = await resolveMcpStdioSourceScope(engine);
+    const sourceScope = await resolveMcpStdioSourceScope(engine, process.cwd(), { warmConfig: OPERATION_MANIFEST.find(o => o.name === name)?.mutating === false });
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
     // takes-holder allow-list to ['world'] so agent-facing callers don't
     // see private hunches via takes_list / takes_search / query. Operators
@@ -504,7 +508,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       surfaceCeiling: session.surface, stdioSurface: session, revealTools: listing.reveal, isListed: listing.isListed,
       resultRows,
     }), dispatchRenderContext);
-  }));
+  })));
 
   const transport = mcpStdioTransport();
   bootPhase('mcp_connect');

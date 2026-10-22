@@ -28,7 +28,16 @@ export const REFRESH_AFTER_MS = 60 * 60_000;
 /** The background refresh job and its per-check budget (the time a slow check needs on a large brain, not 15 s). */
 export const REFRESH_JOB = 'doctor-refresh';
 export const REFRESH_ENTRY_BUDGET_MS = 600_000;
-const REFRESH_TIMEOUT_MS = 2 * 60 * 60_000;
+/**
+ * #7263: the whole refresh's budget, well under its hourly slot. Past it no further check starts (the one running is cut
+ * at it), what finished is recorded and the rest stays unknown for the next slot; the job still completes.
+ */
+export const REFRESH_BUDGET_MS = 10 * 60_000;
+const REFRESH_TIMEOUT_MS = 15 * 60_000;
+/** #7263: behind sync (-10, 0, continuations 5), the autopilot cycles and global maintenance (0), embed backfill and loops extract (5). */
+const REFRESH_PRIORITY = 10;
+/** #7263: `false` turns the background refresh off (DB plane; default on). */
+export const BACKGROUND_REFRESH_KEY = 'doctor.background_refresh';
 /** Bound of the cache read and write (they run outside every entry's deadline). */
 const IO_BOUND_MS = 3_000;
 
@@ -131,12 +140,13 @@ export function unmeasuredCheck(stale: readonly EntryOutcome[], cache: ReadonlyM
   };
 }
 
-/** Queue one background refresh (deduplicated per hour); null when it cannot be queued. */
+/** Queue one background refresh (deduplicated per hour); null when it cannot be queued or `doctor.background_refresh` is false. */
 export async function queueRefresh(engine: BrainEngine, now = Date.now()): Promise<{ id: number } | null> {
   try {
+    if ((await bounded(engine.getConfig(BACKGROUND_REFRESH_KEY)))?.trim().toLowerCase() === 'false') return null;
     const { MinionQueue } = await import('../../core/minions/queue.ts');
     const slot = new Date(now).toISOString().slice(0, 13);
-    const job = await bounded(new MinionQueue(engine).add(REFRESH_JOB, {}, { queue: 'default', idempotency_key: `${REFRESH_JOB}:${slot}`, max_attempts: 1, timeout_ms: REFRESH_TIMEOUT_MS, maxWaiting: 1 }));
+    const job = await bounded(new MinionQueue(engine).add(REFRESH_JOB, {}, { queue: 'default', idempotency_key: `${REFRESH_JOB}:${slot}`, max_attempts: 1, timeout_ms: REFRESH_TIMEOUT_MS, priority: REFRESH_PRIORITY, maxWaiting: 1 }));
     return { id: Number(job.id) };
   } catch {
     return null;
@@ -150,13 +160,13 @@ export function lastKnownMode(ctx: Pick<DoctorContext, 'only' | 'sourceIds' | 'o
 }
 
 /**
- * The `doctor-refresh` job: every standard-tier database check, each with REFRESH_ENTRY_BUDGET_MS, recorded as last
- * known results. Read-only apart from that record; it never queues another refresh.
+ * The `doctor-refresh` job: every standard-tier database check, each with REFRESH_ENTRY_BUDGET_MS and all of them within
+ * `budgetMs`, recorded as last known results. Read-only apart from that record; it never queues another refresh.
  */
-export async function runDoctorRefresh(engine: BrainEngine): Promise<{ recorded: number; unfinished: string[]; elapsed_ms: number }> {
+export async function runDoctorRefresh(engine: BrainEngine, budgetMs = REFRESH_BUDGET_MS): Promise<{ recorded: number; unfinished: string[]; elapsed_ms: number }> {
   const started = Date.now();
   const { buildChecks } = await import('../doctor.ts');
-  const checks = await buildChecks(engine, ['--json', '--tier', 'standard', '--scope=brain'], undefined, undefined, undefined, { lastKnown: 'refresh', entryBudgetOverrideMs: REFRESH_ENTRY_BUDGET_MS, refreshOnly: true });
+  const checks = await buildChecks(engine, ['--json', '--tier', 'standard', '--scope=brain', '--budget-ms', String(budgetMs)], undefined, undefined, undefined, { lastKnown: 'refresh', entryBudgetOverrideMs: REFRESH_ENTRY_BUDGET_MS, refreshOnly: true });
   const unfinished = [...new Set(checks.filter(c => c.details?.health === 'unknown' && c.details.reason === 'budget').map(c => c.name))];
   return { recorded: checks.length - unfinished.length, unfinished, elapsed_ms: Date.now() - started };
 }

@@ -41,6 +41,8 @@ import {
   isAmbiguousModalityQuery,
 } from './query-intent.ts';
 import { isTitlePhraseMatch } from './title-match.ts';
+import { applyGraphSignals, graphSignalPageIds } from './graph-signals.ts';
+import { applyAliasResolvedBoost, readAliasCanonicals } from './hybrid/alias-resolved.ts';
 import {
   textArmsNonEmpty,
   type VectorArm,
@@ -568,17 +570,6 @@ export async function runPostFusionStages(
   // Phase E3 — metadata-axis stages gated as ONE block (see PostFusionOpts).
   const metadata = opts.skipMetadataBoosts !== true;
 
-  // Backlink stage (existing behavior, preserved).
-  if (metadata && opts.applyBacklinks) {
-    try {
-      const pageIds = Array.from(new Set(results.map(r => r.page_id)));
-      const counts = await engine.getBacklinkCounts(pageIds, policy);
-      applyBacklinkBoost(results, counts, floorThreshold);
-    } catch {
-      // Non-fatal; preserves the existing pre-v0.29.1 contract.
-    }
-  }
-
   // Composite refs for the orthogonal axes (multi-source isolation).
   const refs = Array.from(
     new Map(
@@ -586,20 +577,43 @@ export async function runPostFusionStages(
     ).values(),
   );
 
-  // Salience stage (mattering, no time).
-  if (metadata && opts.salience !== 'off') {
+  // Every stage read is keyed by the entry result set (page ids, refs, array
+  // order), never by a score an earlier stage mutates, so all of them start
+  // here instead of costing one round trip each in turn. The stages below
+  // still apply in their fixed order, and a failed read skips only its stage.
+  const backlinkCounts = metadata && opts.applyBacklinks
+    ? startRead(() => engine.getBacklinkCounts(Array.from(new Set(results.map(r => r.page_id))), policy))
+    : undefined;
+  const salienceScores = metadata && opts.salience !== 'off' ? startRead(() => engine.getSalienceScores(refs, policy)) : undefined;
+  const effectiveDates = metadata && opts.recency !== 'off' ? startRead(() => engine.getEffectiveDates(refs, policy)) : undefined;
+  const adjacency = metadata && opts.graphSignalsEnabled
+    ? startRead(() => engine.getAdjacencyBoosts(graphSignalPageIds(results), policy))
+    : undefined;
+  const aliasCanonicals = metadata ? startRead(() => readAliasCanonicals(engine, refs, policy)) : undefined;
+  const supersededBy = startRead(() => readSupersededBy(results, engine, policy));
+
+  // Backlink stage (existing behavior, preserved).
+  if (backlinkCounts) {
     try {
-      const scores = await engine.getSalienceScores(refs, policy);
-      applySalienceBoost(results, scores, opts.salience, floorThreshold);
+      applyBacklinkBoost(results, await backlinkCounts, floorThreshold);
+    } catch {
+      // Non-fatal; preserves the existing pre-v0.29.1 contract.
+    }
+  }
+
+  // Salience stage (mattering, no time).
+  if (salienceScores && opts.salience !== 'off') {
+    try {
+      applySalienceBoost(results, await salienceScores, opts.salience, floorThreshold);
     } catch {
       // Non-fatal.
     }
   }
 
   // Recency stage (per-prefix decay, no mattering).
-  if (metadata && opts.recency !== 'off') {
+  if (effectiveDates && opts.recency !== 'off') {
     try {
-      const dates = await engine.getEffectiveDates(refs, policy);
+      const dates = await effectiveDates;
       // Resolve the effective decay map (defaults + gbrain.yml `recency:` +
       // GBRAIN_RECENCY_DECAY env) instead of the baked-in defaults. The
       // get_recent_salience SQL path already goes through resolveRecencyDecayMap()
@@ -644,13 +658,13 @@ export async function runPostFusionStages(
   // shares the same floor-threshold so a weak hub gets the same
   // protection v0.35.6.0 added for other metadata boosts. Fail-open at
   // this level matches the per-stage non-fatal contract.
-  if (metadata && opts.graphSignalsEnabled) {
+  if (adjacency) {
     try {
-      const { applyGraphSignals } = await import('./graph-signals.ts');
       await applyGraphSignals(results, engine, {
         ...policy,
         enabled: true,
         floorThreshold,
+        adjacencyFn: () => adjacency,
         onMeta: opts.onGraphMeta,
         onScoreDistribution: opts.onScoreDistribution,
       });
@@ -666,9 +680,9 @@ export async function runPostFusionStages(
   // intent: "user explicitly disambiguated this as canonical." Defense-
   // in-depth: pre-v105 brains don't have slug_aliases table; the lookup
   // throws isUndefinedTableError and the stage no-ops.
-  if (metadata) {
+  if (aliasCanonicals) {
     try {
-      await applyAliasResolvedBoost(results, engine, policy);
+      applyAliasResolvedBoost(results, await aliasCanonicals);
     } catch {
       // Non-fatal; preserves the per-stage contract.
     }
@@ -682,10 +696,21 @@ export async function runPostFusionStages(
   // facts. Fail-open per the per-stage contract: a brain with no `supersedes`
   // edges (or a pre-links schema) finds 0 rows / throws and no-ops.
   try {
-    await applySupersedeDownrank(results, engine, policy);
+    stampSuperseded(results, await supersededBy);
   } catch {
     // Non-fatal; preserves the per-stage contract.
   }
+}
+
+/**
+ * Start a stage read now; the stage awaits the promise later. A synchronous
+ * throw becomes a rejection, and the rejection counts as handled until the
+ * stage awaits it, so a read that fails early is not an unhandled rejection.
+ */
+function startRead<T>(read: () => Promise<T>): Promise<T> {
+  const pending = (async () => read())();
+  pending.catch(() => undefined);
+  return pending;
 }
 
 /**
@@ -756,12 +781,21 @@ export async function applySupersedeDownrank(
   engine: import('../engine.ts').BrainEngine,
   policy?: PageReadPolicy,
 ): Promise<void> {
-  if (results.length === 0) return;
+  stampSuperseded(results, await readSupersededBy(results, engine, policy));
+}
+
+/** Superseded page id → the superseding page's slug, for the results' pages; empty when the stage no-ops. */
+async function readSupersededBy(
+  results: SearchResult[],
+  engine: import('../engine.ts').BrainEngine,
+  policy?: PageReadPolicy,
+): Promise<Map<number, string>> {
+  const supersededBy = new Map<number, string>();
   const pageIds = Array.from(
     new Set(results.map(r => r.page_id).filter((id): id is number => typeof id === 'number')),
   );
-  if (pageIds.length === 0) return;
-  if (!(await hasAnySupersedeEdges(engine))) return;
+  if (pageIds.length === 0) return supersededBy;
+  if (!(await hasAnySupersedeEdges(engine))) return supersededBy;
   const params: unknown[] = [pageIds];
   const fromFilter = pageReadFilter('pf', policy, params, !!policy);
   const toFilter = pageReadFilter('pt', policy, params, !!policy);
@@ -782,14 +816,16 @@ export async function applySupersedeDownrank(
     );
   } catch {
     // Pre-links schema or SQL miss; no-op.
-    return;
+    return supersededBy;
   }
-  if (rows.length === 0) return;
-  const supersededBy = new Map<number, string>();
   for (const row of rows) {
     const id = Number(row.to_page_id);
     if (!supersededBy.has(id)) supersededBy.set(id, row.by_slug);
   }
+  return supersededBy;
+}
+
+function stampSuperseded(results: SearchResult[], supersededBy: Map<number, string>): void {
   for (const r of results) {
     const by = supersededBy.get(r.page_id);
     if (by !== undefined) {
@@ -797,66 +833,6 @@ export async function applySupersedeDownrank(
       r.superseded = true;
       r.superseded_by = by;
       r.supersede_penalty = SUPERSEDE_PENALTY;
-    }
-  }
-}
-
-/**
- * v0.42 (T19) — apply 1.05x boost to results whose slug is a canonical_slug
- * in slug_aliases. Stamps `alias_resolved_boost` on touched results so
- * --explain can render the contribution.
- *
- * Single index-hit query bounded by top-K (slug_aliases is small relative
- * to the result set; ALIASES <<< PAGES even on the 186K-page production
- * brain where 5.5K aliases is ~3% of pages).
- *
- * Source-scoped (codex F9: keyed by {source_id, slug} not just slug).
- */
-const ALIAS_RESOLVED_BOOST = 1.05;
-
-async function applyAliasResolvedBoost(
-  results: SearchResult[],
-  engine: import('../engine.ts').BrainEngine,
-  policy?: PageReadPolicy,
-): Promise<void> {
-  if (results.length === 0) return;
-  // Build the (source_id, slug) composite list for the lookup.
-  const refs = Array.from(
-    new Map(
-      results.map(r => [
-        `${r.source_id ?? 'default'}::${r.slug}`,
-        { slug: r.slug, source_id: r.source_id ?? 'default' },
-      ]),
-    ).values(),
-  );
-  if (refs.length === 0) return;
-  // Find which refs are canonical of any slug_aliases row.
-  // Two-array unnest for source-scoped composite lookup.
-  const sourceIds = refs.map(r => r.source_id);
-  const slugs = refs.map(r => r.slug);
-  const params: unknown[] = [sourceIds, slugs];
-  const filter = pageReadFilter('p', policy, params, !!policy);
-  let rows: Array<{ source_id: string; canonical_slug: string }> = [];
-  try {
-    rows = await engine.executeRaw<{ source_id: string; canonical_slug: string }>(
-      `SELECT DISTINCT a.source_id, a.canonical_slug
-       FROM slug_aliases a JOIN pages p ON p.source_id = a.source_id AND p.slug = a.canonical_slug
-       WHERE (a.source_id, a.canonical_slug) IN (
-         SELECT * FROM unnest($1::text[], $2::text[])
-       ) AND ${filter}`,
-      params,
-    );
-  } catch {
-    // Pre-v104 brain or other SQL miss; no-op.
-    return;
-  }
-  if (rows.length === 0) return;
-  const canonicalSet = new Set(rows.map(r => `${r.source_id}::${r.canonical_slug}`));
-  for (const r of results) {
-    const key = `${r.source_id ?? 'default'}::${r.slug}`;
-    if (canonicalSet.has(key)) {
-      r.score *= ALIAS_RESOLVED_BOOST;
-      r.alias_resolved_boost = ALIAS_RESOLVED_BOOST;
     }
   }
 }
@@ -1199,7 +1175,7 @@ export async function hybridSearch(
     : rerankPinned;
   opts?.explainTarget?.observe('time_scoped', rerankScoped);
   const { returnPool, adaptiveDecision, autocutDecision, relationalSlotDecision } = await timer.stage('post_fusion', () => sizeReturnPool(req, {
-    rerankPinned: rerankScoped, deduped, exactLookupOpts: lexical.exactLookupOpts, relationalList, effectiveModality, identityLookups,
+    rerankPinned: rerankScoped, deduped, relationalList, effectiveModality, identityLookups,
   }));
   opts?.explainTarget?.observe('return_pool', returnPool);
   return timer.stage('post_fusion', () => finalizeHybridResults(req, returnPool, {

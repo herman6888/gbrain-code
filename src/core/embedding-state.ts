@@ -9,7 +9,7 @@
  * `chunklessPageState`, next to `staleChunkWhere`) and both engines delegate
  * to it. Precedence for a chunk: deleted page, quarantined page, stored
  * vector, embed job predicate, else embed_skip. For a chunkless live page:
- * quarantined, embed_skip, healable body, else empty.
+ * quarantined, healable body, else empty.
  *
  * - `embedded`: a chunk on a live, unquarantined page whose active column
  *   holds a vector (vectors retained on an embed_skip page count: vector
@@ -19,8 +19,7 @@
  *   `gbrain embed --stale` drains it. On a brain keyless by choice keyword
  *   search is the configured retrieval and reads these chunks, so they are
  *   not counted as unsearchable there.
- * - `keyword_only`: a chunk with no vector on a live `embed_skip` page, or an
- *   `embed_skip` page with no chunk rows. By design (#4306: never purged; its
+ * - `keyword_only`: a chunk with no vector on a live `embed_skip` page. By design (#4306: never purged; its
  *   text feeds keyword search). The import gate sets the marker for a body
  *   over the effective `content_sanity.bytes_block`, so removing the marker
  *   alone is undone on the next import; the exits are splitting the page or
@@ -33,9 +32,11 @@
  * - `deleted_page_chunks`: chunks on a soft-deleted page. The purge lifecycle
  *   (`gbrain pages purge-deleted`, the autopilot purge phase, 72 h) removes
  *   them; past that window they are overdue.
- * - `chunkless_healable`: a live page with body text, no markers and no chunk
- *   rows (`listChunklessPagesWithContent`'s predicate): `gbrain embed --stale`
- *   chunks it before embedding.
+ * - `chunkless_healable`: a live, unquarantined page with body text and no
+ *   chunk rows (`listChunklessPagesWithContent`'s predicate): `gbrain embed
+ *   --stale` chunks it before embedding. An `embed_skip` page is included
+ *   (#7174): writes keep its chunks (#6722), so none means keyword search
+ *   cannot find it; it is chunked and still gets no vectors.
  *
  * Unstamped pending chunks (`embedding_pending_since` NULL: written by a binary
  * older than the v221 stamp) carry no age; the summary reports their count,

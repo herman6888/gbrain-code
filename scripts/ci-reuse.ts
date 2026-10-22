@@ -133,15 +133,27 @@ function accept(run: FullRun, tree: string, rejected: Rejection[], where: string
   return { reuse: true, reason: 'identical_tree_full_run', detail: `run ${run.id} attempt ${run.run_attempt} on ${where} ran the complete full suite on tree ${tree}`, tree, source: { run_id: run.id, run_attempt: run.run_attempt, sha: run.head_sha }, rejected };
 }
 
-/** Every job of one attempt (the jobs API pages at 100). */
+/**
+ * Every job of one attempt. The jobs API pages at up to 100, but GitHub has answered a 100-job page of a rerun attempt
+ * with a 502 on every retry while 30-job pages of the same attempt answered (Release run 39712021085, v0.60.361.0), so a
+ * 5xx that outlives the client's retries restarts the listing at 30 per page.
+ */
 export async function attemptJobs(client: GitHubClient, runId: number, attempt: number): Promise<JobRow[]> {
-  const out: JobRow[] = [];
-  for (let page = 1; page <= 10; page++) {
-    const r = await client.request<{ total_count: number; jobs: JobRow[] }>('GET', `repos/{repo}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`);
-    out.push(...r.jobs);
-    if (r.jobs.length < 100 || out.length >= r.total_count) return out;
+  for (const perPage of [100, 30]) {
+    const out: JobRow[] = [];
+    try {
+      for (let page = 1; page * perPage <= 1000; page++) {
+        const r = await client.request<{ total_count: number; jobs: JobRow[] }>('GET', `repos/{repo}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${perPage}&page=${page}`);
+        out.push(...r.jobs);
+        if (r.jobs.length < perPage || out.length >= r.total_count) return out;
+      }
+    } catch (e) {
+      if (perPage === 30 || ((e as { status?: number }).status ?? 0) < 500) throw e;
+      continue;
+    }
+    throw new Error(`run ${runId} attempt ${attempt} lists more than 1000 jobs`);
   }
-  throw new Error(`run ${runId} attempt ${attempt} lists more than 1000 jobs`);
+  throw new Error('unreachable');
 }
 
 export function apiDeps(client: GitHubClient): ReuseDeps {

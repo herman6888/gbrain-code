@@ -109,7 +109,7 @@ export async function hostIdentityMismatchCheck(engine: BrainEngine): Promise<Ch
 export interface ServiceHost { platform: string; home: string; uid: number }
 
 /** The restart for one consumer: the installed serve service's own command, else stopping that pid for its supervisor or operator to start again. */
-function restartArgv(row: ListedConsumer, service: ServiceHost): string[] {
+export function restartArgv(row: Pick<ListedConsumer, 'kind' | 'pid'>, service: ServiceHost): string[] {
   if (row.kind === 'serve' && service.platform === 'darwin' && existsSync(launchdPlistPath(service.home))) return ['launchctl', 'kickstart', '-k', `gui/${service.uid}/${SERVE_LAUNCHD_LABEL}`];
   if (row.kind === 'serve' && service.platform === 'linux' && existsSync(systemdUnitPath(service.home))) return ['systemctl', '--user', 'restart', SERVE_SYSTEMD_UNIT];
   return ['kill', String(row.pid)];

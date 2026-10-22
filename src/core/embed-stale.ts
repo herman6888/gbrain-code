@@ -26,7 +26,7 @@ import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from './embed-retr
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
 import { healAndReportOverLength } from './embed-overlength-heal.ts';
-import { invalidateStaleSignatureEmbeddingsGuarded, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
+import { hasSignatureDrift, invalidateStaleSignatureEmbeddingsGuarded, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
   quoteIdentifier,
@@ -442,16 +442,15 @@ export async function embedStaleForSource(
   // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
   // untouched. Best-effort — a failure here must not abort the backfill.
   //
-  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-count
-  // (two cheap COUNTs; probe only fires when drift exists) keeps the probe's
+  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-check
+  // (one page-first EXISTS; probe only fires when drift exists) keeps the probe's
   // one embed call off the no-drift common path; a failed probe skips the
   // invalidation entirely so a misresolved worker can't strip a corpus it
   // can never re-embed.
   if (signature) {
     try {
-      const wide = await engine.countStaleChunks({ sourceId, signature });
-      const nullOnly = await engine.countStaleChunks({ sourceId });
-      if (wide - nullOnly > 0) {
+      // One page-first EXISTS: no chunk count before the probe, so a large drifted corpus cannot time the pre-check out (#7117 follow-up).
+      if (await hasSignatureDrift(engine, { signature, sourceId })) {
         await opts.assertOwned?.();
         if (stopped()) return { ...result, aborted: true };
         const probeOk = await probeEmbedder(embedFn, signature, signal);
@@ -471,7 +470,7 @@ export async function embedStaleForSource(
         } else {
           result.invalidationSkipped = 'embedder_probe_failed';
           process.stderr.write(
-            `\n  [embed-stale] ${wide - nullOnly} chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
+            `\n  [embed-stale] embedded chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
             `SKIPPING invalidation (existing vectors preserved). Check embedding provider config/credentials.\n`,
           );
         }

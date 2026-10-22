@@ -14,7 +14,7 @@ import { linkStreamSlugs } from './page-purge.ts';
 import { identityDowngradePurgeHold } from '../sync-identity-downgrades.ts';
 import { atomRetirementPurgeHold } from './atom-retirement-hold.ts';
 import { writerOnboardingPreflight } from './onboarding.ts';
-import { clearPurgePark, notePurgeSourceWriter, PURGE_PARK_LIMIT, purgeParkKey, prunePurgeParks, readPurgeParks, recordPurgeFailure, type PurgePark } from './purge-parks.ts';
+import { clearPurgePark, isParked, notePurgeSourceWriter, PURGE_PARK_LIMIT, purgeParkKey, prunePurgeParks, readPurgeParks, recordPurgeFailure, type PurgePark } from './purge-parks.ts';
 import { ItemRun, type ItemFailure } from '../item-failure.ts';
 import { readUnreviewedSyncTombstones, syncDeleteHeld } from './sync-delete-tombstones.ts';
 
@@ -117,7 +117,7 @@ async function expireRecordedTombstones(engine: BrainEngine, olderThanHours: num
   const failures: Array<{ row: RecordedTombstone; failure: ItemFailure }> = [];
   for (const row of await recordedTombstones(engine, hours)) {
     if (held.has(row.id)) continue;
-    if (row.park && row.park.failures >= PURGE_PARK_LIMIT && !retryParked) {
+    if (isParked(row.park) && !retryParked) {
       out.parked++;
       out.exclude.push(row.id);
       out.blocked.push({ source_id: row.source_id, slug: row.slug, code: 'purge_parked', reason: parkedReason(row.park) });
@@ -189,7 +189,7 @@ export interface PurgeSelection {
 export async function selectPurgeCandidates(engine: BrainEngine, olderThanHours: number, opts: { retryParked?: boolean; automatic?: boolean } = {}): Promise<PurgeSelection> {
   if (!await managedPersistenceEnabled(engine)) {
     const parked = (await recordedTombstones(engine, String(Math.max(0, Math.floor(olderThanHours)))))
-      .filter((row): row is RecordedTombstone & { park: PurgePark } => !!row.park && row.park.failures >= PURGE_PARK_LIMIT);
+      .filter((row): row is RecordedTombstone & { park: PurgePark } => isParked(row.park));
     const skipped = new Set(opts.retryParked ? [] : parked.map(row => row.id));
     const unreviewed = (await readUnreviewedSyncTombstones(engine, olderThanHours)).filter(row => !skipped.has(row.id));
     const kept = opts.automatic ? unreviewed : [];
@@ -231,7 +231,7 @@ export async function selectPurgeCandidates(engine: BrainEngine, olderThanHours:
     const key = purgeParkKey(row.source_id, row.slug, row.deleted_us);
     // A record marked while the writer was not active is dropped by this run (the rearm), so it does not count here.
     const park = parks.get(key)?.inactive_seen ? undefined : parks.get(key);
-    if (park && park.failures >= PURGE_PARK_LIMIT) {
+    if (isParked(park)) {
       selection.parked.push({ source_id: row.source_id, slug: row.slug, failures: park.failures, code: park.code, retried: opts.retryParked === true });
       if (!opts.retryParked) {
         selection.blocked.push({ source_id: row.source_id, slug: row.slug, code: 'purge_parked', reason: parkedReason(park) });

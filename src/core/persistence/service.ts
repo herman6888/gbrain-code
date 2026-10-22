@@ -105,7 +105,7 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation)) return prepareSemanticPageMutation(e, row, cfg);
   if (row.operation === 'append_page') return (await import('./page-upload.ts')).withStagedBodyIf(e, row, async () => (await import('./page-append.ts')).prepareAppendMutation(e, row, cfg, signal, clock));
   if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return preparePageMutation(e, row, cfg, undefined, signal,
-    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock });
+    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock, boundedChunkWrites: true });
   throw new OperationError('unsupported_mutation_protocol', 'No compatible mutation preparer is registered for this operation.', `Request ${row.request_id} (${row.operation}) was accepted by a gbrain version whose preparer this one lacks, so it has not run. Run gbrain upgrade on every host that serves this brain; the request stays journaled and resumes after the upgrade.`);
 }
 /**
@@ -270,11 +270,31 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
       row = { ...row, ...read.row };
       if (isTerminal(row)) return { kind: 'terminal', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
     }
+    // A stopped wait settles only what this process can settle at once: one consumer tick (it claims and publishes the
+    // request when nothing holds it back) and the request this consumer is still executing. A write that cannot move
+    // (another owner's lock, a consumer that defers to another process) is left queued under its request id.
+    if (opts.signal?.aborted && !service.stopping && !handed) {
+      const left = () => deadline - performance.now();
+      await Promise.race([consumer.tick().catch(() => undefined), new Promise<void>(resolve => setTimeout(resolve, Math.max(0, left())))]);
+      while (!handed && consumer.holds(id) && left() > 0) {
+        await new Promise<void>(resolve => {
+          const done = () => { clearTimeout(timer); wake = undefined; resolve(); };
+          const timer = setTimeout(done, Math.min(50, left()));
+          wake = done;
+        });
+      }
+    }
   } finally {
     listeners.delete(listener);
     if (!listeners.size && waiters.get(id) === listeners) waiters.delete(id);
   }
   if (handed) row = handed;
+  // A stopped wait then reads the receipt once, so a write that committed meanwhile is banked rather than reported pending.
+  if (!isTerminal(row) && opts.signal?.aborted && !service.stopping) {
+    const latest = await getWriteRequestProgress(engine, id).catch(() => null);
+    if (latest) row = { ...row, ...latest };
+    if (isTerminal(row)) return { kind: 'terminal', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
+  }
   if (isTerminal(row)) return { kind: 'terminal', row };
   if (failure) {
     const { classifyPgAccessError } = await import('../pg-access-classify.ts');

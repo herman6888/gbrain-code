@@ -12,7 +12,7 @@
  *   otherwise (the v1 contract).
  * - A page marked private only by a privacy alias (`access`, `confidentiality`)
  *   counts as private for everything derived from it; remote page reads honor the
- *   aliases only behind `visibility.honor_aliases` (default off).
+ *   aliases by default; `visibility.honor_aliases false` opts out.
  * - Connector re-renders keep a page's private label; Google private events render private.
  * - The doctor check lists what is already labelled wider than its source, and the
  *   visibility repair previews it and changes it only with --apply.
@@ -243,17 +243,30 @@ describe('privacy aliases (access, confidentiality) count for everything derived
     });
   }, 120_000);
 
-  test('remote page reads honor the aliases only with visibility.honor_aliases on', async () => {
+  test('remote page reads hide alias-private pages by default; local reads are unchanged; honor_aliases false opts out', async () => {
     await onEachEngine(async engine => {
       const s = await source(engine, false);
-      await putAliased(engine, s.sourceId, 'meetings/aliased-example', 'meeting', { access: 'private' });
-      const read = () => operationsByName.get_page!.handler(s.remote, { slug: 'meetings/aliased-example' }).then(() => true, () => false);
-      expect(await read()).toBe(true);
-      await engine.setConfig('visibility.honor_aliases', 'true');
       __resetPrivateVisibilityCacheForTests();
-      try { expect(await read()).toBe(false); }
-      finally { await engine.executeRaw("DELETE FROM config WHERE key='visibility.honor_aliases'"); __resetPrivateVisibilityCacheForTests(); }
-      expect(await read()).toBe(true);
+      await putAliased(engine, s.sourceId, 'meetings/aliased-example', 'meeting', { access: 'private' }, 'Zephyrquill synthetic agenda.');
+      await putAliased(engine, s.sourceId, 'meetings/open-example', 'meeting', { access: 'public' }, 'Zephyrquill open agenda.');
+      const read = (ctx: OperationContext, slug: string) => operationsByName.get_page!.handler(ctx, { slug }).then(() => true, () => false);
+      const found = async (ctx: OperationContext) => {
+        const listed = await operationsByName.list_pages!.handler(ctx, { type: 'meeting' }) as unknown;
+        const rows = (Array.isArray(listed) ? listed : (listed as { pages: unknown[] }).pages) as Array<{ slug: string }>;
+        return rows.map(row => row.slug).filter(slug => slug.startsWith('meetings/')).sort();
+      };
+      expect(await read(s.remote, 'meetings/aliased-example')).toBe(false);
+      expect(await read(s.remote, 'meetings/open-example')).toBe(true);
+      expect(await found(s.remote)).toEqual(['meetings/open-example']);
+      expect(await read(s.local, 'meetings/aliased-example')).toBe(true);
+      expect(await found(s.local)).toEqual(['meetings/aliased-example', 'meetings/open-example']);
+      await engine.setConfig('visibility.honor_aliases', 'false');
+      __resetPrivateVisibilityCacheForTests();
+      try {
+        expect(await read(s.remote, 'meetings/aliased-example')).toBe(true);
+        expect(await found(s.remote)).toEqual(['meetings/aliased-example', 'meetings/open-example']);
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='visibility.honor_aliases'"); __resetPrivateVisibilityCacheForTests(); }
+      expect(await read(s.remote, 'meetings/aliased-example')).toBe(false);
     });
   }, 120_000);
 });
@@ -277,6 +290,7 @@ describe('already-affected rows: listed by doctor, previewed by the repair, chan
       expect(check.details).toMatchObject({ alias_pages_without_visibility: 1, looser_events: 1, world_facts_from_private_sources: 1,
         world_facts_remotely_readable: 1, remotely_readable_fact_ids: [String(fact!.id)] });
       expect(check.message).not.toContain(meeting);
+      expect(check.message).toContain('Remote page reads hide them (to show them: gbrain config set visibility.honor_aliases false).');
 
       const home = mkdtempSync(join(tmpdir(), 'gbrain-visibility-repair-'));
       try {

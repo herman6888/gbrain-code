@@ -173,9 +173,10 @@ async function sharedPackMemberGhost(engine: BrainEngine, owner: GhostOwner, gho
 
 /**
  * One source's ghosts in page-id order. `candidateLimit` bounds the full checks (default `GHOST_CHECK_LIMIT`);
- * anything past it, or past `GHOST_SCAN_LIMIT` live pages, sets `truncated`.
+ * anything past it, or past `GHOST_SCAN_LIMIT` live pages, sets `truncated`. An aborted `signal` throws its reason
+ * before the next statement (the post-sync background scan stops this way before its engine disconnects).
  */
-export async function scanGhostSource(engine: BrainEngine, sourceId: string, opts: { candidateLimit?: number } = {}): Promise<GhostSourceScan> {
+export async function scanGhostSource(engine: BrainEngine, sourceId: string, opts: { candidateLimit?: number; signal?: AbortSignal } = {}): Promise<GhostSourceScan> {
   const limit = opts.candidateLimit ?? GHOST_CHECK_LIMIT;
   const context = await sourceContext(engine, sourceId);
   const scan: GhostSourceScan = { source_id: sourceId, status: 'known', ghosts: [], skill_paths: [], inspected: 0, file_backed: 0, candidates: 0, truncated: false };
@@ -185,6 +186,7 @@ export async function scanGhostSource(engine: BrainEngine, sourceId: string, opt
   let after = 0;
   let unchecked = 0;
   for (;;) {
+    opts.signal?.throwIfAborted();
     const rows = await engine.executeRaw<PageRow>(`SELECT id, slug, source_path, source_uri FROM pages
       WHERE source_id=$1 AND deleted_at IS NULL AND id > $2 ORDER BY id LIMIT ${BATCH}`, [sourceId, after]);
     for (const row of rows) {
@@ -196,6 +198,7 @@ export async function scanGhostSource(engine: BrainEngine, sourceId: string, opt
       if (verdict.kind === 'ambiguous') return { ...scan, status: 'unknown', reason: 'ambiguous_storage' };
       scan.candidates++;
       if (scan.candidates > limit) { scan.truncated = true; unchecked++; continue; }
+      opts.signal?.throwIfAborted();
       const result = await confirm(engine, context, sourceId, row.slug);
       if (result.kind === 'unknown') return { ...scan, status: result.reason === 'not_owner_host' ? 'not_applicable' : 'unknown', reason: result.reason };
       if (result.kind === 'ghost') (await sharedPackMemberGhost(engine, context.owner, result.ghost) ? scan.skill_paths : scan.ghosts).push(result.ghost);

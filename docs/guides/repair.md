@@ -59,7 +59,7 @@ timeline: 12 item(s) to repair
 
 ```bash
 gbrain repair timeline --apply
-gbrain repair visibility --apply
+gbrain repair visibility --apply                # every class; or preview one window and apply it (below)
 gbrain repair safe-chunks --apply
 gbrain repair safe-chunks --apply --no-embed   # re-seal text now, embed later
 gbrain repair contextual-mode --apply
@@ -67,6 +67,23 @@ gbrain repair request-indexes --apply
 gbrain repair google-file-modes --apply             # explicit-only: runs only when named
 gbrain repair --all --apply                    # every automatic kind in order
 ```
+
+On a large brain, apply `visibility` one previewed window at a time. The preview
+plans one class at a time in the order remote callers are exposed (world facts
+from a private page, remotely readable ones first; Life Chronicle events;
+alias-only pages; then atoms and concepts, the only class that reads
+concept-provenance links), reports progress on stderr, lists one window
+(1,000 items; `--limit` up to 10,000) and prints the apply command for it:
+
+```bash
+gbrain repair visibility --class facts        # one class: facts, events, aliases or lineage
+gbrain repair visibility --class facts --apply --expect <hash>   # exactly that window
+```
+
+The apply touches only the listed items and resumes after its last applied
+item if it stops. Apply the window (or decide not to), then preview again for
+the next one. Each plan statement is bounded at 120 s; a class that overruns is
+reported and skipped while the other classes are listed.
 
 `--apply` writes without a prompt, so review the preview first. With
 `--apply` you must name a kind or pass `--all`; `--yes` is refused, and so is
@@ -302,10 +319,12 @@ the schema. If the brain schema is newer than this gbrain client, upgrade
 gbrain first; the repair refuses rather than build an older table shape.
 
 Purges that failed on the missing cache before this fix may have been parked
-after five failures, and the nightly purge skips parked pages. After the
-upgrade, preview them with `gbrain pages purge-deleted --retry-parked
---dry-run` and run it without `--dry-run` after the user agrees; doctor
-`purge_parked_pages` lists them.
+after five failures. A park records the gbrain version that wrote it, and the
+first purge run after an upgrade tries a park an older version wrote once more,
+so these clear by themselves. One that fails again is parked under the new
+version: doctor `purge_parked_pages` lists it; preview
+`gbrain pages purge-deleted --retry-parked --dry-run` and run it without
+`--dry-run` after the user agrees.
 
 A missing table that holds user data is listed under `user_data_tables`; this
 repair never recreates it, because an empty table would hide that its rows are
@@ -1243,6 +1262,13 @@ the same in one transaction):
    database 72 h later without refusing it as a page whose file another page
    records.
 
+A twin soft-deleted by hand while the legacy page records the file (receipt
+`write_through.skipped: shared_origin`) keeps its recorded file, and the
+retention purge removes it database-only too: the file and the legacy page stay
+and no content tombstone is written. A tombstone an older release parked after
+refusing it gets one automatic attempt from the first purge run after the
+upgrade (a park another gbrain version wrote is retried once) and is purged then.
+
 The legacy page keeps its slug: that is also the slug sync gives a never-forked
 file whose legacy page it takes over (#6727), and the folded slug resolves to it
 through the alias. The twin's import-owned tags, chunks, versions and the facts and takes its
@@ -1342,6 +1368,24 @@ job, with an unfinished sync cursor, or above the mass valve. `gbrain sync --jso
 origin; `CREATE UNIQUE INDEX CONCURRENTLY` on Postgres) only when the brain has no twins. With twins the migration
 changes nothing and succeeds, and doctor's `origin_twins` check reports "Index pending". Once the last group is
 resolved, the repair's apply builds the index.
+
+### Slug path mismatch
+
+Doctor's `slug_path_mismatch` check (#7305) counts live pages whose slug their recorded file path does not derive. The
+usual case is a hyphen run or a segment-final hyphen: `notes/x-1900---2000-ab.md` imports as `notes/x-1900-2000-ab`,
+because the path rule folds every hyphen run to one hyphen. Import and sync keep such a page on its own slug only
+through the `slug:` line every render stamps into its file (#5966). A file without that line, such as one an
+older gbrain rendered or another tool rewrote, imports as the folded slug and forks a duplicate-origin twin, which sync
+holds [`origin_conflict`](write-refusals.md#origin_conflict).
+
+The check is read-only. It reads at most 20,000 candidate pages and 200 recorded files per run, and reports `Unknown`
+when either bound stops it. It warns only when a file read on this host lacks the stamp, naming
+`gbrain repair frontmatter --source <id>`, whose preview proposes the stamp as a safe repair. A twin that already forked
+is reported by `origin_twins` and resolved with [`gbrain repair origin-twins`](#origin-twins).
+
+`put_page` and `capture` refuse a new slug with a hyphen run or a segment-final hyphen (`invalid_params`, detail
+`slug_hyphen_run`) and name the folded slug. A page that already holds such a slug keeps updating under it, and its
+response carries `slug_advisory`. To move it, put its content under the folded slug, then delete the old page.
 
 ### Rename identity
 
@@ -2135,11 +2179,63 @@ the two `--prefer` values do opposite things in each state.
 | `purged_differs` | Removes the file. | Imports the file as a new page. |
 | `file_gone` | Recreates the file from the page. | Soft-deletes the page (the mass-delete valve applies). |
 
+A held preview covers one window of the selected holds, in held-path order:
+at most 200 pages, and it starts no page after 60 seconds of work (each page
+reads the database a few dozen times, so a large held set against a remote
+database takes minutes per hundred pages). It reports each page on stderr as
+it goes. The hash and the printed apply command cover only that window. A
+partial window lists `after_window` in its residuals and prints the next
+preview command with `--cursor <next_cursor>` (JSON: `details.window`):
+
+```bash
+gbrain repair file-drift --source <id> --held --side deleted --state file_gone --prefer database             # window 1
+gbrain repair file-drift --source <id> --held --side deleted --state file_gone --prefer database --apply --expect <hash>
+gbrain repair file-drift --source <id> --held --side deleted --state file_gone --cursor <next_cursor> --prefer database  # window 2
+```
+
+The apply reports each page on stderr as well. If the database refuses an item (a deadlock, a serialization failure, a lost
+connection), the apply stops with a result naming what it applied, the reason and the command that resumes from that item. Apply each window (or decide not to), then preview the next one. Pages the
+apply resolved leave the held set, so rerunning without `--cursor` also
+starts from the first page still held.
+
 A `file_gone` hold whose `meta.reason` is `never_committed` or `ignored`
 (#7130) is a page whose file is missing although Git never committed it: the
 sync could not tell a deletion from a file that never reached the repository,
 so the page may hold the only copy. `--prefer file` deletes it after review;
 committing the file again clears the hold.
+
+<a id="file-drift-provenance"></a>**Provenance: who deleted each gone file.** Every page of a
+`--held --side deleted --state file_gone` preview names where its file went
+(JSON: `details.pages[].provenance`, counted in `details.provenance` with every
+kind listed, zeros included), read from HEAD's full history with `--full-history`,
+so a deletion on a branch a merge kept is found (a plain
+`git log --diff-filter=D -- <path>` simplifies it away). The history is walked
+once and cached per commit, so a long history costs one walk per preview, and
+the preview reports the commits read on stderr while it walks:
+
+| Provenance | Meaning |
+|---|---|
+| `deleted_by_commit` | The newest commit that deleted the file, with its sha, author, date and subject (a merge only when its resolution dropped the file). |
+| `never_committed` | No commit ever held the file, so the page holds the only copy. |
+| `deletion_uncommitted` | HEAD still holds the file (even one an older commit deleted and a later one restored); only the worktree lost it. |
+| `unknown` | Git could not answer, or the history touched the file without a deletion it can name. |
+
+`--provenance <kind>` keeps only the held files of one provenance, so each
+population gets its own decision:
+
+```bash
+# Pages no commit ever held: keep each one database-only. No file is written; the page
+# forgets its recorded path (database_only_reason=detached) and the hold is cleared.
+gbrain repair file-drift --source <id> --held --side deleted --state file_gone --provenance never_committed --prefer database
+# Files a commit deleted on purpose: accept the deletions (soft-deletes those pages).
+gbrain repair file-drift --source <id> --held --side deleted --state file_gone --provenance deleted_by_commit --prefer file
+```
+
+`--provenance never_committed --prefer file` is refused: it would soft-delete
+the only copy of each page. A database-only page is no longer screened against
+a file; a file synced back at its old path binds it again. The apply re-checks
+each page (same revision, file still missing, still never committed) and
+reports `changed_since_preview` otherwise.
 
 `both` and `unknown` resolve as `--slug` does above. `--only` / `--skip` narrow
 the held set by file path, and the preview lists each page's action.
@@ -2768,7 +2864,9 @@ the next maintenance run, so pause first if you want to keep the original.
 A file an older gbrain refused before refusals became holds has no page and no
 hold; incremental sync never revisits it. The
 maintenance phase `unindexed_files` finds such files (bounded, never
-clean while incomplete) and schedules a re-screen; doctor
+clean while incomplete; each run continues the stored scan, also after new
+commits, and serves the least recently scanned source first) and schedules a
+re-screen, which the next sync consumes once it imports or holds the file; doctor
 `unindexed_files` reports them. Run `gbrain sources retry-held <id> --unindexed`, then the sync it prints: each file imports or becomes a
 [hold](#held-files). `slug_taken` (the path slug belongs to another page) and `deleted_page`
 (the page was deleted while the file stayed committed) are never scheduled:

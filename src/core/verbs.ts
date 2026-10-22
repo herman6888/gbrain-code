@@ -226,6 +226,7 @@ const entity: Operation = {
     names: { type: 'array', items: { type: 'string' }, description: 'Or up to 50 names/codes at once: compact rows.' },
     source_id: { type: 'string', description: 'Read only this source. Default: your source first, then every source you can read.', fullSurfaceOnly: true },
     prefer_source_id: { type: 'string', description: 'Source to try first (thin clients send .gbrain-source here); never narrows.', fullSurfaceOnly: true },
+    variants: { type: 'boolean', description: 'false: exact names only. Default true: with no exact match, one unambiguous name variant (card.match says which).', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
@@ -247,7 +248,7 @@ const entity: Operation = {
           `Pass either name: "Alice Example" for one full card, or names: ["Alice Example", "WGCO"] (up to ${ENTITY_NAMES_MAX}) for compact rows.`);
       }
       const t0 = Date.now();
-      const out = await lookupEntityNames(ctx.engine, walk.home, names, { remote: ctx.remote !== false, sources: walk.sources, surfaceCeiling: ctx.surfaceCeiling,
+      const out = await lookupEntityNames(ctx.engine, walk.home, names, { remote: ctx.remote !== false, sources: walk.sources, surfaceCeiling: ctx.surfaceCeiling, variants: p.variants !== false,
         emitNotice: n => ctx.emitNotice?.(n) });
       ambientMiss(out.results.map(r => ({ name: r.name, ...(r.found ? { foundIn: r.source_id } : {}) })));
       return { protocol_version: 1, latency_ms: Date.now() - t0, ...out };
@@ -263,7 +264,7 @@ const entity: Operation = {
     const t0 = Date.now();
     const { buildEntityCard } = await import('./verbs/entity-card.ts');
     const result = await buildEntityCard(ctx.engine, walk.home, name, {
-      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling, sources: walk.sources,
+      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling, sources: walk.sources, variants: p.variants !== false,
       omitQuarantined: ctx.remote !== false, // #5575: like get_page, a remote reader never gets a quarantined page's card
       emitNotice: n => ctx.emitNotice?.(n),
     });
@@ -285,6 +286,8 @@ const entity: Operation = {
       ...(result.card ? { card: result.card } : {}),
       ...(result.suggestions !== undefined ? { suggestions: result.suggestions } : {}),
       ...(!result.card && result.coverage ? { coverage: result.coverage } : {}),
+      ...(result.text_mentions ? { text_mentions: result.text_mentions } : {}),
+      ...(result.ambiguous ? { ambiguous: true } : {}),
     };
   },
   cliHints: { name: 'entity', positional: ['name'] },

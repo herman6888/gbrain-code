@@ -39,8 +39,10 @@ export async function mergedRequestConfig(engine: BrainEngine): Promise<GBrainCo
 
 /** The CLI's OperationContext for one request: makeContext's fields, with the caller's routing. */
 export async function cliRequestContext(engine: BrainEngine, params: Record<string, unknown>, op: Pick<Operation, 'params'>,
-  request: Pick<CliSocketRequest, 'routing' | 'cli'>, config: GBrainConfig,
+  request: Pick<CliSocketRequest, 'routing' | 'cli'>, config: GBrainConfig | Promise<GBrainConfig>,
   sinks: { emitResponseMeta: (key: string, value: unknown) => void; emitNotice: (notice: Notice) => void }): Promise<OperationContext> {
+  const merged = Promise.resolve(config);
+  merged.catch(() => {});
   let sourceId: string | undefined;
   let localFederated: string[] | undefined;
   let sourceImplicit = true;
@@ -57,7 +59,7 @@ export async function cliRequestContext(engine: BrainEngine, params: Record<stri
   }
   return {
     engine,
-    config,
+    config: await merged,
     logger: { info: (...args: unknown[]) => console.log(...args), warn: (...args: unknown[]) => console.warn(...args), error: (...args: unknown[]) => console.error(...args) },
     dryRun: (params.dry_run as boolean) || false,
     remote: false, admissionOrigin: 'interactive',
@@ -101,7 +103,8 @@ async function runOp(engine: BrainEngine, request: Extract<CliSocketRequest, { k
   };
   let stage = `gbrain ${request.command}: context`;
   try {
-    const ctx = await withTimeout(track(work, (async () => cliRequestContext(engine, params, op, request, await mergedRequestConfig(engine), sinks))()), wallclockMs, stage);
+    // GBRA-156: the merged config and the source resolution read the request's snapshot together (one round trip).
+    const ctx = await withTimeout(track(work, cliRequestContext(engine, params, op, request, mergedRequestConfig(engine), sinks)), wallclockMs, stage);
     stage = `gbrain ${request.command}`;
     const raw = await withTimeout(track(work, op.handler(ctx, params)), wallclockMs, stage);
     // src/cli/main.ts runSharedOperation: captureRetrievalNotices after the handler, before the JSON round trip.

@@ -11,6 +11,8 @@ import type { SegmentedImport } from './segmented-apply.ts';
  * to the caller, which stamps it with its text seal (`sealImportedPage`).
  */
 export interface PreparedImportApplied { pageId?: number; sealed: boolean; chunkerSeal?: number;
+  /** #7172: the apply left the page's chunk rows for its afterCommit (`continueDeferredProjection`); the caller seals nothing. */
+  projectionPending?: true;
   /** Wave B: the apply published a segmented body; when `complete` the caller seals it with `sealSegmentedPage`, never the inline seals. */
   segmented?: { complete: boolean } }
 

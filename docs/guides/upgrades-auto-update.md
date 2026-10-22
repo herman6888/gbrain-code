@@ -20,9 +20,10 @@ schema. The user gets new capabilities automatically.
 
 gbrain stays current the way gstack does: it rides invocation frequency. A
 throttled, cache-read-only check runs at the start of every `gbrain` invocation
-(CLI and MCP) and emits an `UPGRADE_AVAILABLE <old> <new>` marker on stderr. The
-raw marker line is suppressed when stderr is an interactive TTY (a human sees
-only the plain `gbrain X -> Y available` sentence, not the machine token); set
+(CLI and MCP) and emits an `UPGRADE_AVAILABLE <old> <new>` marker on stderr,
+once per 30 minutes per version under one GBRAIN_HOME (a newer version shows at
+once). It is one line: when stderr is an interactive TTY a human sees only the
+plain `gbrain X -> Y available` sentence instead of the machine token; set
 `GBRAIN_FORCE_UPGRADE_MARKER=1` if an agent harness parses the token but runs
 under a PTY. `<old>` is always the RUNNING binary's version, so a stale or
 foreign-written cache never nags about an upgrade this binary already has. No

@@ -136,6 +136,33 @@ An ordinary page carries no field.
 A body over the page ceiling, or `put_page` content over 24 MiB, has no
 receipt: the write is refused as `request_too_large`.
 
+<a id="reading-part-of-a-page"></a>
+### Reading part of a page
+
+**Say to your agent:** *"Show me just the Next steps section of the
+acme-example meeting page."* The agent runs
+`gbrain get <slug> --section "Next steps"` (MCP: `get_page` with
+`section`) instead of reading the whole page.
+
+**Say to your agent:** *"Where does the widget plan page mention pricing?"*
+The agent runs `gbrain get <slug> --grep pricing --context 1` (MCP:
+`get_page` with `grep` and `context`).
+
+`--section` returns the first section whose heading matches (case does not
+matter), down to the next heading of the same or a higher level, with the
+headings above it. If no heading matches, the error lists the page's headings
+(up to 20). `--grep` returns each paragraph with a line containing the text
+(plain text, not a pattern) plus `--context` paragraphs either side (default
+1, at most 5), with line numbers and `total_matches`. It returns at most 50
+matching paragraphs and 100,000 characters, and says `truncated` when it
+stops early. The line numbers are the ones a `--body window` read takes:
+`gbrain get <slug> --body window --lines 100-140` reads lines 100 to 140
+(`--lines 100` reads one line, `--bytes 0-999` the first 1,000 bytes).
+Both read the same text a window does, so they show a remote caller nothing a
+window would not, and they work on segmented pages one segment at a time.
+Every `get_page` response carries `chars`, the characters of page text it
+returned.
+
 <a id="segmented-page-storage"></a>
 ### Segmented page storage
 
@@ -288,11 +315,18 @@ for up to two minutes, on the CPU, on keyless brains too, and prints a receipt;
 resumes where it stopped. It removes only gate-written markers whose reason is
 `oversized`, and the matching `content_flag: oversized`; a page above the
 operator's effective `bytes_block` keeps both and is re-chunked for keyword
-search with no vectors. The backfill never embeds.
+search with no vectors. The backfill never embeds. A page whose rewrite is
+refused (an invalid fence the canonical owner will not write, for example)
+keeps its marker and is listed under `failed`; the hold placed for it is put
+back, so it is not left waiting for an approval that cannot embed it. Until
+its content is repaired, the chunk safety net (`gbrain embed --stale`, the
+cycle's embed phase) gives it chunks for keyword search with no vectors, and
+doctor `oversized_pages` counts the marked pages with and without chunks.
 Backfilled pages over 1 MiB are held for consent; the post-upgrade notice,
 `gbrain embed --stale` (its `budget_limited` line) and doctor's
 `partial_embedding` check show how many are held and what embedding them
-would cost. Pages between 500 KB and 1 MiB cost a cent or two each and embed
+would cost; doctor also says how many holds have waited more than a day
+without a decision, and since when. Pages between 500 KB and 1 MiB cost a cent or two each and embed
 through the normal sweep under the existing caps.
 
 Nothing releases a hold automatically. `gbrain embed --held --dry-run` lists

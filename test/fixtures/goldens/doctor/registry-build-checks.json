@@ -882,6 +882,10 @@
         "name": "host_identity_mismatch"
       },
       {
+        "category": "ops",
+        "name": "runtime_build_skew"
+      },
+      {
         "category": "brain",
         "name": "extract_atoms_held_failed"
       },
@@ -896,6 +900,10 @@
       {
         "category": "brain",
         "name": "origin_twins"
+      },
+      {
+        "category": "brain",
+        "name": "slug_path_mismatch"
       },
       {
         "category": "brain",
@@ -928,6 +936,10 @@
       {
         "category": "ops",
         "name": "managed_sync_convergence"
+      },
+      {
+        "category": "brain",
+        "name": "person_title_duplicates"
       },
       {
         "category": "brain",

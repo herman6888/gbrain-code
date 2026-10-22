@@ -9,6 +9,7 @@
  * A missing or older-than-24 h observation is "upstream unknown", never fresh.
  */
 import { execFileSync } from './spawn.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
 import { statSync } from 'node:fs';
 import type { BrainEngine } from './engine.ts';
 import { ERROR_CATALOGUE } from './error-catalogue.ts';
@@ -30,6 +31,12 @@ function git(root: string, args: string[]): string | null {
   }
 }
 
+/** GBRA-133 2b.3: `git()` without blocking the event loop; the observation runs after every sync, in residents too. */
+async function gitAsync(root: string, args: string[]): Promise<string | null> {
+  const r = await execFileBounded('git', ['-C', root, ...args], { env: gitChildEnv(), timeout: 10_000 });
+  return r.error ? null : r.stdout.trim() || null;
+}
+
 function mtime(path: string | null): number {
   if (!path) return 0;
   try { return statSync(path).mtimeMs; } catch { return 0; }
@@ -41,16 +48,16 @@ export function tracksUpstream(root: string): boolean {
 }
 
 /** Reads the checkout's upstream state; null when it has no upstream or none was ever fetched or pushed. */
-export function observeUpstream(root: string, syncedCommit: string | null): UpstreamObservation | null {
-  const commit = git(root, ['rev-parse', '--verify', '-q', '@{upstream}^{commit}']);
-  const ref = commit && git(root, ['rev-parse', '--symbolic-full-name', '@{upstream}']);
+export async function observeUpstream(root: string, syncedCommit: string | null): Promise<UpstreamObservation | null> {
+  const commit = await gitAsync(root, ['rev-parse', '--verify', '-q', '@{upstream}^{commit}']);
+  const ref = commit && await gitAsync(root, ['rev-parse', '--symbolic-full-name', '@{upstream}']);
   if (!commit || !ref) return null;
   const checkedMs = Math.max(
-    mtime(git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'FETCH_HEAD'])),
-    mtime(git(root, ['rev-parse', '--path-format=absolute', '--git-path', `logs/${ref}`])),
+    mtime(await gitAsync(root, ['rev-parse', '--path-format=absolute', '--git-path', 'FETCH_HEAD'])),
+    mtime(await gitAsync(root, ['rev-parse', '--path-format=absolute', '--git-path', `logs/${ref}`])),
   );
   if (checkedMs === 0) return null;
-  const count = syncedCommit ? git(root, ['rev-list', '--count', `${syncedCommit}..${commit}`]) : null;
+  const count = syncedCommit ? await gitAsync(root, ['rev-list', '--count', `${syncedCommit}..${commit}`]) : null;
   return { checkedAt: new Date(checkedMs), commit, behind: count === null ? null : Number(count) };
 }
 
@@ -61,7 +68,7 @@ export async function recordUpstreamObservation(engine: BrainEngine, sourceId: s
       'SELECT local_path,last_commit FROM sources WHERE id=$1', [sourceId]);
     const root = repoPath ?? source?.local_path;
     if (!source || !root) return;
-    const observed = observeUpstream(root, source.last_commit);
+    const observed = await observeUpstream(root, source.last_commit);
     if (!observed) return;
     await engine.executeRaw('UPDATE sources SET upstream_checked_at=$2::timestamptz,upstream_commit=$3,upstream_behind=$4 WHERE id=$1',
       [sourceId, observed.checkedAt.toISOString(), observed.commit, observed.behind]);

@@ -21,6 +21,7 @@ const load_extraction = () => import('./ops/extraction.ts') as Promise<Record<st
 const load_facts = () => import('./ops/facts.ts') as Promise<Record<string, unknown>>;
 const load_feedback = () => import('./ops/feedback.ts') as Promise<Record<string, unknown>>;
 const load_files = () => import('./ops/files.ts') as Promise<Record<string, unknown>>;
+const load_graph_rank = () => import('./ops/graph-rank.ts') as Promise<Record<string, unknown>>;
 const load_image = () => import('./ops/image.ts') as Promise<Record<string, unknown>>;
 const load_ingest_log = () => import('./ops/ingest-log.ts') as Promise<Record<string, unknown>>;
 const load_insights = () => import('./ops/insights.ts') as Promise<Record<string, unknown>>;
@@ -41,6 +42,7 @@ const load_raw_data = () => import('./ops/raw-data.ts') as Promise<Record<string
 const load_request_tools = () => import('./ops/request-tools.ts') as Promise<Record<string, unknown>>;
 const load_salience = () => import('./ops/salience.ts') as Promise<Record<string, unknown>>;
 const load_schema_packs = () => import('./ops/schema-packs.ts') as Promise<Record<string, unknown>>;
+const load_search_exact = () => import('./ops/search-exact.ts') as Promise<Record<string, unknown>>;
 const load_search = () => import('./ops/search.ts') as Promise<Record<string, unknown>>;
 const load_skillopt = () => import('./ops/skillopt.ts') as Promise<Record<string, unknown>>;
 const load_skills_catalog = () => import('./ops/skills-catalog.ts') as Promise<Record<string, unknown>>;
@@ -86,6 +88,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "search_modes": [load_search, "searchOperations"],
   "search_tune": [load_search, "searchOperations"],
   "cache_stats": [load_search, "searchOperations"],
+  "search_exact": [load_search_exact, "searchExactOperations"],
   "rate_answer": [load_feedback, "feedbackOperations"],
   "search_by_image": [load_image, "imageOperations"],
   "add_tag": [load_tags, "tagsOperations"],
@@ -140,6 +143,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "file_url": [load_files, "filesOperations"],
   "submit_job": [load_jobs, "jobsOperations"],
   "get_job": [load_jobs, "jobsOperations"],
+  "wait_job": [load_jobs, "jobsOperations"],
   "list_jobs": [load_jobs, "jobsOperations"],
   "cancel_job": [load_jobs, "jobsOperations"],
   "retry_job": [load_jobs, "jobsOperations"],
@@ -152,6 +156,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "get_agent_job": [load_jobs, "jobsOperations"],
   "get_job_stats": [load_jobs, "jobsOperations"],
   "find_orphans": [load_orphans, "orphansOperations"],
+  "rank_entities": [load_graph_rank, "graphRankOperations"],
   "get_calibration_profile": [load_calibration, "calibrationOperations"],
   "takes_list": [load_takes, "takesOperations"],
   "takes_search": [load_takes, "takesOperations"],

@@ -34,7 +34,7 @@ import { compileRowNormalizer } from './normalize.ts';
 import { stagingNeedsTextSql } from '../page-body/schema.ts';
 import { atomRetirementPurgeHold } from '../persistence/atom-retirement-hold.ts';
 import { createPageVersion } from '../page-state/versions.ts';
-import { renderFragment, sqlFragment, trustedSql } from './fragment.ts';
+import { renderFragment, sqlFragment, trustedSql, type SqlFragment } from './fragment.ts';
 import { frontmatterWhereFragment } from '../search/frontmatter-where.ts';
 import { quoteIdentifier, resolveWriteColumnFromConfigRows } from '../search/embedding-column.ts';
 import { pickCanonicalOrigin } from '../persistence/origin-guard.ts';
@@ -782,6 +782,11 @@ function stalePagesWhere(opts?: { sourceId?: string; versionTs?: string; attenda
     : opts?.held === 'only' ? sqlFragment` AND ${linkExtractionHeld(opts.versionTs)}` : sqlFragment``;
   // A quarantined page is hidden from search; it is neither re-extracted nor counted as stale.
   return sqlFragment`deleted_at IS NULL AND ${trustedSql(quarantineFilterFragment('pages'))} AND ${version}${source}${attendance}${held}`;
+}
+
+/** The pages (unaliased `pages` rows) link extraction still owes work: stale, not attendance-blocked, not held (rank_entities' remote coverage). */
+export function staleForExtractionSql(versionTs: string): SqlFragment {
+  return stalePagesWhere({ versionTs, attendance: 'exclude', held: 'exclude' });
 }
 
 /**

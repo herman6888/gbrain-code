@@ -35,8 +35,15 @@
  * write) and stores the result per source in `op_checkpoints` (op
  * `unindexed-files`), where doctor `unindexed_files` reads it through
  * `judgeUnindexedFiles`. An incomplete stored result is continued and
- * accumulated by the next pass while its target commit and eligibility
- * fingerprint are unchanged; otherwise the pass starts over. Blobs are read
+ * accumulated by the next pass while its incarnation and eligibility
+ * fingerprint are unchanged, also when the source's commit moved meanwhile
+ * (#7149: a busy source commits between every two maintenance runs, and a scan
+ * that started over each time never finished): the continuation first
+ * re-examines the paths before its cursor that changed between the two
+ * commits, then resumes after the cursor. When those changes cannot be listed
+ * (the old commit is gone) or number more than `UNINDEXED_REVISIT_CAP`, the
+ * pass starts over. Each source's time budget grows with its size
+ * (`unindexedScanBudgetMs`). Blobs are read
  * and screened in slices bounded by bytes, with the deadline checked between
  * slices (a file left unread counts as `unscreened`).
  */
@@ -47,7 +54,7 @@ import { gitChildEnv } from '../git-env.ts';
 import { isSyncMetafile, matchesAnyGlob, metafileIsPage, resolveSlugForPath } from '../sync.ts';
 import { screenImportContent } from '../import-screen.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
-import { loadSyncEligibility, resolveManagedSyncContext, syncExcludePatterns, type ManagedSyncContext } from './sync-discovery.ts';
+import { loadSyncEligibility, resolveManagedSyncContext, syncExcludePatterns, syncGit, type ManagedSyncContext } from './sync-discovery.ts';
 import { heldGitPaths, readGitHoldRetryPaths, requestGitHoldRetry } from './sync-holds.ts';
 import { readBlobContents, type TreeBlob } from './sync-blobs.ts';
 import { isWindowsColonTarget } from './native-file-target.ts';
@@ -59,11 +66,17 @@ export const UNINDEXED_SCHEDULE_CAP = 5_000;
 /** Found files one pass screens; the rest count as `unscreened`. */
 export const UNINDEXED_SCREEN_LIMIT = 2_000;
 export const UNINDEXED_SAMPLE_LIMIT = 20;
-/** The time one live pass (the maintenance phase, `sources retry-held --unindexed`) spends at most. */
+/** The time one live pass (the maintenance phase, `sources retry-held --unindexed`) spends per `UNINDEXED_BUDGET_PAGES` live pages of its source. */
 export const UNINDEXED_SCAN_BUDGET_MS = 60_000;
+export const UNINDEXED_BUDGET_PAGES = 100_000;
+/** The most one pass of one source spends, and the most the maintenance phase spends over all sources. */
+export const UNINDEXED_SCAN_MAX_BUDGET_MS = 300_000;
+/** Changed paths before a stored cursor a continuation re-examines; with more, the pass starts over. */
+export const UNINDEXED_REVISIT_CAP = 5_000;
 /** A stored result older than this is stale. */
 export const UNINDEXED_STALE_MS = 7 * 24 * 3_600_000;
 const BATCH = 1_000;
+const SYMLINK_MODE = '120000';
 /** Blob bytes one screening slice holds in memory at most (a single larger blob is read alone); each slice is released before the next. */
 const SCREEN_SLICE_BYTES = 32 * 1024 ** 2;
 
@@ -105,6 +118,8 @@ export interface UnindexedScanOpts {
   context?: ManagedSyncContext;
   /** Resume after this Git path (a previous incomplete scan's cursor). */
   cursor?: string | null;
+  /** Git paths at or before `cursor` examined again first (paths that changed since the scan passed them). */
+  revisit?: ReadonlySet<string>;
   /** Absolute epoch ms; checked after each batch, so every pass examines at least one batch. */
   deadlineAt?: number;
   /** Stop after examining this many eligible files. */
@@ -131,7 +146,7 @@ export interface UnindexedRecord extends Omit<UnindexedScan, 'files' | 'schedule
   source_prefix: string;
 }
 
-interface TreeEntry { path: string; oid: string; size: number }
+interface TreeEntry { path: string; oid: string; size: number; mode: string }
 
 /** Reads `entries` in slices of at most `SCREEN_SLICE_BYTES` and visits each with its text (undefined when too large to read); stops before a slice once `stop()` is true. */
 function visitBlobSlices<T extends TreeBlob>(gitRoot: string, entries: T[], visit: (entry: T, content: string | undefined) => void, stop: () => boolean): void {
@@ -144,7 +159,7 @@ function visitBlobSlices<T extends TreeBlob>(gitRoot: string, entries: T[], visi
 }
 
 /** The blobs of `target` under `scope` in tree order, after `after`, in batches; the child stops when the consumer does. */
-async function* treeBatches(gitRoot: string, target: string, scope: string, after: string | null, size: number): AsyncGenerator<TreeEntry[]> {
+async function* treeBatches(gitRoot: string, target: string, scope: string, after: string | null, size: number, revisit?: ReadonlySet<string>): AsyncGenerator<TreeEntry[]> {
   const child = spawn('git', ['-c', 'core.quotepath=false', '--literal-pathspecs', '-C', gitRoot, 'ls-tree', '-r', '-l', '-z', target, ...(scope ? ['--', scope] : [])],
     { env: gitChildEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
@@ -159,10 +174,10 @@ async function* treeBatches(gitRoot: string, target: string, scope: string, afte
         const row = pending.subarray(0, nul).toString('utf8');
         pending = pending.subarray(nul + 1);
         const tab = row.indexOf('\t');
-        const [, kind, oid, bytes] = row.slice(0, tab).split(/\s+/);
+        const [mode, kind, oid, bytes] = row.slice(0, tab).split(/\s+/);
         const path = row.slice(tab + 1);
-        if (kind !== 'blob' || floor && Buffer.compare(Buffer.from(path, 'utf8'), floor) <= 0) continue;
-        batch.push({ path, oid: oid!, size: Number(bytes) });
+        if (kind !== 'blob' || floor && Buffer.compare(Buffer.from(path, 'utf8'), floor) <= 0 && !revisit?.has(path)) continue;
+        batch.push({ path, oid: oid!, size: Number(bytes), mode: mode! });
         if (batch.length >= size) { yield batch; batch = []; }
       }
     }
@@ -193,7 +208,8 @@ export async function findUnindexedFiles(engine: BrainEngine, sourceId: string, 
   const retry = new Set(await readGitHoldRetryPaths(engine, sourceId, incarnation));
   const pastDeadline = () => opts.deadlineAt !== undefined && now() >= opts.deadlineAt;
   let screened = 0;
-  for await (const batch of treeBatches(gitRoot, scan.target, scope, opts.cursor ?? null, opts.batch ?? BATCH)) {
+  const floor = opts.cursor ? Buffer.from(opts.cursor, 'utf8') : null;
+  for await (const batch of treeBatches(gitRoot, scan.target, scope, opts.cursor ?? null, opts.batch ?? BATCH, opts.revisit)) {
     metafileHeads.prime(batch);
     const rows = batch.filter(entry => eligible(entry.path) && !isWindowsColonTarget(entry.path)).map(entry => {
       const root = scope ? entry.path.slice(scope.length + 1) : entry.path;
@@ -230,9 +246,10 @@ export async function findUnindexedFiles(engine: BrainEngine, sourceId: string, 
         'SELECT slug FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND slug = ANY($2::text[])', [sourceId, slugs])).map(page => page.slug) : []);
       const deleted = new Set(fresh.length ? (await engine.executeRaw<{ source_path: string }>(
         'SELECT source_path FROM pages WHERE source_id=$1 AND deleted_at IS NOT NULL AND source_path = ANY($2::text[])', [sourceId, fresh.map(row => row.origin)])).map(page => page.source_path) : []);
-      const toScreen = fresh.slice(0, Math.max(0, screenLimit - screened));
+      // #7149: a committed symlink's blob is its target path, not page content; it is named as one instead of screened.
+      const codes = new Map<string, string>(fresh.filter(row => row.mode === SYMLINK_MODE).map(row => [row.root, 'symlink']));
+      const toScreen = fresh.filter(row => row.mode !== SYMLINK_MODE).slice(0, Math.max(0, screenLimit - screened));
       screened += toScreen.length;
-      const codes = new Map<string, string>();
       visitBlobSlices(gitRoot, toScreen, (row, content) => {
         if (content === undefined) { codes.set(row.root, 'file_too_large'); return; }
         const result = screenImportContent({ content, path: row.origin, byteLength: row.size, expectedSlug: resolveSlugForPath(row.origin) || null });
@@ -250,11 +267,31 @@ export async function findUnindexedFiles(engine: BrainEngine, sourceId: string, 
     }
     if (pastDeadline() || (opts.maxScanned !== undefined && scan.scanned >= opts.maxScanned)) {
       scan.complete = false;
-      scan.cursor = batch[batch.length - 1]!.path;
+      const last = batch[batch.length - 1]!.path;
+      scan.cursor = floor && Buffer.compare(Buffer.from(last, 'utf8'), floor) <= 0 ? opts.cursor! : last;
       break;
     }
   }
   return scan;
+}
+
+/** One pass's time budget for a source: `UNINDEXED_SCAN_BUDGET_MS` per started `UNINDEXED_BUDGET_PAGES` live pages, at most `UNINDEXED_SCAN_MAX_BUDGET_MS`. */
+export async function unindexedScanBudgetMs(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string): Promise<number> {
+  const [row] = await engine.executeRaw<{ n: number | string }>('SELECT count(*) AS n FROM pages WHERE source_id=$1 AND deleted_at IS NULL', [sourceId]);
+  return unindexedBudgetForPages(Number(row?.n ?? 0));
+}
+
+export function unindexedBudgetForPages(pages: number): number {
+  return Math.min(UNINDEXED_SCAN_MAX_BUDGET_MS, UNINDEXED_SCAN_BUDGET_MS * Math.max(1, Math.ceil(pages / UNINDEXED_BUDGET_PAGES)));
+}
+
+/** Git paths at or before `cursor` that differ between `from` and `to`; null when Git cannot list them or they number more than `UNINDEXED_REVISIT_CAP`. */
+function changedBefore(gitRoot: string, from: string, to: string, scope: string, cursor: string): Set<string> | null {
+  let listed: string;
+  try { listed = syncGit(gitRoot, ['--literal-pathspecs', 'diff-tree', '-r', '-z', '--no-renames', '--name-only', from, to, ...(scope ? ['--', scope] : [])]); } catch { return null; }
+  const floor = Buffer.from(cursor, 'utf8');
+  const paths = new Set(listed.split('\0').filter(path => path && Buffer.compare(Buffer.from(path, 'utf8'), floor) <= 0));
+  return paths.size > UNINDEXED_REVISIT_CAP ? null : paths;
 }
 
 /** The stored results of these sources (sources with none are absent). */
@@ -283,12 +320,17 @@ export async function refreshUnindexedFiles(engine: BrainEngine, sourceId: strin
   const stored = (await readUnindexedFiles(engine, [sourceId])).get(sourceId);
   const eligibility = await loadSyncEligibility(engine, context);
   const key = eligibilityKey(eligibility.scope, eligibility.slugMode, await syncExcludePatterns(engine));
-  const previous = stored && !stored.complete && stored.incarnation === context.incarnation && stored.cursor
-    && stored.target === context.source.last_commit && stored.eligibility === key ? stored : null;
-  const scan = await findUnindexedFiles(engine, sourceId, { ...opts, context, cursor: previous?.cursor ?? null });
+  const resumable = stored && !stored.complete && stored.incarnation === context.incarnation && stored.cursor && stored.target && context.source.last_commit
+    && stored.eligibility === key ? stored : null;
+  const revisit = resumable && resumable.target !== context.source.last_commit
+    ? changedBefore(context.gitRoot, resumable.target!, context.source.last_commit!, eligibility.scope, resumable.cursor!) : new Set<string>();
+  const previous = revisit ? resumable : null;
+  const scan = await findUnindexedFiles(engine, sourceId, { ...opts, context, cursor: previous?.cursor ?? null, ...(previous && revisit?.size ? { revisit } : {}) });
   const scheduled = opts.schedule === false ? [] : scan.files.filter(file => !file.slug_taken && !file.deleted_page).map(file => file.path);
   if (scheduled.length) await requestGitHoldRetry(engine, sourceId, context.incarnation, scheduled);
-  const pending = [...new Set([...(previous?.pending ?? []), ...scan.scheduled_paths, ...scheduled])];
+  // Paths the continuation re-examined drop their earlier verdict: one still missing is found again, one deleted or imported is not.
+  const revisited = new Set([...(previous && revisit ? revisit : [])].map(path => eligibility.scope ? path.slice(eligibility.scope.length + 1) : path));
+  const pending = [...new Set([...(previous?.pending ?? []).filter(path => !revisited.has(path)), ...scan.scheduled_paths, ...scheduled])];
   const { scope, slugMode } = eligibility;
   const at = new Date(now()).toISOString();
   const record: UnindexedRecord = {
@@ -320,7 +362,7 @@ export interface UnindexedState {
   unscheduled: number;
   /** Found files a re-screen cannot import (`slug_taken` + `deleted_page`): a person renames, deletes or restores; never scheduled. */
   blocked: number;
-  /** Scheduled paths the next sync has not re-screened yet. */
+  /** Scheduled paths the next sync has not re-screened yet and that still have no page and no hold. */
   waiting: number;
   /** Scheduled paths a sync re-screened that still have no page and no hold. */
   still_unindexed: number;
@@ -328,8 +370,10 @@ export interface UnindexedState {
 }
 
 /**
- * Judges each source's stored result without scanning: its retry row says which scheduled paths still wait for a sync, and
- * one page read plus one hold read over the consumed paths says whether each was imported or held.
+ * Judges each source's stored result without scanning: one page read plus one hold read over the scheduled paths says
+ * whether each was imported or held, and of the rest its retry row says which still wait for a sync. A scheduled path
+ * with a page or a hold is settled even while the retry row still names it (#7149: a sync pass that stops before its
+ * stamp leaves the row behind after importing the path).
  */
 export async function judgeUnindexedFiles(engine: Pick<BrainEngine, 'executeRaw'>, sources: Array<{ id: string; incarnation: string }>, now = Date.now()): Promise<UnindexedState[]> {
   const records = await readUnindexedFiles(engine, sources.map(source => source.id));
@@ -342,16 +386,16 @@ export async function judgeUnindexedFiles(engine: Pick<BrainEngine, 'executeRaw'
     const blocked = (record.slug_taken ?? 0) + (record.deleted_page ?? 0);
     const unscheduled = Math.max(0, record.unindexed - blocked - record.scheduled_now);
     const retry = new Set(await readGitHoldRetryPaths(engine, source.id, source.incarnation));
-    const waiting = record.pending.filter(path => retry.has(path)).length;
-    const consumed = record.pending.filter(path => !retry.has(path));
-    let stillUnindexed = 0;
-    if (consumed.length) {
+    let open = record.pending;
+    if (open.length) {
       const indexed = new Set((await engine.executeRaw<{ source_path: string }>(
         'SELECT source_path FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND source_path = ANY($2::text[])',
-        [source.id, consumed.map(path => `${record.source_prefix}${path}`)])).map(page => page.source_path));
-      const held = await heldGitPaths(engine, source.id, source.incarnation, consumed);
-      stillUnindexed = consumed.filter(path => !indexed.has(`${record.source_prefix}${path}`) && !held.has(path)).length;
+        [source.id, open.map(path => `${record.source_prefix}${path}`)])).map(page => page.source_path));
+      const held = await heldGitPaths(engine, source.id, source.incarnation, open);
+      open = open.filter(path => !indexed.has(`${record.source_prefix}${path}`) && !held.has(path));
     }
+    const waiting = open.filter(path => retry.has(path)).length;
+    const stillUnindexed = open.length - waiting;
     const state = unscheduled || stillUnindexed ? 'unindexed' : waiting ? 'scheduled' : record.complete && !record.pending_truncated ? 'ok' : 'partial';
     out.push({ ...base, state, unscheduled, blocked, waiting, still_unindexed: stillUnindexed });
   }

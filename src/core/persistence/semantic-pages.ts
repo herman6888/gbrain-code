@@ -61,7 +61,7 @@ export async function prepareSemanticPageMutation(engine: BrainEngine, row: Writ
     const snapshot = flipped ? stored : (await wholeBodySnapshot(engine, stored, `${row.operation} (the write gate scans the whole body of an external_untrusted write)`))!;
     const prepared = flipped ?? await preparePageMutation(engine, row, config, {
       expectedRevision: snapshot.revision, tags, content: serializePageToMarkdown(snapshot.page, tags),
-    });
+    }, undefined, { boundedChunkWrites: true });
     // #5251: a tag change leaves every chunk's text as it was, so the republication queues no
     // embedding effect; the stale sweep still picks up any chunk the publish left without a vector.
     return { ...prepared, deferEmbedding: true, apply: async tx => ({ ...await prepared.apply(tx), status: 'ok', tag }) };
@@ -94,7 +94,7 @@ export async function prepareSemanticPageMutation(engine: BrainEngine, row: Writ
   const page = { ...snapshot.page, timeline: exact ? snapshot.page.timeline : spliceTimelineBlock(snapshot.page.timeline, entry.date, block) };
   const prepared = await preparePageMutation(engine, row, config, {
     expectedRevision: snapshot.revision, content: serializePageToMarkdown(page, snapshot.tags),
-  });
+  }, undefined, { boundedChunkWrites: true });
   return { ...prepared, apply: async tx => {
     const outcome = await prepared.apply(tx);
     const inserted = await tx.addTimelineEntry(row.slug, { ...rendered.canonical, detail: rendered.detail }, { sourceId: row.source_id });

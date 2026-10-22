@@ -35,6 +35,7 @@ describe('exit code table', () => {
     expect(exitCodes.CONFIRMATION_REQUIRED_EXIT_CODE).toBe(3);
     expect(exitCodes.PENDING_WRITE_EXIT_CODE).toBe(10);
     expect(exitCodes.BUDGET_STOP_EXIT_CODE).toBe(11);
+    expect(exitCodes.NO_RESULTS_EXIT_CODE).toBe(12);
     expect(exitCodes.HARNESS_PENDING_VERIFY_EXIT_CODE).toBe(13);
     expect(exitCodes.HARNESS_CLEANUP_PENDING_EXIT_CODE).toBe(14);
     expect(exitCodes.SERVE_UNHEALTHY_EXIT_CODE).toBe(69);

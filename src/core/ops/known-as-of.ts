@@ -20,7 +20,7 @@ export const VERSIONS_DIFF_PARAM: ParamDef = { type: 'boolean', fullSurfaceOnly:
 
 /** get_page parameters that select a body window, a fuzzy match or an edit view, none of which a historical read serves. */
 const GET_PAGE_UNSUPPORTED = ['fuzzy', 'include_content', 'content_only', 'include_timeline_entries', 'grammar_diagnostics', 'include_quarantined',
-  'lines', 'bytes', 'around_chunk_id', 'context_lines', 'cursor', 'max_bytes', 'view', 'outline_from'] as const;
+  'lines', 'bytes', 'around_chunk_id', 'context_lines', 'cursor', 'max_bytes', 'view', 'outline_from', 'section', 'grep', 'context'] as const;
 
 /**
  * The one source a recorded-time read targets: the explicit or ambient source, else the only granted source whose

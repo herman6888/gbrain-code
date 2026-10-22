@@ -57,6 +57,20 @@ export function wellFormedJson<T>(value: T): T {
   return value;
 }
 
+/**
+ * #7240: `wellFormedJson` plus U+0000 → U+FFFD in every string and key, the other input Postgres refuses inside a
+ * JSONB value (22P05). One such character in a job payload refused the whole insert, so the phase that submitted it
+ * failed and cancelled every child it had queued.
+ */
+export function jsonbSafeJson<T>(value: T): T {
+  if (typeof value === 'string') return ensureWellFormed(value).replaceAll('\u0000', '\uFFFD') as T;
+  if (Array.isArray(value)) return value.map(jsonbSafeJson) as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [jsonbSafeJson(key), jsonbSafeJson(item)])) as T;
+  }
+  return value;
+}
+
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
 }

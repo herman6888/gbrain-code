@@ -24,12 +24,12 @@ import type { SlugRootMode } from '../../core/sync-anchor.ts';
 import { buildLosslessWorkingTreeManifest, computeLosslessSyncDelta, mergeSyncManifests, type LosslessDelta } from '../../core/sync-delta.ts';
 import { confirmRenameIdentities, redecideHeldRename, type ConfirmedManifest } from '../../core/sync-rename-identity.ts';
 import {
-  git,
+  gitAsync,
   isWithinRoot,
   gitRelativePath,
-  discoverGitRoot,
+  discoverGitRootAsync,
   createSyncBaselineCommit,
-  isDetachedHead,
+  isDetachedHeadAsync,
   hasOriginRemote,
   unique,
 } from '../../core/sync-git.ts';
@@ -90,7 +90,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
   if (lastCommit) {
     let objectPresent = true;
     try {
-      git(gitContextRoot, ['cat-file', '-t', lastCommit]);
+      await gitAsync(gitContextRoot, ['cat-file', '-t', lastCommit]);
     } catch {
       objectPresent = false;
     }
@@ -107,7 +107,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
     // failure mode (#1970) is visible in the logs.
     let isAncestor = true;
     try {
-      git(gitContextRoot, ['merge-base', '--is-ancestor', lastCommit, headCommit]);
+      await gitAsync(gitContextRoot, ['merge-base', '--is-ancestor', lastCommit, headCommit]);
     } catch {
       isAncestor = false;
     }
@@ -500,7 +500,7 @@ async function discoverSyncGitRoot(
   // function's docstring. `!opts.dryRun`: a preview must never write.
   let gitContextRoot: string;
   try {
-    gitContextRoot = realpathSync(discoverGitRoot(repoPath));
+    gitContextRoot = realpathSync(await discoverGitRootAsync(repoPath));
   } catch (err) {
     if (company) throw err;
     if (
@@ -532,7 +532,7 @@ async function discoverSyncGitRoot(
     // this ever reaches a baseline on a repo that turns out to have commits.
     let reprobedRoot: string | null = null;
     try {
-      reprobedRoot = discoverGitRoot(repoPath);
+      reprobedRoot = await discoverGitRootAsync(repoPath);
     } catch {
       reprobedRoot = null;
     }
@@ -543,9 +543,9 @@ async function discoverSyncGitRoot(
       throw err;
     } else {
       serr(`[gbrain] auto-recovery: git-initializing brain dir ${repoPath} (no git repo found).`);
-      git(repoPath, ['init', '--quiet']);
+      await gitAsync(repoPath, ['init', '--quiet']);
       createSyncBaselineCommit(repoPath);
-      gitContextRoot = realpathSync(discoverGitRoot(repoPath));
+      gitContextRoot = realpathSync(await discoverGitRootAsync(repoPath));
     }
   }
   return gitContextRoot;
@@ -564,7 +564,7 @@ async function pullAndResolveHead(
   // Detect detached HEAD up front so the working-tree fallback fires for both
   // the default sync and `--no-pull` callers. Only the actual git pull is
   // gated on opts.noPull or opts.dryRun.
-  const detachedHead = !company && isDetachedHead(gitContextRoot);
+  const detachedHead = !company && await isDetachedHeadAsync(gitContextRoot);
   if (detachedHead && !opts.noPull) {
     // Print the caller's repoPath spelling (not the realpathed git root) —
     // it's what the operator recognizes, and tests pin it.
@@ -670,7 +670,7 @@ async function pullAndResolveHead(
   // Get current HEAD
   let headCommit: string;
   try {
-    headCommit = company?.plan.revision?.commit ?? git(gitContextRoot, ['rev-parse', 'HEAD']);
+    headCommit = company?.plan.revision?.commit ?? await gitAsync(gitContextRoot, ['rev-parse', 'HEAD']);
   } catch {
     // #2964: unborn-HEAD recovery. `.git` exists (discoverGitRoot succeeded
     // above) but there are zero commits — e.g. a prior self-heal `git init`
@@ -696,7 +696,7 @@ async function pullAndResolveHead(
     }
     serr(`[gbrain] auto-recovery: repo has no commits yet, creating baseline commit ${gitContextRoot}.`);
     createSyncBaselineCommit(gitContextRoot);
-    headCommit = git(gitContextRoot, ['rev-parse', 'HEAD']);
+    headCommit = await gitAsync(gitContextRoot, ['rev-parse', 'HEAD']);
   }
 
   // #2964: self-heal deliberately does NOT special-case db_only/.gitignore
@@ -813,7 +813,7 @@ async function resolveCheckpointPin(
       let pinReachable = false;
       try {
         if (company && storedTarget !== company.plan.revision!.commit) throw new Error('Approved revision mismatch');
-        if (!company) git(gitContextRoot, ['merge-base', '--is-ancestor', storedTarget, headCommit]);
+        if (!company) await gitAsync(gitContextRoot, ['merge-base', '--is-ancestor', storedTarget, headCommit]);
         pinReachable = true;
       } catch {
         pinReachable = false;
@@ -901,7 +901,7 @@ async function resolveWorkingTreeScope(
   let workingTreeManifest: ConfirmedManifest;
   let workingTreeBytes: BytePaths = NO_BYTE_PATHS;
   try {
-    const tree: LosslessDelta = company ? { manifest: { added: [], modified: [], deleted: [], renamed: [] }, ...NO_BYTE_PATHS } : buildLosslessWorkingTreeManifest(gitContextRoot);
+    const tree: LosslessDelta = company ? { manifest: { added: [], modified: [], deleted: [], renamed: [] }, ...NO_BYTE_PATHS } : await buildLosslessWorkingTreeManifest(gitContextRoot);
     workingTreeManifest = tree.manifest;
     workingTreeBytes = tree;
   } catch (e) {
@@ -1041,7 +1041,7 @@ async function computeFilteredDelta(
   // #6729: inexact renames keep their page identity only when confirmed, before the company fold, the unsyncable fold
   // and the hold replay read the manifest; the already-confirmed working-tree manifest merges after.
   // GBRA-133: read as bytes (diff --raw -z), so a name is exactly Git's; names that are not page paths and gitlinks ride beside the manifest.
-  const delta = computeLosslessSyncDelta(gitContextRoot, lastCommit, pin);
+  const delta = await computeLosslessSyncDelta(gitContextRoot, lastCommit, pin);
   if (delta.status === 'unavailable') {
     serr(
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +

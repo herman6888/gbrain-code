@@ -33,6 +33,8 @@ type SyncCostGateFlags = {
   full: boolean;
   includeGitignored: boolean;
   noAutoEmbed: boolean;
+  /** GBRA-133 2b.3: the run will not pull, so the inline estimate skips its remote fetch. */
+  noPull?: boolean;
 };
 
 export async function resolveSyncAllEmbedPlan(
@@ -73,6 +75,7 @@ export async function resolveSyncAllEmbedPlan(
       yesFlag: opts.yesFlag,
       full: opts.full,
       includeGitignored: opts.includeGitignored,
+      noPull: opts.noPull,
       label: 'sync --all',
       workerSurface,
       autoSubmitEnabled: !opts.noAutoEmbed,
@@ -104,6 +107,7 @@ export async function resolveSingleSyncEmbedPlan(
     yesFlag: opts.yesFlag,
     full: opts.full,
     includeGitignored: opts.includeGitignored,
+    noPull: opts.noPull,
     label: 'sync',
     workerSurface,
     autoSubmitEnabled: !opts.noAutoEmbed,

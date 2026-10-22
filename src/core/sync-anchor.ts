@@ -5,6 +5,7 @@ import { withCompanyBrainSource } from './company-brain/profile.ts';
  * sprint C13-C14) as a pure move.
  */
 import { realpathSync } from 'fs';
+import { syncDispatchRow } from './sync-dispatch-read.ts';
 import { resolve as pathResolve } from 'path';
 import type { BrainEngine } from './engine.ts';
 import type { SyncOpts } from '../commands/sync.ts';
@@ -24,6 +25,9 @@ export async function readSyncAnchor(
   which: 'repo_path' | 'last_commit',
 ): Promise<string | null> {
   if (sourceId) {
+    // GBRA-133: inside a CLI sync's routing scope the source's routing row answers the repo path (sync-dispatch-read.ts).
+    const routing = which === 'repo_path' ? await syncDispatchRow(engine, sourceId) : undefined;
+    if (routing) return routing.local_path;
     const col = which === 'repo_path' ? 'local_path' : 'last_commit';
     const rows = await engine.executeRaw<Record<string, string | null>>(
       `SELECT ${col} AS value FROM sources WHERE id = $1`,

@@ -62,6 +62,8 @@ const KIND_ICON: Record<FactKind, string> = {
 
 export interface ParsedFlags {
   entity: string | null;
+  /** #4828/#7166: the entity came from --entity (never split or widened), not the bare positional. */
+  entityExplicit: boolean;
   since: Date | null;
   sessionId: string | null;
   grep: string | null;
@@ -97,6 +99,7 @@ const DEFAULT_FALLBACK_HOURS = 24;
 export function parseFlags(args: string[]): ParsedFlags {
   const out: ParsedFlags = {
     entity: null,
+    entityExplicit: false,
     since: null,
     sessionId: null,
     grep: null,
@@ -118,6 +121,7 @@ export function parseFlags(args: string[]): ParsedFlags {
     watchSeconds: null,
   };
   let positional = '';
+  let entityFlag: string | null = null;
   let rawBudget: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -146,6 +150,19 @@ export function parseFlags(args: string[]): ParsedFlags {
       }
       out.sessionId = raw;
       i++;
+      continue;
+    }
+    // #7166: --entity matches the recall op's `entity` parameter (same as the bare positional).
+    if (a === '--entity' || a.startsWith('--entity=')) {
+      const raw = a === '--entity' ? args[i + 1] : a.slice('--entity='.length);
+      if (raw === undefined || raw.trim() === '' || (a === '--entity' && raw.startsWith('--'))) {
+        throw usageError('--entity requires an entity name or slug.', 'Pass it after the flag, e.g. --entity people/alice-example.', {
+          why: 'An empty entity must not silently widen recall to every fact.',
+          fix: { argv: ['gbrain', 'recall', '--help'], consent: [], actor: 'agent', why: 'Shows the recall selectors.', requires_exclusive: false },
+        });
+      }
+      entityFlag = raw;
+      if (a === '--entity') i++;
       continue;
     }
     if (a === '--grep') { out.grep = (args[++i] ?? '').toLowerCase(); continue; }
@@ -198,7 +215,15 @@ export function parseFlags(args: string[]): ParsedFlags {
     if (a.startsWith('--')) continue; // skip unknown flags silently
     if (!positional) positional = a;
   }
-  if (positional) out.entity = positional;
+  if (entityFlag !== null && positional && positional !== entityFlag) {
+    throw usageError(`--entity "${entityFlag.slice(0, 60)}" and the positional "${positional.slice(0, 60)}" name different entities.`,
+      'Pass the entity once: either --entity <name> or the bare positional.', {
+        why: 'recall reads one entity per call; two different names would silently drop one.',
+        fix: { argv: ['gbrain', 'recall', '--entity', entityFlag], consent: [], actor: 'agent', why: 'Recall the --entity value only.', requires_exclusive: false },
+      });
+  }
+  if (entityFlag !== null) { out.entity = entityFlag; out.entityExplicit = true; }
+  else if (positional) out.entity = positional;
   out.budgetTokens = (out.budgetPolicy === 'query_first' && out.query?.trim()
     ? Number(rawBudget)
     : parseInt(rawBudget ?? '', 10)) || null;
@@ -285,7 +310,7 @@ const RECALL_HELP = `Usage: gbrain recall [<entity>] [options]
 Find saved facts (MEMORY_VERBS v1). A question goes in --question; the bare
 positional is an entity name, then a literal piece of fact text.
 
-  gbrain recall <entity>                 facts about one entity (person, company, "user")
+  gbrain recall <entity>                 facts about one entity (person, company, "user"); same as --entity <entity>
   gbrain recall --question "<q>"         facts ranked by relevance to a natural-language question
   gbrain recall --query "<q>"            facts plus matching pages
   gbrain recall --grep <text>            facts whose text contains <text>
@@ -311,7 +336,7 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
   const flags = parseFlags(args);
   if (isOneShotRecall(flags)) {
     try {
-      renderRecallVerbResult(flags, await oneShotRecallResult(engine, flags));
+      await renderRecallVerbResult(flags, await oneShotRecallResult(engine, flags));
     } catch (error) {
       await reportOneShotRecallError(error, flags);
     }
@@ -334,7 +359,7 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
   // MEMORY_VERBS v1 [c4]: the verb params route through the recall OP so the
   // CLI and MCP exercise the same arm (query/budget packing/superset envelope).
   if (flags.query !== null || flags.budgetTokens !== null || flags.question !== null) {
-    renderRecallVerbResult(flags, await recallVerbResult(engine, flags, sourceId));
+    await renderRecallVerbResult(flags, await recallVerbResult(engine, flags, sourceId));
     return;
   }
 
@@ -471,10 +496,12 @@ async function recallVerbResult(engine: BrainEngine, flags: ParsedFlags, sourceI
     : await op.handler(ctx, params)) as RecallVerbResult;
 }
 
-export function renderRecallVerbResult(flags: ParsedFlags, result: RecallVerbResult): void {
+export async function renderRecallVerbResult(flags: ParsedFlags, result: RecallVerbResult): Promise<void> {
   // An older server ignores `question` (warn-mode params) and answers without facts_order.
   const unranked = flags.question !== null && result.facts_order !== 'relevance'
     ? 'note: this brain did not rank facts by the question (its server predates question ranking); facts are newest first.' : null;
+  const matched = result.facts.length + (result.results?.length ?? 0);
+  await markRecallMiss(flags, matched);
   if (flags.json) {
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     if (unranked) process.stderr.write(unranked + '\n');
@@ -515,7 +542,7 @@ export function renderRecallVerbResult(flags: ParsedFlags, result: RecallVerbRes
  * already ran); --supersessions/--session-id keep their own arms.
  */
 function entityTextFallbackApplies(flags: ParsedFlags, matched: number): boolean {
-  return matched === 0 && !!flags.entity && !flags.grep && !flags.supersessions && !flags.sessionId;
+  return matched === 0 && !!flags.entity && !flags.entityExplicit && !flags.grep && !flags.supersessions && !flags.sessionId;
 }
 
 function noteEntityTextFallback(entity: string, matched: number): void {
@@ -543,8 +570,95 @@ async function keylessQuestionFallback(engine: BrainEngine, flags: ParsedFlags, 
   }
   process.stderr.write(`[recall] no entity or fact text matched '${question}'; ranked facts by relevance to it as a question (keyword-only: this brain has no embeddings).\n`);
   const questionFlags = { ...flags, entity: null, question };
-  renderRecallVerbResult(questionFlags, await recallVerbResult(engine, questionFlags, sourceId));
+  await renderRecallVerbResult(questionFlags, await recallVerbResult(engine, questionFlags, sourceId));
   return true;
+}
+
+/**
+ * #4828: agents ask `gbrain recall "<name> <topic>"`. The bare positional is
+ * resolved as one entity (the whole phrase names none), then grepped as one
+ * literal string (the topic words are a paraphrase), so recall answered "No
+ * matching facts." while the person's facts were there. When a multi-word
+ * positional matched nothing, try the leading (then trailing) one to three
+ * words as the entity, with recall's own resolver (an exact page, alias,
+ * basename, or a bare name only one page expands to), and show that entity's facts with those mentioning the other words
+ * first. No model or embedding call; an explicit --entity is never split.
+ */
+const SPLIT_MAX_NAME_WORDS = 3;
+
+function entitySplitApplies(flags: ParsedFlags): boolean {
+  return !!flags.entity && !flags.entityExplicit && /\s/.test(flags.entity.trim()) && !flags.grep && !flags.supersessions && !flags.sessionId;
+}
+
+/** Name spans to try, longest first: leading words, then trailing words. */
+export function entitySplitSpans(positional: string): Array<{ name: string; topic: string }> {
+  const words = positional.trim().split(/\s+/);
+  const out: Array<{ name: string; topic: string }> = [];
+  for (let k = Math.min(SPLIT_MAX_NAME_WORDS, words.length - 1); k >= 1; k--) {
+    out.push({ name: words.slice(0, k).join(' '), topic: words.slice(k).join(' ') });
+    out.push({ name: words.slice(words.length - k).join(' '), topic: words.slice(0, words.length - k).join(' ') });
+  }
+  return out;
+}
+
+const topicStems = (topic: string) => [...new Set(topic.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length >= 3).map(w => w.slice(0, 4)))];
+
+/** Facts that share more topic word stems first; otherwise the input (recency) order. */
+export function rankByTopic(rows: FactRow[], topic: string): FactRow[] {
+  const stems = topicStems(topic);
+  if (!stems.length) return rows;
+  const score = (f: FactRow) => {
+    const words = f.fact.toLowerCase().split(/[^\p{L}\p{N}]+/u);
+    return stems.filter(s => words.some(w => w.startsWith(s))).length;
+  };
+  return rows.map((r, i) => ({ r, i, s: score(r) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.r);
+}
+
+function noteEntitySplit(positional: string, name: string, slug: string, topic: string, n: number): void {
+  process.stderr.write(
+    `[recall] no facts matched '${positional}' as one entity or text; '${name}' is ${slug}: showing its ${n} fact(s), those mentioning '${topic}' first. ` +
+    `Same as: gbrain recall --entity ${slug} (add --question ${JSON.stringify(topic)} to rank them by meaning).\n`,
+  );
+}
+
+async function entitySplitLocal(engine: BrainEngine, flags: ParsedFlags, sourceId: string, resolvedSince: Date | null): Promise<FactRow[]> {
+  if (!entitySplitApplies(flags)) return [];
+  const spans = entitySplitSpans(flags.entity!);
+  if (!await splitMayMatch(engine, sourceId, spans.map(s => s.name))) return [];
+  const { resolveEntitySlugWithSource } = await import('../core/entities/resolve.ts');
+  for (const span of spans) {
+    const resolved = await resolveEntitySlugWithSource(engine, sourceId, span.name);
+    if (!resolved || resolved.source === 'fallback_slugify') continue;
+    const rows = await fetchRowsLocal(engine, { ...flags, entity: resolved.slug, entityExplicit: true }, sourceId, resolvedSince);
+    if (!rows.length) continue;
+    noteEntitySplit(flags.entity!, span.name, resolved.slug, span.topic, rows.length);
+    return rankByTopic(rows, span.topic);
+  }
+  return [];
+}
+
+/**
+ * One statement before the per-span resolution (four statements a span): a
+ * span can only show facts when some fact is keyed under a slug whose last
+ * segment starts with its name, or the name is a page alias. A miss, the
+ * common case for a topic phrase, then costs one round trip instead of up to
+ * twenty-four (test/e2e/retrieval-round-trip-budget.test.ts).
+ */
+async function splitMayMatch(engine: BrainEngine, sourceId: string, names: string[]): Promise<boolean> {
+  const { slugify } = await import('../core/entities/resolve.ts');
+  const { normalizeAlias } = await import('../core/search/alias-normalize.ts');
+  const tokens = [...new Set(names.map(n => slugify(n)).filter(Boolean))];
+  if (!tokens.length) return false;
+  try {
+    const rows = await engine.executeRaw(
+      `SELECT 1 FROM facts WHERE source_id = $1 AND entity_slug ~ ANY($2::text[])
+       UNION ALL SELECT 1 FROM page_aliases WHERE source_id = $1 AND alias_norm = ANY($3::text[])
+       LIMIT 1`,
+      [sourceId, tokens.map(t => `(^|/)${t}(-|$)`), [...new Set(names.map(n => normalizeAlias(n)).filter(Boolean))]]);
+    return rows.length > 0;
+  } catch {
+    return true;
+  }
 }
 
 async function runRecallOnce(
@@ -620,6 +734,7 @@ async function runRecallOnce(
     rows = pageable
       ? await fetchCursorPage(engine, flags, sourceId, cursor!)
       : await fetchRowsLocal(engine, flags, sourceId, resolvedSince);
+    if (rows.length === 0 && !pageable) rows = await entitySplitLocal(engine, flags, sourceId, resolvedSince);
     if (rows.length === 0 && cursorVariant === 'briefing' && await keylessQuestionFallback(engine, flags, sourceId)) return wallClockCursor(tStart);
     if (flags.pending) {
       pendingCount = await engine.countUnconsolidatedFacts(sourceId);
@@ -640,6 +755,7 @@ async function runRecallOnce(
     const payload: Record<string, unknown> = {
       facts: rows.map(factRowToJson),
       total: rows.length,
+      ...(recallMissed(flags, rows.length) ? { status: 'no_results' } : {}),
     };
     if (rollup) payload.top_entities = rollup;
     if (pendingCount !== undefined) payload.pending_consolidation_count = pendingCount;
@@ -658,7 +774,25 @@ async function runRecallOnce(
     }
   }
 
+  await markRecallMiss(flags, rows.length);
   return cursor ? advanceCursor(sourceId, cursorVariant, rows, flags.limit, pageable, thinClient, tStart) : wallClockCursor(tStart);
+}
+
+/**
+ * #7177: a recall that looked something up (an entity or text, --grep,
+ * --question, --query) and matched nothing is a miss: the list render's
+ * --json adds `status: "no_results"` (the verb path prints the operation's
+ * envelope verbatim, where `total: 0` says it), and GBRAIN_FAIL_ON_EMPTY=1
+ * exits NO_RESULTS_EXIT_CODE.
+ * A feed read (--watch, --since-last-run, no filter) with nothing new is not.
+ */
+function recallMissed(flags: ParsedFlags, matched: number): boolean {
+  const lookup = !!flags.entity || !!flags.grep || flags.question !== null || !!flags.query;
+  return matched === 0 && lookup && flags.watchSeconds === null && !flags.sinceLastRun;
+}
+
+async function markRecallMiss(flags: ParsedFlags, matched: number): Promise<void> {
+  if (recallMissed(flags, matched)) (await import('../cli/no-results.ts')).markNoResults('recall');
 }
 
 function wallClockCursor(since: Date): RecallCursor {
@@ -720,12 +854,28 @@ async function fetchCursorPage(engine: BrainEngine, flags: ParsedFlags, sourceId
     ...narrow,
   });
   if (!flags.entity) return (await page({})).reverse();
-  const entityRows = await page({ entitySlug: (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity });
+  const slugs = await entityFactSlugs(engine, sourceId, (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity);
+  const keyOf = (r: FactRow) => [r.created_at_iso ?? new Date(r.created_at).toISOString(), r.id] as const;
+  const entityRows = (await Promise.all(slugs.map(entitySlug => page({ entitySlug })))).flat()
+    .sort((a, b) => { const [ka, ia] = keyOf(a), [kb, ib] = keyOf(b); return ka < kb ? -1 : ka > kb ? 1 : ia - ib; })
+    .slice(0, flags.limit);
   if (!entityTextFallbackApplies(flags, entityRows.length)) return entityRows.reverse();
   const textRows = await page({ grep: flags.entity.toLowerCase() });
   if (textRows.length === 0) return entityRows.reverse();
   noteEntityTextFallback(flags.entity, textRows.length);
   return textRows.reverse();
+}
+
+/** #4828: every entity_slug this entity's facts may be saved under (siblings, title subject, bare basename). */
+async function entityFactSlugs(engine: BrainEngine, sourceId: string, slug: string): Promise<string[]> {
+  const { factEntitySlugs } = await import('../core/mentions/siblings.ts');
+  return factEntitySlugs(engine, sourceId, slug, { excludePrivate: false }).catch(() => [slug]);
+}
+
+function mergeNewestFirst(lists: FactRow[][], limit: number, keyOf: (r: FactRow) => Date | string | null | undefined): FactRow[] {
+  if (lists.length === 1) return lists[0]!;
+  const time = (r: FactRow) => { const v = keyOf(r); return (v instanceof Date ? v.getTime() : v ? Date.parse(String(v)) : 0) || 0; };
+  return lists.flat().sort((a, b) => time(b) - time(a)).slice(0, limit);
 }
 
 async function fetchRowsLocal(
@@ -747,24 +897,27 @@ async function fetchRowsLocal(
   if (flags.entity) {
     const slug = (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity;
     // With a window, entity ANDs onto since in one query (before LIMIT);
-    // without one, the entity arm keeps its valid_from ordering.
-    const rows = resolvedSince
-      ? await engine.listFactsSince(sourceId, resolvedSince, {
+    // without one, the entity arm keeps its valid_from ordering. #4828: read
+    // every slug the entity's facts may be saved under, as the recall op does.
+    const slugs = await entityFactSlugs(engine, sourceId, slug);
+    const lists = await Promise.all(slugs.map(entitySlug => resolvedSince
+      ? engine.listFactsSince(sourceId, resolvedSince, {
           eventTime: windowEventTime,
-          entitySlug: slug,
+          entitySlug,
           sessionId: flags.sessionId || undefined,
           activeOnly: !flags.includeExpired,
           limit: flags.limit,
           grep: flags.grep ?? undefined,
           excludeAuditRows: true,
         })
-      : await engine.listFactsByEntity(sourceId, slug, {
+      : engine.listFactsByEntity(sourceId, entitySlug, {
           sessionId: flags.sessionId || undefined,
           activeOnly: !flags.includeExpired,
           limit: flags.limit,
           grep: flags.grep ?? undefined,
           excludeAuditRows: true,
-        });
+        })));
+    const rows = mergeNewestFirst(lists, flags.limit, resolvedSince && !windowEventTime ? r => r.created_at : r => r.valid_from ?? r.created_at);
     // #4720: the bare positional is entity-first, but keyless/casual usage
     // treats it as a literal word from fact text (`gbrain recall commas`).
     // resolveEntitySlug never returns null for non-empty input (slugify is

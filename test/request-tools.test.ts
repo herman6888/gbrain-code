@@ -158,7 +158,7 @@ describe('request_tools catalog (no args)', () => {
     // catalog includes them alongside the submit_agent/get_agent_job pair.
     expect(names).toEqual([
       'cancel_job', 'get_agent_job', 'get_job', 'get_job_progress',
-      'list_jobs', 'request_tools', 'submit_agent',
+      'list_jobs', 'request_tools', 'submit_agent', 'wait_job',
     ]);
   });
 

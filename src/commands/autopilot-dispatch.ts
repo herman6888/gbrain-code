@@ -25,6 +25,7 @@ import { logError } from './autopilot.ts';
 import { readCheckoutHead } from '../core/checkout-head.ts';
 import { SYNC_ON_COMMIT_KEY } from '../core/sync-config-keys.ts';
 import { autopilotPaused } from '../core/autopilot-paths.ts';
+import { cooldownMinForCount, resolveFailureCooldownOpts } from './autopilot-fanout.ts';
 
 /** Returns cycleOk: false only when the dispatch itself threw. */
 export async function dispatchAutopilotTick(
@@ -300,6 +301,59 @@ async function checkoutFreshness(engine: BrainEngine, src: SourceRow, root: stri
  * A HEAD-driven job is keyed on its HEAD, never the wall-clock slot, so a new commit cannot coalesce into the slot's
  * completed job. A source with a live sync job keeps its HEAD undecided; the next tick or probe dispatches it.
  */
+/** #7239: a source whose automatic sync keeps being refused, and until when its freshness sync waits. */
+export interface SyncRefusalHold { code: string; job_id: number; count: number; retry_at: number }
+
+const REFUSAL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const reportedRefusalJobs = new Set<number>();
+
+/**
+ * #7239: a refused sync job (`job_outcome: 'refused'`, refusal.ts) fails the same way until someone fixes its cause, so
+ * the freshness dispatch stops queueing a new one per slot and per commit. A source's refusals since its last completed
+ * sync job (looking back a day) hold it for the autopilot failure cooldown of that count (10 minutes doubling to the
+ * 2-hour cap; `autopilot.failure_cooldown_min` / `_cap_min`, 0 disables), counted from the newest refusal. A completed
+ * sync job clears the hold; an explicit `gbrain sync --source <id>` is never held. Fails open (no holds) on a read error.
+ */
+export async function readSyncRefusalHolds(engine: BrainEngine, now = Date.now()): Promise<Map<string, SyncRefusalHold>> {
+  const holds = new Map<string, SyncRefusalHold>();
+  const opts = await resolveFailureCooldownOpts(engine);
+  if (opts.baseMin <= 0) return holds;
+  const rows = await engine.executeRaw<{ source_id: string | null; n: number; last_at: string | Date; job_id: number; code: string | null }>(
+    `SELECT COALESCE(j.data->>'sourceId', j.data->>'source_id', 'default') AS source_id, count(*)::int AS n, max(j.finished_at) AS last_at,
+            (array_agg(j.id ORDER BY j.finished_at DESC))[1] AS job_id,
+            (array_agg(j.result->'refusal'->>'code' ORDER BY j.finished_at DESC))[1] AS code
+       FROM minion_jobs j
+      WHERE j.name = 'sync' AND j.status = 'dead' AND j.result->>'job_outcome' = 'refused' AND j.finished_at > $1
+        AND NOT EXISTS (SELECT 1 FROM minion_jobs c
+                         WHERE c.name = 'sync' AND c.status = 'completed' AND c.finished_at > j.finished_at
+                           AND COALESCE(c.data->>'sourceId', c.data->>'source_id', 'default') = COALESCE(j.data->>'sourceId', j.data->>'source_id', 'default'))
+      GROUP BY 1`,
+    [new Date(now - REFUSAL_LOOKBACK_MS).toISOString()],
+  );
+  for (const r of rows) {
+    const last = r.last_at instanceof Date ? r.last_at.getTime() : new Date(r.last_at).getTime();
+    if (!r.source_id || !Number.isFinite(last)) continue;
+    const retryAt = last + cooldownMinForCount(Number(r.n), opts) * 60_000;
+    if (retryAt > now) holds.set(r.source_id, { code: r.code ?? 'refused', job_id: Number(r.job_id), count: Number(r.n), retry_at: retryAt });
+  }
+  return holds;
+}
+
+/** Whether a refusal hold skips this source's freshness sync now; reports the hold once per refused job. */
+function skipRefusedSync(holds: ReadonlyMap<string, SyncRefusalHold>, sourceId: string, jsonMode: boolean): boolean {
+  const hold = holds.get(sourceId);
+  if (!hold) return false;
+  if (!reportedRefusalJobs.has(hold.job_id)) {
+    reportedRefusalJobs.add(hold.job_id);
+    const retryAt = new Date(hold.retry_at).toISOString();
+    process.stderr.write((jsonMode
+      ? JSON.stringify({ event: 'freshness_sync_refused', source_id: sourceId, job_id: hold.job_id, code: hold.code, refusals: hold.count, retry_at: retryAt })
+      : `[dispatch] sync of ${sourceId} waits until ${retryAt}: its last sync job #${hold.job_id} was refused (${hold.code}) and would be refused again. `
+        + `gbrain jobs get ${hold.job_id} --json shows the fix; after fixing it, gbrain sync --source ${sourceId} runs now.`) + '\n');
+  }
+  return true;
+}
+
 export async function dispatchFreshnessSyncs(
   engine: BrainEngine,
   queue: MinionQueue,
@@ -328,8 +382,10 @@ export async function dispatchFreshnessSyncs(
       const activationPending = await loadActivationPendingSourceIds(engine);
       const intervalMs = baseInterval * 1000;
       const now = Date.now();
+      const refusalHolds = await readSyncRefusalHolds(engine, now).catch(() => new Map<string, SyncRefusalHold>());
       for (const src of sources) {
         if (onlySourceIds && !onlySourceIds.has(src.id)) continue;
+        if (skipRefusedSync(refusalHolds, src.id, jsonMode)) { decisions.push({ source_id: src.id, outcome: 'skipped' }); continue; }
         if (isConnectorSourceKind(parseSourceConfig(src.config).kind)) {
           await dispatchConnectorFreshnessSync(queue, src, attempted, activationPending, mismatched, { intervalMs, now, slot, timeoutMs, jsonMode });
           continue;

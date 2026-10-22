@@ -1,7 +1,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { PageReadScope } from '../types.ts';
-import { pageReadFilter } from './read-policy-sql.ts';
 import { projectionClassSql } from '../page-state/projection-class.ts';
+import { coverageScopeFilters } from './retrieval-coverage.ts';
 
 export interface ProjectionReadinessScope extends PageReadScope {
   pageKind?: string;
@@ -83,20 +83,7 @@ async function probeUncached(
   scope: ProjectionReadinessScope,
 ): Promise<ProjectionReadiness> {
   const params: unknown[] = [];
-  const filters = [pageReadFilter('p', scope, params, true)];
-  if (scope.sourceIds?.length === 0) filters.push('FALSE');
-  if (scope.pageKind) {
-    params.push(scope.pageKind);
-    filters.push(`p.page_kind = $${params.length}`);
-  }
-  if (scope.types) {
-    params.push(scope.types);
-    filters.push(`p.type = ANY($${params.length}::text[])`);
-  }
-  for (const prefix of scope.excludeSlugPrefixes ?? []) {
-    params.push(prefix);
-    filters.push(`LEFT(p.slug, LENGTH($${params.length}::text)) <> $${params.length}`);
-  }
+  const filters = coverageScopeFilters(scope, params);
   try {
     // One bound statement: unsealed pages that need work, then those unsealed by design (the class fragment doctor counts).
     const unsealed = `SELECT 1 FROM pages p JOIN sources s ON s.id = p.source_id
@@ -124,3 +111,4 @@ async function probeUncached(
     };
   }
 }
+

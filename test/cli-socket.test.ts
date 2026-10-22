@@ -1,9 +1,10 @@
 /**
  * Warm CLI socket: the guards that decide whether a CLI may talk to a serve.
  *
- * 1. Protects: the identity token changes with the brain, database target,
- *    config home, config bytes, behavior env and version (never with the
- *    password or a provider key's value); the run directory, the directories
+ * 1. Protects: the identity refuses, and names, a different brain, database
+ *    (a port only off a Supavisor pooler host), config home, config bytes,
+ *    read-behavior env or version (never the password, a provider key's value,
+ *    connection sizing or driver-only URL parameters); the run directory, the directories
  *    above it and the socket checks refuse symlinks, foreign owners, open
  *    permissions and a socket swapped after bind; the serve rejects a peer
  *    whose kernel-reported uid differs, refuses to start when peer credentials
@@ -20,12 +21,12 @@
  *    options, exchangeCliSocket's peerCred argument, FsGuardDeps.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
-import { behaviorEnvDigest, canonicalDatabaseTarget, cliSocketIdentity } from '../src/core/cli-socket/identity.ts';
+import { cliSocketIdentity, cliSocketIdentityMismatch, databaseTarget, READ_BEHAVIOR_ENV, type CliSocketIdentity } from '../src/core/cli-socket/identity.ts';
 import {
   ancestorProblem, cliSocketPath, connectProblem, ensurePrivateDir, privateDirProblem, privateSocketProblem, trustedAncestorProblem, verifyBoundSocket, type FsGuardDeps,
 } from '../src/core/cli-socket/fs-guard.ts';
@@ -61,71 +62,148 @@ function homeWithConfig(name: string, body = '{"engine":"postgres"}'): { dir: st
   return { dir, file: join(dir, 'config.json') };
 }
 
-describe('identity token', () => {
+/**
+ * GBRAIN_* names in src that cannot change what a socket read answers or where
+ * its text goes: writes, sync, jobs, workers, locks, doctor, setup and hooks,
+ * other transports (HTTP, MCP surface, thin client), the database URL variables
+ * (compared as a database target), connection sizing and driver tuning,
+ * location variables compared by what they resolve to (GBRAIN_HOME as the config
+ * home, GBRAIN_BRAIN_ID as the brain id, GBRAIN_MOUNTS_PATH for mount brains the
+ * socket never serves, GBRAIN_CWD_ENV_QUARANTINED whose effect is already in the
+ * env it left), diagnostics, settings only the CLI's own renderer reads (GBRAIN_FAIL_ON_EMPTY:
+ * the warm path renders and sets the exit code in the CLI, with the CLI's
+ * environment), and constants that only share the prefix. Families are listed
+ * by prefix only where no member reads; anything else is named.
+ */
+const NOT_READ_BEHAVIOR_PREFIXES = [
+  'GBRAIN_ALLOW', 'GBRAIN_AUTOPILOT_', 'GBRAIN_BACKUP_', 'GBRAIN_BULK', 'GBRAIN_CLAUDE_CLI_', 'GBRAIN_CLAW_', 'GBRAIN_CONNECTOR',
+  'GBRAIN_CYCLE_', 'GBRAIN_DOCTOR_', 'GBRAIN_DREAM', 'GBRAIN_DRIFT_', 'GBRAIN_EMBED_', 'GBRAIN_EXTRACT', 'GBRAIN_FENCE_', 'GBRAIN_FORCE_',
+  'GBRAIN_GIT', 'GBRAIN_GRADUATION_', 'GBRAIN_HOOK', 'GBRAIN_HTTP_', 'GBRAIN_JOB_', 'GBRAIN_LINK_RESOLUTION_', 'GBRAIN_LOCK_', 'GBRAIN_MIGRATE_',
+  'GBRAIN_MINION', 'GBRAIN_NO_', 'GBRAIN_NOTIFIER', 'GBRAIN_NTB_', 'GBRAIN_OAUTH_', 'GBRAIN_PACE', 'GBRAIN_PG_', 'GBRAIN_PGLITE_', 'GBRAIN_POOL_',
+  'GBRAIN_PROGRESSIVE_BATCH_', 'GBRAIN_QUEUE_', 'GBRAIN_SETUP_', 'GBRAIN_STOP_PUSH', 'GBRAIN_SUPERVIS', 'GBRAIN_SWEEP', 'GBRAIN_SYNC', 'GBRAIN_WORKER_',
+];
+const NOT_READ_BEHAVIOR = new Set([
+  'GBRAIN_HOME', 'GBRAIN_SERVE_LOG_MAX_BYTES', 'GBRAIN_SERVE_LOG_MAX_FILES', 'GBRAIN_SERVE_LOG_DEDUPE_SECONDS', 'GBRAIN_BRAIN_ID', 'GBRAIN_MOUNTS_PATH', 'GBRAIN_CWD_ENV_QUARANTINED',
+  'GBRAIN_FAIL_ON_EMPTY', 'GBRAIN_CLI_SOCKET', 'GBRAIN_DEBUG', 'GBRAIN_SQL_TRACE', 'GBRAIN_SQL_TRACE_LABEL', 'GBRAIN_LME_DEBUG', 'GBRAIN_SOURCE',
+  'GBRAIN_DATABASE_URL', 'GBRAIN_DIRECT_DATABASE_URL', 'GBRAIN_DIRECT_POOL_SIZE', 'GBRAIN_DIRECT_POOL_BY_COMMAND', 'GBRAIN_DISABLE_DIRECT_POOL', 'GBRAIN_PREPARE',
+  'GBRAIN_IDLE_TX_TIMEOUT', 'GBRAIN_MAX_CONNECTIONS', 'GBRAIN_NO_RETRY_CONNECT', 'GBRAIN_DB_ACCESS',
+  'GBRAIN_ACCEPT_PENDING', 'GBRAIN_ACCEPT_SILENT_WIDEN', 'GBRAIN_WRITE_WAIT_MS', 'GBRAIN_PREADMIT_CACHE', 'GBRAIN_PREPARATION_DEADLINES',
+  'GBRAIN_SINGLE_CONSUMER', 'GBRAIN_SINGLE_WRITE_GROUP', 'GBRAIN_CONSUMER_DIRECT_LANE', 'GBRAIN_COMMIT_LOCK_WAIT_SECONDS',
+  'GBRAIN_PUBLISH_LOCK_WAIT_SECONDS', 'GBRAIN_PUSH_LOCK_WAIT_SECONDS', 'GBRAIN_PAGE_BLOCK_BYTES', 'GBRAIN_PAGE_WARN_BYTES', 'GBRAIN_INGEST_MAX_BYTES',
+  'GBRAIN_BELIEF_PREIMAGE_CHECK', 'GBRAIN_BLOCK_MARKERS', 'GBRAIN_CANCEL_SETTLE_MS', 'GBRAIN_CHUNKER_TIMEOUT_MS', 'GBRAIN_CONTENT_REPAIR_CALL_TIMEOUT_MS',
+  'GBRAIN_CONTEXTUAL_CHUNK_CONCURRENCY', 'GBRAIN_CONTEXTUAL_HAIKU_RPM', 'GBRAIN_CONTEXTUAL_SYNOPSIS_RPM', 'GBRAIN_CONTRADICTIONS_JUDGE_MODEL',
+  'GBRAIN_CORPUS_WINDOWS_PER_SWEEP', 'GBRAIN_DEFERRED_EMBED_RETRY_MS', 'GBRAIN_DRAIN_TIMEOUT_MS', 'GBRAIN_FLUSH_GRACE_MS', 'GBRAIN_GITHUB_PAT',
+  'GBRAIN_GITHUB_REPO', 'GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS', 'GBRAIN_LLM_HALT_COOLDOWN', 'GBRAIN_MAX_FENCES_PER_PAGE', 'GBRAIN_MAX_SKILL_MD_BYTES',
+  'GBRAIN_MAX_WALK_DEPTH', 'GBRAIN_ORPHANED_PRIVATE_QUEUE_MINUTES', 'GBRAIN_PHANTOM_REDIRECT_LIMIT', 'GBRAIN_PLANNER_AUTO_ANALYZE',
+  'GBRAIN_REFRESH_DRAIN_WAIT_MS', 'GBRAIN_REFRESH_FETCH_TIMEOUT_MS', 'GBRAIN_SKIP_REFERENCE_SWEEP', 'GBRAIN_SKIP_STARTUP_HOOKS', 'GBRAIN_TRAJECTORY_REGRESSION_THRESHOLD',
+  'GBRAIN_WEDGED_QUEUE_WARN_MINUTES', 'GBRAIN_ANTHROPIC_MAX_INFLIGHT',
+  'GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS', 'GBRAIN_SERVE_EOF_DRAIN_MS', 'GBRAIN_SERVE_FAIL_FAST', 'GBRAIN_SERVE_HEAD_DEBOUNCE_MS', 'GBRAIN_SERVE_HEAD_POLL_MS',
+  'GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS', 'GBRAIN_SERVE_STALL_WATCHDOG_MS', 'GBRAIN_SERVE_SYNC_IPC', 'GBRAIN_SERVE_SYNC_SETTLE_MS',
+  'GBRAIN_SURFACE', 'GBRAIN_MCP_FORCE_SURFACE', 'GBRAIN_MCP_INSTRUCTIONS', 'GBRAIN_SOCKET_KINDS', 'GBRAIN_HEALTH_CACHE_TTL_MS', 'GBRAIN_CLIENT_CHECK_INTERVAL',
+  'GBRAIN_CLIENT_HEADER', 'GBRAIN_STDIN_TIMEOUT_MS', 'GBRAIN_STDOUT_DRAIN_DEADLINE_MS', 'GBRAIN_TEARDOWN_DEADLINE_MS', 'GBRAIN_PID1_REAP', 'GBRAIN_NICE',
+  'GBRAIN_REMOTE_CLIENT_ID', 'GBRAIN_REMOTE_CLIENT_SECRET', 'GBRAIN_REMOTE_ISSUER_URL', 'GBRAIN_REMOTE_MCP_URL', 'GBRAIN_REMOTE_TOKEN', 'GBRAIN_REMOTE_TOKEN_ENV',
+  'GBRAIN_THIN_CLIENT_NAME', 'GBRAIN_TAILSCALE_LOGIN_TIMEOUT_MS', 'GBRAIN_ADMIN_BOOTSTRAP_TOKEN',
+  'GBRAIN_SCHEMA_AUDIT_VERBOSE', 'GBRAIN_SCHEMA_LOCK_TIMEOUT_SECONDS', 'GBRAIN_SCHEMA_PACK_MAX_BYTES', 'GBRAIN_SCHEMA_PACK_WARN_BYTES',
+  'GBRAIN_INITSCHEMA_LOCK_TIMEOUT_SECONDS', 'GBRAIN_INIT_SKIP_EMBED_CHECK', 'GBRAIN_IN_AGENT_SETUP', 'GBRAIN_INTERACTIVE', 'GBRAIN_NON_INTERACTIVE',
+  'GBRAIN_BOOTSTRAP_ABORT_AFTER', 'GBRAIN_SEAT', 'GBRAIN_CORE', 'GBRAIN_PRESSURE', 'GBRAIN_PAYLOAD', 'GBRAIN_DESCRIPTION', 'GBRAIN_HARNESS_MARKER_VALUE',
+  'GBRAIN_ENV_TEMPLATE', 'GBRAIN_SKILLS_DIR', 'GBRAIN_COORDINATION_HOME', 'GBRAIN_AUDIT_DIR', 'GBRAIN_TARGET_URL', 'GBRAIN_UPGRADE_OWNS_MIGRATIONS',
+  'GBRAIN_SELF_UPGRADE_MODE', 'GBRAIN_SWAP_RECEIPT', 'GBRAIN_POST_UPGRADE_TIMEOUT_MS', 'GBRAIN_PROBE_PROMPT_GRACE_SECONDS', 'GBRAIN_BANNER',
+  'GBRAIN_BIN', 'GBRAIN_BIN_OVERRIDE', 'GBRAIN_BINARY_VERSION', 'GBRAIN_ROOT', 'GBRAIN_VERIFY', 'GBRAIN_FRICTION_RUN_ID', 'GBRAIN_NOTABILITY_EVAL_REAL',
+  'GBRAIN_WHOKNOWS_FIXTURE_PATH', 'GBRAIN_PACK_STAT_TTL_MS', 'GBRAIN_EMBEDDING', 'GBRAIN_BASE_PATH_PREFIXES', 'GBRAIN_RECOVERED_RETRY',
+]);
+
+describe('identity', () => {
   const url = 'postgresql://alice-example:secret-one@db.acme-example.test:6543/brain?sslmode=require&application_name=x';
-  const token = (overrides: Partial<Parameters<typeof cliSocketIdentity>[0]> = {}) => {
+  const pooler = 'postgresql://postgres.project-a:secret-one@aws-0-region-a.pooler.supabase.com';
+  const identity = (overrides: Partial<Parameters<typeof cliSocketIdentity>[0]> = {}) => {
     const dir = join(root, 'a', '.gbrain');
     return cliSocketIdentity({ config: { engine: 'postgres', database_url: url }, brainId: 'host', configDir: dir, configFile: join(dir, 'config.json'), version: '1.0.0', env: {}, ...overrides });
   };
+  const at = (databaseUrl: string, env: Record<string, string> = {}) => identity({ config: { engine: 'postgres', database_url: databaseUrl }, env });
 
-  test('ignores the password and query-parameter order, keeps host, port, database and user', () => {
-    expect(canonicalDatabaseTarget(url)).toBe(canonicalDatabaseTarget('postgres://alice-example:other@DB.acme-example.test:6543/brain?application_name=x&sslmode=require'));
-    expect(canonicalDatabaseTarget(url)).not.toContain('secret-one');
-    for (const other of [
-      url.replace(':6543', ':5432'), url.replace('/brain', '/brain2'), url.replace('db.acme', 'db2.acme'), url.replace('alice-example', 'bob-example'),
-    ]) expect(canonicalDatabaseTarget(other)).not.toBe(canonicalDatabaseTarget(url));
+  test('the database target drops the password and driver-only parameters, keeps options', () => {
+    expect(databaseTarget(url)).toEqual(databaseTarget('postgres://alice-example:other@DB.acme-example.test:6543/brain?prepare=false&connect_timeout=5'));
+    expect(JSON.stringify(databaseTarget(url))).not.toContain('secret-one');
+    expect(databaseTarget(`${url}&options=-c%20search_path%3Dother`)).not.toEqual(databaseTarget(url));
   });
 
-  test('changes with the database, config home, config bytes and version', () => {
+  test('a session-lane serve answers a transaction-lane CLI on the same Supavisor host, user and database (prepare=, pool sizing and the URL variables differ)', () => {
+    homeWithConfig('a');
+    const serve = at(`${pooler}:5432/postgres`, { GBRAIN_POOL_SIZE: '10', GBRAIN_DATABASE_URL: `${pooler}:5432/postgres`, GBRAIN_HOME: '/home/alice-example' });
+    const cli = at(`${pooler}:6543/postgres?prepare=false`, { GBRAIN_POOL_SIZE: '2', GBRAIN_DIRECT_POOL_SIZE: '1', GBRAIN_PREPARE: 'false',
+      GBRAIN_DATABASE_URL: `${pooler}:6543/postgres?prepare=false`, GBRAIN_HOME: '/home/alice-example' });
+    expect(cliSocketIdentityMismatch(serve, cli)).toBeNull();
+  });
+
+  test('on the pooler a different user or database is refused, and named', () => {
+    homeWithConfig('a');
+    const serve = at(`${pooler}:5432/postgres`);
+    expect(cliSocketIdentityMismatch(serve, at(`${pooler.replace('project-a', 'project-b')}:6543/postgres`))).toBe('database user');
+    expect(cliSocketIdentityMismatch(serve, at(`${pooler}:6543/other`))).toBe('database database');
+    expect(cliSocketIdentityMismatch(serve, at(`${pooler.replace('region-a', 'region-b')}:6543/postgres`))).toBe('database host');
+  });
+
+  test('on plain Postgres another port is another server: refused, and named', () => {
+    homeWithConfig('a');
+    expect(cliSocketIdentityMismatch(at(url), at(url.replace(':6543', ':5432')))).toBe('database port');
+    expect(cliSocketIdentityMismatch(at(url), at(url.replace(':6543', ':6543')))).toBeNull();
+    expect(cliSocketIdentityMismatch(at(url), at(url.replace('db.acme', 'db2.acme')))).toBe('database host');
+    expect(cliSocketIdentityMismatch(at(url), identity({ config: { engine: 'postgres', database_url: undefined } }))).toBe('database');
+  });
+
+  test('names the config home, config bytes, version and brain id (a mount serve never matches a host CLI); a rotated password still matches', () => {
     const home = homeWithConfig('a');
-    const base = token();
-    expect(token()).toBe(base);
-    expect(token({ config: { engine: 'postgres', database_url: url.replace('secret-one', 'rotated') } })).toBe(base);
-    expect(token({ config: { engine: 'postgres', database_url: url.replace('/brain', '/other') } })).not.toBe(base);
-    expect(token({ version: '1.0.1' })).not.toBe(base);
+    const base = identity();
+    expect(cliSocketIdentityMismatch(base, identity())).toBeNull();
+    expect(cliSocketIdentityMismatch(base, at(url.replace('secret-one', 'rotated')))).toBeNull();
+    expect(cliSocketIdentityMismatch(base, identity({ version: '1.0.1' }))).toBe('version');
+    expect(cliSocketIdentityMismatch(base, identity({ brainId: 'mnt-example' }))).toBe('brain');
     const other = homeWithConfig('b');
-    expect(token({ configDir: other.dir, configFile: other.file })).not.toBe(base);
+    expect(cliSocketIdentityMismatch(base, identity({ configDir: other.dir, configFile: other.file }))).toBe('config home');
     writeFileSync(home.file, '{"engine":"postgres","edited":true}');
-    expect(token()).not.toBe(base);
+    expect(cliSocketIdentityMismatch(base, identity())).toBe('config contents');
   });
 
-  test('changes with the resolved brain id (a mount serve never matches a host CLI)', () => {
+  test('a sizing or driver variable may differ, and so may a location variable that resolves to the same home and brain (one side exporting GBRAIN_HOME, the other relying on HOME); a read-behavior variable may not, and is named without its value', () => {
     homeWithConfig('a');
-    expect(token({ brainId: 'mnt-example' })).not.toBe(token());
+    const base = identity({ env: { HOME: '/home/alice-example', GBRAIN_HOME: '/home/alice-example' } });
+    for (const env of [{ GBRAIN_POOL_SIZE: '10' }, { GBRAIN_DIRECT_POOL_SIZE: '4' }, { GBRAIN_PREPARE: 'true' }, { GBRAIN_POOL_MAX_LIFETIME_S: '60' },
+      { GBRAIN_CLI_SOCKET: '1', GBRAIN_DEBUG: '1', GBRAIN_SQL_TRACE: '/tmp/t.jsonl' }, { GBRAIN_SOURCE: 'source-a' }, { HOME: '/elsewhere' }]) {
+      expect(cliSocketIdentityMismatch(base, identity({ env: { HOME: '/home/alice-example', GBRAIN_HOME: '/home/alice-example', ...env } })), JSON.stringify(env)).toBeNull();
+    }
+    const contributor = identity({ env: { GBRAIN_HOME: '/home/alice-example', GBRAIN_CONTRIBUTOR_MODE: '1' } });
+    expect(cliSocketIdentityMismatch(base, contributor)).toBe('env GBRAIN_CONTRIBUTOR_MODE');
+    expect(cliSocketIdentityMismatch(base, identity({ env: { HOME: '/home/alice-example' } }))).toBeNull();
+    expect(cliSocketIdentityMismatch(base, identity({ env: { GBRAIN_HOME: '/home/alice-example', GBRAIN_BRAIN_ID: 'host', GBRAIN_MOUNTS_PATH: '/home/alice-example/.gbrain/mounts.json' } }))).toBeNull();
+    expect(cliSocketIdentityMismatch(base, identity({ env: { GBRAIN_HOME: '/home/alice-example', GBRAIN_MODEL: 'model-a' } }))).toBe('env GBRAIN_MODEL');
+    expect(JSON.stringify(identity({ env: { GBRAIN_MODEL: 'model-secretish' } }))).not.toContain('model-secretish');
   });
 
-  test('changes with GBRAIN_* settings and which provider keys are set, never with a key value or the socket/debug switches', () => {
+  test('provider routing values enter with their value (a local and a remote endpoint never match); credentials only as set or not', () => {
     homeWithConfig('a');
-    const base = token({ env: { HOME: '/home/alice-example', GBRAIN_HOME: '/home/alice-example' } });
-    expect(token({ env: { HOME: '/elsewhere', GBRAIN_HOME: '/home/alice-example' } })).toBe(base);
-    expect(token({ env: { GBRAIN_HOME: '/home/alice-example', GBRAIN_CONTRIBUTOR_MODE: '1' } })).not.toBe(base);
-    expect(token({ env: { GBRAIN_HOME: '/home/alice-example', GBRAIN_CLI_SOCKET: '1', GBRAIN_DEBUG: '1', GBRAIN_SQL_TRACE: '/tmp/t.jsonl' } })).toBe(base);
-    const keyed = behaviorEnvDigest({ VOYAGE_API_KEY: 'value-one' });
-    expect(behaviorEnvDigest({ VOYAGE_API_KEY: 'value-two' })).toBe(keyed);
-    expect(behaviorEnvDigest({})).not.toBe(keyed);
-    expect(behaviorEnvDigest({ VOYAGE_API_KEY: '' })).toBe(behaviorEnvDigest({}));
-    expect(behaviorEnvDigest({ OPENAI_BASE_URL: 'http://localhost:1' })).not.toBe(behaviorEnvDigest({}));
-    expect(JSON.stringify(behaviorEnvDigest({ VOYAGE_API_KEY: 'value-one' }))).not.toContain('value-one');
-  });
-
-  test('provider routing values enter the digest (a local and a remote endpoint never match); credentials stay set-or-not', () => {
-    homeWithConfig('a');
-    const local = { GBRAIN_HOME: '/home/alice-example', OPENAI_BASE_URL: 'http://127.0.0.1:11434/v1' };
-    const remote = { GBRAIN_HOME: '/home/alice-example', OPENAI_BASE_URL: 'https://api.openai.com/v1' };
-    expect(behaviorEnvDigest(local)).not.toBe(behaviorEnvDigest(remote));
-    expect(token({ env: local })).not.toBe(token({ env: remote }));
+    const env = (extra: Record<string, string>) => identity({ env: { GBRAIN_HOME: '/home/alice-example', ...extra } });
+    expect(cliSocketIdentityMismatch(env({ OPENAI_BASE_URL: 'http://127.0.0.1:11434/v1' }), env({ OPENAI_BASE_URL: 'https://api.openai.com/v1' }))).toBe('env OPENAI_BASE_URL');
     for (const name of ['OLLAMA_BASE_URL', 'LMSTUDIO_BASE_URL', 'LLAMA_SERVER_BASE_URL', 'LLAMA_SERVER_RERANKER_BASE_URL', 'LITELLM_BASE_URL', 'OPENROUTER_BASE_URL',
       'ANTHROPIC_BASE_URL', 'AZURE_OPENAI_ENDPOINT', 'AZURE_OPENAI_DEPLOYMENT', 'AZURE_OPENAI_API_VERSION', 'OPENAI_ORG_ID', 'OPENAI_PROJECT', 'MINIMAX_GROUP_ID']) {
-      expect(behaviorEnvDigest({ [name]: 'value-one' }), name).not.toBe(behaviorEnvDigest({ [name]: 'value-two' }));
+      expect(cliSocketIdentityMismatch(env({ [name]: 'value-one' }), env({ [name]: 'value-two' })), name).toBe(`env ${name}`);
     }
-    for (const name of ['OPENAI_API_KEY', 'AZURE_OPENAI_API_KEY', 'LLAMA_SERVER_API_KEY']) {
-      expect(behaviorEnvDigest({ [name]: 'value-one' }), name).toBe(behaviorEnvDigest({ [name]: 'value-two' }));
+    for (const name of ['OPENAI_API_KEY', 'AZURE_OPENAI_API_KEY', 'LLAMA_SERVER_API_KEY', 'VOYAGE_API_KEY']) {
+      expect(cliSocketIdentityMismatch(env({ [name]: 'value-one' }), env({ [name]: 'value-two' })), name).toBeNull();
+      expect(cliSocketIdentityMismatch(env({}), env({ [name]: 'value-one' })), name).toBe(`provider key ${name}`);
     }
+    expect(cliSocketIdentityMismatch(env({}), env({ VOYAGE_API_KEY: '' }))).toBeNull();
+    expect(JSON.stringify(env({ VOYAGE_API_KEY: 'value-one' }))).not.toContain('value-one');
   });
 
-  test('GBRAIN_SOURCE stays out of the digest: it travels with each request and is resolved per call', () => {
-    expect(behaviorEnvDigest({ GBRAIN_SOURCE: 'source-a' })).toBe(behaviorEnvDigest({}));
-    expect(behaviorEnvDigest({ GBRAIN_SOURCE: 'source-a' })).toBe(behaviorEnvDigest({ GBRAIN_SOURCE: 'source-b' }));
+  test('every GBRAIN_* name in src is classified: read behavior (READ_BEHAVIOR_ENV) or listed here as unable to change a socket read', () => {
+    const names = new Set<string>();
+    for (const file of new Bun.Glob('src/**/*.ts').scanSync('.')) {
+      for (const match of readFileSync(file, 'utf8').matchAll(/GBRAIN_[A-Z0-9_]*[A-Z0-9]/g)) names.add(match[0]);
+    }
+    const unclassified = [...names].filter(name => !READ_BEHAVIOR_ENV.includes(name)
+      && !NOT_READ_BEHAVIOR.has(name) && !NOT_READ_BEHAVIOR_PREFIXES.some(prefix => name.startsWith(prefix))).sort();
+    expect(unclassified).toEqual([]);
+    for (const name of READ_BEHAVIOR_ENV) expect(names.has(name), name).toBe(true);
   });
 });
 
@@ -222,13 +300,15 @@ describe('serve listener', () => {
   const bindings: CliSocketBinding[] = [];
   afterEach(() => { for (const b of bindings.splice(0)) b.close(); });
 
-  const request = (identity: string): CliSocketRequest => ({ v: 1, identity, command: 'search', kind: 'op', op: 'search', params: { query: 'q' },
+  const serveIdentity = (databaseUrl = 'postgresql://alice-example@db.acme-example.test/brain'): CliSocketIdentity => (mkdirSync(join(root, 'home', '.gbrain'), { recursive: true, mode: 0o700 }), cliSocketIdentity({
+    config: { engine: 'postgres', database_url: databaseUrl }, brainId: 'host', configDir: join(root, 'home', '.gbrain'), configFile: join(root, 'home', '.gbrain', 'config.json'), version: '1.0.0', env: {} }));
+  const request = (identity: CliSocketIdentity): CliSocketRequest => ({ v: 1, identity, command: 'search', kind: 'op', op: 'search', params: { query: 'q' },
     routing: { cwd: '/', source_env: null }, cli: { quiet: false, timeout_ms: null } });
 
   async function start(overrides: Partial<Parameters<typeof startCliSocketServer>[0]> = {}) {
     const lines: string[] = [];
     const home = join(root, 'home', '.gbrain');
-    const binding = await startCliSocketServer({ engine, log: line => lines.push(line), home, identity: 'token-a', brainId: () => 'host',
+    const binding = await startCliSocketServer({ engine, log: line => lines.push(line), home, identity: serveIdentity(), brainId: () => 'host',
       execute: async () => ({ frame: okFrame, settled: Promise.resolve() }), ...overrides });
     if (binding) bindings.push(binding);
     return { binding, lines, path: cliSocketPath(home) };
@@ -245,8 +325,15 @@ describe('serve listener', () => {
     const { binding, path } = started;
     expect(binding).not.toBeNull();
     expect(lstatSync(path).mode & 0o777).toBe(0o600);
-    expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toEqual({ frame: okFrame });
-    expect(await exchangeCliSocket(path, request('token-b'), 5_000)).toEqual({ reason: 'refused (identity_mismatch)' });
+    expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toEqual({ frame: okFrame });
+    expect(await exchangeCliSocket(path, request({ ...serveIdentity(), version: '1.0.1' }), 5_000)).toEqual({ reason: 'refused (identity_mismatch): version' });
+    expect(await exchangeCliSocket(path, request(serveIdentity('postgresql://alice-example@db.acme-example.test:6543/brain')), 5_000)).toEqual({ reason: 'refused (identity_mismatch): database port' });
+    expect(started.lines.filter(line => line.includes('identity_mismatch'))).toEqual([
+      "[gbrain serve] cli-socket: refused a CLI call: identity_mismatch (version differs from this serve's); that CLI takes its cold path.",
+      "[gbrain serve] cli-socket: refused a CLI call: identity_mismatch (database port differs from this serve's); that CLI takes its cold path.",
+    ]);
+    await exchangeCliSocket(path, request({ ...serveIdentity(), version: '1.0.1' }), 5_000);
+    expect(started.lines.filter(line => line.includes('identity_mismatch')).length).toBe(2);
   });
 
   test('rejects a peer whose kernel uid differs, and one whose uid cannot be read', async () => {
@@ -254,14 +341,14 @@ describe('serve listener', () => {
     // The first read is the start-up self-test on this process's own connection.
     const { binding, path, lines } = await start({ peerCred: { ok: true, read: () => (calls++ === 0 ? uid : uid + 1) } });
     expect(binding).not.toBeNull();
-    const outcome = await exchangeCliSocket(path, request('token-a'), 5_000);
+    const outcome = await exchangeCliSocket(path, request(serveIdentity()), 5_000);
     expect('reason' in outcome && outcome.reason).toMatch(/^serve_closed|connect_failed|lost/);
     expect(lines.join('\n')).toContain(`rejected a connection from uid ${uid + 1}`);
     binding!.close();
     bindings.length = 0;
     calls = 0;
     const second = await start({ peerCred: { ok: true, read: () => (calls++ === 0 ? uid : null) } });
-    expect(await exchangeCliSocket(second.path, request('token-a'), 5_000)).toHaveProperty('reason');
+    expect(await exchangeCliSocket(second.path, request(serveIdentity()), 5_000)).toHaveProperty('reason');
     expect(second.lines.join('\n')).toContain('rejected a connection from an unverifiable peer');
   });
 
@@ -300,25 +387,25 @@ describe('serve listener', () => {
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const { path } = await start({ execute: async () => ({ frame: { v: 1, kind: 'fallback', reason: 'timeout' }, settled: pending }) });
-    for (let i = 0; i < 8; i++) expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toEqual({ frame: { v: 1, kind: 'fallback', reason: 'timeout' } });
-    expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toEqual({ reason: 'refused (busy)' });
+    for (let i = 0; i < 8; i++) expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toEqual({ frame: { v: 1, kind: 'fallback', reason: 'timeout' } });
+    expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toEqual({ reason: 'refused (busy)' });
     release();
     await Bun.sleep(20);
-    expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toHaveProperty('frame');
+    expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toHaveProperty('frame');
   });
 
   test('a request whose work is still unsettled at the round-trip cap is logged once', async () => {
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const { path, lines } = await start({ stuckAfterMs: 50, execute: async () => ({ frame: { v: 1, kind: 'fallback', reason: 'timeout' }, settled: pending }) });
-    await exchangeCliSocket(path, request('token-a'), 5_000);
+    await exchangeCliSocket(path, request(serveIdentity()), 5_000);
     await Bun.sleep(150);
     expect(lines.filter(line => line.includes('is still running')).length).toBe(1);
     expect(lines.join('\n')).toContain('a search request is still running');
     release();
     await Bun.sleep(20);
     const { path: second, lines: quiet } = await start({ home: join(root, 'quiet', '.gbrain'), stuckAfterMs: 50 } as never);
-    await exchangeCliSocket(second, request('token-a'), 5_000);
+    await exchangeCliSocket(second, request(serveIdentity()), 5_000);
     await Bun.sleep(150);
     expect(quiet.filter(line => line.includes('is still running'))).toEqual([]);
   });
@@ -330,11 +417,11 @@ describe('serve listener', () => {
     const probe = join(runDir(), 'probe.sock');
     await new Promise<void>(resolve => counter.listen(probe, resolve));
     try {
-      expect(await exchangeCliSocket(probe, request('token-a'), 5_000, { ok: false, reason: 'no peer-credential call is wired for testos' }))
+      expect(await exchangeCliSocket(probe, request(serveIdentity()), 5_000, { ok: false, reason: 'no peer-credential call is wired for testos' }))
         .toEqual({ reason: 'peer_credentials_unsupported (no peer-credential call is wired for testos)' });
       await Bun.sleep(20);
       expect(connections).toBe(0);
-      expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toEqual({ frame: okFrame });
+      expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toEqual({ frame: okFrame });
     } finally {
       counter.close();
     }
@@ -364,7 +451,7 @@ describe('serve listener', () => {
       const server = net.createServer(socket => socket.once('data', () => socket.write(`${handshake}\n${result}${result ? '\n' : ''}`)));
       await new Promise<void>(resolve => server.listen(path, resolve));
       try {
-        expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toEqual({ reason: 'malformed_response' });
+        expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toEqual({ reason: 'malformed_response' });
       } finally {
         await new Promise<void>(resolve => server.close(() => resolve()));
       }
@@ -380,7 +467,7 @@ describe('serve listener', () => {
     await new Promise<void>(resolve => server.listen(path, resolve));
     try {
       const started = performance.now();
-      expect(await exchangeCliSocket(path, request('token-a'), 300)).toEqual({ reason: 'round_trip_timeout' });
+      expect(await exchangeCliSocket(path, request(serveIdentity()), 300)).toEqual({ reason: 'round_trip_timeout' });
       expect(performance.now() - started).toBeLessThan(2_000);
     } finally {
       server.close();
@@ -392,7 +479,7 @@ describe('serve listener', () => {
     const server = net.createServer(socket => socket.once('data', () => { socket.write('{"v":1,"accepted":true}\n'); setTimeout(() => socket.destroy(), 20); }));
     await new Promise<void>(resolve => server.listen(path, resolve));
     try {
-      expect(await exchangeCliSocket(path, request('token-a'), 5_000)).toEqual({ reason: 'serve_closed_mid_request' });
+      expect(await exchangeCliSocket(path, request(serveIdentity()), 5_000)).toEqual({ reason: 'serve_closed_mid_request' });
     } finally {
       server.close();
     }
@@ -404,7 +491,7 @@ describe('serve listener', () => {
     await new Promise<void>(resolve => server.listen(path, resolve));
     try {
       const started = performance.now();
-      expect(await exchangeCliSocket(path, request('token-a'), 60_000)).toEqual({ reason: 'handshake_timeout' });
+      expect(await exchangeCliSocket(path, request(serveIdentity()), 60_000)).toEqual({ reason: 'handshake_timeout' });
       expect(performance.now() - started).toBeLessThan(3_000);
     } finally {
       server.close();

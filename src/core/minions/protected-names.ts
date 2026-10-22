@@ -12,6 +12,13 @@
  * pay them at module load.
  */
 
+/**
+ * The queue of drain-lease holder records (persistence/sync-lease.ts): an active row per held sync lease that no worker
+ * claims and that the lease renews and deletes itself. It is not a job, so the stall, timeout and wall-clock sweeps
+ * skip it (#7261): dead-lettering it counted an attempt it never started and broke chk_attempts_order.
+ */
+export const LEASE_BEACON_QUEUE = 'gbrain-drain-lease';
+
 export const PROTECTED_JOB_NAMES: ReadonlySet<string> = new Set([
   'shell',
   // v0.15: subagent + aggregator are protected because they call the

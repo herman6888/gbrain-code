@@ -172,6 +172,7 @@ jobs:
           test/e2e/publication-deadline-pgbouncer.test.ts
           test/e2e/transaction-cancel-held-lock.test.ts
           test/e2e/pgbouncer-pipelined-read-pool.test.ts
+          test/e2e/pgbouncer-transaction-pipeline-6930.test.ts
           test/e2e/extract-atoms-page-state.test.ts
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

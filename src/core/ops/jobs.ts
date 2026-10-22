@@ -6,6 +6,13 @@ function publicJob(job: MinionJob) {
   return { ...visible, private_queue_owner_token: job.private_queue_owner_token == null ? null : '[redacted]' };
 }
 
+/** #7241: public jobs with submitted_by, blocked_by, liveness and spend (job-insight.ts), fenced like the row read. */
+async function insightJobs(ctx: OperationContext, jobs: MinionJob[], owner: string | null) {
+  const { describeJobs, withInsight } = await import('../minions/job-insight.ts');
+  const insight = await describeJobs(ctx.engine, jobs, { owner, remote: ctx.remote !== false });
+  return jobs.map(job => withInsight(publicJob(job), insight.get(job.id)));
+}
+
 /** Fields `list_jobs` may project to (F10 token trim): every public job field. */
 const LIST_JOB_FIELDS = [
   'id', 'name', 'queue', 'status', 'priority', 'data', 'max_attempts', 'attempts_made', 'attempts_started', 'backoff_type',
@@ -15,16 +22,18 @@ const LIST_JOB_FIELDS = [
   'private_queue_owner_token', 'private_queue_lease_until', 'quiet_hours', 'stagger_key', 'result', 'progress', 'error_text',
   'stacktrace', 'created_at', 'started_at', 'finished_at', 'updated_at', 'coalesced',
 ] as const satisfies readonly (keyof MinionJob)[];
+/** #7241 computed fields (job-insight.ts JOB_INSIGHT_FIELDS); list_jobs computes them only when projected. */
+const INSIGHT_JOB_FIELDS = ['submitted_by', 'blocked_by', 'heartbeat_age_ms', 'heartbeat_basis', 'lock_expires_in_ms', 'stalled', 'spend'] as const;
 
 /** Parse list_jobs' `fields` (array or comma string); undefined = every field. */
 function parseJobFields(raw: unknown): readonly string[] | undefined {
   if (raw === undefined || raw === null || raw === '') return undefined;
   const list = (Array.isArray(raw) ? raw : String(raw).split(',')).map(f => String(f).trim()).filter(Boolean);
-  const valid: ReadonlySet<string> = new Set(LIST_JOB_FIELDS);
+  const valid: ReadonlySet<string> = new Set([...LIST_JOB_FIELDS, ...INSIGHT_JOB_FIELDS]);
   const unknown = list.filter(f => !valid.has(f));
   if (unknown.length > 0) {
     throw opError('invalid_params', `list_jobs: unknown field(s) ${unknown.map(f => JSON.stringify(f.slice(0, 40))).join(', ')}.`,
-      `Pass fields from: ${LIST_JOB_FIELDS.join(', ')} (e.g. fields: ["id", "name", "status"]), or omit fields for every field.`);
+      `Pass fields from: ${[...LIST_JOB_FIELDS, ...INSIGHT_JOB_FIELDS].join(', ')} (e.g. fields: ["id", "name", "status"]), or omit fields for every field.`);
   }
   return list.length ? list : undefined;
 }
@@ -618,7 +627,45 @@ const get_job: Operation = {
     if (!job) throw jobNotFound(`Job not found: ${p.id}`);
     // private_queue_owner_token is a capability credential (lease renewal /
     // attach), not job data — never expose it over MCP envelopes.
-    return publicJob(job);
+    return (await insightJobs(ctx, [job], owner))[0];
+  },
+};
+
+/** #7242: the longest a single wait_job call holds the request before it answers `terminal: false`. */
+export const WAIT_JOB_MAX_S = 55;
+
+const wait_job: Operation = {
+  name: 'wait_job',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { exempt: 'admin-scoped job introspection: job params and results are operator data, not retrieved brain text' },
+  description: `Wait until a job is completed, failed, dead or cancelled (at most ${WAIT_JOB_MAX_S} s per call), then return it like get_job plus terminal. terminal: false means it is still running: call again. Agent-scoped tokens (no admin) wait only on jobs they own.`,
+  params: {
+    id: { type: 'number', required: true, description: 'Job ID' },
+    timeout_s: { type: 'number', description: `Seconds to wait (default 30, at most ${WAIT_JOB_MAX_S}).` },
+  },
+  scope: 'admin',
+  agentCallable: true,
+  handler: async (ctx, p) => {
+    const owner = agentOwnerFence(ctx, 'wait_job');
+    if (owner !== null) await assertJobOwned(ctx, p.id as number, owner);
+    const { MinionQueue } = await import('../minions/queue.ts');
+    const { waitForCompletion, TimeoutError, isTerminalJobStatus } = await import('../minions/wait-for-completion.ts');
+    const queue = new MinionQueue(ctx.engine);
+    const first = await queue.getJob(p.id as number);
+    if (!first) throw jobNotFound(`Job not found: ${p.id}`);
+    const requested = typeof p.timeout_s === 'number' && Number.isFinite(p.timeout_s) ? p.timeout_s : 30;
+    const timeoutMs = Math.max(0, Math.min(WAIT_JOB_MAX_S, requested)) * 1000;
+    let job = first;
+    if (!isTerminalJobStatus(job.status) && timeoutMs > 0) {
+      try {
+        job = await waitForCompletion(queue, job.id, { timeoutMs, pollMs: ctx.engine.kind === 'pglite' ? 250 : 1000 });
+      } catch (e) {
+        if (!(e instanceof TimeoutError)) throw e instanceof Error && /disappeared/.test(e.message) ? jobNotFound(`Job not found: ${p.id}`) : e;
+        job = (await queue.getJob(job.id)) ?? job;
+      }
+    }
+    return { ...(await insightJobs(ctx, [job], owner))[0], terminal: isTerminalJobStatus(job.status) };
   },
 };
 
@@ -634,12 +681,30 @@ const list_jobs: Operation = {
     name: { type: 'string', description: 'Filter by job type' },
     limit: { type: 'number', description: 'Max results (default: 50)' },
     fields: { type: 'array', items: { type: 'string' }, description: 'Return only these job fields (e.g. ["id","name","status"]) to save tokens; omit for every field.' },
+    finished_since: { type: 'string', description: 'Terminal-event cursor: an ISO time or the next_cursor of the previous call. Returns {jobs, next_cursor}: jobs that finished after it, oldest first.' },
   },
   scope: 'admin',
   agentCallable: true,
   handler: async (ctx, p) => {
     const fields = parseJobFields(p.fields);
     const owner = agentOwnerFence(ctx, 'list_jobs');
+    const project = async (jobs: MinionJob[]) => {
+      const visible = !fields || fields.some(f => (INSIGHT_JOB_FIELDS as readonly string[]).includes(f)) ? await insightJobs(ctx, jobs, owner) : jobs.map(publicJob);
+      return fields ? visible.map(j => Object.fromEntries(fields.map(f => [f, (j as Record<string, unknown>)[f]]))) : visible;
+    };
+    if (p.finished_since !== undefined) {
+      const { listFinishedSince, TerminalCursorError } = await import('../minions/terminal-events.ts');
+      try {
+        const page = await listFinishedSince(ctx.engine, String(p.finished_since), {
+          queue: p.queue as string | undefined, name: p.name as string | undefined, limit: (p.limit as number) || 50,
+          ...(owner !== null ? { ownerClientId: owner } : {}),
+        });
+        return { jobs: await project(page.jobs), next_cursor: page.next_cursor };
+      } catch (e) {
+        if (e instanceof TerminalCursorError) throw invalidParam(ctx, 'list_jobs', 'finished_since', `list_jobs: ${e.message}`, { example: '2026-10-21T00:00:00Z' });
+        throw e;
+      }
+    }
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
     const jobs = await queue.getJobs({
@@ -652,8 +717,7 @@ const list_jobs: Operation = {
     } as Parameters<typeof queue.getJobs>[0]);
     // private_queue_owner_token is a capability credential (lease renewal /
     // attach), not job data — never expose it over MCP envelopes.
-    const visible = jobs.map(publicJob);
-    return fields ? visible.map(j => Object.fromEntries(fields.map(f => [f, (j as Record<string, unknown>)[f]]))) : visible;
+    return project(jobs);
   },
 };
 
@@ -879,6 +943,7 @@ const get_job_stats: Operation = {
     'private_queue: true means the queue is a parent-owned dream-inline queue: wedged is ' +
     'NEVER true for it and a worker restart cannot help — recovery runs automatically at ' +
     'worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. ' +
+    'by_queue has one row per queue (every dream-inline-* queue folded into one dream-inline row). ' +
     'Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.',
   params: {
     queue: { type: 'string', required: false, description: "Queue for the wedge signature (default 'default'). The other blocks stay global/windowed." },
@@ -909,7 +974,7 @@ const get_job_stats: Operation = {
 
 // Ops in EXACTLY the canonical `operations` array order.
 export const jobsOperations: Operation[] = [
-  submit_job, get_job, list_jobs, cancel_job, retry_job, get_job_progress,
+  submit_job, get_job, wait_job, list_jobs, cancel_job, retry_job, get_job_progress,
   pause_job, resume_job, replay_job, send_job_message,
   submit_agent, get_agent_job, get_job_stats,
 ];

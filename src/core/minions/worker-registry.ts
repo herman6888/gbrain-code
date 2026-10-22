@@ -30,6 +30,8 @@ import { join } from 'path';
 import { execFileSync } from '../spawn.ts';
 import { gbrainPath, loadConfig } from '../config.ts';
 import { getEffectiveNiceness } from './niceness.ts';
+import { VERSION } from '../../version.ts';
+import { runtimeInstallRoot } from '../runtime-build.ts';
 
 /** On-disk shape of a `worker-<pid>.json` entry. */
 export interface WorkerRegistryEntry {
@@ -43,6 +45,10 @@ export interface WorkerRegistryEntry {
   nice_requested: number | null;
   /** Niceness actually in effect when the worker registered. */
   nice_effective: number | null;
+  /** #7245: the gbrain version the worker runs (in memory); absent on an entry an older worker wrote. */
+  version?: string;
+  /** #7245: the package root the worker loaded its code from (local path, never in remote output); null in a compiled binary. */
+  install_root?: string | null;
 }
 
 /** A live worker as returned by readWorkers(): on-disk entry + fresh re-measure. */
@@ -123,6 +129,8 @@ export function registerWorker(info: {
     started_at: info.started_at,
     nice_requested: info.nice_requested,
     nice_effective: info.nice_effective,
+    version: VERSION,
+    install_root: runtimeInstallRoot(),
   };
   const path = entryPath(info.pid);
   try {

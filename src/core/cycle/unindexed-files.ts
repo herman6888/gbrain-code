@@ -10,9 +10,12 @@
  * as a hold. Scheduling is the only write: no file or page changes here, and
  * the per-sync path never runs it.
  *
- * Deadline: min(60 s, a third of the maintenance job's remaining time),
- * shared by the sources in id order; a source the budget stops is continued
- * by the next run from its stored cursor. A dry run scans and reports without
+ * Deadline: min(5 min, a third of the maintenance job's remaining time),
+ * shared by the sources, each of which also stops at its own budget (60 s per
+ * started 100k live pages, `unindexedScanBudgetMs`). #7149: the sources run
+ * least recently scanned first (no stored result first, then the oldest), so
+ * one large source cannot keep the others from ever being scanned; a source
+ * the budget stops is continued by the next run from its stored cursor. A dry run scans and reports without
  * scheduling or storing. The report is counts only, never a path. It never
  * fails the cycle: an error on a source reports `warn` and the others still run.
  */
@@ -22,7 +25,7 @@ import type { SyncOpts } from '../../commands/sync.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { resolveManagedSyncContext } from '../persistence/sync-discovery.ts';
 import { companyBrainProfile } from '../company-brain/policy.ts';
-import { findUnindexedFiles, refreshUnindexedFiles, UNINDEXED_SCAN_BUDGET_MS, UNINDEXED_SCHEDULE_CAP, type UnindexedScan } from '../persistence/unindexed-files.ts';
+import { findUnindexedFiles, readUnindexedFiles, refreshUnindexedFiles, unindexedScanBudgetMs, UNINDEXED_SCAN_MAX_BUDGET_MS, UNINDEXED_SCHEDULE_CAP, type UnindexedScan } from '../persistence/unindexed-files.ts';
 import { isUncontainedPhaseError } from './phase-containment.ts';
 
 export interface UnindexedFilesPhaseOpts {
@@ -43,12 +46,15 @@ export async function runUnindexedFilesPhase(engine: BrainEngine | null, opts: U
   }
   const now = opts.now ?? Date.now;
   const start = now();
-  const timeBudgetMs = opts.deadlineAtMs == null ? UNINDEXED_SCAN_BUDGET_MS : Math.min(UNINDEXED_SCAN_BUDGET_MS, Math.floor((opts.deadlineAtMs - start) / 3));
+  const timeBudgetMs = opts.deadlineAtMs == null ? UNINDEXED_SCAN_MAX_BUDGET_MS : Math.min(UNINDEXED_SCAN_MAX_BUDGET_MS, Math.floor((opts.deadlineAtMs - start) / 3));
   if (timeBudgetMs <= 0) return { ...base, status: 'skipped', summary: 'no maintenance-job time left to look for unindexed files; the next run continues', details: { reason: 'deadline' } };
   const deadlineAt = start + timeBudgetMs;
-  const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | null }>(
-    "SELECT id, config FROM sources WHERE archived IS NOT TRUE AND local_path IS NOT NULL AND (config->>'kind') IS NULL ORDER BY id");
-  const sources: Array<{ source_id: string; complete: boolean; scanned: number; unindexed: number; slug_taken: number; scheduled_now: number; already_scheduled: number;
+  const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | null; incarnation: string }>(
+    "SELECT id, config, incarnation::text AS incarnation FROM sources WHERE archived IS NOT TRUE AND local_path IS NOT NULL AND (config->>'kind') IS NULL ORDER BY id");
+  const stored = await readUnindexedFiles(engine, rows.map(row => row.id));
+  const scannedAt = (row: { id: string; incarnation: string }) => { const record = stored.get(row.id); return record?.incarnation === row.incarnation ? record.computed_at : ''; };
+  rows.sort((a, b) => scannedAt(a).localeCompare(scannedAt(b)));
+  const sources: Array<{ source_id: string; budget_ms: number; complete: boolean; scanned: number; unindexed: number; slug_taken: number; scheduled_now: number; already_scheduled: number;
     metafile_skipped: number; by_code: Record<string, number> }> = [];
   const skipped: Array<{ source_id: string; reason: string }> = [];
   const errors: Array<{ source_id: string; code: string }> = [];
@@ -63,12 +69,14 @@ export async function runUnindexedFilesPhase(engine: BrainEngine | null, opts: U
       });
       if (typeof context === 'string') { skipped.push({ source_id: row.id, reason: context }); continue; }
       let scan: UnindexedScan, scheduledNow = 0;
-      if (opts.dryRun) scan = await findUnindexedFiles(engine, row.id, { context, deadlineAt, now });
+      const budgetMs = await unindexedScanBudgetMs(engine, row.id);
+      const sourceDeadlineAt = Math.min(deadlineAt, now() + budgetMs);
+      if (opts.dryRun) scan = await findUnindexedFiles(engine, row.id, { context, deadlineAt: sourceDeadlineAt, now });
       else {
-        const refresh = await refreshUnindexedFiles(engine, row.id, { context, deadlineAt, now, keep: room });
+        const refresh = await refreshUnindexedFiles(engine, row.id, { context, deadlineAt: sourceDeadlineAt, now, keep: room });
         scan = refresh.scan; scheduledNow = refresh.scheduled.length; room -= scheduledNow;
       }
-      sources.push({ source_id: row.id, complete: scan.complete, scanned: scan.scanned, unindexed: scan.unindexed, slug_taken: scan.slug_taken,
+      sources.push({ source_id: row.id, budget_ms: budgetMs, complete: scan.complete, scanned: scan.scanned, unindexed: scan.unindexed, slug_taken: scan.slug_taken,
         scheduled_now: scheduledNow, already_scheduled: scan.scheduled, metafile_skipped: scan.metafile_skipped, by_code: scan.by_code });
     } catch (error) {
       if (isUncontainedPhaseError(error, opts.signal)) throw error;
@@ -88,7 +96,7 @@ export async function runUnindexedFilesPhase(engine: BrainEngine | null, opts: U
     total('metafile_skipped') ? `${total('metafile_skipped')} titled file(s) are named like folder scaffolding (index.md and the like), which sync skips on purpose; renaming one is the user's call` : '',
   ].filter(Boolean);
   const notes = [
-    incomplete ? `${incomplete} source(s) stopped at the phase time budget (${Math.round(timeBudgetMs / 1000)} s); the next maintenance run continues where they stopped.` : '',
+    incomplete ? `${incomplete} source(s) stopped at their time budget; the next maintenance run continues where they stopped.` : '',
     skipped.length ? `${skipped.length} source(s) skipped (${[...new Set(skipped.map(s => s.reason))].join(', ')}).` : '',
     errors.length ? `${errors.length} source(s) could not be checked (${[...new Set(errors.map(e => e.code))].join(', ')}); gbrain doctor --only unindexed_files --json shows each source's state.` : '',
   ].filter(Boolean);

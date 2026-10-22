@@ -89,6 +89,8 @@ import { evaluateQuietHours, type QuietHoursConfig } from './quiet-hours.ts';
 import { endedByShutdown, releaseUndrainedClaims, settleShutdownInterruptedJob } from './worker-shutdown.ts';
 import { isWatchdogSuspect, settleWatchdogAbort } from './watchdog-attribution.ts';
 import { IdleWaiter } from './idle-wait.ts';
+import { DEFAULT_LONG_JOB_NAMES, DEFAULT_SHORT_JOB_RESERVED_SLOTS, claimExclusions } from './lanes.ts';
+import { jobRefusal, refusedJobResult } from './refusal.ts';
 import { readFileSync } from 'fs';
 
 /**
@@ -331,6 +333,9 @@ export class MinionWorker extends EventEmitter {
       jobIsolation: opts?.jobIsolation ?? 'inline',
       childCliInvocation: opts?.childCliInvocation ?? null,
       childTiniPath: opts?.childTiniPath ?? '',
+      longJobNames: opts?.longJobNames ?? DEFAULT_LONG_JOB_NAMES,
+      shortJobReservedSlots: opts?.shortJobReservedSlots ?? DEFAULT_SHORT_JOB_RESERVED_SLOTS,
+      onJobSettled: opts?.onJobSettled ?? (() => {}),
     };
     // Process isolation contract: 'process' without a resolved child CLI
     // invocation would silently execute handlers INLINE while the evict path
@@ -854,7 +859,7 @@ export class MinionWorker extends EventEmitter {
               this.opts.lockDuration,
               this.opts.queue,
               this.registeredNames,
-              { excludeWatchdogSuspects: this.inFlight.size > 0 },
+              { excludeWatchdogSuspects: this.inFlight.size > 0, excludeNames: claimExclusions(this.opts, [...this.inFlight.values()].map(f => f.job.name)) },
             ).then(claimed => {
               if (claimed) {
                 this.executions.set(lockToken, { job: claimed, lockToken, stopped: true });
@@ -1458,6 +1463,7 @@ export class MinionWorker extends EventEmitter {
         if (!this.configurationError || this.configurationDrainFinished) this.executions.delete(lockToken);
         this.jobsCompleted += 1;
         this.checkMemoryLimit('post-job');
+        try { this.opts.onJobSettled(job); } catch { /* the terminal hook never affects the job */ }
       })
       // D7 / codex C5: close the SECOND unhandledRejection vector. If
       // executeJob's catch path throws (e.g., failJob's executeRaw
@@ -1720,7 +1726,7 @@ export class MinionWorker extends EventEmitter {
         return;
       }
 
-      const isUnrecoverable = err instanceof UnrecoverableError;
+      const refusal = jobRefusal(err), isUnrecoverable = refusal !== null || err instanceof UnrecoverableError; // #7239: refusals end now
       const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
 
       let newStatus: 'delayed' | 'failed' | 'dead';
@@ -1746,7 +1752,7 @@ export class MinionWorker extends EventEmitter {
       // so handleStalled requeues it cleanly on a live pool (the D8a path).
       let failed: MinionJob | null;
       try {
-        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+        failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined);
       } catch (recordErr) {
         const recordMsg = recordErr instanceof Error ? recordErr.message : String(recordErr);
         console.error(
@@ -1755,7 +1761,7 @@ export class MinionWorker extends EventEmitter {
         if (!isRetryableConnError(recordErr)) throw recordErr;
         await this.reconnectAfterConnectionError('failJob', recordErr);
         try {
-          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs);
+          failed = await this.queue.failJob(job.id, lockToken, errorText, newStatus, backoffMs, refusal ? refusedJobResult(refusal) : undefined);
         } catch (retryErr) {
           if (isLocalConfigurationError(retryErr)) {
             this.blockForConfiguration(retryErr);
@@ -1781,7 +1787,7 @@ export class MinionWorker extends EventEmitter {
       if (newStatus === 'delayed') {
         console.log(`Job ${job.id} (${job.name}) failed, retrying in ${Math.round(backoffMs)}ms (attempt ${job.attempts_made + 1}/${job.max_attempts})`);
       } else {
-        console.log(`Job ${job.id} (${job.name}) permanently failed: ${errorText}`);
+        console.log(`Job ${job.id} (${job.name}) ${refusal ? `refused (${refusal.code}), not retried` : 'permanently failed'}: ${errorText}`);
       }
     }
   }

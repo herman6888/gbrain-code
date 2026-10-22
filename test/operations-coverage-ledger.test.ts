@@ -63,6 +63,7 @@ const LEDGER: Record<string, string> = {
   search_tune: 'test/search-introspection-ops.test.ts',
   cache_stats: 'test/quarantine-cache-ops.test.ts',
   search_by_image: 'test/search-by-image-op.test.ts',
+  search_exact: 'test/search-exact.test.ts',
   assemble_evidence: 'test/evidence-delivery.test.ts',
   add_tag: 'test/source-id-tx-regression.test.ts',
   remove_tag: 'test/e2e/mechanical.test.ts',
@@ -122,6 +123,7 @@ const LEDGER: Record<string, string> = {
   get_agent_job: 'test/get-agent-job.test.ts',
   get_job_stats: 'test/get-job-stats-op.test.ts',
   find_orphans: 'test/orphans-source-scope.test.ts',
+  rank_entities: 'test/rank-entities.test.ts',
   wanted_pages: 'test/wanted-links.test.ts',
   get_calibration_profile: 'test/calibration-cli.test.ts',
   takes_list: 'test/takes-mcp-allowlist.test.ts',
@@ -189,6 +191,7 @@ const LEDGER: Record<string, string> = {
   rate_answer: 'test/feedback-store.test.ts',
   // Covered by the C1 lifecycle behavioral suite (moved out of UNCOVERED).
   get_job_progress: 'test/jobs-lifecycle-ops.test.ts',
+  wait_job: 'test/minions/job-insight.test.ts',
   pause_job: 'test/jobs-lifecycle-ops.test.ts',
   resume_job: 'test/jobs-lifecycle-ops.test.ts',
   replay_job: 'test/jobs-lifecycle-ops.test.ts',

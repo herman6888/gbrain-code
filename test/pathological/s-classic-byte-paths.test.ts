@@ -233,7 +233,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       await withClassic(databaseUrl, async r => {
         r.write('notes/trail.md ', md('trail')); r.commitAll('odd');
         const { computeLosslessSyncDelta } = await import('../../src/core/sync-delta.ts');
-        const delta = computeLosslessSyncDelta(r.root, (await r.lastCommit())!, r.head());
+        const delta = await computeLosslessSyncDelta(r.root, (await r.lastCommit())!, r.head());
         expect(delta.status === 'ok' && delta.manifest.added.sort()).toEqual(['notes/trail.md ', 'ok/healthy-1.md']);
         const obs = await observe(r, 'ok/healthy-1');
         expect({ thrown: obs.thrown, healthy: obs.healthy, cursorAtHead: obs.cursorAtHead, ledger: obs.ledger }).toEqual({ thrown: null, healthy: true, cursorAtHead: true, ledger: [] });

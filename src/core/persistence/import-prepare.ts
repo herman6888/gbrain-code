@@ -253,7 +253,7 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
     ? await importImageFile(engine, p.inputPath, p.sourcePath, { ...source, noEmbed: p.noEmbed, bytes: imageBytes, prepare })
     : code
     ? await importCodeFile(engine, p.sourcePath, content, { ...source, noEmbed: true, prepare })
-    : await importFromContent(engine, row.slug, content, { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, prepare, fences: 'coordinated', writeGate: await ownerGateInput(engine, row, parseMarkdown(content, row.slug).frontmatter, p.sourcePath),
+    : await importFromContent(engine, row.slug, content, { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, prepare, fences: 'coordinated', boundedChunkWrites: true, writeGate: await ownerGateInput(engine, row, parseMarkdown(content, row.slug).frontmatter, p.sourcePath),
       coordinated: true, existingSnapshot: snapshot, activePack: p.activePack, sourcePath: p.sourcePath, filename: basename(p.sourcePath, '.md'), allowEmptyOverwrite: true,
       segmentedOwner: { kind: 'import', principalKind: row.principal_kind, principalId: row.principal_id, baseRevision: snapshot?.revision ?? null } });
   if (!prepared && result.refusal?.code === 'invalid_fence') throw managedImportRefusal(result.refusal, p.sourcePath);
@@ -290,10 +290,10 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
           await project(tx, final?.page.id);
           if (applied?.segmented) { if (applied.segmented.complete && live) await sealSegmentedPage(tx, Number(live.page.id)); }
           else if (applied?.chunkerSeal !== undefined) await sealImportedPage(tx, row.slug, row.source_id, live, applied.chunkerSeal, applied.pageId);
-          else if (live) await sealPageTextProjection(tx, row.slug, row.source_id, live);
+          else if (live && !applied?.projectionPending) await sealPageTextProjection(tx, row.slug, row.source_id, live);
         }
         mutation.postimage = final;
-      } else if (!ready.noop && !image) await sealPageTextProjection(tx, row.slug, row.source_id);
+      } else if (!ready.noop && !image && !applied?.projectionPending) await sealPageTextProjection(tx, row.slug, row.source_id);
       // #6188: the canonical file is written from the normalized page; the outcome reports what Tier 1 rewrote.
       return { ...result, parsedPage: undefined, imported_file: true, source_id: row.source_id,
         ...(ready.noop ? {} : segmentedOutcome(applied?.segmented, isQuarantined(ready.parsedPage?.frontmatter ?? {}))), fences_normalized: result.fences_normalized?.length

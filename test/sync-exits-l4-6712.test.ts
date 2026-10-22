@@ -19,7 +19,8 @@ import { classifySyncFault, HOLD_ATTEMPTS_NEEDS_HUMAN, HOLD_ESCALATE_MS } from '
 import { classifyTerminal } from '../src/core/persistence/terminal-classify.ts';
 import { holdEscalation, readGitHold, recordHoldAttempt, writeGitHold, type GitHoldRecord } from '../src/core/persistence/sync-holds.ts';
 import { nonPlainSyncFlags, readSoakCounters, recordSoakEvent, sweepNeedsHumanHolds } from '../src/core/persistence/soak-counters.ts';
-import { countSyncGhosts } from '../src/core/persistence/sync-ghosts.ts';
+import { countSyncGhosts, settleSyncGhostScans } from '../src/core/persistence/sync-ghosts.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { parseSince } from '../src/core/since.ts';
 import { parseRepairArgs } from '../src/commands/repair.ts';
 import { fileDriftRepair } from '../src/core/repair/file-drift.ts';
@@ -29,7 +30,7 @@ import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { requirePostgresTestDatabase, testBackends } from './helpers/test-backends.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
-import { managedBrain } from './helpers/managed-brain.ts';
+import { managedBrain, settleManagedGitEffects } from './helpers/managed-brain.ts';
 import { durableGitRepo } from './helpers/git-publication.ts';
 
 describe('#6712 PR 2 L4: the fault table and source_changed routing', () => {
@@ -222,10 +223,15 @@ describe('#6712 PR 2 L4: ghost pages after a managed sync', () => {
     for (const slug of ['notes/kept', 'notes/gone']) {
       await submitPageMutation(ctx, { operation: 'put_page', params: { slug, request_id: randomUUID(), content: `---\ntype: note\ntitle: ${slug}\n---\n\n${slug} body.\n` } });
     }
+    // The files are committed first: a page whose file never reached Git is a working-tree page, which a full pass deletes.
+    await settleManagedGitEffects(engine);
     await disposePersistenceConsumer(engine);
-    const clean = await sync();
+    // GBRA-133 2b.2: the scan runs in the background after a sync (interval 0 here: every sync starts one) and the next
+    // sync reports what it found.
+    const clean = await withEnv({ GBRAIN_SYNC_GHOST_INTERVAL_MS: '0' }, async () => { const r = await sync(); await settleSyncGhostScans(engine); return r; });
     expect(clean.ghostPages).toBeUndefined();
     unlinkSync(join(root, 'notes/gone.md'));
+    await withEnv({ GBRAIN_SYNC_GHOST_INTERVAL_MS: '0' }, async () => { await sync(); await settleSyncGhostScans(engine); });
     const result = await sync();
     expect(result.ghostPages).toMatchObject({ count: 1, truncated: false, samples: ['notes/gone'],
       fix: { argv: ['gbrain', 'repair', 'ghost-pages', '--source', 'default'], actor: 'agent', consent: [] } });

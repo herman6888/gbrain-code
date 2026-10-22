@@ -110,8 +110,7 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
 
   const flags = parseSyncFlags(args);
   noteRetryFailedDeprecated(args);
-  const { repoPath, dryRun, skipFailed, syncAll, jsonOut, breakLock, forceBreakLock, maxAgeSeconds } = flags;
-  let { noEmbed } = flags;
+  const { syncAll, jsonOut, breakLock, forceBreakLock, maxAgeSeconds } = flags;
 
   // v0.41.13.0 (T4 + D1): handle --break-lock / --force-break-lock BEFORE
   // the sync would otherwise contend on the lock. v3's plan dropped the
@@ -119,7 +118,19 @@ export async function runSyncInner(engine: BrainEngine, args: string[]) {
   // source in one call; runBreakLock now widens to iterate sources when
   // --all is set and accept maxAgeSeconds for age-gated breaks.
   if (breakLock || forceBreakLock) return await runSyncBreakLock(engine, args, { syncAll, jsonOut, forceBreakLock, maxAgeSeconds });
+  // GBRA-133: one single-source run reads its routing rows once (core/sync-dispatch-read.ts); --all and --watch read live.
+  if (syncAll || flags.watch) return runRoutedSync(engine, args, flags);
+  const { syncDispatchRow, withSyncDispatchRead } = await import('../../core/sync-dispatch-read.ts');
+  return withSyncDispatchRead(engine, () => {
+    const explicit = args.find((a, i) => args[i - 1] === '--source');
+    if (explicit) void syncDispatchRow(engine, explicit);
+    return runRoutedSync(engine, args, flags);
+  });
+}
 
+async function runRoutedSync(engine: BrainEngine, args: string[], flags: ReturnType<typeof parseSyncFlags>): Promise<void> {
+  const { repoPath, dryRun, skipFailed, syncAll, jsonOut } = flags;
+  let { noEmbed } = flags;
   const fanout = parseSyncFanoutFlags(args, syncAll);
   await refuseManagedForbiddenFlags(engine, flags, args);
 
@@ -462,7 +473,7 @@ async function runSyncAll(
     catch (error) { policyFailures.set(source.id, error); }
   }
   const embedPlan = await resolveSyncAllEmbedPlan(engine, runnableSources.filter(src => !policyFailures.has(src.id) && !companyPolicies.get(src.id)), {
-    v2Enabled, serialFlag, noEmbed: noEmbed || !!embeddingCredentialError, noAutoEmbed, dryRun, jsonOut, yesFlag, full, includeGitignored,
+    v2Enabled, serialFlag, noEmbed: noEmbed || !!embeddingCredentialError, noAutoEmbed, dryRun, jsonOut, yesFlag, full, includeGitignored, noPull,
   });
   if (embedPlan.stop) return;
   const {
@@ -609,7 +620,13 @@ async function runSyncAll(
   const okCount = perSourceResults.filter((r) => r.status === 'ok').length;
   const errCount = perSourceResults.filter((r) => r.status === 'error').length;
 
-  if (jsonOut) emitSyncAllEnvelope({ perSourceResults, embedBackfillBySource, effectiveParallel, okCount, errCount, costGate: embedPlan.costGate, resumeCommand });
+  if (jsonOut) {
+    // #7190: each synced source's applied-through watermark, read after the run.
+    const { readAppliedWatermark } = await import('../../core/persistence/applied-watermark.ts');
+    const watermarks = new Map(await Promise.all(perSourceResults.filter(r => r.status !== 'skipped_missing_path')
+      .map(async r => [r.sourceId, await readAppliedWatermark(engine, r.sourceId).catch(() => null)] as const)));
+    emitSyncAllEnvelope({ perSourceResults, embedBackfillBySource, effectiveParallel, okCount, errCount, costGate: embedPlan.costGate, resumeCommand, watermarks });
+  }
 
   // v0.42.7 (#1696): brain-wide extraction-lag nudge after the --all wave.
   // Best-effort, stderr-only; skipped on dry-run.
@@ -732,8 +749,9 @@ function emitSyncAllEnvelope(input: {
   errCount: number;
   costGate: Record<string, unknown> | undefined;
   resumeCommand: string;
+  watermarks: Map<string, unknown>;
 }): void {
-  const { perSourceResults, embedBackfillBySource, effectiveParallel, okCount, errCount, costGate, resumeCommand } = input;
+  const { perSourceResults, embedBackfillBySource, effectiveParallel, okCount, errCount, costGate, resumeCommand, watermarks } = input;
   // Sort by source_id at emit time so the envelope is deterministic
   // even though completion order is not (pMapAllSettled semantics).
   const sortedSources = perSourceResults
@@ -769,6 +787,7 @@ function emitSyncAllEnvelope(input: {
       ...(embedBackfillBySource.has(r.sourceId)
         ? { embed_backfill: embedBackfillBySource.get(r.sourceId) }
         : {}),
+      ...(watermarks.get(r.sourceId) ? { watermark: watermarks.get(r.sourceId) } : {}),
     }));
   emitJson(JSON.stringify({
     schema_version: 1,
@@ -845,7 +864,7 @@ async function runSingleSourceSync(
         chunker_version: gateRows[0].chunker_version,
       }, {
         dryRun: false,
-        jsonOut, yesFlag, full, includeGitignored, noAutoEmbed,
+        jsonOut, yesFlag, full, includeGitignored, noAutoEmbed, noPull,
       });
       singleSourceNoWorkerSurface = gate.workerSurface.status === 'no_worker_surface';
       singleCostGate = gate.costGate;
@@ -979,7 +998,8 @@ async function runSingleSourceSync(
     const capacity = await syncCapacityNotices(engine, jsonOut, result);
     const convergence = jsonOut && result.status === 'dry_run' && !companyPolicy ? await readConvergence() : undefined;
     if (jsonOut) {
-      emitJson(JSON.stringify({ ...buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate), ...(convergence ? { convergence } : {}),
+      const watermark = await (await import('../../core/persistence/applied-watermark.ts')).readAppliedWatermark(engine, sourceId).catch(() => null);
+      emitJson(JSON.stringify({ ...buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate), ...(convergence ? { convergence } : {}), ...(watermark ? { watermark } : {}),
         ...(result.managedWrite ? { managed_write: result.managedWrite } : {}), ...drainJsonFields(result, resumeCommand, sourceId),
         ...(result.tail ? { tail: syncTailJsonFields(result).tail } : {}), ...capacity }));
     }

@@ -85,6 +85,12 @@ export interface Notice {
    * alone. renderNotice never copies it, so it never reaches the wire.
    */
   dedupe_key?: string;
+  /**
+   * Unrendered (#7165): a coverage notice whose repeat of the same state is
+   * suppressed per session (NoticeLedger) and per one-shot CLI window, until
+   * `level` rises materially or the `key` (code, sources, kinds) is new.
+   */
+  escalation?: { key: string; level: number };
 }
 export interface RenderedNotice extends Omit<Notice, 'fix'> { fix?: RenderedAction; contract_version: 1 }
 

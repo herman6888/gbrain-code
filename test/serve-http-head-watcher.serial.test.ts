@@ -74,8 +74,9 @@ test('runServeHttp starts the head watcher with the serve and stops it on SIGINT
     expect(watcherIntervals).toHaveLength(1);
     const cleared = () => clearSpy.mock.calls.filter(([h]) => h === watcherIntervals[0]).length;
     expect(cleared()).toBe(0);
-    // http-server (lifecycle), resolve-ipc-close and pglite-engine-disconnect: the watcher adds none of its own.
-    expect(_registeredCleanupCountForTests()).toBe(baseline + 3);
+    // http-server (lifecycle), resolve-ipc-close, pglite-engine-disconnect and the resident notifier's
+    // lease release (GBRA-133 2b: a SIGTERM hands the lease over at once); the watcher adds none of its own.
+    expect(_registeredCleanupCountForTests()).toBe(baseline + 4);
 
     process.emit('SIGINT');
     await done;

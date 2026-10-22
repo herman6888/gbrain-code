@@ -188,7 +188,8 @@ export function estimatePageEmbedUsd(chars: number, signature: string | null | u
 /** Held and capped pages with their stale chunk counts (`gbrain embed --held`); `limit: null` lists every one. */
 export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: { state?: 'held' | 'capped'; sourceId?: string; limit?: number | null } = {}): Promise<PageBudgetReport[]> {
   const params: unknown[] = [opts.limit === undefined ? 1000 : opts.limit];
-  const filters = [budgetRowAppliesFilter('b', 'p'), 'p.deleted_at IS NULL'];
+  // #7185: an embed_skip page is never embedded, so a hold on one (a backfill rewrite that did not land) is not approvable work.
+  const filters = [budgetRowAppliesFilter('b', 'p'), 'p.deleted_at IS NULL', `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`];
   if (opts.state) filters.push(`b.state = $${params.push(opts.state)}`);
   if (opts.sourceId) filters.push(`p.source_id = $${params.push(opts.sourceId)}`);
   const pending = `(CASE WHEN p.body_storage = 'segmented' THEN cc.${quoteIdentifier((await embeddingWriteTarget(engine)).column.name)} IS NULL ELSE cc.embedded_at IS NULL END)`;

@@ -12,12 +12,13 @@ import { readPageSnapshotsBatch } from './page-snapshot-batch.ts';
 import { createPageVersion } from './page-state/versions.ts';
 import { moveSlugBindings, recordRenameAlias } from './page-state/rename-alias.ts';
 import { dropPhantomMigrationDuplicates } from './facts/ontology-rekey.ts';
-import { composablePostgresTransaction, transactionMemo } from './page-state/transactions.ts';
+import { composablePostgresTransaction, transactionMemo, withCommitChecks } from './page-state/transactions.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
 import { readRelationalFanout, readChainHop, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
 import postgres from '#postgres'
 import { reservedTransactions, type ReservedTransactions } from './postgres-engine/reserved-transactions.ts';
+import { holdSearchConnection } from './search/connection-budget.ts';
 import { traceSqlOptions } from './sql-trace.ts';
 import { hasPostgresCancellationCapability, postgresCancellationUnavailable, reserveWithCancellation } from './postgres-engine/cancellation.ts';
 import { runBoundedStatement } from './postgres-engine/bounded-statement.ts';
@@ -369,8 +370,7 @@ export class PostgresEngine implements BrainEngine {
     } else if (sourceId) {
       scopesValue = sourceId;
     }
-    return this.transaction(async engine => {
-      const tx = (engine as PostgresEngine).sql;
+    return this.readTransaction(tx => {
       // One settings statement for the scope binding, JIT off and the
       // caller's settings (a thunk is read here, after BEGIN, so a deadline
       // budget is measured one round trip before the query). A savepoint in
@@ -388,7 +388,26 @@ export class PostgresEngine implements BrainEngine {
 
   /** An unscoped read in its own transaction with JIT off (search-settings.ts); a savepoint inside a caller's transaction. */
   private jitOffRead<T>(callback: (tx: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
-    return this.transaction(engine => withSearchJitOff((engine as PostgresEngine).sql, this._pageTransaction, () => callback((engine as PostgresEngine).sql)));
+    return this.readTransaction(tx => withSearchJitOff(tx, this._pageTransaction, () => callback(tx)));
+  }
+
+  /**
+   * GBRA-156: a top-level read transaction answers when its read returns, without waiting for COMMIT's round trip.
+   * The driver keeps the connection reserved, and the gauge counts it, until COMMIT settles; a failed COMMIT cannot
+   * change rows already read, so it is not the caller's error. `run` lets its statement errors propagate (every read here does).
+   */
+  private readTransaction<T>(run: (tx: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
+    if (this._pageTransaction) return this.transaction(engine => run((engine as PostgresEngine).sql));
+    return new Promise<T>((resolve, reject) => {
+      let answered = false;
+      this.transaction(async engine => {
+        const tx = (engine as PostgresEngine).sql;
+        const result = await run(tx);
+        answered = true;
+        resolve(result);
+        return result;
+      }).catch(error => { if (!answered) reject(error); });
+    });
   }
 
   // Lifecycle
@@ -427,7 +446,7 @@ export class PostgresEngine implements BrainEngine {
         // GBRAIN_PG_NOTICES=1.
         onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
         ...db.poolHealthOptions({ ...this.poolHealth('read'), onpoisoned: (status: string) => this.onPoisoned('read', status) }, timeouts.statement_timeout),
-        shared_types: db.resolveSharedTypes(url), ...db.readPoolPipelineOptions(url),
+        shared_types: db.resolveSharedTypes(url), array_types: db.resolveArrayTypes(url), ...db.readPoolPipelineOptions(url), ...db.transactionPipelineOptions(url),
       };
       opts.connection = { ...timeouts, application_name: db.gbrainApplicationName() };
       if (typeof prepare === 'boolean') {
@@ -669,7 +688,9 @@ export class PostgresEngine implements BrainEngine {
     // .begin), which would skip a chained .finally and leak the counter.
     if (!this._pageTransaction) this.checkoutGauge.acquire('tx');
     try {
-      return await withTransactionAbort(opts?.signal, attach => withHeldPageKeys(this._pageTransaction ? this._heldPageKeys : null, held => conn.begin(async (handle) => {
+      // GBRA-156: the pool's begin takes `first`; a nested transaction's begin (a savepoint) takes only the callback.
+      const begin = (run: (handle: unknown) => Promise<unknown>) => opts?.pipelineFirst && !this._pageTransaction ? conn.begin({ first: opts.pipelineFirst }, run) : conn.begin(run);
+      return await holdSearchConnection(() => withCommitChecks(checks => withTransactionAbort(opts?.signal, attach => withHeldPageKeys(this._pageTransaction ? this._heldPageKeys : null, held => begin(async (handle) => {
         attach(handle as Discardable);
         if (!this._pageTransaction) this.checkoutGauge.checkedOut();
         const tx = composablePostgresTransaction(handle);
@@ -678,10 +699,11 @@ export class PostgresEngine implements BrainEngine {
         Object.defineProperty(txEngine, '_chunkWritesInTransaction', { value: true });
         Object.defineProperty(txEngine, '_pageTransaction', { value: true });
         Object.defineProperty(txEngine, '_heldPageKeys', { value: held });
+        if (!this._pageTransaction) Object.defineProperty(txEngine, '_commitChecks', { value: checks });
         Object.defineProperty(txEngine, 'sql', { get: () => tx });
         Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
         return fn(txEngine);
-      }) as Promise<T>), { cancelSettleMs: cancelSettleMs() });
+      }) as Promise<T>), { cancelSettleMs: cancelSettleMs() })));
     } finally {
       if (!this._pageTransaction) this.checkoutGauge.release('tx');
     }
@@ -732,7 +754,7 @@ export class PostgresEngine implements BrainEngine {
           return rows as unknown as R[];
         },
       };
-      return await fn(Object.assign(conn, { transaction: <R>(run: (engine: BrainEngine) => Promise<R>) => this.transactionOn(reservedTransactions(reserved), run) } satisfies ReservedTransactions));
+      return await fn(Object.assign(conn, { transaction: <R>(run: (engine: BrainEngine) => Promise<R>, opts?: TransactionOptions) => this.transactionOn(reservedTransactions(reserved), run, opts) } satisfies ReservedTransactions));
     } finally {
       // Counter/gauge decrements run regardless of release() throwing
       // (double-release or socket error must not permanently leak a permit
@@ -2886,7 +2908,7 @@ export class PostgresEngine implements BrainEngine {
     if (opts?.signal?.aborted) {
       throw new DOMException('aborted', 'AbortError');
     }
-    return (async () => {
+    return holdSearchConnection(async () => {
       const signal = opts?.signal;
       let reserved: postgres.ReservedSql | undefined;
       let pending: ReturnType<typeof conn.unsafe> | undefined;
@@ -2930,7 +2952,7 @@ export class PostgresEngine implements BrainEngine {
         try { cancellation = pending.cancel().catch(() => { retired = true; }); }
         catch { retired = true; }
       }
-    })();
+    });
   }
 
   async executeRaw<T = Record<string, unknown>>(

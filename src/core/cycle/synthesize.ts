@@ -96,6 +96,7 @@ import { verifyAndRepairDreamPages, normForGrounding, readVerifyEpoch, loadChild
 import { dreamBreakerRefusal, loadDreamBreaker } from './dream-breaker.ts';
 import { resolveTriageDecide, type TriageDecide, type TriageDecideStats } from './triage-decide.ts';
 import { OperationError } from '../ops/contract.ts';
+import { isRetryableConnError } from '../retry-matcher.ts';
 import { backoffUntil, recordUnreliableTriage, responseDiagnostic, triageBackoffDetails, TRIAGE_UNRELIABLE_BACKOFF, VerdictCacheWrites, type TriageDiagnostic, type VerdictCacheFailure } from './triage-backoff.ts';
 import { resolveGroundingDecide } from './grounding-decide.ts';
 import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_MIN_SEGMENTS, DEFAULT_RESCUE_CONTENT_TYPES, DEFAULT_RESCUE_CONFIG, type RescueConfig, type RescueVerdictLike } from './triage-rescue.ts';
@@ -247,6 +248,12 @@ function warnUnknownModelOnce(model: string): void {
  *
  * Pure function. Tested by `test/cycle/synthesize-chunker.test.ts`.
  */
+/** #7240: the skip reason for a transcript whose child could not be queued: `submit_failed (<code>): <message>`. */
+function submitFailedReason(e: unknown): string {
+  const code = e instanceof OperationError ? e.code : (e as { code?: unknown } | null)?.code;
+  return `submit_failed${typeof code === 'string' ? ` (${code})` : ''}: ${e instanceof Error ? e.message : String(e)}`;
+}
+
 export function splitTranscriptByBudget(
   content: string,
   contentHash: string,
@@ -866,6 +873,14 @@ async function runPhaseSynthesizeInner(
       // (adversarial finding). Coalesced rows are another run's bookkeeping
       // and must not be cancelled.
       const transcriptFreshIds: number[] = [];
+      const rollbackTranscriptChunks = async (): Promise<void> => {
+        for (const id of transcriptFreshIds) {
+          try { await queue.cancelJob(id); } catch { /* best-effort rollback */ }
+          if (childIds.includes(id)) childIds.splice(childIds.indexOf(id), 1);
+          jobRawSource.delete(id);
+          chunkInfo.delete(id);
+        }
+      };
       const prompts = chunks.map((chunk, i) => buildSynthesisPrompt(
         t, chunk, i, chunks.length, priorContradictionsBlock, config.outputRoot,
         buildTriageMapBlock(triageVerdict, chunk, chunks.length),
@@ -887,8 +902,8 @@ async function runPhaseSynthesizeInner(
         label: `synthesize:${basename(t.filePath)}`,
       });
       if (!spend.allowed) {
-        process.stderr.write(`[dream] synthesize budget: ${spend.reason}; deferring ${basename(t.filePath)} and the rest of this run\n`);
-        budgetExhaustedDeferrals.push(basename(t.filePath));
+        const alone = overBudgetAloneReason(spend, t.basename);
+        if (alone) skipReports.push({ filePath: t.filePath, reason: alone }); else { process.stderr.write(`[dream] synthesize budget: ${spend.reason}; deferring ${basename(t.filePath)} and the rest of this run\n`); budgetExhaustedDeferrals.push(basename(t.filePath)); }
         continue;
       }
       for (let i = 0; i < chunks.length; i++) {
@@ -961,18 +976,17 @@ async function runPhaseSynthesizeInner(
           // partial chunk set would write partial pages for a transcript the
           // skip report says was skipped.
           if (isQueueQuotaExceededError(e)) {
-            for (const id of transcriptFreshIds) {
-              try { await queue.cancelJob(id); } catch { /* best-effort rollback */ }
-              const idx = childIds.indexOf(id);
-              if (idx >= 0) childIds.splice(idx, 1);
-              jobRawSource.delete(id);
-              chunkInfo.delete(id);
-            }
+            await rollbackTranscriptChunks();
             skipReports.push({ filePath: t.filePath, reason: `admission_quota: ${e.message}` });
             quotaHit = true;
             break;
           }
-          throw e;
+          // #7240: one transcript whose child cannot be queued is skipped, never the phase: rethrowing cancelled every
+          // child already queued for the other transcripts. A lost connection or a cancellation still ends the phase.
+          if (opts.signal?.aborted || isRetryableConnError(e)) throw e;
+          await rollbackTranscriptChunks();
+          skipReports.push({ filePath: t.filePath, reason: submitFailedReason(e) });
+          break;
         }
         // Self-heal (#4152 C1): an idempotency-coalesced row still `waiting`
         // in a FOREIGN dream-inline-* queue was stranded by a previously
@@ -2240,6 +2254,13 @@ export function parseSynthV2Key(key: string): ParsedSynthV2Key | null {
   }
 }
 
+/** A transcript over the whole synthesis cap on its own is skipped (like oversize_after_split), never a deferral of the rest; null for a cumulative denial or a 0 cap. */
+function overBudgetAloneReason(spend: { estimatedCostUsd: number; budgetUsd: number }, name: string): string | null {
+  if (spend.budgetUsd <= 0 || spend.estimatedCostUsd <= spend.budgetUsd) return null;
+  process.stderr.write(`[dream] transcript ${name} alone is estimated at $${spend.estimatedCostUsd.toFixed(4)}, over the $${spend.budgetUsd.toFixed(2)} dream.synthesize.budget_usd cap; skipping it. Raise the cap or use a cheaper synthesis model.\n`);
+  return `over_budget_alone: $${spend.estimatedCostUsd.toFixed(4)} > $${spend.budgetUsd.toFixed(2)}`;
+}
+
 // ── Triage pass (#4152) — shared by the synthesize phase and dream retriage ──
 
 /**
@@ -2381,7 +2402,11 @@ export interface TriagePassResult {
  * `score` is non-null AND `triage_version === TRIAGE_VERSION` AND
  * `model === cfg.model` (switching models re-judges, bounded by maxMs) AND it
  * postdates `staleBefore` (when set) AND `force` is off. Legacy boolean-era
- * rows always miss. `maxChars`/`maxTokens` are deliberately NOT part of
+ * rows always miss. With the decide triage slot acting, the same tuple under
+ * `cfg.model` is also a hit for the decide path (triage-decide.ts, #7307), so
+ * a transcript today's triage judged is never re-sent to the decide provider.
+ * A chat_fallback_chain answer (`answeredBy`) is never stored, so it can't be
+ * a hit for either path. `maxChars`/`maxTokens` are deliberately NOT part of
  * validity — tuning them must not cold-restart the corpus; use
  * `gbrain dream retriage --force` to re-judge under new sampling knobs.
  *
@@ -2452,11 +2477,13 @@ export async function runTriagePass(
   const gate = (v: RescueVerdictLike, content: string) =>
     passesTriageGate(v, content, cfg.threshold, rescueCfg, cfg.decide?.gate);
 
+  // Shadow / inactive decide observes only transcripts today's triage judged this pass, never a cache hit.
+  const freshlyJudged = new Set<number>();
   const processOne = async (idx: number): Promise<void> => {
     const d = cfg.decide;
-    if (!d?.acting) { await processLlm(idx); if (d) await d.observe(transcripts[idx]); return; }
+    if (!d?.acting) { await processLlm(idx); if (d && freshlyJudged.has(idx)) await d.observe(transcripts[idx]); return; }
     const t = transcripts[idx];
-    const r = await d.triage(t, { triageVersion: TRIAGE_VERSION, force: cfg.force, staleBefore: cfg.staleBefore, signal: cfg.signal, budgetExhausted });
+    const r = await d.triage(t, { triageVersion: TRIAGE_VERSION, llmModel: cfg.model, force: cfg.force, staleBefore: cfg.staleBefore, signal: cfg.signal, budgetExhausted });
     if (!r.verdict) {
       if (r.deferred || judge) return processLlm(idx);
       reports[idx] = { filePath: t.filePath, worth: true, score: null, content_type: null, reasons: [r.reason ?? 'decide triage no-change'], cached: false };
@@ -2465,7 +2492,8 @@ export async function runTriagePass(
     if (r.cached) cacheHits++;
     else { judged++; if (cfg.shouldStop?.()) stopped = true; }
     byPath.set(t.filePath, r.verdict);
-    reports[idx] = { filePath: t.filePath, worth: gate(r.verdict, t.content).pass, score: r.verdict.score, content_type: r.verdict.content_type, reasons: r.verdict.reasons, cached: r.cached === true };
+    const g = gate(r.verdict, t.content);
+    reports[idx] = { filePath: t.filePath, worth: g.pass, ...(g.rescued ? { rescued: true, verified_segments: g.verified_segments } : {}), score: r.verdict.score, content_type: r.verdict.content_type, reasons: r.verdict.reasons, cached: r.cached === true };
   };
 
   const processLlm = async (idx: number): Promise<void> => {
@@ -2605,6 +2633,7 @@ export async function runTriagePass(
         reasons: triage.reasons,
         cached: false,
       };
+      freshlyJudged.add(idx);
     } catch (e) {
       // AIConfigError at chat time = provider auth/config went bad mid-run
       // (revoked key, recipe misconfig surfacing at first real call). Skip

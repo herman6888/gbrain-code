@@ -4,6 +4,7 @@ import { isQuarantined } from '../quarantine.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { preparationConfigView } from './config-snapshot.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { yieldToEventLoop } from './journal.ts';
 import { maintenanceAttribution } from './attribution.ts';
 import { storedCanonicalTimeline, unrecordedCanonicalTimeline } from './canonical-projections.ts';
 import { runMentionPass, type MentionPassResult } from '../mentions/pass.ts';
@@ -100,6 +101,9 @@ export const MANAGED_LINK_EXTRACTION_WIDTH = 4;
  * coordinated transaction, insert-only. This is the one managed extraction
  * path: sync, `extract --stale` (every caller of extractStaleFromDB) and the
  * PGLite owner delegation all run it, in the process that owns the brain.
+ * Each page yields to the event loop when it finishes: PGLite statements
+ * resolve as one microtask chain, so a long drain would otherwise hold every
+ * timer and in-process request until its last page.
  */
 export async function extractManagedStaleLinks(engine: BrainEngine,
   opts: { sourceId?: string; slugs?: readonly string[]; maxPages?: number; timeBudgetMs?: number; signal?: AbortSignal; mentions?: boolean } = {}): Promise<ManagedLinkExtraction> {
@@ -174,6 +178,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
         try {
           await derive(slug, sourceId, stamp, read);
           run.succeed();
+          await yieldToEventLoop();
         } catch (error) {
           try { failed.push({ ...run.fail(`${sourceId}:${slug}`, error), slug, source_id: sourceId, revision: read.revision }); } catch (stopped) {
             if (stopped !== error && !opts.sourceId) tripped.set(sourceId, stopped as OperationError);

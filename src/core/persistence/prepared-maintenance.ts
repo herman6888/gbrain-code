@@ -539,6 +539,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
   if (row.intent?.kind === 'managed_maintenance_restore_reextract_atom') return (await import('../repair/atoms-restore.ts')).prepareAtomRestore(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_retire_ghost_page') return (await import('../repair/ghost-pages.ts')).prepareGhostPageRetirement(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_file_drift_remove') return (await import('../repair/file-drift.ts')).prepareDriftFileRemoval(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_file_drift_detach') return (await import('../repair/file-drift.ts')).prepareDriftDetach(engine, row);
   if (row.intent?.kind === 'managed_maintenance_merge_legacy_twin') return (await import('../repair/legacy-twins.ts')).prepareLegacyTwinMerge(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_resolve_origin_twin') return (await import('../repair/origin-twins.ts')).prepareOriginTwinResolve(engine, row, config);
   if (row.intent?.kind !== 'managed_maintenance_consolidate') throw opError('invalid_params', 'Unsupported maintenance request.',

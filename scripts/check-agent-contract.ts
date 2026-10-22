@@ -275,7 +275,9 @@ const READ_ONLY_SUBCOMMANDS = new Set(['config get', 'sources list', 'sources st
   // #6661: [X12] --status takes no lock, makes no home dir and writes no receipt; it probes the serve over HTTP.
   'bootstrap harness --status',
   // #6803: the stale-extraction preview returns before any write and reports the terminal counts (actionable, mention_due).
-  'extract --stale --dry-run']);
+  'extract --stale --dry-run',
+  // #7179: per-page search state; reads page, chunk, budget and hold rows plus Git objects, writes nothing.
+  'pages status']);
 
 function tsFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];

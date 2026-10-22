@@ -139,6 +139,13 @@ export interface BatchOpts {
  */
 export interface TransactionOptions {
   signal?: AbortSignal;
+  /**
+   * GBRA-156: Postgres behind a transaction-mode pooler (transaction pipelining on) sends the transaction's first
+   * statement with BEGIN instead of a round trip later, when this accepts its text. If BEGIN fails that statement runs
+   * in autocommit, so pass only a test that accepts a read or a transaction-local set_config, never a write
+   * (`isPersistenceDeclaration`). Ignored by PGLite and inside a transaction.
+   */
+  pipelineFirst?: (statement: string) => boolean;
 }
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -325,6 +332,16 @@ export interface TakesListOpts extends PageReadPolicy {
   /** Per-token MCP allow-list. Server applies AND holder = ANY($takesHoldersAllowList) when set. */
   takesHoldersAllowList?: string[];
   sortBy?: 'weight' | 'since_date' | 'created_at';
+  /** With `sortBy: 'since_date'`, oldest first (default newest first). */
+  oldestFirst?: boolean;
+  /**
+   * Only takes made on or before this ISO date (YYYY-MM-DD): a take with no
+   * since_date is left out, and one in ISO form (YYYY-MM-DD, or YYYY-MM read as
+   * the 15th) after the date is left out; any other form is kept for the caller.
+   */
+  sinceOnOrBefore?: string;
+  /** Takes with no take_grade_cache row for this prompt version and judge come first. */
+  ungradedFirst?: { promptVersion: string; judgeModelId: string };
   limit?: number;
   offset?: number;
   /** Federated/source scope via the take's page.source_id. Array wins over

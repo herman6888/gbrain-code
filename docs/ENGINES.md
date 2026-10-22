@@ -780,10 +780,35 @@ Size the pooler for every process at once:
 
 ```
 long-running processes x GBRAIN_POOL_SIZE
-  + processes with GBRAIN_DIRECT_DATABASE_URL x GBRAIN_DIRECT_POOL_SIZE (default 3)
-  + one-shot commands running at the same time x their pool
+  + processes whose direct route lands on this pooler x their direct pool (see below)
+  + one-shot commands running at the same time x their pool (a full `gbrain sync` is one too)
+  + parallel import workers x 2 (an unmanaged sync of more than 100 files, `--workers N`, or the sync a serve runs)
   <= the pooler's client limit (Supabase Supavisor: the project's pool_size)
 ```
+
+The direct route lands on the pooler when `GBRAIN_DIRECT_DATABASE_URL` names it,
+and also when gbrain derives it from a Supabase pooler URL whose user does not
+name the project (`postgres.<ref>`): the derived route keeps the pooler host on
+port 5432, its session port, even when the main URL uses transaction mode
+(6543). Two long-running processes at the
+defaults (10 + 3 each) already pass a client limit of 25, so a scheduled
+`gbrain sync` next to a `gbrain serve` on the same session port can exhaust it.
+`GBRAIN_MAX_CONNECTIONS` caps a sync's worker fan-out to fit a budget.
+
+<a id="direct-pool-by-command"></a>The direct pool's size follows the command.
+`gbrain serve`, `gbrain jobs`, `gbrain autopilot` and `gbrain sync --watch`
+open up to 3 direct connections. A command that exits but owns writes or takes
+a lease (`sync`, `put`, `import`, `dream`, `cycle`, `sources`, `mcp`,
+`migrate-graduation`) and the diagnostics that report the route (`doctor`,
+`engine`) open 1. Every other command routes nothing through the direct pool:
+its statements use the ordinary pool, as with `GBRAIN_DISABLE_DIRECT_POOL=1`.
+Two exceptions keep the direct route for it: applying pending schema
+migrations (one connection, for the session advisory lock and the 30-minute
+statement timeout), and taking a lease such as an embed or extract lock
+(the command then opens 1, so the lease heartbeat keeps its own connection).
+`GBRAIN_DIRECT_POOL_SIZE` still sets the size wherever a direct pool opens.
+`GBRAIN_DIRECT_POOL_BY_COMMAND=0` restores the earlier behavior: every command
+may open the full 3-connection direct pool.
 
 When the sum does not fit, run fewer long-running processes (for example one
 shared `gbrain serve --http` instead of one stdio `serve` per agent session),

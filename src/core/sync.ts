@@ -721,7 +721,7 @@ export const SLUG_SEGMENT_PATTERN = new RegExp(`[${SLUG_WORD_CHARS}._\\-]+`, 'u'
 const SLUGIFY_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}.\\s_\\-]`, 'gu');
 
 export function slugifySegment(segment: string): string {
-  return segment
+  return foldSegmentHyphens(segment
     .normalize('NFD')                     // Decompose accented chars
     .replace(/[\u0300-\u036f]/g, '')      // Strip accent marks
     // #3700: Hebrew niqqud (vowel points) + cantillation are optional
@@ -739,9 +739,22 @@ export function slugifySegment(segment: string): string {
     .replace(SLUG_VARIATION_SELECTORS_RE, '')
     .toLowerCase()
     .replace(SLUGIFY_KEEP_RE, '')         // Keep alnum, dots, spaces, _-, and CJK (v0.32.7)
-    .replace(/[\s]+/g, '-')              // Spaces → hyphens
-    .replace(/-+/g, '-')                 // Collapse multiple hyphens
-    .replace(/^-|-$/g, '');              // Strip leading/trailing hyphens
+    .replace(/[\s]+/g, '-'));           // Spaces → hyphens
+}
+
+/** Collapse hyphen runs and strip leading/trailing hyphens: slugifySegment's last step. */
+function foldSegmentHyphens(segment: string): string {
+  return segment.replace(/-+/g, '-').replace(/^-|-$/g, '');
+}
+
+/**
+ * #7305: a slug with every segment's hyphen runs collapsed and its edge hyphens
+ * stripped, as slugifySegment does to a file name; null when nothing changes.
+ * put_page and capture refuse a new slug this changes, naming the result.
+ */
+export function hyphenFoldedSlug(slug: string): string | null {
+  const folded = slug.split('/').map(foldSegmentHyphens).join('/');
+  return folded === slug ? null : folded;
 }
 
 /**

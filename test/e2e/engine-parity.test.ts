@@ -1171,9 +1171,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
 
   // Chunkless-page safety net (embed --stale detection gap): a page with
   // non-empty content but zero content_chunks rows (e.g. a putPage-only
-  // write) must be found on BOTH engines identically, and quarantined /
-  // embed_skip pages (intentionally chunkless by design) must be excluded
-  // identically on both. Isolated under a dedicated source.
+  // write) must be found on BOTH engines identically, quarantined pages
+  // (chunkless by design) excluded and a chunkless embed_skip page with a
+  // body included (#7174) identically on both. Isolated under a dedicated source.
   test('chunkless-page-with-content detection: Postgres ↔ PGLite parity', async () => {
     const SRC = 'chunkless-parity';
     for (const eng of [pgEngine, pgliteEngine]) {
@@ -1193,20 +1193,20 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
         type: 'note', title: 'Quarantined', compiled_truth: 'junk content',
         frontmatter: { quarantine: { reason: 'junk_pattern', detail: 'parity fixture', assessed_at: new Date().toISOString() } },
       }, { sourceId: SRC });
-      // cp/skipped: chunkless BY DESIGN — must be excluded.
+      // cp/skipped: embed_skip with no chunk rows — included (#7174: writes keep its chunks since #6722).
       await eng.putPage('cp/skipped', {
         type: 'note', title: 'Skipped', compiled_truth: 'x'.repeat(500),
         frontmatter: { embed_skip: { reason: 'oversized', bytes: 500, assessed_at: new Date().toISOString() } },
       }, { sourceId: SRC });
     }
 
-    expect(await pgEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(1);
-    expect(await pgliteEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(1);
+    expect(await pgEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(2);
+    expect(await pgliteEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(2);
 
     const pgRows = await pgEngine.listChunklessPagesWithContent({ sourceId: SRC });
     const pgliteRows = await pgliteEngine.listChunklessPagesWithContent({ sourceId: SRC });
-    expect(pgRows.map(r => r.slug)).toEqual(['cp/stub']);
-    expect(pgliteRows.map(r => r.slug)).toEqual(['cp/stub']);
+    expect(pgRows.map(r => r.slug)).toEqual(['cp/stub', 'cp/skipped']);
+    expect(pgliteRows.map(r => r.slug)).toEqual(['cp/stub', 'cp/skipped']);
     expect(pgRows[0].compiled_truth).toBe('stub content, never chunked');
     expect(pgliteRows[0].compiled_truth).toBe(pgRows[0].compiled_truth);
 

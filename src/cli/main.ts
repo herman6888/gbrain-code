@@ -57,6 +57,8 @@ import { runCliPreflight } from '../core/cli-preflight.ts';
 import { isBooleanLiteral, isKnownOpFlag } from '../core/op-flag-tokens.ts';
 import { conceptNudge } from '../core/search/query-intent.ts';
 import { redactRetrievalOutput } from '../core/search/output-redaction.ts';
+import { formatSearchExact } from './search-exact-format.ts';
+import { routeCommand } from './command-route.ts';
 import type { CliOptions } from '../core/cli-options.ts';
 import { RemoteMcpError, extractResponseMeta } from '../core/remote-mcp-error.ts';
 import { assertSingleSourceScopeFlag, checkHostHonoredParams, hintAmbientNarrowing, type AmbientSourceBinding } from './source-scope.ts';
@@ -77,7 +79,9 @@ import {
   type CliDispatchContext,
 } from './command-table.ts';
 import { formatRememberResult } from './remember-format.ts';
-import { applyCliOpNotices, captureCapacityNotices, captureOpNotice, captureRetrievalNotices } from './op-notices.ts';
+import { formatEntityResult, markEntityMiss } from './entity-format.ts';
+import { applyCliOpNotices, captureCapacityNotices, captureOpNotice, captureRetrievalNotices, retrievalIncompleteLine } from './op-notices.ts';
+import { admitAcrossCliCalls } from '../core/notice-ledger.ts';
 import { searchTimingsDocument, searchTimingsLine, timeCliPhase } from './search-timings.ts';
 
 // db-availability loop: best-effort brain-id for the GBRAIN_DB_ACCESS marker,
@@ -252,20 +256,15 @@ function maybeEmitUpdateMarker(command: string): void {
       if (latest) {
         // notify mode honors a per-version snooze; auto mode ignores it.
         if (mode === 'notify' && isSnoozeActive(readSnooze(), latest, now)) return;
-        // The raw `UPGRADE_AVAILABLE <cur> <latest>` line is a MACHINE marker
-        // (parsed by the self-upgrade skill / MCP via parseMarker). A human at
-        // an interactive terminal should never see the token as the literal
-        // first line of output — so emit it only when stderr is NOT a TTY
-        // (agent harnesses capture stderr non-interactively and still get it).
-        // GBRAIN_FORCE_UPGRADE_MARKER=1 forces it for the rarer agent harness
-        // that allocates a PTY yet still parses the token. The human sentence
-        // prints on both.
-        if (!process.stderr.isTTY || process.env.GBRAIN_FORCE_UPGRADE_MARKER === '1') {
-          process.stderr.write(`UPGRADE_AVAILABLE ${VERSION} ${latest}\n`);
-        }
-        process.stderr.write(
-          `gbrain ${VERSION} -> ${latest} available. Run: gbrain self-upgrade\n`,
-        );
+        // One line, once per COVERAGE_NOTICE_WINDOW_MS across calls under
+        // GBRAIN_HOME (a newer latest prints at once, #7147). An agent harness
+        // (stderr not a TTY, or GBRAIN_FORCE_UPGRADE_MARKER=1 under a PTY) gets
+        // the raw `UPGRADE_AVAILABLE <cur> <latest>` MACHINE marker the
+        // self-upgrade skill parses; a human at a terminal gets the sentence.
+        if (!admitAcrossCliCalls(`upgrade_available|${VERSION}|${latest}`, 1)) return;
+        process.stderr.write(!process.stderr.isTTY || process.env.GBRAIN_FORCE_UPGRADE_MARKER === '1'
+          ? `UPGRADE_AVAILABLE ${VERSION} ${latest}\n`
+          : `gbrain ${VERSION} -> ${latest} available. Run: gbrain self-upgrade\n`);
       }
       return;
     }
@@ -359,13 +358,19 @@ async function main() {
     if (command !== 'hook') (await import('../core/ai/key-warnings.ts')).warnShadowedProviderKeys();
   }
 
-  const subArgs = args.slice(1);
-
   // DX alias: `ask` is a natural-language alias for `query`
   if (command === 'ask') {
     command = 'query';
   }
+  // #7191: `search --exact` -> search-exact, before any ranked-search flag is parsed (cli/command-route.ts).
+  const routed = routeCommand(command, args.slice(1));
+  command = routed.command;
+  const subArgs = routed.subArgs;
   dispatchedCommand = command;
+  {
+    const { directPoolProfileForCommand, setDirectPoolProfile } = await import('../core/direct-pool-profile.ts');
+    setDirectPoolProfile(directPoolProfileForCommand(command, subArgs));
+  }
 
   // Local patch 2026-06-11 — mark one-shot CLI processes so the facts
   // backstop routes absorb work to the durable jobs worker instead of the
@@ -728,6 +733,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
       );
       setCliExitVerdict(1);
     }
+    markEntityMiss(op.name, result);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     // v0.42.20.0 (codex D4): on error, set exitCode + return so the `finally`
@@ -824,6 +830,7 @@ async function runThinClientRouted(
     const output = formatResult(op.name, result, params);
     // Awaited delivery (#3423) — same contract as the local-engine path.
     if (output) await writeStdoutFinal(output);
+    markEntityMiss(op.name, result);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     if (e instanceof RemoteMcpError) {
@@ -1630,6 +1637,7 @@ export function formatResult(
       return pages.map((p) => formatVolunteeredPage(p)).join('\n') + '\n';
     }
     case 'get_page': return formatGetPage(result as Record<string, any>);
+    case 'search_exact': return formatSearchExact(result as Parameters<typeof formatSearchExact>[0]);
     case 'list_pages': {
       const pages = result as any[];
       if (pages.length === 0) return 'No pages found.\n';
@@ -1644,16 +1652,10 @@ export function formatResult(
     case 'search':
     case 'query': {
       const { results, meta } = redactRetrievalOutput(result as any[], lastRetrievalMeta);
-      const incompleteStages = Array.isArray(meta?.degraded)
-        ? [...new Set((meta.degraded as Array<{ stage?: string }>).map(d => d.stage)
-          .filter(stage => stage === 'vector_candidates_incomplete' || stage === 'projection_pending' || stage === 'projection_status_unknown'))]
-        : [];
-      const incompleteNotice = incompleteStages.length > 0
-        ? `Retrieval incomplete: ${incompleteStages.join(', ')}.\n`
-        : '';
       const answerId = typeof meta?.answer_id === 'string' ? meta.answer_id : undefined;
       if (answerId && results.length > 0) process.stderr.write(`answer: ${answerId} (rate with: gbrain rate ${answerId} 1-5)\n`);
       if (params.json === true) {
+        const incompleteNotice = retrievalIncompleteLine(meta);
         if (incompleteNotice) process.stderr.write(incompleteNotice);
         // --explain --json: the same per-row score_details object MCP `explain: true` returns.
         if (getCliOptions().explain) for (const r of results) r.score_details ??= require('../core/search/explain-formatter.ts').buildScoreDetails(r);
@@ -1675,7 +1677,7 @@ export function formatResult(
         // (autocut decision, `degraded: reranker_skipped (no_key)`) render.
         return formatResultsExplain(results, meta ?? undefined);
       }
-      return incompleteNotice + results.map(r =>
+      return retrievalIncompleteLine(meta) + results.map(r =>
         `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
     }
@@ -1773,38 +1775,7 @@ export function formatResult(
     }
     case 'entity': {
       if (process.argv.includes('--json')) break;
-      const r = result as any;
-      if (!r.found) {
-        const lines = [`No entity found. (${r.latency_ms}ms)${r.coverage && r.coverage.state !== 'complete' ? ` Mention coverage: ${r.coverage.state}, ${r.coverage.pending_pages} page(s) pending.` : ''}`];
-        if (Array.isArray(r.suggestions) && r.suggestions.length) {
-          lines.push('Did you mean:');
-          for (const s of r.suggestions) lines.push(`  ${s.slug} — ${s.title} [${s.create_safety}]`);
-        }
-        return lines.join('\n') + '\n';
-      }
-      const c = r.card;
-      const lines = [`${c.entity.title} (${c.entity.slug})${c.entity.type ? ` [${c.entity.type}]` : ''}  (${r.latency_ms}ms)`];
-      if (c.summary) lines.push(`  ${c.summary}`);
-      if (c.aka?.length) lines.push(`  aka: ${c.aka.join(', ')}`);
-      const lt = c.last_touched || {};
-      const touched = lt.updated_at || lt.last_retrieved_at || lt.last_timeline_date;
-      if (touched) lines.push(`  last touched: ${String(touched).slice(0, 10)}`);
-      if (c.open_threads?.length) {
-        lines.push('  open threads:');
-        for (const t of c.open_threads) lines.push(`    [${t.kind}] ${t.text}${t.date ? ` (${String(t.date).slice(0, 10)})` : ''}`);
-      }
-      if (c.edges?.length) {
-        lines.push('  edges:');
-        for (const e of c.edges) lines.push(`    ${e.direction === 'out' ? '→' : '←'} ${e.type} ${e.slug}`);
-      }
-      lines.push(`  backlinks: ${c.backlink_count} | active facts: ${c.active_fact_count}`);
-      if (c.referenced_by_count) lines.push(`  referenced by ${c.referenced_by_count} page(s):`, ...c.referenced_by.map((g: any) => `    ${g.canonical_type} (${g.total}): ${g.rows.map((x: any) => x.slug).join(', ')}${g.next ? ', ...' : ''}`));
-      if (c.coverage && c.coverage.state !== 'complete') lines.push(`  mention coverage: ${c.coverage.state}, ${c.coverage.pending_pages} page(s) pending`);
-      if (Array.isArray(r.suggestions) && r.suggestions.length) {
-        lines.push('  other matches:');
-        for (const s of r.suggestions) lines.push(`    ${s.slug} — ${s.title}`);
-      }
-      return lines.join('\n') + '\n';
+      return formatEntityResult(result);
     }
     case 'synthesize': {
       if (process.argv.includes('--json')) break;
@@ -2508,7 +2479,7 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
     const cfgJobs = loadConfig();
     if (isThinClient(cfgJobs)) {
       const jobsSub = args[0];
-      if (jobsSub === 'list' || jobsSub === 'get') {
+      if (jobsSub === 'list' || jobsSub === 'get' || jobsSub === 'wait') {
         const { runJobs } = await import('../commands/jobs.ts');
         await runJobs(null, args);
         return null;
@@ -2682,8 +2653,8 @@ async function connectCliOnlyEngine(command: string, args: string[]): Promise<Br
           return connectEngine();
         },
       });
-      const { runServe } = await import('../commands/serve.ts');
-      await runServe(degraded, args);
+      (await import('../core/serve-log.ts')).installServeLogSink({ http: args.includes('--http') });
+      await (await import('../commands/serve.ts')).runServe(degraded, args);
       return null; // serve doesn't disconnect
     }
     throw serveConnectError;
@@ -2871,50 +2842,7 @@ async function completeEngineStartup(engine: BrainEngine, opts: EngineConnectOpt
   // #5628: drop this host's markers of a retired managed epoch before any filesystem guard check. A one-shot read runs no guard check.
   if (!opts.oneShotRead) try { await (await import('../core/persistence/deactivation.ts')).cleanupRetiredManagedMarkers(engine); } catch { /* status reports pending markers */ }
 
-  // v0.27.1 (F3 fix): re-merge DB-plane config now that the engine is up.
-  // Flags like `embedding_multimodal` are user-mutable via `gbrain config set`
-  // (DB plane) and need to flow into the gateway after connect. Schema-sizing
-  // fields (embedding_dimensions etc.) keep their pre-connect file/env values
-  // — those drove initSchema and the merged config respects file/env first.
-  try {
-    const merged = await loadConfigWithEngine(engine, config);
-    if (merged) {
-      // #1475 — hand the merged config to makeContext instead of letting it
-      // re-derive one. See MERGED_CONFIG_BY_ENGINE: the op-side gates read
-      // ctx.config, and re-running the merge there would double this
-      // function's per-key config reads on every command (the cost #3980 is
-      // about). Keyed on the engine so a mounted brain cannot be served the
-      // host brain's merge.
-      MERGED_CONFIG_BY_ENGINE.set(engine, merged);
-      // Stash gate flags on process.env for downstream readers (import-file.ts
-      // dispatches on GBRAIN_EMBEDDING_MULTIMODAL, gates OCR on GBRAIN_EMBEDDING_IMAGE_OCR).
-      // The OCR *model* reaches the gateway via the re-configure below (#4107); its
-      // env stash stays so subprocesses re-fold it through loadConfig's env merge.
-      if (merged.embedding_multimodal !== undefined) {
-        process.env.GBRAIN_EMBEDDING_MULTIMODAL = String(merged.embedding_multimodal);
-      }
-      if (merged.embedding_image_ocr !== undefined) {
-        process.env.GBRAIN_EMBEDDING_IMAGE_OCR = String(merged.embedding_image_ocr);
-      }
-      if (merged.embedding_image_ocr_model !== undefined) {
-        process.env.GBRAIN_EMBEDDING_IMAGE_OCR_MODEL = merged.embedding_image_ocr_model;
-      }
-      // Always re-configure with merged values when DB merge succeeded. The
-      // trigger used to be field-name-gated (only when embedding_multimodal_model
-      // was set); that coupled the gate to the field set and would silently
-      // miss future DB-mutable gateway fields. One extra cache+shrinkState
-      // clear per startup is microseconds, no hot path.
-      (await import('../core/ai/gateway.ts')).configureGateway(buildGatewayConfig(merged));
-    }
-    // v0.31.12: re-resolve gateway defaults through resolveModel so
-    // `models.tier.*` and `models.default` overrides apply to expansion +
-    // chat. Per Codex F3 — configureGateway is sync; this is the async
-    // re-stamp seam after engine.connect() makes config reads possible.
-    const { reconfigureGatewayWithEngine } = await import('../core/ai/gateway.ts');
-    await reconfigureGatewayWithEngine(engine);
-  } catch {
-    // Non-fatal. Pre-v39 brains may not have a usable config table yet.
-  }
+  await (await import('./db-plane-config.ts')).mergeDbPlaneConfig(engine, config, MERGED_CONFIG_BY_ENGINE);
 
   // The one-time behavior-change disclosure on the CLI channel (stderr). `serve`
   // delivers it per MCP channel; `doctor` reads it without marking it shown.

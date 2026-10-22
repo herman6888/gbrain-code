@@ -12,8 +12,8 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { apiDeps, checkRecord, decide, PROFILES, writeDecision, type Commit, type JobRow, type FullRun, type ReuseDeps } from '../../scripts/ci-reuse.ts';
-import type { GitHubClient } from '../../scripts/lib/gh-issue.ts';
+import { apiDeps, attemptJobs, checkRecord, decide, PROFILES, writeDecision, type Commit, type JobRow, type FullRun, type ReuseDeps } from '../../scripts/ci-reuse.ts';
+import { GET_RETRY_DELAYS_MS, restClient, type GitHubClient } from '../../scripts/lib/gh-issue.ts';
 
 const REPO = 'owner-example/repo-example';
 const M = '1'.repeat(40);
@@ -234,6 +234,38 @@ describe('ci-reuse API layer', () => {
     expect(jobs.at(-1)!.name).toBe('full-suite');
     expect(paths.filter(p => p.startsWith('repos/{repo}/actions/runs/500/attempts/2/jobs'))).toHaveLength(2);
     expect((await api.artifact(500, 'full-suite-tree')).reason).toContain('cannot download');
+  });
+
+  test('a job listing that 502s at 100 per page after the client retries is read again at 30 per page (Release run 39712021085)', async () => {
+    const all = Array.from({ length: 109 }, (_, i) => ({ name: `job ${i}`, conclusion: 'success' }));
+    const urls: string[] = []; const slept: number[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(String(input)); urls.push(url.pathname + url.search);
+      const per = Number(url.searchParams.get('per_page')), page = Number(url.searchParams.get('page'));
+      if (per === 100) return new Response('<html>502 Bad Gateway</html>', { status: 502 });
+      return Response.json({ total_count: all.length, jobs: all.slice((page - 1) * per, page * per) });
+    }) as typeof fetch;
+    try {
+      const jobs = await attemptJobs(restClient('acme-example/repo', 'token-example', async ms => { slept.push(ms); }), 500, 2);
+      expect(jobs.map(j => j.name)).toEqual(all.map(j => j.name));
+    } finally { globalThis.fetch = realFetch; }
+    expect(slept).toEqual(GET_RETRY_DELAYS_MS);
+    expect(urls).toEqual([
+      ...Array(GET_RETRY_DELAYS_MS.length + 1).fill('/repos/acme-example/repo/actions/runs/500/attempts/2/jobs?per_page=100&page=1'),
+      ...[1, 2, 3, 4].map(page => `/repos/acme-example/repo/actions/runs/500/attempts/2/jobs?per_page=30&page=${page}`),
+    ]);
+  });
+
+  test('a job listing still refused at 30 per page, or refused with a client error, surfaces the error', async () => {
+    const refusing = (status: (per: number) => number): GitHubClient => ({
+      async request<T>(_m: string, path: string): Promise<T> {
+        const code = status(Number(new URL(path, 'https://x.invalid/').searchParams.get('per_page')));
+        throw Object.assign(new Error(`GitHub API GET ${path} -> ${code}`), { status: code });
+      },
+    });
+    await expect(attemptJobs(refusing(() => 502), 500, 2)).rejects.toThrow('per_page=30&page=1 -> 502');
+    await expect(attemptJobs(refusing(() => 404), 500, 2)).rejects.toThrow('per_page=100&page=1 -> 404');
   });
 });
 

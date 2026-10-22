@@ -158,7 +158,8 @@ const AGENT_RERUN_HEADROOM_MS = 10_000;
 /**
  * One check an entry could not finish within its budget, in the shared unknown convention. The fix reruns the
  * check alone with `--budget-ms N` (which `--only` makes its entry budget), N ten times the budget it ran out of:
- * the agent's while N fits an agent tool call (AGENT_TOOL_LIMIT_MS), else the user's to run in a terminal.
+ * the agent's while N fits an agent tool call (AGENT_TOOL_LIMIT_MS), else the user's to run in a terminal. When the agent's
+ * N is capped below ten times, the message also names the uncapped budget to use in a terminal if the capped rerun stops too.
  */
 export function budgetUnknownCheck(name: string, elapsedMs: number, budgetMs: number, limit: BudgetLimit = 'entry'): Check {
   const agentCap = AGENT_TOOL_LIMIT_MS - AGENT_RERUN_HEADROOM_MS;
@@ -169,8 +170,9 @@ export function budgetUnknownCheck(name: string, elapsedMs: number, budgetMs: nu
   const why = `Runs only this check with a ${n} ms budget, above the ${elapsedMs} ms it already took; read-only.`;
   return {
     name, status: 'warn', elapsed_ms: elapsedMs,
-    message: `Not finished within ${which}. Health is unknown, not clear; rerun this check alone: ${argv.join(' ')}`,
-    details: { health: 'unknown', reason: 'budget', limit, exact: false, elapsed_ms: elapsedMs, budget_ms: budgetMs, rerun_budget_ms: n },
+    message: `Not finished within ${which}. Health is unknown, not clear; rerun this check alone: ${argv.join(' ')}`
+      + (n < wanted ? ` (capped to fit an agent tool call; if it stops again, run it in a terminal with --budget-ms ${wanted})` : ''),
+    details: { health: 'unknown', reason: 'budget', limit, exact: false, elapsed_ms: elapsedMs, budget_ms: budgetMs, rerun_budget_ms: n, ...(n < wanted ? { terminal_budget_ms: wanted } : {}) },
     fix: n <= agentCap ? agentFix(argv, why, name)
       : { argv, consent: [], actor: 'user', requires_exclusive: false, why: `${why} It can run longer than an agent tool call, so run it in a terminal.` },
   };

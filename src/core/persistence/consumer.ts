@@ -21,7 +21,7 @@ import { runPersistenceEffects } from './effects.ts';
 import { settleNoopEmbeddingEffects, type NoopSettleCursor } from './embedding-noop-settle.ts';
 import { runCompactionPass } from './compaction-pass.ts';
 import { currentEmbeddingSignature } from '../embedding.ts';
-import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { isPersistenceDeclaration, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { isWriteErrorCode } from './types.ts';
 import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
 import { OperationError } from '../ops/contract.ts';
@@ -450,7 +450,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     // the lane is given up whatever `run` makes of the error (admission re-runs on the pool and may still succeed).
     let lost = false;
     const lend = async <R>(fn: (tx: BrainEngine) => Promise<R>): Promise<R> => {
-      try { return await conn.transaction!(fn); }
+      // GBRA-156: every lent body (single-write admission and publication, no lane order) opens with the declaration.
+      try { return await conn.transaction!(fn, { pipelineFirst: isPersistenceDeclaration }); }
       catch (error) { if (isConnectionLoss(error)) lost = true; throw error; }
     };
     try {

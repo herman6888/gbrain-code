@@ -14,6 +14,7 @@ import { appendFileSync, mkdirSync, statSync, writeFileSync, readFileSync } from
 import { dirname } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { gbrainPath } from '../config.ts';
+import { registerCleanup } from '../process-cleanup.ts';
 import { SYNC_ON_COMMIT_KEY } from '../sync-config-keys.ts';
 import { localHostId } from '../persistence/identity.ts';
 import {
@@ -185,9 +186,14 @@ export function startResidentNotifier(engine: BrainEngine, opts: ResidentNotifie
   const entry = { notifier, resident: opts.resident };
   active = entry;
   const stop = notifier.stop;
+  // GBRA-133 2b-d2: a termination signal the process does not own (SIGTERM/SIGHUP on serve, serve --http, the
+  // autopilot daemon) runs the cleanup pass and exits; stopping here releases the host's notifier lease first, so the
+  // next resident owns it at its first claim instead of after the lease expires. A SIGKILL still waits for expiry.
+  let deregisterCleanup = (): void => {};
   const wrapped: CommitNotifier = Object.assign(Object.create(Object.getPrototypeOf(notifier)), notifier, {
-    stop: async () => { if (active === entry) active = null; await stop(); },
+    stop: async () => { deregisterCleanup(); if (active === entry) active = null; await stop(); },
   });
+  deregisterCleanup = registerCleanup(`commit-notifier:${opts.resident}`, () => wrapped.stop());
   Object.defineProperties(wrapped, {
     enabled: { get: () => notifier.enabled }, owner: { get: () => notifier.owner }, decisions: { get: () => notifier.decisions },
   });

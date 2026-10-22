@@ -4,6 +4,7 @@
  * The first subcommand: `pages purge-deleted [--older-than HOURS|Nh|Nd] [--retry-parked] [--dry-run] [--json] [--yes]`.
  * `pages unsearchable` (#6696 B3) lists embedding-state rows; its body is pages-unsearchable.ts.
  * `pages ghosts [--source <id>] [--json]` (#6696 B5, pages-ghosts.ts) lists ghost pages, read-only.
+ * `pages status <slug...> [--source <id>] [--json]` (#7179, pages-status.ts) says whether each page is searchable and why, read-only.
  * Manual escape hatch alongside the autopilot purge phase. Hard-deletes pages
  * whose `deleted_at` is older than the cutoff; cascades to content_chunks,
  * page_links, chunk_relations via existing FKs.
@@ -125,6 +126,12 @@ Subcommands:
                                     chunkless_healable; embedded only via --state) with
                                     reason, chunks, bytes and each state's fix. --limit
                                     defaults to 50; complete:false means more rows exist.
+  status <slug...> [--source <id>] [--json]
+                                    Read-only: per page, whether search can find it (state,
+                                    searchable true|keyword|false), its chunks and vector-less
+                                    chunks, any large-page embedding hold or sync hold on its
+                                    file, whether the file is in the synced commit, why, and
+                                    the fix. A page that is not searchable still exits 0.
 
 Notes:
   Soft-delete a page via \`gbrain delete <slug> --force\`; restore via \`gbrain restore <slug> --force\`
@@ -143,6 +150,7 @@ export async function runPages(engine: BrainEngine, args: string[]): Promise<voi
     case 'purges': case 'unpurge': return (await import('./pages-purges.ts')).runPagePurges(engine, sub, args.slice(1));
     case 'unsearchable': return (await import('./pages-unsearchable.ts')).runPagesUnsearchable(engine, args.slice(1));
     case 'ghosts': return (await import('./pages-ghosts.ts')).runPagesGhosts(engine, args.slice(1));
+    case 'status': return (await import('./pages-status.ts')).runPagesStatus(engine, args.slice(1));
     case undefined:
       printUsage();
       return;

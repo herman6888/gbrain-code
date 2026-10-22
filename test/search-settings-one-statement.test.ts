@@ -53,6 +53,25 @@ describe('withSearchSettings', () => {
     expect(Connection.statementTimeoutChanges(statements[0]!.sql, statements[0]!.params)).toEqual([{ kind: 'set', local: true, ms: 8000 }]);
   });
 
+  test('top level: the read is sent behind the settings statement without waiting for its answer', async () => {
+    const sent: string[] = [];
+    let answer!: () => void;
+    const tx = { unsafe: (sql: string) => { sent.push(sql); return new Promise<unknown[]>(resolve => { answer = () => resolve([]); }); } } as never;
+    let readStarted = false;
+    const pending = withSearchSettings(tx, false, { jit: 'off' }, async () => { readStarted = true; return 'rows'; });
+    await Promise.resolve();
+    expect(readStarted).toBe(true);
+    expect(sent).toEqual(["SELECT set_config('jit', $1, true)"]);
+    answer();
+    expect(await pending).toBe('rows');
+  });
+
+  test('top level: a refused settings statement is the error raised, ahead of the read that failed behind it', async () => {
+    const tx = { unsafe: async () => { throw new Error('settings sentinel'); } } as never;
+    await expect(withSearchSettings(tx, false, { jit: 'off' }, async () => { throw new Error('current transaction is aborted'); })).rejects.toThrow('settings sentinel');
+    await expect(withSearchSettings(tx, false, { jit: 'off' }, async () => 'rows')).rejects.toThrow('settings sentinel');
+  });
+
   test("nested: reads the caller's values, sets its own, restores the caller's (fallback for an unloaded extension setting)", async () => {
     const { tx, statements } = recordingTx({ jit: 'on', 'hnsw.ef_search': null });
     let during = -1;

@@ -10,6 +10,7 @@
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
 import type { SyncOpts, SyncResult } from '../../../commands/sync.ts';
+import { reportJobProgress } from './job-progress.ts';
 
 /** The smallest worker lease the wall-clock sweep can use for a row without `lock_duration_ms` (the worker default). */
 const WORKER_LOCK_DEFAULT_MS = 30_000;
@@ -52,18 +53,31 @@ export async function planJobDrain(engine: BrainEngine, job: MinionJobContext, n
   return { opts: { drain: true, deadlineAtMs, lanes, ...(params.noBulk === true ? { noBulk: true } : {}) }, row: row ?? null, trusted };
 }
 
-/** Throttled best-effort progress for `jobs get` / MCP polling while the drain commits pages. Never throws into the sync. */
+/**
+ * Throttled best-effort progress for `jobs get` / MCP polling while the drain commits pages. Never throws into the sync.
+ * #7241: the sync's other phases (`resolve_repo`, `git_pull`, `full_import`, `import` with its checkpointed file count) are
+ * written too, on each phase change and at most every PROGRESS_EVERY_MS within one, so a classic sync's progress is not empty.
+ */
 export function jobDrainProgress(job: MinionJobContext, estimate: (remaining: number | null, processed: number, elapsedMs: number) => { rate_pages_per_min: number | null; eta_seconds: number | null }):
   { onProgress: NonNullable<SyncOpts['onProgress']>; flush(): Promise<void> } {
   const startedAt = Date.now();
   let index = 0, processed = 0, total: number | null = null, phase = 'managed_sync.start', lastAdvanceAt: string | null = null, wroteAt = 0;
+  let syncPhase: string | null = null, syncPhaseAt = 0;
   const snapshot = () => {
     const remaining = total === null ? null : Math.max(0, total - index);
     return { phase, index, total, processed, remaining, ...estimate(remaining, processed, Date.now() - startedAt), last_advance_at: lastAdvanceAt };
   };
   return {
     onProgress: event => {
-      if (!event.phase.startsWith('managed_sync.')) return;
+      if (!event.phase.startsWith('managed_sync.')) {
+        const now = Date.now();
+        if (event.phase === syncPhase && now - wroteAt < PROGRESS_EVERY_MS) return;
+        if (event.phase !== syncPhase) { syncPhase = event.phase; syncPhaseAt = now; }
+        wroteAt = now;
+        void reportJobProgress(job, { phase: event.phase, ...(typeof event.bankedFiles === 'number' ? { banked_files: event.bankedFiles } : {}),
+          started_at: new Date(syncPhaseAt).toISOString() });
+        return;
+      }
       phase = event.phase;
       if (typeof event.total === 'number') total = event.total;
       if (typeof event.bankedFiles === 'number') index = event.bankedFiles;

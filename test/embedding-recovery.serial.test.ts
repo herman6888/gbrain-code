@@ -1075,7 +1075,7 @@ for (const kind of backends) {
             let invalidation = false;
             const observe = (tx: BrainEngine): BrainEngine => new Proxy(tx, { get(inner, field) {
               if (field === 'executeRaw') return async (sql: string, params?: unknown[]) => {
-                if (sql.includes('UPDATE content_chunks cc')) invalidation = true;
+                if (sql.includes('UPDATE content_chunks cc') || sql.includes('AS last_id FROM (SELECT id FROM pages')) invalidation = true;
                 return inner.executeRaw(sql, params);
               };
               if (field === 'transaction') return (nested: (tx: BrainEngine) => Promise<unknown>) =>

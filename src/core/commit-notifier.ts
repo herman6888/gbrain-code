@@ -285,6 +285,18 @@ function snapshotSource(rt: Rt, now: number): NotifierSourceSnapshot {
     markers: rt.markers.map(m => ({ intent: m.intent, generation: m.generation })) };
 }
 
+/** Each source's wanted markers that no live queued job already covers; an unreadable marker table keeps the last read. */
+async function readOwedMarkers(opts: CommitNotifierOptions, guard: ReturnType<typeof notifierKit>['guard'], sources: Map<string, Rt>): Promise<void> {
+  const ids = [...sources.keys()];
+  const markers = ids.length ? await guard('reading wanted markers', () => opts.store.dueMarkers(ids), null) : [];
+  if (!markers) return;
+  const jobIds = markers.flatMap(m => m.job_id === null ? [] : [m.job_id]);
+  const live = jobIds.length ? await guard('reading queued sync jobs', () => opts.store.liveJobs(jobIds), new Set<number>()) : new Set<number>();
+  // A managed source never pulls: its pull markers (a push webhook) wait for gbrain sources refresh, not for this loop.
+  for (const rt of sources.values()) rt.markers = markers.filter(m => m.source_id === rt.sourceId && (m.job_id === null || !live.has(m.job_id))
+    && !(m.intent === 'pull' && rt.kind === 'managed'));
+}
+
 export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier {
   const { pollMs, quietMs, heartbeatMs, leaseMs, cap, now, pid, ownerId, forcePoll, setTimer, clearTimer, log, logOnce, guard, decisions, decide } = notifierKit(opts);
 
@@ -360,6 +372,7 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
   };
 
   const ownership = async () => {
+    if (stopped) return;
     const r = await guard('claiming the notifier lease', () => opts.store.claimLease({ hostId: opts.hostId, ownerId, kind: opts.resident, pid, leaseMs }), undefined);
     if (r === undefined) return;
     if (r === null) { leased = false; if (!owner) { owner = true; log(`owner of this host's notifier (${opts.resident})`); } return; }
@@ -531,15 +544,7 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
     if (wasNudged || firstPass || t - markersAt >= MARKER_SCAN_MS) {
       markersAt = t;
       firstPass = false;
-      const ids = [...sources.keys()];
-      const markers = ids.length ? await guard('reading wanted markers', () => opts.store.dueMarkers(ids), null) : [];
-      if (markers) {
-        const jobIds = markers.flatMap(m => m.job_id === null ? [] : [m.job_id]);
-        const live = jobIds.length ? await guard('reading queued sync jobs', () => opts.store.liveJobs(jobIds), new Set<number>()) : new Set<number>();
-        // A managed source never pulls: its pull markers (a push webhook) wait for gbrain sources refresh, not for this loop.
-        for (const rt of sources.values()) rt.markers = markers.filter(m => m.source_id === rt.sourceId && (m.job_id === null || !live.has(m.job_id))
-          && !(m.intent === 'pull' && rt.kind === 'managed'));
-      }
+      await readOwedMarkers(opts, guard, sources);
     }
     for (const job of [...running.values()]) {
       const st = opts.jobStatus(job.id);
@@ -577,11 +582,15 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
         if (nudgeTimer !== null) clearTimer(nudgeTimer);
         closeAllWatches();
       }
+      // Hand the lease over before settling: a stop on a termination signal has a short cleanup deadline, and a step
+      // still in flight re-checks the lease before any start (and claims nothing once stopped).
+      const release = () => owner && leased ? guard('releasing the notifier lease', () => opts.store.releaseLease(opts.hostId, ownerId), undefined) : undefined;
+      await release();
       if (inflight) {
         await settleWithin(inflight, STOP_SETTLE_MS);
         closeAllWatches();
+        await release();
       }
-      if (owner && leased) await guard('releasing the notifier lease', () => opts.store.releaseLease(opts.hostId, ownerId), undefined);
     },
   };
 }

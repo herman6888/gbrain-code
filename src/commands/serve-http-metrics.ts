@@ -28,6 +28,7 @@ import { persistenceConsumerStatus } from '../core/persistence/service.ts';
 import { readCheckpointBlockerMap, readTerminalFailureSummary, type TerminalSourceSummary, type TerminalSummary } from '../core/persistence/terminal-failures.ts';
 import { consumerRestartRequired, selfExitSuppressed, serveTransport, type ServeTransport } from './serve-health.ts';
 import { VERSION } from '../version.ts';
+import { serveBuild } from '../core/runtime-build.ts';
 import type { ServeHttpContext } from './serve-http.ts';
 
 export interface MetricsCounters {
@@ -368,7 +369,11 @@ export async function probeDeepHealth(
   return { ok: true, status: 200, body: { status: 'ok', deep: true, version, engine: engineName, probe_ms: Date.now() - started, pool: pool(), transport } };
 }
 
-/** GET /health: liveness only (full stats are the admin-only /admin/api/full-stats); `?deep=1` probes through the ordinary pool. */
+/**
+ * GET /health: liveness only (full stats are the admin-only /admin/api/full-stats); `?deep=1` probes through the ordinary pool.
+ * #7245: a 200 carries `build` (this serve's version and the version its install holds on disk now, never a path), so a
+ * serve that kept running an old build after an upgrade on disk says `restart_pending: true` while it stays healthy.
+ */
 export function mountHealth(app: Express, ctx: ServeHttpContext): void {
   const { engine, config } = ctx;
   // ---------------------------------------------------------------------------
@@ -380,7 +385,7 @@ export function mountHealth(app: Express, ctx: ServeHttpContext): void {
     const result = deep === '1' || deep === 'true'
       ? await probeDeepHealth(engine, config.engine || 'pglite', VERSION)
       : await probeLiveness(engine, config.engine || 'pglite', VERSION);
-    res.status(result.status).json(result.body);
+    res.status(result.status).json(result.ok ? { ...result.body, build: serveBuild() } : result.body);
   });
 }
 

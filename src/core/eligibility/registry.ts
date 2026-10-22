@@ -26,14 +26,14 @@ export type ReadTrustHandling = 'filtered' | 'labeled' | 'text_free';
 export const OP_READ_TRUST: Readonly<Record<string, ReadTrustHandling>> = {
   // memory verbs and retrieval
   recall: 'filtered', context_pack: 'filtered', delta: 'filtered',
-  search: 'filtered', query: 'filtered', get_page: 'filtered', fetch: 'filtered',
+  search: 'filtered', search_exact: 'filtered', query: 'filtered', get_page: 'filtered', fetch: 'filtered',
   get_chunks: 'filtered', get_timeline: 'filtered', takes_list: 'filtered', takes_search: 'filtered',
   assemble_evidence: 'filtered',
   entity: 'labeled', synthesize: 'labeled', think: 'labeled',
   search_by_image: 'labeled', list_pages: 'labeled', volunteer_context: 'filtered',
   get_versions: 'labeled', get_raw_data: 'labeled', resolve_slugs: 'labeled',
   get_recent_salience: 'labeled', find_anomalies: 'labeled', get_recent_transcripts: 'labeled',
-  find_orphans: 'labeled', traverse_graph: 'labeled', get_links: 'labeled', get_backlinks: 'labeled',
+  find_orphans: 'labeled', traverse_graph: 'labeled', get_links: 'labeled', get_backlinks: 'labeled', rank_entities: 'labeled',
   wanted_pages: 'labeled', get_tags: 'labeled', get_ingest_log: 'labeled',
   chronicle_day: 'labeled', chronicle_on_this_day: 'labeled', chronicle_since: 'labeled', chronicle_last_seen: 'labeled',
   ontology_get: 'labeled', ontology_dimensions: 'labeled', ontology_conflicts: 'labeled', volunteer_chronicle: 'labeled',

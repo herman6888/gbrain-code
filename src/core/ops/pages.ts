@@ -92,15 +92,15 @@ const get_page: Operation = {
   name: 'get_page',
   idempotent: true,
   outputRedaction: { exempt: 'explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)' },
-  description: 'Read a page by slug. To edit: include_content:true, send `content` to put_page; or edit_page. >256 KB: outline+window, then `next`.',
+  description: 'Read a page; `section` or `grep` reads one part. Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.',
   params: {
     slug: { type: 'string', description: 'Page slug.', required: true },
-    fuzzy: { type: 'boolean', description: 'Fuzzy slug match.' },
-    include_content: { type: 'boolean', description: 'Markdown + revision, to edit.' },
-    content_only: { type: 'boolean', description: 'Round-trip fields only.' },
+    fuzzy: { type: 'boolean', description: 'Fuzzy match.' },
+    include_content: { type: 'boolean', description: 'Markdown + revision.' },
+    content_only: { type: 'boolean', description: 'Round-trip fields.' },
     ...GET_PAGE_BODY_PARAMS,
     include_deleted: { type: 'boolean', description: 'Soft-deleted too.' },
-    include_timeline_entries: { type: 'boolean', description: 'Timeline rows too.' },
+    include_timeline_entries: { type: 'boolean', description: 'Timeline rows.' },
     grammar_diagnostics: { type: 'boolean', description: 'Also return every line-grammar finding for the page.', fullSurfaceOnly: true },
     source_id: { type: 'string', description: "One source, or '__all__'." },
     include_quarantined: { type: 'boolean', description: 'Admin: quarantined body.' },
@@ -705,12 +705,13 @@ const capture: Operation = {
   cliHints: { name: 'capture', hidden: true },
   handler: async (ctx, p) => {
     const { pageMutationSource, submitPageMutation } = await pageMutations();
-    pageMutationSource(ctx, p, 'capture');
+    const sourceId = pageMutationSource(ctx, p, 'capture');
     if (ctx.dryRun) {
       if (typeof p.slug === 'string') {
         validatePageSlug(p.slug);
         enforceClientSlugFence(ctx, p.slug, 'capture');
         enforceSubagentSlugFence(ctx, p.slug, 'capture');
+        await suffixedSlugDryRun(ctx, sourceId, p.slug, 'capture');
       }
       return { dry_run: true, action: 'capture', slug: p.slug };
     }

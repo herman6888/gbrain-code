@@ -164,6 +164,18 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * @default true
    */
   shared_types: boolean | Map<string, number[]>;
+  /**
+   * GBrain (#6930): the array types the first connection to a database fetched, shared with every later
+   * connection (of any pool given the same object), so only that first connection runs the pg_type query.
+   * @default null
+   */
+  array_types: { rows: Array<[number, number]> | null } | null;
+  /**
+   * GBrain (#6930): the pipeline depth on a connection its owner holds (sql.begin, sql.reserve) while every statement
+   * in flight leaves it inside a transaction; used when above max_pipeline (a transaction-mode pooler's 0).
+   * @default 0
+   */
+  transaction_pipeline: number;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;
   keep_alive: number | null;
@@ -764,6 +776,12 @@ declare namespace postgres {
 
     begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
     begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
+    /**
+     * GBrain (#6930): with transaction_pipeline in force, the first statement `first` accepts (its text, `$n` for
+     * parameters) is sent behind BEGIN before BEGIN's answer. If BEGIN fails it runs in autocommit, so `first` must
+     * accept only a read or a transaction-local set_config, never a write.
+     */
+    begin<T>(options: { mode?: string; first?: (statement: string) => boolean }, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
 
     reserve(options?: { signal?: AbortSignal }): Promise<ReservedSql<TTypes>>
   }

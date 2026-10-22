@@ -65,7 +65,16 @@ describe('self-upgrade marker on a real invocation', () => {
     writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
     const { stderr } = runGbrain('notify');
     expect(stderr).toContain(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
-    expect(stderr).toContain('Run: gbrain self-upgrade');
+    expect(stderr).not.toContain('Run: gbrain self-upgrade');
+  });
+
+  test('#7147: one banner per window across calls; a newer latest prints again at once', () => {
+    writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
+    const banners = (stderr: string) => stderr.split('\n').filter(line => line.startsWith('UPGRADE_AVAILABLE') || line.includes('available. Run: gbrain self-upgrade'));
+    expect(banners(runGbrain('notify').stderr)).toEqual([`UPGRADE_AVAILABLE ${VERSION} 0.99.0`]);
+    expect(banners(runGbrain('notify').stderr)).toEqual([]);
+    writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.1`);
+    expect(banners(runGbrain('notify').stderr)).toEqual([`UPGRADE_AVAILABLE ${VERSION} 0.99.1`]);
   });
 
   test('off mode → no marker (update checks disabled)', () => {

@@ -159,7 +159,7 @@ describe('serve-sync-runner delegated jobs', () => {
     expect(await engine.getPage('topics/alpha')).not.toBeNull();
   }, 60_000);
 
-  test('single-flight: a different token while running answers busy with the jobId', () => {
+  test('single-flight: a different token while running answers busy with the jobId', async () => {
     const first = startDelegatedSync(engine, { noPull: true, timeoutSeconds: 60, sourceId: 'default' }, 'token-a');
     expect(first.ok).toBe(true);
     // Same tick — the async job body has not settled, so the guard must hold.
@@ -167,7 +167,10 @@ describe('serve-sync-runner delegated jobs', () => {
     expect(second.ok).toBe(false);
     expect(second.error).toBe('busy');
     expect(second.jobId).toBe(first.jobId);
-  });
+    // The job shares this file's engine and the 'default' source row: left running, it reads a later test's
+    // local_path and imports that test's repo into the shared brain.
+    await waitForTerminal(first.jobId!);
+  }, 60_000);
 
   test('clientToken attach: running retry returns the SAME job; terminal retry returns completed', async () => {
     const first = startDelegatedSync(engine, { noPull: true, timeoutSeconds: 60, sourceId: 'default' }, 'token-attach');

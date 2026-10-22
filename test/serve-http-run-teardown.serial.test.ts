@@ -54,14 +54,14 @@ test('SIGINT shutdown closes the resolve-IPC socket and deregisters every cleanu
     const baseline = _registeredCleanupCountForTests();
     const done = runServeHttp(engine, { port: 0, tokenTtl: 3600, enableDcr: false });
     let socketPath: string | undefined;
-    for (let i = 0; i < 200 && (socketPath === undefined || _registeredCleanupCountForTests() < baseline + 3); i++) {
+    for (let i = 0; i < 200 && (socketPath === undefined || _registeredCleanupCountForTests() < baseline + 4); i++) {
       socketPath ??= lines.map(l => /Resolve IPC: (\S+)/.exec(l)?.[1]).find(Boolean);
       await Bun.sleep(25);
     }
     expect(socketPath, `resolve-IPC path not logged; stderr:\n${lines.join('\n').slice(-2000)}`).toBeDefined();
     expect(existsSync(socketPath!)).toBe(true);
-    // http-server (lifecycle), resolve-ipc-close and pglite-engine-disconnect.
-    expect(_registeredCleanupCountForTests()).toBe(baseline + 3);
+    // http-server (lifecycle), resolve-ipc-close, pglite-engine-disconnect and the resident notifier's lease release.
+    expect(_registeredCleanupCountForTests()).toBe(baseline + 4);
 
     process.emit('SIGINT');
     await done;

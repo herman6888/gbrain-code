@@ -117,7 +117,7 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
       result = await performSync(engine, {
         repoPath, sourceId, noPull, noEmbed, noExtract, signal,
         ...plan.opts,
-        ...(plan.opts.drain ? { onProgress: progress.onProgress } : {}),
+        onProgress: progress.onProgress,
         // #6712 PR 1: the job drains under the source's drain lease; a busy lease is the skip below.
         drainHolder: { kind: 'job', id: String(job.id) },
         concurrency: concurrencyOverride,

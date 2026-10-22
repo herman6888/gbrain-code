@@ -18,7 +18,12 @@
  * `SELECT set_config(...), set_config(...)`: each separate statement was a
  * round trip in series with the query, about 30 ms each to a remote pooler.
  * At the top level nothing is read first or restored after: `set_config(...,
- * true)` ends with the transaction. Inside a caller's transaction the read
+ * true)` ends with the transaction, and the read is sent behind the settings
+ * statement without waiting for its answer (one round trip for both: the
+ * transaction pins its connection, the driver sends in order and budgets the
+ * read by the `statement_timeout` it just sent). A failed settings statement
+ * aborts the transaction, so the read fails behind it and the settings error
+ * is the one raised. Inside a caller's transaction the read
  * runs in a savepoint, and a released savepoint keeps the settings, so one
  * statement reads the caller's values first and one restores them after; a
  * failed read rolls the savepoint back, which reverts them too.
@@ -77,8 +82,14 @@ export async function withSearchSettings<T>(
   if (keys.length === 0) return run();
   const previous = nested ? (await tx.unsafe(currentSettingsStatement(keys)))[0] as Record<string, string | null> : undefined;
   const set = searchSettingsStatement(settings);
-  await tx.unsafe(set.sql, set.params);
-  const result = await run();
+  const applied = tx.unsafe(set.sql, set.params);
+  if (previous) await applied;
+  else applied.catch(() => undefined);
+  const result = await run().catch(async error => {
+    await applied;
+    throw error;
+  });
+  await applied;
   if (previous) {
     const restore = searchSettingsStatement(Object.fromEntries(keys.map(name => [name, previous[name] ?? fallback[name] ?? ''])));
     await tx.unsafe(restore.sql, restore.params);

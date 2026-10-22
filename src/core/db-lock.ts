@@ -24,6 +24,7 @@
 import { hostname } from 'os';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
+import { noteDirectPoolLease } from './direct-pool-profile.ts';
 
 export interface DbLockHandle {
   id: string;
@@ -266,6 +267,7 @@ export async function tryAcquireDbLock(
       RETURNING id, extract(epoch from acquired_at)::text AS fence
     `;
     if (rows.length === 0) return null;
+    noteDirectPoolLease();
     // The UUID is the fence; the epoch text rides on the handle for
     // diagnostics (migration-orchestration-lock.ts reports it when a lease
     // is lost) and is never compared (#6028).

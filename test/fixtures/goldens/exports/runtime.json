@@ -359,6 +359,7 @@
         "readPageSnapshot",
         "readPageSnapshotsBatch",
         "readSegmentTexts",
+        "readTransaction",
         "reconnect",
         "refreshPageBody",
         "registerBeforeDisconnect",

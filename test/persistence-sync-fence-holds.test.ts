@@ -355,6 +355,28 @@ test('a manifest with one fixable fence, one unfixable fence and clean files: th
   expect((await s.sync()).status).toBe('up_to_date');
 }), 180_000);
 
+test('forced probe: the Git effect commits the normalized file before it records the commit, while the next round starts; the pass still ends on its stamp', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A'), 'people/fixable.md': fixable() }, {}, true);
+  const head = git(s.root, 'rev-parse', 'HEAD');
+  // The effect's commit is on disk but its row is not yet committed (`effect:git:mid`) when the pass's next round starts.
+  const committed = Promise.withResolvers<void>(), done = Promise.withResolvers<void>();
+  const { installFaultHook } = await import('../src/core/persistence/fault-points.ts');
+  installFaultHook(async (point, detail) => {
+    if (point === 'effect:git:mid' && detail.sourceId === s.id) { committed.resolve(); await Promise.race([done.promise, Bun.sleep(20_000)]); }
+    if (point === 'sync:round_start' && detail.sourceId === s.id && (detail.round ?? 1) > 1) await Promise.race([committed.promise, Bun.sleep(20_000)]);
+  });
+  let result: SyncResult;
+  try { result = await s.sync(); } finally { done.resolve(); installFaultHook(undefined); }
+  expect(result).toMatchObject({ status: 'first_sync', added: 2 });
+  expect(git(s.root, 'log', '-1', '--format=%s')).toBe('gbrain: persist canonical memory update');
+  expect(await s.lastCommit()).toBe(head);
+  // As without the race: the next sync reads gbrain's own commit as a no-op; the one after is up to date.
+  const again = await s.sync();
+  expect(again).toMatchObject({ added: 0, modified: 0 });
+  expect(again.fences_normalized).toBeUndefined();
+  expect((await s.sync()).status).toBe('up_to_date');
+}), 180_000);
+
 test('dry run lists the file it would normalize beside the hold and leaves every file byte-identical', () => each(async engine => {
   const s = await source(engine, { 'people/fixable.md': fixable(), 'people/malformed.md': MALFORMED, 'notes/ok.md': note('Ok') });
   const before = readFileSync(join(s.root, 'people/fixable.md'), 'utf8');

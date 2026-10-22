@@ -1102,6 +1102,7 @@
         "thinClientRoutedSubcommands": [
           "list",
           "get",
+          "wait",
           "stats"
         ]
       },

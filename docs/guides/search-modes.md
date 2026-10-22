@@ -12,6 +12,8 @@ Two decisions shape every gbrain lookup, and this guide covers both:
 
 To see how a specific result was ranked, or why an expected page is missing,
 see [Explaining search results](search-explain.md).
+To find every page containing a literal phrase or identifier (what you would
+otherwise grep for), use [exact search](exact-search.md): `gbrain search --exact`.
 
 ## The three mode bundles
 

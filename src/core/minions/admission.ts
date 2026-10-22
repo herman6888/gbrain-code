@@ -60,12 +60,13 @@ export const WAITING_TTL_DEFAULT_HOURS: Readonly<Record<string, number>> = {
 export const QUOTA_MAX_WAITING_DEFAULT: Readonly<Record<string, number>> = {};
 
 /**
- * Keys excluded from the param hash. ONLY the hash's own storage key:
- * `__owner_client_id` is deliberately INCLUDED so coalescing never crosses
- * owner lanes — one OAuth client's submit must not be suppressed by (or
- * handed a job id owned by) another client.
+ * Keys excluded from the param hash: the hash's own storage key and the
+ * `__submitter` display label (`job-insight.ts`), so a re-submit from another
+ * local process still coalesces. `__owner_client_id` is deliberately INCLUDED
+ * so coalescing never crosses owner lanes — one OAuth client's submit must not
+ * be suppressed by (or handed a job id owned by) another client.
  */
-export const PARAM_HASH_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['__param_hash']);
+export const PARAM_HASH_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['__param_hash', '__submitter']);
 
 /**
  * error_text prefix stamped by the waiting-TTL sweep. The 24h-cancellation

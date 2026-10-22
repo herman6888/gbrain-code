@@ -15,6 +15,7 @@ import type { CompanyBrainPlan, InspectionEntry } from './types.ts';
 import type { SourceIngestionCheckpoint } from './receipts.ts';
 import { companyBrainProfile, companyBrainPolicyFingerprint, type CompanyBrainProfile } from './policy.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { syncDispatchRow } from '../sync-dispatch-read.ts';
 export { companyBrainProfile, type CompanyBrainProfile } from './policy.ts';
 
 function statusFix(sourceId: string): Action {
@@ -27,7 +28,9 @@ function resumeCommand(sourceId: string): string {
 
 export async function getCompanyBrainProfile(engine: BrainEngine, sourceId: string): Promise<CompanyBrainProfile | null> {
   // The receipt a source without a policy is checked for (of the source's current incarnation) is read beside it.
-  const [[source], [receipt]] = await Promise.all([engine.executeRaw<{ config: unknown; incarnation: string }>('SELECT config,incarnation FROM sources WHERE id=$1', [sourceId]),
+  // GBRA-133: inside a CLI sync's routing scope the source's routing row answers both (sync-dispatch-read.ts).
+  const routing = await syncDispatchRow(engine, sourceId);
+  const [[source], [receipt]] = routing ? [routing.id === null ? [] : [routing], routing.company_receipt ? [true] : []] : await Promise.all([engine.executeRaw<{ config: unknown; incarnation: string }>('SELECT config,incarnation FROM sources WHERE id=$1', [sourceId]),
     engine.executeRaw(`SELECT r.id FROM source_ingestion_receipts r JOIN sources s ON s.id=r.source_id AND s.incarnation=r.source_incarnation
       WHERE r.source_id=$1 AND r.profile='company-brain' LIMIT 1`, [sourceId])]);
   if (!source) return null;

@@ -40,6 +40,7 @@ import { currentRunDeadline, lastForwardProgressAt, noteForwardProgress } from '
 import { faultPoint } from './fault-points.ts';
 import { MANAGED_SYNC_PASS_OP } from './sync-pass-row.ts';
 import { VERSION } from '../../version.ts';
+import { LEASE_BEACON_QUEUE } from '../minions/protected-names.ts';
 
 export const DRAIN_LEASE_TTL_MINUTES = 2;
 export const DRAIN_LEASE_REFRESH_MS = 20_000;
@@ -49,7 +50,7 @@ export const LEASE_RETRY_AFTER_MS = 60_000;
 /** A follower stops this long before its watchdog would (or half its window, when the window is shorter). */
 const FOLLOW_MARGIN_MS = 30_000;
 /** The minion queue of the holder records (also the beacon older binaries' `liveSyncJob` sees); no worker serves it. */
-export const LEASE_BEACON_QUEUE = 'gbrain-drain-lease';
+export { LEASE_BEACON_QUEUE };
 /** A holder with no commit and no cursor save for this long is wedged (the in-pass governor's no-progress window). */
 export const HOLDER_STALL_MS = 5 * 60_000;
 /** How often a following run prints the holder's progress: on a terminal, and otherwise. */
@@ -65,8 +66,12 @@ export interface DrainHolder { kind: DrainHolderKind | 'unknown'; id: string | n
   version: string | null; progress: DrainHolderProgress | null }
 /** `safe_to_loop` and `retry_after_ms` are the `next` fields of the drain's other owner stops (`owner_wedged_here`). */
 export interface DrainLeaseHeld { code: typeof SYNC_DRAIN_LEASE_HELD; holder: DrainHolder | null; retry_after_ms: number; safe_to_loop: true; lost?: true; fix: Action }
-/** `tailClear`: a pass under this lease read that no tail is owed, and nothing under it owed one since (`withSyncTail` reads none). */
-interface DrainLease { lockId: string; sourceId: string; token: string; signal: AbortSignal; tailClear?: boolean }
+/**
+ * `tailClear`: a pass under this lease read that no tail is owed, and nothing under it owed one since (`withSyncTail` reads none).
+ * `idleClear` (GBRA-133): the last pass under this lease was an idle tick whose pin read no hold, no hold summary, no
+ * recorded failure of the source and no owed tail, so the settles that only act on those (sync-idle-skips.ts) have nothing to do.
+ */
+interface DrainLease { lockId: string; sourceId: string; token: string; signal: AbortSignal; tailClear?: boolean; idleClear?: boolean }
 
 const leases = new AsyncLocalStorage<ReadonlyMap<string, DrainLease>>();
 
@@ -103,8 +108,9 @@ export async function readDrainHolder(engine: BrainEngine, sourceId: string): Pr
 }
 
 /**
- * The source's managed-sync commits since `since`, and its last commit, cursor save or (#6712 PR 4b, design v3.2 §3.7)
- * pass row write at all: a pass writes its row at the pin, per batch and at the stamp.
+ * The source's managed-sync commits since `since`, and its last commit, cursor save, (#6712 PR 4b, design v3.2 §3.7)
+ * pass row write or (#7327) hold write at all: a pass writes its row at the pin, per batch and at the stamp, and every
+ * hold it writes or re-screens touches the source's hold summary row, so a pass screening only holds is progressing.
  */
 async function holderProgress(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, since: Date | null): Promise<DrainHolderProgress> {
   const [row] = await engine.executeRaw<{ committed: number | string; last_committed_at: Date | string | null; last_saved_at: Date | string | null }>(`
@@ -113,7 +119,8 @@ async function holderProgress(engine: Pick<BrainEngine, 'executeRaw'>, sourceId:
       (SELECT max(r.completed_at) FROM persistence_requests r WHERE r.worktree_id=b.worktree_id AND r.source_incarnation=b.source_incarnation
         AND r.state='committed' AND COALESCE(r.intent->>'kind','') LIKE 'managed_sync_%') AS last_committed_at,
       GREATEST((SELECT max(c.updated_at) FROM op_checkpoints c WHERE c.op='managed-sync' AND c.completed_keys->0->>'sourceId'=$1),
-        (SELECT c.updated_at FROM op_checkpoints c WHERE c.op=$3 AND c.fingerprint=b.source_id||':'||b.source_incarnation::text)) AS last_saved_at
+        (SELECT c.updated_at FROM op_checkpoints c WHERE c.op=$3 AND c.fingerprint=b.source_id||':'||b.source_incarnation::text),
+        (SELECT c.updated_at FROM op_checkpoints c WHERE c.op='sync-hold-summary' AND c.fingerprint=b.source_id||':'||b.source_incarnation::text)) AS last_saved_at
     FROM persistence_source_bindings b WHERE b.source_id=$1`, [sourceId, (since ?? new Date(0)).toISOString(), MANAGED_SYNC_PASS_OP]);
   const at = (value: Date | string | null | undefined) => value == null ? null : new Date(value).toISOString();
   const committedAt = at(row?.last_committed_at), savedAt = at(row?.last_saved_at);
@@ -121,7 +128,7 @@ async function holderProgress(engine: Pick<BrainEngine, 'executeRaw'>, sourceId:
     last_progress_at: [committedAt, savedAt].filter((value): value is string => !!value).sort().pop() ?? null };
 }
 
-/** A holder that has held the lease, and made no commit or cursor save, for `HOLDER_STALL_MS`. */
+/** A holder that has held the lease, and made no commit, cursor save or hold write, for `HOLDER_STALL_MS`. */
 export function holderStalled(holder: DrainHolder | null, now = Date.now()): boolean {
   if (!holder?.started_at || !holder.progress) return false;
   const since = Math.max(Date.parse(holder.started_at), holder.progress.last_progress_at ? Date.parse(holder.progress.last_progress_at) : 0);

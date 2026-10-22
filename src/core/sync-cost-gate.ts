@@ -149,7 +149,7 @@ function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
  * cost paid a few seconds early — a tighter cap would frequently fall back to
  * local HEAD and underestimate the remote delta).
  */
-function resolveEstimateTarget(localPath: string): { target: string; detached: boolean } | null {
+function resolveEstimateTarget(localPath: string, noPull = false): { target: string; detached: boolean } | null {
   let head: string;
   try {
     head = git(localPath, ['rev-parse', 'HEAD']);
@@ -165,7 +165,9 @@ function resolveEstimateTarget(localPath: string): { target: string; detached: b
   } catch {
     branch = null;
   }
-  if (branch && branch !== 'HEAD' && hasOriginRemote(localPath)) {
+  // GBRA-133 2b.3: a --no-pull run syncs local HEAD and never fetches, so its estimate prices local HEAD and the gate
+  // spends no network round trip (a fetch can take the shared 30 s git budget on a slow or unreachable remote).
+  if (!noPull && branch && branch !== 'HEAD' && hasOriginRemote(localPath)) {
     try {
       // v0.42.42.0 (#2139): route through the SSRF-hardened fetch (same flags +
       // no-prompt env as pullRepo) — a cost preview / dry-run must NOT hit a
@@ -233,7 +235,7 @@ export function estimateInlineNewTokens(
     chunker_version: string | null;
   }>,
   currentChunkerVersion: string,
-  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean; metafilePages?: MetafilePagesMode } = {},
+  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean; noPull?: boolean; metafilePages?: MetafilePagesMode } = {},
 ): InlineEstimate {
   let tokens = 0;
   let changedSources = 0;
@@ -286,7 +288,7 @@ export function estimateInlineNewTokens(
       continue;
     }
 
-    const resolved = resolveEstimateTarget(localPath);
+    const resolved = resolveEstimateTarget(localPath, opts.noPull === true);
     if (!resolved) {
       // HEAD unresolvable (not a git repo / gone) — can't compute a delta. CEILING.
       ceiling(localPath, strategy, 'git_unavailable');
@@ -408,6 +410,8 @@ interface CostGateContext {
   yesFlag: boolean;
   full: boolean;
   includeGitignored?: boolean;
+  /** The run will not pull: estimate against local HEAD without fetching. */
+  noPull?: boolean;
   /** Message prefix ('sync --all' | 'sync'). */
   label: string;
   /** Public queue capability resolved at the command boundary. */
@@ -551,6 +555,7 @@ export async function runInlineCostGate(
   // ── Inline path ───────────────────────────────────────────────
   const inline = estimateInlineNewTokens(sources, chunkerStamp(), {
     forceFullTree: ctx.includeGitignored === true,
+    noPull: ctx.noPull === true,
     chunkerDriftWalks: full === true || !(await readManagedMode(engine).catch(() => false)),
     metafilePages: await readMetafilePagesMode(engine),
   });

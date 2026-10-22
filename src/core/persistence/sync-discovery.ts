@@ -20,6 +20,7 @@ import { isWriteTargetContained } from '../path-confine.ts';
 import { getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { unboundBindCommand } from './unbound-source.ts';
 import { localHostId } from './identity.ts';
+import { ownerUnavailableReason } from './owner-refusal.ts';
 import { sha256 } from './digest.ts';
 import { isWindowsColonTarget } from './native-file-target.ts';
 import { ERROR_CATALOGUE } from '../error-catalogue.ts';
@@ -50,7 +51,7 @@ export interface SyncEntry { path: string; sourcePath: string; action: 'import' 
   prescreened?: true;
   /** #6712 PR 1: the page moved since its last recorded import (or has no record); imported only when the freeze proves it a no-op, else held `file_drift`. */
   drift?: SyncDriftSide;
-  /** #6712: for `both`, the blob the last recorded import left on disk; the freeze imports when the page still holds what that blob imports. */
+  /** #6712: for `both`, the blob the last recorded import left on disk; #7338: for `unknown`, the file at the baseline commit. The freeze imports when the page still holds what that blob imports. */
   driftBaseline?: string;
   /** #6727: live pages with no recorded origin whose slugs fold to this file's slug, several or one the importer cannot write; the freeze holds it `legacy_slug_conflict`. */
   legacySlugs?: string[];
@@ -231,12 +232,17 @@ export async function resolveManagedSyncContext(engine: BrainEngine, opts: SyncO
       binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path) {
     // #6449: a rooted source with no owner at all is the database-only one activation listed; the exit is a deliberate claim.
     const unbound = source && !source.archived && !binding && source.local_path && source.config?.kind == null;
+    // #7239: a missing, archived or re-registered source, or a checkout another host id owns, refuses the same way on every
+    // retry from this host, so a sync job ends at once; a transfer or clone in progress can finish, so it stays retryable.
+    const reason = source && !source.archived ? ownerUnavailableReason(binding, source.incarnation, localHostId()) : null;
+    const deterministic = !source || source.archived || (reason !== null && reason !== 'transfer_in_progress' && reason !== 'clone_in_progress');
     throw opError('owner_unavailable', 'Sync must run on the active registered worktree owner.',
       unbound
         ? `Source ${sourceId} has a checkout path (${source.local_path}) but no canonical owner, so it is database-only and there is no checkout to sync; nothing changed. `
           + `To make this host its owner (a brain-wide change: ask the user first), preview with gbrain sources writer claim ${sourceId} --path ${source.local_path} --dry-run --json, then ${unboundBindCommand(sourceId, source.local_path)}; afterwards run gbrain sync --no-pull --source ${sourceId}.`
         : `Source ${sourceId} is archived, re-registered, or not bound to an active worktree owned by this host. Run its sync on the owner host that gbrain sources writer status --source ${sourceId} --json names; do not claim or transfer the source to make this host the owner.`,
-      { fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+      { ...(reason ? { reason } : {}), ...(deterministic ? { retryable: false } : {}),
+        fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
         why: 'Shows the owning host, binding state and incarnation of the source.' } });
   }
   const registeredRoot = resolve(binding.local_path, binding.relative_path);

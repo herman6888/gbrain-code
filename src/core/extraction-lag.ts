@@ -7,6 +7,7 @@
  * cron default) plus the decision between both routes, with an estimate stated at its basis.
  */
 import type { BrainEngine } from './engine.ts';
+import { withRequestConfigSnapshot } from './config-snapshot.ts';
 import { AGENT_TOOL_LIMIT_MS, type Action, type Decision } from './agent-output.ts';
 import { cliRouting, pinRouting, type FixRouting } from './fix-routing.ts';
 import { extractionLagStatement, heldLinkExtractionStatement } from './engine-sql/pages.ts';
@@ -42,7 +43,20 @@ export interface ExtractionLag {
   mention_last_pass_at: string | null;
 }
 
+/**
+ * GBRA-133: one config snapshot answers the watermark, the mention policy and the schema pack (one statement instead
+ * of five), and the lag count and the mention preview are issued together, so the whole read is two round trips.
+ */
 export async function readExtractionLag(engine: BrainEngine, opts: { sourceId?: string; timeoutMs?: number } = {}): Promise<ExtractionLag> {
+  return withRequestConfigSnapshot(engine, async () => {
+    const [row, mention] = await Promise.all([readLagRow(engine, opts),
+      readMentionPolicy(engine).then(policy => policy.enabled ? previewMentionPass(engine, opts.sourceId) : null)]);
+    return { total: Number(row?.total ?? 0), actionable: Number(row?.stale ?? 0), attendance_blocked: Number(row?.attendance_blocked ?? 0), held: Number(row?.held ?? 0),
+      mention_due: mention ? mention.due : null, mention_last_pass_at: mention?.last_pass_at ?? null };
+  });
+}
+
+async function readLagRow(engine: BrainEngine, opts: { sourceId?: string; timeoutMs?: number }) {
   const versionTs = await effectiveLinkExtractorWatermark(engine);
   const read = async (attendance: boolean, held: boolean) => {
     const { text, params } = extractionLagStatement({ sourceId: opts.sourceId, versionTs, attendance, held });
@@ -57,9 +71,7 @@ export async function readExtractionLag(engine: BrainEngine, opts: { sourceId?: 
     else if (isMissingSchemaObject(e, 'column', 'links_attendance_blocked_revision')) row = await read(false, false);
     else throw e;
   }
-  const mention = (await readMentionPolicy(engine)).enabled ? await previewMentionPass(engine, opts.sourceId) : null;
-  return { total: Number(row?.total ?? 0), actionable: Number(row?.stale ?? 0), attendance_blocked: Number(row?.attendance_blocked ?? 0), held: Number(row?.held ?? 0),
-    mention_due: mention ? mention.due : null, mention_last_pass_at: mention?.last_pass_at ?? null };
+  return row;
 }
 
 /**

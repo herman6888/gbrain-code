@@ -25,6 +25,9 @@
  *         -> last reply) and tail (last reply -> exit), plus round trips.
  *   warm  one long-lived gbrain serve stdio MCP process; per-stage search
  *         timings come from _meta.retrieval.timings.
+ *   socket  one long-lived `gbrain serve --cli-socket` and a CLI process per
+ *         sample that answers through the warm socket (GBRAIN_CLI_SOCKET=1),
+ *         the path a shell-out agent pays once a serve is running.
  *
  * Queries are 2-4 generated words from a random page body plus, for half of
  * them, a word of its title: synthetic text only. Rows carry timings and
@@ -153,6 +156,26 @@ async function main() {
       }
       add(op, 'cold', samples);
     }
+  }
+
+  if (modes.includes('socket')) {
+    const proc = Bun.spawn([process.execPath, CLI, 'serve', '--cli-socket'], { cwd: REPO, env: { ...env, GBRAIN_CLI_SOCKET: '1' }, stdin: 'pipe', stdout: 'ignore', stderr: 'pipe' });
+    let serveErr = '';
+    (async () => { const dec = new TextDecoder(); for await (const c of proc.stderr as ReadableStream<Uint8Array>) serveErr += dec.decode(c); })();
+    for (let waited = 0; !serveErr.includes('cli-socket: listening') && waited < 60_000; waited += 250) await new Promise(r => setTimeout(r, 250));
+    if (!serveErr.includes('cli-socket: listening')) throw new Error('serve --cli-socket did not start: ' + serveErr.slice(-400));
+    for (const op of ops) {
+      for (let i = 0; i < WARMUP; i++) await runCli(cli[op]!(3000 + i), { GBRAIN_CLI_SOCKET: '1' });
+      const samples: Sample[] = [];
+      for (let i = 0; i < N; i++) {
+        const r = await runCli(cli[op]!(i), { GBRAIN_CLI_SOCKET: '1' });
+        samples.push({ ms: r.ms, ok: r.code === 0 });
+      }
+      add(op, 'socket', samples);
+    }
+    try { (proc.stdin as any).end(); } catch { /* closed */ }
+    proc.kill();
+    await proc.exited;
   }
 
   if (modes.includes('warm')) {

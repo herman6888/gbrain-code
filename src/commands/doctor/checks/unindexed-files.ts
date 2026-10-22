@@ -86,7 +86,8 @@ async function runUnindexedFiles(ctx: DoctorContext): Promise<Check[]> {
     const states = await judgeUnindexedFiles(engine, sources);
     const details = { docs: DOCS, sources: states.map(({ source_id, state, record, ...rest }) => !record || state === 'missing' ? { source_id, state }
       : { source_id, state, unscheduled: rest.unscheduled, waiting: rest.waiting, still_unindexed: rest.still_unindexed, age_hours: hours(rest.age_ms), complete: record.complete,
-        scanned: record.scanned, unindexed: record.unindexed, slug_taken: record.slug_taken, deleted_page: record.deleted_page ?? 0, by_code: record.by_code, samples: record.samples, target: record.target, computed_at: record.computed_at,
+        scanned: record.scanned, unindexed: record.unindexed, slug_taken: record.slug_taken, deleted_page: record.deleted_page ?? 0, by_code: record.by_code, samples: record.samples, target: record.target, started_at: record.started_at, computed_at: record.computed_at,
+        scheduled_now: record.scheduled_now, pending_truncated: record.pending_truncated,
         metafile_skipped: record.metafile_skipped ?? 0, metafile_samples: record.metafile_samples ?? [] }) };
     const scaffolding = [blockedNote(states), metafileNote(states)].filter(Boolean).join(' ');
     const unindexed = states.filter(state => state.state === 'unindexed');

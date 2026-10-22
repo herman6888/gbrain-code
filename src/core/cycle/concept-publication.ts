@@ -9,7 +9,7 @@
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { preservedConceptSections, stripPreservedConceptSections } from './concept-sections.ts';
 import type { Page } from '../types.ts';
-import { assertInlineBody } from '../page-body/page-shape.ts';
+import { assertInlineBody, isSegmentedPage, pageBodySegmentedError } from '../page-body/page-shape.ts';
 import { serializeMarkdown, parseMarkdown } from '../markdown.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, replaceOrInsertFactsFence, stripFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence, stripTakesFence } from '../takes-fence.ts';
@@ -32,8 +32,8 @@ export const CONCEPT_PRESERVATION_CODE = 'concept_preservation_hold';
 export const CONCEPT_DEFERRAL_CODES = new Set(['revision_conflict', 'page_identity_changed']);
 /** Error code for a concept whose database row published but whose file write failed. */
 export const CONCEPT_WRITE_THROUGH_FAILED_CODE = 'concept_write_through_failed';
-/** Codes that hold a concept until an operator imports or repairs its page. */
-export const CONCEPT_HOLD_CODES = new Set(['source_changed', CONCEPT_PRESERVATION_CODE, CONCEPT_WRITE_THROUGH_FAILED_CODE]);
+/** Codes that hold a concept until an operator imports or repairs its page (`page_body_segmented`: its body moved to segments during synthesis). */
+export const CONCEPT_HOLD_CODES = new Set(['source_changed', CONCEPT_PRESERVATION_CODE, CONCEPT_WRITE_THROUGH_FAILED_CODE, 'page_body_segmented']);
 
 function conceptHoldError(message: string): Error { return Object.assign(new Error(message), { code: CONCEPT_PRESERVATION_CODE }); }
 
@@ -148,6 +148,18 @@ export function conceptPreservationHold(page: Pick<Page, 'compiled_truth' | 'tim
   }
   const warnings = [...parseFactsFence(body).warnings, ...parseTakesFence(body).warnings];
   return warnings.length ? `CONCEPT_FENCE_UNPARSEABLE: ${warnings[0]}` : null;
+}
+
+/**
+ * The hold publication would raise for an existing concept page, as the
+ * `<code>: <message>` the phase records, or null when it can be republished:
+ * a segmented body (`page_body_segmented`) or fences it cannot carry
+ * losslessly (`concept_preservation_hold`). Checked before any model spend.
+ */
+export function conceptPublicationHold(page: Pick<Page, 'compiled_truth' | 'timeline' | 'body_storage' | 'slug' | 'source_id'>): string | null {
+  if (isSegmentedPage(page)) return `page_body_segmented: ${pageBodySegmentedError(page, 'synthesize_concepts').message}`;
+  const hold = conceptPreservationHold(page);
+  return hold ? `${CONCEPT_PRESERVATION_CODE}: ${hold}` : null;
 }
 
 function fenceBlock(body: string, begin: string, end: string): string | null {

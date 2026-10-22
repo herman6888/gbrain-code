@@ -258,6 +258,47 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`[${backend}
       for (const { sourcePath } of files) expect(await engine.readPageSnapshot(sourcePath.replace(/\.md$/, ''), { sourceId })).not.toBeNull();
     }, 180_000);
 
+    test('a member a group interruption charged is claimed and prepared again even when its backoff elapses before the pass ends', async () => {
+      await engine.setConfig('persistence.max_transient_retries', '2');
+      resetWriteSwitches();
+      const dir = `grp-slow-${++n}`;
+      mkdirSync(join(brainDir, dir), { recursive: true });
+      const files = ['a', 'b'].map(name => {
+        const sourcePath = `${dir}/${name}.md`;
+        writeFileSync(join(brainDir, sourcePath), page(`Slow ${name} ${n}`));
+        return { filePath: join(brainDir, sourcePath), sourcePath };
+      });
+      // As above, and each member's charge is followed by a pause longer than the first backoff (1 s), as on a loaded host:
+      // the first member's backoff has elapsed before the pass is done with the group, so only the charge itself keeps the
+      // pass from taking that claim back and publishing its old preparation under it.
+      const unpublished = new Set<string>(), claims = new Map<string, number>(), grouped: string[][] = [];
+      installFaultHook(async (point, detail) => {
+        if (detail.sourceId !== sourceId) return;
+        if (point === 'consumer:preparing') { unpublished.add(detail.requestId!); claims.set(detail.requestId!, (claims.get(detail.requestId!) ?? 0) + 1); return; }
+        if (point === 'persistence:recovery_interruption_charged') { await new Promise(resolve => setTimeout(resolve, 1_200)); return; }
+        if (point !== 'publication:before_commit') return;
+        const together = unpublished.size;
+        unpublished.delete(detail.requestId!);
+        if (together < 2 || grouped.length >= GUARD) return;
+        grouped.push([...unpublished, detail.requestId!]);
+        unpublished.clear();
+        await new Promise(resolve => setTimeout(resolve, PARK_MS));
+        throw discarded();
+      });
+      const results = await withEnv({ GBRAIN_HOME: home }, () => importManagedFiles(engine, files, { sourceId, noEmbed: true }));
+      installFaultHook(undefined);
+      expect(results.map(result => result.status === 'rejected' ? (result.reason as { code?: string }).code : result.status)).toEqual(['fulfilled', 'fulfilled']);
+      expect(grouped.length).toBe(1);
+      const rows = await engine.executeRaw<{ request_id: string; state: string; transient_interruptions: number }>(
+        "SELECT request_id::text AS request_id,state,transient_interruptions FROM persistence_requests WHERE source_id=$1 AND intent->>'import_batch' IS NOT NULL AND slug LIKE $2 ORDER BY sequence",
+        [sourceId, `${dir}/%`]);
+      expect(rows.length).toBe(2);
+      for (const member of rows) {
+        expect(member).toMatchObject({ state: 'committed', transient_interruptions: 1 });
+        expect(claims.get(member.request_id)).toBe(2);
+      }
+    }, 180_000);
+
     test('a single overrun is retried, never a terminal storage_error (on Postgres the retried publish surfaces as a bare AbortError), and commits', async () => {
       const slug = `wt/overrun-once-${++n}`;
       expect(await call({ slug, content: page(`Prior ${n}`), request_id: randomUUID() }, sourceId)).toMatchObject({ state: 'committed' });

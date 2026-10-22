@@ -73,7 +73,8 @@ async function seedEveryState(): Promise<void> {
   await chunks(await page('notes/deleted-old', { deletedHoursAgo: 100 }), [{}, { vector: true }]);
 }
 
-const EVERY_STATE = { embedded: 2, pending: 2, keyword_only: 2, quarantined: 3, empty: 1, deleted_page_chunks: 3, chunkless_healable: 1 };
+// #7174: notes/fund-a-oversized-bare (embed_skip, body, no chunk rows) is chunkless_healable: writes keep an embed_skip page's chunks (#6722).
+const EVERY_STATE = { embedded: 2, pending: 2, keyword_only: 1, quarantined: 3, empty: 1, deleted_page_chunks: 3, chunkless_healable: 2 };
 
 describe('embedding state classifier (full mode)', () => {
   test('every state on the legacy column, exact', async () => {
@@ -84,7 +85,7 @@ describe('embedding state classifier (full mode)', () => {
     expect(s.active_column).toBe('embedding');
     expect(s.counts).toEqual(EVERY_STATE);
     expect(Object.keys(s.counts).sort()).toEqual([...EMBEDDING_STATES].sort());
-    expect(s.unsearchable).toBe(2 + 3 + 1 + 1);
+    expect(s.unsearchable).toBe(2 + 3 + 1 + 2);
     expect(s.unsearchable_complete).toBe(true);
     expect(s.deleted_page_chunks).toEqual({ within_window: 1, past_window: 2, window_hours: 72 });
     // The default bytes_block is the 24 MiB page ceiling (large pages Wave A); these markers predate it.
@@ -137,7 +138,7 @@ describe('embedding state classifier (full mode)', () => {
     const s = await readEmbeddingState(engine, { mode: 'full' });
     expect(s.reason).toBe('embeddings_disabled');
     expect(s.counts.pending).toBe(2);
-    expect(s.unsearchable).toBe(3 + 1 + 1);
+    expect(s.unsearchable).toBe(3 + 1 + 2);
   });
 });
 
@@ -148,7 +149,7 @@ describe('embedding state classifier (ops mode)', () => {
     expect(s.status).toBe('known');
     expect(s.basis).toBe('estimated');
     expect(s.covering_index).toBe('content_chunks_stale_idx');
-    expect(s.counts).toMatchObject({ pending: 2, keyword_only: 2, quarantined: 3, deleted_page_chunks: 3 });
+    expect(s.counts).toMatchObject({ pending: 2, keyword_only: 1, quarantined: 3, deleted_page_chunks: 3 });
     expect(s.counts.empty).toBeUndefined();
     expect(s.counts.chunkless_healable).toBeUndefined();
     expect(typeof s.counts.embedded).toBe('number');
@@ -182,12 +183,12 @@ describe('embedding state rows and fixes', () => {
     await seedEveryState();
     const rows = await engine.listEmbeddingStateRows({ states: ['keyword_only', 'quarantined', 'empty', 'chunkless_healable', 'deleted_page_chunks'], limit: 50, purgeWindowHours: 72 });
     expect(rows.map(r => `${r.state} ${r.slug} ${r.chunks}`)).toEqual([
+      'chunkless_healable notes/fund-a-oversized-bare 0',
       'chunkless_healable notes/stub-with-body 0',
       'deleted_page_chunks notes/deleted-old 2',
       'deleted_page_chunks notes/deleted-recent 1',
       'empty notes/empty-stub 0',
       'keyword_only notes/fund-a-oversized 1',
-      'keyword_only notes/fund-a-oversized-bare 0',
       'quarantined notes/junk-hidden 0',
       'quarantined notes/junk-legacy 2',
     ]);

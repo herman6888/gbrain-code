@@ -191,8 +191,21 @@ entries are not counted, and a run that spans several commits is dated by its
 newest. Doctor managed_sync_latency warns when p95 commit to searchable is over
 sync.freshness_target_seconds (default 300) and fails over one hour; it grades
 only a brain with sync.on_commit on or a target set, and otherwise reports the
-numbers. gbrain doctor --source <id> grades only that source. A stopped or
-stalled sync is reported by doctor managed_sync_not_moving, not by this check.
+numbers. gbrain doctor --source <id> grades only that source.
+
+The check also grades the commit that is still waiting, so a stalled source
+does not read ok for lack of samples. A source is behind when its checkout
+HEAD differs from the last synced commit (an uncommitted edit does not count).
+The wait runs from the reflog entry that moved HEAD (when the commit landed in
+the checkout), or from the commit notifier's recorded first_due_at when there
+is no usable reflog, and is graded with the same target and one-hour limit.
+When neither can date it (no reflog, or history rewritten so the synced commit
+is no longer an ancestor of HEAD), the wait reads unknown and warns. Classic
+sources are graded the same way. Each source reports keyword-visible and
+embedded freshness separately (details.freshness_by_source in --json); the
+embedding backlog is reported, not graded, and reads disabled on a keyless
+brain. gbrain sources status dates a source's lag the same way. A stopped run
+is reported by doctor managed_sync_blocked and managed_sync_not_moving.
 
 The rest of managed sync (backlogs, holds, the drain) is in
 [live sync](live-sync.md).

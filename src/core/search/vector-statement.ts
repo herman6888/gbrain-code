@@ -31,7 +31,8 @@
  * nearest `innerLimit` eligible ones: the same set the joined statement
  * selects whenever that many survive. Callers run it with sorting disabled so
  * the HNSW scan is the only ordered path, accept it when its window is full,
- * and otherwise run the joined statement as before, whose plans stay with the
+ * widen it when a full window's pages fall short of the limit
+ * (searchIndexWalk), and otherwise run the joined statement as before, whose plans stay with the
  * planner for selective filters. A type or date filter skips the walk: it is
  * an explicit narrowing that usually leaves the window short, so the walk
  * would only add its cost. So does a source scope whose share of pages

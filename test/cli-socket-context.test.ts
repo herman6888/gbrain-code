@@ -16,6 +16,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { makeContext } from '../src/cli/main.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { cliRequestContext, executeCliSocketRequest, mergedRequestConfig } from '../src/core/cli-socket/execute.ts';
+import { cliSocketIdentity } from '../src/core/cli-socket/identity.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -81,7 +82,7 @@ describe('cliRequestContext mirrors makeContext', () => {
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
-    const { frame, settled } = await executeCliSocketRequest(gated, { v: 1, identity: 'x', command: 'search', kind: 'op', op: 'search', params: { query: 'alpha' },
+    const { frame, settled } = await executeCliSocketRequest(gated, { v: 1, identity: cliSocketIdentity({ config: { engine: 'postgres' }, brainId: 'host', configDir: '/nonexistent', configFile: '/nonexistent/config.json', version: 'x', env: {} }), command: 'search', kind: 'op', op: 'search', params: { query: 'alpha' },
       routing: { cwd: process.cwd(), source_env: null }, cli: { quiet: false, timeout_ms: 5 } });
     let done = false;
     void settled.then(() => { done = true; });

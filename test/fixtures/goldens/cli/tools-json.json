@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 254763,
-    "stdoutSha256": "f6d6005ad68241f8e95fac4a2f61f62b074fd5a0a76206e8e410a02d425692df",
+    "stdoutBytes": 262439,
+    "stdoutSha256": "3a6a696129b534029d14fb5301ff3f6874724ad5e1983980f13f88d26ace18b9",
     "toolNames": [
       "remember",
       "entity",
@@ -36,6 +36,7 @@
       "search_modes",
       "search_tune",
       "cache_stats",
+      "search_exact",
       "rate_answer",
       "search_by_image",
       "add_tag",
@@ -90,6 +91,7 @@
       "file_url",
       "submit_job",
       "get_job",
+      "wait_job",
       "list_jobs",
       "cancel_job",
       "retry_job",
@@ -102,6 +104,7 @@
       "get_agent_job",
       "get_job_stats",
       "find_orphans",
+      "rank_entities",
       "get_calibration_profile",
       "takes_list",
       "takes_search",
@@ -307,7 +310,8 @@
           "name": "string?",
           "names": "array?",
           "prefer_source_id": "string?",
-          "source_id": "string?"
+          "source_id": "string?",
+          "variants": "boolean?"
         },
         "required_scopes": [],
         "schema": {
@@ -330,6 +334,10 @@
             "source_id": {
               "description": "Read only this source. Default: your source first, then every source you can read.",
               "type": "string"
+            },
+            "variants": {
+              "description": "false: exact names only. Default true: with no exact match, one unambiguous name variant (card.match says which).",
+              "type": "boolean"
             }
           },
           "required": [],
@@ -411,7 +419,7 @@
         "scope": "write"
       },
       {
-        "description": "Read a page by slug. To edit: include_content:true, send `content` to put_page; or edit_page. >256 KB: outline+window, then `next`.",
+        "description": "Read a page; `section` or `grep` reads one part. Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -421,10 +429,12 @@
           "body": "string?",
           "bytes": "object?",
           "content_only": "boolean?",
+          "context": "number?",
           "context_lines": "number?",
           "cursor": "string?",
           "fuzzy": "boolean?",
           "grammar_diagnostics": "boolean?",
+          "grep": "string?",
           "include_content": "boolean?",
           "include_deleted": "boolean?",
           "include_quarantined": "boolean?",
@@ -434,6 +444,7 @@
           "max_bytes": "number?",
           "min_trust": "string?",
           "outline_from": "number?",
+          "section": "string?",
           "slug": "string",
           "source_id": "string?",
           "view": "string?"
@@ -474,8 +485,12 @@
               "type": "object"
             },
             "content_only": {
-              "description": "Round-trip fields only.",
+              "description": "Round-trip fields.",
               "type": "boolean"
+            },
+            "context": {
+              "description": "With grep: paragraphs of context either side (default 1, max 5).",
+              "type": "number"
             },
             "context_lines": {
               "description": "Lines around around_chunk_id (20).",
@@ -486,15 +501,19 @@
               "type": "string"
             },
             "fuzzy": {
-              "description": "Fuzzy slug match.",
+              "description": "Fuzzy match.",
               "type": "boolean"
             },
             "grammar_diagnostics": {
               "description": "Also return every line-grammar finding for the page.",
               "type": "boolean"
             },
+            "grep": {
+              "description": "Only the paragraphs containing this text (case-insensitive substring, not a regex), with line numbers and total_matches.",
+              "type": "string"
+            },
             "include_content": {
-              "description": "Markdown + revision, to edit.",
+              "description": "Markdown + revision.",
               "type": "boolean"
             },
             "include_deleted": {
@@ -506,7 +525,7 @@
               "type": "boolean"
             },
             "include_timeline_entries": {
-              "description": "Timeline rows too.",
+              "description": "Timeline rows.",
               "type": "boolean"
             },
             "known_as_of": {
@@ -549,6 +568,10 @@
             "outline_from": {
               "description": "Outline next_from_index.",
               "type": "number"
+            },
+            "section": {
+              "description": "Only the section under this heading (case-insensitive, first match), with its heading_path.",
+              "type": "string"
             },
             "slug": {
               "description": "Page slug.",
@@ -1469,11 +1492,16 @@
         "mutating": false,
         "name": "get_write_request",
         "parameters": {
+          "applied": "boolean?",
           "request_id": "string"
         },
         "required_scopes": [],
         "schema": {
           "properties": {
+            "applied": {
+              "description": "Also return applied: searchable yet, the gap, the write watermark.",
+              "type": "boolean"
+            },
             "request_id": {
               "description": "The id you sent, or the receipt's.",
               "type": "string"
@@ -2069,6 +2097,81 @@
           "type": "object"
         },
         "scope": "admin"
+      },
+      {
+        "description": "Find every page containing a literal phrase or identifier, exhaustively: use instead of grep. Unranked; returns every match in page order with snippets, and complete: true only when every page you can read was scanned. Literal: words in order with any whitespace between them, case-insensitive unless case_sensitive; no stemming, punctuation literal (ranked search treats quotes as a stemmed phrase). When complete is false, incomplete_reasons says why: deadline or limit (call again with after: resume_after), or unreadable_pages (pages whose text is not indexed yet, listed under unreadable).",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "search_exact",
+        "parameters": {
+          "after": "number?",
+          "case_sensitive": "boolean?",
+          "limit": "number?",
+          "max_seconds": "number?",
+          "min_trust": "string?",
+          "phrase": "string",
+          "slug_prefix": "string?",
+          "source_id": "string?",
+          "types": "array?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "after": {
+              "description": "Resume a bounded scan: the resume_after of the previous call.",
+              "type": "number"
+            },
+            "case_sensitive": {
+              "description": "Match case exactly (default false).",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Matching pages to return (default 100, max 1000).",
+              "type": "number"
+            },
+            "max_seconds": {
+              "description": "Scan budget in seconds (default 30, max 120).",
+              "type": "number"
+            },
+            "min_trust": {
+              "description": "Lowest trust tier to return (the connection floor still applies).",
+              "enum": [
+                "user_confirmed",
+                "operator_curated",
+                "tool_observed",
+                "agent_written",
+                "unknown",
+                "external_untrusted"
+              ],
+              "type": "string"
+            },
+            "phrase": {
+              "description": "The literal text, e.g. 'INV-2024-0042' or 'quarterly board pack'.",
+              "type": "string"
+            },
+            "slug_prefix": {
+              "description": "Only slugs starting with this, e.g. 'meetings/'.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Only this source; '__all__' spans every source you can read.",
+              "type": "string"
+            },
+            "types": {
+              "description": "Only these page types, e.g. ['meeting'].",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "phrase"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
       },
       {
         "description": "Rate how useful an answer's retrieved evidence was, so this brain ranks better next time (zero LLM calls). Pass the answer_id from a query/search/think/synthesize/recall response and rating 1-5, or rate single pages with pages: [{ ref: \"source_id:slug\", rating }]. Example: { answer_id: \"ans_01J…\", pages: [{ ref: \"default:people/alice-example\", rating: 1 }] }. Returns a receipt with each weight before/after; it never edits stored facts.",
@@ -4199,6 +4302,35 @@
         "scope": "admin"
       },
       {
+        "description": "Wait until a job is completed, failed, dead or cancelled (at most 55 s per call), then return it like get_job plus terminal. terminal: false means it is still running: call again. Agent-scoped tokens (no admin) wait only on jobs they own.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "wait_job",
+        "parameters": {
+          "id": "number",
+          "timeout_s": "number?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            },
+            "timeout_s": {
+              "description": "Seconds to wait (default 30, at most 55).",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "scope": "admin"
+      },
+      {
         "description": "List background jobs with optional status/queue/name filters; pass fields to project each job to the columns you need. Use when checking queued or failed work. Needs admin scope (agent-scoped tokens see only jobs they own).",
         "idempotent": true,
         "local_only": false,
@@ -4206,6 +4338,7 @@
         "name": "list_jobs",
         "parameters": {
           "fields": "array?",
+          "finished_since": "string?",
           "limit": "number?",
           "name": "string?",
           "queue": "string?",
@@ -4220,6 +4353,10 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "finished_since": {
+              "description": "Terminal-event cursor: an ISO time or the next_cursor of the previous call. Returns {jobs, next_cursor}: jobs that finished after it, oldest first.",
+              "type": "string"
             },
             "limit": {
               "description": "Max results (default: 50)",
@@ -4507,7 +4644,7 @@
         "scope": "agent"
       },
       {
-        "description": "Job queue statistics. PER-BLOCK scoping: by_status and queue_health are GLOBAL (unfiltered); by_type is windowed by since_hours; only the wedge block is scoped to the queue param. wedged: true is the silent-halt signal (a worker is alive but claiming nothing while work waits) — suggest restarting the jobs supervisor on the brain host. no_worker: true means work is waiting and NO worker is running for the queue (always on PGLite unless a gbrain jobs work drain is live); wedged is then false and the no_worker notice names the fix. private_queue: true means the queue is a parent-owned dream-inline queue: wedged is NEVER true for it and a worker restart cannot help — recovery runs automatically at worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.",
+        "description": "Job queue statistics. PER-BLOCK scoping: by_status and queue_health are GLOBAL (unfiltered); by_type is windowed by since_hours; only the wedge block is scoped to the queue param. wedged: true is the silent-halt signal (a worker is alive but claiming nothing while work waits) — suggest restarting the jobs supervisor on the brain host. no_worker: true means work is waiting and NO worker is running for the queue (always on PGLite unless a gbrain jobs work drain is live); wedged is then false and the no_worker notice names the fix. private_queue: true means the queue is a parent-owned dream-inline queue: wedged is NEVER true for it and a worker restart cannot help — recovery runs automatically at worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. by_queue has one row per queue (every dream-inline-* queue folded into one dream-inline row). Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -4541,6 +4678,7 @@
         "name": "find_orphans",
         "parameters": {
           "count_only": "boolean?",
+          "cursor": "string?",
           "include_pseudo": "boolean?",
           "limit": "number?",
           "mode": "string?",
@@ -4554,12 +4692,16 @@
               "description": "Return the totals with no rows.",
               "type": "boolean"
             },
+            "cursor": {
+              "description": "next_cursor from the previous page, with the same filters (instead of offset).",
+              "type": "string"
+            },
             "include_pseudo": {
               "description": "Include auto-generated and pseudo pages (default: false)",
               "type": "boolean"
             },
             "limit": {
-              "description": "Rows per page (default 100, max 1000); total_orphans counts every orphan and next_offset names the next page.",
+              "description": "Rows per page (default 100, max 1000); total_orphans counts every orphan, complete says whether this page holds the rest, and next_cursor (or next_offset) names the next page.",
               "type": "number"
             },
             "mode": {
@@ -4573,6 +4715,61 @@
             "source_id": {
               "description": "Only orphans from this source (it must be inside your source grant). Each row carries source_id and type.",
               "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "scope": "read"
+      },
+      {
+        "description": "Rank pages by graph connections: the most-linked people, companies or other entities. Use instead of counting link rows yourself. An edge is a distinct (from page, to page, link_type) between live pages in scope: self-links, links to deleted pages, non-ranking types (amends) and, unless include_mentions, mention rows do not count; several provenance rows for one edge count once. inbound/outbound count edges, neighbors counts distinct linked pages. A redirect stub (canonical: false, superseded_by, merged_into) is folded into its live target in the same source (listed under folded) and its edges count once; title-prefixed person duplicates are listed under possible_duplicates, never merged. Ties order by slug, then source_id. coverage.state is behind when link extraction lags, so counts cover only extracted pages.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "rank_entities",
+        "parameters": {
+          "direction": "string?",
+          "include_mentions": "boolean?",
+          "limit": "number?",
+          "link_type": "string?",
+          "source_id": "string?",
+          "types": "array?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "direction": {
+              "description": "Rank by 'in' (inbound edges, default), 'out' (outbound edges) or 'both' (inbound + outbound).",
+              "enum": [
+                "in",
+                "out",
+                "both"
+              ],
+              "type": "string"
+            },
+            "include_mentions": {
+              "description": "Also count mention links (link_source mentions); default false.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Rows to return (default 20, max 100).",
+              "type": "number"
+            },
+            "link_type": {
+              "description": "Count only edges of this link type, e.g. works_at.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Only this source (it must be inside your source grant); '__all__' spans every source you can read. Both ends of a counted edge stay in scope.",
+              "type": "string"
+            },
+            "types": {
+              "description": "Page types to rank, e.g. ['person']. Default: the schema pack's entity types.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [],

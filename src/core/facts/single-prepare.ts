@@ -141,6 +141,19 @@ function replacesDerivedSuggestion(sourceId: string, slug: string): string {
 }
 
 /**
+ * #7248: a replacement whose visibility the caller did not set keeps a
+ * private target private, so replacing a private fact needs no flag. Only a
+ * local caller qualifies (a remote caller never sees a private fact), and a
+ * world target never widens a default.
+ */
+export async function replacementVisibility(engine: BrainEngine, sourceId: string, targetId: number,
+  defaulted: 'world' | 'private', opts: { remote: boolean }): Promise<'world' | 'private'> {
+  if (defaulted === 'private' || opts.remote || !Number.isSafeInteger(targetId)) return defaulted;
+  const [target] = await engine.executeRaw<{ visibility: string }>('SELECT visibility FROM facts WHERE id=$1 AND source_id=$2', [targetId, sourceId]);
+  return target?.visibility === 'private' ? 'private' : defaulted;
+}
+
+/**
  * `remember.replaces`: the caller names the fact the new one replaces. Checked,
  * zero-model: the target must be an active fact in this source with the same
  * visibility and entity, and on the same entity page; equal text is a no-op
@@ -156,9 +169,12 @@ export async function decideReplacement(engine: BrainEngine, sourceId: string, i
         AND (w.subject='*' OR w.subject=COALESCE(f.entity_slug,'*'))) AS withdrawn
     FROM facts f WHERE f.id=$1 AND f.source_id=$2${opts.excludePrivate ? ` AND ${privateProvenanceFilterFragment('f')}` : ''}${opts.lock ? ' FOR UPDATE OF f' : ''}`, [targetId, sourceId]);
   if (!target || (opts.remote && target.visibility !== 'world')) throw notFound();
-  if (target.visibility !== input.visibility) throw notFound();
   // #5913 [R2]: a slug-bound writer learns nothing about a fact outside its prefixes; the answer is the missing-id one.
   if (opts.slugPrefixes && [target.entity_slug, target.source_markdown_slug].some(slug => slug && !slugUnderBoundPrefixes(opts.slugPrefixes!, slug))) throw notFound();
+  if (target.visibility !== input.visibility) {
+    throw verbError('invalid_params', `replaces_visibility_mismatch: fact #${targetId} is ${target.visibility}, and the new fact would be ${input.visibility}.`,
+      `Pass visibility: "${target.visibility}" to replace it, or forget fact #${targetId} and remember the new claim separately.`);
+  }
   const candidate: FactCandidate = { ...target, id: Number(target.id) };
   if (target.withdrawn) {
     throw verbError('invalid_params', `target_withdrawn: fact #${targetId} was forgotten, so it cannot be replaced.`,

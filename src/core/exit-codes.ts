@@ -6,6 +6,7 @@
  *   0 ok · 1 failed (class/retryable in JSON) · 2 usage / invalid input ·
  *   3 confirmation_required (its ONLY meaning) · 10 write pending ·
  *   11 resumable budget stop · 13 harness wired, verification pending ·
+ *   12 no results (a lookup matched nothing; opt-in, GBRAIN_FAIL_ON_EMPTY=1) ·
  *   14 harness wired, shared-skills/token cleanup pending ·
  *   69 serve exited unhealthy · 75 migration
  *   lock held · 124 timeout · 130 interrupted. `test/exit-codes.test.ts` enumerates every literal
@@ -45,6 +46,17 @@ export const PENDING_WRITE_EXIT_CODE = 10;
  * from 3, which agent-facing commands reserve for "ask the user first".
  */
 export const BUDGET_STOP_EXIT_CODE = 11;
+
+/**
+ * #7177, opt-in with GBRAIN_FAIL_ON_EMPTY=1: a lookup ran and matched nothing
+ * (`gbrain recall <entity|text>`, `--grep`, `--question`, `--query`;
+ * `gbrain entity <name>` with no page and no text mention). Distinct from 0 so
+ * a script that filters stdout can still tell a miss from a hit, and from 1,
+ * which means the command failed. A feed read (`--since-last-run`, `--watch`,
+ * no filter) that finds nothing new is not a miss. Off by default: a miss
+ * exits 0 and --json carries the status.
+ */
+export const NO_RESULTS_EXIT_CODE = 12;
 
 /**
  * #6661: `gbrain bootstrap harness --token` on a PGLite brain wired every

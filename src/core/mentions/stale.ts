@@ -20,15 +20,19 @@ export interface MentionPreview {
  * doctor and post-upgrade.
  */
 export async function previewMentionPass(engine: BrainEngine, sourceId?: string): Promise<MentionPreview> {
-  const policy = await readMentionPolicy(engine);
-  const [row] = await engine.executeRaw<{ last: string | null }>(
-    `SELECT to_char(max(last_pass_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last FROM mention_index_status
-      WHERE ($1::text IS NULL OR source_id = $1)`, [sourceId ?? null]);
-  let due = 0;
-  if (policy.enabled) {
-    const sources = sourceId ? [sourceId] : (await engine.executeRaw<{ id: string }>('SELECT id FROM sources ORDER BY id')).map(r => r.id);
-    for (const id of sources) due += await countIndexDuePages(engine, id, linkableTypesFor(await loadSourcePack(engine, id), policy));
-  }
+  // GBRA-133: the newest pass time does not depend on the policy or the due counts, so it is issued with them.
+  const [[row], { policy, due }] = await Promise.all([
+    engine.executeRaw<{ last: string | null }>(
+      `SELECT to_char(max(last_pass_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS last FROM mention_index_status
+        WHERE ($1::text IS NULL OR source_id = $1)`, [sourceId ?? null]),
+    readMentionPolicy(engine).then(async policy => {
+      let due = 0;
+      if (policy.enabled) {
+        const sources = sourceId ? [sourceId] : (await engine.executeRaw<{ id: string }>('SELECT id FROM sources ORDER BY id')).map(r => r.id);
+        for (const id of sources) due += await countIndexDuePages(engine, id, linkableTypesFor(await loadSourcePack(engine, id), policy));
+      }
+      return { policy, due };
+    })]);
   return { due, last_pass_at: row?.last ?? null, enabled: policy.enabled };
 }
 

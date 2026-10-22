@@ -7,11 +7,13 @@
  *   the file path for trusted local callers only).
  * - search and query hits for such a page carry `stale` (held_since, last_indexed_revision).
  * - retrieval meta carries `held_files` per source in scope (held new files
- *   missing, held modified files stale) and a `held_files` degraded notice.
+ *   missing, held modified files stale) and a `held_files` degraded notice
+ *   when some held file could match the query (#7165, `stampHeldHits`).
  *
- * Cost: one indexed lookup (`op_checkpoints_sync_hold_page_idx`) for the pages
- * a call returns and one read of the per-source summary rows in scope, each
- * cached per request (plus, only for a page whose held file is an
+ * Cost: one read of the per-source summary rows in scope, cached per request,
+ * plus one read per call that returned hits from a scope with holds: the
+ * returned pages' holds (indexed, `op_checkpoints_sync_hold_page_idx`) and the
+ * query-relevant count. `get_page` reads its page's hold (plus, only for an
  * `invalid_fence` hold, the two reads that say whether the maintenance run
  * repairs it). Remote callers get codes, counts and flags, never paths, and a
  * fix addressed to the brain host operator; the repair commands come from the
@@ -23,6 +25,7 @@ import type { Action, Notice } from '../agent-output.ts';
 import { ALL_SOURCES } from '../source-id.ts';
 import { outOfAttemptsHold, GIT_HOLD_OP, GIT_HOLD_SUMMARY_OP, contentRepairArgv, fenceAutoRepairFor, gitHoldDocs, gitHoldFix, holdRepairSteps, type GitHoldCode, type GitHoldReason, type GitHoldRecord, type HoldRepairRoute } from './sync-holds.ts';
 import { fenceHoldLocation, fenceHoldRelay, type FenceAutoRepair, type FenceHoldLocation } from '../fence-repair/hold-fix.ts';
+import { COVERAGE_COUNT_CAP, type CoverageRelevance } from '../search/retrieval-coverage.ts';
 
 type Exec = Pick<BrainEngine, 'executeRaw'>;
 
@@ -180,33 +183,83 @@ export function fileHeldField(held: HeldPage, remote: boolean): FileHeld {
     fix, docs: gitHoldDocs(record.code, record.meta.reason) };
 }
 
+const HOLD_PAGE_JOIN = `FROM op_checkpoints h
+      JOIN sources s ON s.id=h.completed_keys->0->>'source_id' AND s.incarnation::text=h.completed_keys->0->>'incarnation'
+      LEFT JOIN pages p ON p.id=(h.completed_keys->0->>'page_id')::int`;
+
 /**
- * Stamps `stale` on hits whose page's newer file is held (one indexed read)
- * and returns the per-source coverage of the read scope. Hits are mutated in
- * place; callers pass their own copies.
+ * Stamps `stale` on hits whose page's newer file is held and returns the
+ * per-source coverage of the read scope with (#7165) how many held files could
+ * affect this query (retrieval-coverage.ts; every one for an empty result). One
+ * summary read; when the scope holds files and the call returned hits, one more
+ * read gets the hits' holds (indexed) and the count (capped at
+ * COVERAGE_COUNT_CAP). `couldAffect` is null when that read fails: unknown,
+ * never zero. Hits are mutated in place; callers pass their own copies.
  */
 export async function stampHeldHits(engine: Exec, hits: Array<{ page_id?: number; stale?: boolean | StaleHit }>, scope: { sourceId?: string; sourceIds?: string[] },
-  request?: object): Promise<HeldCoverage[]> {
+  relevance: CoverageRelevance, request?: object): Promise<{ coverage: HeldCoverage[]; couldAffect: number | null }> {
   const coverage = await readHeldCoverage(engine, scope, request);
-  if (!coverage.some(source => source.stale > 0) || !hits.length) return coverage;
-  const held = await readHeldPages(engine, hits.flatMap(hit => typeof hit.page_id === 'number' ? [hit.page_id] : []), request);
-  for (const hit of hits) {
-    const page = typeof hit.page_id === 'number' ? held.get(hit.page_id) : undefined;
-    if (page) hit.stale = { held_since: page.record.held_at, last_indexed_revision: page.revision };
+  if (!coverage.length || relevance.all || !hits.length) return { coverage, couldAffect: coverage.reduce((sum, source) => sum + source.missing + source.stale, 0) };
+  const ids = [...new Set(hits.flatMap(hit => typeof hit.page_id === 'number' ? [String(hit.page_id)] : []))];
+  let rows: Array<{ record: GitHoldRecord | null; revision: string | null; could_affect: number | null }>;
+  try {
+    rows = await engine.executeRaw(`(SELECT h.completed_keys->0 AS record, p.knowledge_revision::text AS revision, NULL::int AS could_affect ${HOLD_PAGE_JOIN}
+        WHERE h.op=$1 AND (h.completed_keys->0->>'page_id')=ANY($2::text[]) ORDER BY h.fingerprint)
+      UNION ALL
+      SELECT NULL, NULL, (SELECT count(*)::int FROM (SELECT 1 ${HOLD_PAGE_JOIN}
+        WHERE h.op=$1 AND s.archived IS NOT TRUE AND s.id=ANY($3::text[])
+          AND ((h.completed_keys->0->>'page_id')=ANY($2::text[]) OR p.type=ANY($4::text[])
+            OR lower(concat_ws(' ', h.completed_keys->0->>'path', h.completed_keys->0->>'slug', p.title)) LIKE ANY($5::text[]))
+        LIMIT ${COVERAGE_COUNT_CAP}) x)`,
+    [GIT_HOLD_OP, ids, coverage.map(source => source.source_id), relevance.types, relevance.patterns]);
+  } catch {
+    return { coverage, couldAffect: null };
   }
-  return coverage;
+  let couldAffect: number | null = null;
+  const stamped = new Set<number>();
+  for (const row of rows) {
+    if (!row.record) { couldAffect = Number(row.could_affect); continue; }
+    const id = Number(row.record.page_id);
+    if (stamped.has(id)) continue;
+    stamped.add(id);
+    for (const hit of hits) if (hit.page_id === id) hit.stale = { held_since: row.record.held_at, last_indexed_revision: row.revision };
+  }
+  return { coverage, couldAffect: Number.isFinite(couldAffect) ? couldAffect : null };
 }
 
-/** The `held_files` notice for a read whose scope has held files; null when it has none. */
-export function heldFilesNotice(coverage: HeldCoverage[], remote: boolean): Notice | null {
-  if (!coverage.length) return null;
+/**
+ * The `held_files` notice for a read whose scope has held files or (#7165) pages held
+ * from embedding; null when it has neither. `couldAffect` (a search or query) names
+ * how many held files could match the query, `embedding` how many embedding-held
+ * pages are in scope and how many could; either makes the notice escalating: the
+ * same sources, kinds and counts show once per session.
+ */
+export function heldFilesNotice(coverage: HeldCoverage[], remote: boolean, couldAffect?: number, embedding?: { total: number; could_affect: number }): Notice | null {
+  if (!coverage.length && !embedding) return null;
+  const embeddingWhy = embedding ? `${embedding.total} page(s) in this scope are held from embedding (their embedding budget is held or capped), so they have no vectors and semantic search cannot find them; `
+    + `${embedding.could_affect} of them could match this query. Keyword search still finds them where they have chunks. ` : '';
   const missing = coverage.reduce((sum, source) => sum + source.missing, 0), stale = coverage.reduce((sum, source) => sum + source.stale, 0);
+  const kinds = (source: HeldCoverage) => (['missing', 'stale', 'fences', 'concurrent', 'stalled', 'dirty', 'drift'] as const).filter(kind => (source[kind] ?? 0) > 0).join('+');
+  const escalation = couldAffect === undefined && !embedding ? {} : { escalation: {
+    key: [...coverage.map(source => `${source.source_id}:${kinds(source)}`), ...(embedding ? ['embedding'] : [])].sort().join(','),
+    level: missing + stale + (embedding?.total ?? 0) } };
+  const absent = 'Treat a missing or outdated answer as "held", never as "the brain has nothing on this".';
+  if (!coverage.length) {
+    const why = `Coverage is partial: ${embeddingWhy}${absent}`;
+    const preview = ['gbrain', 'embed', '--held', '--dry-run'];
+    const fix: Action = remote
+      ? { argv: preview, consent: [], actor: 'host_admin', requires_exclusive: false, why: 'Lists the held and capped large pages with the cost to finish embedding them; read-only.',
+        user_message: `Some large pages in your brain are waiting for embedding approval, so semantic search cannot find them. Please run '${preview.join(' ')}' on the brain host to see them and the cost to finish.` }
+      : { argv: preview, consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists the held and capped large pages with the cost to finish embedding them; read-only. Approving the spend is the user\'s call.' };
+    return { code: 'held_files', kind: 'degraded', why: remote ? `${why} Only the brain host operator can approve embedding them.` : why, fix, ...escalation };
+  }
   const per = coverage.map(source => `${source.source_id}: ${source.missing} missing, ${source.stale} stale`).join('; ');
-  const why = `Coverage is partial: sync holds ${missing + stale} file(s) it cannot import (${per}). `
+  const scoped = couldAffect === undefined ? '' : `${couldAffect} of them could match this query. `;
+  const why = `Coverage is partial: sync holds ${missing + stale} file(s) it cannot import (${per}). ${scoped}`
     + `${missing} held new file(s) have no page, so their content is absent from this result; ${stale} page(s) whose newer file is held show their last good revision (hits carry stale). `
-    + 'Treat a missing or outdated answer as "held", never as "the brain has nothing on this".';
+    + `${embeddingWhy}${absent}`;
   const ids = coverage.map(source => source.source_id);
-  if (remote) return { code: 'held_files', kind: 'degraded', why: `${why} Only the brain host operator can inspect and repair held files.`,
+  if (remote) return { code: 'held_files', kind: 'degraded', why: `${why} Only the brain host operator can inspect and repair held files.`, ...escalation,
     fix: hostOperatorFix(coverage.map(source => ({ source_id: source.source_id, route: coverageRoute(source) })), 'The repair preview on the brain host proposes each fix and writes nothing until the operator applies it.') };
   const single = coverage.length === 1 ? holdRepairSteps(ids[0]!, coverageRoute(coverage[0]!)) : null;
   const fix: Action = single
@@ -216,5 +269,5 @@ export function heldFilesNotice(coverage: HeldCoverage[], remote: boolean): Noti
         : `Previews the fix for each held file in source ${ids[0]} (gbrain sources status ${ids[0]} lists them); nothing is written until a hash-bound apply.` }
     : { argv: ['gbrain', 'doctor', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
       why: `Doctor lists the held files of each source with its next step (${coverage.map(source => holdRepairSteps(source.source_id, coverageRoute(source)).commands.join(', ')).join('; ')}).` };
-  return { code: 'held_files', kind: 'degraded', why, fix };
+  return { code: 'held_files', kind: 'degraded', why, fix, ...escalation };
 }

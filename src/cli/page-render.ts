@@ -3,7 +3,7 @@
  * the thin client.
  *
  * A whole page prints as its markdown, as it always has. A partial response
- * (body none / outline / window) prints only what it carries, and says on
+ * (body none / outline / window, a section, grep blocks) prints only what it carries, and says on
  * stderr that it is partial and how to read on, so `gbrain get > file` never
  * writes part of a page as if it were all of it.
  *
@@ -62,6 +62,20 @@ function renderOutline(r: GetPageResult): string {
   return lines.join('\n') + '\n';
 }
 
+/** A section or grep read (#7180): its text on stdout, where it sits in the page on stderr. */
+function renderSlice(r: GetPageResult): string {
+  const more = r.truncated ? ' Truncated: some of it was not printed.' : '';
+  if (r.section) {
+    const s = r.section;
+    const next = r.next?.arguments?.lines ? ` Read on: gbrain get ${r.slug} --lines '${JSON.stringify(r.next.arguments.lines)}'` : '';
+    process.stderr.write(`[gbrain] section ${(s.heading_path ?? [s.heading]).join(' > ')}: lines ${s.line_start}-${s.line_end}, ${r.chars} chars.${more}${next}\n`);
+    return s.text.endsWith('\n') ? s.text : `${s.text}\n`;
+  }
+  const g = r.grep;
+  process.stderr.write(`[gbrain] grep ${JSON.stringify(g.term)}: ${g.total_matches} matching paragraph${g.total_matches === 1 ? '' : 's'}${g.omitted_matches ? `, ${g.returned_matches} printed` : ''}, ${r.chars} chars.${more}\n`);
+  return g.blocks.map((b: GetPageResult) => `-- lines ${b.line_start}-${b.line_end} (match at ${b.match_starts.join(', ')})\n${b.text}\n`).join('');
+}
+
 /** stdout text for one get_page result; partial responses add a stderr note. */
 export function formatGetPage(r: GetPageResult): string {
   if (r.error === 'ambiguous_slug') {
@@ -70,6 +84,7 @@ export function formatGetPage(r: GetPageResult): string {
   if (typeof r.body !== 'string') {
     return serializeMarkdown(r.frontmatter || {}, r.compiled_truth || '', r.timeline || '', { type: r.type, title: r.title, tags: r.tags || [] });
   }
+  if (r.section || r.grep) return renderSlice(r);
   process.stderr.write(partialNote(r) + '\n');
   if (r.window) return r.window.text;
   if (r.outline) return renderOutline(r);
@@ -86,7 +101,7 @@ export function remoteErrorCode(e: unknown): string | undefined {
 
 /** True when a get_page call named no body mode, selector or round-trip flag: the caller wants the page as it is. */
 export function wantsWholePage(params: Record<string, unknown>): boolean {
-  return ['body', 'lines', 'bytes', 'around_chunk_id', 'cursor', 'include_content', 'content_only'].every(k => params[k] === undefined);
+  return ['body', 'lines', 'bytes', 'around_chunk_id', 'cursor', 'include_content', 'content_only', 'section', 'grep'].every(k => params[k] === undefined);
 }
 
 /**

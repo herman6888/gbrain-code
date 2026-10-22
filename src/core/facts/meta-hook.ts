@@ -155,12 +155,16 @@ export async function getBrainHotMemoryMeta(
   // build that raced a forget or a trust transition stores the older value
   // and the next hit rebuilds. The eligibility is read after the generation:
   // a `trust.%` config change bumps it.
+  // The two are independent, so they are sent together (one round trip).
   const generation = _generations.get(ctx.engine) ?? 0;
-  const withdrawals = await withdrawalWatermark(ctx.engine, sourceId);
+  const withdrawalsRead = withdrawalWatermark(ctx.engine, sourceId);
+  const trustGenerationRead = readTrustGeneration(ctx.engine);
+  trustGenerationRead.catch(() => {});
+  const withdrawals = await withdrawalsRead;
   let trustGeneration: string;
   let policy: Awaited<ReturnType<typeof proactiveEligibility>>;
   try {
-    trustGeneration = await readTrustGeneration(ctx.engine);
+    trustGeneration = await trustGenerationRead;
     policy = await proactiveEligibility(ctx, 'hot_memory');
   } catch {
     return undefined;

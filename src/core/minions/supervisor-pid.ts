@@ -10,6 +10,8 @@
 import { existsSync, readFileSync } from 'fs';
 import { hostname } from 'os';
 import { processStartTime } from '../pglite-lock.ts';
+import { VERSION } from '../../version.ts';
+import { runtimeInstallRoot } from '../runtime-build.ts';
 
 export interface SupervisorPidStatus {
   /** Parsed pid from the PID file, or null if missing/corrupt. */
@@ -54,10 +56,24 @@ export function readSupervisorPid(pidFile: string): SupervisorPidStatus {
  * hostname label change from a second supervisor. Every reader takes the first
  * line; `jobs supervisor stop` reads line 2 (non-numeric = unknown); doctor
  * reads line 3 (missing = an older supervisor). An unknown start time leaves
- * line 2 empty so the hostname stays on line 3.
+ * line 2 empty so the hostname stays on line 3. #7245: line 4 is the gbrain
+ * version the supervisor runs and line 5 the package root it loaded from
+ * (empty in a compiled binary); `readSupervisorBuild` reads them.
  */
 export function pidFileContents(pid: number = process.pid, host: string = hostname()): string {
-  return `${pid}\n${processStartTime(pid) ?? ''}\n${host}\n`;
+  return `${pid}\n${processStartTime(pid) ?? ''}\n${host}\n${VERSION}\n${runtimeInstallRoot() ?? ''}\n`;
+}
+
+/** #7245: the build a supervisor recorded in its PID file (lines 4 and 5); null for a file an older supervisor wrote, or none. */
+export function readSupervisorBuild(pidFile: string): { version: string; install_root: string | null } | null {
+  try {
+    const lines = readFileSync(pidFile, 'utf8').split('\n');
+    const version = lines[3]?.trim();
+    if (!version || !/^\d+(?:\.\d+){2,3}$/.test(version)) return null;
+    return { version, install_root: lines[4]?.trim() || null };
+  } catch {
+    return null;
+  }
 }
 
 /** `{ [key]: <kernel start time of pid> }` for an audit row, or nothing when it is unknowable. */

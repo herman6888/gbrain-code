@@ -292,7 +292,7 @@ export function gitHoldFingerprint(sourceId: string, incarnation: string, path: 
   return `${sourceId}:${incarnation}:${path}`;
 }
 
-const summaryFingerprint = (sourceId: string, incarnation: string) => `${sourceId}:${incarnation}`;
+export const summaryFingerprint = (sourceId: string, incarnation: string) => `${sourceId}:${incarnation}`;
 
 /** Locks the source's summary row (creating it), so hold writes of one source serialize. */
 async function lockSummary(tx: Exec, sourceId: string, incarnation: string): Promise<number> {

@@ -155,33 +155,61 @@ const MARKED = 2;
  * body produces), so one entry per row answers both questions.
  */
 export class TimelineKeySet implements TimelineKeyLookup {
-  private readonly digests = new Map<number, number>();
+  /** Open addressing over two plain number arrays (a Map costs about 80 bytes an entry, these about 25): slot i holds the first hash + 1 (0: empty) and the second hash plus its flags times LOW. */
+  private firsts: number[] = new Array<number>(1024).fill(0);
+  private values: number[] = new Array<number>(1024).fill(0);
+  private count = 0;
   add(key: string): void {
     const [a, b] = keyDigest(key);
-    const at = this.digests.get(a);
-    if (at === undefined) this.digests.set(a, b);
-    else if (at % LOW !== b) this.digests.set(a, at - (at % LOW) + b + (Math.floor(at / LOW) & AMBIGUOUS ? 0 : AMBIGUOUS * LOW));
+    const i = this.slot(a);
+    if (this.firsts[i] === 0) {
+      this.firsts[i] = a + 1;
+      this.values[i] = b;
+      if (++this.count * 4 > this.firsts.length * 3) this.grow();
+      return;
+    }
+    const at = this.values[i]!;
+    if (at % LOW !== b) this.values[i] = at - (at % LOW) + b + (Math.floor(at / LOW) & AMBIGUOUS ? 0 : AMBIGUOUS * LOW);
   }
   has(key: string): boolean {
-    return this.entry(key) !== undefined;
+    return this.entry(key) !== -1;
   }
   /** Flag an added key; false when it was not added. */
   mark(key: string): boolean {
-    const [a] = keyDigest(key);
-    const at = this.entry(key);
-    if (at === undefined) return false;
-    if (!(Math.floor(at / LOW) & MARKED)) this.digests.set(a, at + MARKED * LOW);
+    const i = this.entry(key);
+    if (i === -1) return false;
+    if (!(Math.floor(this.values[i]! / LOW) & MARKED)) this.values[i] = this.values[i]! + MARKED * LOW;
     return true;
   }
   marked(key: string): boolean {
-    const at = this.entry(key);
-    return at !== undefined && (Math.floor(at / LOW) & MARKED) !== 0;
+    const i = this.entry(key);
+    return i !== -1 && (Math.floor(this.values[i]! / LOW) & MARKED) !== 0;
   }
-  get size(): number { return this.digests.size; }
-  private entry(key: string): number | undefined {
+  get size(): number { return this.count; }
+  /** The slot holding first hash `a`, or the empty slot where it goes. */
+  private slot(a: number): number {
+    const mask = this.firsts.length - 1;
+    let i = a % this.firsts.length;
+    while (this.firsts[i] !== 0 && this.firsts[i] !== a + 1) i = (i + 1) & mask;
+    return i;
+  }
+  private entry(key: string): number {
     const [a, b] = keyDigest(key);
-    const at = this.digests.get(a);
-    return at !== undefined && ((Math.floor(at / LOW) & AMBIGUOUS) !== 0 || at % LOW === b) ? at : undefined;
+    const i = this.slot(a);
+    if (this.firsts[i] === 0) return -1;
+    const at = this.values[i]!;
+    return (Math.floor(at / LOW) & AMBIGUOUS) !== 0 || at % LOW === b ? i : -1;
+  }
+  private grow(): void {
+    const { firsts, values } = this;
+    this.firsts = new Array<number>(firsts.length * 2).fill(0);
+    this.values = new Array<number>(firsts.length * 2).fill(0);
+    for (let j = 0; j < firsts.length; j++) {
+      if (firsts[j] === 0) continue;
+      const i = this.slot(firsts[j]! - 1);
+      this.firsts[i] = firsts[j]!;
+      this.values[i] = values[j]!;
+    }
   }
 }
 

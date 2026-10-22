@@ -126,7 +126,7 @@ export function isOwnerThisProcess(owner: Pick<ClaimOwner, 'pid' | 'nonce'> | nu
   return claimOwnerIsThisProcess(owner);
 }
 
-const OWNER_COMMANDS = new Set(['sync', 'serve', 'jobs', 'autopilot', 'mcp', 'dream', 'cycle', 'sources', 'migrate-graduation', 'put', 'import']);
+export const OWNER_COMMANDS: ReadonlySet<string> = new Set(['sync', 'serve', 'jobs', 'autopilot', 'mcp', 'dream', 'cycle', 'sources', 'migrate-graduation', 'put', 'import']);
 let ownerOverride: ClaimOwner | undefined;
 /** The gbrain command this process runs (`cli` when none is recognisable). */
 export function claimOwnerKind(): string {

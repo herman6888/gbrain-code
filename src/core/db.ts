@@ -8,7 +8,7 @@ import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.t
 import type { BrainEngine } from './engine.ts';
 import { verifySchema } from './schema-verify.ts';
 import { isConnectTimeoutError, isRetryableConnError } from './retry-matcher.ts';
-import { loadSharedParameterTypes, sharedParameterTypes, type SharedParameterTypes } from './pg-type-cache.ts';
+import { loadSharedParameterTypes, sharedArrayTypes, sharedParameterTypes, type SharedArrayTypes, type SharedParameterTypes } from './pg-type-cache.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
@@ -151,6 +151,21 @@ export function readPoolPipelineOptions(url: string): { max_pipeline?: number } 
   return value === null ? {} : { max_pipeline: value };
 }
 
+/** Pipeline depth inside a transaction on a pool that does not pipeline across transactions (#6930). */
+export const TRANSACTION_PIPELINE_DEPTH = 100;
+
+/**
+ * #6930: a read-side pool that `resolveReadPoolPipeline` keeps from pipelining (a transaction-mode pooler) still
+ * pipelines the statements of one transaction on the connection its owner holds (sql.begin, sql.reserve): the pooler
+ * pins one server connection from BEGIN until the transaction ends, and the driver never sends a statement behind one
+ * that may end the transaction, so #6543's boundary stays closed. Prepared statements stay off (`resolvePrepare`).
+ * `GBRAIN_PG_TXN_PIPELINE=0` restores one round trip per statement.
+ */
+export function transactionPipelineOptions(url: string): { transaction_pipeline?: number } {
+  const off = process.env.GBRAIN_PG_TXN_PIPELINE === '0' || process.env.GBRAIN_PG_TXN_PIPELINE === 'false';
+  return !off && resolveReadPoolPipeline(url).value === 0 ? { transaction_pipeline: TRANSACTION_PIPELINE_DEPTH } : {};
+}
+
 /**
  * Seconds a pool waits for a connection before giving up with CONNECT_TIMEOUT
  * when its URL names no `connect_timeout` of its own.
@@ -175,9 +190,17 @@ const MAX_CONNECT_TIMEOUT_S = Math.floor(0x7fffffff / 1000);
 export function resolveSharedTypes(url?: string): SharedParameterTypes | false {
   return sharedParameterTypes(url);
 }
-/** Forgets the shared parameter types of these pools; a schema change may have changed them. */
+/** #6930: the array types every pool for this database target shares, so only the process's first connection fetches them. */
+export function resolveArrayTypes(url?: string): SharedArrayTypes | null {
+  return sharedArrayTypes(url);
+}
+/** Forgets the shared parameter and array types of these pools; a schema change may have changed them. */
 export function clearSharedTypes(...pools: unknown[]): void {
-  for (const pool of pools) (pool as { options?: { shared_types?: Map<string, number[]> | null } } | null)?.options?.shared_types?.clear();
+  for (const pool of pools) {
+    const options = (pool as { options?: { shared_types?: Map<string, number[]> | null; array_types?: SharedArrayTypes | null } } | null)?.options;
+    options?.shared_types?.clear();
+    if (options?.array_types) options.array_types.rows = null;
+  }
 }
 
 /**
@@ -518,7 +541,9 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       ...poolHealthOptions(hooks, timeouts.statement_timeout),
       shared_types: resolveSharedTypes(url),
+      array_types: resolveArrayTypes(url),
       ...readPoolPipelineOptions(url),
+      ...transactionPipelineOptions(url),
     };
     opts.connection = { ...timeouts, application_name: gbrainApplicationName() };
     if (typeof prepare === 'boolean') {

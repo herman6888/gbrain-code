@@ -34,6 +34,8 @@ import { chunkGenerationFilter } from './search/safe-chunks.ts';
 import { quoteIdentifier } from './search/embedding-column.ts';
 import { embeddingWriteTarget } from './page-state/projections.ts';
 import { budgetRowAppliesFilter } from './page-size-policy.ts';
+import { readOversizedStaleFacts, oversizedFactLine, OVERSIZED_FACT_FIX, type OversizedFact } from './facts/embedding-identity.ts';
+import { resolveMaxChunkTokens } from './embedding-input-limit.ts';
 import { reservationCostUsd } from './budget/reservation-cost.ts';
 import { loadPricingOverrides } from './budget/budget-tracker.ts';
 import { estimatePageEmbedUsd, listBudgetLimitedPages } from './page-embedding-budget.ts';
@@ -140,16 +142,43 @@ export async function budgetLimitedField(engine: BrainEngine, sourceId: string, 
 export async function budgetLimitedFinding(engine: BrainEngine, signature: string | null): Promise<{ message: string; fix: Action; details: Record<string, unknown> } | null> {
   const found = await budgetLimitedReport(engine, { signature });
   if (!found) return null;
-  return { message: found.line, fix: found.fix, details: { ...found.report } };
+  // #7174: a hold nobody decided on stays put by design, so its age is what tells the operator it is waiting on them.
+  const [age] = await engine.executeRaw<{ stale: number; oldest: Date | string | null }>(
+    `SELECT count(*) FILTER (WHERE b.updated_at < now() - interval '1 day')::int AS stale, min(b.updated_at) AS oldest
+       FROM page_embedding_budget b JOIN pages p ON p.id = b.page_id
+      WHERE ${budgetRowAppliesFilter('b', 'p')} AND p.deleted_at IS NULL AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`);
+  const stale = Number(age?.stale ?? 0);
+  const oldest = age?.oldest ? new Date(age.oldest).toISOString() : null;
+  const waited = stale ? ` ${stale} of them have waited more than a day (oldest unchanged since ${oldest}); nothing embeds them until the user approves or declines.` : '';
+  return { message: `${found.line}${waited}`, fix: found.fix, details: { ...found.report, waiting_over_day: stale, oldest_updated_at: oldest } };
 }
 
 type HeldListing = {
   embedded: 0; skipped: 0; would_embed: number; total_chunks: number; pages_processed: 0; failures: 0; failure_samples: []; dryRun: boolean; chunkless_pages_healed: 0;
   held?: number; capped?: number; pages?: Array<{ slug: string; source_id: string; state: string; reason: string | null; pending_chunks: number; spent_usd: number; est_usd: number }>;
   sources?: BudgetLimitedReportSource[];
+  oversized_facts?: OversizedFact[];
 };
 const emptyListing = (dryRun: boolean): HeldListing => ({ embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0, pages_processed: 0, failures: 0, failure_samples: [], dryRun, chunkless_pages_healed: 0,
   ...(dryRun ? { held: 0, capped: 0, pages: [], sources: [] } : {}) });
+
+/**
+ * #7211: stale facts over the embedding input limit, which `gbrain embed --facts` skips. No
+ * approval releases them (only an edit that makes the text fit does), so --held lists them and moves on.
+ */
+async function oversizedFacts(engine: BrainEngine, sourceId: string | undefined, say: (line: string) => void): Promise<OversizedFact[]> {
+  const { getEmbeddingModel, getEmbeddingDimensions } = await import('./ai/gateway.ts');
+  let model: string, dims: number;
+  try { model = getEmbeddingModel(); dims = getEmbeddingDimensions(); } catch { return []; }
+  const maxTokens = resolveMaxChunkTokens();
+  const rows = await readOversizedStaleFacts(engine, { ...(sourceId ? { sourceId } : {}), model, dims, maxTokens });
+  if (!rows.length) return rows;
+  say(`[embed] ${rows.length} fact(s) are longer than the embedding input limit and are skipped by gbrain embed --facts:`);
+  for (const row of rows.slice(0, 20)) say(`[embed]   ${oversizedFactLine(row, maxTokens)}`);
+  if (rows.length > 20) say(`[embed]   … and ${rows.length - 20} more (gbrain embed --held --dry-run --json lists every one)`);
+  say(`[embed] ${OVERSIZED_FACT_FIX}`);
+  return rows;
+}
 
 /**
  * `gbrain embed --held`: list the held and capped large pages with what each
@@ -164,10 +193,12 @@ export async function heldEmbedArgv(engine: BrainEngine, args: readonly string[]
   const at = args.indexOf('--source');
   const sourceId = at >= 0 ? args[at + 1] : undefined;
   const dryRun = args.includes('--dry-run');
+  const oversized = await oversizedFacts(engine, sourceId, say);
+  const withFacts = (listing: HeldListing): HeldListing => oversized.length ? { ...listing, oversized_facts: oversized } : listing;
   const limited = await listBudgetLimitedPages(engine, { ...(sourceId ? { sourceId } : {}), limit: null });
   if (limited.length === 0) {
     say('[embed] No large pages are held or capped by embed.max_usd_per_page.');
-    return emptyListing(dryRun);
+    return withFacts(emptyListing(dryRun));
   }
   const pages = limited.map(row => ({ slug: row.slug, source_id: row.source_id, state: row.state, reason: row.reason, pending_chunks: row.pending_chunks,
     spent_usd: row.spent_usd, est_usd: estimatePageEmbedUsd(row.pending_chars, signature) }));
@@ -179,8 +210,8 @@ export async function heldEmbedArgv(engine: BrainEngine, args: readonly string[]
   if (dryRun) {
     const found = await budgetLimitedReport(engine, { ...(sourceId ? { sourceId } : {}), signature });
     if (found) say(`[embed] ${found.line}`);
-    return { ...emptyListing(true), would_embed: found?.report.pending_chunks ?? 0, total_chunks: found?.report.pending_chunks ?? 0,
-      held: found?.report.held ?? 0, capped: found?.report.capped ?? 0, pages, sources: found?.report.by_source ?? [] };
+    return withFacts({ ...emptyListing(true), would_embed: found?.report.pending_chunks ?? 0, total_chunks: found?.report.pending_chunks ?? 0,
+      held: found?.report.held ?? 0, capped: found?.report.capped ?? 0, pages, sources: found?.report.by_source ?? [] });
   }
   if (sources.length > 1) {
     const found = await budgetLimitedReport(engine, { signature });

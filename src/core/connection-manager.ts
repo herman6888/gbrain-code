@@ -38,9 +38,10 @@
 
 import postgres from '#postgres'
 import { traceSqlOptions } from './sql-trace.ts';
-import { gbrainApplicationName, readPoolPipelineOptions, resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, endPoolBounded, poolHealthOptions, type PoolHealthHooks } from './db.ts';
+import { gbrainApplicationName, readPoolPipelineOptions, transactionPipelineOptions, resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, resolveArrayTypes, endPoolBounded, poolHealthOptions, type PoolHealthHooks } from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
+import { directPoolProfile, type DirectPoolProfile } from './direct-pool-profile.ts';
 
 export type Sql = ReturnType<typeof postgres>;
 
@@ -251,7 +252,8 @@ export function readKillSwitchEnv(): boolean {
 }
 
 /**
- * Resolve direct pool size: explicit > env > default.
+ * Resolve direct pool size: explicit > env > the process profile's default
+ * (3 for a resident process, 1 otherwise).
  */
 export function resolveDirectPoolSize(explicit?: number): number {
   if (typeof explicit === 'number' && explicit > 0) return explicit;
@@ -260,7 +262,7 @@ export function resolveDirectPoolSize(explicit?: number): number {
     const parsed = parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed > 0 && parsed <= 20) return parsed;
   }
-  return DEFAULT_DIRECT_POOL_SIZE;
+  return directPoolProfile() === 'resident' ? DEFAULT_DIRECT_POOL_SIZE : 1;
 }
 
 export class ConnectionManager {
@@ -306,7 +308,12 @@ export class ConnectionManager {
   }
 
   /** Known poolers derive their route; other deployments require a valid explicit override. */
+  /** Statements route through the direct pool. A one-shot command keeps it for schema DDL only (`ddl()`). */
   isDualPoolActive(): boolean {
+    return directPoolProfile() !== 'one_shot' && this.isDirectRouteConfigured();
+  }
+
+  private isDirectRouteConfigured(): boolean {
     if (this._killSwitch || !this._directUrl) return false;
     if (this._isSupabase) return true;
     if (this._directUrlAutoDerived) return false;
@@ -352,7 +359,9 @@ export class ConnectionManager {
       types: { bigint: postgres.BigInt },
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       shared_types: resolveSharedTypes(this.opts.url),
+      array_types: resolveArrayTypes(this.opts.url),
       ...readPoolPipelineOptions(this.opts.url),
+      ...transactionPipelineOptions(this.opts.url),
     };
     const timeouts = resolveSessionTimeouts();
     Object.assign(opts, poolHealthOptions({ ...this.opts.health?.('read'), onpoisoned: (status: string) => this.opts.onpoisoned?.('read', status) }, timeouts.statement_timeout));
@@ -379,12 +388,14 @@ export class ConnectionManager {
   /**
    * Acquire (and lazy-init) the direct DDL pool. The kill switch or an
    * unconfigured direct route returns the read pool (single-pool fallback).
+   * A one-shot command still gets the direct pool here: schema DDL needs its
+   * session advisory lock and long statement timeout.
    *
    * A1: lazy init wraps in a cached Promise<Sql> so concurrent first-callers
    * await the same init instead of racing two pool constructions.
    */
   async ddl(): Promise<Sql> {
-    if (!this.isDualPoolActive()) {
+    if (!this.isDirectRouteConfigured()) {
       return this.getReadPool();
     }
     return this.getDirectPool();
@@ -506,6 +517,7 @@ export class ConnectionManager {
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       ...poolHealthOptions({ ...this.opts.health?.('direct'), onpoisoned: (status: string) => this.opts.onpoisoned?.('direct', status) }, String(DDL_STMT_TIMEOUT_MS)),
       shared_types: resolveSharedTypes(this._directUrl),
+      array_types: resolveArrayTypes(this._directUrl),
       // Apply DDL session GUCs as connection startup parameters (durable
       // through any intermediary pooling layer, same trick as
       // resolveSessionTimeouts).
@@ -592,13 +604,15 @@ export class ConnectionManager {
    * Diagnostic snapshot for doctor / get_health surfaces.
    */
   describeMode(): {
-    mode: 'split' | 'single (kill-switch)' | 'single (non-supabase)' | 'single (no-direct-url)';
+    mode: 'split' | 'single (kill-switch)' | 'single (non-supabase)' | 'single (no-direct-url)' | 'single (one-shot command)';
     direct_host?: string;
     kill_switch_active: boolean;
     direct_pool_size: number;
+    direct_profile: DirectPoolProfile;
   } {
-    let mode: 'split' | 'single (kill-switch)' | 'single (non-supabase)' | 'single (no-direct-url)';
+    let mode: 'split' | 'single (kill-switch)' | 'single (non-supabase)' | 'single (no-direct-url)' | 'single (one-shot command)';
     if (this.isDualPoolActive()) mode = 'split';
+    else if (this.isDirectRouteConfigured()) mode = 'single (one-shot command)';
     else if (this._killSwitch && (this._isSupabase || this._directUrl)) mode = 'single (kill-switch)';
     else if (!this._isSupabase) mode = 'single (non-supabase)';
     else mode = 'single (no-direct-url)';
@@ -607,6 +621,7 @@ export class ConnectionManager {
       direct_host: this._directUrl ? this.hostOnly(this._directUrl) : undefined,
       kill_switch_active: this._killSwitch,
       direct_pool_size: resolveDirectPoolSize(this.opts.directPoolSize),
+      direct_profile: directPoolProfile(),
     };
   }
 

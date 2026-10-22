@@ -52,7 +52,8 @@ notice). User guide: [core memory](../../guides/core-memory.md).
   scan, window detection, once-per-segment state); wired in the user-prompt
   hook and OpenClaw `assemble()`.
 - `src/core/remember-batch.ts`: `remember` with `items[]` (all-or-none
-  validation, deterministic child request ids, per-item status).
+  validation, deterministic child request ids, per-item status; #7248: an
+  item still publishing is `pending` with its `target`, not `failed`).
 - `src/commands/core.ts` (`gbrain core`), `src/commands/doctor/checks/core-memory.ts`
   (`core_memory`), schema `src/core/core-memory-schema.ts` + migration v213.
 - Tests: `test/core-memory.test.ts`, `test/core-guard.test.ts`,

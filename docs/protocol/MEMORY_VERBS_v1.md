@@ -331,13 +331,16 @@ suggestion are unchanged.
 old fact is no longer current (the texts need not mean the same). Zero model calls; the cosine rule does
 not apply. The target must be an active fact in the same source, with the same
 visibility (world only for remote callers, else `not_found`) and the same
-entity, on the same entity page. A target saved without an entity may be
+entity, on the same entity page. A local call that leaves `visibility` unset
+takes a private target's visibility, so the replacement stays private. A target saved without an entity may be
 replaced by a fact with an entity: that links it (the unlinked fact is
 superseded, not forgotten, so the claim stays rememberable). Refusals come back as `invalid_params` with a
 code prefix and a `suggestion`: `target_withdrawn` (forgotten facts are not
 replaceable; remember without `replaces`), `target_superseded` (names the fact
 that replaced it), `target_expired`, `replaces_entity_mismatch`,
-`replaces_cross_page` (forget the old fact, then remember), and
+`replaces_cross_page` (forget the old fact, then remember),
+`replaces_visibility_mismatch` (an explicit `visibility` that differs from the
+target's; pass the target's visibility), and
 `replaces_duplicate` (another active fact already states the new claim). New
 text equal to the target is `status: duplicate` and changes nothing. On success
 `status` is `superseded`, `superseded_fact_id` names the replaced fact and

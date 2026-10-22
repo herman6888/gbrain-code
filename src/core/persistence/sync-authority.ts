@@ -12,6 +12,7 @@ import { authorizePageVisibility } from './page-visibility.ts';
 import { submissionAuthority, authorizeWrite } from './authority.ts';
 import { currentVerifiedLocalWriter, withRegisteredLocalWriter } from './identity.ts';
 import { readManagedMode, readPersistenceBrain } from './managed-mode.ts';
+import { dispatchManagedMode, syncDispatchRow } from '../sync-dispatch-read.ts';
 import type { WriteAuthority } from './model.ts';
 import { writerAdminState } from './admin-intent.ts';
 
@@ -41,10 +42,12 @@ export function assertSyncDispatchActive(): void {
   throwIfAborted(currentJobSignal());
 }
 export async function resolveSyncPersistenceMode(engine: BrainEngine, opts: SyncOpts): Promise<boolean> {
-  const managed = await readManagedMode(engine);
+  // GBRA-133: inside a CLI sync's routing scope the source's routing row answers the mode and the claim (sync-dispatch-read.ts).
+  const routing = await syncDispatchRow(engine, opts.sourceId ?? 'default');
+  const managed = routing ? dispatchManagedMode(routing) : await readManagedMode(engine);
   assertSyncDispatchActive();
   if (managed || opts.signal?.aborted) return managed;
-  const [source] = await engine.executeRaw<{ claimed: boolean }>(`SELECT
+  const [source] = routing ? [routing.id === null ? undefined : routing] : await engine.executeRaw<{ claimed: boolean }>(`SELECT
     EXISTS(SELECT 1 FROM persistence_source_bindings WHERE source_id=s.id AND source_incarnation=s.incarnation) AS claimed
     FROM sources s WHERE s.id=$1`, [opts.sourceId ?? 'default']);
   if (source?.claimed) throw await preActivationClaimRefusal(engine, opts.sourceId ?? 'default');

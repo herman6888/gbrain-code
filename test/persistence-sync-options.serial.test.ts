@@ -871,6 +871,37 @@ for (const boundary of ['accepted-commit', 'receipt-banking'] as const) check(`c
   } finally { engine.executeRaw = execute; engine.transaction = transaction; }
 });
 
+/** How soon an aborted sync returns: a stop check and one receipt read, far under the 5 s write wait it used to sit out. */
+const ABORT_RETURN_MS = 1500;
+
+check('an aborted sync returns promptly, before entry and while it waits on its accepted write, and the write stays queued for resume', async engine => {
+  const before = await fixture(engine), early = new AbortController();
+  early.abort();
+  const started = performance.now();
+  expect(await performSync(engine, { ...before.opts, signal: early.signal })).toMatchObject({ status: 'partial', reason: 'timeout', filesImported: 0 });
+  expect(Math.round(performance.now() - started)).toBeLessThan(ABORT_RETURN_MS);
+  const f = await fixture(engine), abort = new AbortController(), transaction = engine.transaction;
+  const lock = await acquireWorktree((await getWorktreeBinding(engine, f.id))!);
+  expect(lock).not.toBeNull();
+  let abortedAt = 0;
+  engine.transaction = async function (this: BrainEngine, run: (tx: BrainEngine) => Promise<unknown>) {
+    const value = await transaction.call(this, run);
+    if (!abortedAt && value && typeof value === 'object' && 'request_id' in value && 'source_id' in value && value.source_id === f.id) { abortedAt = performance.now(); abort.abort(); }
+    return value;
+  } as BrainEngine['transaction'];
+  try {
+    const pending = await performSync(engine, { ...f.opts, signal: abort.signal });
+    const returnedMs = performance.now() - abortedAt;
+    expect(abortedAt).toBeGreaterThan(0);
+    expect(pending).toMatchObject({ status: 'partial', reason: 'timeout', filesImported: 0, managedWrite: { write_error: 'write_pending' } });
+    expect(Math.round(returnedMs)).toBeLessThan(ABORT_RETURN_MS);
+    const requestId = pending.managedWrite!.write_request.request_id;
+    await disposePersistenceConsumer(engine);
+    expect(await engine.executeRaw('SELECT request_id,state FROM persistence_requests WHERE source_id=$1', [f.id])).toEqual([{ request_id: requestId, state: 'queued' }]);
+  } finally { engine.transaction = transaction; await disposePersistenceConsumer(engine); await lock?.release(); }
+  expect(await performSync(engine, f.opts)).toMatchObject({ status: 'first_sync', added: 1, filesImported: 1 });
+});
+
 check('cancelled waits retain the accepted pending receipt and resume it after owner lock release', async engine => {
   const f = await fixture(engine), abort = new AbortController(), transaction = engine.transaction;
   const lock = await acquireWorktree((await getWorktreeBinding(engine, f.id))!);

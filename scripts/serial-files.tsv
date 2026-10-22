@@ -247,6 +247,7 @@ test/jobs-embed-background-parity.serial.test.ts	R2	R2: mock.module(../src/core/
 test/jobs-embed-stall-wiring.serial.test.ts	R2	R2: mock.module(../src/commands/embed.ts) replaces modules for every file in the process
 test/jobs-gateway-refresh.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, ANTHROPIC_API_KEY, OPENAI_API_KEY)
 test/jobs-list-get-json.serial.test.ts	global-state	global-state: patches process stdout/stderr/console
+test/jobs-wait-cli.serial.test.ts	global-state	global-state: patches process stdout/stderr/console and process.exit
 test/jobs-stats-backpressure.serial.test.ts	global-state	global-state: patches process stdout/stderr/console
 test/jobs-stats-divergence.serial.test.ts	global-state	global-state: patches process stdout/stderr/console
 test/jobs-stats-private-queue.serial.test.ts	global-state	global-state: patches process stdout/stderr/console
@@ -300,6 +301,7 @@ test/openai-latest.serial.test.ts	R1	R1: mutates process.env (GBRAIN_HOME, GBRAI
 test/openclaw-compact-transcript-runtime.serial.test.ts	global-state	global-state: swaps the context engine's module-level transcript-runtime loader and SDK load state
 test/openclaw-context-engine-native.serial.test.ts	global-state	global-state: binds local servers/ports
 test/ops-run-onboard-scope-gate.serial.test.ts	R2	R2: mock.module(../src/core/onboard/checks.ts, ../src/core/remediation/index.ts, ../src/core/onboard/render.ts) replaces modules for every file in the process
+test/oversized-backfill-failed-rewrite-7185.serial.test.ts	global-state	global-state: installs the process-global embedding transport seam (__setEmbedTransportForTests) and gateway config (configureGateway); swaps GBRAIN_HOME through withEnv
 test/oversized-backfill.serial.test.ts	global-state	global-state: installs the process-global embedding transport seam (__setEmbedTransportForTests) and gateway config (configureGateway); swaps GBRAIN_HOME through withEnv
 test/page-summary-length.serial.test.ts	R1	R1: mutates process.env (GBRAIN_AUDIT_DIR)
 test/pathological/a31-migrate-loop-rows.serial.test.ts	global-state	global-state: runMigrateEngine sets the process-wide CLI exit verdict and writes the config under a withEnv-scoped GBRAIN_HOME
@@ -439,3 +441,4 @@ test/search-tune-apply-truthful.serial.test.ts	R2	R2: mock.module(../src/core/se
 test/search-cost.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests, __setRerankTransportForTests; configureGateway changes the process-wide AI gateway
 test/chat-usage-phases.serial.test.ts	global-state	global-state: process-wide test seams __setChatTransportForTests, __setEmbedTransportForTests, __setGenerateObjectTransportForTests; configureGateway changes the process-wide AI gateway; setChatUsageSink replaces the process-wide ledger sink; R1: mutates process.env (ANTHROPIC_API_KEY)
 test/doctor-only-sync-failures-7143.serial.test.ts	global-state	global-state: spawns the real gbrain CLI against a tmpdir PGLite brain and home (doctor --only sync_failures connects the brain)
+test/decide/triage-decide-recheck-7307.serial.test.ts	global-state	global-state: process-wide test seams __setDecideTransportForTests, __resetDecideStoreForTests; configureGateway changes the process-wide AI gateway

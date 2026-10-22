@@ -41,9 +41,9 @@ export function opFlagValue(op: Operation, key: string, def: ParamDef | undefine
 
 /**
  * An object/array param from its CLI text: JSON, or for a string-item array
- * a comma list (`--types person,company`), or for a `cliKeyValue` object
+ * a comma list (`--types person,company`), for a `cliKeyValue` object
  * repeated `key=value` pairs, where `key=a,b` is a list and a repeated key
- * merges. Other values pass through.
+ * merges, or for a `cliRange` window `N-M` (inclusive) or `N`. Other values pass through.
  */
 export function opStructuredValue(key: string, def: ParamDef, value: unknown): unknown {
   const flag = `--${key.replace(/_/g, '-')}`;
@@ -63,8 +63,16 @@ export function opStructuredValue(key: string, def: ParamDef, value: unknown): u
   }
   const text = def.cliKeyValue && Array.isArray(value) ? value[0] : value;
   if ((def.type !== 'object' && def.type !== 'array') || typeof text !== 'string') return value;
+  const range = def.cliRange && /^\s*(\d+)(?:\s*-\s*(\d+))?\s*$/.exec(text);
+  if (def.cliRange && range) {
+    const start = Number(range[1]), end = range[2] === undefined ? start : Number(range[2]);
+    if (end < start) throw usageError(`${flag} ${inertText(text, 40)} ends before it starts.`, `Pass ${flag} N-M with N <= M, e.g. ${flag} 100-140.`);
+    return { [def.cliRange[0]]: start, [def.cliRange[1]]: end - start + 1 };
+  }
   if (def.type === 'array' && def.items?.type === 'string' && !text.trimStart().startsWith('[')) return text.split(',').map(v => v.trim()).filter(Boolean);
-  const jsonError = () => usageError(`${flag} requires a JSON ${def.type}.`, `Pass JSON, e.g. ${flag} '${def.type === 'array' ? '["a","b"]' : '{"key":"value"}'}'.`);
+  const jsonError = () => def.cliRange
+    ? usageError(`${flag} takes a range N-M (inclusive) or N, or a JSON object.`, `Pass ${flag} 100-140, or ${flag} '{"${def.cliRange[0]}":100,"${def.cliRange[1]}":41}'.`)
+    : usageError(`${flag} requires a JSON ${def.type}.`, `Pass JSON, e.g. ${flag} '${def.type === 'array' ? '["a","b"]' : '{"key":"value"}'}'.`);
   let parsed: unknown;
   try { parsed = JSON.parse(text); } catch { throw jsonError(); }
   if (def.type === 'array' ? !Array.isArray(parsed) : parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw jsonError();

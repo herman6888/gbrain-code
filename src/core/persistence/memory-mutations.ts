@@ -180,7 +180,7 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   opts: { visibilityDefaulted?: boolean } = {}): Promise<Record<string, unknown>> {
   registerMutationPreparer('remember', prepareMemoryMutation);
   const sub = await submission(ctx, 'remember', params);
-  if (sub.prior) return throwIfHeld(writeResponse(await waitForWrite(ctx.engine, sub.prior, ctx.config, waitMs ?? ctx.writeWaitMs)));
+  if (sub.prior) { const prior = sub.prior; const settled = await waitForWrite(ctx.engine, prior, ctx.config, waitMs ?? ctx.writeWaitMs); return throwIfHeld(withRememberTarget(prior, () => writeResponse(settled))); }
   const { p, sourceId, principal, callerIntent, requestId, clientRequestId } = sub;
   const [source] = await ctx.engine.executeRaw<RememberSource>(
     "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
@@ -188,8 +188,7 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   const { parseTtlParam } = await import('../ops/facts.ts');
   const validUntil = parseTtlParam(p.ttl);
   const entity = typeof p.entity === 'string' && !isNullLikeEntity(p.entity) ? p.entity.trim() : null;
-  const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
-  const resolved = entity ? await resolveEntitySlugWithSource(ctx.engine, sourceId, entity) : null;
+  const resolved = entity ? await resolveRememberEntity(ctx, sourceId, entity) : null;
   const call: RememberCall = { p, visibilityDefaulted: opts.visibilityDefaulted === true };
   const inference = entity === null ? await inferRememberTarget(ctx, sourceId, source, call) : null;
   const linked = inference && 'target' in inference ? inference : null;
@@ -197,8 +196,11 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   // A source-scoped absent identity serializes subjectless facts. Bound writers
   // cannot use it to escape their namespace grant.
   const { slug, authority, snapshot, fence, binding, writeThrough } = linked?.target ?? await planRememberTarget(ctx, sourceId, source, entitySlug, null, call);
-  const { assertFactNotWithdrawn, decideReplacement } = await import('../facts/single-prepare.ts');
-  const visibility = await rememberVisibility(ctx, call, snapshot?.page);
+  const { assertFactNotWithdrawn, decideReplacement, replacementVisibility } = await import('../facts/single-prepare.ts');
+  const defaultedVisibility = await rememberVisibility(ctx, call, snapshot?.page);
+  const visibility = call.visibilityDefaulted && p.replaces !== undefined && p.replaces !== null
+    ? await replacementVisibility(ctx.engine, sourceId, Number(p.replaces), defaultedVisibility, { remote: ctx.remote !== false })
+    : defaultedVisibility;
   const factIntent = { fact: String(p.fact).trim(), kind: (p.kind ?? 'fact') as never, visibility, entity_slug: entitySlug };
   // Fail fast on an invalid target or a withdrawn claim; the coordinator re-checks both under its locks before publishing.
   if (p.replaces !== undefined && p.replaces !== null) {
@@ -216,9 +218,60 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
       ...(linked ? { entity_inferred: linked.via } : {}), ...(inference && 'warning' in inference ? { entity_warning: inference.warning } : {}),
       session_id: ctx.sessionId ?? null },
     authority, worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null });
-  const response = throwIfHeld(writeResponse(await waitForWrite(ctx.engine, row, ctx.config, waitMs ?? ctx.writeWaitMs)));
+  const written = await waitForWrite(ctx.engine, row, ctx.config, waitMs ?? ctx.writeWaitMs);
+  const response = throwIfHeld(withRememberTarget(row, () => writeResponse(written)));
   emitFenceNotice(ctx, response, row.slug);
   return response;
+}
+
+/**
+ * #7248: a pending (or refused) remember names the page its fact goes to and
+ * the entity it is keyed under, so a caller can tell a misfile at once and
+ * poll the right receipt.
+ */
+function withRememberTarget<T>(row: WriteRequest, reply: () => T): T {
+  try { return reply(); } catch (error) {
+    if (error instanceof OperationError && error.writeRequest) {
+      const entity = (row.intent as { entity_slug?: unknown } | null)?.entity_slug;
+      error.writeRequest.target = { slug: row.slug || null, entity_slug: typeof entity === 'string' ? entity : null };
+    }
+    throw error;
+  }
+}
+
+/**
+ * #7248: an explicit entity names its page. A reference with a folder keeps
+ * the lenient resolution (an existing page, else that exact slug for a page
+ * not written yet); a folder-less one must resolve to exactly one readable
+ * entity page by identity evidence, else the call is refused with the pages
+ * it could mean instead of keying the fact under a bare slug no page carries.
+ * A name no page resembles keeps its slugified key, as a fact about an entity
+ * with no page yet always has.
+ */
+async function resolveRememberEntity(ctx: OperationContext, sourceId: string, entity: string): Promise<{ slug: string }> {
+  const { entityReferenceCandidates, resolveEntitySlugWithSource, resolveStrictEntityReference } = await import('../entities/resolve.ts');
+  if (entity.includes('/')) return (await resolveEntitySlugWithSource(ctx.engine, sourceId, entity))!;
+  const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+  const strict = await resolveStrictEntityReference(ctx.engine, sourceId, entity, { sameName: true, excludePrivate });
+  if (strict.slug !== null) return { slug: strict.slug };
+  const candidates = await entityReferenceCandidates(ctx.engine, sourceId, entity, { excludePrivate });
+  if (strict.miss === 'no_page' && !candidates.length) {
+    const unnamed = await resolveEntitySlugWithSource(ctx.engine, sourceId, entity);
+    if (unnamed?.source === 'fallback_slugify') return { slug: unnamed.slug };
+  }
+  const named = candidates.length ? ` It could mean: ${candidates.join(', ')}.` : '';
+  const what = {
+    ambiguous: `entity "${entity}" matches more than one page.`,
+    unverified: `entity "${entity}" is not a page name; it only begins one.`,
+    not_entity: `entity "${entity}" names a page that is not a person, company or other entity.`,
+    no_page: `No page is named "${entity}".`,
+  }[strict.miss];
+  const example = candidates[0] ?? `people/${entity.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`;
+  const error = verbError('invalid_params', `${what}${named} Nothing was saved.`,
+    `Pass entity as the page slug with its folder, e.g. entity: "${example}". A slug with a folder saves under that page, even one not written yet; a name without one must match exactly one page.`);
+  error.reason = `entity_${strict.miss}`;
+  if (candidates.length) error.detail = `candidates: ${candidates.join(', ')}`;
+  throw error;
 }
 
 interface WithdrawalTarget { id: number; entity_slug: string | null; source_markdown_slug: string | null; expired_at: Date | null; trust_tier?: string | null; }

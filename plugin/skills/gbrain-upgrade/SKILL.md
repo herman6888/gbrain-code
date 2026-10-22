@@ -25,7 +25,8 @@ when_to_use: "Use when the user asks: \"gbrain update available\", \"UPGRADE_AVA
 # GBrain Self-Upgrade
 
 > gbrain rides invocation frequency (like gstack): every `gbrain` call checks for
-> updates and prints `UPGRADE_AVAILABLE <old> <new>` on stderr when one exists.
+> updates and prints `UPGRADE_AVAILABLE <old> <new>` on stderr when one exists
+> (once per 30 minutes per version, so act on the first one you see).
 > This skill turns that marker into the right action for the operator's chosen
 > mode.
 

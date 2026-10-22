@@ -214,7 +214,13 @@ breaking the orchestrator's `JSON.parse`. Its stdio is explicit:
 not on stderr. Each Minion handler that runs a bulk core (embed, sync,
 extract, import, backlinks) calls `job.updateProgress({done, total,
 …})` per iteration. Agents read per-job progress via the
-`get_job_progress` MCP operation or `gbrain jobs get <id>`.
+`get_job_progress` MCP operation or `gbrain jobs get <id>`. A `sync` job
+writes the phase it is in (`resolve_repo`, `git_pull`, `full_import`,
+`import` with `banked_files`, or the managed drain's `managed_sync.*`
+fields), and `autopilot-cycle` / `autopilot-global-maintenance` write
+`{phase, phase_index, phase_count, started_at}` as each cycle phase starts
+(the phase names are `gbrain dream --phase` names). These writes are
+best-effort: a failed progress write never fails the job.
 
 The `jobs work` daemon itself emits coarse one-line-per-job stderr output
 for liveness only. Per-page detail lives in the DB.
