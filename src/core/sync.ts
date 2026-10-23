@@ -614,12 +614,15 @@ export function isNestedSkipMetafile(path: string): boolean {
 }
 
 const METAFILE_PAGE_KEY_RE = /^(?:type|title|"type"|"title"|'type'|'title')[ \t]*:(?:[ \t]+(.*))?$/;
+const METAFILE_SLUG_KEY_RE = /^(?:slug|"slug"|'slug')[ \t]*:[ \t]+(.+)$/;
 
 /**
  * Whether the file at `path` (relative to its source root) is imported as a page although it is named like scaffolding:
  * a non-root `SYNC_SKIP_FILES` name under mode `typed` whose head opens with a closed frontmatter fence holding a
  * top-level `type:` or `title:` key with a value. `head` is the file's text (only the first `METAFILE_HEAD_BYTES`
  * characters are read); undefined (absent or unreadable) is bare. Every other path returns false.
+ * #7341: a top-level `slug:` naming another page (often the folder, `dir/x` for `dir/x/index.md`) keeps the file
+ * scaffolding, as before GBRA-150: importing it could only hold it `frontmatter_slug_conflict`.
  */
 export function metafileIsPage(path: string, head: string | undefined, mode: MetafilePagesMode): boolean {
   if (mode !== 'typed' || head === undefined || !isNestedSkipMetafile(path)) return false;
@@ -627,12 +630,16 @@ export function metafileIsPage(path: string, head: string | undefined, mode: Met
   let i = 0;
   while (i < lines.length && lines[i]!.trim() === '') i++;
   if (lines[i]?.trimEnd() !== '---') return false;
-  let typed = false;
+  let typed = false, foreignSlug = false;
+  const own = slugifyPath(path);
   for (i++; i < lines.length; i++) {
     const line = lines[i]!;
-    if (/^---[ \t]*$/.test(line)) return typed;
+    if (/^---[ \t]*$/.test(line)) return typed && !foreignSlug;
     const value = METAFILE_PAGE_KEY_RE.exec(line)?.[1]?.trim();
     if (value && !value.startsWith('#') && !/^(?:null|~)$/i.test(value)) typed = true;
+    const declared = METAFILE_SLUG_KEY_RE.exec(line)?.[1]?.trim().replace(/^(['"])(.*)\1$/, '$2');
+    // A source with a Git-root slug mode prefixes its scope, so the file's own slug may end the declared one.
+    if (declared && !declared.startsWith('#')) foreignSlug = slugifyPath(declared) !== own && !slugifyPath(declared).endsWith(`/${own}`);
   }
   return false;
 }

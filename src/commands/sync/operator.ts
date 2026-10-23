@@ -151,7 +151,8 @@ export async function runSyncStatus(engine: BrainEngine, args: string[]): Promis
   const notifier = notifierBlock && { ...notifierBlock, fix: notifierBlock.fix ? renderAction(notifierBlock.fix, ctx) : null };
   const read = (r: typeof status.cursors_read) => r.status === 'read' ? r : { ...r, fix: renderAction(r.fix, ctx) };
   const rendered = { ...status, holds: status.holds.map(hold => ({ ...hold, fix: renderAction(hold.fix, ctx) })),
-    git_push_holds: status.git_push_holds.map(hold => ({ ...hold, fix: renderAction(hold.fix, ctx) })), next: status.next ? renderAction(status.next, ctx) : null,
+    git_push_holds: status.git_push_holds.map(hold => ({ ...hold, fix: renderAction(hold.fix, ctx) })),
+    fence_holds: status.fence_holds.map(hold => ({ ...hold, fix: renderAction(hold.fix, ctx) })), next: status.next ? renderAction(status.next, ctx) : null,
     checkpoint_blockers_read: read(status.checkpoint_blockers_read), cursors_read: read(status.cursors_read), terminal_failures_read: read(status.terminal_failures_read),
     landing_read: read(status.landing_read), landing: status.landing?.status === 'ok' ? { ...status.landing, pages: status.landing.pages.map(page => ({ ...page, fix: page.fix ? renderAction(page.fix, ctx) : null })) } : status.landing,
     capacity: { status: snapshot.status, pause_pct: snapshot.pause_pct, low: snapshot.low, paused: snapshot.paused }, freshness, notifier, ...(notices.length ? { notices } : {}) };
@@ -185,6 +186,7 @@ export async function runSyncStatus(engine: BrainEngine, args: string[]): Promis
       + `${landing.gaps ? ` (${Object.entries(landing.by_state).map(([state, n]) => `${state} ${n}`).join(', ')})` : ''}`);
     for (const page of landing.pages) console.log(`    ${page.slug}: ${page.state}, synced ${page.age_seconds} s ago${page.fix?.argv ? `; fix: ${page.fix.argv.join(' ')}` : ''}`);
   } else if (landing) console.log(`  synced but not searchable: ${landing.status} (${landing.reason})`);
+  for (const hold of status.fence_holds) console.log(`  ${hold.kind} held (${hold.reason}) on ${hold.slug}: ${hold.rows} row(s) kept live; ASK THE USER: ${hold.fix.user_message ?? hold.fix.why}`);
   for (const hold of status.git_push_holds) console.log(`  git backups not pushed: ${hold.retrying} retrying, ${hold.parked} parked (${hold.codes.join(', ')}) since ${hold.oldest_at}${hold.conflict ? `; CONFLICT in ${hold.conflict.paths.join(', ')} needs a person` : ''}`);
   const connector = status.connector_last_error;
   if (connector) console.log(`  connector: ${connector.stopped ? 'STOPPED, ' : ''}the last ${connector.consecutive} run(s) ended on ${connector.code}${connector.slug ? ` at ${connector.slug}` : ''}: ${connector.message}`);
@@ -211,6 +213,7 @@ export function syncStatusHeadline(status: Pick<SyncStatus, 'source_id' | 'state
     case 'head_blocked': return `Source ${status.source_id} is blocked: its oldest write waits on something only an operator clears.`;
     case 'recovery_blocked': return `Source ${status.source_id} is blocked: a write's recovery record found changed bytes on disk.`;
     case 'pass_unfinished': return `Source ${status.source_id} is resumable: the newest sync pass did not finish; the next sync continues it.`;
+    case 'pass_abandoned': return `Source ${status.source_id} is blocked: its sync passes keep stopping before they end; another plain sync will not change that (report what doctor shows).`;
     case 'not_converged': return `Source ${status.source_id} is resumable: the newest sync pass ran out of rounds before every path settled.`;
     case 'settle_mismatch': return `Source ${status.source_id} is resumable: a path keeps settling without reading settled; three passes in a row hold it.`;
     case 'deletes_withheld': return `Source ${status.source_id} is blocked: sync withheld a mass delete; the rest of the source is synced.`;

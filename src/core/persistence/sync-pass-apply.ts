@@ -48,7 +48,7 @@ import { faultPoint } from './fault-points.ts';
 import { RECOVERY_VERSION } from '../markdown.ts';
 import { readSyncImportProvenances, recordSyncImportProvenances, syncImportParserFor, writeGitHold,
   type GitHoldCode, type GitHoldMeta, type SyncImportProvenance } from './sync-holds.ts';
-import { assertDrainLease } from './sync-lease.ts';
+import { assertDrainLease, inFencedSlices } from './sync-lease.ts';
 import { clearDeletesWithheld, deleteSetHash, readDeletesWithheld, readOriginDeletedMarker, retireOriginDeletedMarker, writeDeletesWithheld, type DeletesWithheld } from './sync-markers.ts';
 import { isCompactMatched, type ShadowLevel, type ShadowPath } from './sync-pass.ts';
 import { SETTLE_MISMATCH_STREAK, type ManagedSyncPassValue, type PassRoundSummary } from './sync-pass-row.ts';
@@ -61,6 +61,7 @@ import { decideOriginTwins, readOriginClaimants, slugPathOccupied, type OriginCo
 import { originConflictHold } from './sync-screen.ts';
 import { readSyncFile } from './sync-discovery.ts';
 import { frontmatterIdentity } from '../sync-rename-identity.ts';
+import { applyHeldDeletions, newHeldDeletionState, type HeldDeletionState } from './sync-held-deletions.ts';
 
 /** Legacy pages the sweep screens per pass after the incarnation's first full round (design §2.7, [estimated]). */
 export const PASS_LEGACY_SWEEP_MAX = 500;
@@ -99,11 +100,13 @@ export interface PassApplyState {
    * page). The next round's confirm proof attributes those records to the pass.
    */
   recorded: Set<number>;
+  /** GBRA-133: the held committed deletions `sync.apply_held_deletions` screened this pass (sync-held-deletions.ts). */
+  heldDeletions: HeldDeletionState;
 }
 
 export function newPassApplyState(): PassApplyState {
   return { markersRetired: 0, holds: { file_gone: 0, tombstone_edited: 0, purged_differs: 0, settle_mismatch: 0, origin_conflict: 0, page_identity_changed: 0, uncommitted: 0 }, settleMismatch: [], adopted: 0,
-    swept: { screened: 0, recorded: 0, paths: new Set() }, sweptAll: false, withheld: null, withheldCount: 0, keepDb: { admitted: 0, pending: 0, paused: 0, refused: {} }, keepDbTaken: [], originHeld: new Set(), matchedSlugs: new Set(), classes: {}, summary: null, recorded: new Set() };
+    swept: { screened: 0, recorded: 0, paths: new Set() }, sweptAll: false, withheld: null, withheldCount: 0, keepDb: { admitted: 0, pending: 0, paused: 0, refused: {} }, keepDbTaken: [], originHeld: new Set(), matchedSlugs: new Set(), classes: {}, summary: null, recorded: new Set(), heldDeletions: newHeldDeletionState() };
 }
 
 export interface PassApplyInput {
@@ -123,6 +126,8 @@ export interface PassApplyInput {
   screen?: ConvergenceScreen;
   /** GBRA-108: after each committed legacy-sweep slice (the pass saves its row and reports progress). */
   onSwept?: () => Promise<void>;
+  /** GBRA-133: `sync.apply_held_deletions` is on for the source (read once per pass, sync-held-deletions.ts). */
+  heldDeletions?: boolean;
 }
 
 /** The source-relative path (`SyncEntry.path`, the hold key) and the recorded origin of a level path. */
@@ -151,6 +156,7 @@ export async function applyPassRound(engine: BrainEngine, level: ShadowLevel, in
       if (!grantSees(level, entry, input.grantPrefixes) && !entry.result.settled) settleAs(entry, { settled: true, action: 'none', classAction: 'none' });
     }
   }
+  if (input.heldDeletions && !input.remote && input.admission === 'normal') await applyHeldDeletions(engine, level, input.context, state.heldDeletions);
   await applyDeleteValve(engine, level, input, state);
   if (input.remote) {
     // #6948: a remote pass writes no hold, so a path several live pages claim is left as it is for the owner's pass to hold.
@@ -204,17 +210,13 @@ export function summarizeRound(level: ShadowLevel, state: PassApplyState): void 
 async function retireMarkers(engine: BrainEngine, level: ShadowLevel, state: PassApplyState): Promise<void> {
   const retire = await filterYielding(level.paths, entry => !isCompactMatched(entry) && entry.state.marker && !entry.legacyPageless
     && ((entry.state.tree === null && !entry.state.present) || entry.state.page?.live === true));
-  if (!retire.length) return;
-  await engine.transaction(async tx => {
-    await assertDrainLease(tx, level.sourceId);
-    for (const entry of retire) {
-      const { sourcePath } = passEntryPaths(level, entry.path);
-      const stored = await readStoredMarker(tx, level, sourcePath);
-      if (!stored) continue;
-      const blobOids = Array.isArray(stored.blob_oids) ? stored.blob_oids : [];
-      if ((stored.kind === 'legacy' ? 'legacy' : 'deleted') !== entry.state.marker!.kind || blobOids.join('\0') !== entry.state.marker!.blobOids.join('\0')) continue;
-      if (await retireOriginDeletedMarker(tx, { sourceId: level.sourceId, incarnation: level.incarnation, origin: sourcePath, expected: stored })) state.markersRetired++;
-    }
+  await inFencedSlices(engine, level.sourceId, retire, async (tx, entry) => {
+    const { sourcePath } = passEntryPaths(level, entry.path);
+    const stored = await readStoredMarker(tx, level, sourcePath);
+    if (!stored) return;
+    const blobOids = Array.isArray(stored.blob_oids) ? stored.blob_oids : [];
+    if ((stored.kind === 'legacy' ? 'legacy' : 'deleted') !== entry.state.marker!.kind || blobOids.join('\0') !== entry.state.marker!.blobOids.join('\0')) return;
+    if (await retireOriginDeletedMarker(tx, { sourceId: level.sourceId, incarnation: level.incarnation, origin: sourcePath, expected: stored })) state.markersRetired++;
   });
 }
 
@@ -308,11 +310,12 @@ async function writePassHolds(engine: BrainEngine, level: ShadowLevel, input: Pa
     }
     if (r.cls === 'delete_drift' && heldRenameOrigins.has(syncOriginPath(passEntryPaths(level, entry.path).sourcePath))) continue;
     if (r.cls === 'delete_drift' && r.uncommitted) {
-      const why = r.uncommitted === 'ignored' ? '.gitignore excludes it, so Git never kept it' : 'no commit in its history holds it (or Git could not show one)';
+      const why = r.uncommitted === 'ignored' ? '.gitignore excludes it, so Git never kept it' : r.uncommitted === 'origin_unknown' ? 'Git could not show whether a commit held it (its history read did not finish)' : 'no commit in its history holds it';
       pending.push({ entry, code: 'file_drift', slug: entry.slug, kind: 'uncommitted', meta: { side: 'deleted', state: 'file_gone', reason: r.uncommitted, ...(entry.revision ? { page_revision: entry.revision } : {}) },
         message: `${path}: the file is gone, but ${why}, so its absence is no evidence that page ${entry.slug} was deleted; sync held it and kept the page instead of deleting it (#7130); the rest of the source synced.` });
     } else if (r.cls === 'delete_drift') {
-      pending.push({ entry, code: 'file_drift', slug: entry.slug, kind: 'file_gone', meta: { side: 'deleted', state: 'file_gone', ...(entry.revision ? { page_revision: entry.revision } : {}) },
+      pending.push({ entry, code: 'file_drift', slug: entry.slug, kind: 'file_gone', meta: { side: 'deleted', state: 'file_gone', ...(entry.revision ? { page_revision: entry.revision } : {}),
+        ...(r.heldDeletionRefused && entry.revision ? { held_deletion: { refused: r.heldDeletionRefused, page_revision: entry.revision } } : {}) },
         message: `${path}: the file is gone, but page ${entry.slug} changed in the database since the file was last imported, so sync held the deletion instead of deleting the page; the rest of the source synced.` });
     } else if (r.cls === 'deleted_edited') {
       const purged = r.state === 'purged_differs';
@@ -348,25 +351,22 @@ function spellingGroups(level: ShadowLevel): Map<string, string[]> {
   return groups;
 }
 
-/** Writes the round's holds at level `L` under the drain lease, counts them and settles their paths `held`. */
+/** Writes the round's holds at level `L` under the drain lease, counts them and settles their paths `held` as each slice commits. */
 async function writeHolds(engine: BrainEngine, level: ShadowLevel, input: Pick<PassApplyInput, 'passId' | 'observedAt'>, state: PassApplyState, pending: PendingHold[]): Promise<void> {
-  if (!pending.length) return;
-  await engine.transaction(async tx => {
-    await assertDrainLease(tx, level.sourceId);
-    for (const hold of pending) {
-      const { path, sourcePath } = passEntryPaths(level, hold.entry.path);
-      await writeGitHold(tx, { source_id: level.sourceId, incarnation: level.incarnation, path, source_path: sourcePath, slug: hold.slug,
-        page_id: hold.pageId !== undefined ? hold.pageId : hold.entry.state.page?.live ? hold.entry.pageId : null,
-        code: hold.code, message: hold.message, upstream_version: hold.entry.state.levelSha256, observed_at: input.observedAt, run_id: input.passId, mode: 'managed',
-        meta: { recovery_version: RECOVERY_VERSION, ...levelMeta(level, hold.entry), ...hold.meta } });
+  await inFencedSlices(engine, level.sourceId, pending, async (tx, hold) => {
+    const { path, sourcePath } = passEntryPaths(level, hold.entry.path);
+    await writeGitHold(tx, { source_id: level.sourceId, incarnation: level.incarnation, path, source_path: sourcePath, slug: hold.slug,
+      page_id: hold.pageId !== undefined ? hold.pageId : hold.entry.state.page?.live ? hold.entry.pageId : null,
+      code: hold.code, message: hold.message, upstream_version: hold.entry.state.levelSha256, observed_at: input.observedAt, run_id: input.passId, mode: 'managed',
+      meta: { recovery_version: RECOVERY_VERSION, ...levelMeta(level, hold.entry), ...hold.meta } });
+  }, slice => {
+    for (const hold of slice) {
+      state.holds[hold.kind]++;
+      if (hold.code === 'settle_mismatch') state.settleMismatch.push(passEntryPaths(level, hold.entry.path).path);
+      if (hold.code === 'origin_conflict' || hold.code === 'page_identity_changed') state.originHeld.add(hold.entry.path);
+      settleAs(hold.entry, { cls: 'held', settled: true, action: 'none', classAction: 'repair' });
     }
   });
-  for (const hold of pending) {
-    state.holds[hold.kind]++;
-    if (hold.code === 'settle_mismatch') state.settleMismatch.push(passEntryPaths(level, hold.entry.path).path);
-    if (hold.code === 'origin_conflict' || hold.code === 'page_identity_changed') state.originHeld.add(hold.entry.path);
-    settleAs(hold.entry, { cls: 'held', settled: true, action: 'none', classAction: 'repair' });
-  }
 }
 
 /**
@@ -563,5 +563,5 @@ export function passApplyCounts(state: PassApplyState): Record<string, number> {
   return { markers_retired: state.markersRetired, holds_file_gone: state.holds.file_gone, holds_tombstone_edited: state.holds.tombstone_edited,
     holds_purged_differs: state.holds.purged_differs, holds_settle_mismatch: state.holds.settle_mismatch, holds_origin_conflict: state.holds.origin_conflict, holds_page_identity_changed: state.holds.page_identity_changed, holds_uncommitted: state.holds.uncommitted, adopted: state.adopted, legacy_swept: state.swept.screened,
     legacy_recorded: state.swept.recorded, deletes_withheld: state.withheldCount, keep_db_admitted: state.keepDb.admitted, keep_db_pending: state.keepDb.pending,
-    paused_keep_db: state.keepDb.paused, keep_db_refused: refused };
+    paused_keep_db: state.keepDb.paused, keep_db_refused: refused, held_deletions_applied: state.heldDeletions.applied, held_deletions_refused: state.heldDeletions.refused };
 }

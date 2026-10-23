@@ -547,6 +547,18 @@
       },
       {
         "category": "brain",
+        "name": "generation_retirements"
+      },
+      {
+        "category": "brain",
+        "name": "generation_held"
+      },
+      {
+        "category": "brain",
+        "name": "generation_pending"
+      },
+      {
+        "category": "brain",
         "name": "extractor_facts_expired"
       },
       {
@@ -564,6 +576,10 @@
       {
         "category": "brain",
         "name": "facts_redaction_marker"
+      },
+      {
+        "category": "brain",
+        "name": "fact_bulk_dates"
       },
       {
         "category": "brain",
@@ -800,6 +816,22 @@
       {
         "category": "brain",
         "name": "tracked_ownership_marker"
+      },
+      {
+        "category": "brain",
+        "name": "checkout_lagging"
+      },
+      {
+        "category": "brain",
+        "name": "dirty_age"
+      },
+      {
+        "category": "brain",
+        "name": "commits_outside_source_root"
+      },
+      {
+        "category": "brain",
+        "name": "quarantined_changes"
       },
       {
         "category": "ops",

@@ -3,7 +3,7 @@
 Read a file's entry before editing it. This page routes to bounded subsystem
 references; **do not load the whole directory**.
 
-Find a path's entry and its surrounding contract:
+Find a path's entry:
 
 ```bash
 rg -n -F 'src/core/ops/pages.ts' docs/architecture/key-files/
@@ -24,7 +24,7 @@ link it here rather than raising the cap.
 | Subsystem | Entry range / scope |
 |---|---|
 | [Page identity and writer administration](key-files/page-identity-and-administration.md) | Opaque result IDs, current grants, state-bound ownership changes |
-| [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, derived atom state, sync discovery and the origin rule (`sync-origin.ts`, `file-claims.ts`) |
+| [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, [derived generations](key-files/generations.md), sync discovery and the origin rule (`sync-origin.ts`, `file-claims.ts`) |
 | [Company-brain ingestion](key-files/company-brain.md) | Inspection, admission, receipts, derived relationships and schema; [operator guide](../guides/company-brain-ingestion.md) |
 | [Agent operator contract](key-files/agent-contract.md) | `agent-output.ts`, error registry + docs, notice ledger, `isCallable`, `--json` guard, contract scanner |
 | [Commands (1/6)](key-files/commands-1.md) | `src/commands/agent-logs.ts` through `src/commands/db-repair.ts` |
@@ -87,7 +87,7 @@ link it here rather than raising the cap.
 | [Google connector + open-loop engine](key-files/google-and-loops.md) | Cross-file contract; [more](key-files/google-and-loops-continued.md), [API](key-files/google-api-access.md) |
 | [Open loops](key-files/open-loops-engine.md) | detect, extract, store |
 | [Always-loaded core memory](key-files/core-memory.md) | Core tier, write-path guard and lock order, delivery lanes, pressure notice |
-| [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts |
+| [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts, git writer |
 | [Secret and sensitivity scanning](key-files/secret-scan.md) | `secret-scan*.ts`: detection, allowlist, scan counters |
 | [Ambient capture consent gate](key-files/ambient-capture.md) | `memory.auto_writeback` capture lanes |
 | [Belief ledger](key-files/belief-ledger.md) | `src/core/belief/`, `gbrain beliefs`, doctor coverage |

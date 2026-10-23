@@ -49,6 +49,7 @@ export function parseSyncDeleteCap(key: typeof SYNC_MAX_DELETES_KEY | typeof SYN
 /** `gbrain config set`'s refusal of an invalid #7130 delete-safety value (null: valid). */
 export function deleteSafetyConfigRefusal(key: string, value: string): string | null {
   if (key === 'purge.retention_hours') return parsePurgeRetentionHours(value) === null ? `purge.retention_hours must be a whole number of hours, at least ${MIN_PURGE_RETENTION_HOURS}; nothing was written.` : null;
+  if (key.startsWith('sync.apply_held_deletions')) return ['true', 'false'].includes(value.trim().toLowerCase()) ? null : `${key} must be true or false; nothing was written.`;
   const base = key.startsWith(SYNC_MAX_DELETES_KEY + '.') || key === SYNC_MAX_DELETES_KEY ? SYNC_MAX_DELETES_KEY : SYNC_MAX_DELETE_RATIO_KEY;
   if (parseSyncDeleteCap(base, value) !== null) return null;
   return base === SYNC_MAX_DELETES_KEY ? `${key} must be a whole number of pages, 0 or more; nothing was written.` : `${key} must be a number from 0 to 1 (a share of the source's file-backed pages); nothing was written.`;

@@ -265,7 +265,9 @@ import { v261 } from './v261-persistence-request-transient-retries.ts';
 import { v262 } from './v262-commit-notifier.ts';
 import { v263 } from './v263-try-jsonb-function.ts';
 import { v264 } from './v264-set-based-fact-insert-guards.ts';
-import { v265 } from './v265-cjk-bigram-fts.ts';
+import { v265 } from './v265-derived-generations.ts';
+import { v266 } from './v266-derived-generation-activations.ts';
+import { v267 } from './v267-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -530,4 +532,6 @@ export const MIGRATIONS: Migration[] = [
   v263,
   v264,
   v265,
+  v266,
+  v267,
 ];

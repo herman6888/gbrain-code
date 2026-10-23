@@ -187,7 +187,9 @@ paths, never changes existing parent permissions, and refuses with
 or verified at the destination (some locations' inherited permissions prevent
 it; a new path inside your user profile works). The destination must be on a
 local filesystem with Windows ACL support, with built-in Windows PowerShell
-permitted. A busy database or a
+permitted. When Windows PowerShell does not start within the protection step's
+15 seconds (a slow first start on a cold machine), it refuses with
+`private_backup_protection_timeout` instead; run the backup again. A busy database or a
 changing file fails the operation instead of publishing a success receipt.
 
 Before the dump, the command removes gbrain's own IPC socket files

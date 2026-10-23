@@ -5,7 +5,7 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from '../takes-fence.ts';
-import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
+import { extractFactsFromFenceText, pageFactDate } from '../facts/extract-from-fence.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { parseTimelineEntries } from '../link-extraction.ts';
 import { eachStoredTimelineRow, extractTimelineFromContent, hasExtractorDetail, supersededCitationTimeline, TimelineKeySet,
@@ -25,6 +25,9 @@ import type { FenceSection } from '../fence-repair/types.ts';
 import { contestHeldRows, factsAboveWriter, guardFenceRows, guardFenceTakes, heldRows } from '../trust/fence-guard.ts';
 import { propagateFactLowering } from '../trust/propagation.ts';
 import { loadWriteGateConfig } from '../trust/gate-outcomes.ts';
+import { fenceOwnerKey, readFenceBlocks, TAKE_FENCE_KIND } from '../generations/fence.ts';
+import { projectFactFenceGeneration } from '../generations/adapters/fact-rows.ts';
+import { projectTakeFenceGeneration } from '../generations/adapters/take-rows.ts';
 
 const FENCE_PAIRS=[{begin:FACTS_FENCE_BEGIN,end:FACTS_FENCE_END},{begin:TAKES_FENCE_BEGIN,end:TAKES_FENCE_END}];
 
@@ -486,11 +489,11 @@ export async function reprojectTimelineRow(tx: BrainEngine, pageId: number, body
   return true;
 }
 
-export function compileCanonicalProjections(page: ParsedPage, slug: string, sourceId: string) {
+export function compileCanonicalProjections(page: ParsedPage, slug: string, sourceId: string, factDate: Date | null = null) {
   const scan=scanCanonicalFences(page);
   if(scan.defects.length) throw fenceOperationError(scan.defects[0]!, slug, sourceId);
   const fields:Array<[FenceSection,string]>=[['body',page.compiled_truth],['timeline',page.timeline ?? '']];
-  return { factRows: extractFactsFromFenceText(scan.facts,slug,sourceId), takes: scan.takes, sections: scan.sections, quoted: scan.quoting ? quotedFenceRows(fields) : null };
+  return { factRows: extractFactsFromFenceText(scan.facts,slug,sourceId,{ pageEffectiveDate: factDate }), takes: scan.takes, sections: scan.sections, quoted: scan.quoting ? quotedFenceRows(fields) : null };
 }
 
 /**
@@ -532,10 +535,14 @@ function takeCollision(rows: number[], sections: Map<number, FenceSection>, slug
  */
 export async function prepareCanonicalProjections(engine: BrainEngine, page: ParsedPage, slug: string, sourceId: string,
   prior: PageSnapshot | null, writer: ProjectionWriter, policy?: TimelineWritePolicy): Promise<(tx: BrainEngine, pageId?: number) => Promise<CanonicalProjectionResult>> {
-  const { factRows, takes, quoted, sections } = compileCanonicalProjections(page, slug, sourceId);
+  // #7247: a fence row without a valid_from takes the page's stated date, as extract_facts does, never the import time.
+  const factDate = pageFactDate({ slug, frontmatter: page.frontmatter, timeZone: await engine.getConfig('brain.timezone') });
+  const { factRows, takes, quoted, sections } = compileCanonicalProjections(page, slug, sourceId, factDate);
   // #6259: a page the content-quality gate hid as junk projects no facts or takes. Rows projected before it
   // was quarantined are left as they are (hiding them would need a new row state); only new projection stops.
   const projectFences = !isQuarantined(page.frontmatter);
+  // GBRA-161 PR 2: the incoming body's fences decide the fact and take generations; an absent one retires nothing.
+  const fenceReads = { facts: readFenceBlocks(page, 'facts'), takes: readFenceBlocks(page, 'takes') };
   const storedRows = prior ? await storedTimeline(engine, prior.page.id) : [];
   const prior_ = prior ? await priorView(engine, prior.page, slug, storedRows) : null;
   const { timeline, exactIncoming, pinned } = classifyTimeline(storedRows, page, prior_?.rows ?? null, slug, writer, policy);
@@ -544,7 +551,14 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
   const refreshRows = pinned.filter(row => row.action === 'refresh_detail')
     .map(row => ({ id: row.id, detail: row.detail, next: exactIncoming.get(exactTimelineKey(row)) }))
     .filter(row => row.next !== row.detail);
-  const priorTakes = prior_?.takeRows ?? new Set<number>();
+  // GBRA-161 PR 2: a write that dropped the takes fence was held and left its rows stored; once a fence parses again it
+  // is compared with those rows, not with the fenceless body before it.
+  const heldTakeFence = !!prior && projectFences && fenceReads.takes.state === 'parsed' && (await engine.executeRaw(
+    `SELECT 1 FROM derived_generations WHERE source_id=$1 AND kind=$2 AND owner_key=$3 AND state='held' AND held_reason='fence_absent'`,
+    [sourceId, TAKE_FENCE_KIND, fenceOwnerKey(slug)])).length > 0;
+  const priorTakes = heldTakeFence
+    ? new Set([...(prior_?.takeRows ?? []), ...(await engine.executeRaw<{ row_num: number }>('SELECT row_num FROM takes WHERE page_id=$1', [prior!.page.id])).map(r => Number(r.row_num))])
+    : prior_?.takeRows ?? new Set<number>();
   // TE1 (#6188): when the prior takes fence does not parse, its stored rows count as prior canonical rows, so a
   // row Tier 1 normalized (same number, holder `system` -> `brain`) updates its stored take instead of colliding.
   const priorCanonical = prior && prior_?.takesWarn
@@ -609,7 +623,8 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
           r.valid_until::timestamptz,r.expired_at::timestamptz,r.source,r.confidence,r.claim_metric,r.claim_value,r.claim_unit,r.claim_period,r.attributed_to)`,
       [sourceId, slug, fieldRows]) : Promise.resolve([]);
     const checkTakes = () => refuseCollisions(tx, id);
-    const dropTakes = () => tx.executeRaw('DELETE FROM takes WHERE page_id=$1 AND row_num=ANY($2::integer[])', [id, takeRowsGone.filter(n => !heldRowNums.has(n))]);
+    const dropTakes = (held: boolean) => () => held ? Promise.resolve([])
+      : tx.executeRaw('DELETE FROM takes WHERE page_id=$1 AND row_num=ANY($2::integer[])', [id, takeRowsGone.filter(n => !heldRowNums.has(n))]);
     // A fence row's resolution cells are written as Markdown says, so a revert to a version that carries them restores
     // them. A row without resolution cells keeps the stored resolution (a database-only grade, e.g. unmanaged
     // grade_takes) unless its claim changed in place, which drops the old claim's grade. A held take keeps its grade:
@@ -656,15 +671,24 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
         const held = await step('held', contestHeld);
         return { timelineRowsRemoved: removedSummary(removedDates), ...(held.length ? { contested: held } : {}) };
       }
+      // GBRA-161 PR 2: the fact and take generations decide first. A held one (its fence absent from this body) retires and
+      // overwrites nothing, so its rows stay as they are; every row a published one retires is recorded with its before-state.
+      const factGeneration = await step('fact_generation', () => projectFactFenceGeneration(tx, { sourceId, slug, read: fenceReads.facts, incoming, rows: factRows,
+        writer: 'projection' }));
+      const factsHeld = factGeneration.state === 'held';
+      const takesHeld = (await step('take_generation', () => projectTakeFenceGeneration(tx, { sourceId, slug, pageId: id, read: fenceReads.takes,
+        takes: projectedTakes, gone: takeRowsGone.filter(n => !heldRowNums.has(n)), writer: 'projection' }))).state === 'held';
       // #5575: rows more trusted than the writer are never expired by it, and new rows pass the write gate (trust/fence-guard.ts).
-      // The timeline rows are independent of the fact and take rows, so they ride in the first pipeline.
-      const guard = await step('timeline', () => guardFenceRows(tx, { sourceId, slug, incoming, rows: factRows, cfg: loadWriteGateConfig },
-        () => pipelined(tx, [expireFacts, ...timelineRows])));
+      // The timeline rows are independent of the fact and take rows, so they ride in the first pipeline. The expire uses the
+      // generation's retire predicate under the page lock, so it runs only when that generation found rows to retire.
+      const guard = factsHeld ? { rows: [] as typeof factRows, finish: async () => [] as string[] } : await step('timeline', () => guardFenceRows(tx, { sourceId, slug, incoming, rows: factRows, cfg: loadWriteGateConfig },
+        () => pipelined(tx, factGeneration.retiring ? [expireFacts, ...timelineRows] : timelineRows)));
+      if (factsHeld) await step('timeline', () => pipelined(tx, timelineRows));
       if (guard.rows.length) await step('facts', () => tx.insertFacts(guard.rows, { source_id: sourceId })); // gbrain-allow-direct-insert: canonical fence projection shares the journal publication transaction
       const contested = await step('fact_trust', () => guard.finish(tx));
       // W1 #6783 §12 (b): a fence row's field rewrite can lower a more trusted fact (the tier trigger); what was derived from it follows.
       const above = factRows.length ? await factsAboveWriter(tx, sourceId, slug) : [];
-      await step('fact_fields', () => pipelined(tx, [factFields, checkTakes, dropTakes, clearChangedResolutions]));
+      await step('fact_fields', () => pipelined(tx, [factFields, checkTakes, dropTakes(takesHeld), clearChangedResolutions]));
       if (above.length) await propagateFactLowering(tx, above);
       if (projectedTakes.length) {
         await step('takes', async () => {

@@ -382,7 +382,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
   if (await setLineGrammarConfig(engine, key, value)) return;
   if (key === 'sync.admission') return (await import('./config/sync-admission-value.ts')).setSyncAdmissionValue(engine, value);
   if (key === 'sync.metafile_pages') return (await import('./config/sync-metafile-pages-value.ts')).setMetafilePagesValue(engine, value);
-  if (/^sync\.max_delete(s|_ratio)(\.source\..+)?$/.test(key) || key === 'purge.retention_hours') {
+  if (/^sync\.(max_delete(s|_ratio)|apply_held_deletions)(\.source\..+)?$/.test(key) || key === 'purge.retention_hours') {
     const err = (await import('../core/sync-reconcile.ts')).deleteSafetyConfigRefusal(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
@@ -392,6 +392,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
   (await import('./config/enumerated-keys.ts')).refuseUnregisteredEnumeratedKey(key, force);
+  if (key.startsWith('generations.')) await (await import('./config/generations-values.ts')).refuseGenerationsValue(key, value);
   const searchRefusal = key.startsWith('search.') ? (await import('../core/search/config-values.ts')).searchConfigValueRefusal(key, value) : null;
   if (searchRefusal) {
     const { exitCliError, usageError } = await import('../cli/cli-error.ts');

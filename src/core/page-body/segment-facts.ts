@@ -86,16 +86,22 @@ async function regionFence(engine: BrainEngine, page: FencePage, region: BodyReg
     if (end !== -1) parsedText = fence.join('');
   }
   const reduced = parsedText ?? (fence ? FACTS_FENCE_BEGIN : endOnly ? `${'\n'.repeat(FACTS_FENCE_BEGIN.length)}${FACTS_FENCE_END}` : '');
-  return { parsed: parseFactsFence(reduced), holds: fence !== null, marker };
+  return { parsed: parseFactsFence(reduced), holds: fence !== null, marker, text: parsedText };
 }
 
 /** factsFenceView of a segmented page, reading only the runs that can hold a fence marker. */
 export async function segmentedFactsFenceView(engine: BrainEngine, page: { id?: number; slug?: string; source_id?: string }): Promise<FactsFenceView> {
+  return (await segmentedFactsFence(engine, page)).view;
+}
+
+/** segmentedFactsFenceView with each region's whole fence text (`blocks`, null where the region holds no closed fence). */
+export async function segmentedFactsFence(engine: BrainEngine, page: { id?: number; slug?: string; source_id?: string }): Promise<{ view: FactsFenceView; blocks: { body: string | null; timeline: string | null } }> {
   const p = { id: Number(page.id), slug: page.slug ?? '', source_id: page.source_id ?? 'default' };
   const marked = await markerSeqs(engine, p.id);
   const truth = await regionFence(engine, p, 'truth', marked);
   const timeline = await regionFence(engine, p, 'timeline', marked);
-  return { body: truth.parsed, timeline: timeline.parsed, sections: { body: truth.holds, timeline: timeline.holds }, timelineMarker: timeline.marker };
+  return { view: { body: truth.parsed, timeline: timeline.parsed, sections: { body: truth.holds, timeline: timeline.holds }, timelineMarker: timeline.marker },
+    blocks: { body: truth.text, timeline: timeline.text } };
 }
 
 const FILE_READ_BYTES = 1024 * 1024;

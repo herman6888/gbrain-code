@@ -1212,7 +1212,9 @@ paths, never changes existing parent permissions, and refuses with
 or verified at the destination (some locations' inherited permissions prevent
 it; a new path inside your user profile works). The destination must be on a
 local filesystem with Windows ACL support, with built-in Windows PowerShell
-permitted. A busy database or a
+permitted. When Windows PowerShell does not start within the protection step's
+15 seconds (a slow first start on a cold machine), it refuses with
+`private_backup_protection_timeout` instead; run the backup again. A busy database or a
 changing file fails the operation instead of publishing a success receipt.
 
 Before the dump, the command removes gbrain's own IPC socket files
@@ -4421,7 +4423,26 @@ exactly one JSON document to stdout (or NDJSON lines for `eval export`,
 `eval replay`, `eval gate` and `bench-publish`); everything else goes to
 stderr. If such a command exits non-zero without writing its document, gbrain
 writes a fallback: `{error: "command_failed", code, message, suggestion,
-exit_code, contract_version: 1}`.
+exit_code, contract_version: 1}`. A signal (exit 129, 130 or 143) writes
+`error: "interrupted"` with `code: "interrupted"` instead: the command was cut
+off, and it read nothing. That is not an empty result.
+
+**Slow reads.** `sync status`, `sources status`, `doctor`, `orphans`,
+`anomalies`, `status` and `diag` can take minutes on a large brain. They print
+`[gbrain] reading <what>; large brains can take minutes` on stderr when they
+start and a `still reading` line every 10 s, so silence on stdout means "not
+ready yet". Their `--json` document carries `elapsed_ms` and `complete`. When
+`complete` is false, `incomplete` lists each field a budget or bound left out
+(`{field, reason}`, reason `not_read`, `bounded` or `budget`); read those
+fields as unknown, never as none. A signal mid-read prints
+`[gbrain] Interrupted by <signal> after N s while reading <what>` on stderr and,
+under `--json`, writes `{error: "interrupted", signal, read, elapsed_ms,
+complete: false}` at once. If your harness cut the call off, re-run it with a
+longer timeout, or run `gbrain diag --json`: it returns one bounded bundle
+(version and build skew, each source's freshness and HEAD lag, holds by code,
+database connections, one search's stage timing). Each of its sections carries
+`elapsed_ms` and a status: `ok`, `not_read` with its reason, `not_applicable`
+or `error`.
 
 ## A write refused `owner_unavailable` with `detail: unbound_source`
 
@@ -7174,7 +7195,10 @@ indexed at such a path is kept (#1433). This is `sync.metafile_pages`:
 `typed` (the default) or `off`, which skips every meta file as before
 (`gbrain config set sync.metafile_pages off`). The first sync after the upgrade,
 or after setting it back to `typed`, imports the typed files already in the
-tree once; it deletes or rewrites nothing else.
+tree once; it deletes or rewrites nothing else. A meta file whose frontmatter
+`slug:` names another page (`slug: projects/acme-example`, or the bare
+`slug: acme-example`, in `projects/acme-example/index.md`) stays skipped, since the slug conflicts with
+its path; remove the `slug:` line to make it a page (#7341).
 
 A dot-directory you deliberately keep content in (say `.decisions/`) can be
 waived back in with `--include-hidden '<glob>'` on `gbrain sync` — the glob
@@ -8572,6 +8596,7 @@ used?"* — your agent runs `gbrain volunteer-context --stats`.
 | `retrieval_reflex_volunteer` | true | the reflex volunteer arm (Arm 2) — the incident kill switch for volunteered pages on the OpenClaw lane (env: `GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER`, env above config) |
 | `retrieval_reflex_max_pointers` | 3 | pointer cap per turn |
 | `retrieval_reflex_lexical_arms` | true | the lowercase-alias + surname recall arms (env: `GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS`); off = disables both arms |
+| `context.hot_memory.session_only` | off | hot facts on the turn and session-start hooks come from the current session only, with no fallback to other sessions' recent facts (DB-plane; see [ambient writeback](ambient-writeback.md#hot-memory-and-other-sessions)) |
 | `context.proactive_brief` | off | the proactive brief ("Before you start") on the SessionStart and UserPromptSubmit hooks (DB-plane: `gbrain config set context.proactive_brief true`) |
 
 Per-call knobs: `max_pages` + `min_confidence` on both the op and `gbrain watch`

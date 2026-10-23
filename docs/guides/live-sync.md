@@ -345,7 +345,10 @@ indexed at such a path is kept (#1433). This is `sync.metafile_pages`:
 `typed` (the default) or `off`, which skips every meta file as before
 (`gbrain config set sync.metafile_pages off`). The first sync after the upgrade,
 or after setting it back to `typed`, imports the typed files already in the
-tree once; it deletes or rewrites nothing else.
+tree once; it deletes or rewrites nothing else. A meta file whose frontmatter
+`slug:` names another page (`slug: projects/acme-example`, or the bare
+`slug: acme-example`, in `projects/acme-example/index.md`) stays skipped, since the slug conflicts with
+its path; remove the `slug:` line to make it a page (#7341).
 
 A dot-directory you deliberately keep content in (say `.decisions/`) can be
 waived back in with `--include-hidden '<glob>'` on `gbrain sync` — the glob

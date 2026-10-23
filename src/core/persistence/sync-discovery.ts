@@ -58,7 +58,9 @@ export interface SyncEntry { path: string; sourcePath: string; action: 'import' 
   /** #6729 x #6727: the one legacy page carries an explicit frontmatter id that differs from the file's, so it is another document; held `legacy_slug_conflict` (`explicit_id_conflict`). */
   legacyIdVeto?: true;
   /** #6948: several live pages record this file as their origin; the freeze holds it `origin_conflict` (sync.holds=fail refuses). */
-  originConflict?: OriginConflict; }
+  originConflict?: OriginConflict;
+  /** GBRA-133: a held committed deletion `sync.apply_held_deletions` proved (sync-held-deletions.ts); its request carries the proof as the receipt. */
+  heldDeletion?: { commit: string; blob_oid: string }; }
 /** Files that map to a slug another origin keeps; they are left out of the manifest until one is renamed. */
 export interface SyncSlugCollision { slug: string; kept: string; skipped: string[]; }
 /** #5032: a file sync skipped on this host with a named refusal, without failing the run. */

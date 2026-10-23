@@ -1,5 +1,5 @@
 import postgres from '#postgres'
-import { claimOwner } from './persistence/claim-phase.ts';
+import { claimOwner, isOneShotCommand } from './persistence/claim-phase.ts';
 import { traceSqlOptions } from './sql-trace.ts';
 import { warnPoolerPrepareOffOnce } from './pooler-notice.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
@@ -7,21 +7,14 @@ import { SCHEMA_SQL } from './schema-embedded.generated.ts';
 import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.ts';
 import type { BrainEngine } from './engine.ts';
 import { verifySchema } from './schema-verify.ts';
+import { POOL_END_TIMEOUT_SECONDS } from './pool-end-timeout.ts';
 import { isConnectTimeoutError, isRetryableConnError } from './retry-matcher.ts';
 import { loadSharedParameterTypes, sharedArrayTypes, sharedParameterTypes, type SharedArrayTypes, type SharedParameterTypes } from './pg-type-cache.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
 
-/**
- * #1972: hard upper bound (seconds) on a single pool `.end()` drain. postgres.js
- * accepts `{ timeout }` but applies it internally — against PgBouncer
- * transaction-mode the drain can still hang, and a stubbed `.end()` ignores it
- * entirely. So `endPoolBounded` ALSO wraps each end in a gbrain-owned
- * Promise.race and passes this value as the postgres.js hint so a healthy drain
- * still finishes fast.
- */
-export const POOL_END_TIMEOUT_SECONDS = 2;
+export { POOL_END_TIMEOUT_SECONDS };
 
 /**
  * #1972: end a postgres.js pool with a gbrain-owned hard bound. Resolves as soon
@@ -552,6 +545,9 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
     }
     sql = postgres(url, traceSqlOptions(opts, 'module'));
 
+    // GBRA-156: a one-shot command's startup reads its retired-marker state beside its persistence row, which opened the
+    // pool's second connection on the critical path (about three round trips behind a pooler); it opens beside the first.
+    if (isOneShotCommand() && Number(opts.max) >= 3) sql`SELECT 1`.catch(() => undefined);
     // Test connection
     await checkPoolAndLoadSharedTypes(sql, url);
     connectedUrl = url;

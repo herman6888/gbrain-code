@@ -1,7 +1,7 @@
 import type { Migration } from './types.ts';
 
-export const v265: Migration = {
-  // Local fork patch (renumbered v150→v184→v187→v204→v206→v225→v238→v239→v240→v243→v248→v250→v252→v261→v263→v265 (v252 claimed by upstream Wave B segmented-storage migrations v252-v260 in v0.60.301.0; v250 claimed by upstream persistence-request-id-index in v0.60.289.0; v225 claimed; v239 claimed by upstream extract-rollup-halt-reasons in v0.60.177.0; v238 claimed by upstream persistence-client-request-id in v0.60.175.0; v238 claimed by upstream drop-duplicate-embedding-null-index in v0.60.172.0; v240 claimed by upstream pages-name-lookup-indexes in v0.60.208.0; v243 claimed by upstream persistence-consumer-process-start in v0.60.243.0; v248 claimed by upstream segmented-page-storage in v0.60.265.0; v263 claimed by upstream try-jsonb-function in v0.60.343.0, upstream head at v264 hence v265) —
+export const v267: Migration = {
+  // Local fork patch (renumbered v150→v184→v187→v204→v206→v225→v238→v239→v240→v243→v248→v250→v252→v261→v263→v265→v267 (v265 claimed by upstream derived-generations in v0.60.404.0, upstream head at v266 hence v267; v252 claimed by upstream Wave B segmented-storage migrations v252-v260 in v0.60.301.0; v250 claimed by upstream persistence-request-id-index in v0.60.289.0; v225 claimed; v239 claimed by upstream extract-rollup-halt-reasons in v0.60.177.0; v238 claimed by upstream persistence-client-request-id in v0.60.175.0; v238 claimed by upstream drop-duplicate-embedding-null-index in v0.60.172.0; v240 claimed by upstream pages-name-lookup-indexes in v0.60.208.0; v243 claimed by upstream persistence-consumer-process-start in v0.60.243.0; v248 claimed by upstream segmented-page-storage in v0.60.265.0; v263 claimed by upstream try-jsonb-function in v0.60.343.0, upstream head at v264 hence v265) —
   // upstream claimed v150 for canonical_page_revisions_and_guards).
   // Chinese-first search (PMBrain v109 port): extend the existing
   // GIN-backed content_chunks.search_vector with CJK unigram +
@@ -11,7 +11,7 @@ export const v265: Migration = {
   // both functions, DROP TRIGGER IF EXISTS before re-create, and the
   // backfill recomputes search_vector from the source columns, so a
   // re-run converges to the same state.
-  version: 265,
+  version: 267,
   name: 'cjk_bigram_fts',
   idempotent: true,
   sql: `

@@ -62,12 +62,18 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'captured_facts_active',
   // #7125: facts whose stored text holds a pre-fix sanitizer redaction marker (doctor/checks/facts-redaction-marker.ts).
   'facts_redaction_marker',
+  // #7247: a calendar day holding a bulk-loaded share of a source's facts as their valid_from (doctor/checks/fact-bulk-dates.ts).
+  'fact_bulk_dates',
   'conversation_label_facts',
   'conversation_outcomes_stale',
   'connector_checkpoints',
   'connector_held_items',
   'git_held_files',
   'fence_integrity',
+  // GBRA-161: derived items live generations retired in the restore window, and results held instead of published (doctor/checks/generations.ts).
+  'generation_held',
+  'generation_pending',
+  'generation_retirements',
   // #5575: stored trust tier counts, the legacy-row backfill, scan and source claims.
   'trust_tiers',
   'trust_scan',
@@ -191,6 +197,11 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'git_convergence',
   // #5186: an ownership marker committed to a source checkout's Git index.
   'tracked_ownership_marker',
+  // #7381: a source checkout behind its upstream, write-through files or staged files waiting for a commit, unpushed commits outside the source root (doctor/checks/git-writer.ts).
+  'checkout_lagging',
+  'dirty_age',
+  'commits_outside_source_root',
+  'quarantined_changes',
   'takes_count',
   'takes_weight_grid',
   // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).

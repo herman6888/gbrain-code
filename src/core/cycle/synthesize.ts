@@ -76,7 +76,9 @@ import { buildManifestContext, buildLinkManifest, type ManifestContext } from '.
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { stampDreamProvenance, summaryProvenanceLines } from './dream-provenance.ts';
-import { putDerivedPage, summaryDerivation, withTranscriptTaint } from './dream-taint.ts';
+import { activateSynthesisGenerations } from './synthesize-generations.ts';
+import { summaryDerivation, withTranscriptTaint } from './dream-taint.ts';
+import { DREAM_SUMMARY_KIND, publishSinglePage } from '../generations/adapters/single-page.ts';
 import { findSynthV2Completion, partitionCompletedSynthesis } from './synthesize-completion.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
@@ -681,6 +683,7 @@ async function runPhaseSynthesizeInner(
     // verified whole; older pages are verified on their newly written units.
     const verifySince = await readVerifyEpoch(engine);
     const childIds: number[] = [];
+    const summaryRevision = maintenance ? null : (await engine.readPageSnapshot(buildDreamSummarySlug(config.outputRoot, summaryDate), { sourceId: cycleSourceId, includeDeleted: true }))?.revision ?? null;
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
     /** #1978: map child job_id → source transcript path so written pages get a raw_source stamp. */
@@ -1187,13 +1190,18 @@ async function runPhaseSynthesizeInner(
     const writtenSlugs = writtenRefs.map(r => r.slug);
     if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
       const preserveSummary = !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
-      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance)
+      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance, summaryRevision)
         .then(held => held && fileHolds.push(held), (e: unknown) => { deferPublishOrThrow(e, summarySlug); publishPending++; });
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
     // spend, no cooldown stamp (the next run must retry these transcripts).
     throwIfAborted(opts.signal, '[dream] synthesize completion');
+    const synthesisGenerations = await activateSynthesisGenerations(engine, { sourceId: cycleSourceId, maintenance, brainDir: opts.brainDir,
+      transcripts: worthProcessing, refs: writtenRefs, outcomes: childOutcomes, jobRawSource, deferred: new Set(budgetExhaustedDeferrals),
+      publicationIncomplete: publishPending > 0 || postprocessConflicts.length > 0 || postprocessDeferral !== null,
+      corpusDir: config.corpusDir, meetingDir: config.meetingTranscriptsDir });
+    fileHolds.push(...synthesisGenerations.file_holds);
 
     // CDX-8: deferred-embed closure. Oneshot children write chunks with
     // `embedding IS NULL`; the global `embed` phase only runs on SOME
@@ -1370,6 +1378,7 @@ async function runPhaseSynthesizeInner(
       written_slugs: writtenSlugs,
       reverse_write_count: reverseWriteCount,
       child_outcomes: childOutcomes,
+      synthesis_generations: synthesisGenerations,
       // Children submitted (one per chunk for chunked transcripts; one per
       // transcript for single-chunk). Differs from transcripts_processed
       // when chunking is in play.
@@ -3051,8 +3060,8 @@ export function renderPageToMarkdown(page: Page, tags: string[]): string {
 const SUMMARY_LINK_SAMPLE_LIMIT = 20;
 
 /**
- * Write the cycle's summary index page: the database row (the prior body kept in page_versions, `putDerivedPage`),
- * then its file through `writeDreamPageFile` (#6982). Returns the file's `file_database_drift` entry when the file
+ * Write the cycle's summary index page: the database row (unmanaged: a single-item `dream_summary` generation bound to
+ * `expectedRevision`, the summary's revision before the run's children were submitted (read here when not given), the prior page versioned first; GBRA-161 PR 5), then its file through `writeDreamPageFile` (#6982). Returns the file's `file_database_drift` entry when the file
  * holds an edit the database lacks and was kept.
  */
 async function writeSummaryPage(
@@ -3065,8 +3074,11 @@ async function writeSummaryPage(
   sourceId = 'default',
   signal?: AbortSignal,
   maintenance?: MaintenanceAuthority | null,
+  expectedRevision?: string | null,
 ): Promise<string | undefined> {
   throwIfAborted(signal, '[dream] synthesize summary');
+  const revision = expectedRevision !== undefined || maintenance ? expectedRevision ?? null
+    : (await engine.readPageSnapshot(summarySlug, { sourceId, includeDeleted: true }))?.revision ?? null;
   const completed = childOutcomes.filter(c => c.status === 'completed').length;
   const failed = childOutcomes.length - completed;
 
@@ -3120,13 +3132,16 @@ async function writeSummaryPage(
 
   const [{ parseMarkdown }, derivation] = await Promise.all([import('../markdown.ts'), summaryDerivation(engine, sourceId, writtenSlugs)]);
   const parsed = parseMarkdown(fullMarkdown);
-  if (!maintenance) await putDerivedPage(engine, derivation, summarySlug, {
-    type: parsed.type,
-    title: parsed.title,
-    compiled_truth: parsed.compiled_truth,
-    timeline: parsed.timeline,
-    frontmatter: parsed.frontmatter,
-  }, { sourceId, tags: parsed.tags });
+  if (!maintenance) {
+    try {
+      await publishSinglePage(engine, { kind: DREAM_SUMMARY_KIND, sourceId, slug: summarySlug, expectedRevision: revision, derivation, page: { type: parsed.type,
+        title: parsed.title, compiled_truth: parsed.compiled_truth, timeline: parsed.timeline, frontmatter: parsed.frontmatter, tags: parsed.tags } });
+    } catch (e) {
+      if (!(e instanceof OperationError && e.code === 'generation_fenced')) throw e;
+      process.stderr.write(`[dream] summary ${summarySlug} changed while this run composed it, so it was left as it is; the next run writes it.\n`);
+      return undefined;
+    }
+  }
 
   const fileWriteRaw = (await engine.getConfig('dream.synthesize.summary_file_write'))?.trim().toLowerCase();
   const fileWriteEnabled = !(fileWriteRaw === 'false' || fileWriteRaw === '0' || fileWriteRaw === 'off');

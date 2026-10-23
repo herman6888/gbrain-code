@@ -550,10 +550,9 @@ async function hookSessionStart(io: HookIo): Promise<number> {
       try {
         const cfg = loadConfig();
         if (sanitizeSessionId(j?.session_id) !== 'unknown') await sessionCorpus(io, cfg, sanitizeSessionId(j?.session_id), ws); // #6268: freeze at start
-        // Engine-uniform (#4245): same config-keyed socket/secret resolution
-        // as the user-prompt and compact arms; the IPC timeout is clamped to
-        // the remaining deadline. Same session-id sanitizer as the compact
-        // banking path (a raw id would split the cursor key).
+        // Engine-uniform (#4245): same config-keyed socket/secret resolution as the
+        // user-prompt and compact arms; IPC timeout clamped to the remaining deadline.
+        // Same session-id sanitizer as compact banking (a raw id splits the cursor key).
         serveNotReady = awaitServe; // still true if the deadline fires mid-wait
         const sourceId = await contextSource(io, cfg, j?.session_id, ws);
         const res = await requestSessionStartPack(cfg, {
@@ -564,6 +563,7 @@ async function hookSessionStart(io: HookIo): Promise<number> {
           awaitServe,
         });
         serveNotReady = res.serveNotReady;
+        if (res.ipcUnavailable && outcome === 'ok') { outcome = 'degraded'; reason = 'ipc_unavailable'; }
         const pack = res.pack;
         if (pack && !pack.ok && pack.error === 'source_mismatch' && outcome === 'ok') { outcome = 'degraded'; reason = 'source_mismatch'; } // #5941
         if (pack?.ok && pack.degradedReason === 'server_budget' && outcome === 'ok') { outcome = 'degraded'; reason = 'server_budget'; }

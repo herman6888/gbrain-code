@@ -85,6 +85,8 @@ export interface SyncIntent extends Record<string, unknown> {
   lineEndingOnly?: boolean;
   /** #5565: the deleted file is no page's origin; publication only re-proves that and commits a no-op. */
   unownedDeletion?: boolean;
+  /** GBRA-133: a held committed deletion `sync.apply_held_deletions` proved: the deleting commit and the blob the page equals. */
+  heldDeletion?: { commit: string; blob_oid: string };
   working?: boolean;
   renameFrom?: SyncRename;
   processingOptions?: SyncProcessingOptions;

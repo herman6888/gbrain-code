@@ -19,17 +19,19 @@ export function frontmatterSlugConflictMessage(path: string, found: string, expe
 }
 
 /** #5988: the page's canonical file is held by sync; the code says why gbrain cannot import it. Location-free, so receipts may keep it. */
-const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \(([a-z_]+)\) (and differs from the page|occupies the canonical page path); the page is read-only for put_page until the file is repaired\.$/;
+const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \(([a-z_]+)\) (and differs from the page|occupies the canonical page path); the page is read-only for put_page until the file is repaired\.(?: Hold row: source ([^ ,]+), incarnation ([0-9a-f-]+)\.)?$/;
 
 /** #6693: the refusal of a page write whose file holds a committed Git change sync has not imported yet (pending-import.ts). */
 /** #6858: the receipt prefix of a write `gbrain repair stuck-recovery --keep disk` abandoned: its canonical file was kept as edited on disk. */
 export const KEEP_DISK_ABANDONED_PREFIX = 'Publication abandoned by gbrain repair stuck-recovery --keep disk';
 export const PENDING_IMPORT_MESSAGE = 'The canonical file holds a committed Git change that sync has not imported yet.';
 
-export function heldFileMessage(kind: 'drift' | 'occupied', code: string): string {
-  return kind === 'drift'
+/** #7364: `row` names the hold row the refusal read (its source and incarnation, still location-free), so a refusal naming a row that `sources retry-held` does not list shows which. */
+export function heldFileMessage(kind: 'drift' | 'occupied', code: string, row?: { sourceId: string; incarnation: string }): string {
+  const held = kind === 'drift'
     ? `The canonical file is held by sync (${code}) and differs from the page; the page is read-only for put_page until the file is repaired.`
     : `A file held by sync (${code}) occupies the canonical page path; the page is read-only for put_page until the file is repaired.`;
+  return row ? `${held} Hold row: source ${row.sourceId}, incarnation ${row.incarnation}.` : held;
 }
 
 /** The diagnostic of a held-file refusal message (null for any other message); `sourceId` fills the commands when the caller knows it. */
@@ -44,7 +46,8 @@ export function heldFileDiagnostic(message: string | null | undefined, sourceId 
     suggestion: `Sync holds this page's file because gbrain cannot import it; gbrain sources status ${sourceId} names the file${held[1] === 'invalid_fence' ? ', fence and reason' : ', line and key'}. `
       + 'The page keeps its last good revision and refuses put_page until the file is repaired, so retrying this write refuses the same way. '
       + `On the source host, repair the file first (${repair}), `
-      + 'then submit the intended write with a new request_id. Neither copy was overwritten.' };
+      + 'then submit the intended write with a new request_id. Neither copy was overwritten.'
+      + (held[3] ? ` The refusal read the sync-hold row of source ${held[3]}, incarnation ${held[4]}; gbrain sources retry-held ${held[3]} --dry-run --json lists the rows it reads (hold_rows).` : '') };
 }
 
 export function writeFailureDiagnostic(code: string, message?: string | null): { reason: string; message: string; suggestion: string } {
