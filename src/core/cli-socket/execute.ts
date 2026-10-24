@@ -20,7 +20,9 @@ import { localFederatedSourceIds, resolveSourceWithTier, SourceTargetError } fro
 import { OperationTimeoutError, withTimeout } from '../timeout.ts';
 import { bigintToStringReplacer } from '../utils.ts';
 import { OutputCapture, withOutputCapture } from './output-capture.ts';
-import { DEFAULT_READ_WALLCLOCK_MS, MAX_ROUND_TRIP_MS, serializeOperationError, type CliSocketRequest, type ResultFrame } from './protocol.ts';
+import { withRequestSignal } from '../request-signal.ts';
+import { withResponseDeferral } from '../background-work.ts';
+import { DEFAULT_READ_WALLCLOCK_MS, MAX_ROUND_TRIP_MS, serializeOperationError, warmRoundTripTimeout, type CliSocketRequest, type ResultFrame } from './protocol.ts';
 
 /** File config merged with the DB plane, read fresh for every request (inside its config snapshot), as a cold CLI reads it at connect. */
 export async function mergedRequestConfig(engine: BrainEngine): Promise<GBrainConfig> {
@@ -90,11 +92,19 @@ function track<T>(work: Work, promise: Promise<T>): Promise<T> {
   return promise;
 }
 
-async function runOp(engine: BrainEngine, request: Extract<CliSocketRequest, { kind: 'op' }>, capture: OutputCapture, work: Work): Promise<ResultFrame> {
+/** The round trip reached its cap: cancel the request's remaining work (request-signal.ts) and answer a retryable timeout. */
+function roundTripTimeout(request: CliSocketRequest, ms: number, cancel: AbortController, capture: OutputCapture): ResultFrame {
+  cancel.abort(new Error('round_trip_cap'));
+  return { v: 1, kind: 'error', error: serializeOperationError(warmRoundTripTimeout(request.command, ms, 'serve')), output: capture.chunks };
+}
+
+const wallclock = (request: CliSocketRequest) => Math.min(MAX_ROUND_TRIP_MS, request.cli.timeout_ms ?? DEFAULT_READ_WALLCLOCK_MS);
+
+async function runOp(engine: BrainEngine, request: Extract<CliSocketRequest, { kind: 'op' }>, capture: OutputCapture, work: Work, cancel: AbortController): Promise<ResultFrame> {
   const op = operationsByName[request.op];
   if (!op || op.scope !== 'read' || op.mutating) return { v: 1, kind: 'fallback', reason: 'not_a_read_op' };
   const params = request.params;
-  const wallclockMs = Math.min(MAX_ROUND_TRIP_MS, request.cli.timeout_ms ?? DEFAULT_READ_WALLCLOCK_MS);
+  const wallclockMs = wallclock(request);
   let meta: Record<string, unknown> | null = null;
   const notices: Notice[] = [];
   const sinks = {
@@ -114,21 +124,23 @@ async function runOp(engine: BrainEngine, request: Extract<CliSocketRequest, { k
     const result = JSON.parse(JSON.stringify(raw, bigintToStringReplacer) ?? 'null');
     return { v: 1, kind: 'result', result, meta, notices: [...notices, ...retrieval, ...takeChatFallbackHopNotices()], output: capture.chunks };
   } catch (error) {
-    if (error instanceof OperationTimeoutError) return { v: 1, kind: 'fallback', reason: 'timeout' };
+    if (error instanceof OperationTimeoutError) return roundTripTimeout(request, wallclockMs, cancel, capture);
     if (op.name === 'get_page' && (error as { code?: unknown })?.code === 'page_body_segmented') return { v: 1, kind: 'fallback', reason: 'segmented_page' };
     return errorFrame(error, capture);
   }
 }
 
-async function runRecall(engine: BrainEngine, request: Extract<CliSocketRequest, { kind: 'recall' }>, capture: OutputCapture, work: Work): Promise<ResultFrame> {
+async function runRecall(engine: BrainEngine, request: Extract<CliSocketRequest, { kind: 'recall' }>, capture: OutputCapture, work: Work, cancel: AbortController): Promise<ResultFrame> {
   const { recallVerbForCaller } = await import('../../commands/recall.ts');
+  const wallclockMs = wallclock(request);
   try {
-    const raw = await track(work, recallVerbForCaller(engine, request.args, { cwd: request.routing.cwd, env: request.routing.source_env ?? undefined }));
+    const raw = await withTimeout(track(work, recallVerbForCaller(engine, request.args, { cwd: request.routing.cwd, env: request.routing.source_env ?? undefined })), wallclockMs, `gbrain ${request.command}`);
     if (raw === null) return { v: 1, kind: 'fallback', reason: 'not_a_recall_verb' };
     const result = JSON.parse(JSON.stringify(raw, bigintToStringReplacer) ?? 'null');
     // A cold recall prints the first chat-fallback hop at teardown (src/core/cli-force-exit.ts); the CLI does the same with these.
     return { v: 1, kind: 'result', result, meta: null, notices: takeChatFallbackHopNotices(), output: capture.chunks };
   } catch (error) {
+    if (error instanceof OperationTimeoutError) return roundTripTimeout(request, wallclockMs, cancel, capture);
     return errorFrame(error, capture);
   }
 }
@@ -146,12 +158,17 @@ export interface ExecutedRequest {
   settled: Promise<unknown>;
 }
 
-export async function executeCliSocketRequest(engine: BrainEngine, request: CliSocketRequest): Promise<ExecutedRequest> {
+/** `signal`: the serve aborts it when the client disconnects before the answer; the request's work is then cancelled (request-signal.ts). */
+export async function executeCliSocketRequest(engine: BrainEngine, request: CliSocketRequest, signal?: AbortSignal): Promise<ExecutedRequest> {
   const capture = new OutputCapture();
   const work: Work = [];
-  const answered = await withOutputCapture(capture, () => withRequestConfigSnapshot(engine, () => request.kind === 'op'
-    ? runOp(engine, request, capture, work)
-    : runRecall(engine, request, capture, work)));
+  const cancel = new AbortController();
+  if (signal) signal.aborted ? cancel.abort(signal.reason) : signal.addEventListener('abort', () => cancel.abort(signal.reason), { once: true });
+  const { value: answered, release } = await withResponseDeferral(() => withRequestSignal(cancel.signal, () => withOutputCapture(capture, () => withRequestConfigSnapshot(engine, () => request.kind === 'op'
+    ? runOp(engine, request, capture, work, cancel)
+    : runRecall(engine, request, capture, work, cancel)))));
+  // GBRA-156: the request's writes (background-work.ts deferUntilResponse) start once the serve has written this answer.
+  setImmediate(release);
   const settled = Promise.allSettled(work);
   if (answered.kind === 'fallback') return { frame: answered, settled };
   if (capture.overflow) return { frame: { v: 1, kind: 'fallback', reason: 'output_too_large' }, settled };

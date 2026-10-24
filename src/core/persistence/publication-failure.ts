@@ -5,6 +5,7 @@ import type { FenceFailureDetail } from '../fence-repair/refusal.ts';
 import type { WithdrawalFailureDetail } from '../facts/withdrawal.ts';
 import type { Action } from '../agent-output.ts';
 import { classifyPgAccessError } from '../pg-access-classify.ts';
+import { READ_ONLY_SQLSTATE } from '../postgres-engine/read-write-transactions.ts';
 
 /**
  * #5974: a database refusal during preparation or publication becomes a
@@ -124,6 +125,8 @@ export function databaseRefusal(error: unknown): PublicationFailure | null {
   if (sqlstate && SCHEMA_MISSING_SQLSTATES.has(sqlstate) && classifyPgAccessError(error).reason === 'schema_missing') {
     return schemaMissing(sqlstate, typeof e.message === 'string' && e.routine !== 'exec_stmt_raise' ? e.message : '');
   }
+  if (sqlstate === READ_ONLY_SQLSTATE) return { code: 'connection_inherited_read_only', detail: { origin: 'database', sqlstate },
+    message: `The database refused this write as read-only (SQLSTATE ${sqlstate}${typeof e.message === 'string' ? `: ${e.message}` : ''}), so nothing was committed: the server connection defaults to read-only transactions (pooler session state left by another client, a role or database default, or a read-only server).` };
   if (sqlstate !== 'P0001' && sqlstate !== GRADUATION_SQLSTATE) return null;
   const where = typeof e.where === 'string' ? e.where : '';
   const raiser = ident(/PL\/pgSQL function (?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)[( ]/.exec(where)?.[1]);

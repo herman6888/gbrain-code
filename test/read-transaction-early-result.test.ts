@@ -164,7 +164,7 @@ describe('search read transactions answer before COMMIT', () => {
 
     srv.releaseCommit();
     expect(await settledWithin(next, 1_000)).toEqual([]);
-    expect(textsAfter(srv.sent, from)).toEqual(['1:begin', "1:select set_config('statement_timeout',", '1:select 41', '1:commit', '1:select 2']);
+    expect(textsAfter(srv.sent, from)).toEqual(['1:begin read', "1:select set_config('statement_timeout',", '1:select 41', '1:commit', '1:select 2']);
     expect(engine.getPoolDiagnostics()!.tracked.tx).toBe(0);
   }));
 
@@ -202,7 +202,7 @@ describe('search read transactions answer before COMMIT', () => {
     const from = srv.sent.length;
     await expect(engine.keywordBoundedRead(async () => { throw new Error('read sentinel'); })).rejects.toThrow('read sentinel');
     expect(await engine.executeRaw(ANSWER)).toEqual([{ answer: 42 }]);
-    expect(textsAfter(srv.sent, from)).toEqual(['1:begin', "1:select set_config('statement_timeout',", '1:rollback', '1:select 41']);
+    expect(textsAfter(srv.sent, from)).toEqual(['1:begin read', "1:select set_config('statement_timeout',", '1:rollback', '1:select 41']);
   }));
 
   test("a caller's transaction still waits for its COMMIT", () => withEnv(ENV, async () => {
@@ -219,6 +219,6 @@ describe('search read transactions answer before COMMIT', () => {
     const { srv, engine } = await fixture();
     const from = srv.sent.length;
     expect(await engine.transaction(tx => tx.keywordBoundedRead(db => db.executeRaw(ANSWER)))).toEqual([{ answer: 42 }]);
-    expect(textsAfter(srv.sent, from).filter(s => !/current_setting|set_config/.test(s))).toEqual(['1:begin', '1:savepoint "s0"', '1:select 41', '1:commit']);
+    expect(textsAfter(srv.sent, from).filter(s => !/current_setting|set_config/.test(s))).toEqual(['1:begin read', '1:savepoint "s0"', '1:select 41', '1:commit']);
   }));
 });

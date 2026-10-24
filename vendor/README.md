@@ -113,6 +113,18 @@ GBrain passes `isPersistenceDeclaration` (`src/core/persistence/protocol.ts`)
 from the persistence transactions that open with the protocol declaration
 (GBRA-156, same test file).
 
+`sql.begin({ early }, fn)` sends every statement `early(text)` accepts, in
+order, behind BEGIN before BEGIN's answer, on any pool that pipelines inside
+a transaction (a pipelining pool, or `transaction_pipeline` in force); the
+first statement it refuses, and every later one, waits for the answer. The
+same rule applies: if BEGIN fails the accepted statements have run in
+autocommit, so the test must accept only reads and transaction-local
+`set_config`. GBrain passes `isPipelinableSearchRead`
+(`src/core/postgres-engine/search-settings.ts`) from its search read
+transactions, so a scoped search read costs one round trip instead of two
+(GBRA-156, `test/e2e/pgbouncer-transaction-pipeline-6930.test.ts` and
+`test/e2e/search-read-pipeline-postgres.test.ts`).
+
 On a reserved connection (`sql.reserve`), where the pool does not pipeline,
 `reservedTransactions().begin({ first }, fn)`
 (`src/core/postgres-engine/reserved-transactions.ts`) makes the same

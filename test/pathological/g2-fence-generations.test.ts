@@ -11,6 +11,7 @@ import { renderTakesFence } from '../../src/core/takes-fence.ts';
 import { emptyFenceBlock } from '../../src/core/generations/fence.ts';
 import { generationHeldCheck } from '../../src/commands/doctor/checks/generations.ts';
 import { readSyncStatus } from '../../src/core/persistence/sync-status.ts';
+import { installFaultHook } from '../../src/core/persistence/fault-points.ts';
 import { operationsByName } from '../../src/core/operations.ts';
 import { resolveRepairScope, type RepairResult } from '../../src/core/repair/core.ts';
 import { repairRunner } from '../../src/core/repair/registry.ts';
@@ -103,6 +104,35 @@ describe('GBRA-161 PR 2 fence generations', () => {
         expect(await liveCounts(engine, sourceId, SLUG)).toEqual({ facts: 0, takes: 0 });
         expect(await ledger(engine, sourceId, SLUG)).toEqual([{ kind: 'fact_fence', state: 'live', retired: 3, preimages: 3 }]);
         expect((await generationHeldCheck(engine, [sourceId])).status).toBe('ok');
+      });
+    }, 180_000);
+
+    if (backend === 'postgres') test(`[${backend}] a returned put has cleared its publication recovery record, so sync status names the fence fix even while the counter lock is contended`, async () => {
+      await managedSource(databaseUrl, async () => {}, async ({ engine, sourceId, put }) => {
+        await put(SLUG, PERSON('Alice Example', FACTS(3)));
+        let contended: Promise<unknown> | undefined;
+        installFaultHook(async point => {
+          if (point !== 'publication:after_commit' || contended) return;
+          let locked!: () => void;
+          const held = new Promise<void>(resolve => { locked = resolve; });
+          contended = engine.transaction(async tx => {
+            await tx.executeRaw("SELECT key FROM persistence_counters WHERE key='brain' FOR UPDATE");
+            locked();
+            await Bun.sleep(1500);
+          });
+          await held;
+        });
+        try {
+          await put(SLUG, PERSON('Alice Example', 'The facts section was removed in this edit.\n'));
+          const [recovery] = await engine.executeRaw<{ n: number }>('SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1 AND recovery IS NOT NULL', [sourceId]);
+          const status = await readSyncStatus(engine, sourceId);
+          expect(contended).toBeDefined();
+          expect(recovery!.n).toBe(0);
+          expect(status.next).toEqual(status.fence_holds[0]!.fix);
+        } finally {
+          installFaultHook(undefined);
+          await contended;
+        }
       });
     }, 180_000);
 

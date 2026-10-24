@@ -5,7 +5,8 @@
  * answers, the CLI prints that answer with the cold path's own renderer and
  * exit codes. A missing, unsafe, stale, busy, refusing or dying socket returns
  * false and the cold path runs as if the socket did not exist (a note goes to
- * stderr only with GBRAIN_DEBUG=1). GBRAIN_CLI_SOCKET=0 skips the socket.
+ * stderr only with GBRAIN_DEBUG=1, except an identity refusal, which always
+ * prints a degraded notice). GBRAIN_CLI_SOCKET=0 skips the socket.
  */
 import net from 'node:net';
 import { format } from 'node:util';
@@ -19,14 +20,48 @@ import { cliSocketIdentity } from '../core/cli-socket/identity.ts';
 import { peerCredSupport, peerUid, type PeerCredSupport } from '../core/cli-socket/peer-cred.ts';
 import {
   CONNECT_TIMEOUT_MS, DEFAULT_READ_WALLCLOCK_MS, FrameReader, HANDSHAKE_TIMEOUT_MS, isHandshakeFrame, isResultFrame, MAX_RESPONSE_BYTES,
-  MAX_ROUND_TRIP_MS, reviveOperationError, type CliSocketOp, type CliSocketRequest, type OutputChunk, type ResultFrame,
+  MAX_ROUND_TRIP_MS, reviveOperationError, warmRoundTripTimeout, type CliSocketOp, type CliSocketRequest, type OutputChunk, type ResultFrame,
 } from '../core/cli-socket/protocol.ts';
+import type { OperationError } from '../core/ops/contract.ts';
 
 export const CLI_SOCKET_COMMANDS: readonly string[] = ['search', 'query', 'get', 'recall'];
 const SOCKET_OPS: Record<string, CliSocketOp> = { search: 'search', query: 'query', get_page: 'get_page' };
 
 function debug(reason: string): void {
   if (process.env.GBRAIN_DEBUG === '1') process.stderr.write(`[cli-socket] cold path: ${reason}\n`);
+}
+
+/**
+ * A refusal by identity is never silent (GBRA-156): every call from an environment that differs from the serve's
+ * takes the slower cold path until that part matches, so the CLI prints a degraded notice naming the part (never its
+ * value) whether or not GBRAIN_DEBUG is set. The serve counts the refusal for doctor `cli_socket_refusals`.
+ */
+export async function noteCliSocketRefusal(reason: string): Promise<void> {
+  const refused = /^refused \(identity_mismatch\)(?:: (.+))?$/.exec(reason);
+  if (!refused) return;
+  const part = refused[1] ?? 'its identity';
+  const { writeCliNotices } = await import('../core/interop-notices.ts');
+  writeCliNotices([{ code: 'socket_identity_mismatch', kind: 'degraded',
+    why: `The running serve's warm CLI socket refused this call because ${part} differs from the serve's (the value is never shown), so it ran on the slower cold path. Every call from this environment does until that part matches the serve's.`,
+    fix: { argv: ['gbrain', 'doctor', '--only', 'cli_socket_refusals', '--json'], consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/guides/cli-socket.md',
+      why: 'Read-only: names each identity part the serve refused and how often; run the caller with the serve\'s value, or restart the serve with the caller\'s.' } }]);
+}
+
+const isRoundTripTimeout = (fields: Record<string, unknown>) => fields.code === 'timeout' && fields.reason === 'cli_socket_round_trip_cap';
+
+/**
+ * GBRA-156: a warm call that reached its round-trip cap prints a retryable `timeout` error and exits 124 instead of
+ * starting over on the cold path. The envelope goes to stdout under --json and the human line to stderr, as every CLI
+ * error does; without --json an [AGENT] block also goes to stdout, so a caller that discards stderr still sees why.
+ */
+export async function writeWarmTimeout(error: OperationError, command: string): Promise<true> {
+  const { writeCliError } = await import('./cli-error.ts');
+  const { setCliExitVerdict, jsonRequested } = await import('../core/cli-force-exit.ts');
+  const { agentBlock } = await import('../core/agent-markers.ts');
+  const exit = writeCliError(error, command);
+  if (!jsonRequested(process.argv.slice(2))) process.stdout.write(agentBlock({ why: `[timeout] ${error.message}`, next: 'wait: retry the same command' }));
+  setCliExitVerdict(exit);
+  return true;
 }
 
 function debugWarm(command: string, path: string): void {
@@ -166,6 +201,7 @@ export async function renderOp(command: string, op: OperationMeta, params: Recor
   const { applyCliOpNotices, captureOpNotice } = await import('./op-notices.ts');
   const { setCliExitVerdict, writeStdoutFinal } = await import('../core/cli-force-exit.ts');
   await noteSource(frame);
+  if (frame.kind === 'error' && isRoundTripTimeout(frame.error)) { await replay(frame); return writeWarmTimeout(reviveOperationError(frame.error), command); }
   if (frame.kind === 'error') {
     const { writeCliError } = await import('./cli-error.ts');
     const rendered = await buffered(() => writeCliError(reviveOperationError(frame.error), command));
@@ -236,11 +272,17 @@ export async function maybeServeFromCliSocket(command: string, args: string[]): 
     if (!recall.isRecallVerbForm(flags)) return false;
     if (!recall.isOneShotRecall(flags)) recall.validateAndNormalizeFlags(flags);
     const outcome = await exchangeCliSocket(path, { ...base, kind: 'recall', args }, resultTimeoutMs);
-    if ('reason' in outcome) { debug(outcome.reason); return false; }
+    if ('reason' in outcome) {
+      await noteCliSocketRefusal(outcome.reason);
+      if (outcome.reason === 'round_trip_timeout') return writeWarmTimeout(warmRoundTripTimeout(command, resultTimeoutMs, 'cli'), command);
+      debug(outcome.reason);
+      return false;
+    }
     if (outcome.frame.kind === 'fallback') { debug(outcome.frame.reason); return false; }
     const frame = outcome.frame;
     debugWarm(command, path);
     await noteSource(frame);
+    if (frame.kind === 'error' && isRoundTripTimeout(frame.error)) { await replay(frame); return writeWarmTimeout(reviveOperationError(frame.error), command); }
     if (frame.kind === 'error' && !recall.isOneShotRecall(flags)) { await replay(frame); throw reviveOperationError(frame.error); }
     const { writeCliNotices } = await import('../core/interop-notices.ts');
     const rendered = await buffered(async () => {
@@ -257,7 +299,12 @@ export async function maybeServeFromCliSocket(command: string, args: string[]): 
   const prepared = await opRequest(command, args);
   if (typeof prepared === 'string') { debug(prepared); return false; }
   const outcome = await exchangeCliSocket(path, { ...base, kind: 'op', op: SOCKET_OPS[prepared.op.name]!, params: prepared.params }, resultTimeoutMs);
-  if ('reason' in outcome) { debug(outcome.reason); return false; }
+  if ('reason' in outcome) {
+    await noteCliSocketRefusal(outcome.reason);
+    if (outcome.reason === 'round_trip_timeout') return writeWarmTimeout(warmRoundTripTimeout(command, resultTimeoutMs, 'cli'), command);
+    debug(outcome.reason);
+    return false;
+  }
   if (outcome.frame.kind === 'fallback') { debug(outcome.frame.reason); return false; }
   debugWarm(command, path);
   return renderOp(command, prepared.op, prepared.params, outcome.frame);

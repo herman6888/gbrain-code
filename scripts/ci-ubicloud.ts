@@ -422,7 +422,8 @@ async function main() {
       const done = new Set(parsed.map((r) => r.file));
       for (const result of parsed) record(vm, slot, result);
       const lost = batch.filter((item) => !done.has(item.file));
-      if (lost.length) {
+      // The teardown killed this batch: its lost items say nothing about the VM.
+      if (lost.length && !interrupted) {
         vm.infraErrors++;
         log(`batch on ${vm.name} slot ${slot} ended (exit ${code}) with ${lost.length} unfinished item(s); log ${logPath}`);
         for (const item of lost) {
@@ -529,6 +530,7 @@ async function main() {
   try {
     await Promise.race([Promise.all(vms.map((vm, i) => vmLifecycle(vm, i))), recorded]);
     if (control.length && !controlDone) throw new Error("no VM became ready to run gitleaks/verify/exclusive items");
+    if (interrupted) throw new Error(`interrupted: ${totalItems - results.size} item(s) did not run`);
     if (queue.length) throw new Error(`${queue.length} items never ran: every VM failed`);
   } catch (error) {
     console.error(`ci-ubicloud: ${error instanceof Error ? error.message : String(error)}`);

@@ -173,9 +173,26 @@ header never presents when a fact was written as when it became true. An open
 validity end reads `unknown`. The setting
 applies to `search`, `query`, `recall`, `think` and `assemble_evidence`.
 
+### Tail trim
+
+With `search.evidence_tail_trim` on (default off), an `auto` delivery for
+`search` or `query` drops whole-conversation blocks past the top 3 whose
+search score is under half of rank one's. A block that holds the query's terms
+nearly as fully as rank one (at least 80% of rank one's share of them) is kept:
+a low-scoring session can restate the asked fact with an earlier value, which
+an update question needs. Ranked chunks, saved facts and long pages are never
+dropped, and a delivery without a usable score on every row is unchanged.
+`delivery.tail_trim` reports `{ dropped, kept_by_query_terms }` and
+`dropped_reasons.tail_trim` counts the dropped blocks. On LongMemEval-S
+(development evidence), the trim cut delivered tokens by about 36% on the
+questions it touched, with no measurable loss on three reader models
+([gbrain-evals#185](https://github.com/garrytan/gbrain-evals/pull/185)). The
+library `assembleEvidenceForHits` runs it when the call passes `query` and
+each hit's `score`.
+
 Config keys: `search.return_unit`, `search.return_window`,
 `search.return_budget_default`, `search.return_budget_conversation`,
-`search.return_budget_max_remote`, `search.evidence_date_header`, `search.auto_packing`,
+`search.return_budget_max_remote`, `search.evidence_date_header`, `search.evidence_tail_trim`, `search.auto_packing`,
 `search.page_rank_cut`, `search.page_rank_cut_factor`, `think.return_unit`. Kill switch:
 `gbrain config set search.return_unit chunk` and
 `gbrain config set think.return_unit chunk` (or pass `return_unit: "chunk"`
@@ -413,6 +430,7 @@ Response meta (`_meta.retrieval.delivery` over MCP; top-level `delivery` on
   "fallbacks": ["budget_clamped"], // distinct non-fatal problem codes, never silent
   "budget_clamped": { "requested": 50000, "max": 32000 },
   "date_header": true,             // only when search.evidence_date_header is on
+  "tail_trim": { "dropped": 1, "kept_by_query_terms": 0 }, // only when search.evidence_tail_trim ran
   "auto_packing": "cap_only"       // explicit auto budgets only: the packing that ran
 }
 ```

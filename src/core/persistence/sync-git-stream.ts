@@ -8,8 +8,9 @@
  * 600k-path tree costs its map and one chunk.
  */
 import { randomUUID } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync, rmSync, writeFileSync, type BigIntStats } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, type BigIntStats } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
+import { configDir } from '../config.ts';
 import { hardenedGitStream, hardenedStreamComplete, NulRecordSplitter, type HardenedGitStreamResult } from '../hardened-git.ts';
 import { gitBlobOid, sha256 } from './digest.ts';
 import { readSyncFile } from './sync-discovery.ts';
@@ -132,6 +133,35 @@ export async function walkTreeLevel(gitRoot: string, commit: string, scope: stri
     if (!fields || !OID.test(fields.b)) throw malformed('ls-tree', record.toString('utf8'));
     if (fields.a === 'blob' || fields.a === 'commit') visit(fields.path, fields.mode, fields.b);
   }, shared);
+}
+
+/** One `diff-tree -r` change of a `T` path: its entry at the new commit, or null where the new commit has none. */
+export interface GitTreeChange { path: string; entry: GitTreeEntry | null }
+/** The modes `readTreeLevel` keeps (blob and gitlink entries); a change to anything else is not a `T` change it can apply. */
+const TREE_ENTRY_MODE = /^(?:10[0-7]{4}|120000|160000)$/;
+
+/**
+ * The changes of `T` under `scope` from commit `from` to `to` (one `diff-tree -r -z --no-renames`, raw: full OIDs),
+ * or null when a record names an entry `readTreeLevel` would not list the same way: the caller reads `T` whole then.
+ */
+export async function readTreeChanges(gitRoot: string, from: string, to: string, scope: string, shared?: LoopYield): Promise<GitTreeChange[] | null> {
+  const changes: GitTreeChange[] = [];
+  let meta: string | null = null, foreign = false;
+  await readRecords(gitRoot, ['diff-tree', '-r', '-z', '--no-renames', from, to, ...(scope ? ['--', scope] : [])], 'diff-tree', bytes => {
+    if (meta === null) {
+      meta = bytes.toString('latin1');
+      if (!meta.startsWith(':')) throw malformed('diff-tree', meta);
+      return;
+    }
+    const [, dstMode = '', , dstOid = '', status = ''] = meta.slice(1).split(' ');
+    meta = null;
+    const path = bytes.toString('utf8');
+    if (status === 'D') changes.push({ path, entry: null });
+    else if ((status === 'A' || status === 'M' || status === 'T') && TREE_ENTRY_MODE.test(dstMode) && OID.test(dstOid)) changes.push({ path, entry: { mode: dstMode, oid: dstOid } });
+    else foreign = true;
+  }, shared);
+  if (meta !== null) throw new SyncTreeReadIncomplete('diff-tree', 'a status record had no path');
+  return foreign ? null : changes;
 }
 
 /** `X`: the index (never the worktree), keyed by Git-root-relative path; a conflicted path keeps its highest stage. */
@@ -317,9 +347,15 @@ interface ReadFile { path: string; sha256: string; localOid: string; foldedOid: 
  * `ctime` are older than 2 s before the call began, by the earlier of the
  * process's and the filesystem's clocks (`racyFloor`, the working stat cache's
  * racy window), so an edit made during or after the read always rehashes.
+ *
+ * With `persist` (`sync.level_reuse`, GBRA-133 wave 4) the vouched probes also outlive the process: a process with none
+ * for this root and Git root starts from the ones the last process saved (`cleanProbeFile`), each still checked against
+ * the path's lstat key and tree entry, and saves its own when they changed (at most once a minute per root). A file that
+ * is missing, unreadable, for another root or with any malformed entry is ignored whole. With `verify` every reused probe
+ * is read and hashed anyway, and `verify` gets the reused count and the first path whose fresh probe differs.
  */
 export async function probeDirtiness(root: string, gitRoot: string, paths: string[], tree: Map<string, GitTreeEntry>,
-  index: Map<string, GitIndexEntry>, opts: { batch?: number; working?: boolean; step?: LoopYield } = {}): Promise<Map<string, DirtinessProbe>> {
+  index: Map<string, GitIndexEntry>, opts: { batch?: number; working?: boolean; step?: LoopYield; persist?: boolean; verify?: (reused: number, differs: string | null) => void } = {}): Promise<Map<string, DirtinessProbe>> {
   const batch = Math.max(1, opts.batch ?? 2000);
   const results = new Map<string, DirtinessProbe>();
   const firstOid = tree.values().next().value?.oid ?? index.values().next().value?.oid ?? '';
@@ -329,7 +365,9 @@ export async function probeDirtiness(root: string, gitRoot: string, paths: strin
   try { realRoot = realpathSync.native(root); realGitRoot = realpathSync.native(gitRoot); } catch {}
   const step = opts.step ?? loopYield();
   const cleanKey = !opts.working && realRoot !== null && realGitRoot !== null ? `${realRoot}\0${realGitRoot}` : null;
-  const vouched = cleanKey === null ? null : new Map(cleanProbes.get(cleanKey));
+  const vouched = cleanKey === null ? null : new Map(cleanProbes.get(cleanKey) ?? (opts.persist ? loadCleanProbes(cleanKey) : undefined));
+  const checked = new Map<string, DirtinessProbe>();
+  let touched = false;
   const racyFrom = vouched ? racyFloor(realGitRoot!) : 0n;
   for (let start = 0; start < paths.length; start += batch) {
     const decided = new Map<string, Dp | null>();
@@ -347,8 +385,12 @@ export async function probeDirtiness(root: string, gitRoot: string, paths: strin
       const statKey = vouched && dp === null && !unreadable ? statAt(realGitRoot!, path) : null;
       const prior = statKey && statKey !== ABSENT ? vouched!.get(path) : undefined;
       const signature = `${statKey}|${committed?.oid}|${committed?.mode}|`;
-      if (prior?.startsWith(signature)) { results.set(path, { dp: 'clean', rawOid: committed!.oid, rawSha256: prior.slice(signature.length) }); continue; }
-      vouched?.delete(path);
+      if (prior?.startsWith(signature)) {
+        const kept: DirtinessProbe = { dp: 'clean', rawOid: committed!.oid, rawSha256: prior.slice(signature.length) };
+        if (!opts.verify) { results.set(path, kept); continue; }
+        checked.set(path, kept);
+      }
+      if (vouched?.delete(path)) touched = true;
       if (!unreadable) { try { bytes = readSyncFile(root, sourcePath); } catch { unreadable = true; } }
       if ((dp === null || opts.working) && !unreadable && bytes === null) dp = 'deleted';
       const hashable = bytes !== null && !path.includes('\n') && !path.startsWith('"');
@@ -378,7 +420,7 @@ export async function probeDirtiness(root: string, gitRoot: string, paths: strin
       if (rawOid === committed.oid) {
         settle(executableMatches ? 'clean' : 'unknown');
         if (executableMatches && file.statKey && vouched!.size < WORKING_STAT_CACHE_MAX_ENTRIES && statAt(realGitRoot!, file.path) === file.statKey
-          && file.statKey.split(':').slice(5).every(ns => BigInt(ns) < racyFrom)) vouched!.set(file.path, `${file.statKey}|${committed.oid}|${committed.mode}|${file.sha256}`);
+          && file.statKey.split(':').slice(5).every(ns => BigInt(ns) < racyFrom)) { vouched!.set(file.path, `${file.statKey}|${committed.oid}|${committed.mode}|${file.sha256}`); touched = true; }
         continue;
       }
       if (attributeSet(attr['working-tree-encoding']) || (attributeSet(attr.filter) && attr.filter !== 'lfs')) { settle('unknown'); continue; }
@@ -402,12 +444,48 @@ export async function probeDirtiness(root: string, gitRoot: string, paths: strin
     cleanProbes.delete(cleanKey);
     cleanProbes.set(cleanKey, vouched!);
     while (cleanProbes.size > WORKING_STAT_CACHES_REMEMBERED) cleanProbes.delete(cleanProbes.keys().next().value!);
+    if (opts.persist && touched && Date.now() - (cleanProbesSavedAt.get(cleanKey) ?? -Infinity) >= CLEAN_PROBE_SAVE_EVERY_MS) saveCleanProbes(cleanKey, vouched!);
+  }
+  if (opts.verify) {
+    const differs = [...checked].find(([path, kept]) => JSON.stringify(results.get(path)) !== JSON.stringify(kept));
+    opts.verify(checked.size, differs ? `${differs[0]}: kept ${JSON.stringify(differs[1])}, read ${JSON.stringify(results.get(differs[0]))}` : null);
   }
   return results;
 }
 
 /** Committed-mode `clean` probes this process vouched, by root and Git root: path -> `<stat key>|<tree oid>|<tree mode>|<sha256>`. */
 const cleanProbes = new Map<string, Map<string, string>>();
+const cleanProbesSavedAt = new Map<string, number>();
+const CLEAN_PROBE_SAVE_EVERY_MS = 60_000;
+const CLEAN_PROBE = /^\d+:\d+:\d+:\d+:\d+:\d+:\d+\|[0-9a-f]{40}(?:[0-9a-f]{24})?\|\d{6}\|[0-9a-f]{64}$/;
+
+/** Where `persist` keeps the vouched probes of one root and Git root (`key`): this machine's gbrain home, never the brain. */
+export function cleanProbeFile(key: string): string {
+  return join(configDir(), 'persistence', 'clean-probes', `${sha256(key).slice(0, 32)}.json`);
+}
+
+function loadCleanProbes(key: string): Map<string, string> | undefined {
+  try {
+    const doc = JSON.parse(readFileSync(cleanProbeFile(key), 'utf8')) as { v?: unknown; key?: unknown; entries?: unknown };
+    if (doc.v !== 1 || doc.key !== key || !doc.entries || typeof doc.entries !== 'object' || Array.isArray(doc.entries)) return undefined;
+    const list = Object.entries(doc.entries as Record<string, unknown>);
+    if (list.length > WORKING_STAT_CACHE_MAX_ENTRIES || !list.every(([, entry]) => typeof entry === 'string' && CLEAN_PROBE.test(entry))) return undefined;
+    return new Map(list as Array<[string, string]>);
+  } catch { return undefined; }
+}
+
+function saveCleanProbes(key: string, probes: Map<string, string>): void {
+  const file = cleanProbeFile(key), staged = `${file}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(join(file, '..'), { recursive: true, mode: 0o700 });
+    writeFileSync(staged, JSON.stringify({ v: 1, key, entries: Object.fromEntries(probes) }), { mode: 0o600 });
+    renameSync(staged, file);
+    cleanProbesSavedAt.set(key, Date.now());
+  } catch { rmSync(staged, { force: true }); }
+}
+
+/** Tests: forget this process's vouched probes and save times, as a new process starts. */
+export function __resetCleanProbesForTests(): void { cleanProbes.clear(); cleanProbesSavedAt.clear(); }
 
 /** Raw blob ids (no filters) of present files, in order, or null when Git did not answer every path. */
 async function hashRaw(gitRoot: string, paths: string[]): Promise<string[] | null> {

@@ -18,7 +18,7 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -76,6 +76,24 @@ test('refresh timer bounds reject overflow and accept the maximum delay', () => 
   expect(drain.waitDrainMs).toBeGreaterThan(2 ** 31 - 1); // the drain wait is a performance.now() deadline, not a timer: still accepted
   expect((await refreshWorktree(f.engine, f.alpha, drain)).status).toBe('dry_run');
   expect((await refreshWorktree(f.engine, f.alpha, { fetchTimeoutMs: 2 ** 31 - 1, dryRun: true })).status).toBe('dry_run');
+}));
+test('GBRA-133: another HOME refuses refresh_not_owner naming the identity file and HOME it read, and mints no identity', () => each(async f => {
+  const other = mkdtempSync(join(tmpdir(), 'gbrain-refresh-other-home-'));
+  try {
+    const identity = join(other, '.gbrain', 'persistence', 'host.json');
+    await withEnv({ GBRAIN_HOME: other, HOME: other }, async () => {
+      const missing = await refusedWith(refreshWorktree(f.engine, f.alpha, { dryRun: true }), 'refresh_not_owner');
+      expect(missing.message).toContain(`no host identity at ${identity} (none was created)`);
+      expect(missing.message).toContain(`HOME=${other} and GBRAIN_HOME=${other}`);
+      expect(existsSync(identity)).toBe(false);
+      mkdirSync(join(other, '.gbrain', 'persistence'), { recursive: true });
+      const foreign = randomUUID();
+      writeFileSync(identity, JSON.stringify({ version: 1, id: foreign }));
+      const mismatch = await refusedWith(refreshWorktree(f.engine, f.alpha, { dryRun: true }), 'refresh_not_owner');
+      expect(mismatch.message).toContain(`this process has host identity ${foreign} from ${identity}`);
+    });
+    expect((await refreshWorktree(f.engine, f.alpha, { dryRun: true })).status).toBe('dry_run');
+  } finally { rmSync(other, { recursive: true, force: true }); }
 }));
 /** Requeue a committed git effect so the drain must wait for the consumer to process it again. */
 async function requeueGitEffect(f: RefreshFixture, delayMs: number): Promise<number> {

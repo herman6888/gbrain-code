@@ -1,7 +1,7 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, syncGroup, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues, independentGroup, sweepSegmentStorage, yieldToEventLoop } from './journal.ts';
-import { finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, transientDatabaseFailure, type PreparedMutation } from './coordinator.ts';
+import { connectionCapFailure, finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, transientDatabaseFailure, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
 import { preparationConfigView } from './config-snapshot.ts';
@@ -32,7 +32,7 @@ import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 import { maybeRefreshPlannerStats } from '../planner-stats.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { faultPoint } from './fault-points.ts';
-import { releaseAbandonedClaims } from './effect-journal.ts';
+import { EFFECT_OWNER_KEY_SQL, releaseAbandonedClaims } from './effect-journal.ts';
 import { readWriteSwitchSnapshot, writeSwitchOn } from './switches.ts';
 import { consumerConnectionRoute, consumerStatementEngine, poolerExposureLine } from './consumer-lane.ts';
 import { isConnectionLoss } from '../retry-matcher.ts';
@@ -209,6 +209,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private deadOwnerScanAt = 0;
   /** #6650: the dead owners (`deadOwnerClaims`) an idle tick found, handed to that tick's expired-claim reclaim. */
   private deadOwnersSeen: string[] | null = null;
+  /** GBRA-133: the dead owners the last `deadOwnerClaims` scan found, handed to every effect pass until the next scan. */
+  private deadOwnerKeys: string[] = [];
   private projectionWorker: Promise<unknown> | undefined;
   private effectsWorker: Promise<void> | undefined;
   private draining: { since: number; settled: number; ran: number; noticedAt: number } | undefined;
@@ -751,20 +753,26 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
    * `running`) or rolled back with its connection. A live owner, however slow, and an owner on another host or
    * container keep their full lease. Postgres only, at most every `DEAD_OWNER_SCAN_MS`: PGLite admits one process
    * and releases abandoned claims at start. An `idle` scan runs where the idle probe does (its reserved lane), so an
-   * idle pool still drains.
+   * idle pool still drains. GBRA-133: the owners of running effect claims (no recovery record, stamped `claim_owner` of
+   * their current token) are read in the same statement; the effect passes until the next scan claim their effects.
    */
   private async deadOwnerClaims(signal?: AbortSignal, idle = false): Promise<string[]> {
     if (this.engine.kind !== 'postgres' || Date.now() - this.deadOwnerScanAt < DEAD_OWNER_SCAN_MS) return [];
     this.deadOwnerScanAt = Date.now();
     const lane = idle && !this.laneInUse && consumerConnectionRoute(this.engine).lane !== 'direct' ? await this.acquireIdleLane(signal) : undefined;
-    const owners = await this.probeQuery<{ key: string; owner: string }>(lane, `SELECT DISTINCT
+    const owners = await this.probeQuery<{ key: string; owner: string }>(lane, `SELECT DISTINCT key,owner FROM (SELECT
         concat_ws(':',r.claim_phase->'owner'->>'pid',r.claim_phase->'owner'->>'nonce',r.claim_phase->'owner'->>'start') AS key,(r.claim_phase->'owner')::text AS owner
       FROM persistence_requests r
       WHERE r.state='running' AND r.recovery IS NULL AND r.publication_started=false AND r.claim_expires_at>=now()
         AND r.claim_phase->>'token'=r.execution_token::text AND r.claim_phase->'owner'->>'boot_id' IS NOT NULL
         AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))
+      UNION ALL SELECT ${EFFECT_OWNER_KEY_SQL('e')},(e.claim_owner->'owner')::text
+      FROM persistence_effects e
+      WHERE e.state='running' AND e.recovery IS NULL AND e.claim_expires_at>=now()
+        AND e.claim_owner->>'token'=e.execution_token::text AND e.claim_owner->'owner'->>'boot_id' IS NOT NULL
+        AND (e.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=e.worktree_id AND w.owner_host_id=$1::uuid))) o
       LIMIT 100`, [this.hostId], signal);
-    return owners.filter(row => claimOwnerProvablyDead({ owner: JSON.parse(row.owner) })).map(row => row.key);
+    return this.deadOwnerKeys = owners.filter(row => claimOwnerProvablyDead({ owner: JSON.parse(row.owner) })).map(row => row.key);
   }
   /** #5984 lanes: claims the next group heads of every open lane run in this process, up to its effective lane count. */
   private async claimLanes(): Promise<void> {
@@ -832,7 +840,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         if (!done) await yieldToEventLoop();
       }
       for (let ran = limit; ran >= limit && !signal.aborted;) {
-        ran = await runPersistenceEffects(this.engine, this.config, { hostId: this.hostId, limit, signal });
+        ran = await runPersistenceEffects(this.engine, this.config, { hostId: this.hostId, limit, signal, deadOwners: this.deadOwnerKeys });
         drain.ran += ran;
         this.drainNotice(drain);
         if (ran >= limit) await yieldToEventLoop();
@@ -964,12 +972,13 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     this.lastError = { code: typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || isWriteErrorCode(code)) ? code : 'storage_error', at: new Date().toISOString(),
       ...(this.lastPhaseError ? { phase: this.lastPhaseError } : {}) };
     if (this.opts.onError) this.opts.onError(error);
-    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined, row);
+    // GBRA-133: a pooler's client cap names itself and its fix beside the code the pooler sent.
+    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined, row, connectionCapFailure(error));
     this.lastPhaseError = undefined;
     this.lastPhaseTiming = undefined;
   }
   /** #6543 F1: a line about one request is throttled per request (30 s per phase and code); other lines keep the shared throttle. */
-  private log(phase: string, code: string, detail?: string, timing = '', row?: WriteRequest): void {
+  private log(phase: string, code: string, detail?: string, timing = '', row?: WriteRequest, poolCap = false): void {
     const key = `${phase}:${code}`, at = Date.now();
     if (row) {
       const requestKey = `${key}:${row.id}`;
@@ -981,8 +990,10 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
       this.lastLog = { key, at };
     }
-    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${detail ? ` message="${detail}"` : ''}${timing}${row ? requestLogFields(row) : ''}`
-      + '; unfinished work remains tracked; fix: gbrain sources writer status --json; docs: docs/ENGINES.md#persistence-consumer-log\n');
+    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${poolCap ? ' cause=pool_exhausted' : ''}${detail ? ` message="${detail}"` : ''}${timing}${row ? requestLogFields(row) : ''}`
+      + '; unfinished work remains tracked; fix: gbrain sources writer status --json'
+      + `${poolCap ? '; pool: every gbrain process on this database shares the pooler\'s client limit, so run fewer long-running ones (share one gbrain serve --http) or raise the limit (docs/ENGINES.md#pool-sizing)' : ''}`
+      + '; docs: docs/ENGINES.md#persistence-consumer-log\n');
   }
   /** #5373: tracks work that outlived its claim until it settles; the returned promise never rejects. */
   /**

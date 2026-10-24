@@ -107,12 +107,18 @@ export type HardenedGitInput = string | Buffer | Iterable<Buffer | string> | Asy
  * returns a promise holds stdout until it settles (a large read yields to the
  * event loop between chunks); a rejection fails the run like a throw.
  */
-export async function hardenedGitStream(root: string, args: string[],
+export function hardenedGitStream(root: string, args: string[],
   opts: { stdin?: HardenedGitInput; timeoutMs: number; maxBytes?: number; onChunk?: (chunk: Buffer) => void | Promise<void> }): Promise<HardenedGitStreamResult> {
-  assertHardenedGitArgs(args);
-  return await new Promise<HardenedGitStreamResult>((accept, reject) => {
+  try { assertHardenedGitArgs(args); } catch (error) { return Promise.reject(error); }
+  // GBRA-133: not an async function and no callback below names `opts`, so no timer or listener closes over the caller's
+  // options, and the chunk handler is dropped once the read settled. Before, an async function's parameters were captured by
+  // every callback here: the exited-stdout idle timer kept the caller's `onChunk` (and through it the whole pass that read)
+  // reachable for seconds after the read had ended.
+  const { stdin, timeoutMs, maxBytes } = opts;
+  let onChunk = opts.onChunk;
+  return new Promise<HardenedGitStreamResult>((accept, reject) => {
     const child = spawn('git', [...HARDENED_GIT_ARGS, '-C', root, ...args],
-      { env: hardenedGitEnvironment(), stdio: [opts.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'] });
+      { env: hardenedGitEnvironment(), stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'] });
     let bytes = 0;
     let last = -1;
     let stopped: 'timeout' | 'too_large' | undefined;
@@ -121,9 +127,9 @@ export async function hardenedGitStream(root: string, args: string[],
     let exited = false;
     let holding = false;
     let idle: ReturnType<typeof setTimeout> | undefined;
-    const settle = (outcome: () => void): void => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(idle); outcome(); };
+    const settle = (outcome: () => void): void => { if (settled) return; settled = true; onChunk = undefined; clearTimeout(timer); clearTimeout(idle); outcome(); };
     const fail = (error: unknown): void => { failure ??= { error }; child.kill('SIGKILL'); };
-    const timer = setTimeout(() => { stopped ??= 'timeout'; child.kill('SIGKILL'); }, opts.timeoutMs);
+    const timer = setTimeout(() => { stopped ??= 'timeout'; child.kill('SIGKILL'); }, timeoutMs);
     const watchIdle = (): void => {
       clearTimeout(idle);
       if (exited && !holding) idle = setTimeout(() => settle(() => failure ? reject(failure.error) : accept({ ok: false, reason: stopped ?? 'stalled' })), EXITED_STDOUT_IDLE_MS);
@@ -131,10 +137,10 @@ export async function hardenedGitStream(root: string, args: string[],
     child.stdout?.on('data', (chunk: Buffer) => {
       if (settled || stopped || failure) return;
       bytes += chunk.length;
-      if (opts.maxBytes !== undefined && bytes > opts.maxBytes) { stopped = 'too_large'; child.kill('SIGKILL'); return; }
+      if (maxBytes !== undefined && bytes > maxBytes) { stopped = 'too_large'; child.kill('SIGKILL'); return; }
       last = chunk[chunk.length - 1] ?? last;
       let held: void | Promise<void>;
-      try { held = opts.onChunk?.(chunk); } catch (error) { fail(error); return; }
+      try { held = onChunk?.(chunk); } catch (error) { fail(error); return; }
       if (held) { holding = true; child.stdout?.pause(); held.then(() => { holding = false; watchIdle(); child.stdout?.resume(); }, fail); }
       watchIdle();
     });
@@ -147,7 +153,7 @@ export async function hardenedGitStream(root: string, args: string[],
       else if (code !== 0) accept({ ok: false, reason: 'exit', ...(code === null ? {} : { status: code }) });
       else accept({ ok: true, exitCode: 0, signal: null, bytes, endsWithNul: last === 0 });
     }));
-    if (opts.stdin !== undefined && child.stdin) void feedStdin(child.stdin, opts.stdin, fail);
+    if (stdin !== undefined && child.stdin) void feedStdin(child.stdin, stdin, fail);
   });
 }
 

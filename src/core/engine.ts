@@ -146,6 +146,15 @@ export interface TransactionOptions {
    * (`isPersistenceDeclaration`). Ignored by PGLite and inside a transaction.
    */
   pipelineFirst?: (statement: string) => boolean;
+  /**
+   * GBRA-156: Postgres on a pool that pipelines inside a transaction sends every statement this accepts, in order,
+   * behind BEGIN before BEGIN's answer; the first it refuses, and every later one, waits for the answer. If BEGIN fails
+   * the accepted statements run in autocommit, so pass only a test that accepts reads and transaction-local
+   * set_config (`isPipelinableSearchRead`). Ignored by PGLite and inside a transaction.
+   */
+  pipelineEarly?: (statement: string) => boolean;
+  /** GBRA-156: Postgres opens `BEGIN READ ONLY` (a write inside fails with 25006); search's reads pass it. Ignored by PGLite and when nested. */
+  readOnly?: boolean;
 }
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */

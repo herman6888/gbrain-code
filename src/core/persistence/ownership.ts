@@ -15,7 +15,7 @@ import { localHostId } from './identity.ts';
 import { repairWedgedReservation, resolveCoordinationLock } from './coordination-lock.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
-import { acquireShared, deferToLease, exclusiveAcquired, joinLease, yieldLease } from './worktree-lease.ts';
+import { acquireShared, deferToLease, exclusiveAcquired, foreignWaiterAhead, joinLease, noteWaiting, yieldLease } from './worktree-lease.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { assertPhysicalRoot, claimPhysicalRoot, preparePhysicalRootTransfer, readPhysicalRootReservation, restampPhysicalRoot } from './physical-root.ts';
 import { assertPhysicalRootReservation, readPhysicalRootStamp } from './physical-root-record.ts';
@@ -169,9 +169,30 @@ export async function acquireWorktree(binding: WorktreeBinding, waitMs = 0, sign
   if (!binding.local_path || !binding.coordination_path) return null;
   // #5984 lanes: an exclusive writer drains this process's lane lease first; while lanes still hold it the worktree is busy.
   if (waitMs <= 0 && !opts.yieldLanes ? !deferToLease(binding.coordination_path) : !await yieldLease(binding.coordination_path, waitMs, signal)) return null;
+  // GBRA-133: a no-wait take yields to another process's background writer that has waited its grace (worktree-lease.ts).
+  if (waitMs <= 0 && foreignWaiterAhead(binding.coordination_path)) return null;
   const lock = await lockWorktree(binding, waitMs, signal, engine, opts.identity);
   if (lock) exclusiveAcquired(binding.coordination_path);
   return lock;
+}
+
+/** GBRA-133: how often a waiting background writer retries the worktree lock. */
+const WAITING_POLL_MS = 25;
+/**
+ * GBRA-133: a background writer's (the effect worker's) take of the worktree lock under cross-process contention. It
+ * retries the no-wait take for up to `waitMs` and leaves a marker that other processes yield to once it has waited
+ * (worktree-lease.ts `noteWaiting`). The marker stays after the take, so the writer's next take in the same turn goes
+ * first again; the caller ends its turn with `clearWaiting`.
+ */
+export async function acquireWorktreeWaiting(binding: WorktreeBinding, engine: BrainEngine, waitMs: number, signal?: AbortSignal): Promise<NativeLockHandle | null> {
+  if (!binding.local_path || !binding.coordination_path) return null;
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    noteWaiting(binding.coordination_path);
+    const lock = await acquireWorktree(binding, 0, signal, engine);
+    if (lock || Date.now() >= deadline || signal?.aborted) return lock;
+    await new Promise(resolve => setTimeout(resolve, WAITING_POLL_MS));
+  }
 }
 /** #5984 lanes: database-only lane publications share one native lock in this process (worktree-lease.ts). */
 export async function acquireWorktreeShared(binding: WorktreeBinding, engine: BrainEngine): Promise<NativeLockHandle | null> {

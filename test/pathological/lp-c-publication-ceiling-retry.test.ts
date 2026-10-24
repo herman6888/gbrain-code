@@ -21,6 +21,9 @@
  *    discarded connection does (`PublicationDeadlineError`, CONNECTION_CLOSED). PGLite cannot cancel a running
  *    transaction (its signal is checked only before BEGIN), so the parked body's own rejection stands in for the
  *    discard there; on Postgres the signal also discards the connection. The charged hook brings each backoff forward.
+ *    The 300 ms ceiling applies only to publications the test parks: once it parks the last one it means to, the
+ *    publications after it run under the configured ceiling, so a retry slower than 350 ms on a loaded host (a worktree
+ *    publication writes and renames the page file inside its transaction) is not cancelled a second time.
  *    A guard stops the overruns far above the cap, so an unbounded loop ends committed. PGLite always; Postgres with DATABASE_URL.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
@@ -48,6 +51,7 @@ import { pathologicalArms } from './harness.ts';
 const op = (name: string) => operations.find(o => o.name === name)!;
 const page = (title: string) => `---\ntitle: ${title}\ntype: note\n---\n# ${title}\n\nBody of ${title}.\n`;
 const CEILING_MS = 300, GRACE_MS = 50;
+const INJECTED = { ceilingMs: CEILING_MS, graceMs: GRACE_MS };
 /** Parked past the ceiling and its grace, when the owner has cancelled the publication. */
 const PARK_MS = CEILING_MS + GRACE_MS + 200;
 const GUARD = 14;
@@ -92,6 +96,8 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`[${backend}
       }
       if (point === 'publication:before_commit' && seen.claims <= GUARD && overruns(seen.claims)) {
         seen.publications++;
+        // The next claim reads its ceiling before it prepares: only a publication this hook will park keeps the injected one.
+        setTiming(overruns(seen.claims + 1) ? INJECTED : undefined);
         await new Promise(resolve => setTimeout(resolve, PARK_MS));
         throw discarded();
       }
@@ -102,7 +108,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`[${backend}
   beforeAll(async () => {
     if (backend === 'pglite') { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }
     else { const pg = await isolatedPersistencePostgres(databaseUrl!); engine = pg.engine; closePostgres = pg.close; }
-    setTiming({ ceilingMs: CEILING_MS, graceMs: GRACE_MS });
+    setTiming(INJECTED);
   }, 120_000);
   afterAll(async () => {
     setTiming(undefined);
@@ -113,6 +119,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`[${backend}
   afterEach(async () => {
     installFaultHook(undefined);
     await disposePersistenceConsumer(engine);
+    setTiming(INJECTED);
     await engine.executeRaw("DELETE FROM config WHERE key IN ('persistence.max_transient_retries')");
     resetWriteSwitches();
   });
@@ -239,6 +246,8 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`[${backend}
         if (together < 2 || grouped.length >= GUARD) return;
         grouped.push([...unpublished, detail.requestId!]);
         unpublished.clear();
+        // The one parked publication: each member's own publication after it runs under the configured ceiling.
+        setTiming(undefined);
         await new Promise(resolve => setTimeout(resolve, PARK_MS));
         throw discarded();
       });
@@ -282,6 +291,8 @@ for (const { backend, databaseUrl } of pathologicalArms()) describe(`[${backend}
         if (together < 2 || grouped.length >= GUARD) return;
         grouped.push([...unpublished, detail.requestId!]);
         unpublished.clear();
+        // The one parked publication: each member's own publication after it runs under the configured ceiling.
+        setTiming(undefined);
         await new Promise(resolve => setTimeout(resolve, PARK_MS));
         throw discarded();
       });

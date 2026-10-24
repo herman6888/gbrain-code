@@ -25,6 +25,13 @@ const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \
 /** #6858: the receipt prefix of a write `gbrain repair stuck-recovery --keep disk` abandoned: its canonical file was kept as edited on disk. */
 export const KEEP_DISK_ABANDONED_PREFIX = 'Publication abandoned by gbrain repair stuck-recovery --keep disk';
 export const PENDING_IMPORT_MESSAGE = 'The canonical file holds a committed Git change that sync has not imported yet.';
+/**
+ * GBRA-133: who imports a pending commit. Every pending-import refusal says this instead of naming a sync to run: an agent
+ * that started one beside a live serve put a second sync owner on the source.
+ */
+export const PENDING_IMPORT_OWNER = 'Do not start a sync for it: the source\'s running sync owner (gbrain serve, autopilot or a sync job) imports the commit on its next pass, '
+  + 'and a second sync beside it competes with that owner. Read-only: gbrain sync status --source <source> --json shows when the source has imported it; '
+  + 'if it shows no owner running, ask the user to sync the source on its host.';
 
 /** #7364: `row` names the hold row the refusal read (its source and incarnation, still location-free), so a refusal naming a row that `sources retry-held` does not list shows which. */
 export function heldFileMessage(kind: 'drift' | 'occupied', code: string, row?: { sourceId: string; incarnation: string }): string {
@@ -63,7 +70,8 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
     };
     if (message === PENDING_IMPORT_MESSAGE) return {
       reason: 'pending_import', message: 'A committed Git change to the page\'s file has not been imported yet; neither copy was overwritten.',
-      suggestion: 'A refused remember is replayed once by the first managed sync that imports the file; do not save it again. Any other write: after the next gbrain sync --source <source> --no-pull, read the page again and resubmit with a new request_id.',
+      suggestion: `A refused remember is kept and replayed once by the first managed sync that imports the file; do not save it again. ${PENDING_IMPORT_OWNER}`
+        + ' Any other write: once that import shows, read the page again and resubmit with a new request_id.',
     };
     if (['Newer working-tree bytes and the current page disagree with this pinned Git import.',
       'Newer code file bytes disagree with the pinned import.', 'Canonical sanitization cannot overwrite newer working-tree bytes.'].includes(message ?? '')) return {
@@ -203,6 +211,8 @@ export async function runMemoryWrite<T>(run: () => Promise<T>): Promise<T> {
       // #6188: the frozen v1 code stays; the fence refusal's reason, location and issues ride along additively.
       if (error.canonicalCode === 'invalid_fence') Object.assign(frozen, { reason: error.reason, fence: error.fence, fenceIssues: error.fenceIssues });
       if (error.withdrawn) frozen.withdrawn = error.withdrawn;
+      // GBRA-133: a pending import keeps its read-only status fix (a remember's renders `next: wait`), additively.
+      if (frozen.detail === 'pending_import' && error.fix) Object.assign(frozen, { docs: error.docs, fix: error.fix });
       throw frozen;
     }
     // #5575: the frozen wire code stays invalid_params; the envelope's canonical code is purged_content.

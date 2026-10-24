@@ -18,6 +18,7 @@ import { StructuredAgentError } from './errors.ts';
 import { canonicalCodeFor, codeEntry, codeClass, codeRetryable, exitCodeForCode } from './error-catalogue.ts';
 import { VERB_NAMES } from './verbs.ts';
 import { classifyPgAccessError, formatDbAccessMarker } from './pg-access-classify.ts';
+import { isReadOnlyTransactionError } from './postgres-engine/read-write-transactions.ts';
 import { redactConnectionInfo } from './audit/redact-connection-info.ts';
 import { redactUrlsInText } from './url-redact.ts';
 import { parseRepoBase } from './repo-base.ts';
@@ -588,6 +589,11 @@ const ROWS: Row[] = [
       error: e.envelope.code, code: canonicalCodeFor(e.envelope.code), message: e.envelope.message,
       suggestion: e.envelope.hint, docs: e.envelope.docs_url,
     }),
+  },
+  {
+    match: isReadOnlyTransactionError,
+    map: (e: Error) => ({ error: 'connection_inherited_read_only', code: 'connection_inherited_read_only', message: e.message,
+      fix: registryTemplateFix('connection_inherited_read_only', {}) }),
   },
   {
     match: e => e instanceof Error && (e as { tag?: unknown }).tag === 'BUDGET_EXHAUSTED',

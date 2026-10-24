@@ -284,6 +284,7 @@ export interface GBrainConfig {
    */
   self_upgrade?: {
     mode?: 'auto' | 'notify' | 'off';
+    channel?: 'latest' | 'stable';
     /** Set true once the upgrade-time consent prompt has been shown. */
     mode_prompted?: boolean;
     /** Quiet-hours window for the autopilot silent channel. */
@@ -1442,6 +1443,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.auto_packing',
   'search.long_page_unit', 'search.long_page_min_chars', // F2: delivery unit for long (rendered body >= min_chars, default 20000) non-conversation hits under an implied auto: off (default) | window | section | page (search/evidence-delivery.ts)
   'search.evidence_date_header', // C1: one-line date header per delivered block (default off; search/evidence-date.ts)
+  'search.evidence_tail_trim', // GBRA-156: protected top-3 tail trim of auto conversation blocks (default off; search/evidence-tail-trim.ts)
   'search.entity_anchoring', // entity-anchored retrieval for entity-scoped current-state query/search (default off; search/entity-anchor.ts)
   'search.query_facts_arm', // query adds matching active facts as rows in spare capacity (default on; search/facts-arm.ts)
   'search.temporal_fact_reserve', // temporal-cue queries reserve up to 15% of the token budget for question-ranked dated facts (default off; search/facts-arm.ts)
@@ -1670,6 +1672,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)
   'self_upgrade.mode',
+  'self_upgrade.channel',
   'self_upgrade.mode_prompted',
   'self_upgrade.quiet_hours',
   'self_upgrade.failed_versions',
@@ -1752,6 +1755,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.federated_v2',
   'sync.include_working_tree',
   'sync.metafile_pages', // GBRA-150: typed (default) | off, whether a nested folder-scaffolding file with type:/title: frontmatter is a page (core/sync.ts)
+  'sync.level_reuse', // GBRA-133 wave 4: true (default) | false, whether a resident pass patches the tree listing its last pass read (persistence/sync-tree-reuse.ts)
   // #5984: managed Postgres sync publishes pages in bulk groups (on by default; each page keeps its own request).
   'sync.bulk',
   'sync.bulk_size',

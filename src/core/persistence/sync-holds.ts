@@ -148,6 +148,8 @@ export interface GitHoldMeta {
   page_revision?: string;
   /** #6712 PR 1 `file_drift`: which side moved since the page's last recorded import (`unknown`: no usable record); `page_revision` is the page's revision when held. */
   sides?: 'database' | 'both' | 'unknown';
+  /** GBRA-133 `file_drift`: the drift screen that held it; an unknown-side hold from an older screen is re-screened (#7340). */
+  drift_version?: number;
   /**
    * #6712 PR 4b `file_drift`: which side a Decision is about (design v3.2 §4): `both` (the file and the page moved), `unknown`
    * (no import record says which), `deleted` (one side is a deletion, named by `state`). Absent on holds an older gbrain
@@ -438,6 +440,32 @@ export async function clearGitHold(tx: Exec, input: { sourceId: string; incarnat
   return true;
 }
 
+/**
+ * GBRA-133: clears the deleted-side `file_drift` hold at `path` (a page whose file is gone, a tombstone whose file was
+ * edited, a purged page whose file came back) once the page is soft-deleted, the decision it waited for. False when the
+ * path has no such hold.
+ */
+export async function clearDeletionHold(tx: Exec, input: { sourceId: string; incarnation: string; path: string }): Promise<boolean> {
+  const hold = await readRow(tx, input.sourceId, input.incarnation, input.path);
+  if (!hold || hold.code !== 'file_drift' || fileDriftSide(hold.meta) !== 'deleted') return false;
+  return clearGitHold(tx, { ...input, observedAt: hold.observed_at });
+}
+
+/** GBRA-133: a deleted-side `file_drift` hold whose file is gone from the level and the disk (sync-pass.ts `deletionCandidates`). */
+export interface DeletionCandidate { path: string; page_id: number | null; slug: string | null }
+
+/**
+ * GBRA-133: the candidates whose page is no longer live (no live page has its id or its slug), so both sides of the held
+ * deletion agree and the stamp releases the hold. One statement; none without candidates.
+ */
+export async function settledDeletionHolds(tx: Exec, sourceId: string, candidates: readonly DeletionCandidate[] | undefined): Promise<string[]> {
+  if (!candidates?.length) return [];
+  const live = await tx.executeRaw<{ id: string; slug: string }>('SELECT id::text AS id, slug FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND (id = ANY($2::bigint[]) OR slug = ANY($3::text[]))',
+    [sourceId, candidates.flatMap(c => c.page_id === null ? [] : [c.page_id]), candidates.flatMap(c => c.slug === null ? [] : [c.slug])]);
+  const ids = new Set(live.map(row => row.id)), slugs = new Set(live.map(row => row.slug));
+  return candidates.filter(c => (c.page_id === null || !ids.has(String(c.page_id))) && (c.slug === null || !slugs.has(c.slug))).map(c => c.path);
+}
+
 /** #5984: which of these paths have a hold row (one indexed read), so a batched waiver run clears only those. */
 export async function heldGitPaths(tx: Exec, sourceId: string, incarnation: string, paths: readonly string[]): Promise<Set<string>> {
   if (!paths.length) return new Set();
@@ -572,6 +600,9 @@ export async function holdBasisMoved(engine: Pick<BrainEngine, 'executeRaw'>, so
  * under the same blob id), so it re-screens on every sync; a `page_write_failed` hold of a freeze fault (origin `freeze`,
  * S-63) is re-tested by every sync until it has been held `HOLD_ATTEMPTS_NEEDS_HUMAN` times, so a transient fault clears.
  */
+/** GBRA-133: the `file_drift` screen version; 1 is #7340's rule (a page with no import record compares its file at the baseline commit). */
+export const FILE_DRIFT_VERSION = 1;
+
 export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, retried: boolean): boolean {
   return retried || ['frontmatter_slug_conflict', 'file_too_large', 'rename_held', 'parser_regression', 'content_rejected', 'write_gate_rejected', 'purged_content', 'legacy_slug_conflict', 'origin_conflict', 'page_identity_changed', 'git_object_missing'].includes(record.code)
     // #6712: a transient hold (the write owner stalled, not the file) is retried by every sync until it has been held HOLD_ATTEMPTS_NEEDS_HUMAN times.
@@ -579,6 +610,9 @@ export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, re
     || (record.code === 'managed_image_sync_unsupported' && isMultimodalEnabled())
     || record.meta.recovery_version < RECOVERY_VERSION
     || (record.code === 'invalid_fence' && (record.meta.fence_version ?? 0) < FENCE_VERSION)
+    // GBRA-133: an unknown-side drift held before #7340's baseline rule (a Git edit to a page with no import record) imports
+    // now when the page still holds its file at the baseline commit, so it is screened once more.
+    || (record.code === 'file_drift' && fileDriftSide(record.meta) === 'unknown' && (record.meta.drift_version ?? 0) < FILE_DRIFT_VERSION)
     || (outOfAttemptsHold(record.code) && record.meta.stall?.gbrain_version !== VERSION)
     // GBRA-130 A-6: an owner fault is the writer's, not the file's: an upgrade re-tests the path.
     || (record.code === 'page_write_failed' && record.meta.write_failure?.gbrain_version !== VERSION)
@@ -774,8 +808,11 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
         : `page ${slug} changed in the database${record.meta.page_revision ? ` (revision ${record.meta.page_revision})` : ''}`;
       const preview = (prefer: 'database' | 'file') => ['gbrain', 'repair', 'file-drift', '--source', source, '--slug', slug, '--prefer', prefer];
       const verify = { argv: ['gbrain', 'sources', 'status', source, '--json'] };
-      const held = `${by} since ${record.path} was last imported, so sync held the file instead of overwriting the database version (${record.meta.sides === 'database' && !record.meta.side ? 'the file did not change in Git'
-        : fileDriftSide(record.meta) === 'both' ? 'the file changed too' : 'no import record says which side changed'}). `;
+      const side = fileDriftSide(record.meta);
+      const held = side === 'unknown' && !record.meta.competing_request_id
+        ? `Page ${slug} differs from ${record.path} and has no import record to tell whether the file or the database changed, so sync held the file instead of overwriting the database version. `
+        : `${by} since ${record.path} was last imported, so sync held the file instead of overwriting the database version (${record.meta.sides === 'database' && !record.meta.side ? 'the file did not change in Git'
+          : side === 'both' ? 'the file changed too' : 'no import record says whether the file changed too'}). `;
       const decide = 'Decide with the user which version wins, run the apply command the preview prints, then sync again. The rest of the source is not blocked.';
       // #6517: a shared-origin delete kept the file for this surviving page, and its receipt names importing the file.
       const shared = record.meta.shared_origin === true;

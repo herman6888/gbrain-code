@@ -1,6 +1,7 @@
 import postgres from '#postgres'
 import { claimOwner, isOneShotCommand } from './persistence/claim-phase.ts';
 import { traceSqlOptions } from './sql-trace.ts';
+import { beginReadWrite } from './postgres-engine/read-write-transactions.ts';
 import { warnPoolerPrepareOffOnce } from './pooler-notice.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
 import { SCHEMA_SQL } from './schema-embedded.generated.ts';
@@ -610,10 +611,7 @@ export async function initSchema(): Promise<void> {
 export { verifySchema } from './schema-verify.ts';
 
 export async function withTransaction<T>(fn: (tx: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
-  const conn = getConnection();
-  return conn.begin(async (tx) => {
-    return fn(tx as unknown as ReturnType<typeof postgres>);
-  }) as Promise<T>;
+  return beginReadWrite(getConnection(), async (tx) => fn(tx as unknown as ReturnType<typeof postgres>));
 }
 
 // issue #1720 (proposal 4): the startup connect matcher and the runtime

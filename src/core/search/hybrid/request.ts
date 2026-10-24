@@ -96,6 +96,8 @@ export interface HybridRequest {
   collapse?: import('../collapse.ts').CollapseDecision;
   /** Page facts the collapse stage read, reused by its second pass after the identity tiers. */
   collapseFacts?: Map<number, import('../collapse.ts').PageFacts>;
+  /** GBRA-156: the fused pages' facts, read beside the post-fusion stages (collapse.ts prefetchPageFacts). */
+  collapsePrefetch?: Promise<Map<number, import('../collapse.ts').PageFacts> | null>;
   /** The op's stage-timing collector (`opts._timings`), or the no-op timer. */
   timer: StageTimer;
 }

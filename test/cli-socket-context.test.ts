@@ -19,6 +19,7 @@ import { cliRequestContext, executeCliSocketRequest, mergedRequestConfig } from 
 import { cliSocketIdentity } from '../src/core/cli-socket/identity.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { serializeOperationError, warmRoundTripTimeout } from '../src/core/cli-socket/protocol.ts';
 
 let engine: PGLiteEngine;
 const op = { params: {} };
@@ -70,7 +71,7 @@ describe('cliRequestContext mirrors makeContext', () => {
     expect(warm).toEqual(cold);
   });
 
-  test('a serve-side timeout answers fallback (the CLI runs the call itself) while the work keeps the request active until it settles', async () => {
+  test('a serve-side timeout answers a retryable timeout error (no cold rerun) while the work keeps the request active until it settles', async () => {
     // Config reads wait on a gate, so the request is still working when its deadline passes. A bare short deadline
     // is not enough: PGLite can finish the whole search before the timer gets a turn (stress gate, seed 193478).
     let release!: () => void;
@@ -86,7 +87,7 @@ describe('cliRequestContext mirrors makeContext', () => {
       routing: { cwd: process.cwd(), source_env: null }, cli: { quiet: false, timeout_ms: 5 } });
     let done = false;
     void settled.then(() => { done = true; });
-    expect(frame).toEqual({ v: 1, kind: 'fallback', reason: 'timeout' });
+    expect(frame).toEqual({ v: 1, kind: 'error', error: serializeOperationError(warmRoundTripTimeout('search', 5, 'serve')), output: [], source: null });
     await Bun.sleep(20);
     expect(done).toBe(false);
     release();

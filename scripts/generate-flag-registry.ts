@@ -70,6 +70,10 @@ const DELEGATED_MODULES: Record<string, string[]> = {
   // `forget --purge` (and forget --help) hand the argv to runForgetPurge, which
   // parses --dry-run itself; a plain forget refuses --dry-run (recall.ts).
   forget: ['src/commands/forget-purge.ts'],
+  // `upgrade --restart-only --dry-run` is parsed by restartDryRun in
+  // upgrade-restart.ts, which refuses --dry-run without --restart-only;
+  // post-upgrade shares upgrade.ts and never takes it.
+  upgrade: ['src/commands/upgrade-restart.ts'],
 };
 
 /**

@@ -394,7 +394,6 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
     // One post-commit observation for every member (docs/designs/BELIEF_LEDGER.md 5.3).
     if (beliefReport.appended) await markBeliefCommits(engine, done.map(row => row.id)).catch(() => undefined);
     for (const row of done) await seam('after_commit', row);
-    hooks.committed?.(done);
     if (recorded.size) {
       try { await clearResolvedRecoveries(engine, done, transaction); }
       catch {
@@ -404,6 +403,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
         }
       }
     }
+    hooks.committed?.(done);
     return { done, requeued: [] };
   } catch (error) {
     if (committed || !recorded.size) {

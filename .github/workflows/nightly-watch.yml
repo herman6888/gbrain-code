@@ -56,6 +56,7 @@ on:
       - Semgrep
       - OSV-Scanner
       - CI health
+      - TLA+ specs
     types: [completed]
     branches: [master]
   workflow_dispatch:

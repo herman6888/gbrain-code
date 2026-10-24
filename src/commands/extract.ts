@@ -724,6 +724,8 @@ export interface ExtractOpts {
    * `autopilot.incremental_extract_include_frontmatter` (default off).
    */
   includeFrontmatter?: boolean;
+  /** GBRA-133: on a managed brain, stop the stale-page pass after this long (the cycle's drain budget); unset runs to the end. */
+  timeBudgetMs?: number;
 }
 
 /**
@@ -762,7 +764,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   if (!dryRun && opts.mode === 'all' && opts.slugs?.length !== 0 && await managedPersistenceEnabled(engine)) {
     const { extractManagedStaleLinks } = await import('../core/persistence/links-maintenance.ts');
     const progress = createProgress(cliOptsToProgressOptions(getCliOptions())); progress.start('extract.links_fs', opts.slugs?.length);
-    const r = await extractManagedStaleLinks(engine, { sourceId: opts.sourceId, slugs: opts.slugs, signal: opts.signal, maxPages: opts.slugs?.length });
+    const r = await extractManagedStaleLinks(engine, { sourceId: opts.sourceId, slugs: opts.slugs, signal: opts.signal, maxPages: opts.slugs?.length, timeBudgetMs: opts.timeBudgetMs });
     progress.finish(); return { links_created: r.created, timeline_entries_created: r.timeline, pages_processed: r.pages };
   }
   // #5904: a timeline-only pass on a managed brain publishes each page's canonical timeline through the coordinator.

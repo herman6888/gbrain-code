@@ -52,6 +52,7 @@ const DIRECTLY_READ_SINGLETONS = [
   'search.long_page_unit',                   // search/evidence-delivery.ts (long non-conversation pages under implied auto)
   'search.long_page_min_chars',              // search/evidence-delivery.ts (rendered-body threshold for a long page)
   'search.evidence_date_header',             // search/evidence-delivery.ts (C1)
+  'search.evidence_tail_trim',               // search/evidence-tail-trim.ts (GBRA-156)
   'search.entity_anchoring',                 // search/entity-anchor.ts (ops/search.ts)
   'search.query_facts_arm',                  // search/facts-arm.ts (search/query-arms.ts)
   'search.temporal_fact_reserve',            // search/facts-arm.ts (search/query-arms.ts)

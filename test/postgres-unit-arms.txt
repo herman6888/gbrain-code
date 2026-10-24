@@ -67,9 +67,11 @@ test/extraction-watermark-atoms.test.ts
 test/fact-embedding-oversized-7211.test.ts
 test/fact-fence-adoption-exits.test.ts
 test/fact-purge-lookup-timeout-6511.test.ts
+test/facts-absorb-stalled-receipt-7439.test.ts
 test/facts-insert-guards-7105.test.ts
 test/facts-publication-large-fence-6898.test.ts
 test/fence-repair-receipts.test.ts
+test/file-drift-soft-delete-hold-release-gbra133.test.ts
 test/forecast-journal.test.ts
 test/frontmatter-reserved-keys-6454.test.ts
 test/get-chunks-paging.test.ts
@@ -202,6 +204,7 @@ test/link-cross-source.test.ts
 test/link-preparation-shared-index.test.ts
 test/links-attendance-blocked.test.ts
 test/links-extraction-yield.test.ts
+test/list-jobs-row-bound.test.ts
 test/managed-cycle-pull-upstream.test.ts
 test/managed-facts-withdrawal-recovery-6506.test.ts
 test/managed-facts-withdrawn-skip-6506.test.ts
@@ -437,6 +440,7 @@ test/sync-fenced-slices-gbra133.test.ts
 test/sync-freshness-6858.test.ts
 test/sync-frontmatter-recovery.test.ts
 test/sync-frontmatter-slug-conflict.test.ts
+test/sync-full-committed-progress-gbra133.test.ts
 test/sync-full-cursor-slices-6349.test.ts
 test/sync-full-untracked-import-5459.test.ts
 test/sync-group-member-order.test.ts
@@ -450,6 +454,7 @@ test/sync-legacy-holds.test.ts
 test/sync-legacy-retry-actions-6696.test.ts
 test/sync-legacy-slug-adoption-6727.test.ts
 test/sync-legacy-sweep-resume-7189.test.ts
+test/sync-level-reuse-across-gbra133.test.ts
 test/sync-metafile-foreign-slug-7341.test.ts
 test/sync-origin-live-wins-6517.test.ts
 test/sync-page-identity-hold-gbra130.test.ts
@@ -457,14 +462,18 @@ test/sync-page-write-failed-gbra130.test.ts
 test/sync-pass-abandoned-7355.test.ts
 test/sync-pass-cost-grouping-gbra130.test.ts
 test/sync-pass-dirty-after-freeze-gbra130.test.ts
+test/sync-pass-phase-lines-7243.serial.test.ts
 test/sync-pass-stop-in-level-gbra133.test.ts
 test/sync-prescreen-both-delta-6712.test.ts
 test/sync-prescreen-drift-6712.test.ts
 test/sync-slug-root-mode-6694.test.ts
 test/sync-staged-catchup.test.ts
 test/sync-status-failure-detail-6513.test.ts
+test/sync-status-truthful-7243.test.ts
+test/sync-tree-reuse-gbra133.test.ts
 test/sync-unblock-repair-error-gbra130.test.ts
 test/sync-uncommitted-origin-7130.test.ts
+test/sync-unknown-drift-rescreen-gbra133.test.ts
 test/sync-unreadable-file-gbra130.test.ts
 test/sync-waiver-budget.test.ts
 test/sync-waiver-run-imports.test.ts

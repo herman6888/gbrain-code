@@ -62,8 +62,8 @@ export interface GitEffectOwner {
 
 interface GitSession { root: string; hooks: string; signal?: AbortSignal; timeoutMs: number; owner?: GitEffectOwner }
 
-function run(session: GitSession, args: string[]) {
-  return execFileBounded('git', ['--literal-pathspecs', '-C', session.root, '-c', `core.hooksPath=${session.hooks}`, '-c', 'commit.gpgsign=false', ...args], {
+function run(session: GitSession, args: string[], literal = true) {
+  return execFileBounded('git', [...(literal ? ['--literal-pathspecs'] : []), '-C', session.root, '-c', `core.hooksPath=${session.hooks}`, '-c', 'commit.gpgsign=false', ...args], {
     timeout: session.timeoutMs, termGraceMs: GIT_TERM_GRACE_MS, maxBuffer: 1024 * 1024, signal: session.signal, env: gitChildEnv(GIT_ENV),
   });
 }
@@ -161,6 +161,7 @@ async function stageTarget(session: GitSession, relativePath: string): Promise<{
     return { path: relativePath, state: 'unchanged' };
   }
   if (tracked.code === 0) return { path: relativePath, state: 'unchanged' };
+  if (existsSync(path)) await refuseIgnoredTarget(session, relativePath);
   if (existsSync(path)) throw new OperationError('git_target_unsafe', 'Git cannot identify the existing canonical file by its native spelling.',
     'Reconcile the index and worktree spelling before retrying publication.');
   let parent = dirname(path);
@@ -183,6 +184,22 @@ async function stageTarget(session: GitSession, relativePath: string): Promise<{
       'Reconcile the recorded deletion path with the Git index before retrying publication.');
   }
   return { path: relativePath, skip: { git: 'skipped', reason: 'target_absent', push: 'skipped' } };
+}
+
+/**
+ * GBRA-133: an existing untracked file a .gitignore rule excludes cannot be committed while the rule stands. It refuses
+ * as `git_target_ignored` naming the rule (`detail`), so the effect parks at once with the cause instead of looping.
+ */
+async function refuseIgnoredTarget(session: GitSession, relativePath: string): Promise<void> {
+  const status = await git(session, ['status', '--porcelain', '--ignored=matching', '--untracked-files=all', '--', relativePath]);
+  if (status.code !== 0 || !status.stdout.startsWith('!! ')) return;
+  // check-ignore takes no literal pathspecs; it only names the rule for the message.
+  const matched = await run(session, ['check-ignore', '-v', '--', relativePath], false);
+  const rule = matched.error ? '.gitignore' : matched.stdout.split('\t')[0]!.replace(/^(.*?):(\d+):/, '$1:$2: ');
+  const error = new OperationError('git_target_ignored', `Git ignores ${relativePath} (${rule}), so its Git effect cannot commit it.`,
+    `Either remove or narrow the rule (${rule}) and commit that change, then retry the parked effects with gbrain sources writer retry-effects and --parked-code git_target_ignored for the source this checkout backs (gbrain sources writer status names it); or keep the file out of Git and leave the effect parked. The page itself is committed in the database.`);
+  error.detail = rule;
+  throw error;
 }
 
 /** A git session with an empty hooks directory; `scaled` sizes its step deadline by the checkout's index. */
@@ -316,7 +333,7 @@ export async function gitRootAhead(root: string, signal?: AbortSignal): Promise<
 }
 
 /** Git's refusal of a push because the remote branch moved (LC_ALL=C keeps it untranslated). */
-const NON_FAST_FORWARD = /\[rejected\][^\n]*\((?:non-fast-forward|fetch first)\)/;
+export const NON_FAST_FORWARD = /\[rejected\][^\n]*\((?:non-fast-forward|fetch first)\)/;
 
 /**
  * Push the current branch to its tracking remote. A plain push is tried first (idempotent, cannot import remote

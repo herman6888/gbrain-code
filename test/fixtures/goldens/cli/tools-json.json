@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 262439,
-    "stdoutSha256": "3a6a696129b534029d14fb5301ff3f6874724ad5e1983980f13f88d26ace18b9",
+    "stdoutBytes": 262702,
+    "stdoutSha256": "bfd962a82f16847c7969963ab23410170196491231dcdef214ab3863873b495e",
     "toolNames": [
       "remember",
       "entity",
@@ -4337,6 +4337,7 @@
         "mutating": false,
         "name": "list_jobs",
         "parameters": {
+          "cursor": "string?",
           "fields": "array?",
           "finished_since": "string?",
           "limit": "number?",
@@ -4347,6 +4348,10 @@
         "required_scopes": [],
         "schema": {
           "properties": {
+            "cursor": {
+              "description": "next_cursor from the last job of the previous page (it carries truncated: true): returns the next older jobs.",
+              "type": "string"
+            },
             "fields": {
               "description": "Return only these job fields (e.g. [\"id\",\"name\",\"status\"]) to save tokens; omit for every field.",
               "items": {
@@ -4359,7 +4364,7 @@
               "type": "string"
             },
             "limit": {
-              "description": "Max results (default: 50)",
+              "description": "Max results (default 50); MCP callers are capped at 500 per call.",
               "type": "number"
             },
             "name": {

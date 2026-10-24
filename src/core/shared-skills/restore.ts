@@ -65,7 +65,7 @@ export async function quarantineSharedSkillRestore(tx: BrainEngine, restoreId: s
   const pending = await tx.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE state IN ('queued','running') ORDER BY sequence FOR UPDATE");
   for (const request of pending) await completeWrite(tx, request, 'cancelled', {}, { code: mode === 'recovery' ? 'restore_recovery' : 'restore_new_brain', message: 'Restored with archived authority revoked; submit with new authority.' });
   await tx.executeRaw('UPDATE persistence_requests SET execution_token=NULL,claim_expires_at=NULL WHERE execution_token IS NOT NULL OR claim_expires_at IS NOT NULL');
-  await tx.executeRaw("UPDATE persistence_effects SET state='failed',execution_token=NULL,claim_expires_at=NULL,error_code=$1,updated_at=now() WHERE state IN ('queued','running')", [mode === 'recovery' ? 'restore_recovery' : 'restore_new_brain']);
+  await tx.executeRaw("UPDATE persistence_effects SET state='failed',execution_token=NULL,claim_expires_at=NULL,claim_owner=NULL,error_code=$1,updated_at=now() WHERE state IN ('queued','running')", [mode === 'recovery' ? 'restore_recovery' : 'restore_new_brain']);
   await tx.executeRaw('UPDATE persistence_brain SET brain_id=$1::uuid,skill_bundles_enabled=false WHERE singleton=1', [restored.brain_id]);
   const state = await tx.executeRaw('UPDATE shared_skill_state SET token_secret=$1,serving_epoch=$2::uuid WHERE singleton=1 RETURNING singleton', [randomBytes(32).toString('hex'), randomUUID()]);
   if (state.length !== 1) throw new AgentInstallError('invalid_backup', 'The archived shared brain has no serving identity.');

@@ -1,5 +1,9 @@
 # TODOS
 
+## Run-child heap follow-ups (filed 2026-10-24, GBRA-133)
+
+- [ ] **P3 — Heap growth of a managed sync/lint run-child after a history rewrite.** **What:** the per-child `--max-rss` cap from #7467 contains it, but the holder is unknown; synthetic lint --fix with 15k holds, a concurrent 60k-file sync drain plus lint, and a force-pushed rewrite with 15k `file_drift` holds all stayed flat, and every module-level cache is bounded. **Next:** a long-lived run-child across many cycles with a heap snapshot diff per publication. Reopen with the job's data if `ChildRssLimitError` fires. **Effort:** M. **Priority:** P3.
+
 ## LHF wave 2 follow-ups (filed 2026-10-15, GBRA-107)
 
 Context: gbrain-evals `docs/plans/2026-10-15-lhf-wave-2/PLAN.md` ("NOT in scope" and "Round-2 dispositions"), audits in `docs/plans/2026-10-15-lhf-wave-2/audit/`. Reviewer findings are in `docs/plans/2026-10-15-lhf-wave-2/reviews/`: round-2 ids (`ceo-native-N`, `eng-outside-N`, ...) are in `findings.jsonl` and the matching `<phase>-<voice>.md`; round-1 findings are in the `*.r1.md` files.

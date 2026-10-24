@@ -79,6 +79,7 @@ export const RUN_SCOPED_CODES: ReadonlySet<string> = new Set([
   'permission_denied', 'schema_owner_required', 'scope_denied', 'config', 'auth', 'connector_holds_exhausted', 'transfer_in_progress', 'disk_full',
   'invalid_token', 'insufficient_scope', 'trusted_local_only', 'requires_local_engine', 'not_owner_host', 'host_identity_mismatch',
   'recovery_required', 'cancelled', 'persistence_restart_required', 'writer_regrant_required', 'writer_manifest_rescope_required',
+  'connection_inherited_read_only',
 ]);
 
 /** Item codes that fail the same way until the item changes. Every other item code is transient. */
@@ -94,6 +95,7 @@ function sqlstateFailure(state: string): { code: string; scope: 'run' | 'item'; 
     || state.startsWith('58') || state.startsWith('XX')) return { code: 'database_contention', scope: 'run', class: 'transient' };
   if (state === '42P01' || state === '42703' || state === '42883') return { code: 'schema_behind', scope: 'run', class: 'transient' };
   if (state === '42501') return { code: 'permission_denied', scope: 'run', class: 'transient' };
+  if (state === '25006') return { code: 'connection_inherited_read_only', scope: 'run', class: 'transient' };
   if (state.startsWith('28')) return { code: 'auth', scope: 'run', class: 'transient' };
   if (state === '57014') return { code: 'statement_timeout', scope: 'item', class: 'transient' };
   if (state === '55P03') return { code: 'lock_timeout', scope: 'item', class: 'transient' };

@@ -38,8 +38,13 @@ export interface SourceFreshness {
   commit_to_embedded: LatencyStats & { pending: number };
   /** Distinct run targets dated from git. */
   commits: number;
-  /** Targets in the window git could not date here (no checkout on this host, or the commit is not in it); their pages are not sampled. */
+  /**
+   * Synced run targets in the window git could not date here (no checkout on this host, or the commit is not in it); their
+   * pages are not sampled. Not the backlog: commits still waiting to sync are `waiting_commits` (`behind.commits`).
+   */
   unresolved_commits: number;
+  /** GBRA-133 (#7243): commits on this host's checkout HEAD the source has not synced yet (`behind.commits`), or null when git cannot say. */
+  waiting_commits: number | null;
   /**
    * #7189: the current lag, which the latency samples above cannot show (they date only commits that already synced):
    * commits on this host's checkout HEAD after the source's last synced commit, and the committer age of the oldest
@@ -108,7 +113,7 @@ export async function readSyncFreshness(engine: BrainEngine, opts: { sourceIds?:
     const lag = b.root && b.last_commit ? await behindOf(b.root, b.last_commit).catch(() => null) : null;
     const behind = lag && { commits: lag.commits, oldest_seconds: lag.oldest === null ? null : Math.max(0, Math.round(Date.now() / 1000 - lag.oldest)) };
     const empty: SourceFreshness = { source_id: b.source_id, window_hours: FRESHNESS_WINDOW_HOURS, commit_to_searchable: { samples: 0, p50_seconds: null, p95_seconds: null },
-      commit_to_embedded: { samples: 0, p50_seconds: null, p95_seconds: null, pending: 0 }, commits: 0, unresolved_commits: 0, behind };
+      commit_to_embedded: { samples: 0, p50_seconds: null, p95_seconds: null, pending: 0 }, commits: 0, unresolved_commits: 0, waiting_commits: behind ? behind.commits : null, behind };
     const targets = (await engine.executeRaw<{ target: string }>(`SELECT r.intent->>'target' AS target FROM persistence_requests r WHERE ${SAMPLE_WHERE}
       GROUP BY 1 ORDER BY max(r.completed_at) DESC LIMIT ${FRESHNESS_MAX_TARGETS}`, [b.worktree_id, b.source_incarnation, FRESHNESS_WINDOW_HOURS]))
       .map(row => row.target).filter(target => typeof target === 'string' && SHA.test(target));

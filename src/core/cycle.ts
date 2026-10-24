@@ -1412,6 +1412,8 @@ async function runPhaseExtract(
       signal,
       sourceId,
       includeFrontmatter,  // honored on the incremental (slugs) path only
+      // GBRA-133: with no slug list a managed brain's pass covers every stale page of the source; bound it like the drain below.
+      timeBudgetMs: changedSlugs === undefined ? CYCLE_STALE_DRAIN_BUDGET_MS : undefined,
     }).catch((error: unknown) => { if (!(error instanceof ExtractBatchWriteError)) throw error; lostWrites = `; ${error.message}`; return null; });
     const linksCreated = result?.links_created ?? 0;
     const timelineCreated = result?.timeline_entries_created ?? 0;

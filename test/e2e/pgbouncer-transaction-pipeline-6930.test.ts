@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import postgres from '#postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { declarePersistenceProtocol, isPersistenceDeclaration } from '../../src/core/persistence/protocol.ts';
+import { isPipelinableSearchRead } from '../../src/core/postgres-engine/search-settings.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { readSqlTrace, type StatementRecord } from '../helpers/statement-counter.ts';
 import { withEnv } from '../helpers/with-env.ts';
@@ -97,7 +98,7 @@ describe.skipIf(!(pooled && pooledAdmin))('#6930 transaction pipelining through 
       await engine.executeRaw('SELECT 1 AS bounded_read', [], { timeoutMs: 5000 });
       timedOut = await engine.executeRaw('SELECT pg_sleep(2) AS slept', [], { timeoutMs: 200 }).then(() => 'none', (e: { code?: string }) => e.code);
     });
-    expect(sentBeforeAnswer(records, /^BEGIN; SET LOCAL statement_timeout|^SELECT 1 AS bounded_read$|^COMMIT$/, 3)).toEqual([true, true]);
+    expect(sentBeforeAnswer(records, /^BEGIN READ WRITE; SET LOCAL statement_timeout|^SELECT 1 AS bounded_read$|^COMMIT$/, 3)).toEqual([true, true]);
     expect(timedOut).toBe('57014');
   }, 60_000);
 
@@ -148,7 +149,7 @@ describe.skipIf(!(pooled && pooledAdmin))('#6930 transaction pipelining through 
       await engine.withReservedConnection(conn => (conn as unknown as { transaction<R>(run: (tx: PostgresEngine) => Promise<R>): Promise<R> })
         .transaction(tx => Promise.all([tx.executeRaw('SELECT 1 AS reserved_body'), tx.executeRaw('SELECT 2 AS reserved_body')])));
     });
-    const begin = records.find(r => /^begin$/i.test(r.sql))!;
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
     const first = records.find(r => /AS reserved_body$/.test(r.sql))!;
     expect(first.conn).toBe(begin.conn);
     expect(first.t >= end(begin)).toBe(true);
@@ -186,7 +187,7 @@ describe.skipIf(!(pooled && pooledAdmin))('GBRA-156: a transaction\'s first stat
           "SELECT current_setting('gbrain.persistence_protocol', true) AS protocol, txid_current()::text AS xid, pg_backend_pid() AS pid /* after declaration */");
       }, { pipelineFirst: isPersistenceDeclaration });
     });
-    const begin = records.find(r => /^begin\s*$/i.test(r.sql))!;
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
     const declared = records.find(r => r.sql === declaration)!;
     const after = records.find(r => /after declaration \*\/$/.test(r.sql))!;
     expect(declared.t < end(begin)).toBe(true);
@@ -201,7 +202,7 @@ describe.skipIf(!(pooled && pooledAdmin))('GBRA-156: a transaction\'s first stat
         await tx.executeRaw(`DELETE FROM ${table} WHERE n=0`);
       }, { pipelineFirst: isPersistenceDeclaration });
     });
-    const begin = records.find(r => /^begin\s*$/i.test(r.sql))!;
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
     const insert = records.find(r => /refused first \*\/$/.test(r.sql))!;
     expect(insert.t >= end(begin)).toBe(true);
   }, 60_000);
@@ -276,7 +277,7 @@ describe.skipIf(!(pooled && pooledAdmin))('GBRA-156: a transaction\'s first stat
         await tx.executeRaw('SELECT 1 AS reserved_after_declaration');
       }, { pipelineFirst: isPersistenceDeclaration }));
     });
-    const begin = records.find(r => /^begin$/i.test(r.sql))!;
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
     const declared = records.find(r => r.sql === declaration)!;
     const after = records.find(r => /AS reserved_after_declaration$/.test(r.sql))!;
     expect([declared.conn, after.conn]).toEqual([begin.conn, begin.conn]);
@@ -331,7 +332,7 @@ describe.skipIf(!(pooled && pooledAdmin))('GBRA-156: a transaction\'s first stat
     const records = await traced('first-off', 1, async engine => {
       await engine.transaction(tx => declarePersistenceProtocol(tx), { pipelineFirst: isPersistenceDeclaration });
     }, { GBRAIN_PG_TXN_PIPELINE: '0' });
-    const begin = records.find(r => /^begin\s*$/i.test(r.sql))!;
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
     const declared = records.find(r => r.sql === declaration)!;
     expect(declared.t >= end(begin)).toBe(true);
   }, 60_000);
@@ -343,10 +344,87 @@ describe.skipIf(!(pooled && pooledAdmin))('GBRA-156: a transaction\'s first stat
       failed = await engine.executeRaw('SELECT 1/0 AS bounded_failure', [], { timeoutMs: 5000 }).then(() => 'none', (e: { code?: string }) => e.code);
       next = await engine.sql.unsafe("SELECT current_setting('statement_timeout') AS timeout, now() = statement_timestamp() AS fresh") as unknown as typeof next;
     });
-    expect(sentBeforeAnswer(records, /^BEGIN; SET LOCAL statement_timeout|^SELECT 1\/0 AS bounded_failure$|^COMMIT$/, 3)).toEqual([true, true]);
+    expect(sentBeforeAnswer(records, /^BEGIN READ WRITE; SET LOCAL statement_timeout|^SELECT 1\/0 AS bounded_failure$|^COMMIT$/, 3)).toEqual([true, true]);
     expect(failed).toBe('22012');
     expect(next.map(r => r.fresh)).toEqual([true]);
     expect(next[0]!.timeout).not.toBe('5s');
   }, 60_000);
 });
 
+describe.skipIf(!(pooled && pooledAdmin))('GBRA-156: a search read transaction sends its whole body behind BEGIN', () => {
+  const table = `txn_early_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
+  const settings = "SELECT set_config('jit', $1, true), set_config('statement_timeout', $2, true)";
+  beforeAll(async () => {
+    if (!(pooled && pooledAdmin)) return;
+    const admin = postgres(pooledUrl('?prepare=false'), { max: 1, prepare: false, onnotice: () => {} });
+    try { await admin.unsafe(`CREATE TABLE ${table} (n int)`); } finally { await admin.end(); }
+  }, 60_000);
+
+  test('the settings and the read go out before BEGIN\'s answer, and the read runs inside the transaction under those settings', async () => {
+    let seen: Array<{ jit: string; timeout: string }> = [];
+    const records = await traced('early-read', 1, async engine => {
+      // Transaction-local settings are in effect only inside the transaction (outside one set_config(..., true) is a no-op).
+      // The first run also describes the settings statement's parameters; the second is the one measured.
+      for (let run = 0; run < 2; run++) {
+        seen = await engine.transaction(async tx => {
+          const applied = tx.executeRaw(settings, ['off', '4321ms']);
+          const read = tx.executeRaw<{ jit: string; timeout: string }>(
+            `SELECT current_setting('jit') AS jit, current_setting('statement_timeout') AS timeout /* early read ${run} */`);
+          await applied;
+          return read;
+        }, { pipelineEarly: isPipelinableSearchRead });
+      }
+    });
+    const measured = records.slice(records.findLastIndex(r => /^begin read write$/i.test(r.sql)));
+    const begin = measured[0]!;
+    const applied = measured.find(r => r.sql === settings)!;
+    const read = measured.find(r => /early read 1 \*\/$/.test(r.sql))!;
+    expect(isPipelinableSearchRead(read.sql)).toBe(true);
+    expect([applied.conn, read.conn]).toEqual([begin.conn, begin.conn]);
+    expect(applied.t < end(begin)).toBe(true);
+    expect(read.t < end(begin)).toBe(true);
+    expect(seen.map(r => [r.jit, r.timeout])).toEqual([['off', '4321ms']]);
+  }, 60_000);
+
+  test('the first refused statement (a write), and every statement after it, waits for BEGIN\'s answer', async () => {
+    const records = await traced('early-refused', 1, async engine => {
+      await engine.transaction(async tx => {
+        await Promise.all([
+          tx.executeRaw('SELECT 1 AS early_before_write'),
+          tx.executeRaw(`INSERT INTO ${table} VALUES (0) /* refused write */`),
+          tx.executeRaw('SELECT 2 AS early_after_write'),
+        ]);
+        await tx.executeRaw(`DELETE FROM ${table} WHERE n = 0`);
+      }, { pipelineEarly: isPipelinableSearchRead });
+    });
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
+    const before = records.find(r => /AS early_before_write$/.test(r.sql))!;
+    const write = records.find(r => /refused write \*\/$/.test(r.sql))!;
+    const after = records.find(r => /AS early_after_write$/.test(r.sql))!;
+    expect(before.t < end(begin)).toBe(true);
+    expect(write.t >= end(begin)).toBe(true);
+    expect(after.t >= end(begin)).toBe(true);
+  }, 60_000);
+
+  test('a BEGIN that fails runs only accepted reads, in autocommit: no write runs, and the transaction rejects with BEGIN\'s error', async () => {
+    let outcome: string | undefined;
+    let count = -1;
+    await traced('early-begin-fails', 1, async engine => {
+      outcome = await engine.sql.begin({ mode: 'isolation level bogus', early: isPipelinableSearchRead }, async tx => {
+        await Promise.all([tx.unsafe(settings, ['off', '1000ms']), tx.unsafe('SELECT 1 AS early_read_before_failed_begin'), tx.unsafe(`INSERT INTO ${table} VALUES (5)`)]);
+      }).then(() => 'none', (e: { code?: string }) => e.code);
+      count = Number((await engine.sql.unsafe(`SELECT count(*)::int AS c FROM ${table}`))[0]!.c);
+    });
+    expect(outcome).toBe('42601');
+    expect(count).toBe(0);
+  }, 60_000);
+
+  test('GBRAIN_PG_TXN_PIPELINE=0 keeps every statement behind BEGIN\'s answer', async () => {
+    const records = await traced('early-off', 1, async engine => {
+      await engine.transaction(tx => tx.executeRaw('SELECT 1 AS early_switched_off'), { pipelineEarly: isPipelinableSearchRead });
+    }, { GBRAIN_PG_TXN_PIPELINE: '0' });
+    const begin = records.find(r => /^begin read write$/i.test(r.sql))!;
+    const read = records.find(r => /AS early_switched_off$/.test(r.sql))!;
+    expect(read.t >= end(begin)).toBe(true);
+  }, 60_000);
+});

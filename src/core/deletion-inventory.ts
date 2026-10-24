@@ -130,7 +130,7 @@ const ROWS: readonly Row[] = [
   ['pages', 'swept', 'page_body', 'source_id slug type page_kind title compiled_truth timeline frontmatter content_hash effective_date_source import_filename database_only_reason contextual_retrieval_mode corpus_generation search_vector source_path ingested_via source_uri source_kind embedding_signature revision_principal_kind revision_principal_id trust_tier write_origin body_storage body_flags truth_lead timeline_lead links_extract_failure'],
   ['persistence_consumers', 'out_of_scope', 'no_memory_text', 'kind mode pool version nonce minted_under persistence_home host_json_path pid_ns boot_id process_start'],
   ['persistence_counters', 'out_of_scope', 'no_memory_text', 'key'],
-  ['persistence_effects', 'swept', 'effect_recovery', 'kind data state source_id error_code outcome recovery'],
+  ['persistence_effects', 'swept', 'effect_recovery', 'kind data state source_id error_code outcome recovery claim_owner'],
   ['persistence_graduation', 'out_of_scope', 'probed_reported', 'role state source_data_dir trigger_bypass table_receipts replay_probe timings doctor rollback', 'table_receipts'],
   ['persistence_host_bindings', 'out_of_scope', 'no_memory_text', 'local_path coordination_path git_durability'],
   ['persistence_local_writers', 'out_of_scope', 'secret_material', 'lane credential_hash grant_ceiling'],

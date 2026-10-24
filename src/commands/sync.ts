@@ -364,7 +364,7 @@ export interface SyncOpts {
    * breadcrumbs already cover that surface).
    */
   onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
-    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } }) => void;
+    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number }; /** #7243: a pass round (`managed_sync.round_level`, `managed_sync.round_admit`). */ round?: { round: number; target: string; paths: number; read_ms?: number; imports?: number; deletes?: number; in_flight?: number } }) => void;
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the
    * cursor is done, the caller's signal/deadline stops it, or it is blocked

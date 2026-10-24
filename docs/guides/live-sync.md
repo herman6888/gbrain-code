@@ -136,6 +136,23 @@ Timing knobs the drain uses:
 | `GBRAIN_SYNC_BULK_MAX_TXN_MS` (was `sync.bulk_max_txn_ms`, retired in 0.60.266.0) | Target time per bulk group; sizes the next group from the last one's time per page. | 15000 | A smaller next group. |
 | `sync.bulk_size` / `GBRAIN_SYNC_BULK_SIZE` | Largest bulk group. | 16 | — |
 
+### Level reuse
+
+A long-running process (the serve, `gbrain sync --watch`) keeps the tree
+listing of the commit its last pass read and lists only what changed since
+(`git diff-tree`), still judging every path. It also keeps its last synced
+pass's pages-and-import-records read (`I⋈P`) and re-reads in its own
+snapshot only rows changed since. Any doubt reads whole: a new
+process, another source, a failed or unsynced pass, a read older than 10
+minutes, a change over a quarter of the tree or source (and over 2,000), counts
+that do not add up, a wide transaction-id span, pathspec characters in scope,
+or any error. Holds, markers, open work and the Git level are read every round.
+Clean probes persist on disk, so a new process rehashes only files
+whose stat or tree entry moved. `gbrain config set sync.level_reuse false`
+turns all three off.
+`GBRAIN_SYNC_LEVEL_REUSE_VERIFY=1` also reads whole and fails the pass on any
+difference (tests and the nightly freshness cell).
+
 ### Sync config keys
 
 `gbrain config` keeps three kinds of `sync.*` keys (`src/core/sync-config-keys.ts`):
@@ -143,7 +160,7 @@ Timing knobs the drain uses:
 - **Tunables** you set and keep: `sync.bulk_size`, `sync.lanes`, `sync.exclude`, `sync.include_hidden`,
   `sync.include_working_tree`, `sync.holds`, `sync.write_through`, `sync.cost_gate_min_usd`, `sync.on_commit`,
   `sync.freshness_target_seconds` ([on-commit sync](on-commit-sync.md)), `sync.metafile_pages`
-  ([what gets synced](#what-gets-synced)).
+  ([what gets synced](#what-gets-synced)), `sync.level_reuse` ([level reuse](#level-reuse)).
 - **Rollback keys**, the way back a notice or migration promised: `sync.job_drain`, `sync.foreground_priority`,
   `sync.federated_v2`, `sync.waive_batch`, `sync.bulk`. Each one set to `false` restores the earlier behavior, and
   stays honored until at least 2027-01-14 (`CONFIG_ROLLBACK_WINDOWS` in `src/core/wire-skew.ts`). They are not

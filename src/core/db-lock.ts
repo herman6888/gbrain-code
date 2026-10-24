@@ -24,6 +24,7 @@
 import { hostname } from 'os';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
+import { retryReadOnlyAutocommit } from './postgres-engine/read-write-transactions.ts';
 import { noteDirectPoolLease } from './direct-pool-profile.ts';
 
 export interface DbLockHandle {
@@ -214,6 +215,17 @@ export function isLockHolderLive(snap: LockSnapshot, ttlMinutes: number = DEFAUL
  * `CONNECTION_ENDED`, which turned a finished sync into a thrown error and left
  * its lock row behind until the TTL lapsed.
  */
+/**
+ * #7442: the fence on a lock row: the row with this token, unexpired, `FOR KEY SHARE`. KEY SHARE lets the holder's own
+ * renewal (an UPDATE of non-key columns) through while a fenced transaction is open, so fenced transactions, however long
+ * or overlapping, can no longer starve it and lapse a live lease. A takeover still waits for the fence: its upsert also
+ * writes the key (`id = EXCLUDED.id` in `tryAcquireDbLock`), which takes the row lock KEY SHARE conflicts with, as every
+ * DELETE (release, break-lock) does. Returns the row when the fence holds, none when the lease is gone.
+ */
+export function fenceLockRow(tx: Pick<BrainEngine, 'executeRaw'>, lockId: string, token: string): Promise<unknown[]> {
+  return tx.executeRaw('SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR KEY SHARE', [lockId, token]);
+}
+
 export async function tryAcquireDbLock(
   engine: BrainEngine,
   lockId: string,
@@ -251,11 +263,12 @@ export async function tryAcquireDbLock(
     // `gbrain sync --break-lock --max-age <s>` uses last_refreshed_at (not
     // acquired_at) to identify wedged-but-alive holders without stealing
     // healthy long-running holders that are actively refreshing.
-    const rows: Array<{ id: string; fence: string }> = await sql`
+    const rows: Array<{ id: string; fence: string }> = await retryReadOnlyAutocommit(sql, (sql: any) => sql`
       INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token)
       VALUES (${lockId}, ${pid}, ${host}, NOW(), NOW() + ${ttl}::interval, NOW(), ${acquisitionToken}::uuid)
       ON CONFLICT (id) DO UPDATE
-        SET holder_pid = ${pid},
+        SET id = EXCLUDED.id,
+            holder_pid = ${pid},
             holder_host = ${host},
             acquired_at = NOW(),
             acquisition_token = ${acquisitionToken}::uuid,
@@ -265,7 +278,7 @@ export async function tryAcquireDbLock(
           AND (gbrain_cycle_locks.last_refreshed_at IS NULL
                OR gbrain_cycle_locks.last_refreshed_at < NOW() - ${stealGraceSeconds} * INTERVAL '1 second')
       RETURNING id, extract(epoch from acquired_at)::text AS fence
-    `;
+    `);
     if (rows.length === 0) return null;
     noteDirectPoolLease();
     // The UUID is the fence; the epoch text rides on the handle for
@@ -273,10 +286,10 @@ export async function tryAcquireDbLock(
     // is lost) and is never compared (#6028).
     const fence = rows[0].fence;
     const deregister = registerCleanup(`db-lock:${lockId}`, async () => {
-      await (maybePG.sql as any)`
+      await retryReadOnlyAutocommit(maybePG.sql as any, (sql: any) => sql`
         DELETE FROM gbrain_cycle_locks
         WHERE id = ${lockId} AND holder_pid = ${pid} AND acquisition_token = ${acquisitionToken}::uuid
-      `;
+      `);
     });
     return {
       id: lockId,
@@ -300,10 +313,10 @@ export async function tryAcquireDbLock(
       },
       release: async () => {
         deregister();
-        await (maybePG.sql as any)`
+        await retryReadOnlyAutocommit(maybePG.sql as any, (sql: any) => sql`
           DELETE FROM gbrain_cycle_locks
           WHERE id = ${lockId} AND holder_pid = ${pid} AND acquisition_token = ${acquisitionToken}::uuid
-        `;
+        `);
       },
     };
   }
@@ -315,7 +328,8 @@ export async function tryAcquireDbLock(
       `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at, acquisition_token)
        VALUES ($1, $2, $3, NOW(), NOW() + $4::interval, NOW(), $6::uuid)
        ON CONFLICT (id) DO UPDATE
-         SET holder_pid = $2,
+         SET id = EXCLUDED.id,
+             holder_pid = $2,
              holder_host = $3,
              acquired_at = NOW(),
              acquisition_token = $6::uuid,
@@ -662,11 +676,11 @@ export async function deleteLockRow(
 
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
-    const rows: Array<{ id: string }> = await sql`
+    const rows: Array<{ id: string }> = await retryReadOnlyAutocommit(sql, (sql: any) => sql`
       DELETE FROM gbrain_cycle_locks
        WHERE id = ${lockId} AND holder_pid = ${holderPid} AND acquisition_token = ${acquisitionToken}::uuid
       RETURNING id
-    `;
+    `);
     return { deleted: rows.length > 0 };
   }
   if (engine.kind === 'pglite' && maybePGLite.db) {
@@ -733,7 +747,7 @@ export async function deleteLockRowIfStale(
 
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
-    const rows: Array<{ id: string; last_refreshed_at: Date | string | null }> = await sql`
+    const rows: Array<{ id: string; last_refreshed_at: Date | string | null }> = await retryReadOnlyAutocommit(sql, (sql: any) => sql`
       DELETE FROM gbrain_cycle_locks
        WHERE id = ${lockId}
          AND holder_pid = ${holderPid}
@@ -741,7 +755,7 @@ export async function deleteLockRowIfStale(
          AND last_refreshed_at IS NOT NULL
          AND last_refreshed_at < NOW() - ${maxAgeSeconds} * INTERVAL '1 second'
       RETURNING id, last_refreshed_at
-    `;
+    `);
     if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
     const lr = rows[0].last_refreshed_at;
     const lastRefreshed = lr == null ? null : (lr instanceof Date ? lr : new Date(lr));

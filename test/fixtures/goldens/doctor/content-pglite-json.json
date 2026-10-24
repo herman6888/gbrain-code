@@ -961,6 +961,7 @@
             "git_push_holds": [],
             "inspected": 0,
             "parked_effects": 0,
+            "parked_groups": [],
             "truncated": false
           },
           "elapsed_ms": "<volatile>",
@@ -1017,6 +1018,28 @@
           "elapsed_ms": "<volatile>",
           "message": "PGLite at 5 pages — comfortable below the 1000-page threshold",
           "name": "pglite_scale",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "alias_pages_without_visibility": 0,
+            "count": "exact",
+            "fact_ids_truncated": false,
+            "looser_atoms": 0,
+            "looser_concepts": 0,
+            "looser_events": 0,
+            "remotely_readable_fact_ids": [],
+            "repair": "visibility",
+            "truncated": false,
+            "unstamped_atoms": 0,
+            "unstamped_concepts": 0,
+            "world_facts_from_private_sources": 0,
+            "world_facts_remotely_readable": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Every derived page and fact carries a visibility no looser than its source, and no page relies on a privacy alias alone.",
+          "name": "derived_visibility",
           "status": "ok"
         },
         {
@@ -1297,28 +1320,6 @@
           "elapsed_ms": "<volatile>",
           "message": "Every timeline row has a bullet in its page (4 page(s) inspected).",
           "name": "timeline_history",
-          "status": "ok"
-        },
-        {
-          "category": "brain",
-          "details": {
-            "alias_pages_without_visibility": 0,
-            "count": "exact",
-            "fact_ids_truncated": false,
-            "looser_atoms": 0,
-            "looser_concepts": 0,
-            "looser_events": 0,
-            "remotely_readable_fact_ids": [],
-            "repair": "visibility",
-            "truncated": false,
-            "unstamped_atoms": 0,
-            "unstamped_concepts": 0,
-            "world_facts_from_private_sources": 0,
-            "world_facts_remotely_readable": 0
-          },
-          "elapsed_ms": "<volatile>",
-          "message": "Every derived page and fact carries a visibility no looser than its source, and no page relies on a privacy alias alone.",
-          "name": "derived_visibility",
           "status": "ok"
         },
         {
@@ -2571,6 +2572,7 @@
                 "commits": 0,
                 "source_id": "default",
                 "unresolved_commits": 0,
+                "waiting_commits": null,
                 "window_hours": 24
               },
               {
@@ -2589,6 +2591,7 @@
                 "commits": 0,
                 "source_id": "notes",
                 "unresolved_commits": 0,
+                "waiting_commits": null,
                 "window_hours": 24
               }
             ],
@@ -3198,6 +3201,17 @@
           "elapsed_ms": "<volatile>",
           "message": "No long-running gbrain process (serve, jobs supervisor, worker) is running on this host.",
           "name": "runtime_build_skew",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "docs": "docs/guides/cli-socket.md",
+            "refusals": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "The warm CLI socket refused no CLI call in the last 24 hours.",
+          "name": "cli_socket_refusals",
           "status": "ok"
         },
         {

@@ -33,7 +33,8 @@ export function fenceRepairCommit(path: string, classes: readonly string[], tier
 export function contentRepairCommit(path: string, receipt: Pick<ContentRepairReceipt, 'tier' | 'confidence'>): GitCommitNote {
   return { subject: contentRepairCommitSubject(path), line: `${safe(path)} (frontmatter_slug_conflict)`, trailer: contentRepairTrailer(receipt) };
 }
-export interface ParkedTarget { slug?: string; error_code: string }
+/** `rule`: for `git_target_ignored`, the .gitignore rule that excludes the file (`<file>:<line>: <pattern>`). */
+export interface ParkedTarget { slug?: string; error_code: string; rule?: string }
 /** `page_body_segmented`: a segmented page an older binary's mirror or Git scan passed by; this one mirrors and commits it. */
 /** `preview_changed`: a `gbrain repair segmented-mirror` target whose file or render no longer has the hash its preview approved (`data.approved_file`). */
 export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' | 'page_body_segmented' | 'withdrawal_not_mirrored' | 'preview_changed' }
@@ -81,6 +82,10 @@ export interface PersistenceEffect {
     commit_trailer?: string;
     /** Consecutive execution failures of the current Git or withdrawal target. */
     target_failures?: number;
+    /** GBRA-133: consecutive `writer_busy` retries of this streak, when the streak began and when its last retry was recorded (ISO). */
+    busy_retries?: number;
+    busy_since?: string;
+    busy_at?: string;
     /** The target `target_failures` belongs to; a different target starts from zero. */
     failing_target?: string;
     /** Targets set aside after repeated failures; a slugless entry parks the whole effect. */

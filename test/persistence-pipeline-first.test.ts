@@ -12,6 +12,7 @@ import { declarePublication } from '../src/core/persistence/publication-deadline
 import type { BrainEngine } from '../src/core/engine.ts';
 import type postgres from '#postgres';
 import { reservedTransactions } from '../src/core/postgres-engine/reserved-transactions.ts';
+import { READ_WRITE_BEGIN } from '../src/core/postgres-engine/read-write-transactions.ts';
 import { composablePostgresTransaction } from '../src/core/page-state/transactions.ts';
 
 function recorder(kind = 'postgres'): { engine: BrainEngine; sent: string[] } {
@@ -102,7 +103,7 @@ function lazyReserved(beginFails: boolean) {
         if (loads !== undefined) self.strings = [loads];
         const text = self.strings.reduce((a, s, i) => a + '$' + i + s);
         sent.push({ text, beginAnswered });
-        if (text === 'begin') setTimeout(() => { beginAnswered = true; beginFails ? self.reject(Object.assign(new Error('no server connection available'), { code: '08P01' })) : resolve(Object.assign([], { command: 'BEGIN' })); }, 20);
+        if (text === READ_WRITE_BEGIN) setTimeout(() => { beginAnswered = true; beginFails ? self.reject(Object.assign(new Error('no server connection available'), { code: '08P01' })) : resolve(Object.assign([], { command: 'BEGIN' })); }, 20);
         else resolve(Object.assign([], { command: text.toUpperCase() }));
       },
       execute: () => { if (!q.executed) { q.executed = true; void Promise.resolve().then(() => q.handler(q)); } return q; },
@@ -126,7 +127,7 @@ describe('reserved transactions: the declaration goes out with BEGIN', () => {
   test('only the accepted declaration is sent before BEGIN\'s answer; the next statement and COMMIT wait', async () => {
     const { reserved, sent } = lazyReserved(false);
     await beginFirst(reserved, async sql => { await sql.unsafe(DECLARATION); await sql.unsafe('insert into t values (1)'); });
-    expect(sent).toEqual([{ text: 'begin', beginAnswered: false }, { text: DECLARATION, beginAnswered: false },
+    expect(sent).toEqual([{ text: READ_WRITE_BEGIN, beginAnswered: false }, { text: DECLARATION, beginAnswered: false },
       { text: 'insert into t values (1)', beginAnswered: true }, { text: 'commit', beginAnswered: true }]);
   });
 
@@ -140,7 +141,7 @@ describe('reserved transactions: the declaration goes out with BEGIN', () => {
     }).then(() => null, (e: { code?: string }) => e.code);
     expect(error).toBe('08P01');
     expect(swallowed).toBe('08P01');
-    expect(sent.map(s => s.text).filter(t => t !== 'rollback')).toEqual(['begin', DECLARATION]);
+    expect(sent.map(s => s.text).filter(t => t !== 'rollback')).toEqual([READ_WRITE_BEGIN, DECLARATION]);
   });
 
   test('a write first, a fragment argument and a savepoint all wait for BEGIN\'s answer', async () => {
@@ -151,7 +152,7 @@ describe('reserved transactions: the declaration goes out with BEGIN', () => {
     ]) {
       const { reserved, sent } = lazyReserved(false);
       await beginFirst(reserved, body);
-      expect(sent[0]).toEqual({ text: 'begin', beginAnswered: false });
+      expect(sent[0]).toEqual({ text: READ_WRITE_BEGIN, beginAnswered: false });
       expect(sent.slice(1).every(s => s.beginAnswered)).toBe(true);
     }
   });
@@ -168,7 +169,7 @@ describe('reserved transactions: the declaration goes out with BEGIN', () => {
     test(`${name} after the declaration waits for BEGIN's answer`, async () => {
       const { reserved, sent } = lazyReserved(false);
       await beginFirst(reserved, async sql => { await sql.unsafe(DECLARATION); await reach(sql, child => child`insert into t values (${1})`); });
-      expect(sent.slice(0, 2)).toEqual([{ text: 'begin', beginAnswered: false }, { text: DECLARATION, beginAnswered: false }]);
+      expect(sent.slice(0, 2)).toEqual([{ text: READ_WRITE_BEGIN, beginAnswered: false }, { text: DECLARATION, beginAnswered: false }]);
       expect(sent.find(s => s.text === 'insert into t values ($1)')).toEqual({ text: 'insert into t values ($1)', beginAnswered: true });
       expect(sent.slice(2).every(s => s.beginAnswered)).toBe(true);
     });
@@ -186,7 +187,7 @@ describe('reserved transactions: the declaration goes out with BEGIN', () => {
       }).then(() => null, (e: { code?: string }) => e.code);
       expect(error).toBe('08P01');
       expect(swallowed).toBe('08P01');
-      expect(sent.map(s => s.text).filter(t => t !== 'rollback')).toEqual(['begin', DECLARATION]);
+      expect(sent.map(s => s.text).filter(t => t !== 'rollback')).toEqual([READ_WRITE_BEGIN, DECLARATION]);
     });
   }
 
@@ -201,7 +202,7 @@ describe('reserved transactions: the declaration goes out with BEGIN', () => {
       swallowed = await sql.file('refused.sql').then(() => 'sent', (e: { code?: string }) => e.code);
     }).catch(() => undefined);
     expect(swallowed).toBe('08P01');
-    expect(refused.sent.map(s => s.text).filter(t => t !== 'rollback')).toEqual(['begin', DECLARATION]);
+    expect(refused.sent.map(s => s.text).filter(t => t !== 'rollback')).toEqual([READ_WRITE_BEGIN, DECLARATION]);
   });
 });
 

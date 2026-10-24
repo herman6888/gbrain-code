@@ -155,7 +155,7 @@ export async function retryParkedEffects(engine: BrainEngine, sourceId: string, 
       const scanning = targetedWithdrawalEffect(effect) || effect.data.source_scan === true;
       const slugs = scanning ? [...new Set([...retrying, ...parked.flatMap(entry => entry.slug ? [entry.slug] : [])])] : [];
       const [updated] = await tx.executeRaw<{ state: string }>(`UPDATE persistence_effects SET state='queued',data=$2::text::jsonb,error_code=NULL,
-        next_attempt_at=now(),claim_expires_at=NULL,updated_at=now() WHERE id=$1 AND state='failed' AND error_code IS NOT DISTINCT FROM $3
+        next_attempt_at=now(),claim_expires_at=NULL,claim_owner=NULL,updated_at=now() WHERE id=$1 AND state='failed' AND error_code IS NOT DISTINCT FROM $3
         AND execution_token IS NULL AND recovery IS NULL RETURNING state`,
       [effect.id, JSON.stringify({ ...data, ...(slugs.length ? { retry_slugs: slugs } : {}), target_failures: PARK_AFTER_FAILURES - 1,
         ...(!scanning && (effect.data.slug ?? effect.data.relative_path) ? { failing_target: effect.data.slug ?? effect.data.relative_path } : {}),
@@ -309,7 +309,7 @@ export async function retryEmbeddingEffect(engine: BrainEngine, sourceId: string
       pending_chunks: pending.length, next_action: 'Run the same command without --dry-run to approve this bounded action.' };
     const [updated] = await tx.executeRaw<{ state: string }>(`UPDATE persistence_effects SET state=$4,
       data=CASE WHEN $4='queued' THEN $5::text::jsonb||jsonb_build_object('embedding_attempt_base',attempts,'embedding_retry_base',attempts) ELSE $5::text::jsonb END,
-      error_code=NULL,claim_expires_at=NULL,next_attempt_at=now(),updated_at=now(),
+      error_code=NULL,claim_expires_at=NULL,claim_owner=NULL,next_attempt_at=now(),updated_at=now(),
       outcome=CASE WHEN $4='committed' THEN '{"embedding":"reconciled"}'::jsonb ELSE NULL END
       WHERE id=$1 AND state='failed' AND execution_token IS NULL AND recovery IS NULL AND attempts=$2 AND source_incarnation=$3::uuid RETURNING state`,
     [effect.id, effect.attempts, effect.source_incarnation, complete ? 'committed' : 'queued', JSON.stringify(effect.data)]);

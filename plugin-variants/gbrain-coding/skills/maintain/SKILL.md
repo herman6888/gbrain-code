@@ -422,6 +422,13 @@ For a long run (>1000 chunks), route the approved command through the
 durable ladder in `skills/minion-orchestrator/SKILL.md` instead of a bare
 background shell, which hides that exit 3 in a log file.
 
+To see what search cannot reach on one source, run
+`gbrain pages unsearchable --source <id> --json` (read-only). Read
+`semantic_unsearchable`, not only `unsearchable`: it adds `keyword_only`
+pages, which keyword search finds but vector search misses. `awaiting_sync`
+counts files sync still holds, which no embedding state includes; follow
+`gbrain sync status --source <id> --json` for those. Each row carries its `fix`.
+
 ### Security (RLS verification)
 Run `gbrain doctor --json` and check the RLS status.
 All tables should show RLS enabled. If not, run `gbrain init` again.

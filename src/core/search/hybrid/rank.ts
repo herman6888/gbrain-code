@@ -11,12 +11,13 @@ import { type FusionListEntry, type VectorArm, composeFusionLists } from '../fus
 import { type HybridRequest, applyIdentityBoosts, emitHybridMeta } from './request.ts';
 import type { KeywordArmConfidenceDecision } from '../arm-confidence.ts';
 import { type MetadataBoostGateDecision, decideMetadataBoosts, lexicalArmsVoted } from '../metadata-boost-gate.ts';
-import { type PostFusionOpts, RRF_K, cosineReScore, resolveWalkDedupCap, rrfFusionWeighted, runPostFusionStages, stampContentFlags, stampUnverifiedExtractions, textVectorArmNonEmpty } from '../hybrid.ts';
+import { startCosineReScore } from '../cosine-rescore.ts';
+import { type PostFusionOpts, RRF_K, resolveWalkDedupCap, rrfFusionWeighted, runPostFusionStages, stampContentFlags, stampUnverifiedExtractions, textVectorArmNonEmpty } from '../hybrid.ts';
 import { type RelationalEvidenceSlotDecision, ensureRelationalEvidenceSlot } from '../relational-recall.ts';
 import { type RelationalRerankPinDecision, pinRelationalRows } from '../relational-rerank-pin.ts';
 import { applyFeedbackStage } from '../feedback-boost.ts';
 import { capPerSession } from '../diverse-pool.ts';
-import { collapseResults } from '../collapse.ts';
+import { collapseResults, prefetchPageFacts } from '../collapse.ts';
 import { readGeneratedPages } from '../provenance-demotion.ts';
 import { applyRankPriors } from '../rank-priors.ts';
 import { type RerankFailedReason, type RerankPassThroughReason, type RerankSkipReason, applyReranker } from '../rerank.ts';
@@ -144,24 +145,24 @@ export async function fuseArms(
 
   // issue #160: stamp unverified auto-extracted stubs across ALL candidate
   // arms BEFORE fusion so the compiled-truth authority boost skips them.
-  await stampUnverifiedExtractions(engine, allLists.flatMap((l) => l.list), opts);
-
-  const attribute = opts?.explain === true || trace !== undefined;
-  let fused = rrfFusionWeighted(allLists, ctBoost, attribute);
-
+  const candidates = allLists.flatMap((l) => l.list);
   // Cosine re-scoring before dedup so semantically better chunks survive.
   // v0.36 (D9): hydrate from the active embedding column so rescore happens
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
   // always pulled from `embedding` and silently corrupted alt-column ranks.
-  if (queryEmbedding) {
-    // Unified routing embedded the query with the multimodal model, so the
-    // rescore must hydrate the multimodal column, not the text column.
-    fused = await cosineReScore(
-      engine, fused, queryEmbedding, unifiedDone ? 'embedding_multimodal' : resolvedCol.name,
-      imageQueryEmbedding && !unifiedDone ? { queryEmbedding: imageQueryEmbedding, column: 'embedding_image' } : undefined,
-      attribute, () => { req.cosineRescore = 'js_fallback'; },
-    );
-  }
+  // Unified routing embedded the query with the multimodal model, so the
+  // rescore must hydrate the multimodal column, not the text column.
+  // GBRA-156: its reads start here, beside the stub stamp below.
+  const rescore = queryEmbedding ? startCosineReScore(
+    engine, candidates, queryEmbedding, unifiedDone ? 'embedding_multimodal' : resolvedCol.name,
+    imageQueryEmbedding && !unifiedDone ? { queryEmbedding: imageQueryEmbedding, column: 'embedding_image' } : undefined,
+    () => { req.cosineRescore = 'js_fallback'; },
+  ) : null;
+  await stampUnverifiedExtractions(engine, candidates, opts);
+
+  const attribute = opts?.explain === true || trace !== undefined;
+  let fused = rrfFusionWeighted(allLists, ctBoost, attribute);
+  if (rescore) fused = await rescore(fused, attribute);
 
   // Phase E3 (Cat 13): metadata boost gate — decided from the SAME lexical
   // lists composeFusionLists just fused (post relaxed-row demotion); image
@@ -179,6 +180,7 @@ export async function fuseArms(
   // both, or neither fires depending on resolved modes.
   if (fused.length > 0) await req.timer.stage('post_fusion', async () => {
     const generatedRead = readGeneratedPages(engine, fused);
+    if (resolvedMode.collapse) req.collapsePrefetch = prefetchPageFacts(engine, fused.map(r => r.page_id));
     await runPostFusionStages(engine, fused, {
       ...postFusionOpts, skipMetadataBoosts: !metadataBoostGate.boosts_applied,
     });
@@ -266,6 +268,7 @@ export async function collapsePool(req: HybridRequest, rows: SearchResult[]): Pr
   return collapseResults(req.engine, rows, {
     ...req.aliasHopOpts,
     facts: req.collapseFacts,
+    prefetched: req.collapsePrefetch,
     onDecision: (d) => {
       if (d.twins + d.redirects + d.families + d.redirect_reads === 0) return;
       const prev = req.collapse ?? { twins: 0, redirects: 0, families: 0, redirect_reads: 0 };

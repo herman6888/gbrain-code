@@ -673,11 +673,30 @@ async function assertSourceExists(engine: BrainEngine, id: string): Promise<void
       [id],
     );
   if (rows.length === 0) {
+    const nearest = await nearestSourceId(engine, id);
     throw new SourceTargetError(
       `Source "${id}" not found or is archived. Available active sources: ` +
       `run \`gbrain sources list\` to see registered sources, ` +
-      `or create/restore "${id}" before retrying.`,
+      `or create/restore "${id}" before retrying.${nearest ? ` Did you mean "${nearest}"?` : ''}`,
     );
+  }
+}
+
+/**
+ * #7193: the active source an unknown id most likely meant: the one whose id or name it names exactly or is the only
+ * prefix of (`notes` for `notes-brain`), else the nearest id by edit distance (levenshtein.ts). Never throws.
+ */
+async function nearestSourceId(engine: BrainEngine, id: string): Promise<string | null> {
+  try {
+    const sources = await engine.executeRaw<{ id: string; name: string | null }>('SELECT id, name FROM sources WHERE archived = false ORDER BY id');
+    const named = sources.filter(s => s.name === id);
+    if (named.length === 1) return named[0]!.id;
+    const prefixed = sources.filter(s => s.id.startsWith(id) || (s.name ?? '').startsWith(id));
+    if (prefixed.length === 1) return prefixed[0]!.id;
+    const { suggestNearest } = await import('./levenshtein.ts');
+    return suggestNearest(id, sources.map(s => s.id));
+  } catch {
+    return null;
   }
 }
 

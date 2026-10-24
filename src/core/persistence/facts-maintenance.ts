@@ -305,7 +305,10 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
   const session: ManagedFactsSession = { authority, binding: writeThrough ? binding : null, config,
     batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
-    fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
+    // #7439: a page-triggered job keeps its write's batch identity on retry, so its retained file refusal is
+    // rechecked once the hold clears instead of replayed forever. #7402: a caller's explicit request_id keeps
+    // returning its own recorded outcome, so it never rechecks.
+    fileRefusalRetry: !ctx.requestId && (!!ctx.persistenceRequestId || ctx.reAdmitFileRefusals === true && seed === inputDigest),
     inputKeyed: seed === inputDigest,
     wait: new MaintenanceWriteWait(ctx.deadlineAtMs ?? null), ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
@@ -391,8 +394,9 @@ async function storedBatch(engine: BrainEngine, session: ManagedFactsSession): P
 const isEntityRequest = (row: WriteRequest) => (row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_entity';
 
 /**
- * #6048: an input-keyed batch (the sweep has no request id to give a window)
- * would replay a terminal file-check refusal forever. Walk its follow-up
+ * #6048, #7439: an input-keyed batch (the sweep has no request id to give a window)
+ * and a page-triggered job's batch (keyed by its write) would replay a terminal
+ * file-check refusal forever. Walk the follow-up
  * batches instead: while every request of the latest one is terminal and each
  * uncommitted entity request is a `source_changed` refusal that kept its facts,
  * look for the next follow-up, or admit it when every refused page now passes

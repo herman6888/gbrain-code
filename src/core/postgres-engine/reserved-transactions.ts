@@ -1,5 +1,6 @@
 import type postgres from '#postgres';
 import type { BrainEngine, TransactionOptions } from '../engine.ts';
+import { READ_WRITE_BEGIN } from './read-write-transactions.ts';
 
 /**
  * Phase 4.4: what `PostgresEngine.withReservedConnection` adds to its
@@ -12,7 +13,7 @@ export interface ReservedTransactions { transaction<T>(fn: (engine: BrainEngine)
 
 /**
  * Phase 4.4: `begin` for one reserved postgres.js connection, as `sql.begin`
- * runs it on a pooled one: BEGIN, the callback with a handle whose
+ * runs it on a pooled one: BEGIN READ WRITE (#7183), the callback with a handle whose
  * `savepoint` nests (rolled back to on error, like postgres.js), COMMIT, and
  * ROLLBACK on failure. BEGIN and SAVEPOINT are sent with the statements that
  * follow them instead of a round trip ahead (the server still runs them
@@ -57,7 +58,7 @@ export function reservedTransactions(reserved: postgres.ReservedSql): ReturnType
         catch (error) { if (await marker.then(() => true, () => false)) await reserved.unsafe(`rollback to ${name}`); throw error; }
       },
     });
-    const opened = reserved.unsafe('begin').execute();
+    const opened = reserved.unsafe(READ_WRITE_BEGIN).execute();
     if (!pipelines && first) gate = holdBehind(opened, first);
     const afterBegin = pipelines || gate ? Promise.resolve() : opened;
     let result: unknown;

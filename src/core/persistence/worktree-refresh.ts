@@ -30,7 +30,7 @@ import { opError, OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { recordUpstreamObservation } from '../sync-upstream.ts';
 import { checkpointRetryCommand } from './checkpoint-validation.ts';
-import { localHostId, persistenceHome } from './identity.ts';
+import { existingLocalHostId, localHostId, persistenceHome } from './identity.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
 import { isPhysicalRootMetadata } from './physical-root-record.ts';
@@ -72,6 +72,19 @@ function refusal(name: CatalogueName, cause: string, fix: string, refreshId?: st
   const error = catalogueError(name, cause, fix);
   if (refreshId) error.detail = `refresh_id=${refreshId}`;
   return error;
+}
+/**
+ * GBRA-133: the owner check reads this process's host identity without minting one (a cron job with another HOME would
+ * otherwise become a new host silently), and its refusal names the identity file it read and the HOME it resolved from.
+ */
+function assertRefreshOwner<B extends { owner_host_id: string | null; local_path: string | null }>(binding: B, sourceId: string, action: string): asserts binding is B & { local_path: string } {
+  const hostId = existingLocalHostId();
+  if (binding.owner_host_id === hostId && binding.local_path) return;
+  const path = join(persistenceHome(), 'host.json');
+  const self = hostId ? `host identity ${hostId} from ${path}` : `no host identity at ${path} (none was created)`;
+  throw refusal('refresh_not_owner',
+    `Only the registered owner host (${binding.owner_host_id}) of source ${sourceId} may ${action}; this process has ${self}, resolved from HOME=${process.env.HOME ?? '(unset)'} and GBRAIN_HOME=${process.env.GBRAIN_HOME?.trim() || '(unset)'}.`,
+    `Run it on the owner host with the HOME or GBRAIN_HOME its writer uses (a cron job often runs with a different HOME, so set GBRAIN_HOME explicitly); check the owner with gbrain sources writer status ${sourceId}`);
 }
 const writerStatusFix = (why: string, sourceId?: string): Action => readFix(why,
   { argv: ['gbrain', 'sources', 'writer', 'status', ...(sourceId ? ['--source', sourceId] : []), '--json'] });
@@ -190,12 +203,10 @@ interface Plan {
 async function precheck(engine: BrainEngine, git: Git, sourceId: string, fetchTimeoutMs: number): Promise<Plan> {
   if (!await managedPersistenceEnabled(engine)) throw refusal('refresh_not_managed',
     'This brain is not managed, so gbrain sync pulls the checkout itself; there is no worktree fence to coordinate.', `gbrain sync --source ${sourceId}`);
-  const binding = await getWorktreeBinding(engine, sourceId);
+  const binding = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
   if (!binding) throw refusal('refresh_not_managed',
     `Source ${sourceId} has no claimed canonical worktree, so gbrain sync pulls it without a refresh.`, `gbrain sync --source ${sourceId}`);
-  if (binding.owner_host_id !== localHostId() || !binding.local_path) throw refusal('refresh_not_owner',
-    `Only the registered owner host of source ${sourceId} may move its checkout; this host is not that owner.`,
-    `Run gbrain sources refresh ${sourceId} on the owner host; check which host owns it with gbrain sources writer status ${sourceId}`);
+  assertRefreshOwner(binding, sourceId, 'move its checkout');
   const root = binding.local_path;
   const active = await readActiveRefresh(engine, binding.worktree_id);
   if (active) throw refusal('refresh_in_progress', `Refresh ${active.id} of this worktree is ${active.state}; only one refresh per worktree runs at a time.`,
@@ -563,11 +574,10 @@ export async function resumeWorktreeRefreshes(engine: BrainEngine, opts: { hostI
 }
 
 async function resumeOrAbandon(engine: BrainEngine, sourceId: string, opts: RefreshOptions): Promise<WorktreeRefreshResult> {
-  const binding = await getWorktreeBinding(engine, sourceId);
+  const binding = await getWorktreeBinding(engine, sourceId, existingLocalHostId());
   if (!await managedPersistenceEnabled(engine) || !binding) throw refusal('refresh_not_managed',
     `Source ${sourceId} has no claimed canonical worktree on a managed brain, so there is no refresh to resume.`, `gbrain sync --source ${sourceId}`);
-  if (binding.owner_host_id !== localHostId() || !binding.local_path) throw refusal('refresh_not_owner',
-    `Only the registered owner host of source ${sourceId} may resume its refresh.`, `Run it on the owner host; check it with gbrain sources writer status ${sourceId}`);
+  assertRefreshOwner(binding, sourceId, 'resume its refresh');
   const root = binding.local_path;
   const active = await readActiveRefresh(engine, binding.worktree_id);
   const empty: WorktreeRefreshResult = { status: 'nothing_to_resume', refresh_id: null, worktree_id: binding.worktree_id, source_ids: [sourceId],

@@ -63,6 +63,10 @@ jobs:
     name: ${{ matrix.target }} / Bun ${{ matrix.bun }}
     runs-on: ${{ fromJSON('{"linux-x64-glibc":"ubicloud-standard-4-ubuntu-2404","linux-arm64-glibc":"ubicloud-standard-4-arm-ubuntu-2404","darwin-arm64":"macos-26","darwin-x64":"macos-26-intel","win32-x64":"windows-2022","win32-arm64":"windows-11-arm"}')[matrix.target] }}
     timeout-minutes: 15
+    # statuses: the darwin-x64 heartbeat below (one commit status context, diag/native-heartbeat).
+    permissions:
+      contents: read
+      statuses: write
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +82,18 @@ jobs:
         shell: bash
         run: echo "GBRAIN_JOB_DEADLINE=$(( $(date +%s) + 15 * 60 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # A wedged darwin-x64 runner uploads no log at all (#7457's cell, #7419, #7303, #7238), so a background loop posts
+      # the current step or suite, free memory, swap, load and the busiest process names as the commit status
+      # diag/native-heartbeat; GitHub keeps every status, so the last one before a wedge survives it. Nothing on a
+      # fork's pull request, whose token cannot write.
+      - name: Start the diagnostic heartbeat
+        if: matrix.target == 'darwin-x64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GBRAIN_HEARTBEAT_ENABLED: ${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && '1' || '0' }}
+          GBRAIN_HEARTBEAT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GBRAIN_HEARTBEAT_CELL: ${{ matrix.target }}/${{ matrix.bun }}
+        run: bash scripts/native/heartbeat.sh start
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: ${{ matrix.bun }}
@@ -140,6 +156,7 @@ jobs:
             local left=$((stop_at - $(date +%s)))
             if [ "$left" -le 0 ]; then echo "::error::$1 not run: the job timeout is near"; return 1; fi
             local limit=$((left < bound_s ? left : bound_s))
+            GBRAIN_HEARTBEAT_ENABLED=1 bash scripts/native/heartbeat.sh mark "$1" || true
             bun --no-env-file test --timeout=180000 "$1" &
             pid=$!
             for _ in $(seq 1 "$limit"); do
@@ -174,13 +191,27 @@ jobs:
           fi
           bun scripts/native/compiled-smoke.ts --binary bin/gbrain-native-validation
           bun scripts/native/cli-persistence-smoke.ts --binary bin/gbrain-native-validation
+      # The terminal status, naming the job result: a run that ends, even cancelled, leaves nothing pending; a machine
+      # that dies keeps its last heartbeat.
+      - name: Stop the diagnostic heartbeat
+        if: always() && matrix.target == 'darwin-x64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GBRAIN_HEARTBEAT_ENABLED: ${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && '1' || '0' }}
+          GBRAIN_HEARTBEAT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GBRAIN_HEARTBEAT_CELL: ${{ matrix.target }}/${{ matrix.bun }}
+        run: bash scripts/native/heartbeat.sh stop "${{ job.status }}"
 
   windows-backup-console:
     name: Windows PowerShell console probe / ${{ matrix.runner }} / Bun ${{ matrix.bun }}
     # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity).
     if: ${{ inputs.scope != 'smoke' }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 5
+    # Every step carries its own bound (p99.9 over 541 windows-11-arm jobs: checkout 45 s, setup-bun 21 s,
+    # install 59 s, verify 2 s, probe 43 s), so a stalled step fails by name. The job limit is those bounds plus
+    # 5 minutes for runner setup, which GitHub counts against the job ("Set up job" p95 2 s, p99.9 16 s; one ARM
+    # job spent 218 s there and the old 5-minute limit cancelled its passed probe).
+    timeout-minutes: 22
     strategy:
       fail-fast: false
       matrix:
@@ -190,14 +221,18 @@ jobs:
         exclude: ${{ fromJSON(inputs.scope == 'full' && '[]' || '[{"bun":"1.4.0"}]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        timeout-minutes: 2
         with:
           bun-version: ${{ matrix.bun }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
       - run: bun scripts/native/verify.ts
+        timeout-minutes: 1
       - name: Compare native hidden-window launch behavior
+        timeout-minutes: 4
         shell: bash
         env:
           GBRAIN_CI_DISABLE_TEST_ENV_FILE: '1'
@@ -211,7 +246,8 @@ jobs:
     # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity).
     if: ${{ inputs.scope != 'smoke' }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 5
+    # As above (probe p99.9 97 s over 267 windows-11-arm jobs; two tests at 180 s each): step bounds plus 5 minutes of setup.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -221,14 +257,18 @@ jobs:
         exclude: ${{ fromJSON(inputs.scope == 'full' && '[]' || '[{"bun":"1.4.0"}]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        timeout-minutes: 2
         with:
           bun-version: ${{ matrix.bun }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
       - run: bun scripts/native/verify.ts
+        timeout-minutes: 1
       - name: Compare cmdlet and direct dotnet ACL programs
+        timeout-minutes: 7
         shell: bash
         env:
           GBRAIN_CI_DISABLE_TEST_ENV_FILE: '1'

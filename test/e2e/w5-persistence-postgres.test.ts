@@ -5,13 +5,14 @@
  */
 import { describe, test } from 'bun:test';
 import {
-  capacityWarnsAndRefusalNamesTheKey, compactionSkipsUnfinishedReceipts, failuresDoNotCarryToAnotherTarget, healthyScanAndContentionNeverPark,
+  capacityWarnsAndRefusalNamesTheKey, compactionSkipsUnfinishedReceipts, failuresDoNotCarryToAnotherTarget, healthyScanAndContentionNeverPark, ignoredTargetParksAtOnce,
   managedStaleSweep, managedStaleSweepKeepsNormalizedTimeline, managedStaleSweepManyPages, scanParksOneTargetAndContinues, singleTargetParksAndRetries, staleExtractionWithheldWhenItCannotRun,
 } from '../helpers/w5-scenarios.ts';
 
 const url = process.env.DATABASE_URL;
 describe.skipIf(!url)('Postgres managed capacity, parking and stale extraction', () => {
   test('a failing Git target parks and retries', () => singleTargetParksAndRetries(url), 180_000);
+  test('a gitignored Git target parks at once and retries in bulk', () => ignoredTargetParksAtOnce(url), 180_000);
   test('a Git scan parks one target and continues', () => scanParksOneTargetAndContinues(url), 180_000);
   test('failures do not carry to another target', () => failuresDoNotCarryToAnotherTarget(url), 180_000);
   test('a healthy scan and contention never park', () => healthyScanAndContentionNeverPark(url), 180_000);

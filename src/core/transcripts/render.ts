@@ -30,8 +30,8 @@
  * per-session id would make parts 2..N skip as cross-slug duplicates.
  */
 
+import { gbrainPath } from '../config.ts';
 import { dumpFrontmatterYaml } from '../data-frontmatter.ts';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_BYTES_WARN } from '../content-sanity.ts';
 import { applyRedaction, planRedaction, type EchoDictionary, type RedactionPlan } from '../secret-scan.ts';
@@ -82,7 +82,7 @@ export const TRANSCRIPT_IMPORT_VERSION = 1;
 
 /** Default user-pattern file — the same convention skillpack harvest uses. */
 export function defaultUserPatternsPath(): string {
-  return join(homedir(), '.gbrain', 'harvest-private-patterns.txt');
+  return gbrainPath('harvest-private-patterns.txt');
 }
 
 /**

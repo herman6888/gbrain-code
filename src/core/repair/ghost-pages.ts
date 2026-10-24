@@ -47,7 +47,7 @@ import { authorizeWrite } from '../persistence/authority.ts';
 import { getWorktreeBinding, managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { preparePageMutation } from '../persistence/page-prepare.ts';
-import { readSyncImportProvenance } from '../persistence/sync-holds.ts';
+import { clearDeletionHold, readSyncImportProvenance } from '../persistence/sync-holds.ts';
 import { readRevisionAttestations } from '../persistence/sync-pass.ts';
 import { readDeletionProvenance } from '../persistence/sync-origin-evidence.ts';
 import { maintenancePreflight, submitMaintenanceIntent } from '../persistence/prepared-maintenance.ts';
@@ -315,5 +315,10 @@ export async function prepareGhostPageRetirement(engine: BrainEngine, row: Write
   const page = await preparePageMutation(engine, { ...row, operation: 'delete_page' }, config, undefined, undefined, { allowMissingFile: true });
   if (!page.file || relative(page.file.root, page.file.path).split(sep).join('/') !== ghost.path) throw refuse(changed('its canonical file target moved'));
   if (page.file.expectedBeforeHash !== null) throw refuse(restored(ghost));
-  return { ...page, validate: async tx => { await page.validate?.(tx); await authorizeWrite(tx, row.authority, 'delete_page', row.slug); } };
+  return { ...page, validate: async tx => { await page.validate?.(tx); await authorizeWrite(tx, row.authority, 'delete_page', row.slug); },
+    // GBRA-133: the soft delete is the decision a held deletion of this file waited for, so its hold clears with it.
+    apply: async (tx, preimage) => {
+      const outcome = await page.apply(tx, preimage);
+      return await clearDeletionHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: ghost.path }) ? { ...outcome, hold_cleared: true } : outcome;
+    } };
 }

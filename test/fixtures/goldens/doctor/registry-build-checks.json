@@ -346,6 +346,10 @@
         "name": "pglite_scale"
       },
       {
+        "category": "brain",
+        "name": "derived_visibility"
+      },
+      {
         "category": "ops",
         "name": "rls"
       },
@@ -440,10 +444,6 @@
       {
         "category": "brain",
         "name": "timeline_history"
-      },
-      {
-        "category": "brain",
-        "name": "derived_visibility"
       },
       {
         "category": "brain",
@@ -916,6 +916,10 @@
       {
         "category": "ops",
         "name": "runtime_build_skew"
+      },
+      {
+        "category": "ops",
+        "name": "cli_socket_refusals"
       },
       {
         "category": "brain",

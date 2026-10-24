@@ -108,7 +108,7 @@
    "SELECT COALESCE((completed_keys->0->>'count')::int,0) AS count FROM op_checkpoints WHERE op=$1 AND fingerprint=$2",
    "INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()",
    "SAVEPOINT gbrain_nested_1",
-   "SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR SHARE",
+   "SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR KEY SHARE",
    "SELECT completed_keys->0 AS value, updated_at FROM op_checkpoints WHERE op=$1 AND fingerprint=$2",
    "(SELECT r.request_id::text AS request_id FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL LIMIT 1) UNION ALL (SELECT r.request_id::text FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running','recovering') AND r.request_id<>$2::uuid AND r.intent->>'kind' IN ('managed_sync_import','managed_sync_delete','managed_sync_checkpoint') LIMIT 1) LIMIT 1",
    "SELECT GREATEST((SELECT max(sequence) FROM persistence_requests WHERE worktree_id=$1::uuid), (SELECT max(sequence) FROM persistence_requests WHERE worktree_id IS NULL AND source_id=$2 AND source_incarnation=$3::uuid))::text AS hwm",
@@ -132,7 +132,7 @@
  },
  "postgres": {
   "put_page": [
-   "begin",
+   "BEGIN READ WRITE",
    "SELECT set_config('idle_in_transaction_session_timeout',$3,true),set_config('gbrain.persistence_protocol','2',true),set_config('synchronous_commit','on',true), set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),(SELECT brain_id::text FROM persistence_brain WHERE singleton=1 FOR SHARE) AS brain",
    "SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE",
    "SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path, s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state, h.local_path,h.coordination_path,h.git_durability,w.manifest->>'prepared_at' AS prepared_at FROM persistence_source_bindings s JOIN persistence_worktrees w ON w.id=s.worktree_id LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid WHERE s.source_id=$1",
@@ -191,7 +191,7 @@
    "commit"
   ],
   "canonical_import": [
-   "begin",
+   "begin read write",
    "SELECT set_config('idle_in_transaction_session_timeout',$3,true),set_config('gbrain.persistence_protocol','2',true),set_config('synchronous_commit','on',true), set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),(SELECT brain_id::text FROM persistence_brain WHERE singleton=1 FOR SHARE) AS brain",
    "SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE",
    "SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path, s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state, h.local_path,h.coordination_path,h.git_durability,w.manifest->>'prepared_at' AS prepared_at FROM persistence_source_bindings s JOIN persistence_worktrees w ON w.id=s.worktree_id LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid WHERE s.source_id=$1",
@@ -239,7 +239,7 @@
    "SELECT k.row_num FROM takes k JOIN jsonb_to_recordset($2::text::jsonb) AS n(row_num integer,claim text,kind text,holder text) ON n.row_num=k.row_num WHERE k.page_id=$1 AND (k.claim,k.kind,k.holder) IS DISTINCT FROM (n.claim,n.kind,n.holder) ORDER BY k.row_num LIMIT $3",
    "DELETE FROM takes WHERE page_id=$1 AND row_num=ANY($2::integer[])",
    "savepoint \"s0\"",
-   "SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR SHARE",
+   "SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR KEY SHARE",
    "SELECT completed_keys->0 AS value, updated_at FROM op_checkpoints WHERE op=$1 AND fingerprint=$2",
    "(SELECT r.request_id::text AS request_id FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL LIMIT 1) UNION ALL (SELECT r.request_id::text FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running','recovering') AND r.request_id<>$2::uuid AND r.intent->>'kind' IN ('managed_sync_import','managed_sync_delete','managed_sync_checkpoint') LIMIT 1) LIMIT 1",
    "SELECT GREATEST((SELECT max(sequence) FROM persistence_requests WHERE worktree_id=$1::uuid), (SELECT max(sequence) FROM persistence_requests WHERE worktree_id IS NULL AND source_id=$2 AND source_incarnation=$3::uuid))::text AS hwm",

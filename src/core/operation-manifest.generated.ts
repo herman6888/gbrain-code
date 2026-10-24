@@ -3640,7 +3640,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "limit": {
         "type": "number",
-        "description": "Max results (default: 50)"
+        "description": "Max results (default 50); MCP callers are capped at 500 per call."
+      },
+      "cursor": {
+        "type": "string",
+        "description": "next_cursor from the last job of the previous page (it carries truncated: true): returns the next older jobs."
       },
       "fields": {
         "type": "array",

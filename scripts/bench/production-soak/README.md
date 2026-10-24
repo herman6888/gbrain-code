@@ -15,6 +15,7 @@ Weekly (and on dispatch) in `.github/workflows/production-soak.yml`; never in th
 | `lib.ts` | Topology: Postgres, a session-mode PgBouncer capped at 25 clients (the 26th is refused, the EMAXCONNSESSION shape), a transaction-mode PgBouncer, and toxiproxy latency in front of both. `database_url` is the transaction lane and `GBRAIN_DIRECT_DATABASE_URL` the session lane. |
 | `soak.ts` | The production topology for `--hours`: one resident `gbrain serve --http` that owns sync (`sync.on_commit=true`), one `gbrain jobs work`, MCP stdio readers (warm, remote callers), CLI readers (cold), an external writer committing named paths every few minutes, put/remember through CLI and MCP, `extract --stale` and `embed --stale`, and samplers. |
 | `scoreboard.ts` | Turns `events.jsonl` into `scoreboard.json` and `scoreboard.md`; `--combine <dir>` merges cells. |
+| `stage-probe.ts` | On a loaded brain (`--work` with `ready.json`): one warm stdio `gbrain serve` behind the topology at `--rtt-ms`, the mock embedder and reranker, and `--n` search calls whose `_meta.retrieval.timings` (stage and part medians) are written to `<out>/calls.jsonl` and summarized; `--trace` also records every statement (`GBRAIN_SQL_TRACE`). Where the server stage of a warm search spends its time at scale. |
 | `run.sh`, `vm-setup.sh`, `ubicloud.sh` | One cell end to end; VM bootstrap; one Ubicloud VM per latency with an expiring name. |
 
 ## Scoreboard

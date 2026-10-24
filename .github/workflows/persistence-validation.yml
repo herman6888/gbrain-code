@@ -371,18 +371,26 @@ jobs:
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
       # The service password reaches every client through PGPASSWORD, so the URLs carry none.
-      # Named exception (docs/TESTING.md#event-parity): ROBOT_SECONDS is 150 on pull
-      # requests and merge-queue runs; pushes to master, the nightly Test schedule and
-      # manual runs cover the 600 s budget that crashes every seam.
+      # Every run executes a fixed schedule list (scripts/persistence/robot-driver.ts
+      # ROBOT_RANDOM_SEEDS), so a passed run of a tree stands for any run of it and a
+      # master push may reuse it. ROBOT_SECONDS is the ceiling a run fails past, sized
+      # from ubicloud-standard-4 measurements (docs/ci-event-parity.md#crash-robot-ceilings):
+      # 820 s PGLite and 620 s Postgres on pull requests and merge-queue runs (named exception,
+      # docs/TESTING.md#event-parity: scope pr skips the Postgres lease-bound seams),
+      # 1200 s PGLite and 880 s Postgres elsewhere. The nightly Test schedule adds that
+      # day's exploration seeds. Each cell writes its share of the ceiling to the job summary.
       - name: Crash every reachable seam of the generated sequences
         env:
           PGPASSWORD: gbrain_test
           DATABASE_URL: postgres://gbrain_test@127.0.0.1:5432/gbrain_test
           GBRAIN_PGBOUNCER_URL: postgres://gbrain_test@127.0.0.1:55433/gbrain_test
-          ROBOT_SECONDS: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '150' || '600' }}
+          ROBOT_SCOPE: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'pr' || 'full' }}
+          ROBOT_SECONDS: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (matrix.engine == 'postgres' && '620' || '820') || (matrix.engine == 'postgres' && '880' || '1200') }}
+          ROBOT_EXPLORE: ${{ github.event_name == 'schedule' && 'nightly' || '' }}
         run: >-
           bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
-          --schedules=0 --operations=0 --no-crashes --robot-seconds="$ROBOT_SECONDS"
+          --schedules=0 --operations=0 --no-crashes --robot-scope="$ROBOT_SCOPE" --robot-seconds="$ROBOT_SECONDS"
+          ${ROBOT_EXPLORE:+--explore-day=$(( $(date -u +%s) / 86400 ))}
           --manifest=.context/persistence-robot.json
       - name: Replay every shrunk crash-robot failure and the history fixture
         timeout-minutes: 10

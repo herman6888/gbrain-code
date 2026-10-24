@@ -91,7 +91,7 @@ export interface ManagedSyncWriteDiagnostic {
   write_request: WriteReceipt;
   line_endings?: 'crlf_lf_only';
   ledger_recorded?: boolean;
-  detail?: string;
+  detail?: string; /** GBRA-133 PR 3a: a pass checkpoint the pass's end superseded (sync-checkpoint-replaced.ts). */ disposition?: 'superseded';
   docs?: string;
 }
 
@@ -463,7 +463,7 @@ async function freezeEntryOnce(engine: BrainEngine, cursor: Cursor, key: string,
     // #6712 PR 1: an import whose page moved since its file was last imported runs only as a proven no-op (sync-prescreen.ts).
     if (entry.drift && !occupantRebound && content !== null && snapshot && !(image ? sameImageBytes(imageBytes, snapshot.page)
       : await sameContentAtOrigin(engine, cursor, entry, key, snapshot, content, rawHash, lineEndingOnly, run.signal) || await sameContentAtOrigin(engine, cursor, entry, key, snapshot, driftBaselineContent(cursor.gitRoot, entry), null, false, run.signal, true))) {
-      if (!holdsOn) throw syncRunRefusal('file_drift', 'An import would overwrite a database version of the page that sync never saw.', retry, `Page ${slug} in source ${cursor.sourceId} changed in the database since ${entry.path} was last imported, and the file differs from it, so the run stopped before admitting it (sync.holds=fail).`);
+      if (!holdsOn) throw syncRunRefusal('file_drift', 'An import would overwrite a database version of the page that sync never saw.', retry, `Page ${slug} in source ${cursor.sourceId} ${entry.drift === 'unknown' ? `differs from ${entry.path} and has no import record to tell whether the file or the database changed` : `changed in the database since ${entry.path} was last imported, and the file differs from it`}, so the run stopped before admitting it (sync.holds=fail).`);
       const proof = await pageChangeProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pageId, expectedRevision: null }); assertActive();
       return { hold: fileDriftHold(entry, slug, pageId, frozenIntent, { sides: entry.drift, revision: snapshot.revision, proof, sharedOrigin: await sharedOriginSurvivor(engine, cursor.sourceId, entry.sourcePath) }) };
     }
@@ -784,8 +784,8 @@ async function settleFailedRequest(engine: BrainEngine, input: { cursor: Cursor;
   if (converted === 'pending') return { result: result(cursor, 'partial', input.signal?.aborted ? 'timeout' : 'writer_pending') };
   if (converted && 'tripped' in converted) return { result: breakerResult(converted.tripped, pending, done, remote) };
   if (converted) { input.assertActive(); return { cursor: converted }; }
-  // #6513: a checkpoint another run superseded records nothing; this run goes on with the winning cursor as it stands.
-  if (checkpointSuperseded(pending, done)) return { cursor: await currentCursor(engine, key, cursor) };
+  // #6513: a checkpoint another run superseded records nothing; this run goes on with the winning cursor (GBRA-133 PR 3a: a pass's ends; the next pass stamps).
+  if (checkpointSuperseded(pending, done)) return pending.intent.passId ? { result: result(cursor, 'partial', 'writer_pending') } : { cursor: await currentCursor(engine, key, cursor) };
   const rootCause = await syncRootCause(engine, cursor, pending, done);
   const { failure, ledgerRecorded } = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
     code: done.error_code ?? (done.state === 'cancelled' ? 'cancelled' : 'storage_error'), message: done.error_message ?? 'The accepted sync request did not commit.',

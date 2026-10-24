@@ -39,6 +39,7 @@ import { stripChunkHeader } from '../chunkers/code.ts';
 import { OperationError } from '../ops/contract.ts';
 import { blockDateHeaders, evidenceDateHeaderEnabled } from './evidence-date.ts';
 import { cutWholePages, resolvePageRankCut, type PageRankCut, type PageRankCutMeta } from './page-rank-cut.ts';
+import { evidenceTailTrimEnabled, trimEvidenceTail, type TailTrimMeta } from './evidence-tail-trim.ts';
 export { pagePlanHits } from './page-plan-hits.ts';
 import { applyEffectiveDate } from '../utils.ts';
 import { configPacking, MIN_EXPLICIT_AUTO_BUDGET, parseAutoPacking, type AutoPacking } from './evidence-packing.ts';
@@ -119,6 +120,8 @@ export interface DeliveryMeta {
   auto_packing?: AutoPacking;
   /** W5: present when `search.page_rank_cut` cut the page candidates (page-rank-cut.ts). */
   page_rank_cut?: PageRankCutMeta;
+  /** Present when `search.evidence_tail_trim` ran on this delivery (evidence-tail-trim.ts). */
+  tail_trim?: TailTrimMeta;
 }
 
 export type DeliveredSearchResult = SearchResult & { delivered: DeliveredEvidence };
@@ -141,6 +144,8 @@ export interface EvidencePlan {
   longPage?: LongPagePolicy;
   /** W5: page unit + caller budget + `search.page_rank_cut: whole_pages` (page-rank-cut.ts). */
   rankCut?: PageRankCut;
+  /** `auto` with `search.evidence_tail_trim` on: low-scoring conversation blocks past the top 3 are dropped (evidence-tail-trim.ts). */
+  tailTrim?: true;
 }
 
 /** The cap runs only under `auto`, with a budget the caller passed and a packing other than `off`. */
@@ -286,6 +291,7 @@ export async function resolveEvidencePlan(engine: BrainEngine, input: ResolvePla
     ...(budgetClamped ? { budgetClamped } : {}),
     ...(await evidenceDateHeaderEnabled(engine) ? { dateHeader: true as const } : {}),
     ...(rankCut ? { rankCut } : {}),
+    ...(unit === 'auto' && await evidenceTailTrimEnabled(engine) ? { tailTrim: true as const } : {}),
   };
 }
 
@@ -1164,6 +1170,8 @@ export interface DeliverOptions {
   timeoutMs?: number;
   /** F2: the long pages selectLongPages chose for these hits (search/query only). */
   longPages?: LongPageSelection;
+  /** The request's query: the tail trim's query-term guard reads it, and the trim never runs without it. */
+  query?: string;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -1360,6 +1368,11 @@ export async function deliverEvidence(
     results = ranked.sort((a, b) => a.rank - b.rank).map(x => x.r);
   }
 
+  let tailTrim: TailTrimMeta | undefined;
+  if (plan.tailTrim && opts.query) {
+    ({ results, meta: tailTrim } = trimEvidenceTail(results, opts.query));
+    if (tailTrim.dropped > 0) dropped.tail_trim = tailTrim.dropped;
+  }
   const tokensDelivered = results.reduce((n, r) => n + r.delivered.tokens, 0);
   const budgetUsed = tokensDelivered + results.reduce((n, r) => n + countEvidenceTokens(r.title ?? '', tokenizer), 0);
   const droppedTotal = Object.values(dropped).reduce((n, v) => n + v, 0);
@@ -1380,6 +1393,7 @@ export async function deliverEvidence(
     ...(capped ? { auto_packing: plan.packing } : {}),
     ...(plan.dateHeader ? { date_header: true as const } : {}),
     ...(rankCutMeta ? { page_rank_cut: rankCutMeta } : {}),
+    ...(tailTrim ? { tail_trim: tailTrim } : {}),
   };
   return { results: capped ? capEvidenceToBudget(results, delivery) : results, delivery };
 }
@@ -1563,7 +1577,8 @@ export function unsupportedDelivery(plan: EvidencePlan, reason: string): Deliver
 // Frozen-candidate interface (gbrain-evals E1/E3 parity)
 // ---------------------------------------------------------------------------
 
-export interface FrozenHit { source_id: string; slug: string; chunk_id: number }
+/** `score` (library only): the hit's search score, so the tail trim can run on a frozen list. */
+export interface FrozenHit { source_id: string; slug: string; chunk_id: number; score?: number }
 
 export interface AssembleEvidenceInput {
   hits: FrozenHit[];
@@ -1578,6 +1593,8 @@ export interface AssembleEvidenceInput {
    * evaluation can compare packings on one frozen hit list.
    */
   auto_packing?: AutoPacking;
+  /** Library only: the query the hits answered (the tail trim's guard reads it). */
+  query?: string;
 }
 
 export interface AssembleEvidenceOutput {
@@ -1636,7 +1653,7 @@ export async function resolveFrozenHits(
       chunk_source: (r.chunk_source ?? 'compiled_truth') as SearchResult['chunk_source'],
       chunk_id: r.chunk_id == null ? 0 : Number(r.chunk_id),
       chunk_index: r.chunk_index == null ? 0 : Number(r.chunk_index),
-      score: 0,
+      score: Number.isFinite(h.score) ? h.score! : 0,
       stale: false,
     };
     // The page date, normalized exactly as live search rows are, so frozen
@@ -1683,7 +1700,7 @@ export async function assembleEvidenceForHits(engine: BrainEngine, input: Assemb
     const out = redactRetrievalOutput(rows, {});
     return { results: out.results, delivery: null, unresolved };
   }
-  const d = await deliverEvidence(engine, rows, plan, scope, { liveHits: true });
+  const d = await deliverEvidence(engine, rows, plan, scope, { liveHits: true, ...(input.query ? { query: input.query } : {}) });
   const out = redactRetrievalOutput(d.results, d.delivery);
   return { results: capEvidenceToBudget(out.results, out.meta), delivery: out.meta, unresolved };
 }

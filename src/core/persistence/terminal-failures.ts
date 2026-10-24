@@ -26,6 +26,7 @@ import { isStatementTimeout } from './bounded-reads.ts';
 import { readSchemaBehind } from './schema-admission.ts';
 import { readReceiptRetentionDays, DEFAULT_RECEIPT_RETENTION_DAYS } from './limits.ts';
 import { MANAGED_SYNC_PASS_OP } from './sync-pass-row.ts';
+import { SYNC_PASS_SUPERSEDED } from './sync-checkpoint-replaced.ts';
 import type { PublicCategory } from './public-category.ts';
 import { classifyTerminal, dispositionOf, driftSinceAction, TERMINAL_FIXED_IN, supersessionOrderSql, supersessionSql, terminalInspectArgv, terminalKnockOnSql, type TerminalCategory,
   type TerminalDisposition, type TerminalVerdict, CONNECTION_MESSAGE_PATTERN, LEGACY_PUBLICATION_PREFIX } from './terminal-classify.ts';
@@ -145,7 +146,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
     ), resolved AS (
       SELECT r.id FROM base r WHERE NOT r.has_recovery AND EXISTS (SELECT 1 FROM persistence_requests c WHERE ${supersessionSql('r', 'c')})
     ), tagged AS (
-      SELECT b.*, (x.id IS NOT NULL) AS resolved, (b.has_recovery OR b.ended_at > now()-($3::int*interval '1 day')) AS in_window, ${HISTORICAL_BY_BUILD('b')} AS historical_build
+      SELECT b.*, (x.id IS NOT NULL OR (NOT b.has_recovery AND b.error_code='${SYNC_PASS_SUPERSEDED}')) AS resolved, (b.has_recovery OR b.ended_at > now()-($3::int*interval '1 day')) AS in_window, ${HISTORICAL_BY_BUILD('b')} AS historical_build
       FROM base b LEFT JOIN resolved x ON x.id=b.id
     )
     SELECT GROUPING(state) AS set, source_id, state, error_code, origin, reason, cause, operation, intent_kind, has_recovery, blocked_reason, compacted, knock_on, routed_message, build, resolved,
@@ -342,7 +343,8 @@ export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailu
       scanned++;
       cursor = row.sequence;
       const v = verdictOf(row, schemaBehind);
-      const disposition = dispositionOf(row.later_state ? { state: row.later_state, same_intent: row.same_intent === true } : null);
+      // GBRA-133 PR 3a: a pass checkpoint whose pass ended is superseded by construction (the next pass stamps its own).
+      const disposition = row.error_code === SYNC_PASS_SUPERSEDED ? 'superseded' : dispositionOf(row.later_state ? { state: row.later_state, same_intent: row.same_intent === true } : null);
       const historical = !row.has_recovery && (disposition !== 'unknown' || v.historical);
       const matches = (!q.category || v.category === q.category) && (!q.code || v.code === q.code)
         && (q.origin === undefined || (v.origin ?? NO_ORIGIN) === q.origin) && (state === 'all' || !historical);

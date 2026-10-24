@@ -1,9 +1,8 @@
 # Testing (gbrain repo)
 
-This is the contributor reference for how gbrain is tested: which lanes exist,
-what each one proves, how CI runs them, and the guards that keep those claims
-honest. It describes current behavior and invariants only. Release history
-lives in `CHANGELOG.md`; per-file detail lives in the test files and in
+How gbrain is tested: which lanes exist, what each proves, how CI runs them and
+the guards that keep those claims honest. Current behavior and invariants only:
+history lives in `CHANGELOG.md`, per-file detail in the tests and
 `docs/architecture/KEY_FILES.md`.
 
 ## Quick start
@@ -16,9 +15,8 @@ runner validates Bun's JUnit reports with the standard-library XML parser).
 bun install --frozen-lockfile && bun run test && bun run verify
 ```
 
-`bun run test` is the parallel unit loop plus the serial pass (a few minutes on
-a laptop); `bun run verify` is CI's guard battery (about a minute). For E2E,
-follow [E2E test DB lifecycle](#e2e-test-db-lifecycle-always-follow-this) and
+`bun run test` is the parallel unit loop plus the serial pass; `bun run verify`
+is CI's guard battery (about a minute). For E2E, follow [E2E test DB lifecycle](#e2e-test-db-lifecycle-always-follow-this) and
 run `DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run test:e2e`.
 `bun run ci:local` runs the whole CI gate in Docker; `bun run ci:ubicloud` runs
 it on ephemeral VMs in about five minutes.
@@ -215,6 +213,7 @@ JSONB, locking and pooler behavior are not established by a PGLite pass.
 | Keyless behavior, structural guards and shared contracts | Unit shards and `verify` in `test.yml`; process-isolated serial and dedicated slow lanes where required | Real PostgreSQL, native activation or compiled behavior |
 | PostgreSQL behavior and engine parity | Selected E2E and named jobs in `e2e.yml`; the complete nightly runner corpus | Execution of key-gated or native-door assertions merely because their files were discovered |
 | Durable publication and recovery under sustained load | `persistence-validation.yml` and `scripts/persistence/README.md` | Power-loss safety, production authentication or equivalence to two smaller databases |
+| All interleavings of a TLA+ model | `tla-spec.yml`, `spec/tla/README.md` | Behavior outside the model |
 | Native lock ABI and compiled-process exclusion | `native-locks.yml`, compiled smoke and release validation | All compiled CLI features or native-harness activation |
 | Browser journeys | Required `admin-browser` job and `admin/e2e/*.pw.ts` | Vendor-native agent behavior |
 | Native agent doors and heavier operational scenarios | Explicit jobs in `heavy-tests.yml` | A passing skipped door or generic protocol test is not native activation |

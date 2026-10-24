@@ -12,6 +12,7 @@ import { basename, extname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
 import { classifyImportHold, parseMarkdown, resolveParsedSubtype, type ParseOpts, type ParsedMarkdown } from './markdown.ts';
+import { alignWithStored } from './persistence/align-stored.ts';
 import { CODE_FILE_MAX_BYTES, isLargePageBytes } from './page-size-policy.ts';
 import { importSizeLimit, MAX_FILE_SIZE, screenImportContent, settleContentDisposition, stripGateOwnedMarkers, type ContentRefusal, type FenceScreen } from './import-screen.ts';
 import type { WriteGateAssessment, WriteGateInput } from './write-gate.ts';
@@ -477,11 +478,9 @@ export async function importFromContent(
   // means "preserve the stored type", not "re-infer". Pre-fix, a round-trip
   // put (get_page → edit body → put_page without `type:`) silently regressed
   // a curated type to the path-inferred default ('concept' for bare slugs).
-  // Explicit frontmatter type stays an override; new pages still infer.
-  if (parsed.typeExplicit !== true && existing) {
-    parsed.type = existing.type;
-  }
-  resolveParsedSubtype(parsed, existing);
+  // Explicit frontmatter type stays an override; new pages still infer. The stored subtype and grandfather stamp are kept too.
+  if (existing) alignWithStored(parsed, existing, false);
+  else resolveParsedSubtype(parsed, existing);
   // Alias-footgun visibility: an explicit frontmatter `type:` that is an
   // ALIAS of a canonical pack type (or entirely undeclared) is stored
   // literally and never re-normalized — different agents can silently file

@@ -14,6 +14,7 @@ import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSche
 import { startMovementWatch, type MovementWatch } from '../core/persistence/sync-movement.ts';
 import { startServeHeadWatcher } from '../core/serve-head-watcher.ts';
 import { onForwardProgress } from '../core/forward-progress.ts';
+import { foregroundWindow } from '../core/foreground-activity.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
 import {
   installLoopStallWatchdog,
@@ -69,6 +70,18 @@ const PARENT_WATCHDOG_INTERVAL_MS = 5_000;
 // sweep fires after 10–20 min of true inactivity — the armIdle re-arm
 // semantics expressed through the injectable deps.setInterval seam.
 const IDLE_SWEEP_INTERVAL_MS = 10 * 60_000;
+/** GBRA-156: GBRAIN_SWEEP_IDLE_INTERVAL_MS shortens the cadence for benchmarks that force a sweep beside searches (scripts/bench/production-soak/socket-probe.ts); at least 1 s. */
+function idleSweepIntervalMs(): number {
+  const n = Number(process.env.GBRAIN_SWEEP_IDLE_INTERVAL_MS);
+  return Number.isFinite(n) && n >= 1_000 ? Math.floor(n) : IDLE_SWEEP_INTERVAL_MS;
+}
+
+/** GBRA-156: each idle sweep names its start and its duration on stderr, so slow requests can be lined up with it. */
+async function loggedIdleSweep(log: (line: string) => void, run: () => Promise<unknown>): Promise<void> {
+  const startedAt = Date.now();
+  log('[gbrain serve] idle sweep: started');
+  try { await run(); } finally { log(`[gbrain serve] idle sweep: finished in ${Date.now() - startedAt} ms`); }
+}
 
 // Small per-run budget for idle sweeps: the serve must snap back to
 // serving tool calls the moment the client wakes up.
@@ -864,6 +877,7 @@ function installStdioLifecycle(
     });
     let stdinSawData = false;
     let sweepInFlight = false;
+    const sawForeground = foregroundWindow();
     let dataListenerAttached = false;
     idleSweepTimer = deps.setInterval(() => {
       if (shuttingDown) return;
@@ -879,17 +893,16 @@ function installStdioLifecycle(
         dataListenerAttached = true;
         return;
       }
-      if (stdinSawData) { stdinSawData = false; return; } // active — re-arm
-      if (sweepInFlight) return; // never overlap sweeps
-      // Degraded mode (db-availability 4c): background sweeps must not burn
+      if (sawForeground() || stdinSawData) { stdinSawData = false; return; } // active (stdin, or a warm CLI socket request: GBRA-156) — re-arm
+      // Never overlap sweeps. Degraded mode (db-availability 4c): background sweeps must not burn
       // the min-interval reconnect budget — tool calls own recovery.
-      if (isEngineDegradedForServe(engine)) return;
+      if (sweepInFlight || isEngineDegradedForServe(engine)) return;
       sweepInFlight = true;
       Promise.resolve()
-        .then(() => runIdleSweep(engine))
+        .then(() => loggedIdleSweep(deps.log, () => runIdleSweep(engine)))
         .catch(() => { /* idle sweep is best-effort; never kill serve */ })
         .finally(() => { sweepInFlight = false; });
-    }, IDLE_SWEEP_INTERVAL_MS);
+    }, idleSweepIntervalMs());
     (idleSweepTimer as { unref?: () => void } | null)?.unref?.();
   }
 

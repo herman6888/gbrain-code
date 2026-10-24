@@ -749,6 +749,16 @@ More: [docs/guides/write-refusals.md#concurrent_write](../../docs/guides/write-r
 |---|---|---|---|---|---|---|
 | --source and --all-sources were both given. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### connection_inherited_read_only
+
+<a id="connection_inherited_read_only"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The database refused a write as read-only (SQLSTATE 25006): the server connection defaults to read-only transactions, so nothing was written. | default_transaction_read_only is on for that server connection: session state another client set on a connection a transaction-mode pooler shares, a role or database default, or a read-only server. gbrain opens its transactions READ WRITE and runs a refused autocommit statement once more inside one, so a session default alone no longer stops it; a read-only server (a hot standby) still refuses. | Ask the database operator to reset the pooler's server connections (PgBouncer: RECONNECT, or server_reset_query = DISCARD ALL with server_reset_query_always = 1), find the client that issues session-level SET through the pooler (read-only audits belong in BEGIN READ ONLY ... COMMIT), and check ALTER ROLE / ALTER DATABASE ... SET default_transaction_read_only; then retry. Run: gbrain doctor --json | host_admin | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/write-refusals.md#connection_inherited_read_only](../../docs/guides/write-refusals.md#connection_inherited_read_only)
+
 ### connection_lost
 
 <a id="connection_lost"></a>
@@ -1111,6 +1121,16 @@ More: [docs/guides/ambient-recall.md#replay-after-a-degraded-wake](../../docs/gu
 
 More: [docs/guides/troubleshooting.md#doctor-ops-tier](../../docs/guides/troubleshooting.md#doctor-ops-tier)
 
+### drain_holder_stalled
+
+<a id="drain_holder_stalled"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The commit notifier did not wait on a source's drain lease because the process holding it has made no commit or cursor save for 5 minutes; it counts as a failed attempt. | Waiting on a holder that commits nothing kept the source due forever with nothing reported. Counting it as a failed attempt runs the notifier's retry tiers (5 s, 15 s, 1 min, 5 min), so the source reaches notifier_stalled with the sync-now fix in sync status and doctor; a foreground sync follows the holder and takes the source over when its lease lapses. | Read gbrain sync status --source <id> --json (the notifier block and drain_holder name the holder), stop that process if it is wedged, then run gbrain sync --source <id> --no-pull. | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/on-commit-sync.md#notifier-stalled](../../docs/guides/on-commit-sync.md#notifier-stalled)
+
 ### drain_stalled
 
 <a id="drain_stalled"></a>
@@ -1119,7 +1139,7 @@ More: [docs/guides/troubleshooting.md#doctor-ops-tier](../../docs/guides/trouble
 |---|---|---|---|---|---|---|
 | A managed sync drain stopped `blocked` because its head write made no progress (no committed receipt and no step advance) for the whole stall window. | A renewed lease is not progress: the detector keys on the head claim's phase and step. With a live owner on this host the drain prints `stalled <N>s on <step>` from the allowance (budget plus 30 s) and keeps going; it stops only when `persistence.preparation_ceiling_ms` passes without the root being released, or when that owner's heartbeat row reads wedged (`cause: owner_wedged_here`, with the owner's kind, pid and nonce and `retry_after_ms` to the ceiling, after which the owner frees the root and the next pass holds the entry). A lapsed claim (`owner_missing`) stops at once unless this host owns the checkout and a live full consumer can reclaim it, which gets one more window. `drain.stall.cause` names which. | Inspect the writer with gbrain sources writer status --source <id> --json (read-only: the owner process, its step and what it waits on, and the next action). Before the ceiling (`next.safe_to_loop` true) rerun next.command after retry_after_ms; past it, or with a wedged owner, restart the named owner process on the brain host and rerun the same sync. Run: gbrain sources writer status --source '{source_id}' --json | host_admin | `gbrain doctor --only managed_sync_not_moving --json` | 1 | no |
 
-Reasons: `owner_wedged_here`, `owner_missing`, `preparation_overdue`, `publication_overdue`, `no_progress`.
+Reasons: `owner_wedged_here`, `owner_missing`, `preparation_overdue`, `publication_overdue`, `no_progress`, `owner_restart_required`.
 
 More: [docs/guides/write-refusals.md#drain-stalled](../../docs/guides/write-refusals.md#drain-stalled)
 
@@ -1710,6 +1730,14 @@ More: [docs/guides/shared-checkout-git.md#stuck-rebase](../../docs/guides/shared
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The canonical commit is durable locally; its push will retry. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
+
+### git_target_ignored
+
+<a id="git_target_ignored"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A .gitignore rule excludes the canonical file, so its Git effect cannot commit it; the effect parks at once. | The request itself was wrong or no longer matches the brain; nothing was changed. | Remove or narrow the rule and commit that change, then run gbrain sources writer retry-effects <source> --parked-code git_target_ignored; or keep the file out of Git and leave the effect parked. | agent | `repeat the read that failed` | 1 | no |
 
 ### git_target_pending
 
@@ -3519,6 +3547,26 @@ More: [docs/guides/troubleshooting.md#upstream-rewritten](../../docs/guides/trou
 |---|---|---|---|---|---|---|
 | Persistence response exceeds the local transport limit. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### restart_refused
+
+<a id="restart_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `gbrain upgrade` (or `--restart-only`) found a gbrain process on this host it cannot restart onto the new build (a serve or worker started by hand, an autopilot without its service, a running sync, or an MCP server an agent harness started), so it restarted nothing and, before a swap, installed nothing. | A process keeps the build it started with, so restarting only some of them leaves serve, workers and MCP servers on different builds; the upgrade refuses instead of leaving that skew. Each process is named with the exact step that restarts it. | Handle each listed process as the message says (MCP servers only: rerun with --stop-mcp after the user agrees), then run the same command again; `gbrain upgrade --no-restart` installs without restarting. Run: gbrain upgrade --restart-only --dry-run --json | user | `repeat the read that failed` | 3 | no |
+
+More: [docs/guides/upgrades-auto-update.md#restart](../../docs/guides/upgrades-auto-update.md#restart)
+
+### restart_unverified
+
+<a id="restart_unverified"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| After `gbrain upgrade` restarted this host's gbrain processes, one of them still runs another build, did not come back, or the warm CLI socket refused the new build. | The restart is done only when every gbrain process on the host reports the installed build and serve's warm CLI socket accepts it; anything less is the version skew the restart exists to remove. | Restart each process the message lists with the command the plan printed, then run `gbrain upgrade --restart-only` again. Run: gbrain upgrade --restart-only --dry-run --json | agent | `gbrain doctor --only runtime_build_skew --json` | 1 | no |
+
+More: [docs/guides/upgrades-auto-update.md#restart](../../docs/guides/upgrades-auto-update.md#restart)
+
 ### result_too_large
 
 <a id="result_too_large"></a>
@@ -3943,6 +3991,18 @@ More: [docs/guides/write-refusals.md#slug_page_mismatch](../../docs/guides/write
 |---|---|---|---|---|---|---|
 | Split unparseable. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### stable_channel_unresolved
+
+<a id="stable_channel_unresolved"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `gbrain upgrade --channel stable` (or `self_upgrade.channel stable`) could not name the stable release: the repository's tags could not be read, no release has been promoted to stable yet, or the `stable` tag does not share a commit with a `v<version>` release tag. Nothing was changed. | The stable channel installs only a release a maintainer promoted after the production-shaped soak passed on its exact tree; without that answer it installs nothing rather than guess. | Retry later, or upgrade on the latest channel with `gbrain upgrade --channel latest`. | agent | `gbrain doctor --json` | 1 | no |
+
+Reasons: `unreadable`, `no_stable`, `no_release_tag`.
+
+More: [docs/guides/upgrades-auto-update.md#stable-channel](../../docs/guides/upgrades-auto-update.md#stable-channel)
+
 ### stale_unavailable
 
 <a id="stale_unavailable"></a>
@@ -3990,6 +4050,14 @@ Override: reason `database_contention`: retryable, exit 1, retryable.
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Another sync run of the source replaced the managed-sync cursor before this checkpoint published, so the checkpoint had nothing left to publish. | The replacing run (a rediscovery that retried a recorded failure, or a newer sync of the source) covers the source from its own discovery; the superseded checkpoint's receipt is a conflict, no managed-sync failure is recorded for it, and the run that awaited it goes on with the winning cursor. A same-run index lag still reports revision_conflict. | Nothing to repair: let the current sync finish. gbrain sync status --source <id> --json shows the cursor that now covers the source. | agent | `repeat the read that failed` | 1 | no |
+
+### sync_deadline_stalled
+
+<a id="sync_deadline_stalled"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A gbrain sync reached its progress-aware deadline having committed nothing (no page written, deleted or renamed, no cursor advanced), so it stopped as a stall instead of extending. | The deadline extends only while a run commits work. Screening unchanged files, held files and legacy-sweep slices are not progress, so a run that spends its whole deadline on them reports a stall with its cause instead of "still progressing" or a clean resumable stop; rerunning the same way commits nothing again. | Run gbrain sync status --source <id> --json (read-only): it names the step, holds and last error the source is stuck on. Fix what it names, then rerun the same sync. Run: gbrain sync status --source '{source_id}' --json | agent | `gbrain doctor --json` | 1 | no |
 
 ### sync_drain_lease_held
 
@@ -4052,6 +4120,14 @@ Reasons: `content_directory`.
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Sync stopped because gbrain would hold a file whose exact bytes imported before; this is a gbrain bug. | The upgrade invariant says a newer reader never refuses bytes an older one imported; with `GBRAIN_SYNC_PARSER_REGRESSION=stop` set for the process that syncs (the default holds the file), the run stops without advancing rather than hide a regression. | Report it with the gbrain version, the file and the code; upgrade or pin the last good version, then run gbrain sync --source <id> --no-pull. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### sync_pass_superseded
+
+<a id="sync_pass_superseded"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A sync pass's checkpoint did not publish because the pass that admitted it no longer holds the source (it ended, or another pass started); the next pass stamps its own checkpoint. | A pass's checkpoint is bound to its drain lease and pass row, so it can never publish after that pass ends. Its receipt is a conflict that records no managed-sync failure and reads superseded in gbrain sources writer failures; a pass that stops with the checkpoint still pending reports disposition superseded instead of a request to resume. | Nothing to repair or resubmit: the pages the pass committed stand. Let the next sync pass run (gbrain sync --source <id> --no-pull), and read gbrain sync status --source <id> --json to confirm the source converges. | agent | `repeat the read that failed` | 1 | no |
 
 ### tail_changed
 

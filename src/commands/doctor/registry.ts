@@ -60,6 +60,7 @@ import {
 } from './checks/embedding-health.ts';
 import { projectionResidentEntry } from './checks/projection-readiness.ts';
 import {
+  derivedVisibilityEntry,
   graphCoverageEntry,
   orphanRatioEntry,
   staleMentionsEntry,
@@ -94,6 +95,7 @@ import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { linksExtractionLagEntry, syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
 import { persistenceConsumersEntry, serveBuildDriftEntry } from './checks/persistence-consumers.ts';
 import { runtimeBuildSkewEntry } from './checks/runtime-build-skew.ts';
+import { cliSocketRefusalsEntry } from './checks/cli-socket-refusals.ts';
 import { gitConvergenceEntry } from './checks/git-convergence.ts';
 import { gitWriterEntry } from './checks/git-writer.ts';
 import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
@@ -198,6 +200,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   partialEmbeddingEntry,
   syncLandingGapsEntry,
   pgvectorEntry,
+  // #7276: the privacy check next, with its own entry budget, before any full scan.
+  derivedVisibilityEntry,
   rlsEntry,
   schemaVersionEntry,
   rlsEventTriggerEntry,
@@ -264,6 +268,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   coreMemoryEntry,
   persistenceConsumersEntry,
   runtimeBuildSkewEntry,
+  cliSocketRefusalsEntry,
   atomHeldFailedEntry,
   extractionInputTruncatedEntry,
   ghostPagesEntry,

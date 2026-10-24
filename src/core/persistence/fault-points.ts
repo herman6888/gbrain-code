@@ -100,7 +100,7 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
  */
 /** `writeId` is the write request row: rows of a caller-bound replay share one `requestId` (crash-robot per-request seams key on the row). */
 export interface FaultDetail { requestId?: string; writeId?: string; effectId?: string; sourceId?: string; operation?: string | null; signal?: AbortSignal; slug?: string; path?: string;
-  round?: number; read?: string; level?: { statements: number; confirm: { taken: boolean; reason: string | null; rows: number; narrow?: string } | null; reused?: number;
+  round?: number; read?: string; level?: { statements: number; confirm: { taken: boolean; reason: string | null; rows: number; narrow?: string; across?: true } | null; reused?: number;
     /** `sync:level_read`: the level and the input it was read with (sync-pass.ts `readShadowLevel`), for probes that read it again. */
     shadow?: unknown; input?: unknown } }
 /** Postgres returns `persistence_effects.id` (bigserial) as a BigInt; `faultPoint` hands hooks its decimal string (#6584). */

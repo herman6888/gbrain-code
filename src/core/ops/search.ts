@@ -197,7 +197,7 @@ async function withEvidence(ctx: OperationContext, p: Record<string, unknown>, r
   const deliveryScope = { ...scope, requireSafeChunks: ctx.remote !== false };
   const { plan: applied, longPages } = await selectLongPages(ctx.engine, plan, results, deliveryScope);
   if (!applied) return { rows: results };
-  const d = await deliverEvidence(ctx.engine, results, applied, deliveryScope, { liveHits: meta?.cache?.status !== 'hit', ...(longPages ? { longPages } : {}) });
+  const d = await deliverEvidence(ctx.engine, results, applied, deliveryScope, { liveHits: meta?.cache?.status !== 'hit', ...(longPages ? { longPages } : {}), ...(typeof p.query === 'string' ? { query: p.query } : {}) });
   return { rows: d.results, evidence: { delivery: d.delivery, explicitSnippet: typeof p.snippet_chars === 'number' && Number.isFinite(p.snippet_chars) } };
 }
 
@@ -1304,7 +1304,7 @@ const assemble_evidence: Operation = {
     const scope = await trustedSearchScope(ctx, p, undefined);
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
     const out = await assembleEvidenceForHits(ctx.engine, {
-      hits: hits as FrozenHit[],
+      hits: (hits as FrozenHit[]).map(h => ({ source_id: h.source_id, slug: h.slug, chunk_id: h.chunk_id })),
       return_unit: (p.return_unit as ReturnUnit | undefined) ?? 'page',
       return_window: p.return_window as number | undefined,
       budget_tokens: p.token_budget as number | undefined,

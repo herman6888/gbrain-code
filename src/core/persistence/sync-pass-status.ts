@@ -14,7 +14,11 @@ import { ABANDONED_QUIET_MS, ABANDONED_REPORT_STREAK, NOT_CONVERGED_REPORT_STREA
 
 export interface PassConvergence {
   schema: 'convergence/1'; dry_run: false; source_id: string;
-  pass_id: string; kind: string; outcome: string; stop_reason: string | null; target: string; converged_at: string | null;
+  /**
+   * `target` is the commit the newest pass pinned (its telemetry), not a converged state. #7243: `converged_target` is the
+   * commit the stored converged obligation records (the last stamp), null while no stamp backs one (a stuck source that never converged).
+   */
+  pass_id: string; kind: string; outcome: string; stop_reason: string | null; target: string; converged_target: string | null; converged_at: string | null;
   round: number; candidates: number; settled: number; remaining: number; eta_seconds: null; eta_reason: 'pass_round_local';
   counts: Record<string, number>;
   decisions: { both: number; unknown: number; deleted: number };
@@ -41,7 +45,7 @@ export async function passConvergence(engine: Pick<BrainEngine, 'executeRaw'>, i
   const summary = t.summary ?? { db_ahead: { pending: 0, db_only: 0, unproven: 0, by_prefix: {} }, full_skipped_db_ahead: 0, legacy_unverified: 0, legacy_pageless: 0 };
   const episode = o.episode;
   return { schema: 'convergence/1', dry_run: false, source_id: input.sourceId, pass_id: t.pass_id, kind: t.kind, outcome: t.outcome, stop_reason: t.stop_reason, target: t.target,
-    converged_at: o.converged?.at ?? null, round: t.round, candidates: t.candidates, settled: t.settled, remaining: t.remaining, eta_seconds: null, eta_reason: 'pass_round_local',
+    converged_target: o.converged?.target ?? null, converged_at: o.converged?.at ?? null, round: t.round, candidates: t.candidates, settled: t.settled, remaining: t.remaining, eta_seconds: null, eta_reason: 'pass_round_local',
     counts: t.counts, decisions, db_ahead: summary.db_ahead, full_skipped_db_ahead: summary.full_skipped_db_ahead, legacy_unverified: summary.legacy_unverified,
     legacy_pageless: summary.legacy_pageless, keep_db_admitted: t.counts.keep_db_admitted ?? 0, keep_db_pending: t.counts.keep_db_pending ?? 0,
     deletes_withheld: withheld ? { count: withheld.count, ratio: withheld.ratio, set_hash: withheld.set_hash, samples: withheld.samples } : null,

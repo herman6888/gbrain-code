@@ -58,6 +58,8 @@ import type { ScopedReadRunner } from './cjk-search.ts';
  */
 export type SearchTitlesRunDialect = Omit<SearchTitlesDialect, 'chunkManifest'> & {
   chunkManifest?: (exec: ScopedRead) => Promise<boolean>;
+  /** Transaction-local settings for every attempt (Postgres: the keyword statement's work_mem, so a common term's bitmap stays exact). */
+  statementSettings?: Readonly<Record<string, string>>;
 };
 
 export async function searchTitles(
@@ -79,6 +81,7 @@ export async function searchTitles(
     const preferIndex = relaxed && dialect.relaxedPrefersIndex && !statement.safeChunks;
     const settings = {
       ...(dialect.statementTimeout ? { statement_timeout: dialect.statementTimeout } : {}),
+      ...dialect.statementSettings,
       ...(preferIndex ? { enable_seqscan: 'off' } : {}),
     };
     const params = [...statement.params];

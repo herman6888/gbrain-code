@@ -875,7 +875,7 @@ export function durabilityJobStatus(
   }
   let logFresh: boolean | undefined;
   try {
-    const log = join(process.env.HOME || '', '.gbrain', 'brain-pull.log');
+    const log = join(gbrainHome(), 'brain-pull.log');
     if (existsSync(log)) {
       logFresh = Date.now() - statSync(log).mtimeMs <= 2 * intervalSec * 1000;
     }
@@ -912,7 +912,7 @@ function writeCronWrapper(sourceId: string, repoPath: string, branch: string): s
   return wrapper;
 }
 
-export function generateBrainPullPlist(label: string, wrapperPath: string, home: string, intervalSec: number): string {
+export function generateBrainPullPlist(label: string, wrapperPath: string, gbrainDir: string, intervalSec: number): string {
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -921,8 +921,8 @@ export function generateBrainPullPlist(label: string, wrapperPath: string, home:
   <key>Label</key><string>${esc(label)}</string>
   <key>ProgramArguments</key><array><string>${esc(wrapperPath)}</string></array>
   <key>StartInterval</key><integer>${intervalSec}</integer>
-  <key>StandardOutPath</key><string>${esc(home)}/.gbrain/brain-pull.log</string>
-  <key>StandardErrorPath</key><string>${esc(home)}/.gbrain/brain-pull.err</string>
+  <key>StandardOutPath</key><string>${esc(gbrainDir)}/brain-pull.log</string>
+  <key>StandardErrorPath</key><string>${esc(gbrainDir)}/brain-pull.err</string>
 </dict>
 </plist>`;
 }
@@ -949,12 +949,11 @@ export function installDurabilityCron(
     };
   }
   const wrapper = dryRun ? cronWrapperPath(sourceId) : writeCronWrapper(sourceId, repoPath, branch);
-  const home = process.env.HOME || '';
   if (platform === 'darwin') {
     const plistPath = launchdPlistPath(sourceId);
     if (dryRun) return { status: 'fixed', detail: `would install launchd ${cronLabel(sourceId)} every ${intervalSec}s (dry-run)` };
     mkdirSync(dirname(plistPath), { recursive: true });
-    writeFileSync(plistPath, generateBrainPullPlist(cronLabel(sourceId), wrapper, home, intervalSec));
+    writeFileSync(plistPath, generateBrainPullPlist(cronLabel(sourceId), wrapper, gbrainHome(), intervalSec));
     try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* */ }
     try { execSync(`launchctl load "${plistPath}"`, { stdio: 'ignore' }); } catch { /* loaded best-effort */ }
     return { status: 'fixed', detail: `launchd ${cronLabel(sourceId)} every ${intervalSec}s` };

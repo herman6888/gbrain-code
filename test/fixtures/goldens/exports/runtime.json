@@ -926,6 +926,7 @@
         "DEGRADED_CACHE_TTL_SECONDS",
         "PRE_FUSION_POOL_FLOOR",
         "RRF_K",
+        "SUPERSEDE_EDGE_PROBE_SQL",
         "SUPERSEDE_PENALTY",
         "_resetPendingSearchCacheWritesForTests",
         "_resetSupersedeProbeForTests",
