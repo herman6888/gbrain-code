@@ -1142,7 +1142,11 @@ export class PostgresEngine implements BrainEngine {
     const queryExpression = cjkQuery
       ? "plainto_tsquery('simple', gbrain_cjk_search_tokens($1))"
       : `websearch_to_tsquery('${ftsLang}', $1)`;
-    const rankIdx = opts?.rankQuery ? params.push(opts.rankQuery) - 1 : opts?.orFallback ? params.push(params[0]) - 1 : 0;
+    // CJK: ts_rank takes queryExpression (which pins $1), so the rankQuery/
+    // orFallback param would be pushed but never referenced — Postgres then
+    // fails the statement with 42P08 "could not determine data type of
+    // parameter $N" (node-pg sends every pushed param). Skip the push for CJK.
+    const rankIdx = cjkQuery ? 0 : opts?.rankQuery ? params.push(opts.rankQuery) - 1 : opts?.orFallback ? params.push(params[0]) - 1 : 0;
 
     const chunk = buildKeywordChunkMatch(ftsLang, opts?.excludePrivate, queryExpression);
     const rawQuery = `

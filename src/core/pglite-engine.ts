@@ -1494,7 +1494,10 @@ export class PGLiteEngine implements BrainEngine {
     const queryExpression = cjkQuery
       ? "plainto_tsquery('simple', gbrain_cjk_search_tokens($1))"
       : `websearch_to_tsquery('${ftsLang}', $1)`;
-    const rankIdx = opts?.rankQuery ? params.push(opts.rankQuery) - 1 : opts?.orFallback ? params.push(params[0]) - 1 : 0;
+    // CJK ranks with queryExpression (pins $1); pushing the rankQuery/
+    // orFallback param without referencing it trips Postgres 42P08
+    // "could not determine data type of parameter" — skip for CJK.
+    const rankIdx = cjkQuery ? 0 : opts?.rankQuery ? params.push(opts.rankQuery) - 1 : opts?.orFallback ? params.push(params[0]) - 1 : 0;
     const rankParam = `$${rankIdx + 1}`;
 
     const keywordSql =
