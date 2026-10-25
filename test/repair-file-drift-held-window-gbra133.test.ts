@@ -153,6 +153,7 @@ for (const backend of testBackends()) describe(`GBRA-133: a held file-drift prev
     const hash = preview.preview_hash!;
     // Git durability is off in this fixture: the preview leads with what the next sync does to an uncommitted recreate.
     expect(preview.warnings![0]).toStartWith('The next sync undoes this repair unless the recreated files are committed');
+    expect(preview.warnings![0]).toEndWith(`Commit them right after the apply: gbrain git commit-push --path ${f.root} -m 'gbrain: repair file drift in ${f.sourceId}' -- ${slugs.map(slug => `${slug}.md`).join(' ')}`);
     expect(preview.details).toMatchObject({ undone_by_next_sync_unless_committed: { recreated: 3, removed: 0 } });
     const command = `gbrain repair file-drift --source ${f.sourceId}`;
     const first = readArtifact(hash, command);

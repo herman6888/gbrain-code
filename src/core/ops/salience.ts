@@ -29,16 +29,18 @@ const get_recent_salience: Operation = {
   description: GET_RECENT_SALIENCE_DESCRIPTION,
   scope: 'read',
   params: {
-    days: { type: 'number', description: 'Window in days (default 14).' },
-    limit: { type: 'number', description: 'Max results (default 20).' },
+    days: { type: 'number', description: 'Default 14.' },
+    limit: { type: 'number', description: 'Default 20.' },
     slugPrefix: {
       type: 'string',
       description: 'Slug prefix.',
+      fullSurfaceOnly: true,
     },
     recency_bias: {
       type: 'string',
       enum: ['flat', 'on'],
       description: 'flat (default) or on (per-prefix decay).',
+      fullSurfaceOnly: true,
     },
   },
   handler: async (ctx, p) => {
@@ -78,10 +80,12 @@ const find_anomalies: Operation = {
     lookback_days: {
       type: 'number',
       description: 'Baseline days (default 30).',
+      fullSurfaceOnly: true,
     },
     sigma: {
       type: 'number',
       description: 'Threshold (default 3).',
+      fullSurfaceOnly: true,
     },
   },
   handler: async (ctx, p) => {

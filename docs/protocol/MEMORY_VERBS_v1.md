@@ -386,9 +386,8 @@ Optional response fields; clients must ignore any they do not know.
 `items` (1 to 20) replaces `fact` for a batch, typically right before
 context compaction. Each item is a fact string or an object with `fact` plus
 optional `entity`, `kind`, `ttl`, `visibility`, `provenance`,
-`infer_entity` and `replaces`; top-level `provenance`,
-`kind`, `ttl`, `visibility` and `infer_entity` are the defaults, so top-level
-`provenance` is optional when every item carries its own. `replaces` names one
+`content_origin`, `valid_from`, `infer_entity` and `replaces`; each but
+`replaces` is also a top-level default for items that omit it, so top-level `provenance` is optional when every item carries its own. `replaces` names one
 fact, so it goes on its item; passing both `fact` and `items`, or a top-level
 `replaces` with `items`, is `invalid_params`.
 

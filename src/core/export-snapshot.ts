@@ -7,6 +7,7 @@ import { isSegmentedPage } from './page-body/page-shape.ts';
 import { openSegmentedBody, readBodyRange, type BodyLedger } from './page-body/read-range.ts';
 import { TIMELINE_SEPARATOR } from './page-window/document.ts';
 import type { Page } from './types.ts';
+import { serializeMarkdown, slugStampedFrontmatter } from './markdown.ts';
 
 const EXPORT_COLLECT_BYTES = 1024 * 1024;
 
@@ -38,6 +39,30 @@ export async function readExportPage(tx: BrainEngine, key: { id: string; source_
     Object.assign(page, await overlayCanonicalBodies(tx.executeRaw.bind(tx), page.compiled_truth, page.timeline, applicableWithdrawals(page.slug, withdrawals)));
   }
   return { page, tags: row.export_tags as string[] };
+}
+
+export type ExportSnapshot = Awaited<ReturnType<typeof readExportPage>>;
+
+/**
+ * The frontmatter and header fields of a page's exported file. #5966: the slug stamp rule lives in
+ * slugStampedFrontmatter (markdown.ts), shared with every render; an escaped file always carries its slug.
+ */
+function exportHeader(snapshot: ExportSnapshot, escaped: boolean) {
+  const { page } = snapshot;
+  const frontmatter = escaped ? { ...(page.frontmatter ?? {}), slug: page.slug } : slugStampedFrontmatter(page.slug, page.frontmatter ?? {});
+  return { frontmatter, meta: { type: page.type, title: page.title, tags: snapshot.tags } };
+}
+
+/** The exported Markdown of an inline page read by readExportPage, so its withdrawal overlay is applied. */
+export function inlineExportMarkdown(snapshot: ExportSnapshot, escaped = false): string {
+  const { frontmatter, meta } = exportHeader(snapshot, escaped);
+  return serializeMarkdown(frontmatter, snapshot.page.compiled_truth, snapshot.page.timeline, meta);
+}
+
+/** The `head` segmentedExportMarkdown starts a segmented page's file with. */
+export function segmentedExportHead(snapshot: ExportSnapshot, escaped = false): string {
+  const { frontmatter, meta } = exportHeader(snapshot, escaped);
+  return serializeMarkdown(frontmatter, '', '', meta).slice(0, -1);
 }
 
 /** The ledger an export overlays one page's body with: the source's withdrawals that apply to the page. */

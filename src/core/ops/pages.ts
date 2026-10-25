@@ -95,15 +95,15 @@ const get_page: Operation = {
   description: 'Read a page; `section` or `grep` reads one part. Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.',
   params: {
     slug: { type: 'string', description: 'Page slug.', required: true },
-    fuzzy: { type: 'boolean', description: 'Fuzzy match.' },
+    fuzzy: { type: 'boolean', description: 'Fuzzy match.', fullSurfaceOnly: true },
     include_content: { type: 'boolean', description: 'Markdown + revision.' },
-    content_only: { type: 'boolean', description: 'Round-trip fields.' },
+    content_only: { type: 'boolean', description: 'Round-trip fields.', fullSurfaceOnly: true },
     ...GET_PAGE_BODY_PARAMS,
-    include_deleted: { type: 'boolean', description: 'Soft-deleted too.' },
-    include_timeline_entries: { type: 'boolean', description: 'Timeline rows.' },
+    include_deleted: { type: 'boolean', description: 'Soft-deleted too.', fullSurfaceOnly: true },
+    include_timeline_entries: { type: 'boolean', description: 'Timeline rows.', fullSurfaceOnly: true },
     grammar_diagnostics: { type: 'boolean', description: 'Also return every line-grammar finding for the page.', fullSurfaceOnly: true },
     source_id: { type: 'string', description: "One source, or '__all__'." },
-    include_quarantined: { type: 'boolean', description: 'Admin: quarantined body.' },
+    include_quarantined: { type: 'boolean', description: 'Admin: quarantined body.', fullSurfaceOnly: true },
     min_trust: MIN_TRUST_PARAM,
     known_as_of: KNOWN_AS_OF_PARAM,
   },
@@ -338,9 +338,9 @@ const put_page: Operation = {
     ...AGENT_CONTENT_PARAMS,
     slug: { type: 'string', description: 'Page slug.', required: true },
     content: { type: 'string', required: true, description: 'Complete markdown (get_page include_content:true).' },
-    allow_empty: { type: 'boolean', required: false, description: 'Allow an empty page.' },
+    allow_empty: { type: 'boolean', required: false, description: 'Allow an empty page.', fullSurfaceOnly: true },
     allow_shrink: { type: 'boolean', required: false, description: 'Allow content under half a >256 KB page. To add text use append_page, not a re-put; a page over one request goes by begin_page_upload.', fullSurfaceOnly: true },
-    drop_timeline: { type: 'boolean', required: false, description: 'No Timeline in content: delete its entries.' },
+    drop_timeline: { type: 'boolean', required: false, description: 'No Timeline in content: delete its entries.', fullSurfaceOnly: true },
     wait_ms: WRITE_WAIT_PARAM,
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
@@ -348,9 +348,9 @@ const put_page: Operation = {
     // server stamps below; the params are accepted on the wire only so the
     // op schema stays uniform across transports. Audit-trail spoofing is
     // closed structurally — clients cannot poison source_kind labels.
-    source_kind: { type: 'string', description: 'Server-set remotely.', required: false },
-    source_uri: { type: 'string', description: 'Server-set remotely.', required: false },
-    ingested_via: { type: 'string', description: 'Server-set remotely.', required: false },
+    source_kind: { type: 'string', description: 'Server-set remotely.', required: false, fullSurfaceOnly: true },
+    source_uri: { type: 'string', description: 'Server-set remotely.', required: false, fullSurfaceOnly: true },
+    ingested_via: { type: 'string', description: 'Server-set remotely.', required: false, fullSurfaceOnly: true },
   },
   mutating: true,
   scope: 'write',
@@ -506,14 +506,14 @@ const list_pages: Operation = {
   params: {
     type: { type: 'string', description: 'Page type.' },
     tag: { type: 'string', description: 'Tag.' },
-    limit: { type: 'number', description: 'Max rows (default 50; remote max 100).' },
+    limit: { type: 'number', description: 'Remote max 100.' },
     offset: {
-      type: 'number', description: 'Rows to skip.',
+      type: 'number', description: 'Rows to skip.', fullSurfaceOnly: true,
     },
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
-      description: 'Pages updated after this ISO time.',
+      description: 'ISO time.',
     },
     updated_after_slug: {
       type: 'string',
@@ -523,7 +523,7 @@ const list_pages: Operation = {
       type: 'string', description: 'Default updated_desc.',
       enum: [...LIST_PAGES_SORT_VALUES],
     },
-    include_deleted: { type: 'boolean', description: 'Include soft-deleted pages.' },
+    include_deleted: { type: 'boolean', description: 'Include soft-deleted pages.', fullSurfaceOnly: true },
     slug_prefix: { type: 'string', description: "Literal slug prefix, e.g. 'deals/'.", fullSurfaceOnly: true },
     where: WHERE_PARAM,
     // #4400 — list_pages had no source-scoping param at all: unlike
@@ -690,10 +690,10 @@ const capture: Operation = {
   outputRedaction: 'no_stored_text',
   description: CAPTURE_DESCRIPTION,
   params: {
-    ...AGENT_CONTENT_PARAMS,
+    ...AGENT_CONTENT_PARAMS, expected_revision: { ...AGENT_CONTENT_PARAMS.expected_revision, fullSurfaceOnly: true }, force: { ...AGENT_CONTENT_PARAMS.force, fullSurfaceOnly: true },
     ...CAPTURE_EVENT_PARAMS, ...CAPTURE_CLI_PROVENANCE_PARAMS,
     content: { type: 'string', required: true, description: 'Markdown or text (not a file path).' },
-    local_file: { type: 'string', description: 'Local CLI only.', required: false },
+    local_file: { type: 'string', description: 'Local CLI only.', required: false, fullSurfaceOnly: true },
     slug: { type: 'string', required: false, description: 'Default inbox/<date>-<hash>.' },
     type: { type: 'string', required: false, description: 'Page type (default note).' },
   },

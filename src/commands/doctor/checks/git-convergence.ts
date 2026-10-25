@@ -35,6 +35,7 @@ import { existingLocalHostId } from '../../../core/persistence/identity.ts';
 import { gitDurabilityPolicy } from '../../../core/persistence/git-durability-policy.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { doctorVerify } from '../check-fix.ts';
+import { readPorcelain, readUnpushedCommits, type CheckoutCommit, type CheckoutPorcelain } from '../../../core/persistence/checkout-state.ts';
 import { boundUnknownDetails } from '../bounded-unknown.ts';
 
 export const GIT_CONVERGENCE_WARN_MS = 6 * 3_600_000;
@@ -44,7 +45,8 @@ const MAX_ROOTS = 50;
 const MAX_DIRTY_PATHS = 200;
 
 interface RootReport { root: string; source_ids: string[]; branch: string | null; ahead: number; behind: number; dirty: number;
-  oldest_unpushed_at: string | null; oldest_dirty_at: string | null; status: 'ok' | 'warn' | 'fail'; stranded?: true; uncommitted_pages?: string[] }
+  oldest_unpushed_at: string | null; oldest_dirty_at: string | null; status: 'ok' | 'warn' | 'fail'; stranded?: true; uncommitted_pages?: string[];
+  managed?: true; diverged?: true; unpushed_commits?: CheckoutCommit[]; porcelain?: CheckoutPorcelain }
 
 const canonicalPath = (path: string) => { try { return realpathSync(path); } catch { return path; } };
 
@@ -147,6 +149,15 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
   }
   const reports = [...byTop.values()].filter((r): r is RootReport => !('skipped' in r));
   const unwatched = reports.some(r => r.ahead > 0 || tracked.has(r.root)) ? await unwatchedDurableRoots(engine) : new Map<string, string[]>();
+  // Q1 (shape A): on a managed canonical checkout, name each commit the upstream lacks and break the porcelain down; a
+  // diverged one blocks gbrain sources refresh (refresh_diverged), so it warns at once.
+  for (const report of reports) {
+    if (!isManagedFilesystemPath(report.root)) continue;
+    report.managed = true;
+    if (report.ahead) report.unpushed_commits = readUnpushedCommits(report.root);
+    if (report.dirty) report.porcelain = readPorcelain(report.root);
+    if (report.ahead && report.behind) { report.diverged = true; if (report.status === 'ok') report.status = 'warn'; }
+  }
   for (const report of reports) {
     const prefixes = unwatched.get(canonicalPath(report.root));
     if (!prefixes) continue;
@@ -174,7 +185,9 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
   const boundNote = bound ? ` Not every checkout was read: ${bound.note}.` : '';
   if (bound) Object.assign(details, { exact: false, limit: bound.details.limit, timed_out: bound.details.timed_out });
   const lines = bad.map(r => `${r.root}${r.source_ids.length ? ` (${r.source_ids.join(', ')})` : ''}: `
-    + [r.ahead ? `${r.ahead} commit(s) not on the upstream since ${r.oldest_unpushed_at}` : '', r.dirty && r.oldest_dirty_at ? `${r.dirty} uncommitted change(s), oldest from ${r.oldest_dirty_at}` : '']
+    + [r.ahead ? `${r.ahead} commit(s) not on the upstream since ${r.oldest_unpushed_at}` : '', r.diverged ? `diverged (${r.behind} upstream commit(s) not in HEAD)` : '',
+      r.unpushed_commits?.length ? `newest ${r.unpushed_commits[0]!.sha.slice(0, 7)} by ${r.unpushed_commits[0]!.author} at ${r.unpushed_commits[0]!.date} (${r.unpushed_commits[0]!.paths.slice(0, 3).join(', ') || 'no files'})` : '',
+      r.dirty && r.oldest_dirty_at ? `${r.dirty} uncommitted change(s), oldest from ${r.oldest_dirty_at}` : '']
       .filter(Boolean).join('; '));
   // #5808 (#5606 residue): a managed canonical worktree has no bulk push; its owner pushes page writes and the operator pushes the rest.
   const remedy = bad.some(r => isManagedFilesystemPath(r.root))
@@ -200,6 +213,15 @@ export async function gitConvergenceCheck(engine: BrainEngine, now = Date.now())
       message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${stranded.map(r => r.root).join(', ')} ${stranded.length === 1 ? 'is a managed checkout' : 'are managed checkouts'} with Git durability on and no Git effect queued, running or parked, so no effect will push ${stranded.length === 1 ? 'its' : 'their'} commits; push them with the keep-checkout publish, which merges a moved remote in memory and never moves the checkout. ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
       fix: { argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', first.root], consent: [], actor: 'agent', requires_exclusive: false,
         why: `${first.root} has ${first.ahead} commit(s) not on its upstream and no Git effect left to push them (#7089); this publishes the commits already on the branch and commits nothing. A conflict with the remote is reported with the user's choice as its fix.${stranded.length > 1 ? ` ${stranded.length - 1} other checkout(s) need the same, see details.roots (stranded).` : ''}`,
+        verify: doctorVerify('git_convergence') } };
+  }
+  const diverged = bad.find(r => r.diverged);
+  if (diverged) {
+    return { name: 'git_convergence', status, details,
+      message: `Git checkouts have not converged with their upstream: ${lines.join(' | ')}. ${diverged.root} is a managed checkout that diverged from its upstream, so gbrain sources refresh refuses (refresh_diverged) until its local commits are published merged with the upstream; details.roots lists each one (sha, author, date, paths). ${remedy}; this compares with the last fetched upstream and does not fetch.${boundNote}`,
+      fix: { ask_user: true, argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', diverged.root, '--json'], consent: [], actor: 'user', requires_exclusive: false,
+        why: `${diverged.root} holds ${diverged.ahead} commit(s) its upstream lacks while the upstream moved on; this merges the upstream into HEAD in memory, refuses on a conflict, pushes the merge and never moves the checkout, after which gbrain sources refresh fast-forwards. It publishes those commits, so the user reviews them first.`,
+        user_message: `${diverged.root} has ${diverged.ahead} local commit(s) that were never pushed (newest ${diverged.unpushed_commits?.[0]?.sha.slice(0, 7) ?? 'unknown'} by ${diverged.unpushed_commits?.[0]?.author ?? 'unknown'}) while its remote moved on. Push them, merged with the remote, so gbrain can bring the checkout up to date?`,
         verify: doctorVerify('git_convergence') } };
   }
   return { name: 'git_convergence', status, details,

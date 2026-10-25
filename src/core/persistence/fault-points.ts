@@ -100,6 +100,8 @@ export type FaultPoint = `publication:${PublicationBoundary}` | `effect:${Effect
  */
 /** `writeId` is the write request row: rows of a caller-bound replay share one `requestId` (crash-robot per-request seams key on the row). */
 export interface FaultDetail { requestId?: string; writeId?: string; effectId?: string; sourceId?: string; operation?: string | null; signal?: AbortSignal; slug?: string; path?: string;
+  /** The `*_interruption_charged` seams: what was charged and the error it was charged for, so a probe can name a charge it did not expect. */
+  interruption?: { cause: string; sqlstate: string | null; error: string };
   round?: number; read?: string; level?: { statements: number; confirm: { taken: boolean; reason: string | null; rows: number; narrow?: string; across?: true } | null; reused?: number;
     /** `sync:level_read`: the level and the input it was read with (sync-pass.ts `readShadowLevel`), for probes that read it again. */
     shadow?: unknown; input?: unknown } }

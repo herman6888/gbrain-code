@@ -33,6 +33,7 @@ import { explainTrust } from '../src/core/trust/review.ts';
 import { TRUST_TIER_RANK } from '../src/core/trust/tier.ts';
 import { runTrustScan } from '../src/core/eligibility/scan.ts';
 import { runTrustClaimSources } from '../src/commands/trust-claim.ts';
+import { _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { runSetTrust } from '../src/commands/sources-trust.ts';
 import { trustSourcesUnclaimedEntry } from '../src/commands/doctor/checks/trust-sources-unclaimed.ts';
 import { trustScanEntry } from '../src/commands/doctor/checks/trust-scan.ts';
@@ -55,7 +56,7 @@ beforeAll(async () => {
   fresh = empty;
 }, 120_000);
 afterAll(async () => { await engine.disconnect(); await fresh.disconnect(); });
-afterEach(() => { __setConfirmationIoForTests(null); process.exitCode = 0; });
+afterEach(() => { __setConfirmationIoForTests(null); process.exitCode = 0; _resetCliExitVerdictForTests(); });
 
 const cli = { transport: 'cli' as const, isCallable: () => false, preapproved: () => true };
 const render = (fix: unknown) => renderAction(fix as Action, cli);

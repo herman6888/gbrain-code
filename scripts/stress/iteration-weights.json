@@ -118,6 +118,7 @@
   "test/embed-stale-images-managed-6529.test.ts": 6900,
   "test/embedding-completion-atomic.serial.test.ts": 4800,
   "test/engine-sql-facts-keyset.test.ts": 3400,
+  "test/entity-card-perf.slow.test.ts": 246300,
   "test/entity-resolve-perf.slow.test.ts": 6250,
   "test/extract-all-stamp-intersection.serial.test.ts": 9500,
   "test/extract-atoms-input-truncated-6503.test.ts": 4900,

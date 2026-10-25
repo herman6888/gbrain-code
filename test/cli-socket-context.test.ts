@@ -12,7 +12,7 @@
  *    plus the serve-side timeout answer.
  * 4. No production seam.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { makeContext } from '../src/cli/main.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { cliRequestContext, executeCliSocketRequest, mergedRequestConfig } from '../src/core/cli-socket/execute.ts';
@@ -20,6 +20,7 @@ import { cliSocketIdentity } from '../src/core/cli-socket/identity.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { serializeOperationError, warmRoundTripTimeout } from '../src/core/cli-socket/protocol.ts';
+import { _uninstallOutputCaptureForTests, installOutputCapture } from '../src/core/cli-socket/output-capture.ts';
 
 let engine: PGLiteEngine;
 const op = { params: {} };
@@ -32,6 +33,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => { await engine.disconnect(); });
+afterEach(() => _uninstallOutputCaptureForTests());
 
 beforeEach(async () => {
   await resetPgliteState(engine);
@@ -72,14 +74,18 @@ describe('cliRequestContext mirrors makeContext', () => {
   });
 
   test('a serve-side timeout answers a retryable timeout error (no cold rerun) while the work keeps the request active until it settles', async () => {
-    // Config reads wait on a gate, so the request is still working when its deadline passes. A bare short deadline
-    // is not enough: PGLite can finish the whole search before the timer gets a turn (stress gate, seed 193478).
+    // Config reads and SQL wait on a gate, so the request is still working when its deadline passes. A bare short
+    // deadline is not enough: PGLite can finish the whole search before the timer gets a turn (stress gate, seed
+    // 193478). The capture is installed as the serve installs it (process-global, so an earlier test in the same
+    // process may already have done it), and with SQL gated the source resolution cannot finish first: the
+    // timeout frame carries no resolved source whatever ran before this test.
+    installOutputCapture();
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const gated = new Proxy(engine, {
       get(target, key) {
         const value = Reflect.get(target, key, target);
-        if (key === 'getConfig' || key === 'getAllConfig') return async (...args: unknown[]) => { await gate; return (value as (...a: unknown[]) => unknown).apply(target, args); };
+        if (key === 'getConfig' || key === 'getAllConfig' || key === 'executeRaw') return async (...args: unknown[]) => { await gate; return (value as (...a: unknown[]) => unknown).apply(target, args); };
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });

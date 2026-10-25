@@ -7,7 +7,8 @@
  *
  * Fails closed to a whole read: another process starts empty; an entry leaves the cache while a pass uses it and comes
  * back only after that pass walked it whole (a failed or concurrent pass finds none); an entry idle for
- * TREE_REUSE_MAX_AGE_MS is dropped; the key is the source, its incarnation, the Git root and the scope; a scope with
+ * TREE_REUSE_MAX_AGE_MS is dropped; the key is the source, its incarnation, the Git root and the scope, and an entry kept
+ * under the other canonical mode (G3: `config.canonical` flipped since) is dropped; a scope with
  * pathspec magic, a diff larger than a quarter of the tree, a change `readTreeLevel` would not list, and any Git
  * failure read whole. `sync.level_reuse false` turns reuse off (docs/guides/live-sync.md). With
  * GBRAIN_SYNC_LEVEL_REUSE_VERIFY=1 (tests and the nightly freshness cell) every reused listing is compared with a whole
@@ -22,7 +23,7 @@ export const TREE_REUSE_MAX_AGE_MS = 10 * 60_000;
 /** A diff of more paths than this (and a quarter of the tree) reads the tree whole. */
 const TREE_REUSE_MIN_DIFF_BOUND = 2_000;
 
-interface TreeReuseEntry { head: string; tree: Map<string, GitTreeEntry>; at: number; expiry: ReturnType<typeof setTimeout> }
+interface TreeReuseEntry { head: string; canonical?: string; tree: Map<string, GitTreeEntry>; at: number; expiry: ReturnType<typeof setTimeout> }
 const entries = new Map<string, TreeReuseEntry>();
 
 /**
@@ -51,14 +52,14 @@ export type TreeReuse = 'read' | 'same' | 'patched';
  * `T` at `head` under `scope`, from the last listing this process kept for `key` when `allowed`; `keep` stores it for the
  * next pass once the caller has walked it (until then the next pass reads whole), and the caller must not change it.
  */
-export async function readTreeLevelReusing(gitRoot: string, head: string, scope: string, opts: { key: readonly string[]; allowed: boolean; shared?: LoopYield }):
+export async function readTreeLevelReusing(gitRoot: string, head: string, scope: string, opts: { key: readonly string[]; canonical?: string; allowed: boolean; shared?: LoopYield }):
   Promise<{ tree: Map<string, GitTreeEntry>; reuse: TreeReuse; keep: () => void }> {
   const key = JSON.stringify([...opts.key, gitRoot, scope]);
   const prior = opts.allowed ? entries.get(key) : undefined;
   if (prior) { clearTimeout(prior.expiry); entries.delete(key); }
-  const keep = (tree: Map<string, GitTreeEntry>) => () => { entries.set(key, { head, tree, at: Date.now(), expiry: dropWhenIdle(entries, key, 'tree', tree) }); };
+  const keep = (tree: Map<string, GitTreeEntry>) => () => { entries.set(key, { head, canonical: opts.canonical, tree, at: Date.now(), expiry: dropWhenIdle(entries, key, 'tree', tree) }); };
   const whole = async () => { const tree = await readTreeLevel(gitRoot, head, scope, opts.shared); return { tree, reuse: 'read' as const, keep: opts.allowed ? keep(tree) : () => {} }; };
-  if (!opts.allowed || !prior || Date.now() - prior.at > TREE_REUSE_MAX_AGE_MS || /[\\[*?]|^:/.test(scope)) return whole();
+  if (!opts.allowed || !prior || prior.canonical !== opts.canonical || Date.now() - prior.at > TREE_REUSE_MAX_AGE_MS || /[\\[*?]|^:/.test(scope)) return whole();
   let reuse: TreeReuse = 'same';
   if (prior.head !== head) {
     const changes = await readTreeChanges(gitRoot, prior.head, head, scope, opts.shared).catch(() => null);

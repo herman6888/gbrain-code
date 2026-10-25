@@ -2,13 +2,15 @@
 # scripts/native/heartbeat.sh: the darwin-x64 native-locks heartbeat.
 #
 # A wedged macOS runner uploads no log at all, not even for the steps that passed, so while the job runs a background
-# loop posts its state as the commit status `diag/native-heartbeat`. GitHub keeps every status a commit receives, so the
+# loop posts its state as the commit status `diag/native-heartbeat/<cell>`, one context per cell so two cells never
+# overwrite each other. GitHub keeps every status a commit receives, so the
 # last one before a wedge shows what was running. A status carries only the cell, the current step or suite and its
 # elapsed seconds, free memory, swap in use, the load average and the busiest process names; never the environment.
 #
 #   heartbeat.sh start        start the loop (it posts on every label change and every GBRAIN_HEARTBEAT_INTERVAL_S)
 #   heartbeat.sh mark LABEL   the current step or suite; needs no token, the loop posts it
-#   heartbeat.sh stop RESULT  end the loop and post the terminal `success` status, so nothing is left pending
+#   heartbeat.sh stop RESULT  end the loop, its in-flight post included, then post the terminal `success` status (retried
+#                             on a failed request), so nothing is left pending
 #   heartbeat.sh describe     print the description the next status would carry
 #
 # start and stop read GH_TOKEN, GITHUB_REPOSITORY, GBRAIN_HEARTBEAT_SHA and GBRAIN_HEARTBEAT_CELL. Every command does
@@ -16,11 +18,12 @@
 # bash 3.2 compatible.
 set -u
 
-CONTEXT='diag/native-heartbeat'
 dir="${GBRAIN_HEARTBEAT_DIR:-${RUNNER_TEMP:-/tmp}/gbrain-native-heartbeat}"
 interval="${GBRAIN_HEARTBEAT_INTERVAL_S:-30}"
 
 safe() { tr -cd 'A-Za-z0-9._/-' | cut -c1-"$1"; }
+cell=$(printf '%s' "${GBRAIN_HEARTBEAT_CELL:-}" | safe 32)
+CONTEXT="diag/native-heartbeat${cell:+/$cell}"
 
 mem_free_pct() {
   if command -v memory_pressure >/dev/null 2>&1; then
@@ -50,21 +53,25 @@ top_names() {
 }
 
 describe() {
-  local label since now cell
+  local label since now
   label=$(cat "$dir/label" 2>/dev/null || echo setup)
   since=$(cat "$dir/since" 2>/dev/null || date +%s)
   now=$(date +%s)
-  cell=$(printf '%s' "${GBRAIN_HEARTBEAT_CELL:-}" | safe 32)
   printf '%s %s %ss | free %s%% | swap %s | load %s | top %s' "$cell" "$(printf '%s' "${label##*/}" | safe 48)" "$((now - since))" \
     "$(mem_free_pct)" "$(swap_used)" "$(load_1m)" "$(top_names)" | tr -cd 'A-Za-z0-9 ._/|%:,=+-' | cut -c1-140
 }
 
+# A failed post names curl's exit code and the HTTP status on stderr (the loop discards it; stop's lands in the job log).
 post() {
-  local url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
-  curl -sS --max-time 10 -o /dev/null -X POST \
+  local url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}" code rc
+  code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${GH_TOKEN:-}" -H 'Accept: application/vnd.github+json' \
     "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY:-}/statuses/${GBRAIN_HEARTBEAT_SHA:-}" \
-    -d "{\"state\":\"$1\",\"context\":\"$CONTEXT\",\"description\":\"$2\",\"target_url\":\"$url\"}" >/dev/null 2>&1 || true
+    -d "{\"state\":\"$1\",\"context\":\"$CONTEXT\",\"description\":\"$2\",\"target_url\":\"$url\"}" 2>/dev/null)
+  rc=$?
+  case "$code" in 2[0-9][0-9]) [ "$rc" = 0 ] && return 0 ;; esac
+  echo "heartbeat: $1 post failed (curl exit $rc, HTTP ${code:-000})" >&2
+  return 1
 }
 
 loop() {
@@ -74,7 +81,7 @@ loop() {
     label=$(cat "$dir/label" 2>/dev/null)
     now=$(date +%s)
     if [ "$label" != "$last" ] || [ "$now" -ge "$next" ]; then
-      post pending "$(describe)"
+      post pending "$(describe)" || true
       last=$label
       next=$((now + interval))
     fi
@@ -87,6 +94,8 @@ case "${1:-}" in
   start)
     mkdir -p "$dir" && rm -f "$dir/stopped"
     echo setup > "$dir/label"; date +%s > "$dir/since"
+    # Its own process group (job control on), so stop can end the loop together with a post it has in flight.
+    set -m
     loop </dev/null >/dev/null 2>&1 &
     echo $! > "$dir/pid"
     ;;
@@ -96,8 +105,15 @@ case "${1:-}" in
     ;;
   stop)
     touch "$dir/stopped"
-    pid=$(cat "$dir/pid" 2>/dev/null) && kill "$pid" 2>/dev/null
-    post success "$(printf '%s finished %s |%s' "$(printf '%s' "${GBRAIN_HEARTBEAT_CELL:-}" | safe 32)" "$(printf '%s' "${2:-}" | safe 16)" "$(describe | cut -d'|' -f2-)" | cut -c1-140)"
+    if pid=$(cat "$dir/pid" 2>/dev/null) && [ -n "$pid" ]; then
+      kill -TERM -- "-$pid" 2>/dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 0.5; done
+    fi
+    final=$(printf '%s finished %s |%s' "$cell" "$(printf '%s' "${2:-}" | safe 16)" "$(describe | cut -d'|' -f2-)" | cut -c1-140)
+    for attempt in 1 2 3; do
+      post success "$final" && break
+      [ "$attempt" = 3 ] || sleep 2
+    done
     ;;
   describe) describe; echo ;;
   *) echo "usage: heartbeat.sh start | mark LABEL | stop RESULT | describe" >&2; exit 2 ;;

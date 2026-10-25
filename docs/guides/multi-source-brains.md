@@ -137,6 +137,82 @@ still go to the bound source only.
 rule: an explicit `source_id` must be inside the connection's own source or
 grant.
 
+### Narrow one request with `source_ids`
+
+`search` and `query` take `source_ids`, a list of source ids (CLI:
+`--source-ids source-a,source-b`). The request reads only those sources:
+
+- Each id is checked exactly like an explicit `source_id`. A remote agent
+  naming a source outside its grant gets `permission_denied` for the whole
+  request, and a removed or archived source gets `unknown_source`. So the
+  list can narrow a request but never widen it.
+- Omitting `source_ids`, or passing `[]` or a blank string, reads every
+  source the caller can read, as before.
+- With `source_id` as well, the request reads the sources in both
+  (`source_id: "__all__"` keeps the list). If none are left, nothing is
+  searched: the result is empty with an `empty_retrieval` notice, never a
+  fallback to the wider scope.
+- `__all__` and malformed ids in the list are `invalid_params`.
+
+Every part of the request reads the narrowed sources: keyword, vector and
+title matches, other names, entity anchoring, saved facts, the CRAG re-run,
+think escalation and evidence delivery.
+
+**Say to your agent:** *"Search my brain for the acme-example renewal, but
+only in source-a."*
+
+### A bot acting for many members
+
+A shared brain often holds one source per member or project, with one bot
+answering for several people. Give each member their own token, granted only
+the sources that member may read, and send each member's requests with that
+member's token:
+
+```bash
+gbrain auth create bot-alice-example
+gbrain auth rescope --token bot-alice-example --sources source-a
+# OAuth client instead of a bearer token:
+gbrain auth rescope --client <client_id> --sources source-a
+```
+
+The token's grant is the security boundary: the server scopes every call to
+the grant of the token that made it, whatever the call's arguments say.
+`source_ids` is a convenience inside that boundary. A bot holding one token
+granted several sources can pass `source_ids` to keep one request to the
+current member's sources, but a prompt-injected or buggy bot can omit it, so
+it does not separate members who must not see each other's pages. Use
+per-member tokens for that, and `source_ids` to narrow further.
+
+### Lay out sources by who may read them
+
+gbrain enforces access per source, never per page. Two pages in one source are
+readable by exactly the same tokens. So put content in sources by who may read
+it, before any member's bot connects:
+
+- **One source per channel, team or member.** Give a channel's pages a source
+  of their own (`channel-a`), a team's documents theirs (`team-a`), and each
+  member a private one (`private-alice-example`). Content everyone may read
+  goes in a shared source (`public`).
+- **One grant per member.** Grant each member's token or client every source
+  that member may read, and nothing else:
+
+  ```bash
+  gbrain auth rescope --token bot-alice-example --sources private-alice-example,channel-a,team-a,public
+  gbrain auth rescope --client <client_id> --sources private-alice-example,channel-a,team-a,public
+  ```
+
+  The first id is the token's write source, so a member's saved memories land
+  in their own private source.
+
+> **Warning: one shared source has no boundary inside it.** A bot that answers
+> everyone with one unscoped token over a single source exposes everything in
+> that source to every requester. Neither `source_ids` nor a search limit can
+> narrow a read inside one source: `source_ids` chooses whole sources, and a
+> limit only shortens a ranked list, which can still start with a page the
+> requester should not see. Semantic search makes this more visible, because
+> it returns related pages that a keyword search would not match. Split the
+> content into sources first, then grant per member.
+
 ### Links, backlinks and the graph across sources
 
 `gbrain links`, `gbrain backlinks` and `gbrain graph` (MCP: `get_links`,
@@ -240,6 +316,11 @@ gbrain sources mirror-readonly <id>
 gbrain sources mirror-writable <id>
 gbrain sources refresh <id> [--dry-run] [--resume|--abandon]   Managed brains: fast-forward the checkout and sync.
 gbrain sources set-strategy <id> <markdown|code|auto>
+gbrain sources set-sync <id> <on|off> [--dry-run] [--expect <on|off>]
+                               Include or exclude the source from automatic sync
+                               (config.syncEnabled; an explicit gbrain sync --source
+                               still runs). --dry-run prints the apply command, which
+                               carries --expect; a moved state refuses preview_changed.
 ```
 
 ### Read-only mirror sources

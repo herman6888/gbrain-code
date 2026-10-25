@@ -1049,8 +1049,10 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.reuse != 'true' && ((github.event_name != 'pull_request' || needs.changes.outputs.native-scope != 'smoke') && (github.event_name != 'workflow_dispatch' || (inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
     uses: ./.github/workflows/native-locks.yml
-    # statuses: the darwin-x64 cell's diag/native-heartbeat commit status (native-locks.yml).
+    # statuses: the darwin-x64 cells' diag/native-heartbeat/<cell> commit statuses (native-locks.yml); actions: read for its
+    # heartbeat-finalize job, which reads the run's job conclusions.
     permissions:
+      actions: read
       contents: read
       statuses: write
     with:

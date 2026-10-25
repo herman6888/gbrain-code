@@ -375,7 +375,10 @@ async function freezeEntryOnce(engine: BrainEngine, cursor: Cursor, key: string,
       return { hold: await originFaultHold(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, entry, observed: snapshot, message: occupant.originFault.message }), overtaken: true };
     }
     let bytes: Buffer | null = null;
-    try { bytes = entry.action === 'delete' && directoryAt(cursor.root, entry.path) ? null : readSyncFile(cursor.root, entry.path); } // GBRA-133 S-22: a directory is no file
+    // G3: a strict source's entry reads its commit alone (a deletion has no bytes); only a blob over the read bound takes the streamed path below.
+    const committed = entry.committedOnly === true && !entry.working ? entry.action === 'delete' ? null : pinnedBlob(cursor, entry.path) : undefined;
+    try { bytes = committed !== undefined && (committed === null || committed.size <= SYNC_READ_BOUND) ? committed && pinnedImageBytes(cursor, entry)
+      : entry.action === 'delete' && directoryAt(cursor.root, entry.path) ? null : readSyncFile(cursor.root, entry.path); } // GBRA-133 S-22: a directory is no file
     catch (error) {
       if (!isSyncReadBound(error)) { const held = holdsOn ? unreadableFileHold(entry, entry.slug!, entry.pageId ?? null, error, () => pinnedBlob(cursor, entry.path)) : null; if (held) return { hold: held }; throw error; } // GBRA-130 A-7
       // Wave B: with segmented storage on, a Markdown file over the read bound is frozen by reference and streamed by its owner.
@@ -481,6 +484,7 @@ async function freezeEntryOnce(engine: BrainEngine, cursor: Cursor, key: string,
   return remember(frozenSnapshot, { requestId: cursor.passId ? passRequestId(cursor.passId, entry?.path ?? slug, passLevel!) : randomUUID(), slug, pageId, ...(occupantRebound ? { rebound: true as const } : {}), intent: { kind: !entry ? 'managed_sync_checkpoint' : entry.action === 'import' ? 'managed_sync_import' : 'managed_sync_delete',
     expected_revision: revision, sourcePath: entry?.sourcePath ?? null, path: entry?.path ?? null, rawHash, content, lineEndingOnly, ...(bodyRef ? { body_ref: bodyRef } : {}),
     ...(entry?.unownedDeletion ? { unownedDeletion: true } : {}), ...(entry?.heldDeletion ? { heldDeletion: entry.heldDeletion } : {}),
+    ...(entry?.committedOnly ? { committedOnly: true } : {}),
     ...(entry?.renameFrom ? { renameFrom: entry.renameFrom } : {}),
     ...(run.observedAt ? { holdObservedAt: run.observedAt } : {}), ...(blob ? { blobOid: blob.oid } : {}), ...(entry && run.embedDeferred ? { embedDeferred: true } : {}),
     ...(!entry && cursor.releasedHolds?.length ? { releasedHolds: cursor.releasedHolds } : {}),

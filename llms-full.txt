@@ -1824,7 +1824,7 @@ on `query`, `--source <id>`, `--limit`, `--json`; `gbrain backlinks <slug>` and
 `gbrain timeline <slug>` for links and dated events. Copyable examples:
 [brain-first](skills/conventions/brain-first.md#retrieval-gbrain-first).
 
-Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
+Recall relevant saved context before answering. Resolve a person (an email sender, an attendee) only by an exact match (`gbrain whois <email or name>`), never a search's top hit ([identity rule](skills/conventions/brain-first.md#identity-exact-match)). Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
 
 Durable preferences and facts belong in shared memory when the user wants them
 recalled later. Transient task state, credentials, local configuration, and harness
@@ -1883,7 +1883,10 @@ machine contract. The quick version:
 4. Treat `[gbrain notice …]` blocks and `[AGENT]` blocks the same way. A degraded result is not proof of "no notes".
 <!-- END GENERATED agent-protocol:quick-contract -->
 
-Exit 3 always means "stop and ask the user". Full contract, transcripts, effects,
+Exit 3 always means "stop and ask the user". Exit 10 means the write was
+accepted and is still pending: never "not found" or "failed", so poll the
+receipt (`gbrain write-request <id>`) before retrying, reporting or moving on.
+Full contract, transcripts, effects,
 exit codes and marker grammar: [`docs/protocol/AGENT_OPERATOR_v1.md`](./docs/protocol/AGENT_OPERATOR_v1.md).
 
 ## Read this order
@@ -1917,6 +1920,25 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
   [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md),
   [`docs/guides/remote-mcp.md`](./docs/guides/remote-mcp.md) (`gbrain mcp expose`).
+- **Run gbrain from cron, workspace scripts and hooks:** every caller goes
+  through one wrapper that sets `GBRAIN_HOME` (never `HOME`), loads the
+  brain's env file and runs the installed binary, never `bun run src/cli.ts`
+  with an inherited environment. Log stderr (never `2>/dev/null`: a
+  `no_brain` refusal then reads as "no results"), check the exit code, keep
+  hook output off stdout, allow at least 10 s per call, and never print the
+  process environment into a transcript. On a managed brain, schedule
+  `gbrain sources refresh <id>`, and have scripts commit the files they write
+  with `gbrain git commit-push -- <paths>`, never plain `git commit`
+  (`gbrain doctor --only cron_gbrain_home` flags cron lines that skip the
+  wrapper). Wrapper and rules:
+  [cron-schedule.md](docs/guides/cron-schedule.md#calling-gbrain-unattended),
+  [scripts and the managed checkout](docs/guides/shared-checkout-git.md#scripts-and-the-managed-checkout).
+- **Delete or purge pages:** `gbrain delete --purge` skips the 72-hour soft
+  delete, cascades to chunks, versions, links and facts, and `gbrain restore`
+  cannot undo it. Purge only on the user's explicit go for that purge ("scrub
+  the repo" is not one), one page at a time, verifying each; a stopped batch
+  stays stopped until the user says again
+  ([data-loss gate](skills/data-loss-gate/SKILL.md)).
 - **Bring in your chat history:** `gbrain transcripts ingest` imports a
   downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
   connects the account and syncs new conversations live, incrementally and on an
@@ -2837,6 +2859,25 @@ environment-dependent, so a re-run during an outage could silently repoint a
 healthy Postgres brain at the PGLite floor. Broken access is `gbrain db-repair`'s
 lane; moving engines is `gbrain migrate`'s.
 
+**Put the database next to the agent.** A warm search makes dozens of
+sequential round trips to Postgres, so the distance between the agent host and
+the database dominates its latency: in one deployment, moving Postgres into the
+agent host's region took warm search from 3.0 s to 1.2 s at p50. Create the
+database (and use the pooler) in the region of the machine that runs the agent
+and its `gbrain serve`.
+
+<a id="switching-a-database"></a>
+**Switching a brain's database** (a region move, a new server): stop gbrain's
+writers, then change every URL the tooling reads, not just the main one:
+`GBRAIN_DATABASE_URL`, `DATABASE_URL`, `GBRAIN_DIRECT_DATABASE_URL`, the
+`database_url` in `config.json`, and each env file, wrapper and service
+definition that sets them (`gbrain engine status --json` shows which source
+wins, with the password redacted). Restart every gbrain process, since a
+running process keeps the environment it started with. Prove the switch from
+the database side: a row written after the restart (a job, a test page)
+appears on the new server and no gbrain session remains on the old one. A
+shell's `echo $DATABASE_URL` proves only that shell.
+
 `--json` emits `{status, engine, ladder_rung, url_source}` as the ONLY stdout
 content so a scripted install can `| jq` it. The access token is never
 persisted, logged, or echoed.
@@ -3164,6 +3205,17 @@ Read skills/soul-audit/SKILL.md and follow it.
 This generates SOUL.md (agent identity), USER.md (user profile), ACCESS_POLICY.md
 (who sees what), and HEARTBEAT.md (operational cadence) from the user's answers.
 
+**On OpenClaw 2026.10.6 and later,** `openclaw doctor --fix` imports a
+workspace `HEARTBEAT.md` into its own monitor, archives the file under the
+state directory's `backups/heartbeat-migration/` and removes it, while the
+rendered `AGENTS.md` still tells the agent to read it at session start. Until
+the render adapts to OpenClaw ([#7470](https://github.com/garrytan/gbrain/issues/7470)),
+put gbrain's file back after each doctor fix: `gbrain bootstrap render --only HEARTBEAT.md`
+re-renders it from the confirmed answers, or copy the archived file back when
+the user edited it. Jobs that must run on time belong in the host scheduler
+through the [one wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended),
+not only in `HEARTBEAT.md`, which runs only when a session starts.
+
 If skipped, minimal defaults are installed automatically.
 
 ## Step 7: Recurring Jobs
@@ -3173,7 +3225,32 @@ capture, enrichment, maintenance or a service; do not infer consent from a
 successful install or from a health recommendation.
 
 Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
-platform glue entirely with `gbrain autopilot --install` (built-in self-maintaining daemon):
+platform glue entirely with `gbrain autopilot --install` (built-in self-maintaining daemon).
+
+Every cron job, workspace script and hook calls gbrain through **one wrapper**
+that sets `GBRAIN_HOME` (never `HOME`), loads the brain's env file and runs
+the installed binary, never `bun run src/cli.ts` with an inherited
+environment. A scheduled job has another `HOME` than your shell, so a bare
+call finds no database (every lookup silently empty) or acts as a second host
+(`refresh_not_owner`). Log the wrapper's stderr instead of sending it to
+`/dev/null`, check exit codes against the [operator protocol](docs/protocol/AGENT_OPERATOR_v1.md),
+keep hook output off stdout so `--json` stays parseable, and give each call a
+timeout of at least 10 s. The wrapper and its rules:
+[call gbrain through one wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended).
+
+- **Managed brain checkout** (every 15 min, on the owner host):
+  `gbrain sources refresh <id>` is the only sanctioned fast-forward; it drains
+  writes, fast-forwards and re-syncs. Scripts commit the files they write
+  with `gbrain git commit-push -- <paths>` (or save pages through
+  `put_page`/`capture`), never with plain `git commit`: an unpublished local
+  commit makes the checkout diverge and every refresh refuse
+  `refresh_diverged`. `gbrain doctor --only cron_gbrain_home` flags cron
+  lines that skip the wrapper
+  ([scripts and the managed checkout](docs/guides/shared-checkout-git.md#scripts-and-the-managed-checkout)).
+- **Workers**: start `gbrain jobs supervisor` with `--max-rss <MB>`; with
+  `--job-isolation process` the cap also covers each job child's process tree
+  (v0.60.426.0). Size the host for (concurrency + 1) × the cap
+  ([deployment](docs/guides/minions-deployment.md#per-job-process-isolation---job-isolation-process)).
 
 - **Live sync** (every 15 min): `gbrain sync --repo ~/brain && gbrain embed --stale`
   — or `gbrain sync --watch` for a continuous loop. Safe on keyless brains:
@@ -3277,6 +3354,16 @@ operational DB and content backups, consent, edited files, and grant fences.
 DB-only export, explicit regrants, parent/client reconnection, and native
 verification are separate stages; report pending stages rather than claiming
 the whole migration completed.
+
+On a host with resident processes (autopilot, a jobs worker, a serve), pause
+autopilot (`gbrain autopilot pause`), wait until no job is active, run
+`gbrain upgrade` on every install (it restarts every gbrain process onto the
+new build and verifies one build runs, or refuses `restart_refused` naming the
+process it cannot restart), check that each process reports the new version,
+then `gbrain autopilot resume`. A production brain follows the stable channel
+(`gbrain config set self_upgrade.channel stable`)
+([the order](skills/gbrain-upgrade/SKILL.md#always-on-hosts-pause-drain-upgrade-verify-resume),
+[stable channel](docs/guides/upgrades-auto-update.md#stable-channel)).
 
 For memory-only upgrades, keep services and paid reindexing opt-in. The same
 command works for `bun install -g` and `git clone + bun link` installs:
@@ -5548,6 +5635,44 @@ took 103 s on 16 vCPU with 12 GB and 8 workers. Measured, not shipped:
 (m 16, ef_construction 64, `vector`). Measurements and method:
 [`docs/eval/hnsw-scale-bench.md`](eval/hnsw-scale-bench.md).
 
+### Vector index prewarm
+
+<a id="vector-index-prewarm"></a>
+
+After a Postgres restart or a cache eviction, the first searches walk HNSW
+pages nobody has read yet: on a brain whose index is bigger than the cache,
+an unseen query reads 2,000 to 4,500 index pages and spends 1.2 to 2.7 s in
+the vector stage. `gbrain embeddings prewarm` loads every HNSW index of the
+brain into `shared_buffers` once with `pg_prewarm(<index>, 'buffer')`, so
+those pages are already cached. It is opt-in and local to the brain host: a
+CLI-only command (no MCP tool, refused by thin clients), and
+`gbrain config set serve.vector_prewarm true` runs it once in the
+background each time `gbrain serve` starts (off by default; a refusal is
+logged and the serve carries on).
+
+`shared_buffers` decides whether it runs. The indexes must total at most
+half of it, read with `current_setting('shared_buffers')`; past that the
+prewarm would evict the heap and keyword-index pages every other read needs.
+`effective_cache_size` is printed but never decides: it is a planner hint
+the operator sets, not memory the server holds. The check reads only catalog
+rows and file sizes, so a refusal reads no index page.
+
+| Command | Does |
+|---|---|
+| `gbrain embeddings prewarm --dry-run --json` | Index sizes, `shared_buffers`, `effective_cache_size`, the budget and the fit; reads nothing |
+| `gbrain embeddings prewarm` | Prewarms when the indexes fit and `pg_prewarm` exists |
+| `gbrain config set serve.vector_prewarm true` | Prewarms at each serve start (restart the serve) |
+
+Refusals, each with a fix: `vector_prewarm_wont_fit` (raise
+`shared_buffers` to at least twice the index size and restart Postgres; a
+managed database sizes it with the instance), `vector_prewarm_extension_missing`
+(`CREATE EXTENSION IF NOT EXISTS pg_prewarm;` as a role that may create
+extensions) and `vector_prewarm_unsupported_engine` (PGLite has no server
+cache to fill). Prewarmed pages stay cached until Postgres restarts or other
+reads evict them; pg_prewarm's own `autoprewarm` worker
+(`shared_preload_libraries = 'pg_prewarm'`) can reload them after a restart
+without gbrain.
+
 ### Opt-in RLS source-scope binding (`GBRAIN_RLS_SCOPE_BINDING`)
 
 Defense-in-depth layer for Postgres deployments that want the database itself
@@ -7395,7 +7520,7 @@ vars — incident-time escape hatches, not everyday knobs.
    never holds it. The fence repair still repairs such a file: on a legacy
    source it re-reads the file, backs it up under `~/.gbrain/backups/`,
    writes and imports it, and leaves the change for you to commit
-   (`gbrain sources status` names the `git add`/`git commit` command until
+   (`gbrain sources status` names the `gbrain git commit-push` command until
    you do). Holds never count toward the
    legacy auto-skip streak below. A source blocked by such a file before this
    release recovers on its next sync, or now with
@@ -7505,7 +7630,12 @@ vars — incident-time escape hatches, not everyday knobs.
    `sources.refresh_fetch_timeout_ms`, `GBRAIN_REFRESH_FETCH_TIMEOUT_MS`).
    A refresh interrupted by a crash is finished by the restarted owner or by
    `gbrain sources refresh <source-id> --resume`. A cron that keeps a managed
-   brain current runs the refresh instead of `git pull`.
+   brain current runs the refresh instead of `git pull`, through the same
+   [wrapper](cron-schedule.md#calling-gbrain-unattended) as every other
+   scheduled gbrain call (so it runs as the owner host). `refresh_diverged`
+   means something commits into the checkout outside gbrain: fix that writer
+   instead of forcing the checkout
+   ([scripts and the managed checkout](shared-checkout-git.md#scripts-and-the-managed-checkout)).
 
    **Say to your agent:** *"Bring my notes source up to date with its remote."*
 
@@ -7676,8 +7806,9 @@ those (`maintenance_lock_busy`) and the holder runs them.
 # Calendar sync — Sundays at 10 AM
 0 10 * * 0 cd /path/to/calendar-sync && node calendar-sync.mjs --start $(date -v-7d +%Y-%m-%d) --end $(date +%Y-%m-%d)
 
-# Brain health — weekly Mondays at 6 AM
-0 6 * * 1 gbrain doctor --json >> /tmp/gbrain-health.log 2>&1 && gbrain embed --stale
+# Brain health — weekly Mondays at 6 AM. Every gbrain call goes through the
+# wrapper below (gbrain-run), never a bare `gbrain` or `bun run src/cli.ts`.
+0 6 * * 1 gbrain-run doctor --json >> /tmp/gbrain-health.log 2>&1 && gbrain-run embed --stale
 
 # Autopilot health gate — daily at 7 AM. The exit code is the signal:
 # 0 fresh (or nothing installed), 1 needs attention (stale heartbeat,
@@ -7688,11 +7819,88 @@ those (`maintenance_lock_busy`) and the holder runs them.
 # daemon writes the maintenance verdict each tick), so it works even during
 # a DB outage. On a stall: gbrain doctor --only global_maintenance_stalled
 # names the phase and the command to run.
-0 7 * * * gbrain autopilot --status >> /tmp/gbrain-autopilot-health.log 2>&1 || your-notify "gbrain autopilot needs attention"
+0 7 * * * gbrain-run autopilot --status >> /tmp/gbrain-autopilot-health.log 2>&1 || your-notify "gbrain autopilot needs attention"
 
 # Dream cycle — nightly at 2 AM
 0 2 * * * /path/to/dream-cycle.sh
 ```
+
+<a id="calling-gbrain-unattended"></a>
+### Call gbrain through one wrapper
+
+A scheduled job does not run in the shell you tested it in. Cron, a harness's
+workspace scripts and git hooks start with another `HOME`, a bare `PATH` and
+whatever environment their parent had, so a call that works by hand can do
+something else on a schedule:
+
+- **No database.** The job finds no brain config or URL, gbrain refuses
+  (`no_brain`, or `GBRAIN_DB_ACCESS no_url`) on stderr, and a caller that
+  drops stderr reads every lookup as "nothing found".
+- **A second host.** gbrain keeps its host identity under the brain home, so a
+  job that resolves another home is another host: `gbrain sources refresh`
+  refuses `refresh_not_owner` (since v0.60.427.0 it names the identity file it
+  read and the `HOME` and `GBRAIN_HOME` it resolved), and owner-only
+  maintenance reports `owner_unavailable` with reason `host_mismatch`.
+- **A stale database.** A variable the caller already exported wins over the
+  brain's `config.json` and `.gbrain/.env`, so a job started from an old
+  environment keeps using the old `DATABASE_URL`.
+
+Give every cron line, workspace script and hook one entry point, a wrapper that
+sets `GBRAIN_HOME`, loads the brain's env file if the harness keeps one, and
+runs the installed binary:
+
+```bash
+#!/usr/bin/env bash
+# gbrain-run: the only way scheduled work calls gbrain
+set -euo pipefail
+export GBRAIN_HOME=/srv/gbrain          # parent of .gbrain; the value serve, workers and autopilot use
+if [ -f /srv/gbrain/brain.env ]; then   # only if the harness keeps the brain's settings in its own file
+  set -a; . /srv/gbrain/brain.env; set +a
+fi
+exec /srv/gbrain/.bun/bin/gbrain "$@"  # the installed binary, by absolute path
+```
+
+Rules for the wrapper and everything that calls it:
+
+1. **Set `GBRAIN_HOME`, never `HOME`.** `GBRAIN_HOME` moves only gbrain's
+   state. Changing `HOME` also changes the git identity, SSH keys and push
+   credentials the job runs with. Use the same value as the serve, the workers
+   and autopilot; doctor `host_identity_mismatch` names a process that differs.
+2. **Run the installed binary.** Never `bun run src/cli.ts` from a checkout with
+   the caller's inherited environment: it skips the wrapper's settings and can
+   run another build than the serve.
+3. **Keep stderr and the exit code.** Never send gbrain's stderr to
+   `/dev/null`. Append it to a log and branch on the exit code
+   ([exit codes](exit-codes.md)): `10` means the write was accepted and is
+   still pending, not "not found" or "failed"; `3` means stop and ask the
+   user. A refusal fails the job; it is never an empty result.
+4. **Keep stdout clean.** A `--json` caller parses stdout as one document, so
+   the wrapper and any hook it runs log to a file or stderr, never stdout.
+5. **Allow time.** A cold CLI start takes 3–6 s on a pooled Postgres brain.
+   Set caller timeouts of at least 10 s in the shell and in the language
+   runtime that runs it (a runtime's exec timeout can override the shell's
+   without saying so), and turn on the [warm CLI socket](cli-socket.md) so
+   reads skip the cold start.
+6. **Quote the env file.** A file a shell sources is shell syntax. An unquoted
+   `&` in a URL ends the assignment and backgrounds the rest, so the variable
+   silently keeps its old value. Quote every value, keep Postgres URLs to
+   `?sslmode=require` (set driver options such as `GBRAIN_PREPARE=false` as
+   variables instead of extra `&` parameters), and restart every running
+   gbrain process after an edit: a process keeps the environment it started
+   with.
+7. **Never print the environment.** `env`, `printenv` or a process's
+   `environ` holds the database URL and API keys, and a transcript keeps them.
+   To debug, print variable names only, or run `gbrain engine status --json`,
+   which redacts the URL.
+
+On a managed brain the same wrapper runs `gbrain-run sources refresh <id>` on
+a schedule ([the managed cron line](../../skills/cron-scheduler/SKILL.md#managed-brain)).
+Scripts commit the files they write with `gbrain git commit-push -- <paths>`,
+never plain `git commit`, in the managed checkout; see
+[shared-checkout git](shared-checkout-git.md#scripts-and-the-managed-checkout).
+`gbrain doctor --only cron_gbrain_home --json` reads the crontab and the scripts
+it names and warns about a line that runs `src/cli.ts` straight from a checkout,
+or calls gbrain without the brain's `GBRAIN_HOME`.
 
 ### Quiet Hours Gate (MANDATORY)
 
@@ -8041,597 +8249,6 @@ echo "Dream cycle complete at $(date)"
 ---
 
 *Part of the [GBrain Skillpack](../GBRAIN_SKILLPACK.md). See also: [Quiet Hours](quiet-hours.md), [Operational Disciplines](operational-disciplines.md)*
-
----
-
-## docs/guides/scaling-skills.md
-
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/scaling-skills.md
-
-# Scaling skills past 300 without drowning the context window
-
-When an agent grows past 100 skills, a wall starts forming. Sessions take
-longer to start. The model gets a little dumber about which skill to pick.
-Tokens that should be powering reasoning are powering a skill catalog the
-model reads on every turn whether it needs to or not.
-
-This guide is the recipe for breaking through that wall without deleting
-capabilities. Three tiers, one resolver, one safety net. Production-tested
-on a 306-skill agent (Garry's OpenClaw, the agent behind Y Combinator's
-president). The pattern works whether you run OpenClaw, Hermes, Claude Code,
-Cursor, or your own MCP-aware agent.
-
-## The problem
-
-OpenClaw scans every skill file on disk at session start and injects them
-into the system prompt as `<available_skills>` entries. The model sees a
-name, description, and file path for each one. When a request matches, the
-model reads the full SKILL.md and follows it.
-
-This is great architecture at 50 skills. At 100, it's fine. At 200, it
-starts to drag. At 300, the system prompt eats more than 25,000 tokens on
-skill descriptions alone. Tokens that aren't going to reasoning, context,
-or actual work.
-
-The symptoms compound:
-
-- Sessions take noticeably longer to start.
-- The model has less room for conversation history.
-- Skill routing gets fuzzier. With 300 descriptions competing for attention,
-  the model occasionally picks the wrong one.
-- Cost goes up because every turn carries the full skill manifest.
-
-The naive fix is to delete skills you don't use often. Don't do this. The
-whole point of skills is that capabilities compound. A gift pipeline that
-fires twice a month saves 30 minutes each time it does. A flight tracker
-fires once per trip and prevents a missed Uber. Deleting low-frequency
-skills optimizes for prompt size at the cost of capability. You wouldn't
-delete apps from your phone because the home screen is too crowded. You'd
-organize them.
-
-## The three tiers
-
-Not all skills need to be visible to the model at all times. Some are core.
-Some are specialized. Some are dormant.
-
-### Tier A: always loaded (~35 skills)
-
-The skills the model needs on every single turn. Brain search, email triage,
-calendar, meeting ingestion, content creation, the executive assistant.
-They stay in the system prompt's `<available_skills>` manifest. The model
-sees them natively and routes to them without any lookup.
-
-### Tier B: resolver-routed (~85 skills)
-
-Real, active skills that fire regularly but don't need to pollute every
-turn. Gift pipeline, flight tracker, investor update ingestion, adversary
-tracking, book mirror, civic intelligence. They live on disk. They have
-full SKILL.md files. But OpenClaw doesn't inject them into the prompt.
-
-Instead, a compact RESOLVER.md handles routing. One line per skill with
-trigger phrases:
-
-```markdown
-- **gift-advisor**: gift idea | what should I bring | birthday gift | housewarming
-- **flight-tracker**: track my flight | flight status | when does my flight land
-- **investor-update-ingest**: investor update | portfolio update | company metrics
-```
-
-When the model sees "what should I bring to Jessica's dinner," it checks
-the resolver, finds `gift-advisor`, reads the SKILL.md, and executes. Same
-result. Zero wasted tokens on the other 84 turns where gifts aren't relevant.
-
-### Tier C: dormant (~180 skills)
-
-Built-in OpenClaw skills that aren't in active rotation (1Password, Discord,
-Notion, Trello, integrations you haven't wired up yet) plus specialized
-skills that almost never fire. They're explicitly disabled in the config
-with `enabled: false`. They exist on disk as documentation and potential.
-Flip one boolean to wake them up. Zero tokens contributed to every prompt
-until then.
-
-### The numbers
-
-Before tiering, on Garry's 306-skill OpenClaw:
-
-| Metric | Before |
-|---|---|
-| Skills in system prompt | 306 |
-| Skill-description tokens per turn | ~25,000 |
-| Skill routing accuracy | degrading |
-| Session startup | slow |
-
-After tiering:
-
-| Metric | After |
-|---|---|
-| Skills in system prompt (Tier A) | 35 |
-| Skill-description tokens per turn | ~4,000 |
-| Skills still accessible (A + B + C) | 301 |
-| Capability loss | zero |
-| **Tokens freed per turn** | **~21,000** |
-
-21K tokens per turn is not a small optimization. It's the difference between
-the model having room to think and the model being squeezed. It's the
-difference between carrying 3 pages of conversation history and carrying 15.
-
-## What the resolver actually does
-
-The resolver is cheaper than the manifest. That's the load-bearing insight.
-
-OpenClaw's native skill manifest puts ~80 tokens per skill into the system
-prompt (name + description + location). At 300 skills that's 24,000 tokens
-spent every turn whether the model needs the catalog or not.
-
-The resolver puts ~15 tokens per skill into a compact markdown list. At
-300 skills that's 4,500 tokens. But it only fires when the model checks
-it, which is only when the request doesn't match a Tier A skill. Most
-turns, the resolver costs zero tokens because the Tier A match handles it.
-
-This is the routing-table pattern but applied to the skill manifest itself.
-The resolver routes to skills, but it also routes around skills, keeping
-them out of the context window until they're needed.
-
-GBrain ships with a [bundled `skills/RESOLVER.md`](../../skills/RESOLVER.md)
-you can use as a reference shape. The skillpack story for distributing
-your own resolvers across machines is covered in
-[skillpacks as scaffolding](skillpacks-as-scaffolding.md).
-
-## The compact list format
-
-GBrain's resolver parser reads two dialects. Markdown tables:
-
-```markdown
-| Trigger | Skill |
-|---------|-------|
-| "gift idea" | `skills/gift-advisor/SKILL.md` |
-```
-
-Tables are fine at 20 entries, unwieldy at 200, unreadable at 300. The
-compact list format scales better:
-
-```markdown
-- **gift-advisor**: gift idea | what should I bring | birthday gift
-- **flight-tracker**: track my flight | flight status | when does my flight land
-```
-
-The same `parseResolverEntries` function reads table rows and list rows
-in the same file, with the multi-resolver merge (skillpack
-`skills/RESOLVER.md` + workspace `../AGENTS.md`) folding everything into
-one unified view, so a compact-format resolver is fully visible to
-`gbrain doctor`.
-
-### The list-format contract
-
-A few rules to keep the parser unambiguous:
-
-- **Skill names must be kebab-lowercase.** `gift-advisor`, `flight-tracker`,
-  `email-triage`. Names that start with an uppercase letter (`MyTool`,
-  `Note`, `Convention`) are deliberately ignored. This is what stops prose
-  bullets like `- **Note**: see [link]` from being mis-parsed as skill
-  rows in real-world AGENTS.md files.
-- **The path always resolves to `skills/<name>/SKILL.md`.** An optional
-  `→ \`skills/path\`` (or ASCII `->`) suffix is allowed for readability,
-  but the parser strips it. For non-conventional paths (skills under
-  nested directories, references into `conventions/`, anything that
-  isn't `skills/<name>/SKILL.md`), use the table format.
-- **Triggers separate with `|`.** Empty pieces and the literal `...`
-  placeholder are dropped. Each trigger becomes its own resolver entry,
-  all pointing at the same skill.
-- **Bold or plain.** `- **name**: triggers` is preferred. `- name: triggers`
-  works as a fallback.
-
-You can mix table and list rows in the same file. Useful when a brain
-inherits a table-format `RESOLVER.md` from gbrain and a list-format
-`../AGENTS.md` from OpenClaw.
-
-## The doctor safety net
-
-The danger with tiering is invisible skill loss. You disable a skill from
-native scanning, forget to add it to the resolver, and now the agent can't
-do something it used to do. You won't notice until the moment you need it.
-
-`gbrain doctor` walks every skill on disk and verifies it's reachable,
-either through native scanning (Tier A) or through the resolver (Tier B
-and C). On Garry's setup, the first run after tiering found 63 unreachable
-skills. Sixty-three capabilities that existed on disk but had no routing
-path. Fixed in an hour by adding resolver entries.
-
-Run it after every skill change:
-
-```bash
-gbrain doctor
-```
-
-For CI gates, use the JSON-emitting variant:
-
-```bash
-gbrain check-resolvable --json
-gbrain check-resolvable --strict  # warnings fail too
-```
-
-If a skill is unreachable, the output tells you which one and suggests
-the fix. The resolver is a document. Documents are cheap to fix.
-
-## Implementation walkthrough
-
-Three changes. Total time about 45 minutes once you've decided which
-skills go in which tier.
-
-### 1. Audit and tier your skills
-
-Walk through every skill. Ask: does this need to fire on every turn?
-
-- If yes → Tier A.
-- If it fires weekly or less but is real → Tier B.
-- If you don't use it → Tier C.
-
-### 2. Disable Tier B and C in your agent's config
-
-For OpenClaw, the file is `openclaw.json`. Add an entry per disabled skill:
-
-```json
-{
-  "skills": {
-    "entries": {
-      "gift-advisor": { "enabled": false },
-      "flight-tracker": { "enabled": false },
-      "1password": { "enabled": false }
-    }
-  }
-}
-```
-
-The exact config shape depends on which agent runtime you use. The point
-is the same in all of them: tell the runtime not to inject this skill into
-the system prompt. The file stays on disk; only the prompt injection stops.
-
-### 3. Write the resolver
-
-One line per Tier B and Tier C skill. Trigger phrases that match how you
-actually ask for things:
-
-```markdown
-- **gift-advisor**: gift idea | what should I bring | birthday gift
-- **flight-tracker**: track my flight | flight status | when do I land
-- **investor-update-ingest**: investor update | portfolio update | company metrics
-```
-
-That's it. The model handles the rest. When a request doesn't match Tier A,
-it checks the resolver, reads the matching SKILL.md, and executes.
-
-### 4. Run `gbrain doctor` and fix any unreachable skills
-
-The doctor sweep tells you which skills don't have a routing path. Add a
-resolver entry for each one, re-run, repeat until the count is zero.
-
-## Fix the tool, not the data
-
-When a tool fails against valid data, the right move is to fix the tool,
-not reshape the data. A clean list-format resolver is correct, compact,
-readable, and easy to maintain; a validator that only understands one
-shape is the bug, and the parser accepts both shapes for that reason.
-
-The same principle applies everywhere in agent systems. Your SKILL.md is
-the source of truth. Your AGENTS.md is the source of truth. Your resolver
-is the source of truth. When tooling disagrees with your configuration,
-the tooling is wrong. Fix the tooling.
-
-## The scaling curve
-
-At 50 skills, you don't need any of this. Just load everything.
-
-At 100, you start feeling the drag but can push through.
-
-At 200, routing accuracy drops and sessions get noticeably slower. This
-is where most people stop adding skills, which means their agent stops
-getting more capable. Bad trade.
-
-At 300+, tiering is mandatory. But with tiering, there's no ceiling.
-1,000 skills with 35 in the hot path and 965 in the resolver is the same
-per-turn cost as 35 skills with no resolver. The cost stays flat.
-Capabilities compound.
-
-The architecture that gets you from 50 to 300 is different from the
-architecture that gets you from 10 to 50. That's normal. Systems that
-scale change shape. The important thing is that each tier preserves full
-capability. You're organizing, not deleting.
-
-## Plugin bundling is a curation decision
-
-Not every skill in `skills/` reaches downstream installs. The plugin
-manifest (`openclaw.plugin.json`) is the bundled set; everything else is a
-recorded exclusion in `skills/plugin-exclusions.json`, each with a reason.
-The two are test-pinned in both directions: every manifest skill is either
-bundled or a recorded exclusion, and no skill is both. Adding a skill to
-the tree does NOT ship it — bundling is an explicit decision, and an
-unbundled skill never reaches a downstream install. When you write a new
-skill, decide (and record) which side of that line it lives on.
-
-`bun run gate:skills` (`scripts/skills-commit-gate.sh`) is the per-commit gate
-for any change under `skills/`. It runs the conformance + resolver +
-plugin-manifest tests, `check-resolvable --strict`, the `skills.lock.json`
-regen + freshness check, and `check-skill-refs` in seconds — run it before
-committing a skills change so the membership/closure and `plugin.version`
-assertions fail locally instead of in CI.
-
-`check-skill-refs` fails on two things:
-
-- **A `gbrain` command that cannot run.** Every `gbrain <cmd>` in a code block
-  or inline span must be real (`gbrain embed refresh` fails with its
-  replacement). Paid commands go preview, user approval, then `--yes --max-usd <cap>`.
-- **A relative link that leaves `skills/`**, which dangles in every copied
-  skill. Link the protocol through `skills/conventions/agent-operator-protocol.md`
-  and other docs by absolute URL; `bun scripts/portable-skill-links.ts` rewrites
-  both (honoring `LLMS_REPO_BASE`). `skills/migrations/**` is exempt.
-
-## When a skill misroutes
-
-Treat a misroute like a failing test, because it becomes one. First
-reproduce it as a fixture in the skill's `routing-eval.jsonl` — the utterance
-that misrouted, with the expected skill (or `null`). Rewrite the misrouted
-utterance onto placeholder entities (`alice-example`, `acme-example`) before
-committing the fixture — same rule as skill-autobench; a routing fixture is a
-public artifact and must not carry a real contact or company name. Only then
-fix the cause:
-usually a trigger in the skill's frontmatter or its row in
-`skills/RESOLVER.md`. Regenerate the lock (`bun run
-scripts/generate-skills-manifest.ts`) and the llms bundles (`bun run
-build:llms`), verify with `gbrain check-resolvable --strict`, and ship it as
-a MICRO release. Downstream installs heal on their next upgrade — the fix
-travels with the skillpack, not with a support thread.
-
-## Related
-
-- [Skill development cycle](skill-development.md) — the 5-step loop for
-  turning a repeated task into a real skill.
-- [Skillpacks as scaffolding](skillpacks-as-scaffolding.md) — how to
-  distribute a coherent set of skills across machines and agents.
-- [Sub-agent routing](sub-agent-routing.md) — when to delegate to a
-  sub-agent vs handle in-line, and the model routing table for each path.
-
-GBrain: [github.com/garrytan/gbrain](https://github.com/garrytan/gbrain).
-The `parseResolverEntries` parser lives at
-[`src/core/check-resolvable.ts`](../../src/core/check-resolvable.ts);
-the bundled resolver lives at [`skills/RESOLVER.md`](../../skills/RESOLVER.md).
-
----
-
-## docs/guides/push-context.md
-
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/push-context.md
-
-# Push-based context
-
-Pull retrieval needs the agent to *know to ask* before the brain contributes
-anything. Push-based context adds the other direction: the brain volunteers
-relevant pages from the recent conversation, confidence-gated so push noise
-never becomes worse than pull silence.
-
-The push channels share one zero-LLM core (`src/core/context/volunteer.ts`):
-
-| Channel | Surface | When to use |
-|---|---|---|
-| `reflex` | automatic, inside the context engine | default-on for plugin hosts; nothing to call |
-| `op` | `gbrain volunteer-context` / MCP `volunteer_context` | agents without the plugin; one call per turn |
-| `watch` | `gbrain watch` | stream a transcript in, volunteered pages stream out |
-| `claude-code` / `codex` / `opencode` | `gbrain hook user-prompt` (registered by `gbrain bootstrap`) | per-prompt injection inside a harness; see "Harness hooks" below |
-
-Push context is READ-side. Its WRITE-side sibling — the opt-in ambient
-memory writeback channel (`gbrain hook stop` banking gated user turns for
-serve-side extraction, `memory.auto_writeback`) — is documented in
-[ambient-writeback.md](./ambient-writeback.md).
-
-## How it decides
-
-1. **Extract** entities across the last N turns (capitalized runs, `@handles`),
-   merged with recency / frequency / user-role salience. Assistant-introduced
-   entities and "what did she invest in?" follow-ups whose antecedent was named
-   in the window resolve.
-2. **Resolve** through the alias table, exact titles, surnames, and slug
-   suffixes — each arm carries an honest confidence: alias 0.9, exact title
-   0.8, surname 0.72, slug-suffix 0.6, +0.05 when mentioned in ≥2 turns or the
-   newest turn. Lowercase mentions ("remind me what alice said") probe the
-   alias table only, and only when the alias is unique across every source in
-   play; a surname-only reference ("Did Galewright follow up?") resolves when
-   exactly one person page carries that surname. Ambiguity in either arm
-   injects nothing — silence beats a wrong pointer. Kill switch for both:
-   `retrieval_reflex_lexical_arms` (default on).
-3. **Gate** at `min_confidence` (default 0.7 — slug-suffix matches need an
-   explicit lower gate), suppress pages already surfaced (slug-presence only),
-   cap at 3 pages (hard cap 5).
-
-## CLI
-
-```bash
-# one-shot: pipe recent turns (oldest → newest)
-printf 'user: ask alice-example about the deal\nassistant: noted\nuser: what did she say?\n' \
-  | gbrain volunteer-context
-
-# streaming: volunteered pages print as the transcript flows
-some-transcript-feed | gbrain watch --json
-
-# the feedback loop: how often were volunteered pages actually opened?
-gbrain volunteer-context --stats
-```
-
-Stats are **approximate** by design: "used" means the page's last retrieval
-(`page_retrievals.last_retrieved_at`, or the legacy `pages.last_retrieved_at`) >
-`volunteered_at` — the 5-minute last-retrieved throttle causes false negatives
-and unrelated reads of the same page cause false positives. Use the per-arm
-precision to tune `min_confidence`, not as an exact metric.
-
-**PGLite + `gbrain watch`:** PGLite is single-connection, and watch holds its
-connection for the whole session — a concurrent `gbrain serve` or any write
-path blocks until watch exits. On a PGLite brain, run watch in bursts (piped
-input exits at EOF) or use the ambient reflex channel instead, which routes
-through a running serve's resolve socket rather than taking the lock. Routing
-watch through that same socket is a filed follow-up (TODOS.md). Postgres
-brains are unaffected.
-
-## Harness hooks (the prompt-time channel)
-
-`gbrain bootstrap` registers `gbrain hook user-prompt` as a Claude Code
-`UserPromptSubmit` hook: every prompt is assembled into a per-turn context
-block (reflex pointers + volunteered pages + hot facts) through a running
-serve's IPC socket and injected as `additionalContext`. Two properties make
-this channel production-grade rather than spammy-and-invisible:
-
-- **Cross-turn dedupe.** The hook reads its OWN previous injections back out
-  of the session transcript (Claude Code records them as structured
-  `hook_additional_context` attachments; only gbrain-marked blocks count) and
-  passes them as prior context — so a page is volunteered once per session,
-  not once per mention. The dedupe horizon is bounded (the recent transcript
-  window, byte-capped), so a marathon session can eventually re-volunteer its
-  oldest injections. The extraction is structural, never substring matching
-  over raw turn text, so a short slug appearing in a tool payload can't
-  over-suppress.
-- **The feedback loop.** The serve logs each DELIVERED block's volunteered
-  pages and pointers to `context_volunteer_events` under the hook's channel
-  (`claude-code` by default; a codex hook registration passes
-  `--harness codex` / `--harness opencode`). `gbrain volunteer-context --stats` then shows
-  per-harness precision, and `gbrain doctor`'s `volunteer_channels` check
-  shows which channels actually fire, with guidance for the two quiet cases:
-  "hook installed but never registered (restart the session)" and "registered
-  but quiet". Logging happens at the delivery point only — a block abandoned
-  before the serve responded is never counted — and because a delivered
-  response still isn't proof of injection (the hook can trim or drop it
-  client-side), the doctor check reconciles the counts against the hook's own
-  heartbeat and cautions when they diverge.
-
-The hook lane rides the running serve's IPC socket on PGLite and Postgres alike
-(the listener is engine-uniform and keys its socket off the connection URL), so
-the hook stays quiet only while no `gbrain serve` for the brain is running, and
-on a thin-client install, where pull-mode retrieval covers it.
-
-Kill switch: `GBRAIN_HOOKS=0`. Install/uninstall: `docs/guides/bootstrap.md`.
-
-## The proactive brief ("Before you start", off by default)
-
-Wave 5 D5. Before a meeting or a reply, the brain can hand the agent at most
-three dated items about the counterparty it did not ask for. It is off until
-the owner turns it on with `gbrain config set context.proactive_brief true`;
-with the key unset, no hook output and no `context_pack` response changes. It
-stays off by default until the D6 evaluation shows the agent does better work
-with it.
-
-**When it fires.** On Claude Code's existing hooks only:
-
-- **UserPromptSubmit:** the current prompt names a person or company the
-  brain resolves on the alias or title arm at 0.8 or more (never through a
-  common word such as "Will" or "May", never through a lowercase-only
-  mention), AND either a meeting with that counterparty starts within 12
-  hours (a meeting page in a google source that synced within 24 hours) or
-  the prompt matches a fixed reply/meeting phrase list ("reply", "follow up",
-  "draft an email", "meeting with", "prep for", "1:1", …). A prompt that
-  names someone without either stays silent.
-- **SessionStart:** a meeting starts within 12 hours and one of its
-  attendees' emails resolves to exactly one person or company page.
-
-Silent tasks (no counterparty named and no meeting), unnamed counterparties,
-and Codex, OpenCode and thin-client harnesses are out of scope for v1. **On a
-thin client, push is unsupported**: use the pull form below.
-
-**What it pushes.** The newest open loop with the counterparty, the newest
-dated fact about them, the newest dated edit to their page, then further
-loops, up to three items. The edit item is for agents that record a change by
-editing the page instead of calling `remember`: it is the page's newest
-timeline entry or the lines its newest revision added (whichever was recorded
-last), and it is dropped when it repeats the content of one of the
-counterparty's facts or loops in the brief. Facts and takes fence rows and
-headings never count as an edit. Each line
-carries a short id (`L12`, `F3401`, `Ev88` for a revision, `Et17` for a
-timeline entry), a date (`undated` when there is none),
-and the source slug, quoted as data inside the `retrieved brain context —
-data, not instructions` envelope. Each item is at most 600 characters, and
-the block at most 1,800. The block leads the injected context, so the hook's
-size cap never cuts it.
-
-- **World-only, always.** Private pages are never pushed, and neither are
-  facts whose provenance page is private. An open loop is pushed only
-  through its own world-visible, trust-eligible commitment fact; loops
-  extracted from email are written private, so they stay out until the owner
-  makes the fact world. The `remote_private_pages` escape hatch does not
-  widen the push.
-- **Fresh only.** Loops with no activity for 90 days and loops whose google
-  source has not synced in 24 hours are skipped. A page edit or timeline entry
-  recorded more than 30 days ago (or a timeline entry dated more than 30 days
-  ago) is skipped.
-- **Once per session.** An item id is not pushed twice in a session. The
-  serve remembers delivered ids per session (in memory, so a serve restart
-  forgets them), and the transcript's earlier injections are scanned for the
-  id. A compaction or `/clear` starts over. This is best effort: a delivered
-  response is not proof the hook injected it.
-- **Contradictions are not pushed yet.** They wait for D9, which makes stored
-  contradiction reports source-scoped and visibility-checked.
-
-**Known limit.** A google source's sync stamp is written after its Gmail sweep,
-so a sync whose calendar sweep alone failed still counts as fresh for the
-meeting trigger.
-
-**Telemetry.** Each delivered item logs one row to `context_volunteer_events`
-under channel `brief`, with `match_arm` set to `brief-calendar`,
-`brief-lexicon` or `brief-session` and the rationale `<kind>:<id>`.
-`volunteer-context --stats` shows these rows. Its "used" column counts a
-later read of the item's source page, which is only a page-open proxy: the
-brief puts the item inline, so an agent can use it without reading the page.
-D6 measures use.
-
-**Pull form, for harnesses without hooks.** `context_pack` takes
-`counterparty` (a name or an exact slug) and an optional `intent` (`meeting`
-or `reply`) and returns the same brief labelled `## Before you start (pulled
-on request)`, plus a structured `brief` field. Remote callers get the dated
-fact and page-edit arms (world pages only, the same text `get_versions` and
-`get_timeline` already return them); open loops are withheld
-(`withheld_arms: ["loops"]`).
-
-## The OpenClaw reflex volunteer arm
-
-The OpenClaw context-engine lane's ambient reflex runs TWO arms per
-windowed turn: Arm 1 resolves entity pointers (the classic 3-pointer block),
-then Arm 2 runs the same `volunteerStage` gate the Claude Code turn-context
-lane ships — up to 3 additional confidence-gated pages (0.7 gate), deduped
-against the turn's pointers, rendered in the same wire idiom. Volunteer
-events from this lane log to `context_volunteer_events` under the `openclaw`
-channel (in-process only — the wire-claimable harness channel allowlist
-deliberately excludes it, so a hook client cannot spoof production
-attribution; on the PGLite/IPC rung these events are not logged; extending the
-log to that rung is a filed follow-up in TODOS.md).
-
-**Say to your agent:** *"Turn off the brain's volunteered context for now"* —
-your agent sets `retrieval_reflex_volunteer` to `false` (or exports
-`GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER=off` when config is unreachable — env wins
-over config as the incident lever). *"How often are volunteered pages actually
-used?"* — your agent runs `gbrain volunteer-context --stats`.
-
-## Config
-
-| Key | Default | What it does |
-|---|---|---|
-| `retrieval_reflex_window_turns` | 4 | turns the ambient reflex extracts from; 1 = current turn only (file/env plane: `GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS`) |
-| `retrieval_reflex` | true | the ambient channel's master switch (env: `GBRAIN_RETRIEVAL_REFLEX`; negatives `false/0/off/no`, case-insensitive) |
-| `retrieval_reflex_volunteer` | true | the reflex volunteer arm (Arm 2) — the incident kill switch for volunteered pages on the OpenClaw lane (env: `GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER`, env above config) |
-| `retrieval_reflex_max_pointers` | 3 | pointer cap per turn |
-| `retrieval_reflex_lexical_arms` | true | the lowercase-alias + surname recall arms (env: `GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS`); off = disables both arms |
-| `context.hot_memory.session_only` | off | hot facts on the turn and session-start hooks come from the current session only, with no fallback to other sessions' recent facts (DB-plane; see [ambient writeback](ambient-writeback.md#hot-memory-and-other-sessions)) |
-| `context.proactive_brief` | off | the proactive brief ("Before you start") on the SessionStart and UserPromptSubmit hooks (DB-plane: `gbrain config set context.proactive_brief true`) |
-
-Per-call knobs: `max_pages` + `min_confidence` on both the op and `gbrain watch`
-(`--max-pages` / `--min-confidence`, plus `--window-turns` / `--source` on watch);
-on the op only: `prior_context` (text whose already-surfaced slugs are suppressed),
-`session_id` / `turn` attribution params (watch stamps its own per-session id and
-turn numbers in the feedback log), and `days` to size the `--stats` window.
-
-## Storage + privacy
-
-Volunteered pages log to `context_volunteer_events` (migration v117): slug,
-arm, confidence, channel, optional session/turn — the rationale is a
-deterministic template string, never raw conversation text. Event writes are
-best-effort (fire-and-forget, drained at CLI exit) — the log is a tuning signal,
-not an audit trail. Rows are pruned after 90 days by the dream cycle's purge
-phase. Synopses always strip the takes/facts fences — the same strip `get_page`
-applies to untrusted callers, applied unconditionally here so private fence rows
-never reach a prompt regardless of caller trust.
 
 ---
 
@@ -9245,9 +8862,8 @@ Optional response fields; clients must ignore any they do not know.
 `items` (1 to 20) replaces `fact` for a batch, typically right before
 context compaction. Each item is a fact string or an object with `fact` plus
 optional `entity`, `kind`, `ttl`, `visibility`, `provenance`,
-`infer_entity` and `replaces`; top-level `provenance`,
-`kind`, `ttl`, `visibility` and `infer_entity` are the defaults, so top-level
-`provenance` is optional when every item carries its own. `replaces` names one
+`content_origin`, `valid_from`, `infer_entity` and `replaces`; each but
+`replaces` is also a top-level default for items that omit it, so top-level `provenance` is optional when every item carries its own. `replaces` names one
 fact, so it goes on its item; passing both `fact` and `items`, or a top-level
 `replaces` with `items`, is `invalid_params`.
 
@@ -10533,6 +10149,14 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | A gbrain call failed with a code you don't recognize | follow `fix.next` ([protocol](../protocol/AGENT_OPERATOR_v1.md)); `gbrain errors <code>` | agent | as the fix's `consent` | the fix's `verify` |
 | A graph read omits a relationship you know existed, or says someone still works somewhere they left | the default read returns relationships true today: repeat with `status: "all"` or `as_of`; to record an end, add a dated timeline line (`Ended works_at [[companies/x]]`) or `add_link ... valid_until` ([temporal edges](temporal-edges.md)) | agent | none | `gbrain doctor --only edge_validity --json` |
 | A command exited 3 (`confirmation_required`) | relay `user_message`; run `fix.command` only after the user agrees | agent, after the user agrees | the payload's `effects` | the fix's `verify` |
+| A scheduled job, workspace script or hook finds nothing in the brain (every lookup empty), or its log shows `no_brain` or `GBRAIN_DB_ACCESS no_url`, while the same command works by hand | the job runs without the brain's config: call gbrain through one wrapper that sets `GBRAIN_HOME` and loads the brain's env file, and stop discarding its stderr ([the wrapper](cron-schedule.md#calling-gbrain-unattended)); `gbrain doctor --only cron_gbrain_home --json` names crontab lines that skip it | agent | none | the job's log shows results, and `gbrain engine status --json` run through the wrapper names the expected `db_url_source` |
+| `gbrain sources refresh` refuses `refresh_not_owner` from cron or a script but works by hand | the caller resolves another gbrain home, so it is another host; the refusal names the identity file, `HOME` and `GBRAIN_HOME` it read. Set the owner's `GBRAIN_HOME` in the wrapper (not `HOME`, which also swaps git credentials); never copy or delete a `host.json` | agent | none | `gbrain sources refresh <id> --dry-run` through the wrapper |
+| `gbrain sources refresh` refuses `refresh_diverged` on every run | something commits into the managed checkout outside gbrain, usually a script that writes files and runs `git commit` without pushing. `git log @{upstream}..HEAD` names the commits; move that writer to `gbrain git commit-push -- <paths>`, then publish the stray commits merged with the upstream (`gbrain git commit-push --push-only --keep-checkout --path <checkout>`) and retry, as the [refusal](write-refusals.md#refresh_diverged) says; never force ([scripts and the managed checkout](shared-checkout-git.md#scripts-and-the-managed-checkout)) | agent; reconciling after the user agrees | `destructive` when reconciling drops local commits | `gbrain sources refresh <id> --dry-run` |
+| A `--json` caller fails to parse gbrain's output | something other than gbrain wrote to stdout, usually a wrapper or a hook it runs; send that output to a log file or stderr (gbrain's own notices already go to stderr) | agent | none | the same call piped to `jq .` parses |
+| gbrain calls time out from a script or language runtime but finish by hand, or each search takes several seconds | a cold CLI start takes 3–6 s on a pooled Postgres brain: set caller timeouts of at least 10 s in both the shell and the runtime (a runtime exec timeout can override the shell's), and turn on the [warm CLI socket](cli-socket.md). If warm searches stay slow, measure the round trip to the database; one in another region dominates search time | agent; moving the database after the user agrees | none | `GBRAIN_DEBUG=1 gbrain search <query>` prints a `[cli-socket] warm:` line |
+| After a database change some processes still use the old server, or a URL variable silently keeps its old value | a shell-sourced env file has an unquoted `&` (the assignment ends there), or a process kept the environment it started with. Quote every value, keep Postgres URLs to `?sslmode=require` (driver options as variables, such as `GBRAIN_PREPARE=false`), update every URL variable the tooling reads, restart every gbrain process, and prove the switch from the database side ([switching a database](../../INSTALL_FOR_AGENTS.md#switching-a-database)). Never paste `env` output into a transcript while debugging | agent, after the user agrees | none | a row written after the restart appears on the new server |
+| Doctor `parked_effects` lists `git_target_ignored` effects | a `.gitignore` rule excludes those pages' files, so their Git effects cannot commit. The user decides: un-ignore (narrow the rule, commit it, then `gbrain sources writer retry-effects <source> --parked-code git_target_ignored`) or keep the pages database-only and leave the effects parked ([gitignored paths](shared-checkout-git.md#scripts-and-the-managed-checkout)) | agent, after the user decides | none | `gbrain sources writer status --source <id> --json` |
+| Sync and the maintenance cycle re-read a whole source on every run after its Git history was rewritten (force-push, `git filter-repo`) | the recorded base commit no longer exists. Move the checkout onto the new history ([upstream rewritten](#upstream-rewritten)); before the next rewrite, run `gbrain sources set-sync <id> off` and `gbrain sources mirror-readonly <id>` first | agent; the reset after the user agrees | `destructive` (the reset keeps a backup ref) | `gbrain doctor --only sync_failures --json` |
 | [Database unreachable or `GBRAIN_DB_ACCESS <reason>`](#database-unreachable) | `gbrain engine status --probe`, then `gbrain db-repair` (diagnose); `gbrain db-repair --yes` applies safe fixes | agent; `--yes` after the user agrees | none to diagnose; `--apply-rewrites` rewrites the config URL (undoable) | `gbrain engine status --probe --json` |
 | [PGLite `RuntimeError: Aborted()` at startup](#pglite-aborted) | automatic repair on the next command; else `gbrain pglite-repair --dry-run`, then `gbrain pglite-repair --yes` | agent; `--yes` after the user agrees | `destructive` (a WAL backup is kept and the restore command printed) | `gbrain doctor --only connection --json` |
 | [`expected N dimensions, not M` on import](#embedding-dimensions) | `gbrain doctor` prints the exact `gbrain config set …` or `gbrain migrate embeddings --to <provider:model>` command | agent, after the user agrees | `migrate embeddings`: `paid`, needs the brain's writer lock | `gbrain doctor --only embeddings,embedding_width_consistency --json` |

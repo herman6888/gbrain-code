@@ -1001,7 +1001,7 @@
         {
           "category": "ops",
           "elapsed_ms": "<volatile>",
-          "message": "RLS enabled on 156/156 public tables",
+          "message": "RLS enabled on 157/157 public tables",
           "name": "rls",
           "status": "ok"
         },
@@ -1015,14 +1015,14 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1357 column(s) verified against live schema",
+          "message": "1359 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "All 156 table(s) the applied migrations create exist.",
+          "message": "All 157 table(s) the applied migrations create exist.",
           "name": "schema_missing_tables",
           "status": "ok"
         },
@@ -3235,6 +3235,34 @@
           "elapsed_ms": "<volatile>",
           "message": "No title-prefixed person page pairs with an unprefixed page (0 titled page(s) examined).",
           "name": "person_title_duplicates",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/designs/GIT_CANONICAL_MEMORY.md#the-git-gap-census",
+            "errors": [],
+            "informational": true,
+            "partial_sources": [],
+            "sources": [],
+            "sources_without_git_checkout": 1,
+            "timeout_ms": "<volatile>"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No source has a Git checkout, so there is no commit to compare the database with.",
+          "name": "db_ahead_of_git",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/designs/GIT_CANONICAL_MEMORY.md#the-model",
+            "sources": [],
+            "warn_seconds": 900
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No source is strict (git-canonical), so no index trails a commit.",
+          "name": "git_index_lag",
           "status": "ok"
         },
         {

@@ -35,6 +35,8 @@ import { runManagedSourceLifecycle } from '../src/core/persistence/source-lifecy
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { refreshWorktree, resumeWorktreeRefreshes } from '../src/core/persistence/worktree-refresh.ts';
+import { commitAndPush } from '../src/core/git/commit-push.ts';
+import { gitConvergenceCheck } from '../src/commands/doctor/checks/git-convergence.ts';
 import { MANAGED_SYNC_PASS_OP, writePassRow, type ManagedSyncPassValue } from '../src/core/persistence/sync-pass-row.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
@@ -201,6 +203,61 @@ test('4. a diverged checkout is refused with no row and HEAD unchanged', () => e
   expect(error.suggestion).toContain(`gbrain sources reclone ${f.alpha}`);
   expect(await f.refreshRows()).toEqual([]);
   expect(f.head()).toBe(head);
+}), 120_000);
+
+test('4b. Q1: the diverged refusal names the keep-checkout publish; running it, then the refresh, brings the checkout up to date with the local commit kept', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream side.'));
+  writeFileSync(join(f.root, 'beta/local.md'), page('Local', 'A local commit nobody pushed.'));
+  git(f.root, 'add', 'beta/local.md'); git(f.root, 'commit', '-qm', 'local only');
+  const local = f.head();
+  const error = await refusedWith(refreshWorktree(f.engine, f.alpha), 'refresh_diverged') as { suggestion?: string; fix?: { argv: string[]; ask_user?: boolean; actor?: string } };
+  expect(error.suggestion).toContain('1 local commit(s)');
+  expect(error.fix).toMatchObject({ argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'], ask_user: true, actor: 'user' });
+  git(f.root, 'config', 'user.name', 'Example'); git(f.root, 'config', 'user.email', 'example@example.invalid');
+  expect(commitAndPush({ repo: f.root, pushOnly: true, keepCheckout: true })).toMatchObject({ outcome: 'pushed', integrated: 1, checkout: 'unchanged' });
+  expect(f.head()).toBe(local);
+  const done = await refreshWorktree(f.engine, f.alpha);
+  expect(done).toMatchObject({ status: 'completed', old_head: local });
+  git(f.root, 'merge-base', '--is-ancestor', local, 'HEAD');
+  expect(readFileSync(join(f.root, 'alpha/two.md'), 'utf8')).toContain('Upstream side.');
+  expect((await f.engine.getPage('two', { sourceId: f.alpha }))?.compiled_truth ?? (await f.engine.getPage('alpha/two', { sourceId: f.alpha }))?.compiled_truth).toContain('Upstream side.');
+}), 120_000);
+
+test('4c. Q1: commit-push on the managed checkout commits only the named page path, fetches and pushes nothing, and keeps other dirt', () => each(async f => {
+  git(f.root, 'config', 'user.name', 'Example'); git(f.root, 'config', 'user.email', 'example@example.invalid');
+  writeFileSync(join(f.root, 'beta/agent.md'), page('Agent', 'Written by an agent script.'));
+  writeFileSync(join(f.root, 'beta/other.md'), page('Other', 'Another writer, not named.'));
+  const before = f.head(), remote = git(f.root, 'ls-remote', 'origin', 'refs/heads/main').split('\t')[0];
+  const result = commitAndPush({ repo: f.root, cwd: f.root, paths: ['beta/agent.md'], message: 'agent: file one page' });
+  expect(result).toMatchObject({ outcome: 'committed_local', paths: ['beta/agent.md'], integrated: 0, checkout: 'unchanged' });
+  expect(git(f.root, 'rev-parse', 'HEAD^').trim()).toBe(before);
+  expect(git(f.root, 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim()).toBe('beta/agent.md');
+  expect(git(f.root, 'status', '--porcelain', '--', 'beta/other.md').trim()).toBe('?? beta/other.md');
+  expect(git(f.root, 'ls-remote', 'origin', 'refs/heads/main').split('\t')[0]).toBe(remote);
+  expect(() => commitAndPush({ repo: f.root, cwd: f.root, pending: true, message: 'pending' })).toThrow(expect.objectContaining({ code: 'commit_paths_invalid' }));
+  expect(() => commitAndPush({ repo: f.root, cwd: f.root, pushOnly: true })).toThrow(expect.objectContaining({ code: 'writer_coordinator_required' }));
+}), 120_000);
+
+test('4d. Q1: writer status and doctor name each commit a diverged managed checkout holds (sha, author, date, paths) and its porcelain', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream side.'));
+  git(f.root, 'fetch', '-q', 'origin');
+  writeFileSync(join(f.root, 'beta/local.md'), page('Local', 'A commit made outside gbrain.'));
+  git(f.root, 'add', 'beta/local.md'); git(f.root, 'commit', '-qm', 'cron: bare commit');
+  const sha = f.head(), author = git(f.root, 'log', '-1', '--format=%an <%ae>').trim(), date = git(f.root, 'log', '-1', '--format=%aI').trim();
+  writeFileSync(join(f.root, 'beta/scratch.txt'), 'untracked\n');
+  const status = await runPersistenceAdministration(f.engine, 'writer_status', { source_id: f.beta }) as { checkouts: Array<Record<string, any>> };
+  expect(status.checkouts).toHaveLength(1);
+  expect(status.checkouts[0]).toMatchObject({ source_ids: [f.beta], branch: 'main', upstream: 'origin/main', ahead: 1, behind: 1, diverged: true, fetched: false,
+    unpushed_truncated: false, porcelain: { staged: 0, modified: 0, untracked: 1, conflicted: 0 } });
+  expect(status.checkouts[0]!.unpushed_commits).toEqual([{ sha, author, date, subject: 'cron: bare commit', paths: ['beta/local.md'], paths_total: 1 }]);
+  const check = await gitConvergenceCheck(f.engine);
+  expect(check?.status).toBe('warn');
+  expect(check?.message).toContain('diverged');
+  expect(check?.message).toContain(sha.slice(0, 7));
+  const root = (check?.details as { roots: Array<Record<string, any>> }).roots.find(r => r.root === f.root)!;
+  expect(root).toMatchObject({ managed: true, diverged: true, ahead: 1, behind: 1, porcelain: { untracked: 1 } });
+  expect(root.unpushed_commits[0]).toMatchObject({ sha, author, paths: ['beta/local.md'] });
+  expect(check?.fix).toMatchObject({ ask_user: true, actor: 'user', argv: ['gbrain', 'git', 'commit-push', '--push-only', '--keep-checkout', '--path', f.root, '--json'] });
 }), 120_000);
 
 test('5. dirt overlapping the incoming diff refuses naming the path; unrelated dirt is preserved and listed', () => each(async f => {

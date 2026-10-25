@@ -222,6 +222,7 @@ export async function startCliSocketServer(opts: CliSocketServerOptions): Promis
   const close = () => {
     if (closing) return;
     closing = true;
+    process.off('exit', close);
     refusals.flush();
     server.close();
     for (const socket of sockets) socket.destroy();

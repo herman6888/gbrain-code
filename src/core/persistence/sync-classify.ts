@@ -9,6 +9,14 @@
  * its current revision, its hold, deletion marker, baseline blob and open work. Definitions (v3.1 §2.3, v3.2 §2.3):
  * `fileSame := L ∈ {r.blob_oid, r.disk_blob_oid}`, `dbSame := r.revision = page.revision`, `proof := dbSame ∨ att(R)`,
  * `obligation := ¬sameParser ∨ origin ≠ page.source_path ∨ episodeUnsatisfied`.
+ *
+ * G3 of git-canonical memory (docs/designs/GIT_CANONICAL_MEMORY.md): for a strict source (`config.canonical = "git"`) the
+ * classifier reads the commit alone and Git wins. The working tree is invisible (every path in `T` is clean, a path absent
+ * from `T` is absent), a page Git moved past or never matched imports the committed blob over the database, and a live
+ * page whose file a commit removed is deleted. A page Git never held stays as the database has it. Holds keep their rows
+ * (a hold at its level settles, a re-screened one re-runs Git's verdict); conversion resolves a source's holds before it
+ * turns strict. `gitWins` names the class the same path gets on a source that is not strict, so a preview can list what
+ * Git overwrote.
  */
 
 /** Candidate dirtiness of a committed-mode path in `T` (sync-git-stream.ts `probeDirtiness`). */
@@ -104,6 +112,8 @@ export interface SyncClassified {
   heldDeletion?: { commit: string; blob_oid: string };
   /** GBRA-133: why that proof refused this held deletion; its hold records it at the page's revision. */
   heldDeletionRefused?: string;
+  /** G3, a strict source: the class this path gets on a source that is not strict, when Git's verdict differs from it. */
+  gitWins?: SyncClass;
 }
 
 const CLEAN = new Set<SyncDirtiness | null>(['clean', 'clean_eol', 'clean_lfs']);
@@ -127,9 +137,9 @@ type Matched = Omit<SyncClassified, 'inFlight' | 'classAction'>;
  * in a class whose action says who finishes it. So a path with a hold row never settles in a later row (b2): unless the hold
  * is at its level and not re-screen due, the pass re-runs it (`held`, `rescreenDue`).
  */
-function firstMatch(s: SyncPathState): Matched {
+function firstMatch(s: SyncPathState, strict = false): Matched {
   if (s.hold && s.hold.atLevel && !s.hold.rescreenDue && !s.hold.retried) return { cls: 'held', settled: true, action: 'none' };
-  const rest = afterHold(s);
+  const rest = strict ? gitWins(s) : afterHold(s);
   // The re-run is the import the hold refused, where an import is what the level would get anyway (`import`) or changes
   // nothing (`matched`). A level that needs another action (a drift side, a delete proof, a reparse) keeps that class, so
   // its guard still applies; one that settles any other way (database ahead, a deleted page, an uncommitted edit, a legacy
@@ -187,9 +197,43 @@ function afterHold(s: SyncPathState): Matched {
   return { cls: 'drift', settled: false, action: 'hold', side: s.record?.revision != null ? 'both' : 'unknown' };
 }
 
-/** The class of one path (v3.2 §2.3), with the open-work overlay applied. */
-export function classifySyncPath(s: SyncPathState): SyncClassified {
-  const match = firstMatch(s);
+/**
+ * G3: a strict source's path as the commit alone shows it. Committed mode only (a strict pass never reads a working level):
+ * every path in `T` is clean with no disk bytes, a path absent from `T` is absent from disk, and keep_db does not apply.
+ */
+export function committedOnlyState(s: SyncPathState): SyncPathState {
+  return { ...s, present: s.tree !== null, dirty: s.tree === null ? null : 'clean', diskOid: null, published: false, keepDb: false };
+}
+
+/**
+ * G3: Git's verdict for a strict source, after its hold rows. Drift, a database version sync never saw (`db_ahead` that is
+ * not a pending door write), keep_db and an edited tombstone import the committed blob. A live page whose file is absent
+ * from `T` waits for its origin evidence (sync-pass.ts reads it for every delete candidate), then is deleted when a commit
+ * held the file and left as the database has it otherwise.
+ */
+function gitWins(s: SyncPathState): Matched {
+  const verdict = gitVerdict(committedOnlyState(s));
+  const before = afterHold(s).cls;
+  return verdict.cls === before ? verdict : { ...verdict, gitWins: before };
+}
+
+function gitVerdict(state: SyncPathState): Matched {
+  const rest = afterHold(state);
+  const wins = (match: Matched): Matched => match;
+  switch (rest.cls) {
+    case 'drift': case 'keep_db': case 'deleted_edited': return wins({ cls: 'import', settled: false, action: 'import' });
+    case 'db_ahead': return rest.sub === 'pending' ? rest : wins({ cls: 'import', settled: false, action: 'import' });
+    case 'delete': case 'delete_drift':
+      if (state.originEvidence === undefined) return rest;
+      if (state.originEvidence !== 'committed') return wins({ cls: 'kept', settled: true, action: 'none' });
+      return rest.cls === 'delete' ? rest : wins({ cls: 'delete', settled: false, action: 'delete' });
+    default: return rest;
+  }
+}
+
+/** The class of one path (v3.2 §2.3), with the open-work overlay applied; `strict` is Git's verdict (G3). */
+export function classifySyncPath(s: SyncPathState, opts: { strict?: boolean } = {}): SyncClassified {
+  const match = firstMatch(s, opts.strict === true && s.mode === 'committed');
   const inFlight = !match.settled && s.openWork;
   const classAction: SyncClassAction = inFlight || match.rescreenDue ? 'owner' : match.cls === 'dirty' ? (match.settled ? 'none' : 'repair') : syncClassAction(match.cls);
   return { ...match, inFlight, classAction };

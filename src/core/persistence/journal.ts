@@ -425,28 +425,52 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
  */
 /**
  * The publication group key of a request: a bulk sync's `intent.group`, the
- * batch id of a `put_pages` child (`intent.page_batch.id`, #6007), or the
- * batch id of a managed file import (`intent.import_batch`). Null when it
- * publishes alone.
+ * batch id of a `put_pages` child or of an `add_timeline_entry` admitted in
+ * the same batch (`intent.page_batch.id`, #6007), the batch id of a managed
+ * file import (`intent.import_batch`), the batch id of a maintenance run's
+ * page publications (`intent.maintenance_batch`, G6), or the activation id of
+ * a managed atom generation (its page members and its activation, G6). Null
+ * when it publishes alone. GROUP_KEY_SQL below is the same function in SQL.
+ *
+ * Every key is an independent group (`independentGroup`): one member's failure
+ * never cancels another. A maintenance batch is a set of unrelated page
+ * rewrites. An atom generation is already published one request at a time and
+ * crash-tolerant member by member (generations/managed.ts): creates land before
+ * the activation (an activation that never happens leaves orphan candidates),
+ * and overwrite and retire members each refuse unless pending on the live
+ * activated generation, a crash between them resuming on the next run. So a
+ * generation may activate with some members still pending; a member that fails
+ * in its group publishes or fails alone, exactly as it would ungrouped.
  */
 export function publicationGroupKey(row: Pick<WriteRequest, 'operation' | 'intent'>): string | null {
   if (typeof row.intent?.group === 'string') return `sync:${row.intent.group}`;
-  if (row.operation !== 'put_page') return null;
-  if (row.intent?.kind === 'managed_file_import') return typeof row.intent.import_batch === 'string' ? `import:${row.intent.import_batch}` : null;
+  const kind = row.intent?.kind;
+  if (row.operation === 'submit_job') {
+    if (kind === 'managed_maintenance_page') return typeof row.intent!.maintenance_batch === 'string' ? `maintenance:${row.intent!.maintenance_batch}` : null;
+    const atom = kind === 'managed_atom_page' || kind === 'managed_atom_delete'
+      || kind === 'managed_generation_activate' && (row.intent!.key as { kind?: unknown } | undefined)?.kind === 'atom';
+    return atom && typeof row.intent!.activationId === 'string' ? `generation:${row.intent!.activationId}` : null;
+  }
+  if (row.operation === 'put_page' && kind === 'managed_file_import') return typeof row.intent!.import_batch === 'string' ? `import:${row.intent!.import_batch}` : null;
+  if (row.operation !== 'put_page' && row.operation !== 'add_timeline_entry') return null;
   const batch = row.intent?.page_batch as { id?: unknown } | undefined;
-  return !row.intent?.kind && typeof batch?.id === 'string' ? `batch:${batch.id}` : null;
+  return !kind && typeof batch?.id === 'string' ? `batch:${batch.id}` : null;
 }
-/** Groups whose members are independent page writes: one member's failure never cancels the others. */
+/** Groups whose members are independent page writes: one member's failure never cancels the others (see publicationGroupKey). */
 export function independentGroup(key: string | null): boolean {
-  return key !== null && (key.startsWith('batch:') || key.startsWith('import:'));
+  return key !== null && ['batch:', 'import:', 'maintenance:', 'generation:'].some(prefix => key.startsWith(prefix));
 }
 /** #6712: a bulk managed-sync group key; such a group claims up to its admitted size (63 followers) and prepares four members at a time. */
 export function syncGroup(key: string | null): boolean {
   return key !== null && key.startsWith('sync:');
 }
-const GROUP_KEY_SQL = `CASE WHEN intent ? 'group' THEN 'sync:'||(intent->>'group')
+/** publicationGroupKey in SQL, over a persistence_requests row (test/git-door-g6-publication-groups.test.ts holds them equal). */
+export const GROUP_KEY_SQL = `CASE WHEN jsonb_typeof(intent->'group')='string' THEN 'sync:'||(intent->>'group')
+  WHEN operation='submit_job' AND intent->>'kind'='managed_maintenance_page' AND jsonb_typeof(intent->'maintenance_batch')='string' THEN 'maintenance:'||(intent->>'maintenance_batch')
+  WHEN operation='submit_job' AND (intent->>'kind' IN ('managed_atom_page','managed_atom_delete')
+    OR intent->>'kind'='managed_generation_activate' AND intent->'key'->>'kind'='atom') AND jsonb_typeof(intent->'activationId')='string' THEN 'generation:'||(intent->>'activationId')
   WHEN operation='put_page' AND intent->>'kind'='managed_file_import' AND jsonb_typeof(intent->'import_batch')='string' THEN 'import:'||(intent->>'import_batch')
-  WHEN operation='put_page' AND NOT (intent ? 'kind') AND jsonb_typeof(intent->'page_batch'->'id')='string' THEN 'batch:'||(intent->'page_batch'->>'id') END`;
+  WHEN operation IN ('put_page','add_timeline_entry') AND NOT (intent ? 'kind') AND jsonb_typeof(intent->'page_batch'->'id')='string' THEN 'batch:'||(intent->'page_batch'->>'id') END`;
 export async function claimGroupFollowers(engine: BrainEngine, head: WriteRequest, group: string, max: number, leaseMs = 30_000): Promise<WriteRequest[]> {
   if (!head.worktree_id || max <= 0) return [];
   return engine.transactionDirect(async tx => {

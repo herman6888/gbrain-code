@@ -43,10 +43,18 @@ function repo(): string {
 }
 
 describe('#7355: the drain hears a level read that is still working', () => {
+  // The drain's clock advances 20 ms per level-progress event against an 80 ms window, so the verdict no longer depends on
+  // event-loop scheduling (a loaded runner stalled the loop past the window). The governor still ticks on real timers; the
+  // 120 ms loop stall after the first event outlasts the window on purpose and stopped the pass before the clock seam.
   test('a pass that reports level progress past the no-progress window is not abandoned', async () => {
-    const result = await runDrain({ governMs: 10, noProgressMs: 80, publicationCeilingMs: 60_000,
+    let now = 0;
+    const result = await runDrain({ governMs: 10, noProgressMs: 80, publicationCeilingMs: 60_000, clock: () => now,
       pass: async (_signal, onProgress) => {
-        for (let i = 0; i < 20; i++) { onProgress?.({ phase: 'managed_sync.level_progress' }); await Bun.sleep(20); }
+        for (let i = 0; i < 20; i++) {
+          onProgress?.({ phase: 'managed_sync.level_progress' }); now += 20;
+          if (i === 0) { const blockedUntil = performance.now() + 120; while (performance.now() < blockedUntil) { /* the event loop stalls 120 ms after the first event */ } }
+          await Bun.sleep(20);
+        }
         return done;
       } });
     expect(result.drain).toMatchObject({ outcome: 'synced', passes: 1 });

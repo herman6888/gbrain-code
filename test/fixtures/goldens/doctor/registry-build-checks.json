@@ -191,6 +191,10 @@
       },
       {
         "category": "ops",
+        "name": "cron_gbrain_home"
+      },
+      {
+        "category": "ops",
         "name": "graduation_interrupted"
       },
       {
@@ -976,6 +980,14 @@
       {
         "category": "brain",
         "name": "person_title_duplicates"
+      },
+      {
+        "category": "brain",
+        "name": "db_ahead_of_git"
+      },
+      {
+        "category": "brain",
+        "name": "git_index_lag"
       },
       {
         "category": "brain",

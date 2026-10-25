@@ -6,6 +6,11 @@ the longer guidance for people: what each starter-surface tool does, its
 defaults, and the edge cases behind each parameter. The served schemas
 remain the contract; when they and this page differ, the schemas win.
 
+The starter surface lists the parameters an agent needs for the common call.
+Local-only, admin, legacy and tuning parameters stay callable on every
+surface, and `request_tools {tools: ["name"]}` returns a tool's full schema
+with every optional parameter.
+
 Say to your agent: *"Before you call a gbrain tool you have not used yet,
 check docs/mcp/TOOL_REFERENCE.md for its defaults."*
 

@@ -45,6 +45,8 @@ export interface WorktreeBinding {
   git_durability: GitDurabilitySetting;
   /** C-5: when the prepared transfer was recorded (manifest `prepared_at`); null when none is, or an older release prepared it. */
   prepared_at?: string | null;
+  /** G2 (git-door.ts): the source is strict (`config.canonical = "git"`), read with the binding so a write pays no extra statement. */
+  canonical_git?: boolean | null;
 }
 export type GitDurabilitySetting = 'enabled' | 'disabled' | null;
 export function containsPath(root: string, path: string): boolean {
@@ -74,7 +76,8 @@ export async function persistenceEnabledForHealth(engine: BrainEngine): Promise<
 /** The source's binding as this host sees it; group-publish.ts's preparation memo answers this exact statement once. */
 export const WORKTREE_BINDING_SQL = `SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path,
     s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state,
-    h.local_path,h.coordination_path,h.git_durability,w.manifest->>'prepared_at' AS prepared_at FROM persistence_source_bindings s
+    h.local_path,h.coordination_path,h.git_durability,w.manifest->>'prepared_at' AS prepared_at,
+    (SELECT COALESCE(src.config->>'canonical','')='git' FROM sources src WHERE src.id=s.source_id) AS canonical_git FROM persistence_source_bindings s
     JOIN persistence_worktrees w ON w.id=s.worktree_id
     LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid
     WHERE s.source_id=$1`;

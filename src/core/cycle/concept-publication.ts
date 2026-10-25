@@ -1,10 +1,12 @@
 /**
  * Managed publication of `synthesize_concepts` output (#5484).
  *
- * On a managed brain the phase publishes each concept page through the
- * maintenance coordinator (`publishMaintenancePage`) instead of the legacy
+ * On a managed brain the phase publishes its concept pages through the
+ * maintenance coordinator (`publishMaintenancePages`) instead of the legacy
  * `importFromContent` writer, which a managed brain refuses. The caller keeps
- * the #5525 order: publish private, bank provenance edges, then promote.
+ * the #5525 order: publish private, bank provenance edges, then promote; a
+ * concept whose banked edges already cover every member publishes once, at
+ * world (GBRA-60).
  */
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import { preservedConceptSections, stripPreservedConceptSections } from './concept-sections.ts';
@@ -14,7 +16,7 @@ import { serializeMarkdown, parseMarkdown } from '../markdown.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, replaceOrInsertFactsFence, stripFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence, stripTakesFence } from '../takes-fence.ts';
 import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
-import { publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { publishMaintenancePages, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
 import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { acquirePageLock } from '../page-lock.ts';
@@ -37,17 +39,32 @@ export const CONCEPT_HOLD_CODES = new Set(['source_changed', CONCEPT_PRESERVATIO
 
 function conceptHoldError(message: string): Error { return Object.assign(new Error(message), { code: CONCEPT_PRESERVATION_CODE }); }
 
+/** One concept page a managed run publishes: its synthesized frontmatter and narrative over the revision it was synthesized from. */
+export interface ManagedConcept { slug: string; synthesized: Record<string, unknown>; narrative: string; expectedRevision: string | null; members?: readonly string[] }
+
 /**
- * Publish one concept page through the maintenance coordinator. A concept
- * keeps the storage shape it already has: a row with a recorded source file is
- * republished to that file (a database-only update would leave the file stale
- * for the next sync to resurrect); new concepts and file-less rows stay
- * database-only, which is what the legacy writer produced. A declared
- * `db_only` storage tier always wins.
+ * Publish a run's concept pages through the maintenance coordinator as one batch (GBRA-60: one publication group on
+ * Postgres, so a strict source commits them together). Each concept settles on its own: the revision its publication
+ * produced, or the error that refused it (a revision race or a preservation hold included). A concept keeps the storage
+ * shape it already has: a row with a recorded source file is republished to that file (a database-only update would
+ * leave the file stale for the next sync to resurrect); new concepts and file-less rows stay database-only, which is
+ * what the legacy writer produced. A declared `db_only` storage tier always wins.
  */
-export async function publishManagedConcept(engine: BrainEngine, authority: MaintenanceAuthority,
-  slug: string, synthesized: Record<string, unknown>, narrative: string, expectedRevision: string | null, brainDir?: string,
-  members?: readonly string[]): Promise<string | null> {
+export async function publishManagedConcepts(engine: BrainEngine, authority: MaintenanceAuthority, concepts: readonly ManagedConcept[],
+  brainDir?: string): Promise<Array<{ revision: string | null } | { error: unknown }>> {
+  const prepared = await Promise.all(concepts.map(concept => prepareManagedConcept(engine, authority, concept, brainDir).catch((error: unknown) => ({ error }))));
+  const pages = prepared.flatMap(page => 'error' in page ? [] : [page]);
+  const published = pages.length ? await publishMaintenancePages(engine, authority, pages) : [];
+  let next = 0;
+  return prepared.map(page => {
+    if ('error' in page) return page;
+    const outcome = published[next++]!;
+    return 'error' in outcome ? outcome : { revision: typeof outcome.receipt.revision === 'string' ? outcome.receipt.revision : null };
+  });
+}
+
+async function prepareManagedConcept(engine: BrainEngine, authority: MaintenanceAuthority,
+  { slug, synthesized, narrative, expectedRevision, members }: ManagedConcept, brainDir?: string) {
   const derivation = members ? await conceptDerivation(engine, authority.writer.sourceId, members) : null;
   const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId, includeDeleted: true });
   // The narrative was synthesized from the revision read before the model call
@@ -68,9 +85,22 @@ export async function publishManagedConcept(engine: BrainEngine, authority: Main
   const markdown = snapshot && !snapshot.page.deleted_at
     ? composeConceptRepublication(snapshot.page, snapshot.tags, synthesized, narrative)
     : serializeMarkdown(synthesized, narrative, '', { type: 'concept', title, tags: [] });
-  const receipt = await publishMaintenancePage(engine, authority, slug, markdown,
-    { expectedRevision: snapshot?.revision ?? null, file: !dbOnly, ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) });
-  return typeof receipt.revision === 'string' ? receipt.revision : null;
+  return { slug, content: markdown, expectedRevision: snapshot?.revision ?? null, file: !dbOnly,
+    ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) };
+}
+
+/**
+ * #5525: whether the concept's `synthesized_from` provenance edges reach every member atom, the condition for publishing
+ * it at world. Read before publication too (GBRA-60): edges a prior run banked let a republished concept go straight to
+ * world instead of committing a private intermediate.
+ */
+export async function conceptProvenanceCovers(engine: BrainEngine, sourceId: string, conceptSlug: string, atomSlugs: readonly string[]): Promise<boolean> {
+  const members = [...new Set(atomSlugs)];
+  const [{ linked }] = await engine.executeRaw<{ linked: number }>(`SELECT COUNT(DISTINCT a.slug)::int AS linked FROM links l
+    JOIN pages c ON c.id=l.from_page_id JOIN pages a ON a.id=l.to_page_id
+    WHERE c.source_id=$1 AND c.slug=$2 AND a.slug=ANY($3::text[]) AND l.link_source='concept-provenance' AND l.link_type='synthesized_from'`,
+  [sourceId, conceptSlug, members]);
+  return Number(linked) === members.length;
 }
 
 /**

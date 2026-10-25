@@ -77,6 +77,8 @@ export interface AtomIntent extends Record<string, unknown> {
   retiredBy?: DerivedRetiredBy;
   /** The generation key the batch publishes, so a retry republishes under the same key. */
   generationKey?: GenerationKey;
+  /** #7514: a hold completion records the strike count it holds at instead of counting one more failure. */
+  attempts?: number;
 }
 
 const ownerStatusFix = (sourceId: string): Action => readFix(
@@ -561,7 +563,7 @@ export interface ManagedAtomRetirement {
 
 export async function publishManagedAtoms(engine: BrainEngine, session: ManagedAtomSession, origin: AtomOrigin,
   atoms: Array<{ slug: string; content: string; links: LinkBatchInput[]; expectedTarget?: { pageId: number | null; revision: string | null } }>,
-  failure?: string, reviewedRetirements?: ManagedAtomRetirement[]): Promise<WriteReceipt[]> {
+  failure?: string, reviewedRetirements?: ManagedAtomRetirement[], heldAttempts?: number): Promise<WriteReceipt[]> {
   const claim = atomClaim(session, origin);
   const key = claim.runKey;
   const advance = claim.checkpointKey ? { checkpointKey: claim.checkpointKey, expectedCheckpoint: claim.expectedCheckpoint ?? null } : {};
@@ -608,7 +610,7 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
     const children: string[] = [];
     const accepted: WriteRequest[] = [];
     for (const input of [...inputs, { slug: '__managed_atom_complete__', pageId: null,
-      intent: { kind: 'managed_atom_complete', runKey: key, origin, children, ...(failure ? { failure } : {}), ...advance } as AtomIntent }]) {
+      intent: { kind: 'managed_atom_complete', runKey: key, origin, children, ...(failure ? { failure } : {}), ...(heldAttempts ? { attempts: heldAttempts } : {}), ...advance } as AtomIntent }]) {
       const requestId = atomRequestId(key, input.slug);
       const row = await admitWriteInTransaction(tx, { principal: session.authority.principal, authority: session.authority,
         operation: 'submit_job', sourceId: session.sourceId, sourceIncarnation: session.incarnation,
@@ -635,6 +637,39 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
   return receipts;
 }
 
+const UNCOMMITTED_OP = 'managed-atoms-uncommitted';
+export interface AtomWriteFailure { error: string; request_id: string; code: string; strikes?: number; held?: boolean }
+
+/**
+ * #7514: an atom batch whose write ended without committing (conflict, failed, cancelled) is a write failure with
+ * the request id and refusal code of that write, never a provider failure. On the drain (not an explicit retry) each
+ * time it is met counts one strike for the failed batch, with no model call: a failed batch is not re-extracted on
+ * its own. At MAX_DETERMINISTIC_FAILURES strikes a journaled failure completion holds the origin (held_failed), so it
+ * leaves the backlog and doctor lists it with its receipt and the reviewed retry. Null for any other error.
+ */
+export async function atomWriteFailure(engine: BrainEngine, session: ManagedAtomSession, origin: AtomOrigin, error: unknown): Promise<AtomWriteFailure | null> {
+  const receipt = error instanceof OperationError ? error.writeRequest : undefined;
+  if (!(error instanceof OperationError) || !receipt || !['conflict', 'failed', 'cancelled'].includes(receipt.state)) return null;
+  const failure: AtomWriteFailure = { error: error.message, request_id: receipt.request_id, code: error.code };
+  if (session.retry) return failure;
+  const runKey = atomClaim(session, origin).runKey;
+  const [strike] = await engine.executeRaw<{ strikes: number }>(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys)
+      VALUES('${UNCOMMITTED_OP}',$1,jsonb_build_array(jsonb_build_object('requestId',$2::text,'code',$3::text,'strikes',1)))
+    ON CONFLICT(op,fingerprint) DO UPDATE SET updated_at=now(), completed_keys=jsonb_build_array(jsonb_build_object('requestId',$2::text,'code',$3::text,
+      'strikes',COALESCE((op_checkpoints.completed_keys->0->>'strikes')::integer,0)+1))
+    RETURNING (completed_keys->0->>'strikes')::integer AS strikes`, [runKey, receipt.request_id, failure.code]);
+  const strikes = Number(strike?.strikes ?? 1);
+  if (strikes < MAX_DETERMINISTIC_FAILURES) return { ...failure, strikes, error: `${failure.error} (write did not commit: strike ${strikes} of ${MAX_DETERMINISTIC_FAILURES} on this content)` };
+  const key = drainKey(session, origin);
+  const checkpoint = await readAtomCheckpoint(engine, key);
+  (session.attempts ??= new Map()).set(key, { runKey: digest([runKey, 'uncommitted-hold', checkpoint]), checkpointKey: key, expectedCheckpoint: checkpoint });
+  const receipts = await publishManagedAtoms(engine, session, origin, [],
+    `write did not commit: ${failure.code} (request ${receipt.request_id}): ${failure.error}`.slice(0, 500), undefined, strikes);
+  const held = receipts.every(row => row.state === 'committed');
+  if (held) await engine.executeRaw(`DELETE FROM op_checkpoints WHERE op='${UNCOMMITTED_OP}' AND fingerprint=$1`, [runKey]);
+  return { ...failure, strikes, held, error: `${failure.error} (write did not commit ${strikes} times on this content${held ? '; held: doctor extract_atoms_held_failed lists it' : ''})` };
+}
+
 export async function prepareManagedAtomMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const p = row.intent as AtomIntent | null;
   if (!p || !['managed_atom_page', 'managed_atom_delete', 'managed_atom_complete'].includes(p.kind) || !p.origin || row.authority.remote) {
@@ -644,15 +679,17 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
   }
   // GBRA-161 PR 1b: an overwrite or retirement member runs only after its activation: the activation rechecked the input
   // and the planned identities under the locks, so the member checks its item is pending on that live generation instead.
+  // G6: that check runs under the publication locks only. A member is prepared before its activation publishes when both
+  // are claimed in one generation group (journal.ts publicationGroupKey), where the activation applies first in the same transaction.
   const gated = Boolean(p.activationId) && (p.kind === 'managed_atom_delete' || p.phase === 'overwrite');
-  const validate = async (tx: BrainEngine) => {
+  const validate = async (tx: BrainEngine, publishing = true) => {
     // A connector preflighted as unbound publishes database-only; one claimed since then must use its owner.
     if (row.authority.databaseOnlyReason === 'connector_database' && await getWorktreeBinding(tx, row.source_id)) {
       throw opError('source_changed', 'The connector source gained a canonical owner after atom preflight; the next run extracts through its owner.',
         `Connector source ${row.source_id} was claimed by a canonical owner after this database-only atom run started; request ${row.request_id} changed nothing. Run the atom drain on the owning host.`,
         { fix: ownerStatusFix(row.source_id) });
     }
-    if (gated) { await assertMemberPending(tx, row, p.activationId!, 'atom'); return; }
+    if (gated) { if (publishing) await assertMemberPending(tx, row, p.activationId!, 'atom'); return; }
     if (p.origin.kind === 'transcript') {
       if (sha256(readFileSync(p.origin.locator)) !== p.origin.textHash) throw opError('source_changed', 'The accepted atom transcript changed.',
         `The transcript behind atom request ${row.request_id} in source ${row.source_id} was edited after acceptance, so the request published nothing. Run the atom drain again to extract the current file.`,
@@ -667,7 +704,7 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
       }
     }
   };
-  await validate(engine);
+  await validate(engine, false);
   const additionalPageKeys = p.origin.kind === 'page' ? [{ sourceId: row.source_id, slug: p.origin.locator }] : [];
   if (p.kind === 'managed_atom_delete') {
     if (!p.activationId) await replacementPublished(engine, row, p);
@@ -727,7 +764,7 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
       }
       // #6325: one strike per completed failure of this content, counted on the checkpoint it advances.
       const prior = Array.isArray(p.expectedCheckpoint) ? p.expectedCheckpoint[0] as AtomCheckpoint | undefined : undefined;
-      const attempts = (prior?.failure ? Number(prior.attempts ?? 1) : 0) + 1;
+      const attempts = p.attempts ?? (prior?.failure ? Number(prior.attempts ?? 1) : 0) + 1;
       const checkpoint = JSON.stringify([{ sourceId: row.source_id, incarnation: row.source_incarnation, requestId: row.request_id,
         kind: p.origin.kind, locator: p.origin.locator, pageId: p.origin.pageId, contentHash: p.origin.contentHash,
         ...(p.failure ? { failure: p.failure, attempts, ...(attempts >= MAX_DETERMINISTIC_FAILURES ? { held: true } : {}) }
@@ -799,10 +836,18 @@ export function managedAtomCompletedSql(page: { sourceId: string; slug: string; 
     AND ac.completed_keys->0->>'failure' IS NULL`;
 }
 
-/** #6325: discovery and the backlog skip a page whose current content completed or is held after repeated failures. */
-export const MANAGED_ATOM_DISCOVERY_SQL = `AND NOT EXISTS (SELECT 1 FROM op_checkpoints ac
+/**
+ * #6325: discovery and the backlog skip a page whose current content completed or is held after repeated failures.
+ * #7391: given the current input cap, a partial checkpoint recorded below it (one `releasePartialDispositions` clears) is not skipped.
+ */
+export function managedAtomDiscoverySql(maxInputChars?: string): string {
+  return `AND NOT EXISTS (SELECT 1 FROM op_checkpoints ac
   WHERE ${managedAtomIdentitySql({ sourceId: 'p.source_id', slug: 'p.slug', pageId: 'p.id', contentHash: 'p.content_hash' })}
-    AND (ac.completed_keys->0->>'failure' IS NULL OR ac.completed_keys->0->>'held'='true'))`;
+    AND (ac.completed_keys->0->>'failure' IS NULL OR ac.completed_keys->0->>'held'='true')${maxInputChars ? `
+    AND (ac.completed_keys->0->>'partial' IS NULL OR (ac.completed_keys->0->>'partial')::integer >= ${maxInputChars})` : ''})`;
+}
+
+export const MANAGED_ATOM_DISCOVERY_SQL = managedAtomDiscoverySql();
 
 export interface HeldManagedAtom {
   source_id: string;

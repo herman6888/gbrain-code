@@ -283,11 +283,14 @@ const THINKING_DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 // OpenAI reasoning models spend output budget on internal reasoning tokens
 // the same way — reasoning tokens are billed as output and count against
 // `max_tokens` — so they get the same headroom. Deliberately scoped to the
-// gpt-5 family and the numbered o-series only; anything else (gpt-4o, the
-// non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other providers'
-// reasoning models routed through their own recipes) keeps the conservative
-// 4000 default.
-const OPENAI_REASONING_MODEL_RE = /^openai[:/](?:gpt-5|o[0-9]+)(?:[.-]|$)/i;
+// gpt-5-and-later families and the numbered o-series only; anything else
+// (gpt-4o, the non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other
+// providers' reasoning models routed through their own recipes) keeps the
+// conservative 4000 default. #7421: matched behind any provider-prefix chain
+// (`openai:`, `litellm:`, `openrouter:openai/`), like the Claude regexes,
+// because the proxy route does not change how the model bills reasoning; an
+// opaque proxy alias (`litellm:my-reasoner`) still cannot be recognized.
+const OPENAI_REASONING_MODEL_RE = /[:/](?:gpt-[5-9]|o[0-9]+)(?:[.-]|$)/i;
 const OPENAI_CHAT_SNAPSHOT_RE = /-chat(?:-|$)/i; // gpt-5-chat-latest, gpt-5.2-chat-latest
 // #4375: the default deep tier (anthropic:claude-opus-4-7) routinely needs
 // more than 4000 tokens for the synthesis JSON envelope; at 4000 the envelope

@@ -88,6 +88,8 @@ export interface SyncIntent extends Record<string, unknown> {
   unownedDeletion?: boolean;
   /** GBRA-133: a held committed deletion `sync.apply_held_deletions` proved: the deleting commit and the blob the page equals. */
   heldDeletion?: { commit: string; blob_oid: string };
+  /** G3: a strict source's import or deletion, frozen from its commit alone: publication does not compare the working tree. */
+  committedOnly?: true;
   working?: boolean;
   renameFrom?: SyncRename;
   processingOptions?: SyncProcessingOptions;
@@ -736,7 +738,7 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
       },
       async () => {
         // GBRA-133 S-22: a deletion whose name became a directory has no file to compare.
-        if (p.path !== null && !p.body_ref && (p.kind === 'managed_sync_delete' && directoryAt(root, p.path) ? null : syncRawHash(root, p.path)) !== p.rawHash) throw syncPublicationRefusal('source_changed', 'The imported file changed after sync admission.', row, p,
+        if (p.path !== null && !p.body_ref && !p.committedOnly && (p.kind === 'managed_sync_delete' && directoryAt(root, p.path) ? null : syncRawHash(root, p.path)) !== p.rawHash) throw syncPublicationRefusal('source_changed', 'The imported file changed after sync admission.', row, p,
           `The file of ${row.slug} changed on disk after this sync was admitted; review the change and commit it.`);
       },
       async () => {

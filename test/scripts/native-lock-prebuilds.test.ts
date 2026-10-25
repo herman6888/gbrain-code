@@ -80,6 +80,10 @@ describe('native lock distribution integrity', () => {
         expect(job.steps.some(step => step.run?.includes('test/openclaw-context-engine-native.serial.test.ts'))).toBe(true);
         continue;
       }
+      if (name === 'heartbeat-finalize') {
+        expect(job.steps.some(step => step.run === 'bun scripts/native/heartbeat-finalize.ts')).toBe(true);
+        continue;
+      }
       if (name === 'windows-backup-console') {
         expect(job.steps.some(step => step.run?.includes('Windows backup console controls:'))).toBe(true);
         expect(job.steps.some(step => step.run === 'bun scripts/native/verify.ts')).toBe(true);

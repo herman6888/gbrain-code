@@ -89,8 +89,8 @@ import { utcDate } from './cycle-date.ts';
 import { atomSourceDate } from './atom-source-date.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
-import { atomOriginPin, managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, publishManagedAtomGeneration, resumeManagedGenerationMembers,
-  MANAGED_ATOM_DISCOVERY_SQL, type AtomOrigin } from '../persistence/atom-maintenance.ts';
+import { atomOriginPin, atomWriteFailure, type AtomWriteFailure, managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, publishManagedAtomGeneration, resumeManagedGenerationMembers,
+  MANAGED_ATOM_DISCOVERY_SQL, managedAtomDiscoverySql, type AtomOrigin } from '../persistence/atom-maintenance.ts';
 import { effectiveVisibility } from '../search/private-visibility.ts';
 import { OperationError } from '../ops/contract.ts';
 import { isOpPageSlug } from '../ops/context.ts';
@@ -205,11 +205,15 @@ const RAW_SOURCE_HOLDER_EXCLUSION_SQL =
 
 // #6503: a partial row (the page was cut at the input cap) is skipped like a
 // tombstone until releasePartialDispositions clears it under a raised cap.
-const PAGE_SCAN_STATE_EXCLUSION_SQL = `AND NOT EXISTS (
+// #7391: the backlog count passes the current cap, so a row recorded below it
+// (one the phase's release clears) counts before any phase has run.
+const pageScanStateExclusionSql = (maxInputChars?: string) => `AND NOT EXISTS (
   SELECT 1 FROM extract_atoms_page_state scan
   WHERE scan.source_incarnation=(SELECT s.incarnation FROM sources s WHERE s.id=p.source_id)
-    AND scan.page_id=p.id AND scan.content_hash=p.content_hash AND (scan.tombstoned OR scan.partial_input_chars IS NOT NULL)
+    AND scan.page_id=p.id AND scan.content_hash=p.content_hash
+    AND (scan.tombstoned OR ${maxInputChars ? `scan.partial_input_chars >= ${maxInputChars}` : 'scan.partial_input_chars IS NOT NULL'})
 )`;
+const PAGE_SCAN_STATE_EXCLUSION_SQL = pageScanStateExclusionSql();
 
 /**
  * Pure allowlist policy: the legacy floor (minus floor types the pack declares not extractable, #5756: the floor
@@ -533,6 +537,10 @@ export async function discoverExtractablePages(
  * rides migration v104's `pages_atom_source_hash_idx` partial index and stays
  * O(log n) on 100K+ brains.
  *
+ * #7391: a partial disposition recorded below the current input cap counts,
+ * because the phase releases it before discovery; without it a drain under a
+ * raised cap stopped at a zero count before any phase could release it.
+ *
  * PAGE-BACKLOG-ONLY (Codex #11): extract_atoms also discovers transcript files
  * at runtime; this count covers DB pages only. Callers label that caveat.
  *
@@ -562,8 +570,8 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
            AND ${minCompiledTruthChars('$3')}
-           ${MANAGED_ATOM_DISCOVERY_SQL}
-           ${PAGE_SCAN_STATE_EXCLUSION_SQL}
+           ${managedAtomDiscoverySql('$4::integer')}
+           ${pageScanStateExclusionSql('$4::integer')}
            ${connectorExclusion}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
@@ -580,8 +588,8 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
            AND ${minCompiledTruthChars('$2')}
-           ${MANAGED_ATOM_DISCOVERY_SQL}
-           ${PAGE_SCAN_STATE_EXCLUSION_SQL}
+           ${managedAtomDiscoverySql('$3::integer')}
+           ${pageScanStateExclusionSql('$3::integer')}
            ${connectorExclusion}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
@@ -591,9 +599,10 @@ export async function countExtractAtomsBacklog(
                AND atom.deleted_at IS NULL
            )`;
     const extractableTypes = await resolveExtractableTypes();
+    const maxInputChars = await resolveExtractAtomsInputCap(engine);
     const params = scoped
-      ? [sourceId, extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION]
-      : [extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION];
+      ? [sourceId, extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION, maxInputChars]
+      : [extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION, maxInputChars];
     const rows = await engine.executeRaw<{ cnt: string | number }>(sql, params, { signal: opts.signal });
     return Number(rows[0]?.cnt ?? 0);
   } catch (err) {
@@ -952,7 +961,7 @@ export async function runPhaseExtractAtoms(
   let pagesProcessed = 0;
   let transcriptsSkipped = 0;
   let pagesSkipped = 0;
-  const failures: Array<{ source: string; error: string }> = [];
+  const failures: Array<{ source: string; error: string } & Partial<Omit<AtomWriteFailure, 'error'>>> = [];
   let estimatedSpendUsd = 0;
   let budgetExhausted = false;
   // #3813: key-aware tier default, not a hardcoded Anthropic model — an
@@ -1162,6 +1171,7 @@ export async function runPhaseExtractAtoms(
     // disposition instead of a completion stamp (extract-atoms-input.ts).
     const input = extractAtomsInput(item, maxInputChars, item.kind === 'page' ? (await readPageWatermark(engine, sourceId, item.slug, 'extract_atoms')).stored : null);
     const { promptContent } = input;
+    let origin: AtomOrigin | null = null;
     // Local fork patch (#6503): oversized items are windowed with overlap
     // instead of truncated at the cap; a one-window item keeps the old path
     // byte-for-byte (chunks[0].text === promptContent then). A windowed item
@@ -1174,7 +1184,7 @@ export async function runPhaseExtractAtoms(
     const chunked = chunks.length > 1;
     const truncated = input.truncated && !chunked;
     try {
-      const origin: AtomOrigin | null = managed ? { ...await readAtomOrigin(engine, managed, item), ...(truncated ? { partialInputChars: maxInputChars } : {}) } : null;
+      origin = managed ? { ...await readAtomOrigin(engine, managed, item), ...(truncated ? { partialInputChars: maxInputChars } : {}) } : null;
       const sourcePage = item.kind === 'page' ? await engine.getPage(item.slug, { sourceId }) : null;
       const contentDate = await atomSourceDate(engine, sourcePage); // #6720: captured with the input, before inference
       const visibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
@@ -1326,6 +1336,7 @@ export async function runPhaseExtractAtoms(
             item.kind === 'page'
               ? await resolvePageAtomSlug(engine, atom.title, item.slug, sourceId, undatedDate, pageAtomTitles)
               : await resolveTranscriptAtomSlug(engine, sourceId, atom.title, item, undatedDate, atomSlug);
+          if (importedSlugs.includes(slug)) continue; // #7514: a repeated title is one atom; a second item at its slug cannot publish
           const originFrontmatter =
             item.kind === 'transcript'
               ? { source_path: item.filePath }
@@ -1458,6 +1469,8 @@ export async function runPhaseExtractAtoms(
         else pagesSkipped++;
         continue;
       }
+      const written = managed && origin ? await atomWriteFailure(engine, managed, origin, err) : null; // #7514: never a provider error
+      if (written) { hardFailureCount++; failures.push({ source: originLabel, ...written }); continue; }
       // gbrain#4148: classify. Transient provider/infra errors (timeouts,
       // rate limits, 5xx, network) stay retryable and are NOT counted toward
       // any tombstone. A provider content block (prompt-level refusal) is

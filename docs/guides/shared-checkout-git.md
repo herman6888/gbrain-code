@@ -106,7 +106,9 @@ gbrain git commit-push --dry-run -m "people: add alice-example" -- people/alice-
 ```
 
 Flags: `--path <dir>` acts on a checkout other than the one containing the
-current directory, `--json` prints one JSON result (or the error envelope),
+current directory (the paths are then relative to `<dir>`, like `git -C`),
+`-m` repeats like `git commit` (each one is a new paragraph, so a second `-m`
+carries a trailer), `--json` prints one JSON result (or the error envelope),
 `--require-clean` makes `--pull` skip when the checkout has any local edit
 (the rule the unattended pull cron uses). The command is local only: it pushes
 with this machine's git credentials and is never exposed over MCP.
@@ -116,10 +118,27 @@ path-scoped commit and a plain push. A rejected push then fails loudly (exit 4)
 and tells you to install gbrain and run `gbrain git commit-push --push-only`;
 the fallback never integrates remote commits itself.
 
-A managed canonical worktree (`gbrain sources writer git-durability`) refuses
-both forms with `writer_coordinator_required`: its persistence owner is the only
-Git writer there. Save pages with `put_page`, `edit_page`, `remember` or
-`capture`; see [files that are not pages](../architecture/topologies.md#files-that-are-not-pages).
+In a managed canonical worktree (`gbrain sources writer git-durability`) its
+persistence owner is the only Git publisher. Save pages with `put_page`,
+`edit_page`, `remember` or `capture`. For files written there outside gbrain
+(see [files that are not pages](../architecture/topologies.md#files-that-are-not-pages)),
+`gbrain git commit-push -m "<msg>" -- <paths>` commits only the named paths
+under the checkout's commit lock and reports `committed_local`: it never
+fetches, merges, pushes or moves the checkout, and refuses `--pending`,
+`--branch`, `--resolve` and `--allow-outside-source-root` there
+(`commit_paths_invalid`). The commit reaches the remote on the owner's next Git
+publish. `--push-only` without `--keep-checkout` is still refused with
+`writer_coordinator_required`.
+
+A checkout with no Git remote at all (`git remote` prints nothing and the
+branch names none) has nothing to publish to: `gbrain git commit-push -m "<msg>" -- <paths>`
+commits only the named paths under the commit lock and reports
+`committed_local` with `no_remote: true`, saying nothing was pushed.
+`--push-only`, `--pending`, `--branch`, `--resolve`/`--expect-remote` and
+`--require-clean` are refused there (`commit_paths_invalid`). Add a remote and
+set the branch upstream, then `gbrain git commit-push --push-only` publishes the
+local commits. A branch that names a remote which does not exist still refuses
+(`git_unavailable`).
 
 The one form a managed worktree accepts is `--push-only --keep-checkout`. It
 publishes the commits already on the branch, merging a moved remote in memory,
@@ -146,7 +165,8 @@ Follow the error's `fix.next` as the
 | --- | --- | --- |
 | `pushed` | 0 | Done. Report the commit; a hosted link to the file works now. |
 | `push_deferred` | 0 | Only with `--require-clean` (the post-commit hook): another push was running in this checkout and was asked to publish HEAD too when it finishes. Nothing to do. |
-| `nothing_to_commit` | 0 | The paths had no change. Any earlier local commit on the branch was still pushed, so nothing is waiting. |
+| `nothing_to_commit` | 0 | The paths had no change. Any earlier local commit on the branch was still pushed, so nothing is waiting (with `no_remote: true`, nothing is pushed). |
+| `committed_local` | 0 | A managed canonical worktree, or a checkout with no Git remote (`no_remote: true`): the paths were committed locally and nothing was pushed. Report the commit; it reaches a remote on the owner's next publish, or after a remote is added and `--push-only` runs. |
 | `pushed_checkout_lagging` | 0 | The push landed but this checkout was not advanced; a `[gbrain notice]` names the files that blocked it. Change nothing: the next commit-push or `--pull` catches the checkout up. Never stash or reset to "fix" it. |
 | `commit_lock_busy` | 1 | Another writer held the lock for the whole wait; nothing was committed. Retry once. If it is still busy, tell the user which checkout and lock path the message names and stop. |
 | `commit_paths_invalid` | 1 | No paths, a path outside the checkout, the checkout root itself, or a path git would not stage. Name the explicit files you wrote and rerun. |
@@ -159,7 +179,7 @@ Follow the error's `fix.next` as the
 | `integrate_conflict` | 1 | Local and remote commits changed the same file; nothing was merged and the checkout is unchanged. Stop, relay the question to the user, then [resolve](#conflicts). |
 | `push_unconfirmed` | 4 | The commit is durable locally but no push destination confirmed it (network, credentials, branch protection, a remote that kept moving, or another push that held the push lock for the whole wait). Fix what the message names, then run `gbrain git commit-push --push-only`. Never force-push. |
 | `writer_coordinator_required` | 1 | This is a managed worktree. Stop using git for pages; save them through `put_page` and the other gbrain write tools. |
-| `git_unavailable` | 1 | A git command failed, often a missing `user.name`/`user.email` or a refusing pre-commit hook. Read the message, fix that, rerun. When the branch has no usable remote at all, the run stops before committing: add the remote, or commit locally with `git add <paths> && git commit -m "<msg>" -- <paths>`. |
+| `git_unavailable` | 1 | A git command failed, often a missing `user.name`/`user.email` or a refusing pre-commit hook. Read the message, fix that, rerun. When the branch names a remote that does not exist (a typo or a broken clone), the run stops before committing: fix the name or add the remote, then rerun. A checkout with no remote at all commits locally instead (`committed_local`). |
 
 `--pull` reports `up_to_date`, `advanced`, `ahead` (local commits not yet
 pushed; run `--push-only`), `skipped_dirty` (only with `--require-clean`) or
@@ -216,6 +236,52 @@ write that gets the lock commits the pending files with its own, and
 `gbrain git commit-push --pending` commits and pushes them on demand.
 `gbrain doctor` reports pending files older than 30 minutes as `dirty_age`.
 
+<a id="scripts-and-the-managed-checkout"></a>
+## Scripts and the managed checkout
+
+On a managed brain the persistence owner is the only Git writer in the
+canonical checkout, and `gbrain sources refresh` is the only way upstream
+commits come in. Four rules keep that checkout able to move:
+
+1. **Scripts commit through gbrain, never with plain `git commit`.** A cron
+   job or hook that writes files into the checkout and commits them with
+   plain git leaves commits the upstream lacks and nobody publishes. The
+   checkout diverges, and every later refresh refuses `refresh_diverged` and
+   changes nothing. Commit the files a script wrote with
+   `gbrain git commit-push -m "<msg>" -- <paths>`: on a managed worktree it
+   commits only those paths under the commit lock (`committed_local`) and the
+   owner publishes them on its next Git publish. Pages can also go through
+   `put_page`, `edit_page`, `remember` or `capture`. CLI calls go through
+   the [one wrapper](cron-schedule.md#calling-gbrain-unattended).
+2. **Refresh on a schedule.** `gbrain sources refresh <id>` drains queued
+   writes, refuses new ones until it finishes, fast-forwards with
+   `git merge --ff-only` and re-syncs every source on the checkout; run it
+   from cron on the owner host
+   ([cron line](../../skills/cron-scheduler/SKILL.md#managed-brain)).
+   `refresh_diverged` means something committed outside gbrain:
+   `git log --format='%h %an %ad %s' @{upstream}..HEAD` lists the stray
+   commits. Fix that writer first, then, after the user agrees, publish the
+   stray commits merged with the upstream
+   (`gbrain git commit-push --push-only --keep-checkout --path <checkout>`)
+   and retry the refresh, as the [refusal](write-refusals.md#refresh_diverged)
+   says. Never force the checkout.
+3. **Stop syncing a source before rewriting its history.** Before a
+   force-push or `git filter-repo`, run `gbrain sources set-sync <id> off`
+   (with the user's agreement) so automatic sync skips it, and
+   `gbrain sources mirror-readonly <id>` so no managed write touches its
+   checkout. A sync whose recorded base commit no longer exists makes sync and
+   the maintenance cycle re-read the whole tree. After the rewrite, move the
+   checkout onto the new history
+   ([upstream rewritten](troubleshooting.md#upstream-rewritten)), then
+   `gbrain sources mirror-writable <id>` and `gbrain sources set-sync <id> on`.
+4. **Decide what a gitignored path is.** A page whose file a `.gitignore`
+   rule excludes cannot be committed, so its Git effect parks at once as
+   `git_target_ignored` naming the rule (since v0.60.427.0). Either un-ignore
+   it (remove or narrow the rule, commit that, then
+   `gbrain sources writer retry-effects <source> --parked-code git_target_ignored`)
+   or keep those pages database-only and leave the effects parked. Ask the
+   user which; it decides whether those pages are in the Git backup.
+
 <a id="conflicts"></a>
 ## Conflicts
 
@@ -229,6 +295,20 @@ untouched and nothing is pushed. The error names the files, the local and
 remote commits (in its `detail`), and a question to relay to the user. Until it
 is resolved, every later commit-push from this checkout hits the same
 conflict, even for other files, because the unpushed commit is still waiting.
+
+One kind of conflict settles itself on push. When the remote's version of a
+file is one this checkout already had at that path and later replaced with
+another version (a stale clone or writer pushed an old copy back, often inside
+a merge), gbrain keeps this machine's version: the remote's copy is history
+this checkout already moved past. It looks at the last 200 commits that
+changed the file. The push lists those files in `superseded_remote_paths`
+(`--json`) and a `[gbrain notice]` line, and the merge commit message names
+them. A version this checkout never had, a file the remote deleted, and a file
+you name with `--resolve` stay ordinary conflicts. When both kinds meet in one
+push, the error lists only the real conflicts (its `detail.superseded` names
+the others), and the `--resolve` run keeps this machine's version of the
+superseded files. `--pull` still reports them as conflicts; a
+`gbrain git commit-push --push-only` settles them.
 
 To resolve:
 

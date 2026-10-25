@@ -57,7 +57,22 @@ describe('data-safety native CI coverage', () => {
     const caller = (load(readFileSync(join(import.meta.dir, '../../.github/workflows/test.yml'), 'utf8')) as {
       jobs: Record<string, { uses?: string; permissions?: Record<string, string> }> }).jobs['native-locks']!;
     expect(caller.uses).toBe('./.github/workflows/native-locks.yml');
-    expect(caller.permissions).toEqual({ contents: 'read', statuses: 'write' });
+    expect(caller.permissions).toEqual({ actions: 'read', contents: 'read', statuses: 'write' });
+  });
+
+  test('a Linux job after every cell finalizes a darwin-x64 heartbeat its cell left pending, never on a fork pull request', () => {
+    const finalize = (workflow.jobs as unknown as Record<string, { needs: string[]; if: string; 'runs-on': string; permissions: Record<string, string>; steps: Step[] }>)['heartbeat-finalize']!;
+    expect(finalize.needs).toEqual(['native']);
+    expect(finalize.if).toBe("${{ always() && inputs.scope != 'smoke' }}");
+    expect(finalize['runs-on']).toBe('ubicloud-standard-2-ubuntu-2404');
+    expect(finalize.permissions).toEqual({ actions: 'read', contents: 'read', statuses: 'write' });
+    const step = finalize.steps.at(-1)!;
+    expect(step).toEqual({ name: 'Finalize darwin-x64 heartbeats left pending', run: 'bun scripts/native/heartbeat-finalize.ts', env: {
+      GH_TOKEN: '${{ github.token }}',
+      GBRAIN_HEARTBEAT_ENABLED: "${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && '1' || '0' }}",
+      GBRAIN_HEARTBEAT_SHA: '${{ github.event.pull_request.head.sha || github.sha }}',
+    } });
+    for (const other of finalize.steps.slice(0, -1)) expect(JSON.stringify(other)).not.toContain('github.token');
   });
 
   test('the opt-in console diagnostic has an isolated Windows matrix without filtering the acceptance suites', () => {

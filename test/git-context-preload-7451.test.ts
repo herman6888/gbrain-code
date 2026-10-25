@@ -24,7 +24,7 @@ function git(args: string[], cwd: string): string {
   return proc.stdout.toString().trim();
 }
 
-function outerRepo(): { root: string; outer: string; probe: string; inner: string } {
+function outerRepo(spawnEnv = 'env: { ...process.env }, '): { root: string; outer: string; probe: string; inner: string } {
   const root = mkdtempSync(join(tmpdir(), 'gbrain-git-context-'));
   dirs.push(root);
   const outer = join(root, 'outer');
@@ -33,7 +33,7 @@ function outerRepo(): { root: string; outer: string; probe: string; inner: strin
   const probe = join(root, 'git-context-probe.test.ts');
   writeFileSync(probe, `import { expect, test } from 'bun:test';
 test('a throwaway repo gets its own config', () => {
-  const run = (args: string[], cwd: string) => Bun.spawnSync(['git', ...args], { cwd, env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' });
+  const run = (args: string[], cwd: string) => Bun.spawnSync(['git', ...args], { cwd, ${spawnEnv}stdout: 'pipe', stderr: 'pipe' });
   expect(run(['init', '-q', ${JSON.stringify(inner)}], ${JSON.stringify(root)}).exitCode).toBe(0);
   expect(run(['-C', ${JSON.stringify(inner)}, 'config', 'user.name', 't'], ${JSON.stringify(root)}).exitCode).toBe(0);
   expect(run(['-C', ${JSON.stringify(inner)}, 'config', 'user.email', 't@t'], ${JSON.stringify(root)}).exitCode).toBe(0);
@@ -58,6 +58,18 @@ describe('git-hermetic-preload: inherited git context (#7451)', () => {
     expect(result.exitCode).toBe(0);
     expect(git(['config', '--file', join(outer, '.git', 'config'), '--list'], outer)).toBe(before);
     expect(git(['config', '--file', join(outer, '.git', 'config'), '--get', 'core.bare'], outer)).toBe('false');
+    expect(git(['config', '--file', join(inner, '.git', 'config'), '--get', 'user.name'], inner)).toBe('t');
+  }, 60_000);
+
+  // Bun.spawn and Bun.spawnSync called without `env` hand the child the environment the process started with, not
+  // process.env as the preloads left it, so the preload makes process.env their default.
+  test('a helper that spawns git without an env option leaves the outer repository config untouched too', () => {
+    const { outer, probe, inner } = outerRepo('');
+    const before = git(['config', '--file', join(outer, '.git', 'config'), '--list'], outer);
+    const result = runProbe(probe, { GIT_DIR: join(outer, '.git'), GIT_WORK_TREE: outer, GIT_INDEX_FILE: join(outer, '.git', 'index') });
+    expect(result.output).toContain('1 pass');
+    expect(result.exitCode).toBe(0);
+    expect(git(['config', '--file', join(outer, '.git', 'config'), '--list'], outer)).toBe(before);
     expect(git(['config', '--file', join(inner, '.git', 'config'), '--get', 'user.name'], inner)).toBe('t');
   }, 60_000);
 

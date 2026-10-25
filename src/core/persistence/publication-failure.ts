@@ -65,6 +65,8 @@ export interface PublicationFailure { code: string; message: string; detail?: Pu
 const IDENT = /^[A-Za-z_][A-Za-z0-9_.:-]{0,79}$/;
 const ident = (value: unknown) => typeof value === 'string' && IDENT.test(value) ? value : undefined;
 const GUARD_PREFIX = 'writer_coordinator_required:';
+/** G7a (writer-guard-schema.ts): the guard's refusal of a git-canonical source's row from a writer without the git protocol. */
+const GIT_PROTOCOL_PREFIX = 'git_protocol_required:';
 /** trust/schema.ts: the tier trigger's refusal of a raise without owner confirmation. */
 const TRUST_PREFIX = 'trust_raise_refused:';
 const PURGED_PREFIX = 'purged_content:';
@@ -142,6 +144,10 @@ export function databaseRefusal(error: unknown): PublicationFailure | null {
   }
   if (message.startsWith(PURGED_PREFIX)) return { code: 'purged_content', message: `${message.slice(PURGED_PREFIX.length).trim()}. Nothing was committed.`,
     detail: { origin: 'database_trigger', sqlstate, ...(raiser ? { raiser } : {}), ...(table ? { table } : {}) } };
+  if (message.startsWith(GIT_PROTOCOL_PREFIX) || constraint.startsWith('git_canonical_fence')) {
+    return { code: 'git_protocol_required', detail: { origin: 'database_guard', sqlstate, raiser: raiser ?? 'gbrain_require_managed_writer', ...(table ? { table } : {}), ...guardDetail(e.detail) },
+      message: `The git-canonical database fence refused a write${table ? ` on ${table}` : ''}: the source is git-canonical and this gbrain process does not declare the git protocol (an older gbrain). Nothing was committed.` };
+  }
   if (message.startsWith(GUARD_PREFIX) || constraint.startsWith('managed_writer_guard')) {
     const branch = constraint.startsWith('managed_writer_guard:') ? ident(constraint.slice('managed_writer_guard:'.length)) : undefined;
     const detail: PublicationFailureDetail = { origin: 'database_guard', sqlstate, raiser: raiser ?? 'gbrain_require_managed_writer',

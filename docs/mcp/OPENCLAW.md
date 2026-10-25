@@ -71,6 +71,19 @@ Leave `GBRAIN_SOURCE` unset in the MCP env unless you deliberately want
 single-source retrieval: a pin scopes every tool (search, `get_brain_identity`
 counts, …) to that one source, and nothing warns on reads.
 
+## Scheduled jobs and workspace scripts
+
+OpenClaw cron jobs, workspace scripts and hooks run with another `HOME` and
+environment than the gateway's MCP server. Route every one of them through a
+single wrapper that sets `GBRAIN_HOME`, loads the brain's env file and runs the
+installed `gbrain` by absolute path; log its stderr and check its exit code
+([the wrapper and its rules](../guides/cron-schedule.md#calling-gbrain-unattended)).
+On a managed brain, scripts commit the files they write with
+`gbrain git commit-push -- <paths>` (never plain `git commit`); a scheduled
+`gbrain sources refresh <id>`
+keeps it current
+([scripts and the managed checkout](../guides/shared-checkout-git.md#scripts-and-the-managed-checkout)).
+
 ## Verify
 
 `openclaw mcp list` should show `gbrain`. Then start an agent turn and ask it

@@ -139,6 +139,10 @@ export async function findOrphans(
   const sourceId = opts.sourceId;
   const sourceIds =
     opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
+  const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
+  const connectorSources = includePseudo ? new Set<string>() : await loadConnectorSourceIds(engine);
+  const isConnectorRender = (row: { type?: string | null; source_id?: string }) =>
+    !!row.source_id && connectorSources.has(row.source_id) && !!row.type && CONNECTOR_RENDER_TYPES.has(row.type);
   // The NOT EXISTS anti-join over pages × links can take seconds on 50K-page
   // brains. Heartbeat every second so agents see the scan is alive. Keyset
   // pagination was considered and rejected: without an index on
@@ -150,10 +154,6 @@ export async function findOrphans(
   let allOrphans: { slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }[];
   let total: number;
   let excludedAll: number;
-  const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
-  const connectorSources = includePseudo ? new Set<string>() : await loadConnectorSourceIds(engine);
-  const isConnectorRender = (row: { type?: string | null; source_id?: string }) =>
-    !!row.source_id && connectorSources.has(row.source_id) && !!row.type && CONNECTOR_RENDER_TYPES.has(row.type);
   try {
     allOrphans = await engine.findOrphanPages({
       excludePrivate: opts.excludePrivate,

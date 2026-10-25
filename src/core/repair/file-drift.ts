@@ -63,6 +63,7 @@ import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import { validateSlug } from '../utils.ts';
 import { matchesRepairPath } from './path-glob.ts';
 import { shellQuote } from '../agent-output.ts';
+import { commitPushCommand } from '../git/commit-push.ts';
 import type { ParsedPage } from '../import-file.ts';
 import { digest, stableJson } from '../persistence/digest.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, withVerifiedLocalRegistration } from '../persistence/identity.ts';
@@ -802,8 +803,8 @@ export const fileDriftRepair: RepairHandler = {
       const binding = await getWorktreeBinding(engine, sourceId);
       const root = join(binding!.local_path!, binding!.relative_path);
       if (!(await gitDurabilityPolicy(binding, root).catch(() => ({ durable: false }))).durable) {
-        if (removed.length) warnings.unshift(`The next sync undoes this repair unless the removals are committed: Git durability is off for ${sourceId}, so the apply leaves each removed file's deletion uncommitted (${removed.length} file(s)) and the next sync holds the committed file again. Commit them right after the apply: git -C ${root} add -- ${removed.join(' ')} && git -C ${root} commit`);
-        if (recreated.length) warnings.unshift(`The next sync undoes this repair unless the recreated files are committed: Git durability is off for ${sourceId}, so the apply leaves each recreated file uncommitted (${recreated.length} file(s)) and the next sync imports their committed deletion again. Commit them right after the apply: git -C ${root} add -- ${recreated.join(' ')} && git -C ${root} commit`);
+        if (removed.length) warnings.unshift(`The next sync undoes this repair unless the removals are committed: Git durability is off for ${sourceId}, so the apply leaves each removed file's deletion uncommitted (${removed.length} file(s)) and the next sync holds the committed file again. Commit them right after the apply: ${commitPushCommand(root, removed, [`gbrain: repair file drift in ${sourceId}`])}`);
+        if (recreated.length) warnings.unshift(`The next sync undoes this repair unless the recreated files are committed: Git durability is off for ${sourceId}, so the apply leaves each recreated file uncommitted (${recreated.length} file(s)) and the next sync imports their committed deletion again. Commit them right after the apply: ${commitPushCommand(root, recreated, [`gbrain: repair file drift in ${sourceId}`])}`);
         undoneBySync = { recreated: recreated.length, removed: removed.length };
       }
     }

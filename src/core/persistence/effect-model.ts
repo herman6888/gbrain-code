@@ -80,6 +80,8 @@ export interface PersistenceEffect {
     commit_subject?: string;
     commit_line?: string;
     commit_trailer?: string;
+    /** G2 (git-door.ts): the file was committed with its publication (a strict source); the effect only pushes. */
+    push_only?: boolean;
     /** Consecutive execution failures of the current Git or withdrawal target. */
     target_failures?: number;
     /** GBRA-133: consecutive `writer_busy` retries of this streak, when the streak began and when its last retry was recorded (ISO). */

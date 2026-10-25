@@ -907,6 +907,8 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
       return;
     }
     const targets: { effect: PersistenceEffect; path: string; attempt: EffectAttempt }[] = [];
+    // G2 (git-door.ts): a strict source's file was committed with its publication; its effect only joins the push.
+    const committedAtPublication: PersistenceEffect[] = [];
     let reclaimed = false;
     try {
       for (const effect of effects) {
@@ -922,6 +924,7 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
           if (!own?.local_path || own.local_path !== binding.local_path) throw opError('source_changed', 'The effect canonical binding changed.',
             `Source ${effect.source_id}'s canonical checkout no longer matches the worktree this Git group is committing, so its file was left out. Check the owner; the effect resumes under the current binding.`,
             { fix: effectStatusFix(effect) });
+          if (effect.data.push_only === true) { committedAtPublication.push(effect); continue; }
           const path = await singleFileGitTarget(engine, effect, { ...own, local_path: own.local_path }, attempt);
           if (path !== null) targets.push({ effect, path, attempt });
         } catch (error) { await recordFailure(engine, effect, error, opts.signal, attempt.target); }
@@ -940,6 +943,7 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
         else if (outcome.reason === 'target_absent' && !ahead) await completeEffect(engine, effect, outcome);
         else pending.items.push({ effect, outcome, target: attempt.target });
       }
+      for (const effect of committedAtPublication) pending.items.push({ effect, outcome: { git: 'committed', at: 'publication' } });
       if (pending.items.length) unpushed.set(binding.local_path, pending);
     } catch (error) {
       for (const { effect, attempt } of targets) await recordFailure(engine, effect, error, opts.signal, attempt.target);

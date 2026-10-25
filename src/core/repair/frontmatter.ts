@@ -64,6 +64,7 @@ import { materializedSnapshot, segmentedOverCeiling } from '../persistence/segme
 import { pageBodyOverCeilingError } from '../page-body/page-shape.ts';
 import { afterCursor, repairRequestId, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairListing, type RepairPlan, type RepairScope } from './core.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { commitPushCommand } from '../git/commit-push.ts';
 import { bindOrigin, originConflictMessage, pickCanonicalOrigin } from '../persistence/origin-guard.ts';
 
 type Mode = 'managed' | 'legacy';
@@ -583,5 +584,5 @@ async function applyRepair(ctx: OperationContext, repair: ApprovedRepair, select
     'SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [repair.source_id]))[0]!.incarnation, path: repair.path, observedAt: new Date().toISOString() });
   return { applied: ok, outcome: ok ? 'repaired' : 'import_refused', ...(ok ? {} : { reason: imported.error ?? 'the import refused the repaired file' }),
     detail: { path: repair.path, written: repair.before !== repair.after, ...(backup ? { backup } : {}), imported: imported.status, hold_cleared: holdCleared,
-      committed: 'commit_step', commit_step: `git -C ${shellQuote([root])} add -- ${shellQuote([repair.path])} && git -C ${shellQuote([root])} commit -m ${shellQuote([`fix(frontmatter): repair ${repair.path}`])}` } };
+      committed: 'commit_step', commit_step: commitPushCommand(root, [repair.path], [`fix(frontmatter): repair ${repair.path}`]) } };
 }

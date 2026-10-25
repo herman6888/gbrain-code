@@ -13,6 +13,8 @@ import { primeRelationSemantics } from '../link-semantics-pack.ts';
 import { bodyUnread, isSegmentedPage } from '../page-body/page-shape.ts';
 import { extractSegmentedPageLinks, segmentedRoleText } from '../page-body/segment-links.ts';
 import { temporalBodyOf, type TemporalBody } from '../link-temporal-apply.ts';
+import { linksFenceProjectionRows, projectLinksFence } from '../links-fence-projection.ts';
+import { isQuarantined } from '../quarantine.ts';
 
 async function liveSlugAliases(engine: BrainEngine, sourceId: string, targets: string[]): Promise<Map<string, string>> {
   if (!targets.length) return new Map();
@@ -96,6 +98,8 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
   if (!opts.pack || !settings) return { pageKeys: [{ sourceId, slug }], attendanceComplete: true, settings,
     apply: async () => ({ created: 0, removed: 0, errors: 1, unresolved_count: 1 }) };
   const segmented = bodyUnread(page) ? { id: Number(page.id), slug, source_id: sourceId, type: page.type, frontmatter: page.frontmatter } : null;
+  // G5: re-derivation also restores the page's links fence edges (a body with no readable fence leaves them alone).
+  const fenceLinks = segmented || isQuarantined(page.frontmatter) ? null : await linksFenceProjectionRows(engine, sourceId, page);
   const roleText = segmented ? await segmentedRoleText(engine, segmented) : undefined;
   const extract = (o: ExtractPageLinksOptions & { temporal?: boolean }): Promise<PageLinksResult & { temporalBody?: TemporalBody }> => segmented
     ? extractSegmentedPageLinks(engine, segmented, resolver, { ...o, roleText })
@@ -147,6 +151,11 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
       const result = await tx.replaceDerivedLinks({ slug, sourceId, expectedRevision: snapshot.revision,
         sourceIncarnation: snapshot.sourceIncarnation, snapshot }, rows, { preserveExisting: true, semanticsPrimed: primeSemantics, lineGrammar: settings, wanted: { ...wanted, producers: [...wanted.producers] },
         expectedEndpoints: capturedLinkEndpoints(rows, metadata, { slug, sourceId }), ...stored });
+      if (fenceLinks) {
+        const fence = await projectLinksFence(tx, snapshot.page, fenceLinks);
+        result.created += fence.created;
+        result.removed += fence.removed;
+      }
       return { ...result, errors: 0, unresolved_count: unresolved.length, skipped_cross_source: skippedCrossSource, wanted_count: wanted.rows.length,
         ...(wanted.rows.length ? { wanted: wanted.rows.slice(0, 10).map(row => ({ slug: row.target_ref, source_id: row.target_source_id })),
           wanted_message: 'These link targets have no page yet; each edge is created when its page is. Create the page if it is real, or fix the link if it is a typo.',

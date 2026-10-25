@@ -31,9 +31,10 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { execFileSync } from '../spawn.ts';
 import { gitChildEnv } from '../git-env.ts';
 import { GIT_ENV, GIT_ENV_AUTH, GIT_SSRF_SUBCOMMAND_FLAGS, durableSsrfFlags } from '../git-transport.ts';
-import { assertManagedFilesystemWrite } from '../persistence/filesystem-guard.ts';
+import { assertManagedFilesystemWrite, hasFilesystemPublication, managedFilesystemRootFor, type ManagedFilesystemRoot } from '../persistence/filesystem-guard.ts';
 import { acquireNativeLock, acquireNativeLockSync, type NativeLockSyncHandle } from '../persistence/native-lock.ts';
 import { OperationError, opError } from '../ops/contract.ts';
+import { shellQuote } from '../agent-output.ts';
 
 export const COMMIT_LOCK_NAME = 'brain-commit.lock';
 /** Taken by pre-#6530 helpers and hooks; held too so they still exclude us during the mixed-version window. */
@@ -55,8 +56,11 @@ const INDEX_LOCK_RETRIES = 5;
 export type CheckoutState = 'advanced' | 'unchanged' | 'lagging';
 
 export interface CommitPushResult {
-  /** `push_deferred`: an unattended publish found another publish running and left it a request to publish HEAD too. */
-  outcome: 'pushed' | 'nothing_to_commit' | 'pushed_checkout_lagging' | 'push_deferred';
+  /**
+   * `push_deferred`: an unattended publish found another publish running and left it a request to publish HEAD too.
+   * `committed_local`: a managed canonical worktree, or a checkout with no Git remote (`no_remote`), where commit-push only commits the named paths and never pushes.
+   */
+  outcome: 'pushed' | 'nothing_to_commit' | 'pushed_checkout_lagging' | 'push_deferred' | 'committed_local';
   /** The commit now on the remote branch (the caller's commit or the merge built over it). */
   sha: string | null;
   committed: string | null;
@@ -71,6 +75,10 @@ export interface CommitPushResult {
   lagging_reason?: string;
   /** Opt-in quarantine (git config gbrain.quarantine): the local versions of conflicting files, parked under a ref; the remote's version was published. */
   quarantined?: QuarantineEntry;
+  /** The checkout has no Git remote: the paths were committed locally (or were already committed) and nothing was pushed. */
+  no_remote?: true;
+  /** Conflicted files where the remote held a version this checkout had already replaced: this checkout's version was published. */
+  superseded_remote_paths?: string[];
 }
 
 export interface PullResult {
@@ -181,6 +189,11 @@ function absGitPath(root: string, rel: string): string {
 }
 
 /** The checkout's toplevel; throws `commit_paths_invalid` outside a work tree. */
+/** The operator step that commits and pushes only `paths` (relative to `root`) with one -m per message paragraph: the fix text doctor and repair print instead of a bare git add/commit. */
+export function commitPushCommand(root: string, paths: readonly string[], messages: readonly string[]): string {
+  return shellQuote(['gbrain', 'git', 'commit-push', '--path', root, ...messages.flatMap(m => ['-m', m]), '--', ...paths]);
+}
+
 export function checkoutRoot(dir: string): string {
   const r = git(dir, ['rev-parse', '--show-toplevel']);
   if (r.code !== 0 || !r.stdout.trim()) {
@@ -714,6 +727,30 @@ function blobConflict(root: string, base: string, ours: string, theirs: string, 
   return true;
 }
 
+const MAX_SUPERSEDED_HISTORY = 200;
+
+/**
+ * Content conflicts where the remote's blob is one this checkout held at the same path and then replaced with
+ * another blob (a stale clone or writer brought an old copy back): the remote's version is history this side
+ * already moved past, so these resolve to ours. Reads the last MAX_SUPERSEDED_HISTORY commits of `ours` that touch
+ * the path. A blob ours never held there, a remote deletion, a structural conflict and a path the caller resolves
+ * explicitly stay conflicts.
+ */
+function supersededPaths(root: string, ours: string, theirs: string, merged: MergeTree, explicit?: Map<string, Resolution>): string[] {
+  const base = git(root, ['merge-base', ours, theirs]).stdout.trim();
+  return merged.conflicts.filter(path => {
+    if (explicit?.has(path) || merged.structural.includes(path) || path.includes('\n') || !blobConflict(root, base, ours, theirs, path)) return false;
+    const remote = treeEntry(root, theirs, path);
+    if (!remote) return false;
+    const commits = git(root, ['--literal-pathspecs', 'log', '--format=%H', '-n', String(MAX_SUPERSEDED_HISTORY), ours, '--', path]).stdout.split('\n').filter(Boolean);
+    const blobs = git(root, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], { input: commits.map(c => `${c}:${path}\n`).join('') })
+      .stdout.split('\n').slice(0, commits.length).map(line => (line.endsWith(' blob') ? line.split(' ')[0] : null));
+    const held = [treeEntry(root, ours, path)?.sha ?? null, ...blobs];
+    const at = held.indexOf(remote.sha);
+    return at > 0 && held.slice(0, at).some(sha => sha && sha !== remote.sha);
+  });
+}
+
 /** Apply `--resolve` choices on top of the merge's placeholder tree; structural conflicts are refused. */
 function resolvedTree(ctx: Ctx, ours: string, theirs: string, merged: MergeTree, resolutions: Map<string, Resolution>, cwd: string): string {
   if (merged.conflicts.some(p => !resolutions.has(p))) throw conflictError(ctx, ours, theirs, merged);
@@ -745,7 +782,7 @@ function shellWord(v: string): string {
   return /^[A-Za-z0-9._\/@%+:-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`;
 }
 
-function conflictError(ctx: Ctx, ours: string, theirs: string, merged: MergeTree, preface = ''): OperationError {
+function conflictError(ctx: Ctx, ours: string, theirs: string, merged: MergeTree & { superseded?: string[] }, preface = ''): OperationError {
   const paths = merged.conflicts;
   const local = ours.slice(0, 12);
   const remote = theirs.slice(0, 12);
@@ -754,7 +791,7 @@ function conflictError(ctx: Ctx, ours: string, theirs: string, merged: MergeTree
     ? `${preface}The local commit ${local} stays local and the checkout is unchanged. ${merged.structural.map(shellWord).join(', ')} ${merged.structural.length === 1 ? 'is' : 'are'} a file/directory or rename conflict that a per-file choice cannot resolve. ${compare}, then move or remove the local path in a new commit (gbrain git commit-push -m "<msg>" -- <paths>) and rerun gbrain git commit-push --push-only. See docs/guides/shared-checkout-git.md#conflicts.`
     : `${preface}The local commit ${local} stays local and the checkout is unchanged. ${compare}, then run gbrain git commit-push --push-only${ctx.keepCheckout ? ' --keep-checkout' : ''} --expect-remote ${remote} ${paths.map(p => `--resolve ${shellWord(p)}=ours|theirs`).join(' ')} (ours = this machine's version, theirs = the remote's, or =file:<path> with a merged copy). Until then every push from this checkout reports this conflict. See docs/guides/shared-checkout-git.md#conflicts.`;
   return opError('integrate_conflict', `Local and remote commits both changed ${paths.length} file(s) on ${ctx.branch}; nothing was merged.`, fix,
-    { detail: JSON.stringify({ local: ours, remote: theirs, paths, structural: merged.structural }),
+    { detail: JSON.stringify({ local: ours, remote: theirs, paths, structural: merged.structural, ...(merged.superseded?.length ? { superseded: merged.superseded } : {}) }),
       fix: { ask_user: true, consent: [], actor: 'user', requires_exclusive: false,
         why: 'Choosing which version of a file wins discards the other side; ask the user before resolving.',
         user_message: `Both this machine and the remote changed ${paths.join(', ')}. Which version should win, or should they be merged by hand?`,
@@ -806,7 +843,7 @@ function remoteContains(ctx: Ctx, sha: string): boolean {
   return true;
 }
 
-interface Published { sha: string; integrated: number; confirmed: 'push' | 'remote'; quarantined?: QuarantineEntry }
+interface Published { sha: string; integrated: number; confirmed: 'push' | 'remote'; quarantined?: QuarantineEntry; superseded?: string[] }
 
 // ── Quarantine (opt-in) ─────────────────────────────────────────────────────
 
@@ -853,14 +890,16 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
   let lastError = '';
   let stalled = 0;
   let quarantined: QuarantineEntry | undefined;
+  const superseded = new Set<string>();
+  const notes = () => ({ ...(quarantined ? { quarantined } : {}), ...(superseded.size ? { superseded: [...superseded] } : {}) });
   const onRemote = (): Published => {
     const tip = fetchTracking(ctx);
-    return { sha: tip && isAncestor(ctx.root, candidate, tip) ? tip : candidate, integrated, confirmed: 'remote', ...(quarantined ? { quarantined } : {}) };
+    return { sha: tip && isAncestor(ctx.root, candidate, tip) ? tip : candidate, integrated, confirmed: 'remote', ...notes() };
   };
   for (let attempt = 0; attempt < MAX_PUSH_ATTEMPTS; attempt++) {
     if (attempt) Atomics.wait(sleeper, 0, 0, Math.min(2000, 50 * 2 ** attempt) + Math.floor(Math.random() * 100));
     const push = remoteGit(ctx.root, 'push', [...(ctx.keepCheckout ? ['--no-verify'] : []), '--', ctx.remote, `${candidate}:${ctx.mergeRef}`]);
-    if (push.code === 0) return { sha: candidate, integrated, confirmed: 'push', ...(quarantined ? { quarantined } : {}) };
+    if (push.code === 0) return { sha: candidate, integrated, confirmed: 'push', ...notes() };
     lastError = push.stderr.trim();
     if (remoteContains(ctx, candidate)) return onRemote();
     const remoteTip = fetchTracking(ctx);
@@ -869,13 +908,19 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
       if (++stalled > 1) break;
       continue;
     }
-    const merged = integrate(ctx.root, candidate, remoteTip);
+    const raw = integrate(ctx.root, candidate, remoteTip);
+    const kept = supersededPaths(ctx.root, candidate, remoteTip, raw, resolutions);
+    const merged = kept.length
+      ? { ...raw, superseded: kept, conflicts: raw.conflicts.filter(p => !kept.includes(p)),
+        tree: resolvedTree(ctx, candidate, remoteTip, { ...raw, conflicts: kept }, new Map(kept.map(p => [p, { kind: 'ours' } as Resolution])), cwd) }
+      : raw;
     let tree = merged.tree!;
-    let parkedNote: string[] = [];
+    let mergeNotes: string[] = kept.length
+      ? [`Kept this machine's version of ${kept.length} file(s) where the remote held a version this checkout had already replaced: ${kept.slice(0, 20).join(', ')}${kept.length > 20 ? ', ...' : ''}`] : [];
     if (merged.conflicts.length && !resolutions?.size && !merged.structural.length && quarantineEnabled(ctx.root)) {
       tree = resolvedTree(ctx, candidate, remoteTip, merged, new Map(merged.conflicts.map(p => [p, { kind: 'theirs' } as Resolution])), cwd);
       quarantined = parkLocalVersion(ctx.root, candidate, remoteTip, merged.conflicts);
-      parkedNote = [`Quarantined this machine's version of ${merged.conflicts.length} conflicting file(s) under ${quarantined.ref}: ${merged.conflicts.slice(0, 20).join(', ')}`];
+      mergeNotes = [...mergeNotes, `Quarantined this machine's version of ${merged.conflicts.length} conflicting file(s) under ${quarantined.ref}: ${merged.conflicts.slice(0, 20).join(', ')}`];
     } else if (merged.conflicts.length) {
       if (!resolutions?.size) throw conflictError(ctx, candidate, remoteTip, merged);
       if (!expectRemote || !remoteTip.startsWith(expectRemote.toLowerCase())) {
@@ -885,7 +930,8 @@ function publish(ctx: Ctx, start: string, resolutions: Map<string, Resolution> |
       tree = resolvedTree(ctx, candidate, remoteTip, merged, resolutions, cwd);
     }
     integrated += Number(git(ctx.root, ['rev-list', '--count', `${candidate}..${remoteTip}`]).stdout.trim() || 0);
-    candidate = buildMerge(ctx, candidate, remoteTip, tree, merged.skipped, parkedNote);
+    candidate = buildMerge(ctx, candidate, remoteTip, tree, merged.skipped, mergeNotes);
+    for (const p of kept) superseded.add(p);
   }
   if (remoteContains(ctx, candidate)) return onRemote();
   throw opError('push_unconfirmed', `The commit is durable locally but no push to ${ctx.remote}/${ctx.mergeRef.replace(/^refs\/heads\//, '')} was confirmed.`,
@@ -992,10 +1038,67 @@ function defaultPublishWaitMs(): number {
   return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : 300_000;
 }
 
+/**
+ * Q1: on a managed canonical worktree commit-push commits only the paths the caller names (pages written outside gbrain,
+ * which would otherwise land as bare commits), under the commit lock, and nothing more: no fetch, merge, push or checkout
+ * move, so the owner stays the only publisher. The commit reaches the remote on the owner's next Git publish, or with
+ * `gbrain git commit-push --push-only --keep-checkout`.
+ */
+function commitManagedPaths(root: string, opts: CommitPushOptions, managed: ManagedFilesystemRoot): CommitPushResult {
+  const where = `${root} is the managed canonical worktree${managed.sourceId ? ` of source ${managed.sourceId}` : ''}`;
+  if (opts.pending || opts.branch || opts.resolutions || opts.expectRemote || opts.allowOutsideSourceRoot || opts.advanceOnlyWhenClean) {
+    throw opError('commit_paths_invalid', `${where}: commit-push there only commits the paths you name.`,
+      `Run gbrain git commit-push with only -m and the page paths after --; gbrain sources refresh${managed.sourceId ? ` ${managed.sourceId}` : ''} brings remote commits in.`);
+  }
+  return commitPathsOnly(root, opts, where, configuredSourceRoots(root), 'Leave the checkout to its owner; gbrain sources writer status names its state.');
+}
+
+/** A checkout with no Git remote at all: no remote is configured and the branch names none (a named but missing remote is refused by resolveCtx). A git command that fails is not proof of "no remote". */
+function hasNoRemote(root: string): boolean {
+  const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  if (branch.code !== 0 || git(root, ['rev-parse', '--verify', '--quiet', 'HEAD']).code !== 0) return false;
+  const remotes = git(root, ['remote']);
+  if (remotes.code !== 0 || remotes.stdout.trim()) return false;
+  return git(root, ['config', '--get', `branch.${branch.stdout.trim()}.remote`]).code === 1;
+}
+
+/** GBRA-133: with no remote there is nothing to publish to, so commit-push only commits the named paths, like a managed worktree. */
+function commitRemotelessPaths(root: string, opts: CommitPushOptions): CommitPushResult {
+  const where = `${root} has no Git remote, so there is nothing to publish to`;
+  if (opts.pushOnly || opts.pending || opts.branch || opts.resolutions || opts.expectRemote || opts.advanceOnlyWhenClean) {
+    throw opError('commit_paths_invalid', `${where}; commit-push there only commits the paths you name.`,
+      'Run gbrain git commit-push -m <msg> -- <paths> to commit them locally, or add a remote (git remote add origin <url>) and set the branch upstream to publish.');
+  }
+  return { ...commitPathsOnly(root, opts, where, opts.allowOutsideSourceRoot ? [''] : configuredSourceRoots(root), 'Check out a branch (git switch <branch>), then rerun.'), no_remote: true };
+}
+
+/** Commit only the named paths under the commit lock and nothing more: no fetch, merge, push or checkout move. */
+function commitPathsOnly(root: string, opts: CommitPushOptions, where: string, roots: string[], detachedFix: string): CommitPushResult {
+  if (!opts.message?.trim()) throw opError('commit_paths_invalid', 'A commit message is required.', 'Pass the commit message with -m.');
+  const rel = scopePaths(root, opts.paths ?? [], opts.cwd ?? process.cwd());
+  if (!rel.length) throw opError('commit_paths_invalid', `${where}: name the paths to commit.`, 'Pass -- <paths> after the message.');
+  const branch = git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']).stdout.trim();
+  if (!branch) throw opError('git_detached_head', `${root} is on a detached HEAD, so there is no branch to commit to.`, detachedFix);
+  assertNoOperationInProgress(root);
+  const lock = acquireCommitLock(root, opts.lockWaitMs);
+  let committed: string | null;
+  try {
+    assertNoOperationInProgress(root);
+    committed = commitPaths(root, rel, opts.message.trim(), { roots, lockPath: lock.lockPath, markHeld: true });
+  } finally {
+    lock.release();
+  }
+  const remote = git(root, ['config', '--get', `branch.${branch}.remote`]).stdout.trim();
+  return { outcome: committed ? 'committed_local' : 'nothing_to_commit', sha: committed, committed, branch, remote, paths: rel, integrated: 0, checkout: 'unchanged' };
+}
+
 export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
   const root = checkoutRoot(opts.repo);
   if (opts.keepCheckout && !opts.pushOnly) throw opError('commit_paths_invalid', 'keepCheckout publishes commits already on the branch; it commits nothing.', 'Use --push-only --keep-checkout.');
+  const managed = opts.keepCheckout || opts.pushOnly ? null : managedFilesystemRootFor(root);
+  if (managed && !hasFilesystemPublication(root)) return commitManagedPaths(root, opts, managed);
   if (!opts.keepCheckout) assertManagedFilesystemWrite(root);
+  if (hasNoRemote(root)) return commitRemotelessPaths(root, opts);
   const cwd = opts.cwd ?? process.cwd();
   const roots = configuredSourceRoots(root);
   const rel = opts.pushOnly ? [] : opts.pending
@@ -1076,6 +1179,7 @@ export function commitAndPush(opts: CommitPushOptions): CommitPushResult {
     sha: published.sha, committed, branch: ctx.branch, remote: ctx.remote, paths: rel,
     integrated: published.integrated, confirmed: published.confirmed, checkout: moved.checkout, ...(moved.reason ? { lagging_reason: moved.reason } : {}),
     ...(published.quarantined ? { quarantined: published.quarantined } : {}),
+    ...(published.superseded ? { superseded_remote_paths: published.superseded } : {}),
   };
 }
 

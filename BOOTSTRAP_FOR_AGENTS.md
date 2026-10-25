@@ -1,4 +1,4 @@
-<!-- gbrain-runbook-stamp: 0.60.428.0 -->
+<!-- gbrain-runbook-stamp: 0.60.452.0 -->
 <!-- This stamp must equal the VERSION file at every release; CI enforces it
      (scripts/check-bootstrap-tag.sh). `gbrain bootstrap status` compares it to
      the installed binary and warns on skew. -->
@@ -277,6 +277,7 @@ placeholder). Trust the CLI's detection over your own guesses.
 | Hook reports "brain context unavailable" | serve not running or degraded | `gbrain doctor` names it; hooks fail open by design. | agent | none | `gbrain doctor --only bootstrap_hooks_heartbeat --json` |
 | gh answers 403 "not enabled for this session" | Cloud proxy scoping — the repo is not attached to the session | Expected in cloud; the visibility ladder falls back to git protocol. NEVER shim gh. | agent (nothing to fix) | none | none needed |
 | "crontab: command not found" / cron skipped | Containers and cloud sandboxes ship without a scheduler | Expected; event-driven pushes cover it — the skip message says exactly this. | agent (nothing to fix) | none | none needed |
+| A scheduled job, workspace script or hook finds nothing in the brain, or refuses `refresh_not_owner`, while the same command works in the session | The job runs with another `HOME`, so it reads another gbrain home (no database, or a second host identity) | Call gbrain from every job through one wrapper that sets `GBRAIN_HOME` (never `HOME`) and keeps stderr ([the wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended)). | agent | none | the job's log shows results and no refusal |
 | A turn shows "workspace push is FAILING" | The background push is refusing (visibility, secret-scan, or network reasons) | Run `gbrain doctor`; the banner repeats every 30 min until fixed. | agent | none | `gbrain doctor --only bootstrap_push_health --json` |
 
 ## Hand off

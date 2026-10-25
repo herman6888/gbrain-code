@@ -52,7 +52,8 @@ describe('remote title arm plan (postgres)', () => {
     });
   }
 
-  for (const query of ['acme', 'acme -secret', '"weekly sync"', 'globex or acme']) {
+  // 'matt acme' ORs in its given-name variant 'matthew acme' (#7471).
+  for (const query of ['acme', 'acme -secret', '"weekly sync"', 'globex or acme', 'matt acme']) {
     test(`\`${query}\` uses idx_pages_title_search with no per-row to_tsvector(title)`, async () => {
       const text = await plan(query);
       expect(text).toContain('idx_pages_title_search');

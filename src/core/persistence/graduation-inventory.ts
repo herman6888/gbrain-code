@@ -79,6 +79,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('fact_withdrawals', 'user_data', 'Fact withdrawal ledger (forget); must never be lost.'),
     carry('facts', 'user_data', 'Facts with attribution columns and the superseded_by self-FK.'),
     carry('files', 'user_data', 'File metadata; object bytes stay in the storage backend.'),
+    carry('git_canonical_brain', 'operational', 'Git-canonical fence counter (GBRA-95 G7a): sources whose config sets canonical = git, kept by triggers on sources that the copy bypasses; the target would otherwise read zero and its writer guard would refuse nothing.'),
     carry('ingest_log', 'operational', 'Ingestion log.'),
     carry('links', 'user_data', 'Page graph links.'),
     carry('link_edge_proposals', 'user_data', 'Relationship contradiction proposals with the user\'s accept/reject/undo decisions and the paid judge results behind them.'),

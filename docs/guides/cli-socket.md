@@ -133,6 +133,17 @@ whenever a call falls back, including when no socket exists (`no socket at
 answered by the serve socket at <path>` line when the serve answers. `GBRAIN_CLI_SOCKET=0` makes a CLI call skip the
 socket entirely, for comparisons and benchmarks.
 
+<a id="caller-timeouts"></a>
+## Caller timeouts
+
+A call that falls back to the cold path pays the full start (3–6 s on a
+pooled Postgres brain) before it reads anything. Give gbrain calls from scripts
+and agent runtimes a timeout of at least 10 s, and set it in every layer that
+has one: a language runtime's exec timeout (Node's `child_process`, Python's
+`subprocess`, a harness tool timeout) can end the call before a longer shell
+`timeout` ever applies, and the kill reads as an empty result. Scheduled
+callers go through one wrapper ([cron-schedule.md](cron-schedule.md#calling-gbrain-unattended)).
+
 ## Security
 
 - **Unix domain socket only**, at `$GBRAIN_HOME/.gbrain/run/cli.sock`; never TCP.

@@ -63,7 +63,7 @@ jobs:
     name: ${{ matrix.target }} / Bun ${{ matrix.bun }}
     runs-on: ${{ fromJSON('{"linux-x64-glibc":"ubicloud-standard-4-ubuntu-2404","linux-arm64-glibc":"ubicloud-standard-4-arm-ubuntu-2404","darwin-arm64":"macos-26","darwin-x64":"macos-26-intel","win32-x64":"windows-2022","win32-arm64":"windows-11-arm"}')[matrix.target] }}
     timeout-minutes: 15
-    # statuses: the darwin-x64 heartbeat below (one commit status context, diag/native-heartbeat).
+    # statuses: the darwin-x64 heartbeat below (one commit status context per cell, diag/native-heartbeat/<target>/<bun>).
     permissions:
       contents: read
       statuses: write
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       # A wedged darwin-x64 runner uploads no log at all (#7457's cell, #7419, #7303, #7238), so a background loop posts
       # the current step or suite, free memory, swap, load and the busiest process names as the commit status
-      # diag/native-heartbeat; GitHub keeps every status, so the last one before a wedge survives it. Nothing on a
+      # diag/native-heartbeat/<cell>; GitHub keeps every status, so the last one before a wedge survives it. Nothing on a
       # fork's pull request, whose token cannot write.
       - name: Start the diagnostic heartbeat
         if: matrix.target == 'darwin-x64'
@@ -201,6 +201,39 @@ jobs:
           GBRAIN_HEARTBEAT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GBRAIN_HEARTBEAT_CELL: ${{ matrix.target }}/${{ matrix.bun }}
         run: bash scripts/native/heartbeat.sh stop "${{ job.status }}"
+
+  # The darwin-x64 runner sometimes cannot reach the API when a cell ends (#7499: all three attempts of the cell's terminal
+  # post timed out), so its diag/native-heartbeat/<cell> status stays pending on a job that passed. This Linux job runs
+  # after every cell and posts success, naming the cell's real conclusion and last heartbeat, on any cell context still
+  # pending (scripts/native/heartbeat-finalize.ts). Nothing on a fork's pull request, whose token cannot write.
+  # Named exception: PR scope reduction, covered by scope=full runs (docs/TESTING.md#event-parity); scope=smoke runs
+  # no darwin-x64 cell, so there is nothing to finalize.
+  heartbeat-finalize:
+    name: darwin-x64 heartbeat finalize
+    needs: [native]
+    if: ${{ always() && inputs.scope != 'smoke' }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    # statuses: the darwin-x64 cells' diag/native-heartbeat/<cell> contexts; actions: read the run's jobs and conclusions.
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/native/heartbeat-finalize.ts
+          sparse-checkout-cone-mode: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+      - name: Finalize darwin-x64 heartbeats left pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GBRAIN_HEARTBEAT_ENABLED: ${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && '1' || '0' }}
+          GBRAIN_HEARTBEAT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bun scripts/native/heartbeat-finalize.ts
 
   windows-backup-console:
     name: Windows PowerShell console probe / ${{ matrix.runner }} / Bun ${{ matrix.bun }}

@@ -122,6 +122,8 @@ import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { providerConsentEntry } from './checks/provider-consent.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { dbAheadOfGitEntry } from './checks/db-ahead-of-git.ts';
+import { gitIndexLagEntry } from './checks/git-index-lag.ts';
 import { syncConfigKeysEntry } from './checks/sync-config-keys.ts';
 import { ghostPagesEntry } from './checks/ghost-pages.ts';
 import { originTwinsEntry } from './checks/origin-twins.ts';
@@ -285,6 +287,10 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   managedSyncConvergenceEntry,
   // #7160: title-prefixed person pages next to the unprefixed page (read-only, preview-first).
   personTitleDuplicatesEntry,
+  // Git-canonical G1: the read-only git-gap census totals per source with a checkout (informational, always ok).
+  dbAheadOfGitEntry,
+  // Git-canonical G3: how far each strict source's index trails the commit at HEAD.
+  gitIndexLagEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];

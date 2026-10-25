@@ -65,7 +65,7 @@ on `query`, `--source <id>`, `--limit`, `--json`; `gbrain backlinks <slug>` and
 `gbrain timeline <slug>` for links and dated events. Copyable examples:
 [brain-first](skills/conventions/brain-first.md#retrieval-gbrain-first).
 
-Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
+Recall relevant saved context before answering. Resolve a person (an email sender, an attendee) only by an exact match (`gbrain whois <email or name>`), never a search's top hit ([identity rule](skills/conventions/brain-first.md#identity-exact-match)). Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
 
 Durable preferences and facts belong in shared memory when the user wants them
 recalled later. Transient task state, credentials, local configuration, and harness
@@ -124,7 +124,10 @@ machine contract. The quick version:
 4. Treat `[gbrain notice …]` blocks and `[AGENT]` blocks the same way. A degraded result is not proof of "no notes".
 <!-- END GENERATED agent-protocol:quick-contract -->
 
-Exit 3 always means "stop and ask the user". Full contract, transcripts, effects,
+Exit 3 always means "stop and ask the user". Exit 10 means the write was
+accepted and is still pending: never "not found" or "failed", so poll the
+receipt (`gbrain write-request <id>`) before retrying, reporting or moving on.
+Full contract, transcripts, effects,
 exit codes and marker grammar: [`docs/protocol/AGENT_OPERATOR_v1.md`](./docs/protocol/AGENT_OPERATOR_v1.md).
 
 ## Read this order
@@ -158,6 +161,25 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
   [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md),
   [`docs/guides/remote-mcp.md`](./docs/guides/remote-mcp.md) (`gbrain mcp expose`).
+- **Run gbrain from cron, workspace scripts and hooks:** every caller goes
+  through one wrapper that sets `GBRAIN_HOME` (never `HOME`), loads the
+  brain's env file and runs the installed binary, never `bun run src/cli.ts`
+  with an inherited environment. Log stderr (never `2>/dev/null`: a
+  `no_brain` refusal then reads as "no results"), check the exit code, keep
+  hook output off stdout, allow at least 10 s per call, and never print the
+  process environment into a transcript. On a managed brain, schedule
+  `gbrain sources refresh <id>`, and have scripts commit the files they write
+  with `gbrain git commit-push -- <paths>`, never plain `git commit`
+  (`gbrain doctor --only cron_gbrain_home` flags cron lines that skip the
+  wrapper). Wrapper and rules:
+  [cron-schedule.md](docs/guides/cron-schedule.md#calling-gbrain-unattended),
+  [scripts and the managed checkout](docs/guides/shared-checkout-git.md#scripts-and-the-managed-checkout).
+- **Delete or purge pages:** `gbrain delete --purge` skips the 72-hour soft
+  delete, cascades to chunks, versions, links and facts, and `gbrain restore`
+  cannot undo it. Purge only on the user's explicit go for that purge ("scrub
+  the repo" is not one), one page at a time, verifying each; a stopped batch
+  stays stopped until the user says again
+  ([data-loss gate](skills/data-loss-gate/SKILL.md)).
 - **Bring in your chat history:** `gbrain transcripts ingest` imports a
   downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
   connects the account and syncs new conversations live, incrementally and on an

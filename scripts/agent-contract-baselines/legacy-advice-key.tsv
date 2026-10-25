@@ -36,7 +36,7 @@ src/core/ai/recipes/lmstudio.ts	2
 src/core/backup/coverage.ts	11
 src/core/backup/repository.ts	1
 src/core/brainstorm/error-classify.ts	1
-src/core/connectors/sync.ts	8
+src/core/connectors/sync.ts	7
 src/core/context/hook-heartbeat.ts	2
 src/core/cycle/patterns.ts	1
 src/core/cycle/synthesize.ts	1

@@ -45,6 +45,7 @@ const ALLOWED_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ['cat-file', new Set(['--batch'])],
   ['hash-object', new Set(['--no-filters', '--stdin-paths'])],
   ['check-attr', new Set(['-z', '--stdin'])],
+  ['check-ignore', new Set(['-z', '--stdin'])],
   ['diff-index', new Set(['--cached', '--quiet'])],
   ['diff-tree', new Set(['-r', '-z', '--no-renames'])],
 ]);

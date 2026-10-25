@@ -76,8 +76,8 @@ export async function committedPendingImport(engine: BrainEngine, sourceId: stri
   const [source] = await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [sourceId]);
   const rel = `./${relative(root, path).split(sep).join('/')}`;
   try {
-    const head = (await gitRead(root, ['rev-parse', '--verify', '--quiet', `HEAD:${rel}`], signal)).trim();
-    if (!head || (await gitRead(root, ['hash-object', '--', rel], signal)).trim() !== head) return false;
+    const head = await committedBlob(root, path, signal);
+    if (!head) return false;
     if (!source?.last_commit) return true;
     await gitRead(root, ['cat-file', '-e', `${source.last_commit}^{commit}`], signal);
     let imported = '';
@@ -90,6 +90,30 @@ export async function committedPendingImport(engine: BrainEngine, sourceId: stri
     if (signal?.aborted) throw signal.reason;
     return false;
   }
+}
+
+/** The blob id HEAD holds at `path` (inside `root`), or null when HEAD has no entry there or Git cannot read it. Rejects only when `signal` aborts. */
+export async function headBlob(root: string, path: string, signal?: AbortSignal): Promise<string | null> {
+  return quiet(gitRead(root, ['rev-parse', '--verify', '--quiet', `HEAD:./${relative(root, path).split(sep).join('/')}`], signal), signal);
+}
+
+/**
+ * The blob id HEAD holds at `path` when the working-tree file there is exactly that blob (`hash-object` applies the
+ * path's clean filters, as `git add` would); null when the file differs, is absent, or HEAD has no entry there.
+ */
+export async function committedBlob(root: string, path: string, signal?: AbortSignal): Promise<string | null> {
+  const head = await headBlob(root, path, signal);
+  if (!head) return null;
+  return await quiet(gitRead(root, ['hash-object', '--', `./${relative(root, path).split(sep).join('/')}`], signal), signal) === head ? head : null;
+}
+
+/** The commit HEAD names in `root`, or null on an unborn branch or when Git cannot read it. */
+export async function headCommit(root: string, signal?: AbortSignal): Promise<string | null> {
+  return quiet(gitRead(root, ['rev-parse', '--verify', '--quiet', 'HEAD'], signal), signal);
+}
+
+function quiet(read: Promise<string>, signal?: AbortSignal): Promise<string | null> {
+  return read.then(out => out.trim() || null, error => { if (signal?.aborted) throw error; return null; });
 }
 
 /**

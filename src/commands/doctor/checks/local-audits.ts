@@ -493,6 +493,15 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
     // Best-effort filesystem-hygiene check; never block doctor (a missing/
     // unparseable config.json lands here and skips, same fail-open posture).
   }
+  // GBRA-108: cron lines (and scripts they run) that call gbrain without GBRAIN_HOME (doctor/checks/cron-gbrain-home.ts).
+  // No environment gate: a container can run cron too; without a crontab the check emits nothing.
+  try {
+    const { cronGbrainHomeCheck, readCrontab } = await import('./cron-gbrain-home.ts');
+    const cron = cronGbrainHomeCheck(readCrontab(), process.env.GBRAIN_HOME || undefined);
+    if (cron) checks.push(cron);
+  } catch {
+    // Best-effort: an unreadable crontab never blocks doctor.
+  }
   // Engine graduation state (filesystem only; src/commands/doctor/checks/engine-graduation.ts).
   try {
     const { graduationStateCheck } = await import('./engine-graduation.ts');
@@ -506,7 +515,7 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
 
 export const homeDirInWorktreeEntry: DoctorEntry = {
   name: 'home_dir_in_worktree',
-  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'graduation_interrupted'],
+  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'cron_gbrain_home', 'graduation_interrupted'],
   run: runHomeDirInWorktree,
 };
 

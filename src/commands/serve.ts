@@ -293,6 +293,10 @@ export async function runServe(
   const sourceGuard = args.includes('--source-guard');
   // Opt-in warm CLI socket (core/cli-socket/server.ts): off, the serve loads nothing and reads nothing for it.
   const cliSocketOn = args.includes('--cli-socket') || MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_cli_socket === true;
+  // Opt-in vector index prewarm (core/vector-prewarm.ts): off, the serve loads nothing and reads nothing for it.
+  if (MERGED_CONFIG_BY_ENGINE.get(engine)?.serve_vector_prewarm === true) {
+    void import('../core/vector-prewarm.ts').then(m => m.prewarmAtServeStart(engine, opts.log ?? ((msg: string) => console.error(msg))));
+  }
   if (sourceGuard && isHttp) {
     // Loud posture warning (the --log-full-params precedent): the guard is a
     // stdio-lane mechanism; HTTP writes are scoped per token instead. An

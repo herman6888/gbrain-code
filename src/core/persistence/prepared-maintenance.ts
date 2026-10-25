@@ -15,13 +15,15 @@ import { submissionAuthority, authorizeStoredRequest, authorizeWrite } from './a
 import { currentVerifiedLocalWriter, localHostId, registerLocalWriter } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
 import { checkOwner, ownerUnavailableError } from './owner-refusal.ts';
-import { admitWrite, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
+import { admitWrite, admitWriteInTransaction, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
 import { assertRefusalBreakerClosed } from './refusal-breaker.ts';
+import { retryWriteAdmission } from './admission-retry.ts';
+import { declareDurablePersistence } from './protocol.ts';
 import { CANONICAL_FILE_MISSING } from './publication-failure.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
 import { preparePageMutation, prepareFileTarget } from './page-prepare.ts';
 import { prepareTakesMutation } from './takes-prepare.ts';
-import { digest } from './digest.ts';
+import { digest, sha256 } from './digest.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
@@ -141,13 +143,24 @@ async function validateMaintenance(engine: BrainEngine, authority: MaintenanceAu
 
 async function submitMaintenance(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
   intent: Record<string, unknown>, requestId: string, file = true): Promise<Record<string, unknown>> {
-  await validateMaintenance(engine, authority, slug);
+  const prepared = await prepareMaintenanceAdmission(engine, authority, slug, intent, requestId, file);
+  return awaitMaintenance(engine, authority, 'prior' in prepared ? prepared.prior : await admitWrite(engine, prepared.admission));
+}
+
+function awaitMaintenance(engine: BrainEngine, authority: MaintenanceAuthority, row: WriteRequest): Promise<Record<string, unknown>> {
   const wait = authority.wait ??= new MaintenanceWriteWait();
+  return waitForWrite(engine, row, loadConfig() ?? { engine: engine.kind }, wait.ms()).then(done => writeResponse(wait.observe(done)));
+}
+
+/** Every check a maintenance request passes before it is journaled: the authorized prior request with its id (a replay), or the admission to submit. */
+async function prepareMaintenanceAdmission(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
+  intent: Record<string, unknown>, requestId: string, file: boolean): Promise<{ prior: WriteRequest } | { admission: WriteAdmission }> {
+  await validateMaintenance(engine, authority, slug);
   const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
   if (prior) {
     await authorizeStoredRequest(engine, prior);
     assertReplayIntent(prior, intentDigest({ operation: 'submit_job', sourceId: authority.writer.sourceId, slug, callerIntent: intent }));
-    return writeResponse(wait.observe(await waitForWrite(engine, prior, loadConfig() ?? { engine: engine.kind }, wait.ms())));
+    return { prior };
   }
   const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId, includeDeleted: true });
   // A deleted-page intent (extract_facts expiring a soft-deleted page's facts) admits only a page that is still soft-deleted.
@@ -186,11 +199,10 @@ async function submitMaintenance(engine: BrainEngine, authority: MaintenanceAuth
   // #6696 (A12): the same write refused K times in the window is not admitted again until something it depends on changes.
   await assertRefusalBreakerClosed(engine, { principal: authority.writer.principal, sourceId: authority.writer.sourceId, slug,
     digest: intentDigest({ operation: 'submit_job', sourceId: authority.writer.sourceId, slug, callerIntent: intent }) });
-  const row = await admitWrite(engine, { principal: authority.writer.principal, requestId, operation: 'submit_job',
+  return { admission: { principal: authority.writer.principal, requestId, operation: 'submit_job',
     sourceId: authority.writer.sourceId, sourceIncarnation: authority.writer.sourceIncarnation, slug,
     pageId: snapshot?.page.id ?? null, authority: authority.writer, callerIntent: intent, intent,
-    worktreeId: file ? authority.binding?.worktree_id : null, topologyGeneration: file ? authority.binding?.topology_generation : null });
-  return writeResponse(wait.observe(await waitForWrite(engine, row, loadConfig() ?? { engine: engine.kind }, wait.ms())));
+    worktreeId: file ? authority.binding?.worktree_id : null, topologyGeneration: file ? authority.binding?.topology_generation : null } };
 }
 
 /** #6643: `source_changed` / `file_database_drift` before admission: the audit and repair commands, never a new request. */
@@ -222,15 +234,59 @@ export function maintenanceGhostRefusal(sourceId: string, slug: string): Operati
 /** #5523: a Life Chronicle timeline row projected onto the depth page in the same publication. */
 export interface MaintenanceEventProjection { depth_slug: string; date: string; summary: string; }
 
-/** `derivation` (#5575 I2): the deriver's taint declaration; the page and its edges are stamped from it at publication. */
-export async function publishMaintenancePage(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
-  content: string, options: { requestId?: string; expectedRevision: string | null; file?: boolean;
-    eventProjection?: MaintenanceEventProjection; derivation?: DerivationDeclaration }): Promise<Record<string, unknown>> {
+type MaintenancePageOptions = { requestId?: string; expectedRevision: string | null; file?: boolean;
+  eventProjection?: MaintenanceEventProjection; derivation?: DerivationDeclaration };
+
+/** A maintenance page publication's intent and request id; `batch` (G6) is the run's batch id, part of both. */
+function maintenancePageRequest(authority: MaintenanceAuthority, slug: string, content: string, options: MaintenancePageOptions, batch?: string) {
   const projection = options.eventProjection ? { event_projection: options.eventProjection } : {};
   const derivation = options.derivation ? { derivation: options.derivation } : {};
-  return submitMaintenance(engine, authority, slug, { kind: 'managed_maintenance_page', content,
-    expected_revision: options.expectedRevision, ...projection, ...derivation }, options.requestId ?? maintenanceRequestId({ authority: authority.writer,
-    slug, content, revision: options.expectedRevision, file: options.file ?? true, ...projection, ...derivation }), options.file);
+  const grouped = batch ? { maintenance_batch: batch } : {};
+  return { intent: { kind: 'managed_maintenance_page', content, expected_revision: options.expectedRevision, ...projection, ...derivation, ...grouped },
+    requestId: options.requestId ?? maintenanceRequestId({ authority: authority.writer, slug, content, revision: options.expectedRevision, file: options.file ?? true,
+      ...projection, ...derivation, ...grouped }) };
+}
+
+/** `derivation` (#5575 I2): the deriver's taint declaration; the page and its edges are stamped from it at publication. */
+export async function publishMaintenancePage(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
+  content: string, options: MaintenancePageOptions): Promise<Record<string, unknown>> {
+  const { intent, requestId } = maintenancePageRequest(authority, slug, content, options);
+  return submitMaintenance(engine, authority, slug, intent, requestId, options.file);
+}
+
+/**
+ * G6: one run's maintenance pages as one batch. Every page is checked, then every request is admitted in one transaction
+ * before any is waited on, each carrying the batch id, so the owner claims them as one contiguous run and publishes them
+ * in groups of up to PAGE_BATCH_GROUP_MAX on Postgres (journal.ts publicationGroupKey: an independent group, one page's
+ * failure never cancels another). The batch id is derived from its pages, so a rerun over the same pages and revisions
+ * replays the same requests. Each page settles on its own: its receipt, or the error publishMaintenancePage would throw.
+ */
+export async function publishMaintenancePages(engine: BrainEngine, authority: MaintenanceAuthority,
+  pages: Array<{ slug: string; content: string } & Omit<MaintenancePageOptions, 'requestId'>>): Promise<Array<{ receipt: Record<string, unknown> } | { error: unknown }>> {
+  if (new Set(pages.map(page => page.slug)).size !== pages.length) throw new TypeError('A maintenance batch publishes each page once.');
+  const batch = digest(['maintenance-batch-v1', authority.writer.sourceId, pages.map(page => [page.slug, page.expectedRevision, sha256(page.content)])]);
+  const prepared: Array<{ prior: WriteRequest } | { admission: WriteAdmission } | { error: unknown }> = [];
+  for (const page of pages) {
+    const { intent, requestId } = maintenancePageRequest(authority, page.slug, page.content, page, batch);
+    prepared.push(await prepareMaintenanceAdmission(engine, authority, page.slug, intent, requestId, page.file ?? true).catch(error => ({ error })));
+  }
+  const fresh = prepared.flatMap(entry => 'admission' in entry ? [entry.admission] : []);
+  // One admission transaction, retried on contention as admitWrite is; when it fails, every page it carried fails with it.
+  const admitted: WriteRequest[] | { error: unknown } = !fresh.length ? [] : await retryWriteAdmission(`maintenance batch ${batch}`, remaining => engine.transaction(async tx => {
+    await declareDurablePersistence(tx, `${Math.min(1000, remaining)}ms`, `${remaining}ms`);
+    const rows: WriteRequest[] = [];
+    for (const admission of fresh) rows.push(await admitWriteInTransaction(tx, admission));
+    return rows;
+  }), 30_000, error => engine.reconnect({ error })).catch(error => ({ error }));
+  const out: Array<{ receipt: Record<string, unknown> } | { error: unknown }> = [];
+  let next = 0;
+  for (const entry of prepared) {
+    if ('error' in entry) { out.push(entry); continue; }
+    if ('admission' in entry && 'error' in admitted) { out.push(admitted); continue; }
+    const row = 'prior' in entry ? entry.prior : (admitted as WriteRequest[])[next++]!;
+    out.push(await awaitMaintenance(engine, authority, row).then(receipt => ({ receipt }), error => ({ error })));
+  }
+  return out;
 }
 
 /** A maintenance request with its own intent kind, keyed by the intent (a retry replays its receipt). */
@@ -249,19 +305,31 @@ export async function submitDatabaseMaintenanceIntent(engine: BrainEngine, autho
   return submitMaintenance(engine, authority, slug, intent, requestId, false);
 }
 
-/** `derivation` (#5575 I2): the deriver's taint declaration, stamped onto the output page. */
-export async function stampMaintenancePage(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
-  cycleDate: string, rawSource?: string, rawTraceExemptReason?: string, seat?: string | null, derivation?: DerivationDeclaration): Promise<void> {
+/** The dream provenance stamp of a maintenance output page's frontmatter (seat null drops a seat an earlier run stamped). */
+export function maintenanceStampFrontmatter(frontmatter: Record<string, unknown>, cycleDate: string, rawSource?: string, rawTraceExemptReason?: string,
+  seat?: string | null): Record<string, unknown> {
+  const firstDate = frontmatter.dream_created_cycle_date || frontmatter.dream_cycle_date || cycleDate;
+  const { seat: _staleSeat, ...kept } = frontmatter;
+  return { ...(seat === null ? kept : frontmatter), dream_generated: true,
+    dream_cycle_date: firstDate, dream_created_cycle_date: firstDate, ...(rawSource ? { raw_source: rawSource } : {}),
+    ...(rawTraceExemptReason ? { raw_trace_exempt: true, raw_trace_exempt_reason: rawTraceExemptReason } : {}),
+    ...(seat ? { seat } : {}) };
+}
+
+/** A maintenance output page's current snapshot, or the refusal stamping a page that disappeared raises. */
+export async function stampTarget(engine: BrainEngine, authority: MaintenanceAuthority, slug: string) {
   const snapshot = await engine.readPageSnapshot(slug, { sourceId: authority.writer.sourceId });
   if (!snapshot) throw opError('page_not_found', 'A maintenance output page disappeared.',
     `Output page ${slug} in '${authority.writer.sourceId}' no longer exists, so it was not stamped. Confirm with the command in fix, then run maintenance again to regenerate it if it is still wanted.`,
     { fix: readFix('Shows whether the page exists in this source now.', { argv: ['gbrain', 'get', '--source', authority.writer.sourceId, '--', slug] }) });
-  const firstDate = snapshot.page.frontmatter.dream_created_cycle_date || snapshot.page.frontmatter.dream_cycle_date || cycleDate;
-  const { seat: _staleSeat, ...kept } = snapshot.page.frontmatter;
-  const page = { ...snapshot.page, frontmatter: { ...(seat === null ? kept : snapshot.page.frontmatter), dream_generated: true,
-    dream_cycle_date: firstDate, dream_created_cycle_date: firstDate, ...(rawSource ? { raw_source: rawSource } : {}),
-    ...(rawTraceExemptReason ? { raw_trace_exempt: true, raw_trace_exempt_reason: rawTraceExemptReason } : {}),
-    ...(seat ? { seat } : {}) } };
+  return snapshot;
+}
+
+/** `derivation` (#5575 I2): the deriver's taint declaration, stamped onto the output page. */
+export async function stampMaintenancePage(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
+  cycleDate: string, rawSource?: string, rawTraceExemptReason?: string, seat?: string | null, derivation?: DerivationDeclaration): Promise<void> {
+  const snapshot = await stampTarget(engine, authority, slug);
+  const page = { ...snapshot.page, frontmatter: maintenanceStampFrontmatter(snapshot.page.frontmatter, cycleDate, rawSource, rawTraceExemptReason, seat) };
   await publishMaintenancePage(engine, authority, slug, serializePageToMarkdown(page, snapshot.tags), { expectedRevision: snapshot.revision,
     ...(derivation ? { derivation } : {}) });
 }

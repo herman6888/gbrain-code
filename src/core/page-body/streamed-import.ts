@@ -310,7 +310,7 @@ export async function importStreamedMarkdownFile(engine: BrainEngine, filePath: 
     return { slug: '', status: 'skipped', skip_reason: 'malformed_path', chunks: 0,
       error: `Path "${relativePath}" contains bracket or control characters and cannot be imported. Rename the file to import it.` };
   }
-  if (!opts.coordinated) await assertUnmanagedCanonicalWriter(engine, 'direct content import');
+  if (!opts.coordinated) await assertUnmanagedCanonicalWriter(engine, 'direct content import', { sourceId: opts.sourceId ?? 'default' });
   const expectedSlug = slugifyPath(relativePath);
   const file = await open(assertSourceFilePath(filePath), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {

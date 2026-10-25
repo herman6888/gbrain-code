@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
-import { loadConfig, loadConfigWithEngine } from '../config.ts';
+import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, type GBrainConfig } from '../config.ts';
 import { loadOperatorLiterals } from '../content-sanity-literals.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { alignWithStored } from './align-stored.ts';
@@ -60,8 +60,21 @@ export interface ReconcileState {
  */
 const CYCLE_STAMP_KEYS = ['last_source_cycle_at', 'last_full_cycle_at'];
 
+/**
+ * #7506: the file and environment side of the policy digest, as every consumer on the owner host resolves it: the config
+ * file, with the content-sanity overrides the environment sets (the import gate's env > file > DB). Any consumer on that
+ * host may prepare and publish an admitted reconcile, each with its own environment, so the rest of the environment
+ * (credentials, connection targets, model and gateway choices) stays out: none of it changes what a reconcile writes, and
+ * a consumer whose environment differed from the previewing process's read every preview stale.
+ */
+function reconcilePolicyBase(): GBrainConfig | null {
+  const file = loadConfigFileOnly();
+  const sanity = loadConfig()?.content_sanity;
+  return sanity ? { ...(file ?? { engine: 'postgres' }), content_sanity: sanity } : file;
+}
+
 export async function reconcilePolicyDigest(engine: BrainEngine, sourceId: string): Promise<string> {
-  const config = await loadConfigWithEngine(engine, loadConfig());
+  const config = await loadConfigWithEngine(engine, reconcilePolicyBase());
   const [row] = await engine.executeRaw<Record<string, unknown>>('SELECT config,contextual_retrieval_mode,trust_frontmatter_overrides FROM sources WHERE id=$1', [sourceId]);
   let sourceConfig = row?.config;
   if (typeof sourceConfig === 'string') {

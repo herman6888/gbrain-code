@@ -16,6 +16,7 @@
  * insufficient_scope, a stale approval applies, or the listing drifts.
  * Runs on PGLite, and on Postgres when DATABASE_URL is set.
  */
+import { _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -452,7 +453,7 @@ describe('review, explain and accept-all (CEO-2, DX-10, DX-15, DX-16)', () => {
       nonTty();
       await runTrustOwnerCommand(localTrustBackend(engine), 'review', ['--accept-all']);
       await runTrustOwnerCommand(localTrustBackend(engine), 'review', ['--accept-all', '--from', b.sourceId]);
-    } finally { process.stderr.write = original; process.exitCode = 0; }
+    } finally { process.stderr.write = original; process.exitCode = 0; _resetCliExitVerdictForTests(); }
     expect(errors.join('\n')).toContain('needs at least one filter');
     expect(errors.join('\n')).toContain('confirmation_required');
     expect((await pageRow(b, 'notes/bulk-example')).trust_tier).toBe('agent_written');
@@ -540,7 +541,7 @@ describe('aliases (DX-7)', () => {
     const error = console.error;
     process.stderr.write = ((chunk: string | Uint8Array) => { out.push(String(chunk)); return true; }) as typeof process.stderr.write;
     console.error = (...args: unknown[]) => { out.push(args.join(' ')); };
-    try { return { result: await fn(), stderr: out.join('\n') }; } finally { process.stderr.write = write; console.error = error; process.exitCode = 0; }
+    try { return { result: await fn(), stderr: out.join('\n') }; } finally { process.stderr.write = write; console.error = error; process.exitCode = 0; _resetCliExitVerdictForTests(); }
   };
 
   test('quarantine release|drop print the canonical trust form and run the same checks', async () => withEnv({ GBRAIN_HOME: home }, async () => {

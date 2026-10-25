@@ -45,8 +45,10 @@ gbrain jobs supervisor status --json
 # Graceful stop (SIGTERM + drain wait + SIGKILL fallback).
 gbrain jobs supervisor stop
 
-# Optional: cap worker memory in MB (--max-rss). Without the flag the RSS
-# watchdog is still on, at a RAM-relative auto-sized cap.
+# Cap worker memory in MB (--max-rss). Without the flag the RSS watchdog is
+# still on, at a RAM-relative auto-sized cap. With --job-isolation process the
+# cap also covers each job child's process tree; size the host for
+# (concurrency + 1) × the cap.
 gbrain jobs supervisor --concurrency 4 --max-rss 4096
 ```
 

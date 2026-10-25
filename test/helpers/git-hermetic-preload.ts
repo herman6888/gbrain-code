@@ -30,10 +30,21 @@
  * repository through them, and a helper's `git -C <temp repo> config ...` then wrote into the caller's repository
  * (`core.bare=true`, `user.name t`). Transport and credential variables pass through, as in production.
  *
+ * Bun.spawn and Bun.spawnSync called without an `env` option give the child the environment the process started with,
+ * not process.env as edited here, so both are wrapped to default `env` to process.env (child_process already does).
+ * Without that, a helper's `Bun.spawnSync(['git', ...])` still saw the hook's GIT_DIR and none of the keys below.
+ *
  * Imported by `bunfig.toml` via
  * `preload = [..., "./test/helpers/git-hermetic-preload.ts"]`.
  */
 import { gitChildEnv } from '../../src/core/git-env.ts';
+
+for (const name of ['spawn', 'spawnSync'] as const) {
+  const original = Bun[name] as (...args: unknown[]) => unknown;
+  (Bun as unknown as Record<string, unknown>)[name] = (first: unknown, second?: object) => Array.isArray(first)
+    ? original(first, { env: process.env, ...second })
+    : original({ env: process.env, ...(first as object) });
+}
 
 const kept = gitChildEnv({}, process.env);
 for (const key of Object.keys(process.env)) if (!(key in kept)) delete process.env[key];

@@ -12,7 +12,9 @@
  *     the same pages, and reads whole under `sync.level_reuse false`.
  *   - #7358: a kept listing holds only its commit and tree. Its drop timer once closed over the reading function's scope
  *     (the previous entry and the pass's options), and a cleared timer keeps its callback, so a resident serve kept every
- *     pass it ran. Each read's loop yield and each managed pass's progress callback is collectable after the next pass.
+ *     pass it ran. Each read's loop yield and each managed pass's progress callback is collectable after the next pass,
+ *     judged by one full collection made from a timer callback (`collected`; forced probe: a pointer left on the checking
+ *     frame's stack).
  * Before: every pass listed the whole tree.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, setSystemTime, test } from 'bun:test';
@@ -36,6 +38,13 @@ const commit = (root: string, message: string) => { git(root, 'add', '-A'); git(
 const note = (title: string, body: string) => `---\ntype: concept\ntitle: ${title}\n---\n\n${body}\n`;
 const KEY = ['source-a', 'incarnation-1'];
 const sorted = (tree: Map<string, GitTreeEntry>) => [...tree].sort(([a], [b]) => (a < b ? -1 : 1));
+/**
+ * #7358: which of `refs` one full collection frees, the collection made from a timer callback. JSC scans the machine stack
+ * conservatively: a collection made in the test's own continuation also keeps what the frames under it still hold, a pointer
+ * into an earlier pass that no JS can reach (7 runs in about 1,950 on a 4-core machine). A timer callback runs once
+ * those frames have returned, and anything JS still reaches (a timer, a cache, a closure) keeps a pass there as well.
+ */
+const collected = (refs: ReadonlyArray<WeakRef<object>>) => new Promise<boolean[]>(resolve => setTimeout(() => { Bun.gc(true); resolve(refs.map(ref => ref.deref() === undefined)); }, 0));
 
 describe('readTreeLevelReusing: T across passes', () => {
   let root: string;
@@ -140,9 +149,22 @@ describe('readTreeLevelReusing: T across passes', () => {
       commit(root, `collectable probe ${i}`);
       expect(await read()).toBe('patched');
     }
-    Bun.gc(true);
     // The newest may still be reachable from its own stream's timers until they fire; every earlier one must be gone.
-    expect(refs.slice(0, -1).map(ref => ref.deref() === undefined)).toEqual([true, true, true]);
+    expect(await collected(refs.slice(0, -1))).toEqual([true, true, true]);
+  });
+
+  test('#7358 (forced probe): a pass held only by the checking frame\'s stack is collected; one a timer holds is not', async () => {
+    const pass = (refs: Array<WeakRef<object>>) => { const options = { onProgress: () => {} }; refs.push(new WeakRef(options.onProgress)); return options; };
+    const onStack: Array<WeakRef<object>> = [];
+    // Never read again: only this frame's stack slot holds it, as a frame left a pointer into an earlier pass.
+    const left = pass(onStack);
+    expect(await collected(onStack)).toEqual([true]);
+    const heldByTimer: Array<WeakRef<object>> = [];
+    const held = pass(heldByTimer);
+    const timer = setTimeout(() => held.onProgress(), 60_000);
+    timer.unref();
+    expect(await collected(heldByTimer)).toEqual([false]);
+    clearTimeout(timer);
   });
 
   test('the oracle: GBRAIN_SYNC_LEVEL_REUSE_VERIFY=1 throws when a kept listing differs from a whole read (forced probe)', async () => {
@@ -223,8 +245,7 @@ for (const backend of testBackends()) describe(`[${backend}] GBRA-133: a managed
       commit(root, `edit ${name}`);
       expect(await sync()).toBe('synced');
     }
-    Bun.gc(true);
     // The newest may still be reachable from its own stream's timers until they fire; every earlier one must be gone.
-    expect(refs.slice(0, -1).map(ref => ref.deref() === undefined)).toEqual([true, true, true]);
+    expect(await collected(refs.slice(0, -1))).toEqual([true, true, true]);
   }, { databaseUrl, setup }), 300_000);
 });

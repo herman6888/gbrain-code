@@ -45,6 +45,8 @@ export interface SyncEntry { path: string; sourcePath: string; action: 'import' 
   identityHead?: string;
   /** #5565: a deleted file no page records as its origin; its slug's page keeps another origin, so the deletion is a fenced no-op. */
   unownedDeletion?: boolean;
+  /** G3: a strict source's entry; the freeze reads its commit alone and publication never compares the working tree. */
+  committedOnly?: true;
   /** #5988: a held rename destination whose source page changed since the rename was recorded; the freeze screen holds it as `rename_held`. */
   renameHeld?: SyncRename;
   /** #6712 PR 1: the import provenance matches the pinned blob, the frozen revision and this parser; the no-op kernel decides (sync-prescreen.ts). */
@@ -230,6 +232,7 @@ export async function resolveManagedSyncContext(engine: BrainEngine, opts: SyncO
   const forbidden = managedForbiddenFlag(opts);
   if (forbidden) throw managedSyncFlagRefusal(forbidden, sourceId, ['--source', sourceId, '--no-pull']);
   const [source, binding] = await (rows ?? readManagedSyncRows(engine, sourceId));
+  if (source?.config?.canonical === 'git' && managedForbiddenFlag(opts, true)) throw managedSyncFlagRefusal('--working-tree', sourceId, ['--source', sourceId, '--no-pull', '--working-tree']);
   if (!source || source.archived || !binding || binding.source_incarnation !== source.incarnation ||
       binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path) {
     // #6449: a rooted source with no owner at all is the database-only one activation listed; the exit is a deliberate claim.

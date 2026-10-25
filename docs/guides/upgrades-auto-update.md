@@ -275,6 +275,11 @@ gbrain upgrade --restart-only                    # restart onto the installed bu
 gbrain upgrade --no-restart                      # install only; doctor fails runtime_build_skew until the restart runs
 ```
 
+On an always-on host, start with `gbrain autopilot pause --reason "upgrade"`
+and wait until `gbrain jobs list --status active --json` returns no jobs, so no
+job runs half on each build; resume with `gbrain autopilot resume` once the
+checks below pass ([the order](../../skills/gbrain-upgrade/SKILL.md#always-on-hosts-pause-drain-upgrade-verify-resume)).
+
 The autopilot `--swap-only` channel still exits for its own supervisor to
 relaunch and restarts nothing else; doctor's `runtime_build_skew` fails while
 two builds run, with `gbrain upgrade --restart-only` as its fix.

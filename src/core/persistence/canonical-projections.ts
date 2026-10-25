@@ -28,6 +28,7 @@ import { loadWriteGateConfig } from '../trust/gate-outcomes.ts';
 import { fenceOwnerKey, readFenceBlocks, TAKE_FENCE_KIND } from '../generations/fence.ts';
 import { projectFactFenceGeneration } from '../generations/adapters/fact-rows.ts';
 import { projectTakeFenceGeneration } from '../generations/adapters/take-rows.ts';
+import { linksFenceProjectionRows, projectLinksFence } from '../links-fence-projection.ts';
 
 const FENCE_PAIRS=[{begin:FACTS_FENCE_BEGIN,end:FACTS_FENCE_END},{begin:TAKES_FENCE_BEGIN,end:TAKES_FENCE_END}];
 
@@ -543,6 +544,8 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
   const projectFences = !isQuarantined(page.frontmatter);
   // GBRA-161 PR 2: the incoming body's fences decide the fact and take generations; an absent one retires nothing.
   const fenceReads = { facts: readFenceBlocks(page, 'facts'), takes: readFenceBlocks(page, 'takes') };
+  // G5: the links fence projects its own edges; a body with no fence (or one that does not parse) leaves them as they are.
+  const fenceLinks = projectFences && !bodyUnread(page) ? await linksFenceProjectionRows(engine, sourceId, page) : null;
   const storedRows = prior ? await storedTimeline(engine, prior.page.id) : [];
   const prior_ = prior ? await priorView(engine, prior.page, slug, storedRows) : null;
   const { timeline, exactIncoming, pinned } = classifyTimeline(storedRows, page, prior_?.rows ?? null, slug, writer, policy);
@@ -696,6 +699,7 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
           await resolveTakes();
         });
       }
+      if (fenceLinks) await step('links_fence', () => projectLinksFence(tx, { id, source_id: sourceId }, fenceLinks));
       const all = [...contested, ...await step('held', contestHeld)];
       return { timelineRowsRemoved: removedSummary(removedDates), ...(all.length ? { contested: all } : {}) };
     } finally {

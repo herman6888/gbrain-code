@@ -18,7 +18,9 @@ import { assertLargePageReplacement } from './large-page-guard.ts';
 import { applyInference } from '../frontmatter-inference.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { CANONICAL_FILE_MISSING } from './publication-failure.ts';
-import { committedPendingImport, pendingImportRefusal, SYNC_HELD } from './pending-import.ts';
+import { committedBlob, committedPendingImport, headBlob, pendingImportRefusal, SYNC_HELD } from './pending-import.ts';
+import { sourceCanonicalGit } from './git-door.ts';
+import { assertLfsTarget, ignoredTarget, isNeverFiledDerivedPage, isPrivacyClass, renderedPageForClass, strictPageClass } from './git-declared.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { isOpPageSlug } from '../ops/context.ts';
 import { shellQuote, type Action } from '../agent-output.ts';
@@ -75,7 +77,6 @@ import { isSourceDbOnlySlug } from './source-storage.ts';
 import { gitIgnoresUntracked } from './sync-origin-evidence.ts';
 import { gitDurabilityPolicy } from './git-durability-policy.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { DERIVE_PHASE_DB_ONLY_DEFAULTS } from '../storage-config.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from '../source-config-sql.ts';
 import { readSlugRootMode } from '../sync-anchor.ts';
 import { applyPageEdits, editDiff, parseEditWithin, parsePageEdits, prepareSegmentedEditMutation } from './page-edit.ts';
@@ -149,10 +150,7 @@ function putProvenance(row: WriteRequest, snapshot: PageSnapshot | null, parsed:
   Object.assign(parsed.frontmatter, stamp);
   return stamp;
 }
-/** A derive-phase page (DERIVE_PHASE_DB_ONLY_DEFAULTS) that never recorded a canonical file. */
-function isNeverFiledDerivedPage(slug: string, page: { source_path?: string | null; source_uri?: string | null }): boolean {
-  return !page.source_path && !page.source_uri && DERIVE_PHASE_DB_ONLY_DEFAULTS.some(prefix => slug.startsWith(prefix));
-}
+export { isNeverFiledDerivedPage };
 /**
  * A live page whose canonical file is absent publishes to the database only
  * when its slug is a declared db_only path or a never-filed derive-phase page.
@@ -302,6 +300,19 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   // target file does not exist yet: an existing page keeps its file (and its drift checks and storage refusals), and only a
   // person's detach turns it database-only. A Git-durable source keeps writing the file: its Git effect cannot commit an
   // ignored target and parks it (`git_target_unsafe`), which already shows the page needs a decision.
+  // G7a (git-declared.ts): on a strict source a declared database-only page gets no file to commit (no door commit, no Git
+  // effect), a page turning private gets the removal of the file it still has, and a path under an LFS rule commits only
+  // when the operator opted in and the checkout configures LFS. Removals are never refused: they move the database toward Git.
+  if (binding.canonical_git === true && content !== null) {
+    const declared = await strictPageClass(engine, row.source_id, root, renderedPageForClass(row.slug, content, snapshot), snapshot?.page ?? null)
+      ?? (await waitingOnWhile(options.clock, 'git', () => ignoredTarget(root, path)) ? 'git_ignored' : null);
+    if (declared) {
+      if (!isPrivacyClass(declared) || !snapshot || snapshot.page.deleted_at) return undefined;
+      if (!existsSync(path) && await headBlob(root, path) === null) return undefined;
+      content = null;
+      options = { ...options, deleting: true };
+    } else await assertLfsTarget(engine, row, root, path, options.remote === true);
+  }
   if (options.newPageIgnoredDatabaseOnly && !snapshot && content !== null && !existsSync(path) && !isSourceDbOnlySlug(root, row.slug, 'not_db_only') && await waitingOnWhile(options.clock, 'git', () => gitIgnoresUntracked(root, relative(root, path).split(sep).join('/')))
     && !(await gitDurabilityPolicy(binding, root)).durable) return undefined;
   if (options.excludeTombstone && snapshot?.page.deleted_at) {
@@ -340,6 +351,11 @@ async function compareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 's
     // missing still refuses below.
     if (publishesDatabaseOnly(root, row.slug, snapshot)) return undefined;
     if (options.deleting === true && content === null && !snapshot.page.source_path && !capturedPath) return undefined;
+    // G2: on a strict source a removal Git already holds (a replay after the door commit landed) completes in the database;
+    // G7a: one whose file HEAD still holds (only the worktree copy is gone) is committed through the door.
+    if (options.deleting === true && content === null && await sourceCanonicalGit(engine, row.source_id)) {
+      return await headBlob(root, path) === null ? undefined : { path, root, content: null, expectedBeforeHash: null };
+    }
     // #6696 (A12): tagged, so a producer can refuse this before admission and the receipt says which refusal it was.
     throw opError('source_changed', 'The canonical file was removed outside coordinated publication.',
       'Import the local deletion or recover the canonical file before editing this page.', { detail: CANONICAL_FILE_MISSING });
@@ -357,6 +373,10 @@ async function compareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 's
     // holding content the database never had is an uncoordinated edit and still refuses below.
     const staleCache = !matches && before instanceof Buffer && publishesDatabaseOnly(root, row.slug, snapshot)
       && await replaceableFile(engine, row.source_id, row.slug, path).then(check => check.ok && check.expectedFileBytes === before.toString('utf8'));
+    // G2: a strict publication replayed after its door commit landed finds exactly its own bytes, committed, and completes against them.
+    const landed = !matches && !staleCache && content !== null && beforeHash() === fileContentHash(content)
+      && await sourceCanonicalGit(engine, row.source_id) && await committedBlob(root, path) !== null;
+    if (landed) return { path, root, content, expectedBeforeHash: beforeHash() };
     if (!matches && !staleCache) {
       const held = await heldFileRefusal(engine, row, root, path, 'drift', options.remote === true);
       if (held) throw held;
@@ -419,6 +439,17 @@ async function heldFileRefusal(engine: BrainEngine, row: Pick<WriteRequest, 'sou
  */
 export function databaseOnlyPublication(row: Pick<WriteRequest, 'worktree_id'>, file: PreparedMutation['file']): Pick<PreparedMutation, 'databaseOnlyReason'> {
   return row.worktree_id && !file ? { databaseOnlyReason: 'db_only' } : {};
+}
+/**
+ * G7a: the file target of a strict page turning private (git-declared.ts): the removal of the file it still has in the
+ * worktree or at HEAD, which the door commits. The publication then stamps `database_only_reason` and clears
+ * `source_path`/`source_uri` in the same transaction (`declareStrictPublication`). Undefined when there is no file to
+ * remove, the write is unbound, or the source is not strict (such a page publishes as before).
+ */
+export async function preparePrivateTransition(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, snapshot: PageSnapshot,
+  options: { remote?: boolean; clock?: ClaimPhaseClock } = {}): Promise<PreparedMutation['file']> {
+  if (!row.worktree_id || !await sourceCanonicalGit(engine, row.source_id)) return undefined;
+  return prepareFileTarget(engine, row, snapshot, null, undefined, { ...options, deleting: true });
 }
 export async function pageDatabaseOnlyPublication(engine: SqlEngine, row: WriteRequest, file: PreparedMutation['file']): Promise<Pick<PreparedMutation, 'databaseOnlyReason'>> {
   const reason = databaseOnlyPublication(row, file);
@@ -820,7 +851,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
   const lean = options.coordinated === true && !targetDeleted && row.operation !== 'restore_page' && !versionTags;
   enterClaimStep(clock, 'import_content', undefined, 'db');
   const result = await importFromContent(engine, row.slug, content, {
-    ...source, noEmbed: true, remote: row.authority.remote, activePack, fences: projected ? 'coordinated' : 'lenient', coordinated: lean, boundedChunkWrites: options.boundedChunkWrites,
+    ...source, noEmbed: true, remote: row.authority.remote || p.keep_hidden_rows === true, activePack, fences: projected ? 'coordinated' : 'lenient', coordinated: lean, boundedChunkWrites: options.boundedChunkWrites,
     segmentedOwner: { kind: row.operation === 'edit_page' ? 'edit' : 'put', principalKind: row.principal_kind, principalId: row.principal_id, baseRevision: observedRevision },
     ...(lean ? { existingSnapshot: snapshot } : {}),
     // #6259: only owner-tier intents keep gate-owned markers; an ordinary put_page, local or remote, has them stripped.
@@ -883,7 +914,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
   const ordinaryPage = ['put_page','capture','restore_page','revert_version','edit_page'].includes(row.operation);
   // A managed maintenance page (e.g. the dream write-back after grounding
   // quarantine) republishes a body; its automatic links follow that body.
-  const autoLinkedPage = ordinaryPage || p.kind === 'managed_maintenance_page';
+  const autoLinkedPage = ordinaryPage || p.kind === 'managed_maintenance_page' || row.operation === 'add_timeline_entry';
   const capture = row.operation === 'capture' && typeof p.capture_path === 'string' && typeof p.capture_file_hash === 'string'
     ? { path: p.capture_path, hash: p.capture_file_hash } : undefined;
   // Projections, advisories, link resolution (links-preparation.ts), the file target and the core guard go out together.

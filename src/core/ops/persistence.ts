@@ -185,7 +185,7 @@ export const persistenceOperations: Operation[] = [
     description: 'Your write receipts in one source, newest first (for a lost request_id).',
     params: {
       source_id: { type: 'string', description: 'Default: yours.' },
-      limit: { type: 'number', default: 25, description: '1-100 (default 25).' },
+      limit: { type: 'number', default: 25, description: '1-100 (default 25).', fullSurfaceOnly: true },
       before: { type: 'string', description: "Previous page's next cursor." },
     },
     scope: 'write', mutating: false, area: 'pages',

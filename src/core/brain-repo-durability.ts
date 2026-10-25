@@ -369,9 +369,11 @@ function renderManagedBlock(repoPath: string, managed?: { sourceId: string }): s
    HEAD and never pulls, so a pull, rebase, reset or checkout of page paths moves
    files under it. To bring in remote commits run
    \`gbrain sources refresh ${managed.sourceId}\`. Files that are not pages (this file,
-   \`MEMORY.md\`, daily notes) are yours: \`git add\` and \`git commit\` them with plain
-   git; they reach the remote on the owner's next push, or push them by hand
-   with \`git push\` (never \`--force\`).` : `2. **Every write is committed AND pushed — push is never deferred.** After any
+   \`MEMORY.md\`, daily notes) are yours: commit them with
+   \`gbrain git commit-push -m "<msg>" -- <paths>\`, which commits only those paths
+   under this checkout's commit lock and never fetches, pushes or moves the
+   checkout. They reach the remote on the owner's next push, or publish them with
+   \`gbrain git commit-push --push-only --keep-checkout\` (never \`git push --force\`).` : `2. **Every write is committed AND pushed — push is never deferred.** After any
    persistent write, run \`scripts/brain-commit-push.sh "<msg>" <path>\` (or
    \`gbrain git commit-push -m "<msg>" -- <path>\`). It commits only the paths you
    name, takes this checkout's writer lock, merges remote commits without
