@@ -38,6 +38,10 @@ export type PageState = typeof PAGE_STATES[number];
 export const WORKTREE_STATES = ['clean', 'modified', 'deleted', 'untracked', 'absent'] as const;
 export type WorktreeState = typeof WORKTREE_STATES[number];
 
+/** One page as the census classified it, handed to a caller that plans per page (G8 conversion, persistence/git-conversion.ts). */
+export interface GitGapPage { id: string; slug: string; revision: string | null; path: string | null; state: PageState; segmented: boolean;
+  declared?: DeclaredClass; worktree?: WorktreeState; headBlob?: string; databaseAlsoMoved?: boolean }
+
 export interface GitGapSample { slug: string; path: string; state: PageState; fields?: string[]; declared?: DeclaredClass; basis?: 'import_record' | 'no_import_record'; worktree?: WorktreeState }
 
 export interface GitGapCensus {
@@ -97,7 +101,7 @@ export function parseGitGapArgs(args: string[]): { sourceId: string; json: boole
   return { sourceId: positional[0]!, json: args.includes('--json'), sample };
 }
 
-type Key = { id: string; slug: string; source_id: string; source_path: string | null; source_path_bytes: number; source_uri: string | null; type: string;
+type Key = { id: string; slug: string; source_id: string; source_path: string | null; source_path_bytes: number; source_uri: string | null; withheld_source_path: string | null; type: string;
   frontmatter: unknown; database_only_reason: string | null; segmented: boolean; lineage_private: boolean; revision: string | null };
 
 const zeros = <K extends string>(keys: readonly K[]) => Object.fromEntries(keys.map(key => [key, 0])) as Record<K, number>;
@@ -117,7 +121,7 @@ interface Checkout { root: string; head: HeadTree; mode: Awaited<ReturnType<type
 
 const refuse = (message: string, suggestion: string) => new OperationError('storage_error', message, suggestion, GIT_GAP_DOCS);
 
-export async function censusGitGap(engine: BrainEngine, sourceId: string, opts: { sample: number; deadlineAt?: number }): Promise<GitGapCensus> {
+export async function censusGitGap(engine: BrainEngine, sourceId: string, opts: { sample: number; deadlineAt?: number; collect?: (page: GitGapPage) => void }): Promise<GitGapCensus> {
   await resolveSourceId(engine, sourceId, undefined, { skipLocalSignals: true });
   const [source] = await engine.executeRaw<{ local_path: string | null; incarnation: string }>('SELECT local_path, incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]);
   const root = source?.local_path && existsSync(source.local_path) ? source.local_path : null;
@@ -139,10 +143,10 @@ export async function censusGitGap(engine: BrainEngine, sourceId: string, opts: 
     if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) { census.complete = false; break; }
     const done = await engine.transaction(async tx => {
       await tx.executeRaw('SET TRANSACTION READ ONLY');
-      const batch = await tx.executeRaw<Key>(`SELECT id::text, slug, source_id, source_path, octet_length(source_path) AS source_path_bytes, source_uri, type, frontmatter,
+      const batch = await tx.executeRaw<Key>(`SELECT id::text, slug, source_id, source_path, octet_length(source_path) AS source_path_bytes, source_uri, withheld_source_path, type, frontmatter,
           database_only_reason, body_storage='segmented' AS segmented, knowledge_revision::text AS revision, NOT ${privatePagesFilterFragment('pages')} AS lineage_private
         FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND pages.id > $2::bigint ORDER BY pages.id LIMIT ${BATCH}`, [sourceId, cursor]);
-      if (batch.length) { await censusBatch(tx, batch, census, { checkout, policy, incarnation: source!.incarnation, sample: opts.sample }); cursor = batch[batch.length - 1]!.id; }
+      if (batch.length) { await censusBatch(tx, batch, census, { checkout, policy, incarnation: source!.incarnation, sample: opts.sample, collect: opts.collect }); cursor = batch[batch.length - 1]!.id; }
       return batch.length < BATCH;
     });
     if (done) break;
@@ -154,7 +158,11 @@ export async function censusGitGap(engine: BrainEngine, sourceId: string, opts: 
   return census;
 }
 
-interface BatchContext { checkout: Checkout | null; policy: { mirror: boolean; databaseOnlySource: boolean; dbOnly: (slug: string) => boolean; ignored: Set<string> }; incarnation: string; sample: number }
+interface BatchContext { checkout: Checkout | null; policy: { mirror: boolean; databaseOnlySource: boolean; dbOnly: (slug: string) => boolean; ignored: Set<string> }; incarnation: string; sample: number;
+  collect?: (page: GitGapPage) => void }
+
+const collected = (key: Key, path: string | null, state: PageState, extra: Partial<GitGapPage> = {}): GitGapPage =>
+  ({ id: key.id, slug: key.slug, revision: key.revision, path, state, segmented: key.segmented === true, ...extra });
 
 function note(census: GitGapCensus, limit: number, item: GitGapSample): void {
   if (census.sample.length < limit) census.sample.push(item);
@@ -187,6 +195,7 @@ async function censusBatch(tx: BrainEngine, batch: Key[], census: GitGapCensus, 
     if (declared) {
       census.declared[declared]++;
       census.states.declared_database_only++;
+      ctx.collect?.(collected(key, rel, 'declared_database_only', { declared, ...(blob ? { headBlob: blob.oid } : {}) }));
       if (blob) { census.declared_with_head_blob++; note(census, ctx.sample, { slug: key.slug, path: rel!, state: 'declared_database_only', declared }); }
       else if (checkout) noFile.declared.push(key);
       continue;
@@ -194,6 +203,7 @@ async function censusBatch(tx: BrainEngine, batch: Key[], census: GitGapCensus, 
     if (!checkout) { census.not_compared++; continue; }
     if (!path || rel === null) {
       census.states.unsafe_path++;
+      ctx.collect?.(collected(key, null, 'unsafe_path'));
       noFile.undeclared.push(key);
       note(census, ctx.sample, { slug: key.slug, path: key.source_path ?? '', state: 'unsafe_path' });
       continue;
@@ -203,6 +213,7 @@ async function censusBatch(tx: BrainEngine, batch: Key[], census: GitGapCensus, 
       const state: PageState = oid === null ? 'undeclared_database_only' : 'worktree_only';
       census.worktree![oid === null ? 'absent' : 'untracked']++;
       census.states[state]++;
+      ctx.collect?.(collected(key, rel, state, { worktree: oid === null ? 'absent' : 'untracked' }));
       noFile.undeclared.push(key);
       note(census, ctx.sample, { slug: key.slug, path: rel, state, worktree: oid === null ? 'absent' : 'untracked' });
       continue;
@@ -211,6 +222,7 @@ async function censusBatch(tx: BrainEngine, batch: Key[], census: GitGapCensus, 
     census.worktree![worktree]++;
     if (blob.mode !== '100644' && blob.mode !== '100755') {
       census.states.unparseable++;
+      ctx.collect?.(collected(key, rel, 'unparseable', { worktree, headBlob: blob.oid }));
       note(census, ctx.sample, { slug: key.slug, path: rel, state: 'unparseable', worktree });
       continue;
     }
@@ -233,9 +245,10 @@ async function compareBatch(tx: BrainEngine, compare: Array<{ key: Key; path: st
     const snapshot = await readExportPage(tx, item.key, withdrawals);
     const compared: ExportFileComparison = item.key.segmented ? await compareSegmentedExportBlob(tx, snapshot, withdrawals, item.blob, checkout.head.format)
       : compareInlineExportFile(blobs.get(item.blob.oid)!, scannerSourcePath(checkout.root, item.path, checkout.mode), snapshot);
-    if (compared.state === 'equal') { census.states.equal++; continue; }
+    if (compared.state === 'equal') { census.states.equal++; ctx.collect?.(collected(item.key, item.rel, 'equal', { worktree: item.worktree, headBlob: item.blob.oid })); continue; }
     if (compared.state === 'unparseable') {
       census.states.unparseable++;
+      ctx.collect?.(collected(item.key, item.rel, 'unparseable', { worktree: item.worktree, headBlob: item.blob.oid }));
       note(census, ctx.sample, { slug: item.key.slug, path: item.rel, state: 'unparseable', worktree: item.worktree });
       continue;
     }
@@ -250,7 +263,9 @@ async function compareBatch(tx: BrainEngine, compare: Array<{ key: Key; path: st
     const state: PageState = gitMoved ? 'git_ahead' : 'database_ahead';
     census.states[state]++;
     if (!imported.length) census.database_ahead_without_import_record++;
-    if (gitMoved && record?.revision != null && String(record.revision) !== String(item.key.revision)) census.git_ahead_database_also_moved++;
+    const databaseAlsoMoved = gitMoved && record?.revision != null && String(record.revision) !== String(item.key.revision);
+    if (databaseAlsoMoved) census.git_ahead_database_also_moved++;
+    ctx.collect?.(collected(item.key, item.rel, state, { worktree: item.worktree, headBlob: item.blob.oid, databaseAlsoMoved }));
     note(census, ctx.sample, { slug: item.key.slug, path: item.rel, state, fields: item.fields, basis: imported.length ? 'import_record' : 'no_import_record', worktree: item.worktree });
   }
 }

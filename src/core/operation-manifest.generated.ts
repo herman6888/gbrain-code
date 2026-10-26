@@ -6019,6 +6019,10 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "boolean",
         "description": "Report the stored receipt and completion of the purge named by request_id."
       },
+      "continue": {
+        "type": "boolean",
+        "description": "With status: first continue the purge's sweep of stored derivation results (derivation_sweep pending or stalled), then report."
+      },
       "vacuum": {
         "type": "boolean",
         "description": "PGLite only: VACUUM the touched tables after the purge."

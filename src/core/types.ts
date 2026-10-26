@@ -173,6 +173,8 @@ export interface Page {
   source_kind?: string | null;
   /** Original URI/path/message-id the ingestion event carried. */
   source_uri?: string | null;
+  /** G7a: the file a strict page had before it turned private (its origin is cleared); it writes there when it turns world. */
+  withheld_source_path?: string | null;
   /** Richer label paired with source_kind (often same value; indexable separately). */
   ingested_via?: string | null;
   /** Server-stamped first-write audit timestamp; CV12 COALESCE-preserved across edits. */

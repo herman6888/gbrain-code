@@ -1,10 +1,10 @@
 import type { BrainEngine } from './engine.ts';
 import type { Migration } from './schema-migrations/types.ts';
 import { isLockTimeoutError } from './retry-matcher.ts';
-import { resolveSchemaLockTimeoutMs, schemaLockBlockedError, withSchemaLockTimeout } from './postgres-engine/schema-lock-timeout.ts';
+import { resolveSchemaLockTimeoutMs, schemaLockBlockedError } from './postgres-engine/schema-lock-timeout.ts';
 import { MIGRATIONS } from './schema-migrations/registry.generated.ts';
 import { hasPendingMigrations } from './migrate-pending.ts';
-import { setQuietMigrationNotices } from './schema-migrations/helpers.ts';
+import { runMigrationStatement, setQuietMigrationNotices } from './schema-migrations/helpers.ts';
 import { MIGRATION_PRELUDES, runMigrationPrelude } from './migration-preludes.ts';
 import { clearMigrationTimeout, migrationStatementTimeoutMs, recordMigrationTimeout } from './migration-timeout.ts';
 // runMigrations executes while an initialized engine is live. Keep its helper
@@ -232,35 +232,7 @@ export async function runMigrationSQL(
       throw error;
     }
   } else {
-    // Postgres + transaction:false → can't use SET LOCAL (needs a txn),
-    // can't use plain SET on the pooled connection (leaks to other
-    // queries). Instead: reserve a dedicated backend, set session-level
-    // statement_timeout on just that connection, run the DDL there.
-    //
-    // On Supabase (both PgBouncer 6543 and direct 5432) a server-level
-    // statement_timeout of ~2 min is enforced. Without this override a
-    // CREATE INDEX CONCURRENTLY on a large table (e.g. 500K pages) hits
-    // the timeout and aborts. SET on the reserved connection cleanly
-    // overrides because the GUC scope is connection-local (session-scope
-    // is fine when nobody else uses the connection).
-    //
-    // The reserved-connection primitive is new in PR #356. See
-    // BrainEngine.withReservedConnection.
-    await engine.withReservedConnection(async (conn) => {
-      try {
-        await conn.executeRaw(`SET statement_timeout = '${migrationStatementTimeoutMs()}'`);
-      } catch {
-        // Non-fatal: some managed Postgres may restrict this GUC.
-        // Falling through means the DDL runs with the server default.
-      }
-      // #5227 (W14 P1.6): no transaction here, so the lock bound is session-level on this reserved backend and restored after.
-      // #6543 (A4): the raised statement_timeout is restored too, so the connection does not carry this migration's budget back to the pool.
-      try {
-        await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${m.version}` });
-      } finally {
-        await conn.executeRaw('RESET statement_timeout').catch(() => {});
-      }
-    }, { selfContained: true });
+    await runMigrationStatement(engine, m.version, sql);
   }
 }
 

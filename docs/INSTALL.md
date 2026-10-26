@@ -28,7 +28,8 @@ Already running [OpenClaw](https://github.com/garrytan/openclaw) or [Hermes](htt
 ```bash
 bun install -g github:garrytan/gbrain#latest-stable
 gbrain init --pglite --no-embedding   # keyless; no server
-gbrain skillpack scaffold --all       # scaffolds every bundled skill (skills/manifest.json) into your agent workspace
+gbrain skillpack scaffold --harness openclaw --workspace <ws>   # OpenClaw: the five-skill brain-first core
+gbrain skillpack scaffold --all       # Hermes or any other workspace: every bundled skill (skills/manifest.json)
 gbrain doctor                         # inspect diagnostics and expected empty-brain warnings
 ```
 

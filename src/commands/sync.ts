@@ -202,6 +202,12 @@ export interface SyncOpts {
   /** #6696: a runtime paid-work constraint (the cost gate deferred this run's embedding); never a processing option, never lifted by cursor adoption. */
   embedDeferred?: boolean;
   /**
+   * G8 (persistence/git-conversion.ts): the conversion apply's strict-equivalent full pass, run before the source row says
+   * `canonical: git`. Internal: no CLI flag or MCP parameter sets it, it refuses a remote caller, and it cannot reach
+   * working-tree mode (resolveManagedSyncContext refuses `--working-tree` for a strict-classified pass).
+   */
+  canonicalOverride?: 'git';
+  /**
    * v0.18.0 Step 5 — sync a specific named source. When set, sync reads
    * local_path + last_commit from the sources table (not the global
    * config.sync.* keys) and writes last_commit + last_sync_at back to

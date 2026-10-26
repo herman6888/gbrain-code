@@ -136,6 +136,10 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'extract_health',
   // Large pages A7: page extractions that read only part of their input.
   'extraction_input_truncated',
+  // PR 4 (Wave B incremental derivation, transcripts): conversation pages held because no format is detected over them.
+  'conversation_detection_ambiguous',
+  // PR 4 (Wave B incremental derivation, transcripts): segmented derivations held back by a model without a price.
+  'derivation_unpriced_model',
   'facts_embedding_width_consistency',
   'facts_extraction_health',
   'facts_health',
@@ -169,6 +173,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'parked_effects',
   // #6741: managed purges parked after repeated failures (doctor/checks/purge-parks.ts).
   'purge_parked_pages',
+  // Wave B PR 4: fact purge sweeps of stored derivation results still pending or stalled (doctor/checks/derivation-purge-sweeps.ts).
+  'derivation_purge_sweeps',
   'partial_embedding',
   'pglite_scratch_probe',
   'quarantined_pages',

@@ -456,7 +456,18 @@ brain rather than making another bundled copy. Follow the
 and preserve edited files.
 
 If you're running an agent platform (OpenClaw, Hermes, or any repo with a workspace),
-scaffold the bundled skills into it:
+scaffold the bundled skills into it. On OpenClaw, install the brain-first core:
+
+```bash
+gbrain skillpack scaffold --harness openclaw --workspace /path/to/agent/workspace
+```
+
+That is five skills (`query`, `brain-ops`, `capture`, `data-loss-gate`,
+`resolve-before-asking`) and their shared files. OpenClaw lists every workspace
+skill's name and description in every prompt, so each scaffolded skill costs
+input tokens on every turn whether or not it is used. Add a skill when the agent
+needs it (`--skill <name>`, repeatable), or the whole bundle with `--all`. On
+Hermes or any other workspace:
 
 ```bash
 cd /path/to/agent/workspace
@@ -553,16 +564,21 @@ Read skills/soul-audit/SKILL.md and follow it.
 This generates SOUL.md (agent identity), USER.md (user profile), ACCESS_POLICY.md
 (who sees what), and HEARTBEAT.md (operational cadence) from the user's answers.
 
-**On OpenClaw 2026.10.6 and later,** `openclaw doctor --fix` imports a
-workspace `HEARTBEAT.md` into its own monitor, archives the file under the
-state directory's `backups/heartbeat-migration/` and removes it, while the
-rendered `AGENTS.md` still tells the agent to read it at session start. Until
-the render adapts to OpenClaw ([#7470](https://github.com/garrytan/gbrain/issues/7470)),
-put gbrain's file back after each doctor fix: `gbrain bootstrap render --only HEARTBEAT.md`
-re-renders it from the confirmed answers, or copy the archived file back when
-the user edited it. Jobs that must run on time belong in the host scheduler
-through the [one wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended),
-not only in `HEARTBEAT.md`, which runs only when a session starts.
+**On OpenClaw,** the due-job list renders as `SCHEDULES.md` instead, and the
+rendered `AGENTS.md` points there. OpenClaw 2026.10.6 retired its own
+`HEARTBEAT.md`: `openclaw doctor --fix` imports a workspace file by that name
+into its heartbeat monitor, archives it under the state directory's
+`backups/heartbeat-migration/` and removes it. Render detects an OpenClaw
+workspace (`OPENCLAW_WORKSPACE_DIR`, `OPENCLAW_WORKSPACE`, or a `workspace`
+tree under `OPENCLAW_STATE_DIR`, `~/.openclaw` or `~/.openclaw-<profile>`);
+for a workspace OpenClaw finds only through its config, pass `--host openclaw`.
+A workspace rendered before this change still has the old references: re-render
+both files with `gbrain bootstrap render --only AGENTS.md,HEARTBEAT.md --force`
+(the old copies are backed up first; carry over any hand edits, and copy the
+doctor's archived `HEARTBEAT.md` when the user edited the job list). Jobs that
+must run on time belong in the host scheduler through the
+[one wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended), not
+only in the due-job list, which runs only when a session starts.
 
 If skipped, minimal defaults are installed automatically.
 

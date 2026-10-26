@@ -4,7 +4,8 @@
  * `<root>`. Every Git spawn under
  * `src/core` builds its env here (guarded by `test/git-env-guard.test.ts`).
  * Transport and credential variables (`GIT_SSH_COMMAND`, `GIT_ASKPASS`,
- * `SSH_AUTH_SOCK`, proxies) pass through; `extra` wins over both.
+ * `SSH_AUTH_SOCK`, proxies) pass through, and so do the operator's environment
+ * `safe.directory` entries (#7584); `extra` wins over all of them.
  */
 
 /** `git rev-parse --local-env-vars` (Git 2.55): the variables that locate or reconfigure one repository. */
@@ -21,10 +22,32 @@ const LOCAL = new Set<string>(GIT_LOCAL_ENV_VARS);
  */
 export const GIT_READ_ENV: NodeJS.ProcessEnv = { GIT_OPTIONAL_LOCKS: '0' };
 
+/**
+ * #7584: the `safe.directory` entries the operator set through `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`,
+ * in order. Only this key survives a scrub: it relaxes Git's ownership check for directories the operator names and cannot run
+ * code or reach the network, so carrying it lets a repository owned by another user be read the way plain `git` reads it.
+ */
+export function envSafeDirectories(source: NodeJS.ProcessEnv = process.env): string[] {
+  const count = Number(source.GIT_CONFIG_COUNT);
+  const values: string[] = [];
+  for (let i = 0; Number.isInteger(count) && i < count; i++) {
+    if (source[`GIT_CONFIG_KEY_${i}`]?.toLowerCase() === 'safe.directory') values.push(source[`GIT_CONFIG_VALUE_${i}`] ?? '');
+  }
+  return values;
+}
+
+/** `safe.directory` values as command-scope config in the environment, in order (an empty value resets the list, as in Git). */
+export function safeDirectoryEnv(values: readonly string[]): NodeJS.ProcessEnv {
+  if (!values.length) return {};
+  const env: NodeJS.ProcessEnv = { GIT_CONFIG_COUNT: String(values.length) };
+  values.forEach((value, i) => { env[`GIT_CONFIG_KEY_${i}`] = 'safe.directory'; env[`GIT_CONFIG_VALUE_${i}`] = value; });
+  return env;
+}
+
 export function gitChildEnv(extra: NodeJS.ProcessEnv = {}, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(source)) {
     if (!LOCAL.has(key) && !/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) env[key] = value;
   }
-  return { ...env, ...extra };
+  return { ...env, ...safeDirectoryEnv(envSafeDirectories(source)), ...extra };
 }

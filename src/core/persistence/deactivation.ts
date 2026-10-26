@@ -26,6 +26,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { DATABASE_ONLY_SOURCES_KEY } from './unbound-source.ts';
+import { NOT_PAGE_EMBEDDING_LEASE } from '../page-embedding-lease.ts';
 import { existsSync, lstatSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
@@ -143,7 +144,7 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
         : carry.state_file ? `move ${carry.state_file} aside, then rerun deactivate; or ${resolve}` : resolve });
   }
   const leases = await engine.executeRaw<{ id: string; holder_host: string; holder_pid: number }>(
-    'SELECT id, holder_host, holder_pid FROM gbrain_cycle_locks WHERE ttl_expires_at > now() ORDER BY id');
+    `SELECT id, holder_host, holder_pid FROM gbrain_cycle_locks WHERE ttl_expires_at > now() AND ${NOT_PAGE_EMBEDDING_LEASE} ORDER BY id`);
   for (const l of leases) blockers.push({ kind: 'lease', id: l.id, detail: `held by host ${l.holder_host}, pid ${l.holder_pid}`,
     exit: 'wait for that connector sync or maintenance run to finish (gbrain doctor shows live locks), then rerun deactivate' });
   return blockers;

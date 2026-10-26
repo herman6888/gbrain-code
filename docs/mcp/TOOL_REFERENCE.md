@@ -209,8 +209,8 @@ Fetch one skill's full instructions by name. Returns `{name, frontmatter (saniti
 | `source_incarnation` | string | Source incarnation from version 2 discovery. |
 | `pack_id` | string | Canonical pack identifier. |
 | `revision` | string | Exact immutable revision, or omit for the current head. |
-| `name` | string | Skill name exactly as returned by list_skills (or the brain-pack skill slug when source_id is set). |
-| `source_id` | string | Optional: fetch a brain-resident pack skill from this source instead of the host catalog. Disambiguates a slug that exists on more than one source (see list_brain_skillpack). |
+| `name` | string | Skill name exactly as returned by list_skills (or a pack skill's `name` from list_brain_skillpack when source_id is set). |
+| `source_id` | string | Optional: fetch a brain-resident pack skill from this source instead of the host catalog. Disambiguates a skill name that exists on more than one source (see list_brain_skillpack). |
 
 ## `get_skill_asset`
 
@@ -237,7 +237,7 @@ Read your durable write receipt by request_id. Requires write scope and this ope
 
 ## `list_brain_skillpack`
 
-List brain-resident skillpacks this brain ships (per-source). Returns each pack's skills, one-line descriptions, the schema pack it targets + whether that matches this brain, and a git scaffold spec. Read-only; gated by mcp.publish_skills. After orienting, call this and ask the user whether to install any pack the brain offers (gbrain skillpack scaffold <spec>).
+List brain-resident skillpacks this brain ships (per-source). Returns each pack's skills (`name`, the skill name get_skill takes, never a page slug) with one-line descriptions, the schema pack it targets + whether that matches this brain, and a git scaffold spec. Read-only; gated by mcp.publish_skills. After orienting, call this and ask the user whether to install any pack the brain offers (gbrain skillpack scaffold <spec>).
 
 ## `list_link_sources`
 

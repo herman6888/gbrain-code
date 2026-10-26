@@ -207,7 +207,8 @@ export function committedOnlyState(s: SyncPathState): SyncPathState {
 
 /**
  * G3: Git's verdict for a strict source, after its hold rows. Drift, a database version sync never saw (`db_ahead` that is
- * not a pending door write), keep_db and an edited tombstone import the committed blob. A live page whose file is absent
+ * not a pending door write, or a page no import record proves: `legacy_unverified`), keep_db and an edited tombstone import
+ * the committed blob. A live page whose file is absent
  * from `T` waits for its origin evidence (sync-pass.ts reads it for every delete candidate), then is deleted when a commit
  * held the file and left as the database has it otherwise.
  */
@@ -221,7 +222,8 @@ function gitVerdict(state: SyncPathState): Matched {
   const rest = afterHold(state);
   const wins = (match: Matched): Matched => match;
   switch (rest.cls) {
-    case 'drift': case 'keep_db': case 'deleted_edited': return wins({ cls: 'import', settled: false, action: 'import' });
+    // G8a: a page no import record proves (legacy_unverified, typically the unknown side of a held drift) takes the commit too.
+    case 'drift': case 'keep_db': case 'deleted_edited': case 'legacy_unverified': return wins({ cls: 'import', settled: false, action: 'import' });
     case 'db_ahead': return rest.sub === 'pending' ? rest : wins({ cls: 'import', settled: false, action: 'import' });
     case 'delete': case 'delete_drift':
       if (state.originEvidence === undefined) return rest;

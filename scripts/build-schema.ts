@@ -33,7 +33,7 @@ import { FACT_WITHDRAWAL_SCHEMA_STATEMENTS } from '../src/core/facts/withdrawal-
 import { GRANT_AUDIT_SCHEMA_SQL } from '../src/core/grants/schema.ts';
 import { LEASE_TOKEN_SCHEMA_SQL } from '../src/core/lease-schema.ts';
 import { LINK_TEMPORAL_SCHEMA_SQL } from '../src/core/link-temporal-schema.ts';
-import { PAGE_BODY_RLS_SQL, PAGE_BODY_SCHEMA_SQL, PAGE_GENERATION_BUMP_FN_SQL } from '../src/core/page-body/schema.ts';
+import { PAGE_BODY_RLS_SQL, PAGE_BODY_SCHEMA_SQL, PAGE_GENERATION_BUMP_FN_SQL, PAGE_SEGMENT_DERIVATIONS_SQL } from '../src/core/page-body/schema.ts';
 import { PAGE_PROJECTION_SCHEMA_SQL } from '../src/core/page-state/projection-schema.ts';
 import { PAGE_STATE_SCHEMA_SQL } from '../src/core/page-state/schema.ts';
 import { POSTGRES_CONCURRENT_PERSISTENCE_INDEXES, PERSISTENCE_SCHEMA_STATEMENTS } from '../src/core/persistence/schema.ts';
@@ -89,6 +89,7 @@ export const FRAGMENTS: readonly Fragment[] = [
   },
   { source: 'src/core/lease-schema.ts', expr: 'LEASE_TOKEN_SCHEMA_SQL', postgres: LEASE_TOKEN_SCHEMA_SQL, pglite: LEASE_TOKEN_SCHEMA_SQL },
   { source: 'src/core/page-body/schema.ts', expr: 'PAGE_BODY_SCHEMA_SQL', postgres: PAGE_BODY_SCHEMA_SQL, pglite: PAGE_BODY_SCHEMA_SQL },
+  { source: 'src/core/page-body/schema.ts', expr: 'PAGE_SEGMENT_DERIVATIONS_SQL', postgres: PAGE_SEGMENT_DERIVATIONS_SQL, pglite: PAGE_SEGMENT_DERIVATIONS_SQL },
   // Capability rule: PGLite has no role system and enables RLS on no core table, so the segment tables' RLS block is Postgres-only.
   { source: 'src/core/page-body/schema.ts', expr: 'PAGE_BODY_RLS_SQL', postgres: PAGE_BODY_RLS_SQL, pglite: '' },
   { source: 'src/core/page-state/schema.ts', expr: 'PAGE_STATE_SCHEMA_SQL', postgres: PAGE_STATE_SCHEMA_SQL, pglite: PAGE_STATE_SCHEMA_SQL },

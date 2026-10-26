@@ -49,6 +49,15 @@ configurations can deliberately use starter/verbs to expose fewer tools. Stdio
 serves the server-resolved surface directly, without a client row; per-client
 surface ceilings (`effectiveSurfaceForClient`) apply only to OAuth HTTP.
 
+**Writes to a strict source:** a thin client's write is an ordinary remote
+journal request. On a source in git-canonical mode (`canonical: git`) the
+brain owner's door commits it to Git before the database row commits, and the
+receipt names the commit (`outcome.persistence.git_commit`). While the owner
+is down the call ends `write_pending` (exit 10) with its request id, and
+`gbrain write-request <id>` follows it; nothing is written to the
+database first. Design: `docs/designs/GIT_CANONICAL_MEMORY.md`, "Remote and
+hosted writes".
+
 Key files (per-file detail lives in each file's `KEY_FILES.md` entry; this doc
 carries the routing-seam picture):
 

@@ -123,9 +123,9 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
             --status              Gate: exits nonzero until required answers exist.
             --show                Read-back payload (all answers + confirm hash).
             --confirm <hash>      Record the human's confirmation of the read-back.
-  render [--force] [--only F] [--minimal]
+  render [--force] [--only F] [--minimal] [--host openclaw|generic|auto]
                                   Render identity files from the confirmed answers.
-                                  Never clobbers; --force backs up first.
+                                  Never clobbers; --force backs up first. OpenClaw: SCHEDULES.md.
   contract [--repair]             Audit the same-turn GBrain write-back contract.
                                   --repair appends it additively and backs up AGENTS.md.
   hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]
@@ -951,25 +951,25 @@ async function runRender(ws: string, rest: string[], home: string): Promise<numb
       /* canonical fallback applies */
     }
 
-    // source_id seam [source-id collision]: render is ENGINE-FREE (D5/ENG-2)
-    // and the sources registry lives only in the DB, so render cannot detect a
-    // 'workspace' id already claimed by another checkout. It therefore passes
-    // NO sourceId: render.ts preserves an existing manifest source_id and
-    // defaults new manifests to 'workspace'; verify (which holds the engine)
-    // detects the collision and persists a derived 'workspace-<hash>' id that
-    // every consumer reads back from the manifest.
+    // source_id seam [source-id collision]: render is ENGINE-FREE (D5/ENG-2) and the sources
+    // registry lives only in the DB, so render cannot detect a 'workspace' id already claimed
+    // by another checkout. It therefore passes NO sourceId: render.ts preserves an existing
+    // manifest source_id and defaults new manifests to 'workspace'; verify (which holds the
+    // engine) detects the collision and persists a derived 'workspace-<hash>' id that every
+    // consumer reads back from the manifest.
     const res = renderWorkspace(ws, {
       force,
       ...(only.length > 0 ? { only } : {}),
       minimal,
       derived,
       createdBy: `gbrain@${VERSION}`,
+      host: flagValue(rest, '--host'),
     });
 
     if (only.length === 0 && !minimal) writeRenderReceipt(home, ws);
     abortIfInjected('render');
 
-    console.log(`rendered: ${res.written.join(', ') || '(nothing new)'}`);
+    console.log(`${res.note ? `${res.note}\n` : ''}rendered: ${res.written.join(', ') || '(nothing new)'}`);
     if (res.skipped.length > 0) console.log(`kept (already present — use --force to overwrite): ${res.skipped.join(', ')}`);
     if (res.backups.length > 0) console.log(`backups: ${res.backups.join(', ')}`);
     return 0;

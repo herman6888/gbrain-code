@@ -298,25 +298,51 @@ describe('redaction before write', () => {
   });
 });
 
+/**
+ * Wave B: a new session is one page under the page ceiling, so a session splits only past it. These tests lower
+ * `pages.max_bytes` for the first import to get a split session; its parts pin that part size afterwards.
+ */
+async function ingestUnderCeiling(maxBytes: number, paths: string[]) {
+  await engine.setConfig('pages.max_bytes', String(maxBytes));
+  try {
+    return await runTranscriptsIngest(engine, baseOpts(paths));
+  } finally {
+    await engine.unsetConfig('pages.max_bytes');
+  }
+}
+
 describe('part splitting + dangerous transitions', () => {
-  test('big session splits under the embed-skip threshold and every part is a real page', async () => {
+  test('a big new session imports as one embeddable page; a session past the ceiling splits into real pages', async () => {
     const p = writeBigAgentSession(tmp, 'bigsession-0001', 150);
     const r = await runTranscriptsIngest(engine, baseOpts([p]));
     expect(r.sessionsImported).toBe(1);
-    expect(r.pages.imported).toBeGreaterThan(1);
+    expect(r.pages.imported).toBe(1);
     expect(r.cleanScan).toBe(true); // pristine synthetic file: clean scan holds
     const base = buildTranscriptSlug('openclaw', '2026-08-10T08:00:00.000Z', {
       sessionId: 'bigsession-0001',
     });
-    const p1 = await engine.getPage(base, { sourceId: 'default' });
-    const p2 = await engine.getPage(`${base}-p2`, { sourceId: 'default' });
+    const one = await engine.getPage(base, { sourceId: 'default' });
+    expect(one).not.toBeNull();
+    expect(await engine.getPage(`${base}-p2`, { sourceId: 'default' })).toBeNull();
+    expect((one!.frontmatter as Record<string, any>).embed_skip).toBeUndefined();
+    expect((one!.frontmatter as Record<string, any>).transcript_import).toMatchObject({ part: 1, of: 1 });
+
+    const q = writeBigAgentSession(tmp, 'bigsession-0002', 150);
+    const split = await ingestUnderCeiling(100_000, [q]);
+    expect(split.pages.imported).toBeGreaterThan(1);
+    const splitBase = buildTranscriptSlug('openclaw', '2026-08-10T08:00:00.000Z', {
+      sessionId: 'bigsession-0002',
+    });
+    const p1 = await engine.getPage(splitBase, { sourceId: 'default' });
+    const p2 = await engine.getPage(`${splitBase}-p2`, { sourceId: 'default' });
     expect(p1).not.toBeNull();
     expect(p2).not.toBeNull();
     // Split pages must stay embeddable: no embed_skip marker on any part.
     for (const page of [p1!, p2!]) {
       const fm = page.frontmatter as Record<string, any>;
       expect(fm.embed_skip).toBeUndefined();
-      expect(fm.transcript_import.of).toBe(r.pages.imported);
+      expect(fm.transcript_import.of).toBeUndefined();
+      expect(fm.transcript_import.part_bytes).toBe(90_000);
     }
     // Unique per-part identity (a shared id would dedup-skip parts 2..N).
     expect((p1!.frontmatter as any).id).not.toBe((p2!.frontmatter as any).id);
@@ -324,7 +350,7 @@ describe('part splitting + dangerous transitions', () => {
 
   test('split → shrink deletes stale higher parts (reconciliation)', async () => {
     const big = writeBigAgentSession(tmp, 'shrinksession-01', 150);
-    const r1 = await runTranscriptsIngest(engine, baseOpts([big]));
+    const r1 = await ingestUnderCeiling(100_000, [big]);
     const parts = r1.pages.imported;
     expect(parts).toBeGreaterThan(1);
     // Same session id, now tiny: re-render to ONE part.
@@ -341,7 +367,7 @@ describe('part splitting + dangerous transitions', () => {
 
   test('reconciliation heals crash holes (deleted -p2, surviving -p3)', async () => {
     const big = writeBigAgentSession(tmp, 'holesession-0001', 300);
-    const r1 = await runTranscriptsIngest(engine, baseOpts([big]));
+    const r1 = await ingestUnderCeiling(100_000, [big]);
     expect(r1.pages.imported).toBeGreaterThan(2); // need at least p3 for the hole
     const base = buildTranscriptSlug('openclaw', '2026-08-10T08:00:00.000Z', {
       sessionId: 'holesession-0001',

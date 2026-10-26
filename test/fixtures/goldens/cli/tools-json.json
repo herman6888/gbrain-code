@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 264227,
-    "stdoutSha256": "f1f964ec0bac00c293cdf8e2dfdd28c67c75cde928f45b71f189690e93762e67",
+    "stdoutBytes": 264473,
+    "stdoutSha256": "f5647f0a0d45a36ed8685afa000792cef233379d012eeceec6fa2f9366d1b0ee",
     "toolNames": [
       "remember",
       "entity",
@@ -6965,6 +6965,7 @@
         "parameters": {
           "all_subjects": "boolean?",
           "confirm": "string?",
+          "continue": "boolean?",
           "dry_run": "boolean?",
           "expected_revision": "string?",
           "id": "number?",
@@ -6985,6 +6986,10 @@
             "confirm": {
               "description": "The confirmation token from the dry run (first 8 hex of the claim fingerprint).",
               "type": "string"
+            },
+            "continue": {
+              "description": "With status: first continue the purge's sweep of stored derivation results (derivation_sweep pending or stalled), then report.",
+              "type": "boolean"
             },
             "dry_run": {
               "description": "Return the receipt with would-remove counts and the confirmation token; changes nothing.",

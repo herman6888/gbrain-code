@@ -42,7 +42,7 @@ export interface GitHomePolicy { mirror: boolean; databaseOnlySource?: boolean; 
  * computes it in SQL. Callers load `visibility.honor_aliases` (readHonorAliases) first.
  */
 export function declaredDatabaseOnly(page: { slug: string; type?: string | null; frontmatter?: unknown; database_only_reason?: string | null;
-  lineage_private?: boolean; source_path?: string | null; source_uri?: string | null }, relativePath: string | null, policy: GitHomePolicy): DeclaredClass | null {
+  lineage_private?: boolean; source_path?: string | null; source_uri?: string | null; withheld_source_path?: string | null }, relativePath: string | null, policy: GitHomePolicy): DeclaredClass | null {
   if (policy.mirror) return 'mirror_source';
   if (policy.databaseOnlySource) return 'database_only_source';
   if (isPrivatePage(page)) return 'private';
