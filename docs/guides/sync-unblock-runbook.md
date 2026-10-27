@@ -429,7 +429,8 @@ it, and a `--full` continues until every path it covers is settled.
 - `owner`, sync finishes it by itself: `in_flight` (admitted, not yet
   published), `import`, `reparse` (an unchanged file whose page is imported
   again because its parser or schema pack changed, its origin moved, or an
-  open episode covers it), `delete`, `keep_db` and `keep_db_pending` (at most 200
+  open episode covers it and the page is not already current: same blob and
+  revision, chunks and text projection current, no hold), `delete`, `keep_db` and `keep_db_pending` (at most 200
   DB-wins writes per pass; the rest wait for the next pass),
   `legacy_unverified` (the legacy sweep checks it), and `paused_keep_db`
   (which waits for the owner's `sync.admission` change, as paused deletes

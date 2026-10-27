@@ -390,6 +390,19 @@ segmented chunk (`test/e2e/segmented-switch-off-write-role.test.ts`). With the
 policies above it creates segmented pages and sees only its sources' rows
 (`test/e2e/segmented-rls-scope.test.ts`).
 
+**Purge and withdrawal guards.** The guards that refuse purged content and keep withdrawn
+facts withdrawn run as the writing role (`SECURITY INVOKER`) and read their ledgers
+(`fact_purges`, `fact_withdrawals`, `take_purges`, `page_purges` and the derivation purge
+tables) under that role's RLS. Every gbrain function that pins a search_path ends it with
+`pg_temp` (migration v277, #7632), so a session's temp table or view named like a ledger
+cannot hide it from a guard; before, any session, the owner included, could store purged
+content that way. A write role with no policy on a ledger still reads it empty, so its
+purged or withdrawn writes still go through: give a scoped write role a `SELECT` policy on
+the ledgers of the sources it writes (gbrain#7659 tracks the fix). Where the migrating role
+does not own a function, v277 names it on stderr and leaves it; `gbrain doctor`
+(`function_search_path`) prints the `ALTER FUNCTION` to run as its owner
+(`test/e2e/function-search-path-postgres.test.ts`).
+
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
 (`src/core/engine-sql/brands.ts`); the engine obtains the branded executor, so

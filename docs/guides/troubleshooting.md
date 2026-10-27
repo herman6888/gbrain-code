@@ -135,9 +135,9 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="embed-backfill-skipped"></a>**A sync job or `embed-backfill` job reports `embed_backfill_skipped` (reason `embedding_disabled`)?** Nothing is wrong: the brain is keyless by choice (`embedding_disabled`), so sync queues no embed-backfill and a backfill already queued ends on its first attempt without reading a page. Search stays keyword-only. The notice appears once per brain state (the first skip after the brain became keyless); its fix is the optional step that turns embedding on and names the provider key it needs (effects `credentials` and `paid`: ask the user first).
 
-**`gbrain doctor` warns `default_source_local_path`?** Your `default` source has no `local_path` AND that null pointer is provably breaking write-through (the repo fallback is another source's own working tree, or file-backed default pages have no resolvable root). A null `local_path` on its own is the designed fallback topology and reports ok. The repair is a pointer update, never a file move: `gbrain sources set-path default <path>` prints the prior value before changing it and refuses a path that nests inside or swallows another source's tree (exit 6; `--force` bypasses). **Say to your agent:** *"Run a brain health check and fix what you find"* — the maintain skill runs `gbrain doctor` and applies the printed repair.
+**`gbrain doctor` warns `default_source_local_path`?** Your `default` source has no `local_path` AND that null pointer is provably breaking write-through (the repo fallback is another source's own working tree, or file-backed default pages have no resolvable root). A null `local_path` on its own is the designed fallback topology and reports ok. The repair is a pointer update, never a file move: `gbrain sources set-path default <path>` prints the prior value before changing it and refuses a path that nests inside or swallows another source's tree (exit 6; `--force` bypasses). The check also warns when any source's `local_path` is a relative path such as `.`, or when a `default` source with no path falls back to a relative `sync.repo_path`, because sync refuses those (`sync_anchor_relative`); see [relative source path](#relative-source-path). **Say to your agent:** *"Run a brain health check and fix what you find"* — the maintain skill runs `gbrain doctor` and applies the printed repair.
 
-**A Gmail, Calendar or GitHub connector source still has an old `local_path`?** Connector sources sync from their provider, so autopilot ignores their `local_path`: once a connector has synced (or tried to) at least once, autopilot syncs it on every interval and runs its database phases with no checkout. A connector that has never synced stays idle until you run `gbrain sync --source <id>` once; autopilot prints that command the first time it skips one. To remove the stale pointer, run `gbrain sources set-path <id> --clear` (connector sources only; it refuses a filesystem source and a connector bound to a canonical owner). `config.syncEnabled=false` still opts a source out. **Say to your agent:** *"My Gmail source points at an old folder. Clear it and keep it syncing."*
+**A Gmail, Calendar or GitHub connector source still has an old `local_path`?** Connector sources sync from their provider, so autopilot ignores their `local_path`: once a connector has synced (or tried to) at least once, autopilot syncs it on every interval and runs its database phases with no checkout. A connector that has never synced stays idle until you run `gbrain sync --source <id>` once; autopilot prints that command the first time it skips one. To remove the stale pointer, run `gbrain sources set-path <id> --clear` (connector sources, or any source whose `local_path` is relative; it refuses a filesystem source with an absolute path and any source bound to a canonical owner). `config.syncEnabled=false` still opts a source out. **Say to your agent:** *"My Gmail source points at an old folder. Clear it and keep it syncing."*
 
 <a id="write-refused"></a>**A save, sync or background effect was refused with a named reason?** Reasons such as `file_database_drift`, `ambiguous_source_path`, `physical_root_device_changed`, `cursor_processing_options_conflict`, `take_row_collision`, `invalid_source_uri`, `queue_capacity` and parked effects (`targets_parked`, doctor `parked_effects`) each come with a recovery step in the error's `suggestion`. [Write refusal reasons](write-refusals.md) explains each one and its recovery. **Say to your agent:** *"My save was refused. Explain the reason and show me the fix before you run it."*
 
@@ -248,7 +248,7 @@ A spike warns only on its own: when at least `persistence.terminal_failures.spik
 ```bash
 gbrain doctor --only persistence_terminal_failures --json      # blockers, unresolved, historical, the fix
 gbrain sync status --source <id>                               # the same summary for one source, with BLOCKING lines
-gbrain sources writer failures <id> --group-by category        # groups on code + origin + category, each with its drill-down
+gbrain sources writer failures <id> --group-by category        # groups on code + origin + category (+ operation for a sync_fault), each with its drill-down
 gbrain sources writer failures <id> --category owner_exception --code storage_error --origin owner_exception --json
 gbrain write-request <request> --json                          # one receipt: write_error_reason, suggestion, diagnosis.fix
 ```
@@ -820,3 +820,70 @@ syncs keep ending `partial` or failing has none, however many pages it imported.
   - `last_attempt_unsuccessful`: read the job (`gbrain jobs get <id> --json`)
     or the managed failure, then retry.
   - `no_attempt`: run `gbrain sync --source <id>` (`--no-pull` on a managed brain).
+
+## Relative source path
+
+<a id="relative-source-path"></a>
+
+**Say to your agent:** *"Sync refused with `sync_anchor_relative`, or doctor warns that my default source's local_path is relative."*
+
+A source's stored directory (`sources.local_path`, or the legacy `sync.repo_path`)
+must be an absolute path. A relative one such as `.` names whatever directory
+gbrain runs from, so it cannot say which folder is the brain. Before #7630, a
+`gbrain sync --source default` or `gbrain sync --all` run from an unrelated
+folder treated that folder as the brain repo: it ran `git init`, committed
+everything in it and imported its markdown. Sync now refuses
+`sync_anchor_relative` (exit 3) before any Git probe, cost estimate or import,
+and nothing is changed. Doctor's `default_source_local_path` check warns on
+every source with a relative path, and on a relative `sync.repo_path` behind a
+default source with no path.
+
+Ask the user which directory holds the source, then do one of:
+
+- `gbrain sources set-path <id> <absolute-directory>` points the source at that
+  directory (non-destructive; it only updates the pointer).
+- `gbrain sources set-path <id> --clear` clears the relative pointer. It changes
+  no file or page. A `default` source with no path writes through
+  `sync.repo_path` (the designed fallback), and its sync refuses until a path
+  is set again. On a managed brain, a source with a canonical owner refuses
+  `--clear` (`writer_transfer_required`); point it at its directory instead.
+
+A path that is absolute only on another operating system (a Windows drive path
+such as `C:\brain-example`, set by another host sharing the brain, read on Linux
+or macOS) is refused the same way, as not an absolute path on this host. Use
+`set-path` with this host's directory (or `gbrain config set sync.repo_path` for
+the legacy key); `--clear` refuses such a path. An explicit absolute `--repo`
+passes the refusal, but it never advances the sync position of a source whose
+stored path is relative.
+
+Until the path is absolute, the main readers do not treat the folder gbrain
+runs from as the source either: page and fact writes skip the file and stay in
+the database (`repo_not_found`, `no_repo_configured`), a captured file keeps
+no origin path, matching a folder to its source ignores the path, fence repair
+edits stored pages, managed activation refuses it (`source_changed`, detail
+`source_path_missing`), the dream, autopilot, per-phase and global
+maintenance cycles and `gbrain maintain` run only their database phases
+(a cycle run on a directory that matches no registered source fails its
+sync phase `sync_anchor_relative` while the `default` source's path is
+relative),
+`sources set-path` does not count it as another source's tree, the
+write-through leak guard counts a live source's relative path as owning any
+tree (so every source with no `local_path`, the `default` source and any
+`.sources/<id>` source, saves its pages to the database only, `source_repo_belongs_to_other_source`, until that path is set
+or cleared), `gbrain autopilot
+--install` asks for `--repo`, a remote `submit_job` for the source is
+refused, import does not count the folder as a configured root or stamp it
+fresh, and a managed brain does not record it as a managed root. A few other
+local commands may still read it from the folder they run in, so set the path
+first. A managed brain that ran before this fix may already have recorded the
+folders it ran from as managed roots; those records stay until an operator
+drains them (tracked in #7646).
+
+For `sync.repo_path`: `gbrain config set sync.repo_path <absolute-directory>`.
+`config set` refuses a relative value and writes nothing.
+
+If an earlier sync already initialized and imported the wrong folder, the user
+decides what to undo: the folder's new `.git` directory and the pages imported
+from it are theirs to review before anything is removed.
+Verify with `gbrain sources status <id> --json` and
+`gbrain doctor --only default_source_local_path --json`.

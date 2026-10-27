@@ -297,7 +297,7 @@
         {
           "category": "ops",
           "elapsed_ms": "<volatile>",
-          "message": "Bun <bun-version> (minimum 1.4.0)",
+          "message": "Bun <bun-version> (minimum 1.4.4)",
           "name": "bun_runtime",
           "status": "ok"
         },
@@ -1047,6 +1047,13 @@
           "elapsed_ms": "<volatile>",
           "message": "Skipped (PGLite — no PostgREST exposure, RLS not applicable)",
           "name": "rls",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "elapsed_ms": "<volatile>",
+          "message": "Every gbrain function that pins a search_path ends it with pg_temp",
+          "name": "function_search_path",
           "status": "ok"
         },
         {

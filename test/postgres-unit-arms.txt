@@ -85,9 +85,11 @@ test/get-chunks-paging.test.ts
 test/git-canonical-conversion-g8a.test.ts
 test/git-canonical-declared-g7a.test.ts
 test/git-canonical-indexer-g3.test.ts
+test/git-door-planned-state.test.ts
 test/git-door-plumbing-gbra133.test.ts
 test/git-door-remote-g7b.test.ts
 test/git-door-strict-gbra133.test.ts
+test/git-door-write-cost.test.ts
 test/git-gap-census.test.ts
 test/google-connector-facts-fence-7292.test.ts
 test/grade-takes-window.test.ts
