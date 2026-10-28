@@ -397,9 +397,8 @@ runs its phases in-process rather than spawning a child `gbrain init
 --migrate-only` per phase; a spawned child is what dies on
 Windows + bun + Supabase pooler with a DNS-resolution failure even
 though the parent connects fine, and running in-process removes the
-spawn entirely. The grandfather migration runs as a chunked bulk SQL
-pass (keyed on the page PK, soft-delete-filtered, source-safe) and
-completes in seconds on an 80K-page PGLite brain.
+spawn entirely. The v0.13.1 grandfather migration writes nothing since #7814: it
+records completion and leaves every page as it was.
 
 <a id="ghost-pages"></a>**A write refuses `source_changed` with "The canonical file was removed outside coordinated publication." (`canonical_file_missing`), or doctor `ghost_pages` warns?** The page is a ghost: its canonical file is gone on the owner host but the database page is live, so every write refuses and no sync can import a file that is not there. On the owner host, list them with `gbrain pages ghosts --source <id>` (read-only). For each, the user decides: to keep the page, restore its file at the recorded path (from Git or a backup; gbrain has no automated file restore) and run `gbrain sync --source <id>`; to remove it, preview `gbrain repair ghost-pages --source <id>`, show the user the list, and after they agree run the printed `--apply --expect <hash> --yes`. Removed pages are purged after 72 h; `gbrain restore <slug> --force` undoes one until then. Off the owner host it refuses `not_owner_host`; on an unreadable checkout `ghost_storage_unknown`; when ghosts are more than half of the source's file-backed pages `ghost_mass_delete_refused` (check the checkout first). See [ghost pages](repair.md#ghost-pages). **Say to your agent:** *"Which pages lost their files? Show me the list before you remove anything."*
 

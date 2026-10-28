@@ -44,6 +44,7 @@ test/company-brain-policy.test.ts
 test/company-brain-runtime.test.ts
 test/consolidate-fenced-close-reimport.test.ts
 test/consolidate-same-instant-6023.test.ts
+test/conversation-facts-outcome-marker-purge-7778.test.ts
 test/conversation-facts-oversized-sidecar.test.ts
 test/conversation-facts-purged-claim-7438.test.ts
 test/cycle/synthesize-concepts-merge.test.ts
@@ -83,8 +84,10 @@ test/forecast-journal.test.ts
 test/frontmatter-reserved-keys-6454.test.ts
 test/get-chunks-paging.test.ts
 test/git-canonical-conversion-g8a.test.ts
+test/git-canonical-conversion-progress.test.ts
 test/git-canonical-declared-g7a.test.ts
 test/git-canonical-indexer-g3.test.ts
+test/git-door-index-lock-7742.test.ts
 test/git-door-planned-state.test.ts
 test/git-door-plumbing-gbra133.test.ts
 test/git-door-remote-g7b.test.ts

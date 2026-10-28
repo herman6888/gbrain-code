@@ -1719,9 +1719,16 @@ CREATE TABLE IF NOT EXISTS persistence_consumers (
   );
 
 CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
-DECLARE target_source text; old_source text; row_data jsonb; old_data jsonb; allowed jsonb;
+DECLARE managed boolean; strict_count integer; seen integer; git boolean; unreadable text; target_source text; old_source text; row_data jsonb; old_data jsonb; allowed jsonb;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM persistence_brain WHERE singleton=1 AND enabled) THEN
+  -- #7636: init always writes the singleton, so a missing row means this role cannot read it (RLS), never "unmanaged".
+  SELECT enabled INTO managed FROM persistence_brain WHERE singleton=1;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','persistence_brain')::text;
+  END IF;
+  IF NOT managed THEN
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   END IF;
   IF TG_TABLE_NAME='page_segment_texts' THEN
@@ -1771,9 +1778,19 @@ BEGIN
   IF TG_TABLE_NAME NOT IN ('tags','timeline_entries','takes') THEN
     target_source := row_data->>'source_id'; old_source := old_data->>'source_id';
   END IF;
-  IF target_source IS NULL THEN SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
+  IF target_source IS NULL THEN
+    SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer;
+    IF NOT FOUND AND row_security_active('pages') THEN unreadable := 'pages'; END IF;
+  END IF;
   IF TG_OP='UPDATE' AND old_source IS NULL THEN
     SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer;
+    IF NOT FOUND AND row_security_active('pages') THEN unreadable := 'pages'; END IF;
+  END IF;
+  -- A page row-level security hides is not a deleted parent (a cascade runs as the table owner, outside RLS).
+  IF unreadable IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state',unreadable)::text;
   END IF;
   -- Cascaded projection removal after the already-guarded parent deletion.
   IF target_source IS NULL AND TG_OP='DELETE' THEN RETURN OLD; END IF;
@@ -1786,12 +1803,24 @@ BEGIN
         'target_source',target_source,'old_source',old_source,'allowed',allowed)::text;
   END IF;
   -- G7a (git-canonical-schema.ts): a git-canonical source takes rows only from a writer that declares the git protocol.
-  IF COALESCE(current_setting('gbrain.git_protocol',true),'') <> '1'
-    AND EXISTS (SELECT 1 FROM git_canonical_brain WHERE singleton=1 AND strict_sources>0)
-    AND EXISTS (SELECT 1 FROM sources WHERE id IN (target_source, old_source) AND config->>'canonical'='git') THEN
-    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='git_protocol_required: this source is git-canonical and the writer does not declare the git protocol',
-      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='git_canonical_fence:mutation',
-      DETAIL=jsonb_build_object('op',TG_OP,'target_source',target_source,'old_source',old_source)::text;
+  IF COALESCE(current_setting('gbrain.git_protocol',true),'') <> '1' THEN
+    SELECT strict_sources INTO strict_count FROM git_canonical_brain WHERE singleton=1;
+    IF NOT FOUND THEN unreadable := 'git_canonical_brain';
+    ELSIF strict_count>0 THEN
+      SELECT count(*), COALESCE(bool_or(config->>'canonical'='git'),false) INTO seen, git FROM sources WHERE id IN (target_source, old_source);
+      IF seen < (CASE WHEN old_source IS NULL OR old_source=target_source THEN 1 ELSE 2 END) AND row_security_active('sources') THEN
+        unreadable := 'sources';
+      ELSIF git THEN
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='git_protocol_required: this source is git-canonical and the writer does not declare the git protocol',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='git_canonical_fence:mutation',
+          DETAIL=jsonb_build_object('op',TG_OP,'target_source',target_source,'old_source',old_source)::text;
+      END IF;
+    END IF;
+    IF unreadable IS NOT NULL THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+        DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state',unreadable)::text;
+    END IF;
   END IF;
   IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END \$fn\$;
@@ -1814,6 +1843,12 @@ CREATE TABLE IF NOT EXISTS git_canonical_brain (
 );
 CREATE OR REPLACE FUNCTION gbrain_count_git_canonical_sources() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
 BEGIN
+  -- #7636: a count over the rows row-level security lets this role see would undercount and could switch G7a off.
+  IF row_security_active('sources') THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','sources')::text;
+  END IF;
   INSERT INTO git_canonical_brain(singleton, strict_sources)
     VALUES (1, (SELECT count(*) FROM sources WHERE config->>'canonical' = 'git'))
     ON CONFLICT (singleton) DO UPDATE SET strict_sources = EXCLUDED.strict_sources;
@@ -2065,6 +2100,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGU
     IF TG_OP='DELETE' THEN target:=OLD.target_kind; version:=OLD.protocol_version;
     ELSE target:=NEW.target_kind; version:=NEW.protocol_version; END IF;
     SELECT writer_protocol_floor,skill_bundles_enabled INTO floor,active FROM persistence_brain WHERE singleton=1 FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'writer_coordinator_required: writer state is unreadable to this database role' USING ERRCODE='42501'; END IF;
     PERFORM gbrain_require_persistence_protocol(GREATEST(floor,version,CASE WHEN target='skill_bundle' THEN 2 ELSE 1 END));
     IF TG_OP='DELETE' THEN RETURN OLD; END IF;
     IF TG_OP='UPDATE' AND (NEW.target_kind<>OLD.target_kind OR NEW.protocol_version<>OLD.protocol_version) THEN
@@ -2103,6 +2139,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUA
   DECLARE floor integer;
   BEGIN
     SELECT writer_protocol_floor INTO floor FROM persistence_brain WHERE singleton=1 FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'writer_coordinator_required: writer state is unreadable to this database role' USING ERRCODE='42501'; END IF;
     PERFORM gbrain_require_persistence_protocol(floor);
     IF TG_OP='DELETE' THEN RETURN OLD; END IF;
     RETURN NEW;
@@ -2117,6 +2154,10 @@ CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LA
     END IF;
     IF NEW.writer_protocol_floor>OLD.writer_protocol_floor OR (NEW.skill_bundles_enabled AND NOT OLD.skill_bundles_enabled) THEN
       PERFORM gbrain_require_persistence_protocol(2);
+      IF row_security_active('persistence_requests') OR row_security_active('persistence_effects') OR row_security_active('persistence_worktrees')
+        OR row_security_active('persistence_source_bindings') OR row_security_active('sources') THEN
+        RAISE EXCEPTION 'writer_coordinator_required: writer state is unreadable to this database role' USING ERRCODE='42501';
+      END IF;
       IF COALESCE(current_setting('gbrain.writer_quiesced',true),'')<>'true' OR NOT NEW.enabled OR NEW.writer_protocol_floor<>2
         OR EXISTS (SELECT 1 FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL)
         OR EXISTS (SELECT 1 FROM persistence_effects WHERE state='running' OR recovery IS NOT NULL)

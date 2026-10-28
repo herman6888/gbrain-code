@@ -1,6 +1,6 @@
 {
   "golden": {
-    "count": 272,
+    "count": 274,
     "gaps": [
       17,
       18,
@@ -92,7 +92,7 @@
       "verifyProjectionStatistics": "0d231b04ecfbc5a4109d6fca9567bf4e8c9e9db6c3fbbb35212e026579ed6f67",
       "withSchemaLockTimeout": "95605bd3004955e11e936c7a4aa6889319b401098abf9db18ef3e48da2c3fc59"
     },
-    "latest": 277,
+    "latest": 279,
     "records": [
       {
         "handler": {
@@ -2286,8 +2286,8 @@
         "idempotent": true,
         "name": "durable_concurrent_persistence",
         "sql": {
-          "length": 13533,
-          "sha256": "44196cf3f167069f378f222b703225d8f5348a4c72b7e72712f7963cbe259a5b"
+          "length": 15532,
+          "sha256": "d18cf500d26ac27f68e4cdeb71e9c23220c33505b6b08100377e91fcdf1a82a8"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2351,8 +2351,8 @@
         "idempotent": true,
         "name": "managed_alias_and_source_checkpoint_guards",
         "sql": {
-          "length": 7037,
-          "sha256": "1964cc4ad2ac89e71e37417b81f19df7635ae1e1cfe01c597c775184e963bd27"
+          "length": 9036,
+          "sha256": "bbc1864bccd1b4a56e3370845644f81c705b70ea8ff12730b8c91a42b6a5ef19"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2473,8 +2473,8 @@
         "idempotent": true,
         "name": "shared_brain_skills_and_membership",
         "sql": {
-          "length": 15917,
-          "sha256": "6d54ba001944603fd35abe6d6f355f106322a4e0dda206cfd93622fc1493e4aa"
+          "length": 16604,
+          "sha256": "12f33fc2b93cd862226d9e1e9cfb3eaebc7c475aa18113645a6f9c175888b49b"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2510,8 +2510,8 @@
         "idempotent": true,
         "name": "fact_embedding_identity",
         "sql": {
-          "length": 7182,
-          "sha256": "900ebf824b3255a9f483b19ab0ef4a00be37114859806c56dacb160156345854"
+          "length": 9181,
+          "sha256": "293f747112998b8549064e2e8542d62fb2787272c5e879ff0bd9a57ff2348dd6"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2915,8 +2915,8 @@
         "idempotent": true,
         "name": "take_embedding_identity",
         "sql": {
-          "length": 7182,
-          "sha256": "00cd2c3e74426d3ba1e64147628c4a90213326e35578e81e23dd10b23e3d26f8"
+          "length": 9181,
+          "sha256": "900c5d058b546debd51a01e833ca319151d68115b53e5cedc588bcca52ab7193"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2928,8 +2928,8 @@
         "idempotent": true,
         "name": "f1_write_attribution",
         "sql": {
-          "length": 17096,
-          "sha256": "1828c72a03caf415da2d2690d1211c06c52820e4d9fdffe9870685150cec8f0c"
+          "length": 19095,
+          "sha256": "c95c8ad32212efd3b78023cac5c243d12b65cd11ee9122835cd42e1dbf27c83b"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2986,8 +2986,8 @@
         "idempotent": true,
         "name": "managed_guard_null_source_fallback",
         "sql": {
-          "length": 6497,
-          "sha256": "1661de8bdc43511fda3ebe84135800d415e6d2cd1653335011510a44fc92ec6f"
+          "length": 8496,
+          "sha256": "ec57ed5104233106665ea06b95ad921f989df354c1fa4db972f2d7059b6b98d2"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -2999,8 +2999,8 @@
         "idempotent": true,
         "name": "publication_failure_detail",
         "sql": {
-          "length": 6588,
-          "sha256": "3ac268e502ae5c7041441a433c9abf6122e915ac77c1677da79b093b26080d88"
+          "length": 8587,
+          "sha256": "230863f55030cc855bec3c949dfda7a38dbccea84724360d45e232e9f8a95332"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -3447,8 +3447,8 @@
         "idempotent": true,
         "name": "trust_tiers",
         "sql": {
-          "length": 22427,
-          "sha256": "a45cf1c8031731bb7934737b379eb96559c7892af1d64f8f0700231c0c701199"
+          "length": 24426,
+          "sha256": "b013d5979a6973d1fcdc5ab0bf9ae2e6a5c3ae21cb3e4b85c55025ee76f4cbfd"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -4214,8 +4214,8 @@
         "idempotent": true,
         "name": "set_based_fact_insert_guards",
         "sql": {
-          "length": 8343,
-          "sha256": "d01ea4d8a212485932351ad8473d54ef7d0b65f4d5b59b1ba34e4b63bf20b4bb"
+          "length": 8575,
+          "sha256": "7a76b08224ef82c7034f93c983b82effc7e5bb54a4b734182541967bb478caec"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -4382,8 +4382,8 @@
         "idempotent": true,
         "name": "git_canonical_declared",
         "sql": {
-          "length": 8553,
-          "sha256": "c18a85c1f6621f60f19274990cca67fb0a87d988a01b38463464737192bf0a4b"
+          "length": 11056,
+          "sha256": "c6270a97f0b7ede1b5342363c96aaeae598b6e28df80bbddebf7d577bead600e"
         },
         "sqlFor": "absent",
         "transaction": "absent",
@@ -4505,6 +4505,32 @@
         "transaction": false,
         "verify": "absent",
         "version": 277
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "writer_fence_fail_closed",
+        "sql": {
+          "length": 14628,
+          "sha256": "662048ed2b30ecb75cd4bbee438564fda6533f6e647b43f82ea1cfaaadb4bb7c"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 278
+      },
+      {
+        "handler": "absent",
+        "idempotent": true,
+        "name": "outcome_markers_skip_purge_guard",
+        "sql": {
+          "length": 2560,
+          "sha256": "95449fe0798457014873642724ad5da8fc97db0bb9cbb94d3b8c22c01b303a3b"
+        },
+        "sqlFor": "absent",
+        "transaction": "absent",
+        "verify": "absent",
+        "version": 279
       }
     ],
     "versions": [
@@ -4779,7 +4805,9 @@
       274,
       275,
       276,
-      277
+      277,
+      278,
+      279
     ]
   },
   "normalizer": "migrations-record-v1"

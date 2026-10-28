@@ -586,6 +586,19 @@ or `embedding_auth_failed` on the first rejected embedding
 ([write refusals](write-refusals.md#embedding_auth_failed)). After fixing a
 rejected key, `gbrain embed --stale` embeds what was saved meanwhile.
 
+<a id="outside-content-fences"></a>
+### Outside-content fences
+
+Doctor's `outside_content_fences` check warns when an imported page whose body is someone else's text (a Gmail thread or calendar event from a Google source, a GitHub issue, PR or repo card, an imported chat transcript) has facts, takes or links indexed from a fence on it. Before GBRA-221 those importers copied the text verbatim. A sender who wrote `<!--- gbrain:facts:begin -->` and a table planted facts, which `extract_facts` saved with the visibility and confidence the sender chose. A re-render carries a stored fence forward. Imports now escape the markers, so new mail can't do this. Rows planted earlier stay until someone removes them.
+
+The check lists each page with its counts (world-visible facts counted apart), never a cell value. It reads the indexed rows, so a fence not yet extracted shows up after the next `extract_facts` run. gbrain's own writers (`remember`, loop extraction) also add rows to some of these pages, and the check can't tell which is which, so there is no automatic repair:
+
+1. Read the page with the user: `gbrain get --source <id> -- <slug>`.
+2. For each fact they say a sender wrote, withdraw it after they agree: `gbrain forget <fact-id> --source <id>`.
+3. Verify with `gbrain doctor --only outside_content_fences --json`.
+
+**Say to your agent:** *"Which imported pages hold facts a sender could have planted? Show me before you remove anything."*
+
 <a id="connector-held-items"></a>
 ### Connector held items
 

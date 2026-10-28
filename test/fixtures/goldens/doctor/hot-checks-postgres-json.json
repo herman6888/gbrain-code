@@ -3351,6 +3351,17 @@
           {
             "category": "brain",
             "details": {
+              "items": [],
+              "total": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No released fact was confirmed with fence-row fields its release preview did not show.",
+            "name": "trust_release_unpreviewed_fields",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "bad_config": [],
               "chars_limit": 4000,
               "chars_used": 0,
@@ -3817,6 +3828,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No source is strict (git-canonical), so no index trails a commit.",
             "name": "git_index_lag",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#outside-content-fences",
+              "items": [],
+              "pages": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No fact, take or link is indexed from a fence on an imported email, calendar, GitHub or transcript page.",
+            "name": "outside_content_fences",
             "status": "ok"
           },
           {
@@ -8098,6 +8121,17 @@
           {
             "category": "brain",
             "details": {
+              "items": [],
+              "total": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No released fact was confirmed with fence-row fields its release preview did not show.",
+            "name": "trust_release_unpreviewed_fields",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "bad_config": [],
               "chars_limit": 4000,
               "chars_used": 0,
@@ -8564,6 +8598,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No source is strict (git-canonical), so no index trails a commit.",
             "name": "git_index_lag",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/repair.md#outside-content-fences",
+              "items": [],
+              "pages": 0
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No fact, take or link is indexed from a fence on an imported email, calendar, GitHub or transcript page.",
+            "name": "outside_content_fences",
             "status": "ok"
           },
           {

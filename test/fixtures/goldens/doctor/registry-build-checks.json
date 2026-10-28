@@ -907,6 +907,10 @@
       },
       {
         "category": "brain",
+        "name": "trust_release_unpreviewed_fields"
+      },
+      {
+        "category": "brain",
         "name": "core_memory"
       },
       {
@@ -1004,6 +1008,10 @@
       {
         "category": "brain",
         "name": "git_index_lag"
+      },
+      {
+        "category": "brain",
+        "name": "outside_content_fences"
       },
       {
         "category": "brain",

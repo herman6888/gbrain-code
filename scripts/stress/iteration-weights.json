@@ -190,6 +190,8 @@
   "test/frontmatter-alias-bomb.test.ts": 100,
   "test/frontmatter-reserved-keys-6454.test.ts": 6300,
   "test/get-chunks-paging.test.ts": 5000,
+  "test/git-canonical-conversion-g8a.test.ts": 210700,
+  "test/git-canonical-conversion-progress.test.ts": 143250,
   "test/google-connector-facts-fence-7292.test.ts": 13200,
   "test/grade-takes-window.test.ts": 2500,
   "test/graduation-copy.test.ts": 27900,

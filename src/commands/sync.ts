@@ -1,4 +1,5 @@
 import { type ManagedSyncFailure } from '../core/persistence/sync-failures.ts';
+import { startMemoryTrace } from '../core/memory-trace.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { DEFAULT_PARALLEL_SOURCES } from '../core/sync-concurrency.ts';
 import { withHumanLogsToStderr, withSourcePrefix } from '../core/console-prefix.ts';
@@ -435,9 +436,8 @@ export async function runSync(engine: BrainEngine, args: string[]) {
   // serr/progress are stderr already. The envelope (sync/run.ts emitJson) and
   // `sync status|unblock --json` (sync/operator.ts) write through
   // writeJsonDocument, the guard's only stdout path.
-  return args.includes('--json')
-    ? withHumanLogsToStderr(() => runSyncInner(engine, args))
-    : runSyncInner(engine, args);
+  const stopTrace = startMemoryTrace('sync');
+  try { return await (args.includes('--json') ? withHumanLogsToStderr(() => runSyncInner(engine, args)) : runSyncInner(engine, args)); } finally { stopTrace(); }
 }
 
 /**

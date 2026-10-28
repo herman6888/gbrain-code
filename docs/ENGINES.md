@@ -403,6 +403,20 @@ does not own a function, v277 names it on stderr and leaves it; `gbrain doctor`
 (`function_search_path`) prints the `ALTER FUNCTION` to run as its owner
 (`test/e2e/function-search-path-postgres.test.ts`).
 
+**Writer-protocol fences.** The managed-writer guard, the persistence protocol floor, protocol
+activation and the Git-canonical source counter also run as the writing role and read their state
+under its RLS. Since migration v278 (#7636) they fail closed: a role that cannot see the
+`persistence_brain` row is refused with `writer_coordinator_required` (relationship
+`unreadable_state`) on every guarded write, managed brain or not, instead of being treated as
+unmanaged. On a managed brain the same refusal covers a hidden `git_canonical_brain` row or
+Git-canonical source row (for a writer without the git protocol) and a hidden page row behind a tag,
+timeline entry or take. Protocol activation (row-level security on `sources`, `persistence_requests`,
+`persistence_effects`, `persistence_worktrees` or `persistence_source_bindings`) and a change to
+which sources are Git-canonical (row-level security on `sources`) refuse any role it applies to,
+whatever its policies; only the table owner (without `FORCE ROW LEVEL SECURITY`) or a role that
+bypasses RLS passes them ([write refusals](guides/write-refusals.md#writer-coordinator-required);
+`test/writer-fence-fail-closed-7636.test.ts`).
+
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
 (`src/core/engine-sql/brands.ts`); the engine obtains the branded executor, so

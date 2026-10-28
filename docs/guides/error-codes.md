@@ -1685,9 +1685,9 @@ More: [docs/guides/repair.md#ghost-pages](../../docs/guides/repair.md#ghost-page
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Converting a source to git-canonical would discard database content or cannot place it, so the apply wrote nothing. | gbrain sources canonical --to git applies only when every database row will be in Git or in a declared database-only class afterwards. The preview counts what would be lost or cannot be placed by category (detail lists them): both_moved and held_drift_both, a page Git and the database both changed; deleted_in_git, a page Git deleted that the database edited since; uncommitted_edit, a working-tree edit the adoption would overwrite; ignored_target, a page whose file Git ignores without a declared class; unparseable and unsafe_path, a committed file or path sync cannot read; segmented_page, a segmented page conversion does not adopt yet; export_mismatch, a page whose export does not read back equal; git_overwrites_database, a page version a strict pass would replace that nothing accepted. There is no override. | Relay the categories and their paths (the --dry-run preview lists them) and ask the user how each should be resolved; preview again afterwards. | user | `repeat the read that failed` | 1 | no |
+| Converting a source to git-canonical would discard database content or cannot place it, so the apply wrote nothing. | gbrain sources canonical --to git applies only when every database row will be in Git or in a declared database-only class afterwards. The preview counts what would be lost or cannot be placed by category (detail lists them): both_moved and held_drift_both, a page Git and the database both changed; deleted_in_git, a page Git deleted that the database edited since; uncommitted_edit, a working-tree edit the adoption would overwrite; ignored_target, a page whose file Git ignores without a declared class; unparseable and unsafe_path, a committed file or path sync cannot read; segmented_page, a segmented page conversion does not adopt yet; export_mismatch, a page whose export does not read back equal; git_overwrites_database, a page version a strict pass would replace that nothing accepted; ignore_status_unknown, a target whose ignore status Git cannot read (beyond a symlink, outside the checkout, a timed-out check). There is no override. | Relay the categories and their paths (the --dry-run preview lists them) and ask the user how each should be resolved; preview again afterwards. | user | `repeat the read that failed` | 1 | no |
 
-Reasons: `both_moved`, `held_drift_both`, `held_drift_unknown_differs`, `deleted_in_git`, `uncommitted_edit`, `ignored_target`, `unparseable`, `unsafe_path`, `segmented_page`, `export_mismatch`, `git_overwrites_database`.
+Reasons: `both_moved`, `held_drift_both`, `held_drift_unknown_differs`, `deleted_in_git`, `uncommitted_edit`, `ignored_target`, `unparseable`, `unsafe_path`, `segmented_page`, `export_mismatch`, `git_overwrites_database`, `ignore_status_unknown`.
 
 More: [docs/designs/GIT_CANONICAL_MEMORY.md#conversion](../../docs/designs/GIT_CANONICAL_MEMORY.md#conversion)
 
@@ -4636,6 +4636,18 @@ More: [docs/ENGINES.md#vector-index-prewarm](../../docs/ENGINES.md#vector-index-
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Source content or relationships changed during verification. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### visibility_not_applied
+
+<a id="visibility_not_applied"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A page write asked for visibility: private, but the page would have stayed world-readable, so nothing was written. | A write that reports success while the page stays world-readable leaves the caller believing it is hidden. Page privacy reads only the exact lowercase key and value visibility: private (#7841). When the frontmatter is unreadable or ambiguous, the write is refused invalid_frontmatter instead. | Read the page and its revision, write visibility: private on its own frontmatter line (lowercase key and value), then submit again with a new request_id. Run: gbrain get --source '{source_id}' -- '{slug}' | agent | `repeat the read that failed` | 1 | no |
+
+Reasons: `noncanonical_value`, `not_kept`.
+
+More: [docs/guides/write-refusals.md#visibility_not_applied](../../docs/guides/write-refusals.md#visibility_not_applied)
 
 ### withdrawal_capacity
 

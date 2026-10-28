@@ -232,7 +232,7 @@ title: 旧数据
 describe('migration v239 idempotency', () => {
   test('v239 exists, is marked idempotent, and re-runs cleanly', async () => {
     // Renumbered from v150 during the v0.60.25.0 merge (upstream claimed v150).
-    const v239 = MIGRATIONS.find(m => m.version === 278);
+    const v239 = MIGRATIONS.find(m => m.version === 280);
     expect(v239).toBeDefined();
     expect(v239!.name).toBe('cjk_bigram_fts');
     expect(v239!.idempotent).toBe(true);
@@ -248,8 +248,8 @@ title: 迁移幂等
 负责人延期交付，验证迁移可重跑。`;
     await importFromContent(engine, 'originals/cjk-migrate-idem', md, { noEmbed: true });
 
-    await engine.runMigration(278, v239!.sql!);
-    await engine.runMigration(278, v239!.sql!);
+    await engine.runMigration(280, v239!.sql!);
+    await engine.runMigration(280, v239!.sql!);
 
     const hits = await engine.searchKeyword('延期');
     expect(hits.length).toBeGreaterThan(0);

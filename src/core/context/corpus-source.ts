@@ -309,8 +309,10 @@ export interface CorpusSourceHolds {
  * Doctor/CLI view of the held files that only an operator mapping can
  * release (a multi-source brain's legacy files and unresolved sessions).
  * Engine-free; `soleSource` is the caller's `SELECT id FROM sources` answer.
+ * `includeIngested` (the operator mapping) also lists sessions the sweep already
+ * extracted: dream synthesis holds them too until their source is known (#7805).
  */
-export function listCorpusSourceHolds(corpusDir: string, soleSource: boolean): CorpusSourceHolds {
+export function listCorpusSourceHolds(corpusDir: string, soleSource: boolean, opts: { includeIngested?: boolean } = {}): CorpusSourceHolds {
   const out: CorpusSourceHolds = { legacy_unstamped: 0, unresolved: 0, sessions: [] };
   const spool = corpusSpoolDir(corpusDir);
   const sessions = new Set<string>();
@@ -319,7 +321,7 @@ export function listCorpusSourceHolds(corpusDir: string, soleSource: boolean): C
     try { names = readdirSync(dir); } catch { return; }
     const present = new Set(names);
     for (const name of names) {
-      if (!name.endsWith('.txt') || present.has(name + '.ingested')) continue;
+      if (!name.endsWith('.txt') || (!opts.includeIngested && present.has(name + '.ingested'))) continue;
       const sid = corpusFileSessionId(name);
       if (readSessionSource(spool, sid)?.source_id) continue;
       if (location === 'spool') {
