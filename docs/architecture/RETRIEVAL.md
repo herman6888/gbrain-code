@@ -345,6 +345,16 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
   budget and 30% of the rows. They render with their date header, oldest first
   after the pages, in place of the facts arm. No model call. Gates:
   `docs/eval/decisions/temporal-fact-reserve/`.
+- **Facts block (default on) and fact source pages (default off), GBRA-205.**
+  Every `query` with a token budget gets the reserve's dated facts, up to 22%
+  of the budget and 40 rows, oldest first ahead of the pages, in place of the
+  facts arm and the temporal reserve. On the sealed held-out set it answered
+  183 of 200 questions against 151 without it (gbrain-evals
+  `docs/benchmarks/2026-10-26-gbrain-8k-conversion.md`).
+  `search.query_facts_block=false` turns it off; a config read error also
+  leaves it off. With `search.fact_source_pages=true`, the conversations the
+  best-matching facts came from join the hits after the top three rows; it
+  stays off (inert on development data).
 
 ### Use-attributed feedback
 

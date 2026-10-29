@@ -766,16 +766,27 @@ export async function runPhaseExtractAtoms(
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
   const managed = await managedAtomSession(engine, sourceId, opts._managedRetry, opts.attempt?.writeWait);
-  if (managed && !opts.dryRun) await resumeManagedGenerationMembers(engine, managed); // GBRA-161 PR 1b: finish what a crash after an activation left
+  // v0.41.2.1: loadConfigWithEngine() so the dream.* DB-plane merge from Phase 1 reaches this phase.
+  let transcriptDirs: { session_corpus_dir?: string; meeting_transcripts_dir?: string } | undefined;
+  try {
+    const cfg = (opts._loadConfig ? await opts._loadConfig() : await (await import('../config.ts')).loadConfigWithEngine(engine)) as unknown as
+      { dream?: { synthesize?: typeof transcriptDirs } } | null;
+    transcriptDirs = cfg?.dream?.synthesize;
+  } catch { transcriptDirs = undefined; }
+  const sourceRouting = emptySessionSourceRouting();
+  if (managed && !opts.dryRun) { // GBRA-161 PR 1b: finish what a crash after an activation left
+    for (const member of await resumeManagedGenerationMembers(engine, managed, { corpusDir: transcriptDirs?.session_corpus_dir ?? null })) {
+      if (member.outcome !== 'held_session_source') continue;
+      const held = sourceRouting.generation_members_held ??= {};
+      held[member.reason!] = (held[member.reason!] ?? 0) + 1;
+    }
+  }
   const atomFiles = await derivedWriteThrough(engine, 'extract_atoms', sourceId, { managed: managed !== null, dryRun: opts.dryRun ?? false });
   const writeRequests: WriteReceipt[] = [];
   const pageAtomTitles = new Map<string, Map<string, string[]>>();
 
   // 1a. Get transcripts (test seam OR production discovery).
-  //     v0.41.2.1: config loader switched to loadConfigWithEngine() so the
-  //     dream.* DB-plane merge from Phase 1 reaches this phase.
   let transcripts: Array<{ filePath: string; content: string; contentHash: string; root?: { path: string; label: string } }> = opts._transcripts ?? [];
-  const sourceRouting = emptySessionSourceRouting();
   // Configured transcript paths are brain-global: every source walks the session
   // corpus and keeps only the files #6268 resolves to it (#7846); the meeting
   // transcripts dir stays default's.
@@ -786,21 +797,13 @@ export async function runPhaseExtractAtoms(
   ) {
     try {
       const { discoverTranscripts } = await import('./transcript-discovery.ts');
-      const { loadConfigWithEngine } = await import('../config.ts');
-      const cfgRaw = opts._loadConfig
-        ? await opts._loadConfig()
-        : await loadConfigWithEngine(engine);
-      const cfg = (cfgRaw ?? {}) as unknown as Record<string, unknown>;
-      const dream = cfg.dream as
-        | { synthesize?: { session_corpus_dir?: string; meeting_transcripts_dir?: string } }
-        | undefined;
-      const corpusDir = dream?.synthesize?.session_corpus_dir;
-      const meetingDir = dream?.synthesize?.meeting_transcripts_dir;
+      const corpusDir = transcriptDirs?.session_corpus_dir;
+      const meetingDir = transcriptDirs?.meeting_transcripts_dir;
       if (corpusDir !== undefined) {
         const discovered = await keepSessionSourceTranscripts(engine, discoverTranscripts({
           corpusDir,
           meetingTranscriptsDir: sourceId === 'default' ? meetingDir : undefined, selfCaptureSessionIds: claudeCliSelfSessionIds(), // #5820, as synthesize
-        }), { corpusDir, sourceId }, sourceRouting);
+        }), { corpusDir, sourceId, readOnly: opts.dryRun }, sourceRouting);
         transcripts = discovered.map((d) => ({
           filePath: d.filePath,
           content: d.content,

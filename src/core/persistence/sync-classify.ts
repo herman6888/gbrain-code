@@ -272,6 +272,8 @@ export interface SyncPassKindInput {
   rescreenDueHold: boolean;
   /** `--full`. */
   full: boolean;
+  /** #7866: a full round asked for without an episode (SyncOpts.fullRound). */
+  fullRound?: boolean;
 }
 
 /** Full rounds run at least this often (v3.2 §2.2, [estimated]). */
@@ -286,7 +288,7 @@ export function syncPassKind(input: SyncPassKindInput): { kind: 'idle' | 'hold_o
   else {
     if (c.target !== input.head) blockers.push('target_moved');
     if (c.parserFp !== input.parserFp || c.pack !== input.pack || c.selectionFp !== input.selectionFp) blockers.push('fingerprint_changed');
-    if (c.passesSinceFull >= SYNC_FULL_ROUND_MAX_PASSES || input.now - c.lastFullAt >= SYNC_FULL_ROUND_MAX_MS) blockers.push('full_round_due');
+    if (input.fullRound || c.passesSinceFull >= SYNC_FULL_ROUND_MAX_PASSES || input.now - c.lastFullAt >= SYNC_FULL_ROUND_MAX_MS) blockers.push('full_round_due');
   }
   if (input.full || input.openEpisode) blockers.push('open_episode');
   if (input.owedTail) blockers.push('owed_tail');

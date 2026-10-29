@@ -14,6 +14,7 @@
  */
 import { opError, type OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import type { ContentRefusal } from '../import-screen.ts';
 import type { WriteRequest } from './model.ts';
 
 /** The values the content's frontmatter gives `visibility` (top-level key, any case), lowercased; empty without a closed block. */
@@ -56,10 +57,34 @@ export function readPrivateRequest(content: string, parse: () => Record<string, 
   return inline || visibilityValues(frontmatter).includes('private') ? { frontmatter } : null;
 }
 
+/** Page privacy reads only this: the stored frontmatter's lowercase `visibility` key holding exactly `private`. */
+const keptPrivate = (published: Record<string, unknown> | null | undefined): boolean => published?.visibility === 'private';
+
+/**
+ * #7848: true when `content` asks for `visibility: private` but `frontmatter`, the frontmatter it would store, does not
+ * carry exactly that. Sync and import hold such a file (`noncanonicalPrivateHold`); doctor reads a stored page with
+ * `content` '' (its frontmatter decides).
+ */
+export function noncanonicalPrivateRequest(content: string, frontmatter: Record<string, unknown> | null | undefined): boolean {
+  return readPrivateRequest(content, () => frontmatter) !== null && !keptPrivate(frontmatter);
+}
+
+/** #7848: the `visibility_noncanonical` hold a file earns on sync and import, or null when `noncanonicalPrivateRequest` is false. */
+export function noncanonicalPrivateHold(content: string, frontmatter: Record<string, unknown> | null | undefined): ContentRefusal | null {
+  if (!noncanonicalPrivateRequest(content, frontmatter)) return null;
+  return { code: 'visibility_noncanonical', message: 'The frontmatter asks for visibility: private in a spelling page privacy does not read (another case, a block scalar, a list, '
+    + 'a flow mapping or a merge key), so the page would be world-readable; it was not imported. Write visibility: private on its own frontmatter line, lowercase, then sync or import the file again.' };
+}
+
 /** Refuses a write that asked for `visibility: private` when `published` (the frontmatter it would store) does not carry exactly that. */
 export function assertPrivateRequestKept(row: Pick<WriteRequest, 'slug' | 'source_id'>, published: Record<string, unknown> | null | undefined): void {
-  if (published?.visibility === 'private') return;
-  throw visibilityNotApplied(row, visibilityValues(published).includes('private') ? 'noncanonical_value' : 'not_kept');
+  if (keptPrivate(published)) return;
+  throw privateRequestRefusal(row, published);
+}
+
+/** #7880: the `visibility_not_applied` refusal of a write whose `published` frontmatter does not keep its private request (an unmanaged capture the screen held `visibility_noncanonical`). */
+export function privateRequestRefusal(row: Pick<WriteRequest, 'slug' | 'source_id'>, published: Record<string, unknown> | null | undefined): OperationError {
+  return visibilityNotApplied(row, visibilityValues(published).includes('private') ? 'noncanonical_value' : 'not_kept');
 }
 
 function visibilityNotApplied(row: Pick<WriteRequest, 'slug' | 'source_id'>, reason: 'noncanonical_value' | 'not_kept'): OperationError {

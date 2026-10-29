@@ -4343,6 +4343,16 @@ More: [docs/guides/write-refusals.md#timeline_rows_would_be_removed](../../docs/
 
 More: [docs/guides/data-ingestion.md#credential-redaction](../../docs/guides/data-ingestion.md#credential-redaction)
 
+### transcript_source_mismatch
+
+<a id="transcript_source_mismatch"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| An explicit atom retry was refused before it started: its transcript does not resolve to the retry's source (a captured session of another source, a session with no known source, or a transcript outside the session corpus on a source other than default). | A batch that failed before session routing may hold another source's session transcript; retrying it would write that session's atoms into the wrong source. Captured sessions resolve through their stamp, frozen record or the registered path containing their cwd, and nothing falls back to the retry's source. | Run the atom drain for the source the session belongs to (corpus_source_other), or map a held session with gbrain sweep --assign-corpus <source> (preview first) and run that source. | agent | `repeat the read that failed` | 1 | no |
+
+Reasons: `corpus_source_other`, `corpus_source_unresolved`, `corpus_legacy_unstamped`, `corpus_stamp_missing`, `corpus_source_missing`, `corpus_source_archived`, `corpus_source_incarnation_changed`, `corpus_path_unresolvable`, `transcript_outside_corpus`.
+
 ### triage_unreliable_backoff
 
 <a id="triage_unreliable_backoff"></a>
@@ -4636,6 +4646,16 @@ More: [docs/ENGINES.md#vector-index-prewarm](../../docs/ENGINES.md#vector-index-
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Source content or relationships changed during verification. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### visibility_noncanonical
+
+<a id="visibility_noncanonical"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A file asks for visibility: private in a spelling page privacy does not read, so sync or import held it instead of storing it world-readable. | Page privacy reads only the exact lowercase key and value visibility: private. A file that spells it another way (Visibility: private, visibility: Private, a block scalar, a list, a flow mapping or a merge key) would be stored as a world page while its author believes it is private (#7848); put_page, edit_page, capture, ingest_capture, brainstorm --save and sources reconcile refuse the same request as visibility_not_applied. | Write visibility: private on its own frontmatter line (lowercase key and value), then commit and sync, or import the file again. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#visibility_noncanonical](../../docs/guides/write-refusals.md#visibility_noncanonical)
 
 ### visibility_not_applied
 

@@ -43,7 +43,7 @@ import { keepFrontmatterMatches } from '../search/frontmatter-where.ts';
 import { WHERE_PARAM, whereOpParam } from './where-param.ts';
 import { searchFilterHint } from '../search/filter-hint.ts';
 import { TargetTrace, diagnoseProbe, diagnoseTrace, probeTarget, type ExplainTargetDiagnosis } from '../search/explain-target.ts';
-import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, pagePlanHits, resolveEvidencePlan, selectLongPages, unsupportedDelivery, withLongPagePolicy, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
+import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, pagePlanHits, queryBudgetUsesAuto, resolveEvidencePlan, selectLongPages, unsupportedDelivery, withLongPagePolicy, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, chunkManifestReads } from '../search/safe-chunks.ts';
@@ -171,12 +171,13 @@ const RETURN_WINDOW_PARAM = {
 /**
  * With a plan, `token_budget` budgets the delivered evidence, so query's
  * chunk-level budget stays off; query's token_budget without a return_unit
- * keeps its chunk-mode meaning. The long-page policy (`search.long_page_unit`)
+ * keeps its chunk-mode meaning unless `search.query_budget_unit` is `auto`
+ * (GBRA-205, default off). The long-page policy (`search.long_page_unit`)
  * is resolved here, at the search/query caller, and nowhere else.
  */
 async function evidencePlanFor(ctx: OperationContext, p: Record<string, unknown>, snippetCap: number, op: 'search' | 'query'): Promise<EvidencePlan | null> {
   return withLongPagePolicy(ctx.engine, await resolveEvidencePlan(ctx.engine, {
-    legacyBudget: op === 'query' && typeof p.token_budget === 'number',
+    legacyBudget: op === 'query' && typeof p.token_budget === 'number' && !await queryBudgetUsesAuto(ctx.engine),
     remote: ctx.remote,
     viaSubagent: ctx.viaSubagent,
     returnUnit: p.return_unit,

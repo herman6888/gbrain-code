@@ -42,7 +42,10 @@
 import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
-import type { SyncOpts } from '../../commands/sync.ts';
+import type { SyncOpts, SyncResult } from '../../commands/sync.ts';
+import type { Action } from '../agent-output.ts';
+import { LockUnavailableError, syncLockId } from '../db-lock.ts';
+import { syncOutcome } from './sync-drain.ts';
 import { loadConfig } from '../config.ts';
 import { resolveSourceId } from '../source-resolver.ts';
 import { opError, OperationError } from '../ops/contract.ts';
@@ -84,10 +87,13 @@ export const CONVERSION_PHASES = ['adopt', 'withhold', 'recheck', 'holds', 'stri
 export type ConversionPhase = typeof CONVERSION_PHASES[number];
 /**
  * Where an apply stands: its phase, the door commits it made (adoption and withholding groups), and the items the phase
- * went through of its total. In a strict pass, `round` is the pass round, `total` the paths its level read until it
- * admits, then its batch, and `scanned` the batch entries settled.
+ * went through of its total. In a strict pass (#7866), `total` is the paths the strict level holds (the planned page count,
+ * set from the recheck's read and kept for the whole pass), `round` the pass round, `candidates` the paths that round
+ * imports or deletes, `batch` of `batches` the import batch it is draining, and `scanned` the candidates of the round
+ * settled so far, across its batches.
  */
-export interface ConversionProgress { phase: ConversionPhase; groups_committed: number; scanned: number; total: number; round?: number; push?: ConversionPush }
+export interface ConversionProgress { phase: ConversionPhase; groups_committed: number; scanned: number; total: number; round?: number; candidates?: number;
+  batch?: number; batches?: number; push?: ConversionPush }
 /**
  * Where the push of the apply's door commits stands: `pushed`; `pending` (the commits are local and the next page write's
  * push-only effect pushes them; `code` and `notice` say why it did not land); `skipped` (`reason`: durability is off,
@@ -508,13 +514,16 @@ export async function applyGitConversion(engine: BrainEngine, sourceId: string, 
     report({ scanned: progress.scanned + 1 });
   }
   const processing = { noEmbed: opts.noEmbed, noExtract: opts.noExtract };
-  const { performManagedSync } = await import('./sync-run.ts');
-  report({ phase: 'strict_pass_1', scanned: 0, total: 0 });
-  passOrThrow(sourceId, await performManagedSync(engine, { sourceId, noPull: true, full: true, ...processing, canonicalOverride: 'git', onProgress: passProgress(report) }));
+  const planned = recheck?.paths.length ?? 0;
+  const pass = (phase: 'strict_pass_1' | 'strict_pass_2') => {
+    report({ phase, scanned: 0, total: planned, round: undefined, candidates: undefined, batch: undefined, batches: undefined });
+    return strictPass(engine, sourceId, { sourceId, noPull: true, fullRound: true, ...processing, ...(phase === 'strict_pass_1' ? { canonicalOverride: 'git' as const } : {}),
+      onProgress: passProgress(report) });
+  };
+  passOrThrow(sourceId, 'strict_pass_1', await pass('strict_pass_1'), progress);
   await faultPoint('conversion:before_flip', { sourceId });
   await recordConversion(engine, sourceId, plan.incarnation, 'git', expect, plan.preview.head);
-  report({ phase: 'strict_pass_2', scanned: 0, total: 0, round: undefined });
-  passOrThrow(sourceId, await performManagedSync(engine, { sourceId, noPull: true, full: true, ...processing, onProgress: passProgress(report) }));
+  passOrThrow(sourceId, 'strict_pass_2', await pass('strict_pass_2'), progress);
   const final = await pushConversion(engine, plan.context);
   const push = final.reason === 'nothing_to_push' ? progress.push! : final;
   report({ push });
@@ -546,11 +555,38 @@ async function pushConversion(engine: BrainEngine, context: ManagedSyncContext):
   }
 }
 
-/** A strict pass's progress events as the apply's: a round's level read sets the total, its batch the scanned entries. */
+/**
+ * #7866: a strict pass of the apply. It drains (sync-drain.ts) under the source's drain lease, as `gbrain sync` does: the
+ * single pass (`performManagedSync`) stops `writer_pending` whenever one of its own writes outlives its 5 s wait, which on a
+ * large source ended the conversion on work it had queued itself. The drain re-enters on that and stops only on its own
+ * rules (no progress, contention, a blocked head), so an unrelated write that never settles still stops the apply.
+ */
+async function strictPass(engine: BrainEngine, sourceId: string, opts: SyncOpts): Promise<SyncResult> {
+  const { withDrainLease, leaseHeldResult, readDrainHolder } = await import('./sync-lease.ts');
+  const { drainManagedSync } = await import('./sync-drain.ts');
+  const { withSyncTail } = await import('./sync-tail.ts');
+  try {
+    const drained = await withDrainLease(engine, sourceId, { holder: { kind: 'cli', id: null }, remote: false },
+      signal => drainManagedSync(engine, signal ? { ...opts, signal } : opts, false));
+    return await withSyncTail(engine, sourceId, drained, { signal: opts.signal });
+  } catch (error) {
+    if (!(error instanceof LockUnavailableError) || error.lockId !== syncLockId(sourceId)) throw error;
+    return leaseHeldResult(sourceId, await readDrainHolder(engine, sourceId).catch(() => null));
+  }
+}
+
+/**
+ * A strict pass's progress events as the apply's (#7866): `total` stays the planned paths; a round names its candidates
+ * and each import batch, and `scanned` counts the round's settled candidates across its batches.
+ */
 function passProgress(report: ConversionReporter): NonNullable<SyncOpts['onProgress']> {
+  let base = 0;
   return event => {
-    if (event.round) report({ round: event.round.round, scanned: 0, total: event.phase === 'managed_sync.round_admit' ? (event.round.imports ?? 0) + (event.round.deletes ?? 0) : event.round.paths });
-    else if (event.bankedFiles !== undefined && event.phase !== 'managed_sync.level_progress' && event.phase !== 'managed_sync.legacy_swept') report({ scanned: event.bankedFiles, ...(event.total !== undefined ? { total: event.total } : {}) });
+    const round = event.round;
+    if (round && event.phase === 'managed_sync.round_level') { base = 0; report({ round: round.round, scanned: 0, candidates: undefined, batch: undefined, batches: undefined }); }
+    else if (round && event.phase === 'managed_sync.round_admit') report({ round: round.round, scanned: 0, candidates: (round.imports ?? 0) + (round.deletes ?? 0) });
+    else if (round && event.phase === 'managed_sync.round_batch') { base = round.base ?? 0; report({ round: round.round, scanned: base, batch: round.batch, batches: round.batches }); }
+    else if (event.bankedFiles !== undefined && event.phase !== 'managed_sync.level_progress' && event.phase !== 'managed_sync.legacy_swept') report({ scanned: base + event.bankedFiles });
   };
 }
 
@@ -569,11 +605,19 @@ async function movedSincePlan(engine: BrainEngine, sourceId: string, compared: M
 }
 
 const PASS_DONE = new Set(['first_sync', 'synced', 'up_to_date']);
-function passOrThrow(sourceId: string, result: { status: string; reason?: string }): void {
-  if (PASS_DONE.has(result.status)) return;
-  throw opError('git_conversion_incomplete', `The strict pass of source ${sourceId} ended ${result.status}${result.reason ? ` (${result.reason})` : ''}, so the conversion stopped there.`,
-    `Rerun gbrain sources canonical ${sourceId} --to git --dry-run once gbrain sync status --source ${sourceId} --json shows the source idle, then apply the new hash.`,
-    { docs: DOCS, detail: result.status });
+/** The operator step every git_conversion_incomplete refusal carries (#7866): preview again, verified by the source's sync status. */
+export function conversionIncompleteFix(sourceId: string): Action {
+  return { argv: ['gbrain', 'sources', 'canonical', sourceId, '--to', 'git', '--dry-run', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+    why: 'Plans the conversion again from where it stopped (the door groups already committed read equal); read-only. Apply its new hash once the source is idle.',
+    verify: { argv: ['gbrain', 'sync', 'status', '--source', sourceId, '--json'] } };
+}
+function passOrThrow(sourceId: string, phase: ConversionPhase, result: SyncResult, at: ConversionProgress): void {
+  if (PASS_DONE.has(result.status) && syncOutcome(result) === 'synced') return;
+  const stop = result.drain?.stop_reason ?? result.reason;
+  const written = result.added + result.modified + result.deleted + result.renamed;
+  throw opError('git_conversion_incomplete', `The ${phase} of source ${sourceId} ended ${result.status}${stop ? ` (${stop})` : ''} after ${written} page write(s), at round ${at.round ?? 0}, ${at.scanned} of ${at.candidates ?? 0} candidate(s) settled of ${at.total} planned path(s); the conversion stopped there${phase === 'strict_pass_1' ? ' and the source is still mixed' : ' and the source stays git-canonical'}.`,
+    `Run gbrain sync status --source ${sourceId} --json until the source is idle, then preview again with gbrain sources canonical ${sourceId} --to git --dry-run and apply the new hash.`,
+    { docs: DOCS, reason: stop ?? result.status, detail: `${result.status}${stop ? `:${stop}` : ''}`, fix: conversionIncompleteFix(sourceId) });
 }
 
 /**
@@ -590,7 +634,7 @@ async function adoptGroups(engine: BrainEngine, plan: GitConversionPlan, preview
     const group = adopt.slice(start, start + CONVERSION_GROUP_MAX);
     const lock = await acquireWorktree(context.binding, LOCK_WAIT_MS, undefined, engine, { yieldLanes: true });
     if (!lock) throw opError('writer_busy', `The writer lock of source ${context.sourceId}'s checkout stayed busy for ${LOCK_WAIT_MS / 1000}s, so group ${start / CONVERSION_GROUP_MAX + 1} was not committed.`,
-      `Run ${previewCommand} again; the groups already committed read equal, so the new plan holds only what is left.`, { retryable: true });
+      `Run ${previewCommand} again; the groups already committed read equal, so the new plan holds only what is left.`, { retryable: true, fix: conversionIncompleteFix(context.sourceId) });
     try {
       const files: Array<{ path: string; bytes: Buffer }> = [];
       for (const item of group) {
@@ -639,7 +683,7 @@ async function withholdGroups(engine: BrainEngine, plan: GitConversionPlan, prev
     const group = committed.slice(start, start + CONVERSION_GROUP_MAX);
     const lock = await acquireWorktree(context.binding, LOCK_WAIT_MS, undefined, engine, { yieldLanes: true });
     if (!lock) throw opError('writer_busy', `The writer lock of source ${context.sourceId}'s checkout stayed busy for ${LOCK_WAIT_MS / 1000}s, so the removal of private pages' files was not committed.`,
-      `Run ${previewCommand} again; the pages already withheld drop out of the plan, so the new plan holds only what is left.`, { retryable: true });
+      `Run ${previewCommand} again; the pages already withheld drop out of the plan, so the new plan holds only what is left.`, { retryable: true, fix: conversionIncompleteFix(context.sourceId) });
     try {
       for (const item of group) {
         const target = join(root, item.path);
