@@ -76,6 +76,7 @@ export interface SyncResult {
   tail?: Omit<import('../core/persistence/sync-tail.ts').SyncTailReport, 'links'>;
   /** #5459 (P4.5): live pages a `--full` tree walk kept because their file is in the working tree and their import provenance is the working tree or unknown. */
   working_tree_kept?: number;
+  /** #8007: pages whose file is gone kept because gbrain.yml's storage section is invalid. */ storage_invalid_kept?: number;
   /**
    * Aggregated alias/undeclared explicit-type warnings (schema.type_warnings,
    * default on) — one entry per distinct non-canonical type this run.
