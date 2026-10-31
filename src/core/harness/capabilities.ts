@@ -379,6 +379,7 @@ export function describeAuthCapabilities(auth: AuthInfo, options: { surface?: st
     surface: options.surface ?? auth.surface ?? 'full',
     source_id: auth.sourceId ?? null,
     federated_read: auth.allowedSources ?? [],
+    private_pages: auth.privatePages ?? { mode: 'none', sources: [] },
     allowed_operations: auth.allowedOperations ?? null,
     ...(options.visibleOperations ? { available_operations: options.visibleOperations } : {}),
     shared_skills: {

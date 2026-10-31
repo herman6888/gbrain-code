@@ -20,7 +20,9 @@
  * behind SearchOpts.excludePrivate; this resolver decides whether to set it.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { BrainEngine } from '../engine.ts';
+import { isValidSourceId } from '../source-id.ts';
 
 export const REMOTE_PRIVATE_PAGES_KEY = 'search.remote_private_pages';
 
@@ -61,6 +63,57 @@ export function privatePagesFilterFragmentFast(pageAlias: string): string {
       ? `\n      AND ${pageAlias}.frontmatter->'access' IS NULL AND ${pageAlias}.frontmatter->'confidentiality' IS NULL` : ''}
       AND ${pageAlias}.type NOT IN ('atom', 'concept', 'event'))
     OR ${privatePagesFilterFragment(pageAlias)})`;
+}
+
+/**
+ * GBRA-156: the sources whose private pages the current remote read may see,
+ * from its grant's `private_pages: granted_sources` axis (the sources the
+ * grant names explicitly; never the no-grant floor, federation, an OAuth
+ * client's bound source or a request's `source_ids`). Set only by MCP
+ * dispatch around a non-mutating operation; empty everywhere else (local
+ * CLI, writes, jobs, cycles), so every other path keeps the rule above.
+ */
+const privateReadable = new AsyncLocalStorage<readonly string[]>();
+
+/** Runs `fn` with `sourceIds` as the private-readable set; an invalid id empties the whole set (fail closed). */
+export function withPrivateReadableSources<T>(sourceIds: readonly string[] | undefined, fn: () => T): T {
+  const ids = sourceIds?.length && sourceIds.every(isValidSourceId) ? Object.freeze([...new Set(sourceIds)]) : Object.freeze([]);
+  return privateReadable.run(ids, fn);
+}
+
+/** The private-readable set of the current read; empty outside a granted remote read. */
+export function privateReadableSources(): readonly string[] {
+  return privateReadable.getStore() ?? [];
+}
+
+/**
+ * `visiblePredicate`, widened to pages (`pageAlias`, a code-provided alias)
+ * whose source is in the current private-readable set. A page carrying the
+ * `pinned_question` marker never widens: pinned questions stay owner-private
+ * (src/core/questions/pages.ts). The ids are embedded as literals: each passed
+ * isValidSourceId, whose alphabet has no quote or backslash.
+ */
+export function orPrivateReadableSource(pageAlias: string, visiblePredicate: string): string {
+  const ids = privateReadableSources();
+  if (ids.length === 0) return visiblePredicate;
+  return `((${pageAlias}.source_id IN (${ids.map(id => `'${id}'`).join(', ')}) AND NOT COALESCE(${pageAlias}.frontmatter ? 'pinned_question', false)) OR ${visiblePredicate})`;
+}
+
+/** privatePagesFilterFragment for a remote read: a page in a private-readable source passes. Read sites only; derived-visibility decisions keep the plain fragment. */
+export function privatePagesFilterForCaller(pageAlias: string): string {
+  return orPrivateReadableSource(pageAlias, privatePagesFilterFragment(pageAlias));
+}
+
+/** privatePagesFilterFragmentFast for a remote read. */
+export function privatePagesFilterFastForCaller(pageAlias: string): string {
+  return orPrivateReadableSource(pageAlias, privatePagesFilterFragmentFast(pageAlias));
+}
+
+/** isPrivatePage for a remote read: false for a page whose `source_id` is private-readable, unless it carries the `pinned_question` marker; a row without `source_id` keeps the plain rule. */
+export function isPrivatePageForCaller(page: { type?: string | null; frontmatter?: unknown; source_id?: string | null }): boolean {
+  if (!isPrivatePage(page)) return false;
+  if (typeof page.frontmatter === 'object' && page.frontmatter !== null && (page.frontmatter as Record<string, unknown>).pinned_question != null) return true;
+  return !(typeof page.source_id === 'string' && privateReadableSources().includes(page.source_id));
 }
 
 /**
@@ -232,6 +285,24 @@ export function privateTimelineEventFilterFragment(timelineAlias: string): strin
   ))`;
 }
 
+/** privateLinkOriginFilterFragment for a remote read: an origin page in a private-readable source passes. */
+export function privateLinkOriginFilterForCaller(linkAlias: string): string {
+  return `(${linkAlias}.origin_page_id IS NULL OR EXISTS (
+    SELECT 1 FROM pages origin_private
+    WHERE origin_private.id = ${linkAlias}.origin_page_id
+      AND ${privatePagesFilterForCaller('origin_private')}
+  ))`;
+}
+
+/** privateTimelineEventFilterFragment for a remote read. */
+export function privateTimelineEventFilterForCaller(timelineAlias: string): string {
+  return `(${timelineAlias}.event_page_id IS NULL OR EXISTS (
+    SELECT 1 FROM pages event_private
+    WHERE event_private.id = ${timelineAlias}.event_page_id
+      AND ${privatePagesFilterForCaller('event_private')}
+  ))`;
+}
+
 /**
  * Fact-row twin for ontology provenance: hide an observation whose provenance
  * page (`source_markdown_slug`, looked up in the fact's own source) is
@@ -294,7 +365,7 @@ export async function findPrivateOnlySlugs(
         ${opts.includeDeleted ? '' : 'AND p.deleted_at IS NULL'}
         ${scopeClause}
       GROUP BY p.slug
-      HAVING bool_and(NOT (${privatePagesFilterFragment('p')}))`,
+      HAVING bool_and(NOT (${privatePagesFilterForCaller('p')}))`,
     params,
   );
   return new Set(rows.map(r => r.slug));

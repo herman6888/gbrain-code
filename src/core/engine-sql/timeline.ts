@@ -18,7 +18,7 @@ import type {
 import { executeRawJsonb } from '../sql-query.ts';
 import { sanitizeForJsonb, buildTimelineRows } from '../batch-rows.ts';
 import { finalizeLastSeen } from '../chronicle/last-seen.ts';
-import { privatePagesFilterFragment, privateTimelineEventFilterFragment } from '../search/private-visibility.ts';
+import { privatePagesFilterForCaller, privateTimelineEventFilterForCaller } from '../search/private-visibility.ts';
 import { PageMissingError } from '../engine-errors.ts';
 import type { SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
@@ -119,8 +119,8 @@ export async function getTimeline(exec: LegacyUnscopedRead, slug: string, opts?:
     const rows = (await exec.run(sqlFragment`
       SELECT te.* FROM ${pagesJoin}
       WHERE p.slug = ${slug} ${sourceCond} ${afterCond} ${beforeCond}
-        ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}
-          AND ${privateTimelineEventFilterFragment('te')}`) : sqlFragment``}${opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('timeline_entries', 'te', opts.eligibility))}` : sqlFragment``}
+        ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterForCaller('p')}
+          AND ${privateTimelineEventFilterForCaller('te')}`) : sqlFragment``}${opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('timeline_entries', 'te', opts.eligibility))}` : sqlFragment``}
       ORDER BY te.date DESC, te.id DESC LIMIT ${limit}`)).rows;
     return rows as unknown as TimelineEntry[];
   }
@@ -134,7 +134,7 @@ export async function getTimeline(exec: LegacyUnscopedRead, slug: string, opts?:
   // ep=true: the ep LEFT JOIN carries the same scope so out-of-scope event fields null out (#2200 origin-join shape).
 function chronicleSourceCond(opts?: PageReadScope, ep = false) {
     const privacy = opts?.excludePrivate && !ep
-      ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateTimelineEventFilterFragment('te')}`)
+      ? trustedSql(`AND ${privatePagesFilterForCaller('p')} AND ${privateTimelineEventFilterForCaller('te')}`)
       : sqlFragment``;
     if (opts?.sourceIds && opts.sourceIds.length > 0)
       return ep ? sqlFragment`AND ep.source_id = ANY(${opts.sourceIds}::text[])` : sqlFragment`AND p.source_id = ANY(${opts.sourceIds}::text[]) ${privacy}`;

@@ -6,6 +6,7 @@ import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
 import { countEvidenceTokens, deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
 import { withFactDateHeaders } from '../search/evidence-date.ts';
+import { fenceTranscriptRows, neutralizeTranscriptRows, quoteFacts } from '../search/transcript-quote.ts';
 import { randomUUID } from 'node:crypto';
 import { readHolders } from './context.ts';
 /**
@@ -26,7 +27,8 @@ import type { Operation, OperationContext } from './contract.ts';
 import type { Notice } from '../agent-output.ts';
 import { OperationError, opError, verbError } from './contract.ts';
 import { invalidParam, paramUse } from './op-fix.ts';
-import { assertExplicitSourceLive, federatedSearchScope, parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
+import { parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
+import { parseSourceIdsParam, requestSourceScope, SOURCE_IDS_PARAM } from './search-source-scope.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags, type HybridSearchOpts } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
@@ -214,9 +216,23 @@ function packingArm<T>(candidates: T[], kept: T[], cost: (item: T) => number) {
 }
 
 /**
+ * #8042: third-party text reaches a remote recall reader quoted (facts as redacted for it), before packing so the budget
+ * prices the fence; a trusted local reader gets both as they are. When the facts' source lookup fails the facts are
+ * withheld (`withheld`), never returned unquoted; the results still come back.
+ */
+async function quoteRecall<F extends { id: number; fact: string; source?: string | null }>(ctx: OperationContext, facts: F[],
+  redacted: ReadonlyArray<Partial<F>>, results: SearchResult[], delivery: DeliveryMeta | undefined) {
+  if (ctx.remote === false) return { facts, withheld: false, results };
+  const recount = delivery ? { count: (text: string) => countEvidenceTokens(text, delivery.tokenizer), delivery } : undefined;
+  const quoted = await quoteFacts(ctx.engine, facts.map((f, i) => ({ ...f, ...redacted[i] }))).catch(() => null);
+  return { facts: quoted ?? [], withheld: quoted === null && facts.length > 0, results: fenceTranscriptRows(neutralizeTranscriptRows(results, delivery?.date_header === true), recount) };
+}
+
+/**
  * A result row's cost in recall's packing. A delivered block costs what delivery counted (its text and title in
  * delivery's tokenizer), so recall never re-cuts a set delivery already fit using a different estimator.
  */
+
 function recallResultCost(delivery: DeliveryMeta | undefined): (r: SearchResult) => number {
   if (!delivery) return resultTokens;
   return r => r.delivered ? r.delivered.tokens + countEvidenceTokens(r.title ?? '', delivery.tokenizer) : resultTokens(r);
@@ -280,6 +296,7 @@ const recall: Operation = {
     budget_tokens: { type: 'number', description: 'Token budget; facts pack first.' },
     budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Default facts_first.', fullSurfaceOnly: true },
     source_id: { type: 'string', description: 'One readable source.' },
+    source_ids: { ...SOURCE_IDS_PARAM, fullSurfaceOnly: true },
     since: { type: 'string', description: 'ISO 8601 or "8 hours ago".' },
     session_id: { type: 'string', description: "This session's facts." },
     include_expired: { type: 'boolean', description: 'Also expired; question ranks them.', fullSurfaceOnly: true },
@@ -313,10 +330,9 @@ const recall: Operation = {
       sourceIdParam = parseSourceIdParam(p.source_id, 'recall');
       // The facts arms widen an unqualified no-grant caller across the transport-computed
       // federated set, exactly like the page-search arm below and every sibling read op.
-      scope = federatedSearchScope(ctx, sourceIdParam);
-      await assertExplicitSourceLive(ctx, sourceIdParam);
+      scope = await requestSourceScope(ctx, sourceIdParam, parseSourceIdsParam(ctx, 'recall', p.source_ids));
     } catch (error) {
-      if (!(error instanceof OperationError) || p.source_id === undefined || p.source_id === null) throw error;
+      if (!(error instanceof OperationError) || ((p.source_id === undefined || p.source_id === null) && (p.source_ids === undefined || p.source_ids === null))) throw error;
       const code = error.code === 'permission_denied' ? 'scope_denied'
         : error.code === 'unknown_source' ? 'not_found'
           : error.code === 'invalid_params' ? 'invalid_params' : null;
@@ -327,7 +343,8 @@ const recall: Operation = {
     }
     // Set-dedupe: a grant carrying a repeated id (or the scalar source again)
     // must not fan out the same source twice into the merge.
-    const factSources: string[] = [...new Set(
+    const readsNoSource = scope.sourceIds?.length === 0;
+    const factSources: string[] = readsNoSource ? [] : [...new Set(
       scope.sourceIds && scope.sourceIds.length > 0 ? scope.sourceIds
         : scope.sourceId ? [scope.sourceId]
           : [sourceId],
@@ -345,7 +362,7 @@ const recall: Operation = {
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
-    type FactRows = Array<Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>[number] & { entity_slugs?: string[]; collapsed_count?: number }>;
+    type FactRows = Array<Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>[number] & { entity_slugs?: string[]; collapsed_count?: number; quoted?: 'transcript' }>;
     type FactRowItem = FactRows[number];
     // Per-arm merge key: each arm's engine query ORDERs by a different column
     // (supersessions by COALESCE(expired_at, valid_until) — #3014, entity by
@@ -403,7 +420,7 @@ const recall: Operation = {
       excludeAuditRows: true, eligibility,
     };
 
-    if (question !== null) {
+    if (question !== null && !readsNoSource) {
       ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
         scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
       ({ rows, ambiguousEntity } = ranking);
@@ -514,13 +531,13 @@ const recall: Operation = {
     let delivery: DeliveryMeta | undefined;
     const evidencePlan = queryText ? await recallEvidencePlan(ctx, p) : null;
     const rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = evidencePlan?.rankCut ? { pageRankCut: evidencePlan.rankCut } : {};
-    if (queryText) {
+    if (queryText && !readsNoSource) {
       // #3242 parity (#4707): the page-search arm widens an unqualified
       // no-grant caller across the transport-computed federated set, exactly
       // like search/query/get_page/list_pages/resolve_slugs. sourceScopeOpts
       // alone pinned this arm to the scalar source, so a `federated: true`
       // source was invisible to recall while visible to every sibling read op.
-      const searchScope = { ...federatedSearchScope(ctx, sourceIdParam), ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
+      const searchScope = { ...scope, ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
       // untrusted callers with the excludePrivate resolved above.
       const keywordOnly = await recallKeywordOnlyReason(ctx);
@@ -547,7 +564,7 @@ const recall: Operation = {
     // Pack what is delivered: results redacted for all; facts for remote only (localVerbatim).
     const view = redactRetrievalOutput([{ facts: rows.map(r => ({ fact: r.fact, context: r.context, source: r.source })), results: searchResults }], {}).results[0];
     searchResults = view.results;
-    if (ctx.remote !== false) rows = rows.map((r, i) => ({ ...r, ...view.facts[i] }));
+    const quoted = await quoteRecall(ctx, rows, view.facts, searchResults, delivery); rows = quoted.facts; searchResults = quoted.results;
 
     let packedFacts = rows;
     let packedResults = searchResults;
@@ -611,13 +628,13 @@ const recall: Operation = {
         // pre-v1 consumers — legacy fields are frozen byte-equal). `provenance`
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
-        provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
+        provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}), ...(r.quoted ? { quoted: r.quoted } : {}),
         ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}), ...(r.collapsed_count ? { collapsed_count: r.collapsed_count } : {}),
         ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
       })), f => f.id)),
       total: packedFacts.length,
       facts_order: ranking ? 'relevance' : 'newest',
-      ...(ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
+      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
       ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}),
       ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
@@ -634,7 +651,7 @@ const recall: Operation = {
               provenance: r.slug,
               // #4830: a row without a source takes the scope's single source; a federated read leaves it absent.
               ...((r.source_id ?? scalarSource) ? { source_id: r.source_id ?? scalarSource } : {}),
-              ...(r.delivered ? { delivered: r.delivered } : {}),
+              ...(r.delivered ? { delivered: r.delivered } : {}), ...(r.quoted ? { quoted: r.quoted } : {}),
               ...(r.relational ? { relational: r.relational } : {}),
               ...(r.trust_tier ? { trust_tier: r.trust_tier, origin: r.origin, ...(r.unconfirmed ? { unconfirmed: true } : {}) } : {}),
             })),
@@ -1236,6 +1253,7 @@ const delta: Operation = {
         fact_id: String(f.id),
         provenance: f.provenance,
         ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
+        ...(f.quoted ? { quoted: f.quoted } : {}),
       })),
       threads,
       text,

@@ -422,6 +422,7 @@ describe('#7619 split rules', () => {
       'src/mcp/surface.ts': 'serve --access/--surface parsers read both forms (#7603); the entry splits the = form first',
       'src/core/direct-pool-profile.ts': 'pool profile reads serve --access in both forms from the raw argv before the gate',
       'src/core/workspace-push.ts': 'git child argv',
+      'src/core/context/session-speaker.ts': 'reads another process\'s argv (claude --print=), not a gbrain flag',
       'src/eval/longmemeval/via-operation.ts': 'git child argv',
     };
     const READER = [/['"`]--[a-z0-9-]+=/, /(?:startsWith|indexOf|===)\(?\s*`\$\{\w+\}=`/, /startsWith\(\w+ \+ '='\)/];

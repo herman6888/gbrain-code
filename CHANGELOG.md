@@ -10,6 +10,271 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.529.0] - 2026-10-31
+
+**A pull request that adds a file to the PGLite snapshot inputs no longer gets stopped at gstack's pregate secrets check by its own workflow cache keys (#8107).**
+
+Pregate read every `key: pglite-snapshot-${{ runner.os }}-${{ hashFiles(...) }}` line in the workflow files as a possible secret (`env.kv`), and a branch can't allowlist findings on its own lines. `.gstack/pregate.json` now allowlists that one finding on those cache-key lines, and only when every `hashFiles` argument is a lowercase path or glob under `src/`, `test/` or `scripts/`. An argument with digits, capitals or a `./` prefix still gets flagged, and so does any recognized credential on the line. A new test checks that every cache-key line in the workflows is covered and that secret-shaped values are not. Nothing changes for users of the gbrain CLI.
+
+## [0.60.528.0] - 2026-10-31
+
+**The test-isolation scan is about 25 times faster on Linux and 12 times faster on macOS, so `bun run verify` and the macOS validation job no longer come close to their per-check caps (#8053, #8099).**
+
+`check:test-isolation` started several processes per test file, about 2,400 in all. It now reads every file in one awk pass with byte-identical output under mawk, gawk and macOS awk. Linux: 123 s to 1.3 s alone (about 5 s inside verify). macOS 26 validation (bash 3.2, a 240 s cap): 134-146 s to 10 s. Neither cap changed.
+
+This release also brings the Ubicloud runner up to date with gstack main, refreshes the shard weights from the median of ten recent runs, fixes CI gate edge cases and removes several flaky tests at their root cause. Nothing changes for users of the gbrain CLI.
+
+### Itemized changes
+
+- `scripts/check-test-isolation.sh`: one awk pass over all files instead of per-file greps (#8053, #8099).
+- `scripts/ubicloud/ubi-runner.sh`, `.gstack/ubicloud.json`, `scripts/ubicloud/reap-expired.ts`: runner synced from gstack main, owner-tagged VM names with an expiry (3 h default), a per-command idle watchdog, a committed remote verify, and `UBI_REAP=0` by default until legacy VMs without a TTL are gone. `scripts/ubicloud/ci-item.sh` now exits with the worst item's exit code, so the committed verify fails when its item fails.
+- `scripts/ci-ubicloud.ts`, `scripts/pregate-remote-gate.sh`: a gate that exits before requesting a VM reports `left=0 vms=0`, so its failure stays a gate result instead of an infrastructure failure.
+- `scripts/ci-reuse.ts`, `scripts/ci-executed-counts.ts`: gate reuse and executed-count edge cases (#8001, #7927). `scripts/ci-mcp-tap.sh`, `scripts/ci-openclaw-mcp.sh`: Tier 2 counts a tool call only when its request was answered (#8011). The crash robot stops a lane after a worker failure (#8062).
+- `scripts/mine-shard-weights.ts`, `scripts/test-weights.json`, `scripts/serial-weights.json`, `scripts/e2e-weights.json`: weights are the per-file median of several runs; a complete re-mine drops files only older runs measured.
+- Tests: flaky tests fixed at the cause (#7922, #7933, #7957, #7964, #8025, trust-release fence); the #7679 refresh matrices 7c and 7d moved to their own files to fit the per-file E2E cap (#8025).
+- `docs/TESTING.md`, `scripts/ubicloud/README.md`, `docs/eval/`: runner TTL and reap defaults; long repro recipes pass `--ttl-hours`.
+
+## [0.60.527.0] - 2026-10-31
+
+**A shared brain can now let each member's agent read that member's own private pages, and nobody else's. Access tokens and OAuth clients have a new private-pages grant: `none` for every token and client, existing or new, so remote reads keep hiding `visibility: private` pages exactly as before until the brain host opts a connection in with `gbrain auth rescope --token <name> --private-pages granted-sources` (or `--client <client_id>`). An opted-in connection then reads private pages only in the sources its grant names.**
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A member's agent reads a private page in its own granted source | hidden from every remote caller unless the operator set `search.remote_private_pages`, which shows private pages to every remote caller | still hidden by default; after `--private-pages granted-sources` it is visible to that token or client in `search`, `query`, `recall`, `entity`, `get_page`, `list_pages`, `get_chunks`, `get_versions`, `get_timeline`, links, backlinks, the graph and `resolve_slugs` |
+| Which sources count | | a token's `--sources` list, or a client's write source plus its read sources. A token with no source grant (the `default` floor), federated sources the grant does not name, a client's bound source and a request's `source_id` / `source_ids` never add one |
+| What the grant opens in a named source | | `visibility: private` pages, pages with a privacy alias (`access`, `confidentiality`), and atoms, concepts and events derived from private or unknown origins. Pinned questions stay owner-only |
+| Another member's private page, or a bot token granted every source without the setting | hidden | hidden |
+| `context_pack`, `delta` and writes | world-only | world-only, for every caller |
+| `--private-pages none` | | hides them again on the next request |
+| `gbrain auth list`, `auth clients`, `auth rescope`, the `serve --http` dashboard API key list and `whoami` | | show the setting; `gbrain auth list --json` is new |
+| A harness answering a channel or other shared session | every successful tool call could carry `_meta.brain_hot_memory`, which holds recent facts from the connection's write source (a member token's own private source), and there was no way to turn it off for one call | `_meta.hot_memory: "off"`, on the request or inside the arguments, drops the block for that call. Without it, nothing changes. `docs/protocol/MCP_META_CHANNELS.md`, `docs/mcp/README.md` and the install guide now say when the block appears and which source it reads |
+
+### What to watch for after you upgrade
+
+- Nothing changes until you opt a token or client in, and nothing is rewritten on upgrade. A schema migration adds a `private_pages` column (default `none`) to `access_tokens` and `oauth_clients`; the legacy permissions JSON is untouched, so an older binary keeps hiding private pages.
+- Opt in only connections that act for one person or one team. A bot answering several members over one token sees the private pages of every source that token is granted; give each member their own token ([lay out sources by who may read them](docs/guides/multi-source-brains.md#lay-out-sources-by-who-may-read-them)).
+- `search.remote_private_pages` and `GBRAIN_REMOTE_PRIVATE_PAGES` keep their meaning: when set, every remote caller sees private pages, whatever this grant says.
+- A local CLI call reads private pages as before.
+
+## [0.60.526.0] - 2026-10-31
+
+**The #7679 refresh state-matrix tests (7c and 7d) now run in about half the time, with every assertion kept (#7782).**
+
+These two tests built a fresh brain for each cell, and on a 2-CPU machine that cost added up to minutes per run. Now 7c hands a cell that ends settled to the next cell instead of building a new brain, and 7d builds one brain per kind of interrupted refresh and runs every action on it in turn, with each action undoing its seam. Nothing changes for users.
+
+### Itemized changes
+
+- Tests: 7c and 7d in `test/persistence-worktree-refresh.test.ts` share fixtures across their cells, and every assertion is kept (#7782).
+
+## [0.60.525.0] - 2026-10-31
+
+**Sync no longer moves its checkpoint past a file it never imported (#8071), a source refresh can no longer hold its lock for over an hour (#8072), and dream-cycle pages written into a Git checkout are now committed instead of left untracked (#8073).**
+
+If a file was edited while a sync pass was importing it, sync could record the newer bytes as imported while the page kept the older text. Once you committed the edit, sync treated the file as settled and the page stayed stale with no hold. Sync now records only the bytes the page actually holds, so the committed edit is imported on the next pass. To find pages already left behind, `gbrain doctor` adds `sync_rows_behind_checkpoint`: on each managed source's owner host it compares every live Markdown page with the file committed at the source's checkpoint, skips paths sync would not import, and reports `unknown` rather than ok when it runs out of time. `gbrain repair rows-behind --source <id>` previews the fix, and `--apply --expect <hash>` re-imports the committed file through the normal import (or opens the hold sync would have opened). Pages with no import record change only with `--include-ambiguous`, pages with uncommitted edits are listed and left alone, and nothing runs on upgrade. Repo-less brains are not affected.
+
+A refresh's member syncs now run under a deadline, `sources.refresh_sync_budget_ms` (default 5 minutes). A member that commits nothing in that time is reported `refresh_sync_timeout` with the write it waited on, a member that made progress is reported deferred, and the refresh always finishes and releases its lock, so later ticks run again. A Markdown file over 24 MiB that sync had to read whole to refuse (held `file_too_large`, for example for a facts fence) is no longer re-read on every tick; it is checked again only when it changes, after `gbrain sources retry-held <source>`, or after a gbrain upgrade.
+
+Atom and concept write-through and the reverse-written synthesis, patterns and cycle-summary pages now commit each batch through the checkout's commit door, naming only the files they wrote. Before, those files stayed untracked and made the scheduled pull skip every run. A refused commit rolls the batch's files back and the phase reports `write_through_failed`; files a crash left uncommitted are picked up by the next commit, and your own untracked files are never touched. Repo-less sources, non-Git folders, `storage.db_only` paths and gitignored paths behave as before.
+
+### Itemized changes
+
+- `src/core/persistence/sync-prepare.ts`: the import record names the working file only when it holds the imported bytes (line endings aside).
+- `src/core/persistence/rows-behind.ts` (new), `src/commands/doctor/checks/rows-behind.ts` (new), `src/core/repair/rows-behind.ts` (new): the `sync_rows_behind_checkpoint` doctor check and the explicit-only `rows-behind` repair kind; doctor and export goldens updated.
+- `src/core/persistence/worktree-refresh.ts`, `src/commands/sources-refresh.ts`: member syncs run through the governed drain under `sources.refresh_sync_budget_ms`; new code `refresh_sync_timeout`.
+- `src/core/persistence/sync-screen.ts`, `src/core/persistence/sync-holds.ts`: a held over-limit file is re-screened only when it changes.
+- `src/core/cycle/derived-write-through.ts`, `src/core/cycle/extract-atoms.ts`, `src/core/cycle/synthesize-concepts.ts`, `src/core/write-through.ts`: one commit per batch, rollback on a refused commit, pending write-through ledger.
+- `docs/guides/repair.md`, `docs/guides/live-sync.md`, `docs/guides/error-codes.md`, `docs/guides/write-refusals.md`: the new check, repair kind, budget and code.
+
+## [0.60.524.0] - 2026-10-31
+
+**A brain moved or restored under a new host identity no longer leaves writes pending forever behind an `--accept-pending` exit 0, and a keyless re-init from a cold `GBRAIN_HOME` no longer switches an embedded brain to keyword-only (GBRA-248 W0).**
+
+A managed source publishes only through the host that owns its checkout. When a brain moved to another machine, was restored from a backup, or ran in a container that restarted with a fresh `GBRAIN_HOME`, the new process got a new host identity, its writes queued for the old owner, and nothing said that owner was gone: the receipt read as an ordinary pending write and `--accept-pending` (or `GBRAIN_ACCEPT_PENDING=1`) exited 0, so hooks and cron treated writes that would never publish as saved. A pending receipt now flags that owner (reason `owner_unavailable` with a new `diagnostic.owner` block holding its last activity, which older clients ignore; doctor names the host) when it runs no live consumer and has been quiet for more than 24 hours, or at once on PGLite when this process holds the database file under another identity. `--accept-pending` does not cover such a write: `gbrain put`, `gbrain call`, brainstorm saves and `gbrain trust accept --all` exit 10 and say why. A consumer's clean stop now stamps the worktrees its host owns, so a stopped owner is not mistaken for a gone one. The owner host never sees the block, a repo-less (database-only) write never names an owner, and nothing claims or transfers ownership. New doctor check `owner_host_stale` lists the waiting writes with the owner and the read-only next step.
+
+`gbrain init` with no provider key in reach falls back to keyless. Run from a cold home against a database that already had an embedding model and vectors, it wrote `embedding_disabled: true` into the new config file, and the brain stopped embedding. When that fallback was implicit and the database holds vectors, init now keeps the database's stored model and width in the config file instead and prints the key to set and `gbrain embed --stale`. A fresh keyless install, a keyless brain with no vectors, an explicit `--no-embedding` and a database that already disables embeddings behave as before. New doctor check `embedding_plane_disagreement` finds brains the old behavior left in that state and prints the `gbrain init --force --embedding-model …` enable for the same model.
+
+### Itemized changes
+
+- `src/core/persistence/owner-activity.ts` (new): owner liveness, last activity and the stale rule; `journal.ts` attaches it to receipt facts inside budgets the reads already have, cancelled past them; `health.ts`, `types.ts`, `params.ts`: the optional `diagnostic.owner` receipt field.
+- `src/core/persistence/service.ts`: a write left pending carries its owner facts into the receipt.
+- `src/core/persistence/write-wait.ts`: `acceptPendingCovers`; `writeErrorExitCode` keeps exit 10 when `diagnostic.owner` is present; `persistence-delegate.ts`, `brainstorm.ts`, `trust.ts` follow it.
+- `src/core/persistence/consumer-heartbeat.ts`: a clean stop stamps `persistence_worktrees.heartbeat_at` for the host's worktrees.
+- `src/commands/init-embedding-plane.ts` (new), `src/commands/init.ts`: the implicit-keyless marker and the kept database identity on both engines.
+- Doctor: `owner_host_stale` (`checks/owner-host-stale.ts`) and `embedding_plane_disagreement` (`checks/embedding-plane.ts`); `core/readiness.ts` exports `enableArgv`.
+- Docs: troubleshooting entries `#owner-host-stale` (with the stable `GBRAIN_HOME` guidance for servers and containers) and `#embedding-plane-disagreement`; the exit-status tables.
+- Tests: `test/owner-stale-moved-brain.test.ts` (real CLI, PGLite), `test/persistence-owner-activity.test.ts` (PGLite and Postgres), `test/init-cold-home-embedding.test.ts` (PGLite and Postgres), `test/doctor-owner-host-stale.test.ts`, `test/doctor-embedding-plane-disagreement.test.ts`; doctor goldens.
+
+## [0.60.523.0] - 2026-10-31
+
+**A launcher can now tell gbrain that a session's user turns are an agent's, not yours, so orchestrator worker briefs stop landing in your brain as your own preferences (#8064). Codex sessions that open and close with no prompt no longer raise a week-long parser_drift alert (#8016), and task notifications and agent-team messages no longer get brain context injected as if you typed them (#8028).**
+
+Set `GBRAIN_SESSION_AGENT=<label>` on a worker's process and the capture hooks still save the session, but every claim from its user turns is saved as `attributed_to: other` with the context note `speaker: agent <label>, not the owner`, and the extractor is told the agent wrote them. `GBRAIN_SESSION_AGENT=off` saves nothing from the session; `owner` declares the turns yours. With the variable unset, a headless `claude -p` or `codex exec` session whose ancestors include another claude or codex process is detected and saved as agent `agent-launched`'s. The marker is a `<session>.speaker.json` sidecar written before any corpus file; if it can't be written, nothing is saved. Agent claims are never consolidated into your own takes. The marker covers the Claude Code and Codex hook lanes; the OpenClaw context-engine lane and dream synthesis don't read it yet.
+
+For facts already saved as yours, `gbrain repair agent-session-facts` previews a re-attribution: facts from sessions with a speaker marker, sessions you name (`--session`), or sessions whose working directory sits under a path you name (`--cwd`, for an orchestrator's worktree root). Sessions whose first turn opens with the same 160 characters as at least 3 other sessions (a template brief) are listed as ambiguous and change only with `--include-ambiguous`. `--apply --expect <hash> --yes` sets exactly the previewed facts to `attributed_to: other` with the speaker note and retires the self takes consolidate built only from them. It deletes nothing, keeps a claim you also made in another session, and works on repo-less brains. `gbrain doctor` (`agent_session_facts`) counts the candidates, and `doctor --remediation-plan` lists the preview command.
+
+### Itemized changes
+
+- `src/core/context/session-speaker.ts` (new): the env contract, ancestry detection, the speaker sidecar.
+- `src/commands/hook.ts`: compact, stop and session-end record the speaker before banking and skip banking on `off`; user-prompt skips `<task-notification` and `<teammate-message` prompts (`harness_prompt`); a session-end that saves turns clears its own lane's `parser_drift` status file, which now records the lane.
+- `src/core/facts/backstop.ts`, `src/core/facts/extract.ts`, `src/core/facts/speaker-context.ts`, `src/core/persistence/facts-maintenance.ts`: the `speaker` pipeline option.
+- `src/core/context/checkpoint-harvest.ts`, `src/core/sweep.ts`: the capture lanes pass the corpus file's speaker.
+- `src/core/transcripts/codex-hook-lane.ts`: `event_msg` / `thread_settings_applied` counts as a recognized record.
+- `src/core/repair/agent-session-facts.ts` (new), `src/commands/doctor/checks/agent-session-facts.ts` (new): the explicit-only repair kind, its `managed_maintenance_agent_session_facts` request and the `agent_session_facts` doctor check; registry, preview-approval and doctor goldens updated.
+- `docs/guides/ambient-writeback.md`: "Sessions an agent launches"; `docs/guides/repair.md`: the new kind.
+
+## [0.60.522.0] - 2026-10-31
+
+**`recall` and `list_pages` now honour `source_ids`, the per-request source narrowing `search` and `query` already had. Before, both ops ignored the list, so an agent narrowing each call to the asking member's sources still got other sources' facts and pages from these two tools.** A harness-evals run measured it: under per-request narrowing, `recall` returned a page from outside the requester's sources twice and `list_pages` 57 pages over three calls. Each id is checked like an explicit `source_id`, so the list can only narrow what the token's grant allows; an id outside a remote grant refuses the whole request, and an empty intersection with `source_id` returns nothing with an `empty_retrieval` notice. A call that names its own sources also no longer gets `_meta.brain_hot_memory`, which reads the connection's source.
+
+### Itemized changes
+
+- `src/core/ops/facts.ts`: `recall` takes `source_ids` and reads every fact arm and its page-search arm inside the narrowed scope.
+- `src/core/ops/pages.ts`: `list_pages` takes `source_ids`.
+- `src/core/ops/search-source-scope.ts`: the shared parser and resolver serve all four ops.
+- `src/mcp/dispatch.ts`: the hot-memory hook is skipped when a call names `source_ids` or a `source_id` other than the connection's.
+- `docs/protocol/MCP_META_CHANNELS.md`: says when `brain_hot_memory` is left out.
+- `docs/guides/multi-source-brains.md`: "Narrow one request with `source_ids`" names all four ops.
+- `test/recall-list-pages-source-ids.test.ts` (PGLite and Postgres): each recall arm and list_pages under narrowing, the grant refusal, the empty intersection, and starter-surface dispatch with the hot-memory hook; red on the old code.
+
+## [0.60.521.0] - 2026-10-30
+
+**Text from other people's messages is now quoted on every read that hands it to an agent, not only in `search` results for imported conversations: Slack, iMessage, email and meeting pages, facts saved from them, and `get_page`, `fetch`, `recall`, `delta`, hot memory and `think` all mark it as source material.**
+
+Since the previous release, `search`, `query` and `assemble_evidence` returned a `conversation` page's text inside a quote fence, a line naming the page as source material, not instructions, then a code fence the text cannot close, with tool calls in it summarized. Other chat page types and the facts extracted from them came back unmarked, and so did every other read. Now one rule decides what is quoted: a page of type `conversation`, `meeting`, `slack`, `slack-dm-day`, `slack-thread`, `email`, `email-digest`, `imessage`, `imessage-daily`, `transcript` or `chat`, and a fact taken from one: saved by the conversation-facts extractor (`cli:extract-conversation-facts`), extracted by the facts backstop or `extract_facts` from such a page (a synced or written Slack, email or meeting page), or held in such a page's facts fence. Which facts count is decided when they are read, from what each fact already records about its source page: the page holding it, the derivation edge the backstop has written since it started recording them, or, for older backstop facts and brains rebuilt from git, the page its `source_session` names (`sync:<slug>`, `put_page:<slug>`). This release adds no new write and changes nothing stored. Each comes back with `quoted: "transcript"` and its text fenced; a fact's marker names it as `fact <id>`.
+
+- `search`, `query` and `assemble_evidence` quote these rows for every caller, as they already did for `conversation` pages, including fact rows and `saved_facts`. If the lookup that decides which facts to quote fails, `saved_facts` is left out with the degraded stage `saved_facts_withheld` (and remote `recall` returns no facts, with `facts_degraded.reason: "saved_facts_withheld"`) rather than returning them unquoted.
+- Over MCP, `recall` quotes its `results` and the `fact` of each quoted fact, and `delta` facts and `_meta.brain_hot_memory` do the same.
+- Over MCP, `get_page` on such a page fences `compiled_truth`, `timeline`, `content` and every window's text, and `fetch` fences `text` (`metadata.quoted`). Tool calls are not summarized there, so the text inside the fence is the stored text: `edit_page` with `old_text` copied from inside still matches, and `put_page` given the fenced `content` back removes exactly those fences before it writes, so a read, edit and write round trip keeps the page as it was apart from your edit. Only a page whose stored or new type is quoted loses a fence naming it on such a write; a note whose own text looks like one keeps it, and a retried write that changes the type replays as the same request.
+- Over MCP, `get_page` with `known_as_of` and `get_versions` with `include_body` (and the `known_as_of` `diff`) fence the same pages' recorded bodies and mark them `quoted`.
+- `think` quotes these pages in the evidence it gives the model, on every run.
+- The local CLI (`gbrain get`, `gbrain put`, `gbrain recall`, `gbrain delta`) reads and writes as before. A thin-client `gbrain get` (and `--json`) prints the fences the host returns, except when it pages a large chat page window by window: it removes them and checks the page against the host's size and checksum. Stored pages, facts, ranking and scores are unchanged. `search_exact` and `get_chunks` still return text as stored.
+
+### What changes for you
+
+- An agent connected over MCP sees chat and email text, and facts saved from it, as quoted source material wherever it reads them.
+- A script reading `get_page` or `recall` over MCP sees the marker line and fence around such text; read `quoted` to tell. Writing `content` back with `put_page` needs no change.
+- Upgrade thin clients with the host: a thin client older than this release cannot page a large chat page from a host on it, because the fenced windows no longer match the reported checksum.
+- Not covered yet: `get_timeline` rows and `get_page include_timeline_entries` rows, the `context_pack` and `delta` text renderers, `search_exact` and `get_chunks`.
+
+## [0.60.520.0] - 2026-10-30
+
+**The Heavy nightly's Codex plugin door test checks the plugin's MCP surface against `PLUGIN_SURFACE`, the surface the plugin's `mcp.json` actually serves, instead of `REGISTRATION_SURFACE`. A unit-shard listing that dies on a signal now names the signal instead of an empty error.**
+
+The plugin ships `serve --surface PLUGIN_SURFACE --source-guard`, so the door test's launcher-args check and its `tools/list` oracle compared against the wrong surface and failed every Heavy nightly (#6049).
+
+`unitShards()` in `scripts/sharding.ts` threw `scripts/test-shard.sh --dry-run-list 26 28 failed: ` with nothing after it when a plain `bun test test/scripts/unit-shard-budget.test.ts` hit Bun's 5 s default test timeout. Bun ignores bunfig's `timeout`, the 28 listings take about 5.5 s, and the timeout kills the child, so the status is null and stderr is empty. The error now reads `killed by SIGTERM`. CI was never affected: `scripts/test-shard.sh` passes `--timeout=60000`.
+
+### Itemized changes
+
+- `test/e2e/codex-plugin-install-real.serial.test.ts`: assert `PLUGIN_SURFACE`.
+- `scripts/sharding.ts`: `unitShards()` names the signal that killed a listing.
+- `test/scripts/sharding.test.ts`: a listing killed by SIGTERM reports it.
+
+## [0.60.519.0] - 2026-10-30
+
+**The unit lane now runs 28 shards instead of 22, on shard weights refreshed from the Oct 30 nightly. With the fresh weights, every one of 22 shards would be planned at 624.4 s against the 600 s per-shard budget; at 28 shards the largest is 490.6 s.**
+
+`UNIT_SHARDS` is 28. `test.yml`'s unit matrix and `e2e.yml`'s `coverage-full-unit` matrix follow it, and `test/scripts/unit-shard-budget.test.ts` pins both, still two shards per runner. The unit, serial and E2E weight maps and their metadata come from the Oct 30 nightly mining run, and weight coverage is clean: 4366 unit, 446 serial and 832 E2E files, with no dead entries.
+
+### Itemized changes
+
+- `scripts/sharding.ts`: `UNIT_SHARDS = 28`.
+- `.github/workflows/test.yml`, `.github/workflows/e2e.yml`: the unit and coverage-full-unit matrices and their `--manifest-expect` lists.
+- `scripts/test-weights.json`, `scripts/serial-weights.json`, `scripts/e2e-weights.json` and their `.metadata.json`: the Oct 30 refresh.
+- `docs/TESTING.md`: the shard counts.
+
+## [0.60.518.0] - 2026-10-30
+
+**`gbrain repair secret-spans --source <id> --slug <slug>...` replaces the credentials the secret scanner finds in the database copies of the pages you name with `<REDACTED:rule>` markers and changes nothing else, held pages included (GST-327).**
+
+A credential pasted into a page lives in more places than its file: the page row, timeline, fact and take rows, link contexts, raw connector data and the chunks built from them. A page that sync holds keeps its stale database copy, so redacting the file never reaches it. The new kind reads every one of those copies, plans the spans with the scanner's own rules (`--rules`, default every named credential rule; the two broad heuristics only when named) and proves the result equals the scanner's redaction byte for byte before it writes. The preview shows counts per rule and each changed field's old and new SHA-256, never a value; `--apply --expect <hash>` rewrites exactly that set, one transaction per page, keeps trust tiers, rebuilds the chunks from the redacted body and re-scans what it wrote. It writes no file and no commit, leaves sync holds as they are, keeps page versions as history, and works the same on a repo-less brain. Explicit-only and trusted-local-CLI-only.
+
+### Itemized changes
+
+- `src/core/secret-spans.ts` (new): the pure span planner and proof (`redactFields`, `resolveSecretRules`, `residualMatches`); `src/core/secret-scan.ts` exports `NAMED_SECRET_RULES`.
+- `src/core/repair/secret-spans.ts` (new): the repair kind (preview, preview-bound apply, per-page receipt, re-scan), registered explicit-only and preview-bound; `gbrain repair` accepts `--rules` and `--slug` for it.
+- `docs/guides/repair.md`: the `secret-spans` section and table row.
+- Tests: `test/secret-spans.test.ts`, `test/repair-secret-spans.test.ts` (repo-less and managed brains, segmented embed_skip page, held page, impossible timeline date, `preview_changed`, remote refusal); the explicit-kind lists in `test/repair-explicit-only.test.ts` and `test/fix-wave-5-integration.test.ts` name the new kind.
+
+## [0.60.517.0] - 2026-10-30
+
+**The crash robot now runs two writer runs at a time, with the same runs, faults and manifest order as before, so its Postgres and PGLite cells finish well inside their ceilings again (#8036). reconcile-owner-journey is split by transport, so neither half hits the serial lane's 300 s per-file cap on a slow runner (#8040).**
+
+Every crash-robot run was executing one after another, so a slow runner plus the 2-minute `pooler_disconnect` lease wait pushed the Postgres cell to 899 s against its 880 s ceiling. The driver now draws every random schedule, fault point and seed in the old order before anything runs, executes `ROBOT_CONCURRENCY` (2) runs at a time, each with its own scratch root, database and `GBRAIN_HOME`, and reports results in the original manifest order. Ceilings and seeds are unchanged. Measured locally, Postgres went from 423 s to 258 s and PGLite from 699 s to 418 s, with identical manifests and no violations; on CI, Postgres took 369 s against its 880 s ceiling and PGLite 531 s against 1200 s.
+
+`test/reconcile-owner-journey.serial.test.ts` ran its stdio and http owner journeys in one file. On a runner pinned to one core it was killed at 301 s. Each transport is now its own file over a shared helper (`test/helpers/reconcile-owner-journey.ts`), with the same four cases and assertions; on that probe the two halves passed in 214 s and 193 s.
+
+The pregate allowlists `pii.phone.e164` only for `scripts/*-weights.metadata.json`, whose run IDs look like phone numbers, and two comments about the 22-minute unit job timeout no longer carry a bare shard-count literal.
+
+### Itemized changes
+
+- `scripts/persistence/robot-driver.ts`: a `pooled` runner at `ROBOT_CONCURRENCY`, results stored by item index, and a per-run `HOME`/`GBRAIN_HOME`. `test/persistence-crash-robot.test.ts` checks that concurrent runs cover exactly the serial runs, faults and manifest order.
+- `test/helpers/reconcile-owner-journey.ts`, `test/reconcile-owner-journey.serial.test.ts`, `test/reconcile-owner-journey-http.serial.test.ts`; `scripts/serial-files.tsv` gains the http file.
+- `.gstack/pregate.json`: the scoped allowlist. `scripts/test-shard.sh`, `test/scripts/unit-shard-budget.test.ts`: comment wording.
+- Docs: `scripts/persistence/README.md`, `docs/ci-event-parity.md`.
+
+## [0.60.516.0] - 2026-10-30
+
+**The crash robot no longer reports a lost write when the user's own Git commit in a sync race never landed (#8043).**
+
+In `sync_and_connector_race_direct_write`, the robot plays a user who edits a page file, commits it and syncs while an agent edits the same page. It ran `git add` and `git commit` without reading their exit status. On one Postgres run (seed 5105, `sync:mid_checkpoint#13`) the commit did not land, but the sync ran anyway and was counted as a committed write of the user's marker. Sync correctly imports nothing from an uncommitted file, so the group check called the page lost. The same missing commit explains why the agent's edit was refused as an "uncoordinated local edit" rather than `pending_import` (what it gets whenever the commit lands, 150 of 150 local Postgres runs), and why the planned fault was never reached: there were no imports to checkpoint. CI kept no git stderr, so this is the best-supported cause, not a proven one: a sync that advanced its cursor without importing the page would leave the same signature. The fix tells the two apart, so a `lost_write` here from now on is a real sync bug.
+
+The user step now checks that its commit landed. It retries while another Git process holds a lock, for up to 20 s. Any other failure throws with git's stderr and fails the run as a harness error, so the model never sees a sync whose commit does not exist. A failing run's trace now also shows each sync's `fromCommit`, `toCommit`, `added` and `modified`, so a recurrence is diagnosable from the manifest. The reference model is unchanged.
+
+### Itemized changes
+
+- `scripts/persistence/ops.ts`: `userEdit` writes and commits the user's files and verifies them clean at HEAD (retrying a held lock, throwing otherwise) before `executeOp`'s try, and `runSync` now only runs `sync_brain`; a sync observation keeps the commits and counts the sync reported. `scripts/persistence/crash-robot.ts`: the failure trace prints that for sync and connector ops.
+- Tests: `test/persistence-crash-robot.test.ts`, under "a sync op whose user commit did not land". The forced probe holds `index.lock` across the user's commit: on the previous code it reproduces the CI result (sy2 `uncoordinated local edit`, sy1 committed, `lost_write`), and now the commit lands and the race leaves no violation. A refused commit fails the op instead of reporting it committed, and a committed sync whose marker the page lacks is still `lost_write`.
+
+## [0.60.515.0] - 2026-10-30
+
+**gbrain's Ubicloud VMs now carry a TTL in gstack's name grammar, `ubirun-<owner>-<epoch>-<suffix>-t<H>`. gstack's runner reaps any TTL-less `ubirun-*` VM of the caller's owner after 4 h; under the new names, a gbrain gate, soak or dev VM lives until its own TTL ends and no longer.**
+
+`ci:ubicloud` names gate VMs `…-ciNN<hex>-t2` by default. `--ttl-hours` takes 1 to 999; `0` (no expiry) is gone. `ubi-runner.sh up` and `run` give every name they generate a TTL: `--ttl-hours H`, or `-t999` (about 41 days) without it. The production soak defaults to `-t15`. The operator reaper (`scripts/ubicloud/reap-expired.ts`) reads `-t<H>` names from every owner and tool as expiring H hours after creation. It keeps reaping the older `-x<expiry>` names until none are left, and still never selects a TTL-less, untagged-legacy or foreign name. Follow-ups are in #8050.
+
+### Itemized changes
+
+- `scripts/ubicloud/reap-expired.ts`: a `-t<H>` grammar ahead of the `-x<expiry>` one; `expiringVmName` writes `-t<H>`, 1 to 999.
+- `scripts/ubicloud/ubi-runner.sh`: `new_name` always appends `-t<H>` (default 999); `--ttl-hours` accepts 1 to 999.
+- `scripts/ci-ubicloud.ts`: `--ttl-hours` accepts 1 to 999; batch log names drop the TTL suffix.
+- `scripts/bench/production-soak/ubicloud.sh`: default TTL 15.
+- Docs: `scripts/ubicloud/README.md`, the runner header and usage text, `docs/TESTING.md`.
+
+## [0.60.514.0] - 2026-10-30
+
+**A correctly redacted transcript page now clears `gbrain transcripts audit-secrets`, and a missing-file page under a `db_only` directory is kept rather than deleted in two more cases: on company-brain sources (#8014), and whenever gbrain.yml's storage lines cannot be fully resolved (#8015).**
+
+The importer writes redaction markers like `login **<REDACTED:user-pattern>**`, and the `labeled_credential` detector read the marker itself as a typed user/password pair, so a page that was already redacted failed every audit (#7997). The labeled patterns now scan a copy of the line in which a standalone marker is rewritten to an inert token of the same length, while the reported value is still cut from the original line. A password written beside a marker, or glued straight onto one, is still found. The audit detector version moves to 3, so `gbrain doctor` asks for one fresh audit.
+
+Company-brain sources skipped the `db_only` check when retiring pages whose files are not in the approved manifest, so they deleted live database-only pages (#8014). Their deletes now go through the same verdict as other managed sources, read from gbrain.yml at the approved commit, never from the working tree.
+
+The `db_only` resolver now fails closed (#8015). A `db_only` or `supabase_only` line whose inline value the parser refuses (a missing comma, a nested list, an unquoted value with spaces) counts as unresolved even when another key resolved, and a held page is released only when its verdict is known. A deprecated `supabase_only` list ignored beside canonical keys now holds only the pages under its directories that `db_only` does not cover, `gbrain storage status` names those directories, and the deprecation warnings no longer point to a `gbrain doctor --fix` rename that does not exist.
+
+Contributed by @Masashi-Ono0611 (#7997 report and #7999).
+
+### Itemized changes
+
+- `src/core/secret-scan-labeled.ts`, `src/core/secret-scan.ts`: `neutralizeRedactionMarkers` and a per-pattern scan subject; `src/core/transcripts/secret-audit.ts`: audit version 3.
+- `src/core/persistence/sync-discovery.ts`: company delete entries carry their slug and go through `retireDbOnlyDeletes` with a verdict from the approved commit's gbrain.yml.
+- `src/core/storage-config.ts`: `dbOnlyVerdict`, a stricter flow-list parser, `ignored_db_only` in place of a boolean, and the stricter unresolved rule; `src/core/persistence/sync-pass.ts` and `source-storage.ts` use the per-slug verdict; `src/commands/storage.ts` warns about ignored directories.
+- Docs: `docs/storage-tiering.md`, `docs/guides/repair.md`. Three `BEHAVIOR_CHANGES` rows.
+- Tests: `test/secret-scan-redaction-marker-7997.test.ts` (new), `test/company-brain-runtime.test.ts`, `test/sync-storage-invalid-8007.test.ts`, `test/storage-config.test.ts`, `test/storage-pglite.test.ts`.
+
+## [0.60.513.0] - 2026-10-30
+
+**A search on a brain with many pages still waiting for a projection no longer spends seconds in the readiness check: the probe stops after it finds a pending page instead of also walking every unsealed page for the `by_design` answer it then discards (#8000).**
+
+The readiness probe that runs before every uncached `search` and `query` asked two questions in one statement: is any page in scope pending, and are the only unsealed pages protected ones (`by_design`). The second answer is only used when nothing is pending, but Postgres evaluated both. While pages are pending there is usually no protected page for its `LIMIT 1` to stop at, so it read every unsealed page on every cold call. On a synthetic brain with 235k pending image pages that was most of the `meta_readiness` stage. The statement now evaluates `by_design` only when nothing is pending, still in one round trip, and returns the same `ready`, `projection_pending` and `by_design` answers.
+
+Contributed by @Masashi-Ono0611, whose #8004 proposed the short-circuit.
+
+### Itemized changes
+
+- `src/core/search/projection-readiness.ts`: the probe reads `pending` in a materialized CTE and `by_design` inside `CASE WHEN pending THEN false ELSE … END`, so its subplan never runs while pages are pending.
+- Tests: `test/projection-readiness.test.ts` (PGLite) and `test/e2e/projection-readiness-plan-postgres.test.ts` (Postgres) pin the plan: with pending pages only one scan of `pages` executes.
+
 ## [0.60.512.0] - 2026-10-30
 
 **After an automatic self-upgrade, the autopilot now restarts the serve your installed service runs when it is still on the old build, so one auto-upgrade no longer leaves two builds running until someone runs `gbrain upgrade --restart-only` by hand.**

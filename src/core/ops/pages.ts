@@ -16,7 +16,7 @@ import type { Page } from '../types.ts';
 import { decodeDeepResearchAnchor, decodeDeepResearchId, deepResearchPageUrl } from '../deep-research-id.ts';
 import { PageSnapshotAmbiguousError, type PageSnapshot } from '../page-state/types.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { pageTrustForRead, projectFetchText, projectGetPage, readQuarantined } from './get-page-projection.ts';
+import { pageTrustForRead, projectFetchText, projectGetPage, quotesBody, readQuarantined } from './get-page-projection.ts';
 import { assertLargePageAdmission } from '../persistence/large-page-guard.ts';
 import { assertFullReadFits, bodyBytes, fetchWindowResult, GET_PAGE_BODY_PARAMS, inlineBodyBytes, parseBodyRequest, readPartialBody, segmentedFullReadError, authorizedReadPin } from './get-page-body.ts';
 import { isSegmentedPage } from '../page-body/page-shape.ts';
@@ -28,12 +28,13 @@ import { sanitizeRemoteBody } from '../remote-body.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { fileHeldField, readHeldPages } from '../persistence/held-reads.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
-import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs } from '../search/private-visibility.ts';
+import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs, isPrivatePageForCaller } from '../search/private-visibility.ts';
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
 import { listPagesPagination, listingTruncatedNotice } from './list-pages-pagination.ts';
 import { OperationError, opError, type Operation, type OperationContext } from './contract.ts';
 import { invalidParam, readFix } from './op-fix.ts';
 import { WHERE_PARAM, whereOpParam } from './where-param.ts';
+import { parseSourceIdsParam, requestSourceScope, SOURCE_IDS_PARAM } from './search-source-scope.ts';
 import { isDatetimeInputError } from '../utils.ts';
 import { rethrowNamingRevisionSource } from './put-page-revision-source.ts';
 import {
@@ -143,7 +144,7 @@ const get_page: Operation = {
 
     let snapshot = await ctx.engine.readPageSnapshot(slug, { includeDeleted, excludePrivate, ...sourceOpts, resolveAlias: true });
     let page = snapshot?.page ?? null;
-    if (page && excludePrivate && isPrivatePage(page)) page = null;
+    if (page && excludePrivate && isPrivatePageForCaller(page)) page = null;
     let resolved_slug: string | undefined = page && page.slug !== slug ? page.slug : undefined;
 
     if (!page && fuzzy) {
@@ -157,7 +158,7 @@ const get_page: Operation = {
           ? await tx.readPageSnapshot(candidates[0], { includeDeleted, excludePrivate, ...sourceOpts }) : null };
       });
       if (fallback.candidates.length > 1) return { error: 'ambiguous_slug', candidates: fallback.candidates };
-      if (fallback.snapshot && !(excludePrivate && isPrivatePage(fallback.snapshot.page))) {
+      if (fallback.snapshot && !(excludePrivate && isPrivatePageForCaller(fallback.snapshot.page))) {
         snapshot = fallback.snapshot;
         page = snapshot.page;
         resolved_slug = page.slug;
@@ -232,14 +233,14 @@ const get_page: Operation = {
     const whole = bodyRequest.mode === 'full'
       || (bodyRequest.mode === 'auto' && !segmented && bodyBytes(visibleBody) <= await inlineBodyBytes(ctx));
     if (!whole) {
-      const partial = await readPartialBody(ctx, { page, visibleBody, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, pin,
+      const partial = await readPartialBody(ctx, { page, visibleBody, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, pin, quote: quotesBody(ctx, page),
         extras: { ...(quarantined ? { quarantined } : {}), ...(timelineEntries ? { timeline_entries: timelineEntries } : {}), ...fileHeld,
           ...(resolved_slug ? { resolved_slug } : {}), ...(content_flag ? { content_flag } : {}) } }, bodyRequest);
       return lineGrammar ? { ...partial, line_grammar: lineGrammar } : partial;
     }
     if (segmented) throw await segmentedFullReadError(ctx, page, bodyRequest, { ...pin, revision: snapshot!.revision });
     const projected = projectGetPage(visibleBody, {
-      revision: snapshot!.revision, tags, includeContent, contentOnly, resolved_slug, content_flag, quarantined, trust: readable.trust,
+      revision: snapshot!.revision, tags, includeContent, contentOnly, resolved_slug, content_flag, quarantined, trust: readable.trust, quote: quotesBody(ctx, page),
       ...(timelineEntries ? { timeline_entries: timelineEntries } : {}),
       ...fileHeld,
     });
@@ -296,7 +297,7 @@ const fetch_page: Operation = {
       throw error;
     }
     const page = snapshot?.page;
-    if (!page || (excludePrivate && isPrivatePage(page))) throw missing();
+    if (!page || (excludePrivate && isPrivatePageForCaller(page))) throw missing();
     const readable = await pageTrustForRead(ctx, page, p.min_trust); // #5575: below the read floor reads as missing
     if (!readable) throw missing();
     bumpLastRetrievedAt(ctx.engine, [page.id]);
@@ -307,12 +308,12 @@ const fetch_page: Operation = {
     const quarantined = readQuarantined(ctx, page, p.include_quarantined === true);
     if (!quarantined?.body_omitted && (segmented || (ctx.remote !== false && bodyBytes(visibleBody) > await inlineBodyBytes(ctx)))) {
       const pin = authorizedReadPin(ctx, page, snapshot!.bodyGeneration, p.min_trust, missing);
-      return fetchWindowResult(ctx, { page, visibleBody: visibleBody as Page, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, extras: {}, pin }, id, identity ? decodeDeepResearchAnchor(id) : null);
+      return fetchWindowResult(ctx, { page, visibleBody: visibleBody as Page, revision: snapshot!.revision, tags, quarantined, trust: readable.trust, extras: {}, pin, quote: quotesBody(ctx, page) }, id, identity ? decodeDeepResearchAnchor(id) : null);
     }
     return {
       id: identity ? id : page.slug,
       title: page.title,
-      text: projectFetchText(visibleBody as Page, tags, quarantined, readable.trust),
+      text: projectFetchText(visibleBody as Page, tags, quarantined, readable.trust, quotesBody(ctx, page)),
       // Pages have no public http home; a stable brain-local URI satisfies
       // the contract's citation slot without inventing a fake web URL.
       url: deepResearchPageUrl(page.source_id, page.slug),
@@ -321,7 +322,7 @@ const fetch_page: Operation = {
         type: page.type,
         source_id: page.source_id,
         updated_at: page.updated_at,
-        tags, ...(quarantined ? { quarantined } : {}), ...readable.trust,
+        tags, ...(quarantined ? { quarantined } : {}), ...readable.trust, ...(quotesBody(ctx, page) ? { quoted: 'transcript' } : {}),
       },
     };
   },
@@ -536,6 +537,7 @@ const list_pages: Operation = {
       type: 'string',
       description: "One source, or '__all__'.",
     },
+    source_ids: { ...SOURCE_IDS_PARAM, fullSurfaceOnly: true },
   },
   handler: async (ctx, p) => {
     // Whitelist the sort enum at the handler before passing to the engine.
@@ -568,9 +570,7 @@ const list_pages: Operation = {
     // them silently return [] or, for the CLI's `--source-id ""`, widen to
     // every source.
     const sourceIdParam = parseSourceIdParam(p.source_id, 'list_pages', { allowAll: true });
-    const scope = federatedSearchScope(ctx, sourceIdParam);
-    // #4620: an explicit source_id must name a live source (after the grant check).
-    await assertExplicitSourceLive(ctx, sourceIdParam);
+    const scope = await requestSourceScope(ctx, sourceIdParam, parseSourceIdsParam(ctx, 'list_pages', p.source_ids));
     // #4352 remediation: untrusted listing never enumerates
     // `visibility: private` pages (slugs + titles are the leak surface here).
     // Composes with the #4400 per-call source_id and the v0.34.1 grant scope
@@ -608,7 +608,7 @@ const list_pages: Operation = {
     // list and never learns rows were dropped, and with the default
     // updated_desc sort the dropped rows are always the OLDEST, i.e. exactly
     // the pages such consumers exist to find.
-    const rows = await ctx.engine.listPages({
+    const rows = scope.sourceIds?.length === 0 ? [] : await ctx.engine.listPages({
       type: p.type as any,
       tag: p.tag as string,
       limit: limit + 1,

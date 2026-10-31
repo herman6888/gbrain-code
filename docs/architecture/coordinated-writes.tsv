@@ -33,6 +33,7 @@ src/core/repair/facts-rehome.ts	apply	1	facts_lane	Moves database-only facts of 
 src/core/repair/frontmatter-keys.ts	apply	1	projection	Strips parser-reserved keys older imports stored in pages.frontmatter; they never render, so the stripped row equals what the file parses to.
 src/core/repair/ontology-facts.ts	apply	1	facts_lane	Restores ontology-observation facts; G4 (GBRA-190) gives ontology observations a page home.
 src/core/repair/segmented-mirror.ts	admitRemirror	1	door	Admits a journaled re-mirror request and queues its withdrawal-mirror and Git effects, which rewrite the canonical file.
+src/core/repair/secret-spans.ts	apply	1	projection	Replaces only the credential spans the secret scanner finds in a named page's stored rows with <REDACTED:rule> markers and adds no content; it is the database side of a redaction whose file edit goes through Git, and chunks are rebuilt from the redacted body.
 src/core/repair/timeline-comments.ts	cleanRows	1	projection	Rewrites or deletes timeline rows still carrying markup so they equal the tuple the parser reads from the page text.
 src/core/shared-skills/publication.ts	validate	1	operational	Prunes retained shared-skill revisions inside a skill-bundle publication; retention bookkeeping, the bundle files are published separately.
 src/core/shared-skills/retention.ts	pruneSharedSkillRevisions	1	operational	Prunes retained shared-skill revisions past the retention limits; retention bookkeeping, not memory content.

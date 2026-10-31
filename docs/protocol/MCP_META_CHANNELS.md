@@ -42,7 +42,9 @@ in front of the model without a separate call.
 
 **When it is sent.** On a successful tool call over stdio (`gbrain serve`) and
 over HTTP (`gbrain serve --http`), except `recall`, `extract_facts` and
-`forget_fact`, which already return facts. It is absent when there is nothing
+`forget_fact`, which already return facts, and except a call that names its own
+sources (a non-empty `source_ids`, or a `source_id` other than the connection's
+source), so a narrowed request never carries another source's facts. It is absent when there is nothing
 to send, and it is best-effort: if it cannot be built, the key is left out and
 the tool call still succeeds. It cannot be turned off per call.
 
@@ -107,3 +109,44 @@ lives in JSON BODIES of eval commands — a third, unrelated plane. Ambient
 recall rides content/hooks, not `_meta`.
 
 Adding a key: register it in the table above, one producer, additive-forever.
+
+## `brain_hot_memory`: when it appears and how to turn it off
+
+**When.** On every successful tool call over stdio (`gbrain serve`) and
+HTTP (`gbrain serve --http`), except `recall`, `extract_facts` and
+`forget_fact`, whenever the source below has facts to show. Errors never carry
+it.
+
+**Which facts.** Up to 10 recent facts from one source: the connection's own
+source. Over HTTP that is the token's or client's write source (the first id
+of its source grant), or `default` with no grant. Over stdio it is the source
+the server resolved (`GBRAIN_SOURCE`, `.gbrain-source`, then `default`). With
+a `_meta.session_id`, the block holds that session's facts. Without one, or
+when the session has none, it holds the source's facts from the last 24 hours,
+unless the host set `context.hot_memory.session_only`. A remote caller only
+ever gets facts with `visibility: world`, and never a fact from a source its
+grant can't read.
+
+**Why it matters for shared sessions.** A member token whose first source is
+that member's private source (`private-alice-example`) gets that member's own
+recent facts in the block, such as preferences from a direct message. That is
+correct for the member's own session. A harness that answers several people in
+a channel and puts the block into the model's context can carry those facts
+into a reply everyone reads.
+
+**Turning it off for one call.** Set `_meta.hot_memory: "off"` on the request,
+beside `arguments` (MCP request-level `_meta`), or inside the tool arguments
+(`{"query": "…", "_meta": {"hot_memory": "off"}}`) for clients that fold
+`_meta` into the arguments. That call's response carries no
+`brain_hot_memory`. Other values, or no value, leave the block as it is. A
+channel or shared session should send it on every call. A member's own
+direct-message session can leave it out. The opt-out removes only this
+`_meta` block: a `context_pack` or `delta` body still lists the connection's
+recent facts, so a channel harness should not call them with a member token
+whose first source is that member's private source.
+
+```json
+{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+ "params": {"name": "search", "arguments": {"query": "standup time"},
+            "_meta": {"session_id": "channel-a", "hot_memory": "off"}}}
+```

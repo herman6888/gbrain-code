@@ -970,6 +970,12 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // column order; no blob statement or index reads it, and the DCR insert falls
   // back to the unmarked insert while the column is missing.
   'oauth_clients.registered_via',
+  // GBRA-156 access_tokens/oauth_clients.private_pages (migration
+  // principal_private_pages): migration-only like min_trust, so fresh and
+  // upgraded catalogs keep the same column order; no blob statement or index
+  // reads them, and grant reads treat a missing column as 'none'.
+  'access_tokens.private_pages',
+  'oauth_clients.private_pages',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so

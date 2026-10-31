@@ -52,7 +52,7 @@ import { degradedLastError, isEngineDegraded } from '../core/degraded-marker.ts'
 import { classifyPgAccessError } from '../core/pg-access-classify.ts';
 import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
 import { redactUrlsInText } from '../core/url-redact.ts';
-import { authSourcesFromGrant } from '../core/grants/model.ts';
+import { authSourcesFromGrant, privatePagesAuth } from '../core/grants/model.ts';
 import { resolveTokenGrant, touchTokenLastUsed } from '../core/grants/legacy-token.ts';
 import { storedMinTrust } from '../core/trust/tier.ts';
 export { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
@@ -288,7 +288,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         scopes: grant.scopes,
         sourceId,
         ...(grant.allowedOperations === null ? {} : { allowedOperations: grant.allowedOperations }),
-        ...(allowedSources ? { allowedSources } : {}),
+        ...(allowedSources ? { allowedSources } : {}), ...privatePagesAuth(grant),
         ...(storedMinTrust(row.min_trust) ? { minTrust: storedMinTrust(row.min_trust) } : {}),
       };
       return {

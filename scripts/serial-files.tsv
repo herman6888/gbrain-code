@@ -334,6 +334,7 @@ test/query-op-limit-mode-4356.serial.test.ts	R2	R2: mock.module(../src/core/sear
 test/readiness-embedding-enablement.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll
 test/recall-budget-policy-thin.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
 test/recall-thin-client-fallback.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
+test/reconcile-owner-journey-http.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll; R4: PGLiteEngine without an afterAll disconnect; binds local servers/ports
 test/reconcile-owner-journey.serial.test.ts	global-state	global-state: R3: constructs PGLiteEngine outside beforeAll; R4: PGLiteEngine without an afterAll disconnect; binds local servers/ports
 test/reindex-code-max-cost.serial.test.ts	global-state	global-state: configureGateway changes the process-wide AI gateway
 test/reindex-code-model-source.serial.test.ts	R1	R1: mutates process.env (GBRAIN_NO_CODE_MODEL_NUDGE)
@@ -447,3 +448,4 @@ test/sync-pass-phase-lines-7243.serial.test.ts	global-state	global-state: proces
 test/embed-once-per-content-version.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests (the forced probes hold the first provider call at the transport) and pageEmbeddingLeaseProbe (the module-wide lease contention hook); withEnv scopes GBRAIN_HOME
 test/page-embedding-lease.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests (each case swaps the embed transport, one to a refusing provider) and pageEmbeddingLeaseProbe (the module-wide lease contention hook); withEnv scopes GBRAIN_HOME
 test/migrate-search-path-best-effort.serial.test.ts	R2	R2: mock.module(v277 migration module) replaces modules for every file in the process
+test/agent-session-speaker-8064.serial.test.ts	R1	R1: sets GBRAIN_HOME and GBRAIN_SESSION_AGENT and clears DATABASE_URL and the hook env on process.env

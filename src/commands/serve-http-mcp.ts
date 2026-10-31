@@ -22,7 +22,7 @@ import { createSkillResources } from '../mcp/skill-resources.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
-import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, type ToolResult } from '../mcp/dispatch.ts';
+import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, hotMemoryOffIn, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
 import { STATUS_TOOL_NAME, statusModeOf, statusToolResult } from '../mcp/status-mode.ts';
 import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
@@ -405,6 +405,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
       transport: 'http',
       inboundFrameBytes: DEFAULT_MAX_REQUEST_BODY_SIZE,
       ...(sessionId ? { sessionId } : {}),
+      ...(hotMemoryOffIn(request.params) ? { hotMemoryOff: true } : {}),
       takesHoldersAllowList: tokenAllowList,
       sourceId: tokenSourceId,
       ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),

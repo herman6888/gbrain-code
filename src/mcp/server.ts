@@ -453,7 +453,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
   server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(() => withRequestConfigSnapshot(engine, async () => {
     const { name, arguments: params } = request.params;
-    const [{ dispatchToolCall, dispatchRenderContext, requestMetaSessionId }, { getBrainHotMemoryMeta }] = await gate.awaitCall();
+    const [{ dispatchToolCall, dispatchRenderContext, requestMetaSessionId, hotMemoryOffIn }, { getBrainHotMemoryMeta }] = await gate.awaitCall();
     // F4: status-only mode answers gbrain_status and refuses the rest until
     // a tool call's re-probe finds the brain openable (then dispatch normally).
     if (statusMode) {
@@ -493,7 +493,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       // stdio stays remote/untrusted.
       transport: 'stdio', inboundFrameBytes: MCP_STDIO_MAX_MESSAGE_BYTES,
       takesHoldersAllowList: ['world'],
-      ...(sessionId ? { sessionId } : {}),
+      ...(sessionId ? { sessionId } : {}), ...(hotMemoryOffIn(request.params) ? { hotMemoryOff: true } : {}),
       sourceId: sourceScope.sourceId,
       ...(sourceScope.localFederatedSourceIds
         ? { localFederatedSourceIds: sourceScope.localFederatedSourceIds }

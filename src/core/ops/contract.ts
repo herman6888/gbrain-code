@@ -409,6 +409,13 @@ export interface AuthInfo {
    * but never lower it. Undefined = no floor (or a brain before the column).
    */
   minTrust?: TrustTier;
+  /**
+   * GBRA-156: the grant's `private_pages: granted_sources` axis, set at token
+   * verification from the live row. `sources` are the sources the grant names
+   * explicitly (`privatePagesSources`); MCP dispatch makes them the
+   * private-readable set of each non-mutating call. Undefined = `none`.
+   */
+  privatePages?: { mode: 'granted_sources'; sources: string[] };
   /** Current transport ceiling applied to this authenticated request. */
   effectiveSurface?: 'verbs' | 'starter' | 'full';
   /**

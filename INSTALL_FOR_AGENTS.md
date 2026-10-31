@@ -644,6 +644,24 @@ to register. Ask the user which integrations they want (email, calendar, voice, 
 
 Verify: `gbrain integrations doctor` (after at least one is configured)
 
+### A bot that answers in channels or shared sessions
+
+Every successful MCP tool call except `recall`, `extract_facts` and
+`forget_fact` can carry a `_meta.brain_hot_memory` block. It holds recent
+facts from the connection's own source: a token's write source (the first id
+of its source grant), a stdio server's resolved source, or `default`. For a
+member token whose first source is that member's private source, the block
+holds that member's own facts, such as preferences from a direct message. The
+grant still holds: the block never draws on a source the connection can't
+read. But the harness may put it into its context, so the member's facts can
+reach a channel reply other people read.
+
+A harness running a channel or other shared session should set
+`_meta.hot_memory: "off"` on each tool call, on the MCP request beside
+`arguments` or inside the arguments. That call then carries no block. One
+member's direct-message session can keep it. Details:
+[MCP_META_CHANNELS.md](docs/protocol/MCP_META_CHANNELS.md#brain_hot_memory-when-it-appears-and-how-to-turn-it-off).
+
 ## Step 9: Verify
 
 For memory-only installs, run the install check from the
