@@ -29,12 +29,13 @@ import { persistenceFileHash, type PreparedMutation } from './coordinator.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { databaseOnlyPublication, prepareFileTarget, preparePrivateTransition } from './page-prepare.ts';
 import { sourceCanonicalGit } from './git-door.ts';
-import { isPrivatePage } from '../search/private-visibility.ts';
+import { isPrivacyPrivatePage } from '../search/private-visibility.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { LockStolenError, syncLockId, withRefreshingLock, type DbLockHandle } from '../db-lock.ts';
 import { ownedGoogleReceipts, prepareGoogleReceiptPatch, type GoogleReceipts } from './connector-google-receipts.ts';
 import { connectorCheckpointKeys, connectorIdentity, connectorIdentityMatches, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
+import { connectorDirKey } from './connector-kinds.ts';
 import { CONNECTOR_PURGED_LIMIT, readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorPurgedItem, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
 import { connectorConfigDigest } from './connector-account-mismatch.ts';
 import { connectorAccountChanged, connectorFenceHint, docsAnchor, receiptDeliveredHint, CONNECTOR_INTENT_OUTDATED_OLD_HOST, CONNECTOR_INTENT_OUTDATED_PRE_UPGRADE } from './connector-errors.ts';
@@ -193,7 +194,7 @@ function connectorBindingRoot(sourceId: string, source: ConnectorSource, binding
   assertPhysicalRoot(localPath, { worktreeId: binding.worktree_id, coordinationPath });
   try {
     const root = realpathSync(join(localPath, binding.relative_path));
-    const configured = source.config[source.config.kind === 'google' ? 'g_dir' : 'gh_dir'];
+    const configured = source.config[connectorDirKey(source.config.kind as ConnectorKind)];
     const directory = typeof configured === 'string' && configured.length > 0 ? configured : sourcePath;
     if (!containsPath(localPath, root) || !statSync(root).isDirectory() || realpathSync(sourcePath) !== root || realpathSync(directory) !== root) {
       throw new Error('root mismatch');
@@ -249,7 +250,7 @@ async function connectorFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 
 async function strictPrivateImport(engine: BrainEngine, sourceId: string, content: string, sourcePath: string, snapshot: PageSnapshot | null): Promise<boolean> {
   const parsed = parseMarkdown(content, sourcePath);
   const frontmatter = snapshot?.page.frontmatter.visibility === 'private' ? { ...parsed.frontmatter, visibility: 'private' } : parsed.frontmatter;
-  return isPrivatePage({ type: parsed.type, frontmatter }) && await sourceCanonicalGit(engine, sourceId);
+  return isPrivacyPrivatePage({ type: parsed.type, frontmatter }) && await sourceCanonicalGit(engine, sourceId);
 }
 
 /**
@@ -261,7 +262,7 @@ async function strictPrivateImport(engine: BrainEngine, sourceId: string, conten
 async function strictPrivateFile(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, content: string, sourcePath: string,
   snapshot: PageSnapshot | null): Promise<{ file: PreparedMutation['file'] } | null> {
   if (!await strictPrivateImport(engine, row.source_id, content, sourcePath, snapshot)) return null;
-  const turning = snapshot && !snapshot.page.deleted_at && !isPrivatePage({ type: snapshot.page.type, frontmatter: snapshot.page.frontmatter });
+  const turning = snapshot && !snapshot.page.deleted_at && !isPrivacyPrivatePage({ type: snapshot.page.type, frontmatter: snapshot.page.frontmatter });
   return { file: turning ? await preparePrivateTransition(engine, row, snapshot) : undefined };
 }
 
@@ -410,6 +411,8 @@ export class ManagedConnectorSync {
     this.checkpointKeys = connectorCheckpointKeys(sourceId, source.incarnation, identity);
     this.checkpointKey = this.checkpointKeys[0]!;
   }
+  /** Whether this run publishes canonical files (a bound worktree root) rather than database-only rows. */
+  get bound(): boolean { return this.canonicalRoot !== null; }
   async assertLease(engine: BrainEngine): Promise<void> {
     if (!this.lease) return;
     this.lease.signal.throwIfAborted();
