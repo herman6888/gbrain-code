@@ -66,8 +66,13 @@ CHECKS=(
   # ── heavy (longest-first) ──
   "typecheck"
   "check:admin-build"
+  # #7126: src/admin-embedded.ts embeds exactly the committed admin/dist; the
+  # admin build above writes a throwaway directory, so it cannot catch this.
+  "check:admin-embedded"
   "check:wasm"
   "check:pglite-embedded"
+  # gbrain's bundled skills survive bun build --compile byte-identical (GBRA-194).
+  "check:skills-embedded"
   # HEIC + AVIF decoders survive bun build --compile (~0.6s: the smoketest
   # bundles a handful of modules, not the CLI).
   "check:image-decoders"

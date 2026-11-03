@@ -247,7 +247,7 @@ const LINK_ALL_SOURCES_PARAM = {
   description: 'Same as source_id __all__.',
   fullSurfaceOnly: true,
 } as const;
-const LINK_LIMIT_PARAM = { type: 'number', description: `Rows per call (default ${LINK_READ_DEFAULT_LIMIT}, max ${LINK_READ_MAX_LIMIT}).` } as const;
+const LINK_LIMIT_PARAM = { type: 'number', minimum: 1, description: `Rows per call (default ${LINK_READ_DEFAULT_LIMIT}, max ${LINK_READ_MAX_LIMIT}).` } as const;
 const LINK_CURSOR_PARAM = { type: 'string', description: 'next_cursor from the previous call (same filters).' } as const;
 const LINK_ALL_PARAM = { type: 'boolean', description: 'Local CLI only: every row, paging internally.', fullSurfaceOnly: true } as const;
 
@@ -449,7 +449,7 @@ const get_backlinks: Operation = {
     all_sources: LINK_ALL_SOURCES_PARAM,
     type: { type: 'string', description: 'Referrer type.' },
     group: { type: 'string', enum: ['page'], description: 'Per page.' },
-    limit: { type: 'number', description: `≤${LINK_READ_MAX_LIMIT}` },
+    limit: { type: 'number', minimum: 1, description: `≤${LINK_READ_MAX_LIMIT}` },
     cursor: { type: 'string', description: 'Next.' },
     all: LINK_ALL_PARAM,
   },
@@ -573,6 +573,7 @@ const traverse_graph: Operation = {
     direction: { type: 'string', description: 'Remote default both.', enum: ['in', 'out', 'both'] },
     hops: {
       type: 'array',
+      minItems: 1,
       description: '≤3 typed hops, e.g. [{"link_type":"founded","toward":"subject"}]; toward: object|subject.',
       items: { type: 'object', properties: { link_type: { type: 'string' }, toward: { type: 'string' } } },
       fullSurfaceOnly: true,
@@ -623,12 +624,17 @@ const traverse_graph: Operation = {
     const { paths, truncated } = await ctx.engine.traversePathsDetailed(slug, { depth, linkType, direction, ...scope });
     // Cap hit: the walk stopped at TRAVERSE_WALK_ROW_CAP visited pages or the
     // output at TRAVERSE_PATH_ROW_CAP edge rows, dropping the deepest edges.
-    // stderr-only so the GraphPath[] wire shape stays unchanged.
+    // The stderr note stays; a per-call notice (GBRA-200 stamps it) tells MCP callers, so the GraphPath[] wire shape stays unchanged.
     if (truncated) {
       ctx.logger.warn(
         `[gbrain] traverse_graph output truncated (walk cap ${TRAVERSE_WALK_ROW_CAP} pages, ${TRAVERSE_PATH_ROW_CAP} edge rows; shallowest first). ` +
         `Lower depth or narrow with link_type/direction for a complete walk.`,
       );
+      const why = `The walk stopped at its cap (${TRAVERSE_WALK_ROW_CAP} pages, ${TRAVERSE_PATH_ROW_CAP} edge rows; shallowest first), so deeper edges are missing; walk one level shallower or narrow with link_type or direction for a complete walk.`;
+      const fix = depth > 1 ? readFix(why, {
+        mcp: { tool: 'traverse_graph', arguments: { slug, depth: depth - 1, ...(linkType ? { link_type: linkType } : {}), direction } },
+      }) : undefined;
+      ctx.emitNotice?.({ code: 'graph_walk_truncated', kind: 'degraded', why, ...(fix ? { fix } : {}) });
     }
     return paths;
   },
@@ -648,7 +654,7 @@ const wanted_pages: Operation = {
   description: 'Link targets that have no page yet, most-referenced first: each was written as a link but its page does not exist, so no edge exists. Use to find entities worth a page (enrichment) or typo links to fix. The edge appears on its own once the page is created.',
   params: {
     source_id: { type: 'string', description: 'Only targets referenced from this source (must be inside your source grant).' },
-    limit: { type: 'number', description: `Rows per page (default ${WANTED_DEFAULT_LIMIT}, max ${WANTED_MAX_LIMIT}).` },
+    limit: { type: 'number', minimum: 1, description: `Rows per page (default ${WANTED_DEFAULT_LIMIT}, max ${WANTED_MAX_LIMIT}).` },
     offset: { type: 'number', description: 'Skip the first N targets.' },
     count_only: { type: 'boolean', description: 'Return the total with no rows.' },
   },
