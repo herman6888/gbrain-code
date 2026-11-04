@@ -60,6 +60,7 @@ import { searchVectorFallback, searchWithoutEmbeddings } from './hybrid/keyword-
 import { factEmbeddingDisabled } from '../embedding-disabled.ts';
 import { capSessionPool, collapsePool, expandStructuralNeighbors, finalizeHybridResults, fuseArms, rerankAndPin, sizeReturnPool } from './hybrid/rank.ts';
 import { type StageTimer, UNTIMED } from './stage-timings.ts';
+import { needsEngineScope, withEngineScope } from '../engine-scope.ts';
 
 export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
@@ -1088,6 +1089,7 @@ export async function hybridSearch(
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
   if (opts?.types?.length === 0) return [];
+  if (needsEngineScope(engine)) return withEngineScope(engine, () => hybridSearch(engine, query, opts));
   const timer = opts?._timings ?? UNTIMED;
   if (opts?.type || opts?.types?.length) {
     const { expandEngineTypeFilters } = await import('../schema-pack/query-types.ts');
@@ -1265,6 +1267,7 @@ export async function hybridSearchCached(
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
   if (opts?.types?.length === 0) return [];
+  if (needsEngineScope(engine)) return withEngineScope(engine, () => hybridSearchCached(engine, query, opts));
   const auditT0 = Date.now();
   // Fork extension (Jev-Mem borrowing Phase 3): routed budget — a System-One
   // classifier (julia with rule fail-soft) scores four retrieval needs, the

@@ -36,6 +36,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError, type OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import { isEmbeddedEngine } from '../embedded-engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import type { WriteRequest } from './model.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
@@ -329,7 +330,7 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   removed.persistence_requests = await lookup('redaction_read', () => redactRequestIntents(tx, requests, row.id, { skipPending: true, needles }));
   const journalSweep = { scanned: prepared.sweep.scanned, ceiling: prepared.sweep.ceiling, watermark: prepared.sweep.watermark ?? null, batch: prepared.sweep.batch ?? 1,
     tail: recheck.tail, pending_rechecked: recheck.pendingRechecked, complete: prepared.sweep.complete && recheck.complete };
-  const files = await tx.executeRaw<{ storage_path: string }>(`DELETE FROM files WHERE (page_id=$1 OR (page_slug=$2 AND (source_id=$3 OR source_id IS NULL)))
+  const files = await tx.executeRaw<{ storage_path: string }>(`DELETE FROM files WHERE (page_id=$1 OR (page_id IS NULL AND page_slug=$2 AND (source_id=$3 OR source_id IS NULL)))
     RETURNING storage_path`, [page.id, slug, sourceId]);
   removed.files = files.length;
   Object.assign(removed, await (await import('../generations/ledger-scrub.ts')).scrubGenerationLedger(tx, sourceId, { slug }));
@@ -377,9 +378,17 @@ export async function finishPagePurge(ctx: Pick<OperationContext, 'engine' | 'co
   const remaining: string[] = [];
   if (purge.blobs?.length) {
     try {
-      const { createStorage } = await import('../storage.ts');
-      const storage = await createStorage((ctx.config as { storage?: unknown } | undefined)?.storage as never);
-      for (const path of purge.blobs) { try { await storage.delete(path); } catch { remaining.push(path); } }
+      const { createStorage, settingsStorage } = await import('../storage.ts');
+      const embedded = isEmbeddedEngine(ctx.engine);
+      const storage = embedded ? await settingsStorage(ctx.engine)
+        : await createStorage((ctx.config as { storage?: unknown } | undefined)?.storage as never);
+      if (!storage) throw new Error('This engine was opened with no settings.storage.');
+      for (const path of purge.blobs) {
+        try {
+          if (embedded && !(await storage.exists(path))) { remaining.push(path); continue; }
+          await storage.delete(path);
+        } catch { remaining.push(path); }
+      }
     } catch { remaining.push(...purge.blobs); }
   }
   const { verifyPagePurge } = await import('../facts/purge-verify.ts');

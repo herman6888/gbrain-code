@@ -6,15 +6,16 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { BrainEngine } from './engine.ts';
 import type { EngineConfig } from './types.ts';
 import { opError } from './ops/contract.ts';
-import { createEngine } from './engine-factory.ts';
-import { connectionUrlProblem, markEmbeddedEngine, releaseEmbeddedEngine, type EngineAISettings, type EngineSettings } from './embedded-engine.ts';
+import { constructEngine } from './engine-construct.ts';
+import { makeEngineChatUsageSink, registerEngineChatUsageSink } from './ai/chat-usage.ts';
+import { connectionUrlProblem, markEmbeddedEngine, releaseEmbeddedEngine, type EngineAISettings, type EngineSettings, type EngineStorageSettings } from './embedded-engine.ts';
 import { assertLocalWriterValue, setEngineHostId } from './persistence/identity.ts';
-import { engineProviderProblem, recipeKeyEnv, sharedProviderEnvConflict } from './ai/engine-gateway.ts';
+import { engineProviderProblem, recipeKeyEnv, releaseEngineGatewayState, sharedProviderEnvConflict } from './ai/engine-gateway.ts';
 import { getRecipe } from './ai/recipes/index.ts';
 
-export type { EngineAISettings, EngineSettings, EmbeddedSettingsView } from './embedded-engine.ts';
+export type { EngineAISettings, EngineSettings, EngineStorageSettings, EmbeddedSettingsView } from './embedded-engine.ts';
 export { embeddedSettings, isEmbeddedEngine, processHasEmbeddedEngines } from './embedded-engine.ts';
-export { withEngineScope } from './engine-scope.ts';
+export { withEngineScope, withLocalScope } from './engine-scope.ts';
 export { hostIdFor } from './persistence/identity.ts';
 
 /** Connections a Postgres engine opened from settings may open when `pool.max` is not given. */
@@ -26,6 +27,23 @@ const invalid = (setting: string, why: string) => opError('engine_settings_inval
 const text = (value: unknown) => typeof value === 'string' && value.length > 0;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AI_MODELS = ['chat', 'expansion', 'reranker'];
+
+const STORAGE_NEEDS: Record<string, readonly (keyof EngineStorageSettings)[]> = {
+  local: ['localPath'], s3: ['bucket', 'endpoint', 'accessKeyId', 'secretAccessKey'],
+};
+const STORAGE_FIELDS = new Set(['backend', 'bucket', 'localPath', 'region', 'endpoint', 'accessKeyId', 'secretAccessKey', 'prefix']);
+const PREFIX = /^[a-z0-9][a-z0-9_-]*$/i;
+
+/** Every value the backend needs is given, so no backend falls back to a default path or reads an endpoint or credentials from the environment. */
+function checkStorage(storage: EngineStorageSettings): void {
+  const needs = storage && typeof storage === 'object' ? STORAGE_NEEDS[storage.backend] : undefined;
+  if (!needs) throw invalid('storage.backend', "storage is { backend: 'local' | 's3', ... }.");
+  const extra = Object.keys(storage).find(field => !STORAGE_FIELDS.has(field));
+  if (extra) throw invalid(`storage.${extra}`, `storage takes ${[...STORAGE_FIELDS].join(', ')}.`);
+  const missing = needs.find(field => !text(storage[field]));
+  if (missing) throw invalid(`storage.${missing}`, `A ${storage.backend} store needs ${needs.join(', ')}.`);
+  if (storage.prefix !== undefined && !PREFIX.test(storage.prefix)) throw invalid('storage.prefix', 'prefix is one segment of letters, digits, - and _.');
+}
 
 /** Names the setting that is wrong, never a key: a key's value is never part of a refusal. */
 function checkAI(ai: EngineAISettings): void {
@@ -55,7 +73,24 @@ function checkAI(ai: EngineAISettings): void {
   }
 }
 
+/** Each setting openEngine reads, with the fields it reads inside it (null: a value, or fields another check reads: ai.providers, storage). */
+const SETTINGS_FIELDS: Record<string, readonly string[] | null> = {
+  embedded_core: null, engine: null, database: ['url', 'directUrl', 'path'], pool: ['max'], host: ['id'], writer: ['id', 'credential', 'lane'],
+  embedding: ['model', 'dimensions'], keyword_statement_timeout_ms: null, pglite: ['shared_buffers'], ai: ['providers', 'models'], storage: null, cache_namespace: null,
+};
+
+/** A misspelled or foreign key would be silently ignored, so it refuses, naming the key and never its value. */
+function checkKnownKeys(settings: EngineSettings): void {
+  for (const [name, value] of Object.entries(settings)) {
+    if (!Object.hasOwn(SETTINGS_FIELDS, name)) throw invalid(name, `openEngine reads ${Object.keys(SETTINGS_FIELDS).join(', ')}, so a misspelled or foreign setting would be ignored.`);
+    const fields = SETTINGS_FIELDS[name];
+    const extra = fields && value && typeof value === 'object' ? Object.keys(value).find(field => !fields.includes(field)) : undefined;
+    if (extra) throw invalid(`${name}.${extra}`, `${name} takes ${fields!.join(', ')}.`);
+  }
+}
+
 function checkSettings(settings: EngineSettings): void {
+  checkKnownKeys(settings);
   if (settings.engine !== 'postgres' && settings.engine !== 'pglite') throw invalid('engine', "engine is 'postgres' or 'pglite'.");
   const database = settings.database;
   if (!database || typeof database !== 'object') throw invalid('database', 'database is an object: { url, directUrl? } for Postgres, { path? } for PGLite.');
@@ -84,6 +119,9 @@ function checkSettings(settings: EngineSettings): void {
     throw invalid('embedding', 'embedding is { model, dimensions } with a model name and a positive whole width.');
   }
   if (settings.ai !== undefined) checkAI(settings.ai);
+  const namespace = settings.cache_namespace;
+  if (namespace !== undefined && !(text(namespace) && namespace.length <= 256)) throw invalid('cache_namespace', 'cache_namespace is an opaque string of 1 to 256 characters when given.');
+  if (settings.storage !== undefined) checkStorage(settings.storage);
 }
 
 /**
@@ -112,6 +150,7 @@ export async function openEngine(settings: EngineSettings): Promise<BrainEngine>
     ...(settings.writer ? { writer: { ...settings.writer } } : {}),
     ...(settings.embedding ? { embedding: { ...settings.embedding } } : {}),
     ...(settings.pglite ? { pglite: { ...settings.pglite } } : {}),
+    ...(settings.storage ? { storage: { ...settings.storage } } : {}),
     ...(settings.ai ? { ai: {
       providers: Object.fromEntries(Object.entries(settings.ai.providers).map(([id, provider]) => [id, { ...provider }])),
       ...(settings.ai.models ? { models: { ...settings.ai.models } } : {}),
@@ -124,15 +163,18 @@ export async function openEngine(settings: EngineSettings): Promise<BrainEngine>
     ...(held.keyword_statement_timeout_ms !== undefined ? { keyword_statement_timeout_ms: held.keyword_statement_timeout_ms } : {}),
     ...(held.pglite?.shared_buffers ? { pglite_shared_buffers: held.pglite.shared_buffers } : {}),
   };
-  const engine = await createEngine(config);
+  const engine = await constructEngine(config);
   markEmbeddedEngine(engine, held);
   setEngineHostId(engine, held.host.id);
+  const dropUsageSink = registerEngineChatUsageSink(engine, makeEngineChatUsageSink(engine));
   let closed = false;
   const insideReconnect = new AsyncLocalStorage<true>();
   const disconnect = engine.disconnect.bind(engine);
   engine.disconnect = async (): Promise<void> => {
     if (insideReconnect.getStore()) return disconnect();
     closed = true;
+    dropUsageSink();
+    releaseEngineGatewayState(engine);
     releaseEmbeddedEngine(engine);
     await disconnect();
   };
