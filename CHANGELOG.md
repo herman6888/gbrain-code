@@ -10,6 +10,178 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.593.0] - 2026-11-06
+
+**`gbrain repair failed-writes` now previews a brain with a large write journal in about a second instead of timing out.** On Postgres, the preview of refused writes read the request table once per refused write, and one of those reads walked the table from that write to its end. With hundreds of refused writes and a journal of over a million requests, the preview ran for minutes and the server's statement timeout ended it with a bare `internal_error`, so the operator had no way to see or recover the lost writes. The preview now classes refused writes together in set reads, each sized so it stays short even on a page with hundreds of refused writes and a long history. On a synthetic journal of 1.5 million requests with over 800 refused writes it took about a second (it took 265 seconds before), with the same classes and the same preview hash. When a preview read does still run past the timeout, it refuses `repair_preview_timeout` with a fix instead of `internal_error`, and nothing is saved.
+
+### Itemized changes
+
+- `src/core/repair/failed-writes.ts`: recovered fact requests are read once for all refused writes instead of inside the candidate read; replay attempts are read for every refused write together (`request_id = ANY`); the later requests of each refused write's page are read for groups of writes sized by how long their pages' later history is, so one page with hundreds of refused writes and a long history cannot make one read outlast the statement timeout; the file check runs once per page. The listing, classes, residuals and preview hash are unchanged.
+- New refusal `repair_preview_timeout`. When the request indexes the preview reads are missing or INVALID, it names them and its fix is the read-only `gbrain repair request-indexes --json` preview, whose apply command builds them; when they are valid, it tells the brain host to run the same preview once with a longer statement timeout.
+- Schema migration v291 builds two request-table indexes online (`persistence_requests_replay_id` on the request id, `persistence_requests_slug_sequence` on source, slug and sequence). They join the indexes `gbrain repair request-indexes` and doctor's `persistence_request_indexes` check report. Without them the preview is still bounded, only slower. PGLite and repo-less brains get them unchanged.
+- The request-index states doctor and `gbrain repair request-indexes` print now come back in the order the indexes are declared on Postgres as well as PGLite.
+- `test/repair-failed-writes-bounded-8707.test.ts` (PGLite and Postgres) seeds a journal with refused writes of every class and checks that the preview's request-table reads stay flat as refused writes grow, that each write gets its class, and that a read ended at the statement timeout refuses `repair_preview_timeout` and saves nothing, and (Postgres) that 500 refused writes on one page followed by 20,000 later commits preview inside a 1 s statement timeout.
+
+## [0.60.592.0] - 2026-11-06
+
+**On a page with no import record, converting a source to git-canonical, `sources git-gap` and `repair rows-behind` now pick the winner from content evidence, never from a timestamp, and nothing overwrites a page that changed after it was reviewed.**
+
+A page whose database copy differs from its committed file and that has no import record used to count as database-ahead. Converting a source to git-canonical then adopted it, so a plain Git edit of that page could be lost. Now its archived versions are compared with the blobs its path held in Git. An older version that equals the committed file means the database moved, so it is adopted. A page that equals an older committed blob means the file moved, so Git wins. A page where both sides moved, or where nothing is shared, waits for the owner's decision. A revert on either side counts as a move, and a history that was capped or pruned gives no verdict. The owner reviews a list, decides each page in a decisions file, or approves the whole plan once. Either way, only pages unchanged since the review apply.
+
+### Itemized changes
+
+- `src/core/persistence/git-gap.ts`: one direction classifier (`adopt_db_moved`, `git_wins_file_moved`, `both_moved`, `no_evidence`) reads each page's newest 32 versions and 32 blobs from one scoped history walk run from the Git top level. Renames are followed, version bodies are read under a byte budget, and a segmented page or a version with no comparable content gives no one-sided verdict. `sources git-gap` reports `direction_evidence`.
+- `gbrain sources canonical <id> --to git`: each page is placed by its evidence kind, and the kind is bound into the preview hash. `both_moved` and `no_evidence` are new discards (`no_record_both_moved`, `no_record_no_evidence`). `--list-out <file>` writes the review list, `--decisions <file>` applies the owner's decisions, and `--approval-out` / `--approved` apply an approval across time. Only items unchanged since the approval apply, and the rest comes back as `git_conversion_delta` with counts. These files are written 0600 and refused inside a source checkout or the Git working tree that holds it (`conversion_file_in_source_root`).
+- The conversion's strict passes may replace a database version only where the plan approved it. A page that changes during the apply is held instead of overwritten, the apply stops with `changed_since_preview`, and the source stays mixed. A failed apply reports `recovery` (mode, commits, push, writes and the non-destructive rollback).
+- `gbrain repair rows-behind` never re-imports a row with no import record whose database moved since (`excluded:database_moved`). `--include-ambiguous` also no longer re-imports a row with no import record where both the page and its file moved. Such a row is listed `excluded:both_moved`, and `gbrain repair file-drift` decides it.
+- `sources git-gap` and doctor `db_ahead_of_git` report each source's `live_pages`. A scan the time budget stopped reads `PARTIAL, <read> of <live> live page(s) read`.
+- The hardened git runner accepts a second `log` shape for the history walk and bare `cat-file --batch-check`; every other form still refuses.
+- Tests: `test/git-gap-direction-evidence-d4.test.ts`, `test/git-canonical-conversion-evidence-d4.test.ts` and `test/rows-behind-checkpoint-8071.test.ts` run on PGLite and Postgres. Guides: docs/guides/git-canonical.md and docs/guides/repair.md.
+
+## [0.60.591.0] - 2026-11-06
+
+**`gbrain repair file-drift --prefer file` now imports a page stored in segments that keeps protected parts, instead of refusing every apply with no next step.**
+
+A held page whose body is stored in segments (`pages.segmented_storage`, a page over 1 MiB) and whose database copy keeps a protected frontmatter key and a timeline row the file lacks previewed cleanly, listing both exceptions and an apply command. That apply refused every time with `invalid_params` "Unsupported or missing reconciliation fields." and no `fix`, so the page stayed held and blocked writes to it. The apply now imports the file with the same protections (the file keeps its bytes plus the appended key and row, the page keeps both), the page stays segmented and searchable, and the next sync releases the hold. A preview now refuses a page its own apply would refuse, and every refusal on this path names its next step.
+
+### Itemized changes
+
+- `src/core/persistence/reconcile-state.ts`: a reconcile preview of a segmented page validates: its snapshot's `bodyGeneration` and the page's `body_storage` / `body_bytes` are accepted (the preimage checks are unchanged). A page with no revision yet (the revision backfill has not reached it) refuses `revision_backfill_pending` in the preview, with `gbrain apply-migrations --force-schema` in `fix` (or `gbrain repair orphan-children` when the backfill already used every attempt on the row), instead of a stale-preview refusal with none; `revision_backfill_pending` joins the error registry. Read-only drift classification and the audit read such a page as before.
+- `src/core/persistence/reconcile-prepare.ts`: the reconcile publication of a segmented page leaves its text seal to the segmented import (as the managed file repair does), runs the import's `afterCommit`, and reads the published page back materialized.
+- `src/core/repair/file-drift.ts`: the preview validates each page's reconcile artifact as the apply reads it back, so a page the apply would refuse is listed `refused` in the preview. A refused preview row carries the refusal's `fix` and its `why`; a refused or changed apply outcome carries both, with a read-only preview of that page alone (for a held deleted-side page, its held preview) when the refusal has no `fix`. `gbrain repair` prints each row's `fix` with its consent.
+- `src/core/persistence/reconcile-merge.ts`: "Unsupported or missing reconciliation fields." names the fields in `why`.
+
+## [0.60.590.0] - 2026-11-06
+
+**A managed sync no longer stops for good when a write queues behind another write that waits on the sync, and the convergence nightly's kill loop tests only points a sync actually reaches.**
+
+A write queued behind an earlier write that waited on a sync row naming its page used to count as a write that could go first. That held back the very sync row the earlier write waited on, so the three rows waited on each other and nothing committed until the drain gave up, about an hour into the nightly run. The claim now skips such a write, so the sync row commits and both writes follow in order. The live `stalled Ns on queued` line also stops reporting a stall while the head keeps moving, for example while this process commits the in-flight writes of a serve that was killed.
+
+### Itemized changes
+
+- `src/core/persistence/journal.ts`: the FIFO claim no longer counts a write that sits behind an earlier queued write waiting on a sync row naming its page. That write can't go first anyway, because a write never passes an earlier one.
+- `src/core/persistence/sync-drain.ts`: the in-pass stall line counts an unclaimed head's age from when that head became the head, and never from before the drain's own last commit.
+- `src/core/persistence/sync-run.ts` and `fault-points.ts`: a new `sync:passed_over` fault point after the cursor step that passes over an entry whose file changed after admission. It does nothing without a test hook.
+- `test/sync-convergence.serial.test.ts`: the kill loop drops `sync:prescreened` and `sync:retry_deferred`, which only company sources reach since #6712 PR 4b, and kills at `sync:passed_over` and `sync:batch_entries` instead. A primed edit that the round's sync never froze is now reported by the "every planned fault fired" check, where it used to crash the harness on an empty commit.
+- `test/claim-fifo-foreground-waiting.test.ts` covers the chained write on PGLite and Postgres, and `test/sync-drain-claims.test.ts` covers a head that keeps moving.
+
+## [0.60.589.0] - 2026-11-06
+
+**gbrain can now wake an agent's conversation when a job it started finishes, through Wakeshift. It's off until the brain owner turns it on.**
+
+An agent that submits a long job no longer has to poll. With reporting back on, it calls `watch_job` with the job id and ends its turn. When the job completes, fails, dies or is cancelled, Wakeshift wakes that conversation with one line naming the job and the `get_job` call that reads the result. The wake is a pointer (the job id, kind, status and times), never page text, titles or slugs, so it can't widen what anyone reads. The owner turns it on with `gbrain wakeshift enable` on the brain host, using a key from their own Wakeshift app, and `gbrain wakeshift disable` turns it off at once. Until then nothing changes: the tools aren't listed, no rows are written and nothing is sent. This release reports back only on brains that serve their owner alone. `wait_job` and `gbrain jobs wait <id>` remain the way to wait with nothing leaving the machine. Guide: docs/guides/wakeshift.md.
+
+### Itemized changes
+
+- New MCP tools `watch_job`, `list_watches` and `unwatch`, listed only while reporting back is on and a usable key is on the host. `watch_job` runs the same owner check as `get_job`: a job the caller doesn't own reads like a missing one and nothing is sent. A watch belongs to the credential that made it, and a revoked credential's watch ends without a wake.
+- New `gbrain wakeshift enable | disable | status | test`. `enable` asks consent (it sends data off the machine and stores a credential), refuses a brain with live access members, checks the key with Wakeshift and publishes gbrain's `gbrain.job.finished` event. The key comes from `WAKESHIFT_API_KEY` or a 0600 `~/.gbrain/wakeshift.key`, and is never stored in the database or printed (status shows its fingerprint).
+- Delivery runs inside `gbrain serve` (stdio and HTTP) and the job worker every 5 seconds, and once more at the end of `gbrain jobs work`. A watch on a job that already finished wakes at once. A failed delivery is retried at most 5 times over about 40 minutes, then the watch ends and the conversation is told. Jobs are never slowed by Wakeshift.
+- New doctor check `wakeshift`: a key file other users can read, reporting back enabled without a usable key, and watches that died or were refused as `id_reused` in the last 7 days.
+- Schema migration v290 adds `wake_subscriptions` (empty unless reporting back is on). Repo-less brains get it unchanged.
+- `--log-full-params` on `gbrain serve --http` now redacts a tool call's `session_key` argument.
+
+## [0.60.588.0] - 2026-11-06
+
+**Engines that make their first write at the same moment no longer fail one of the writes registering the same writer.** Two or more engines opened from the same settings on one Postgres database (the same writer id, credential and lane), or two processes that share one credential file, could both find no registration and both insert it. The loser hit the credential's unique index and failed with `duplicate key value violates unique constraint "persistence_local_writers_credential_hash_key"`; four engines on a fresh database lost three of their four first writes. Registration is now idempotent under that race, and every refusal still holds. PGLite was never affected, because its single connection runs the read and the insert one after the other. Contributed by @bradgessler.
+
+### Itemized changes
+
+- `src/core/persistence/identity.ts`: the registration insert names no conflict target, so a conflict on either unique index (the id or the credential hash) does nothing. When nothing was inserted, the row under the id is read again and checked exactly as an existing row is. The same credential and lane pass, while a revoked row or another credential or lane under the id refuses `permission_denied`. No row under the id means the credential belongs to another registration, which now refuses `permission_denied` with a fix where it used to raise a raw 23505.
+- `test/e2e/engine-open-postgres.test.ts`: four engines opened from one writer value make their first writes at once, twelve rounds on a scratch database (master: `['23505','resolved','resolved','resolved']`). A second case forces the lost-insert branch and checks each refusal on Postgres.
+- `test/engine-open.test.ts`: the same lost-insert cases on PGLite, plus four concurrent first writes on one engine landing under one registration.
+
+## [0.60.587.0] - 2026-11-06
+
+**An HTTP MCP caller can now say which AI made a write, and attribution reads show it.** Send `X-Gbrain-Agent-Label: Claude Code` (or `Codex`, or a job name) on a request, and the writes that request makes itself show `agent_label` in `gbrain attribution` / `get_write_attribution` and in `get_versions` for admin and local readers. This answers "which of my AIs wrote this?" when several share one OAuth client or token. The label is text the caller declares and gbrain does not verify. The principal is still who was authorized, and no grant, access rule or trust tier reads it. A request without the header is recorded exactly as before, so nothing changes until a caller sends it. Contributed by @JamisonMercurio (#8664).
+
+### Itemized changes
+
+- Both HTTP transports (the OAuth `serve --http` mount and the legacy bearer transport) read the header. Admission stores it on the request's existing `authority` record as `agentLabel`, so there's no new column or migration, and repo-less brains record it too. Stdio MCP and the local CLI have no request headers and record no label.
+- A label is 1 to 120 printable ASCII characters after trimming. Anything else (control, bidi, zero-width or non-ASCII characters, or a longer value) is dropped, never refused.
+- Jobs a labelled request queues (`submit_job` remote jobs and agent jobs) run under their own authority and record no label.
+- Both transports' CORS preflight now allows the header, so a browser client on an origin in `GBRAIN_HTTP_CORS_ORIGIN` can send it without its whole MCP call being blocked.
+- `test/write-agent-label.test.ts` covers both transports, a repo-less brain, the parser bounds, a stored authority that is otherwise identical with and without a label, and a read-only token that is still refused. The export-surface golden gains the optional `agentLabel` and `agent_label` fields.
+
+## [0.60.586.0] - 2026-11-06
+
+**A `remember` refused for its arguments now names the whole valid call, so an agent that never read the schema saves on its next try.**
+
+An agent on a harness that lists MCP tools as one line and shows parameters only on request sent `remember` its host's own memory shape, `facts: [{text}]`. gbrain answered "did you mean `fact`?", the agent resent `{fact, entity}` without provenance, and only the third call saved, so every saved fact cost two refusals. The refusal now points `facts` at `items` and `text` at `fact`, and quotes a valid call with placeholder values, provenance included. provenance stays required.
+
+### Itemized changes
+
+- `src/mcp/validate-params.ts`, `src/mcp/dispatch.ts`: an unknown `facts` on `remember` suggests `items` and an unknown `text` suggests `fact`; the refusal then appends the operation's `callShape`, a valid call as JSON with placeholder values (`<one claim>`, `<subject-slug>`, `<where you learned it, with the date>`) that says provenance is required. `callShape` is a new optional `Operation` field; only `remember` sets it.
+- `src/core/verbs.ts`: `remember`'s description opens with the call itself, `{fact, provenance (required: source), \`entity\` (subject; recall needs it)} or items[]`, inside the 117 characters a one-line tool listing keeps. A missing `fact` quotes the same placeholder call instead of an example without provenance, and the missing- and empty-provenance refusals quote its provenance placeholder instead of a realistic source an agent could copy.
+- `src/core/remember-batch.ts`: an item that carries `text` is told to rename it to `fact`.
+
+## [0.60.585.0] - 2026-11-05
+
+**CI shard weights are re-mined from the 2026-11-05 nightlies, so the unit and serial lanes pack their shards on current timings.** Nothing changes for users.
+
+### Itemized changes
+
+- `scripts/test-weights.json` and `scripts/serial-weights.json`: each test file's weight is its median over the five newest green Test nightlies, 2026-11-01 through 2026-11-05; `scripts/*-weights.metadata.json` names the runs. The heaviest of the 28 unit shards is predicted at 538 s against the 600 s budget (537 s before). Test files with no weight drop from 61 to 36 of 4547 in the unit lane and from 4 to 1 of 457 in the serial lane.
+- `scripts/e2e-weights.json` is unchanged: the 2026-11-05 full-corpus E2E nightly failed, and the newest green one already sourced the map.
+- `test/pathological/a18-ledger-path-text.test.ts` and `test/pathological/s-70-classifier-origin.test.ts`: the injected import failure picks the import's page read by its arguments instead of by an `importOnePath` stack frame, so it still fires when an earlier file in the same process opened an embedded engine. The new packing runs `test/engine-gateway.test.ts` before a18 in one unit shard, where five of its cases failed every time.
+
+## [0.60.584.0] - 2026-11-05
+
+**`gbrain sources refresh --abandon` no longer lets the next sync delete pages a member source already synced.**
+
+A refresh interrupted after a member source synced the upstream commit, then moved to `recovery_required` with the checkout back at the commit it started from, could be abandoned: `--resume` refused and named `--abandon`, `--abandon` lifted the fence, and the next sync diffed that member back to the start commit and soft-deleted every page it had synced. `--abandon` now refuses such a row (`refresh_recovery_required`, nothing changed) once any member's `last_commit` is past the start commit (set, and neither that commit nor an ancestor of it; a commit git cannot find counts as past), and `--resume` no longer names `--abandon` there. Both name the one way out that keeps the pages, as an ask-the-user fix. It previews with `git -C <checkout> status --short`, fast-forwards the checkout with `git merge --ff-only` to the commit the members synced (the upstream commit, or a later one a member already synced), then runs `--resume`; when git refuses, it names `git reset --hard` to that commit as the destructive fallback. `--resume` now also finishes a `recovery_required` refresh whose HEAD descends from the upstream commit instead of refusing it, and never finishes one at a HEAD that does not contain the commit a member source synced on this refresh's line (or a commit git cannot place). Writer status uses the same member check. A row whose members never moved past the start commit is abandoned exactly as before, and sync's deletion behaviour is unchanged.
+
+### Itemized changes
+
+- `src/core/persistence/worktree-refresh.ts`: one member check (`membersPastStart`) feeds `--abandon`, the `--resume` refusal at the start commit, the stored `recovery_required` fix and writer status.
+- Tests: `test/persistence-worktree-refresh.test.ts` 7r (the three-step chain: crash while syncing, member synced, HEAD reset; pages survive, then reset-to-target and `--resume` completes) 7s (no member moved: `--abandon` still works) 7t (a member behind the start commit still abandons; an unknown commit refuses), 7u (a member synced past the target keeps its pages), 7w and 7x (`--resume` never finishes at a HEAD that lacks a member's synced commit), 7y (a member already on rewritten history before the refresh never leaves crash recovery stuck) and 7v (an unrelated HEAD names no `--abandon`; a HEAD past the target resumes), on PGLite and on Postgres through `test/e2e/worktree-refresh-postgres.test.ts`.
+
+## [0.60.583.0] - 2026-11-05
+
+**Sync and source-refresh follow-ups from wave #8123: an interrupted refresh names what holds it and how to finish it, managed-sync preparations stop waiting on table locks, code sources converge on their first full sync, and `sync.write_through=false`, impossible timeline dates, image names, dry runs and missing source directories behave as documented.**
+
+**`gbrain sources refresh` says what is actually holding an interrupted refresh, and its owner recovery stops holding locks it doesn't need (#8123).**
+
+Writer status for a `recovery_required` refresh now reads the checkout HEAD. At the upstream commit it names `--resume`, at the start commit `--abandon` (only when no member source has synced past it), and only another HEAD asks the user to reset. An orphan whose HEAD git cannot read names `git -C <checkout> status` instead of promising that the next refresh finishes it, and the owner scan logs it once every 15 minutes instead of swallowing it. A refresh lock file this host cannot open reads `liveness: unknown` with the lock path, and a plain refresh refuses `refresh_in_progress` instead of failing with a raw lock error. A refresh held on another host names that host in `next`. A plain refresh that rolled back an orphan and then refused keeps that recovery in its refusal message. A delegated refresh (a resident PGLite owner) prints the same structured `fix` as a direct one.
+
+### Itemized changes
+
+- `src/core/persistence/worktree-refresh.ts`: the owner scan checks member progress before it takes the refresh lock, caches a syncing orphan it could not complete because of its HEAD, fails one row (not the scan) on a lock error, and prunes its caches each scan (#7712, #7728, #7730, #7731); `refreshHolderReport` reads HEAD (#7712, #7731); `next` is host-scoped and shell-quoted (#7731).
+- `src/core/persistence/ipc.ts`: a refusal's `fix`, `why`, `reason` and `contract_version` survive the owner socket (#7707, #8130).
+- Tests: the #7679 state matrix gains the `--abandon` action for every kind (#7718-#7727, #7729), plus red tests for the owner scan's syncing filter and test 7's adoption guard (#7708) and the unreadable-lock branch (#7728).
+
+**A table lock on `pages` no longer pins a managed sync's preparations past their budget, sync and waiver provenance records name a file only when it holds the bytes they record, and the rows-behind doctor check holds at most 64 MiB of committed files per batch (#6318, #8089, #8093, #8094).**
+
+A managed sync bounds each preparation by `persistence.sync_preparation_ms`. Its raw reads already ended on the server at that budget, but the engine's own reads (the page snapshot, the import pipeline's duplicate and content-hash lookups) ran as plain autocommit statements, so under `LOCK TABLE pages` held elsewhere they waited as long as the lock did, through a pooler that drops the session `statement_timeout`. In a managed sync those reads now run in a transaction whose `statement_timeout` is the time the preparation has left, and a read the server ends there is the member's `preparation_deadline`, held as `preparation_stalled` like the head member. Nothing changes without a deadline, inside a transaction, or on PGLite.
+
+### Itemized changes
+
+- `src/core/read-deadline.ts` (new), `src/core/postgres-engine.ts` `withScopedReadTransaction`, `src/core/persistence/bounded-reads.ts`: a call through the managed-sync preparer's bounded engine view carries the clock's deadline, and the Postgres engine's scoped reads issued under it run on a reserved connection as `BEGIN READ ONLY; SET LOCAL statement_timeout`, the read and `COMMIT`, pipelined (`runDeadlineRead` in `src/core/postgres-engine/bounded-statement.ts`) (#6318). Page and maintenance preparations keep plain engine reads (#8307). Probe: `test/e2e/persistence-preparation-engine-reads-lock-postgres.test.ts`.
+- `src/core/persistence/sync-prepare.ts` (`publishedSyncNoop`, new `heldDiskBytes`), `src/core/persistence/sync-waivers.ts` (`waivedProvenance`): a `published` no-op re-reads its file at apply and records provenance only when the file still has the raw hash; a waiver records the file it read only when it holds the imported bytes (up to line endings), the rule `syncDiskBytes` already follows (#8089). Probe: `test/sync-provenance-writers-8089.test.ts`.
+- `src/core/persistence/rows-behind.ts`: doctor `sync_rows_behind_checkpoint` reads and compares a batch's committed files in chunks of at most 64 MiB (`ROWS_BEHIND_BATCH_BYTES`), drops each chunk's buffers after the comparison (a differing row keeps a copy of its bytes, so it never pins its chunk), checks the deadline before the per-source tree reads and each chunk, and reads its screen config only once a batch starts (#8093 item 1). The docstring names `not_eligible` (#8094).
+- `test/cycle/dream-reverse-write-commit.test.ts`: a refused commit in one source's checkout holds only that source's page (#8094).
+- `scripts/bench/managed-sync-stall-repro.ts`: `--sync-preparation-ms` and a `lock_release` result listing sync statements still waiting on a lock 3 s past the budget.
+
+**A first `gbrain sync --full` on a code-strategy source now settles in one pass, and a plain `gbrain sync status` no longer issues one database statement per abandoned uncommitted edit (#8047, #7339).**
+
+A code or image import recorded its provenance without the open `--full` episode, so every round of the pass saw those files as still owed and imported them again. A fresh code source reported twice its file count, stopped `not_converged` three passes in a row and then held every file `settle_mismatch`. Code and image imports now record the episode the way Markdown imports do, and the pass converges in its first round.
+
+`sync status` re-reads each `worktree_dirty` hold that is due to escalate, to see whether someone is still editing the file. It read every such hold's row even when the file's bytes still matched the hash the hold already recorded. On a source with thousands of abandoned edits that was thousands of round trips per status call, about minutes over a remote pooler. It now reads a row only when the bytes changed. With 40 such holds, a plain status went from 54 statements to 15, the same count as with one hold; an edit whose bytes changed is still noticed and stops counting as abandoned.
+
+### Itemized changes
+
+- `src/core/persistence/sync-prepare.ts`: `syncFileProvenance` (code and image imports) records `full_episode` (#8047). The same line is in contributor PR #8051; this fix was derived independently from the #8047 reproduction.
+- `src/core/persistence/sync-status.ts`: `observeDirtyEditors` skips `noteHoldEdit` when the working-tree hash equals the hold's recorded `working_hash` (#7339).
+- New tests: `test/sync-full-code-episode-8047.test.ts`, `test/sync-status-hold-reads-7339.test.ts`.
+
+**Managed sync and source checks fixes from the sync/refresh wave (#8123 part C): `sync.write_through=false` keeps sync's frontmatter corrections out of the checkout, a page with an impossible timeline date no longer blocks sync, images with punctuation in their names sync, `sync --dry-run` previews what it would do, and a missing source directory is no longer reported clean.**
+
+- With `sync.write_through` off, a managed sync keeps its canonical correction of a file (the frontmatter, title or tags a page keeps when an upstream edit drops them) in the database and never rewrites the checkout. Before, it wrote the rendering into the working tree and left it uncommitted, including into a read-only mirror's checkout reached through the `default` source's `sync.repo_path` fallback (#7084, #8118).
+- A timeline bullet or heading dated with an impossible day (`2026-02-30`, month 13) is no longer extracted as a timeline row. It used to reach the database's date cast and fail the page's publication, which blocked a managed sync and aborted a whole `repair file-drift` preview batch (#8049). The text stays in the page.
+- Managed image sync now gives an image the importer's identity (path lowercased, punctuation kept), so `notes/Photo+A.png` imports as `notes/photo+a.png` instead of being refused, and stays distinct from `notes/PhotoA.png` (#7107).
+- A managed `gbrain sync --dry-run` reports and prints how many files the run would add, modify, soft-delete and rename. It used to report zero, or repeat the previous run's counts (#7087).
+- `gbrain sources list` marks archived sources with `⚠ archived` and `--json` carries `archived` per source (#7701).
+- A registered source whose directory is missing is reported `missing` by the frontmatter audit and both frontmatter doctor checks, with the path and the restore or `sources set-path` step, instead of clean; a connector source's leftover path is not reported (#7889).
+
 ## [0.60.582.0] - 2026-11-05
 
 **A frontmatter-only disagreement between a page's file and its database copy no longer blocks an unrelated `remember`, a contact row whose `last_used` moved forward reconciles automatically, and duplicated contact rows can be collapsed with one previewed repair (#8109).**

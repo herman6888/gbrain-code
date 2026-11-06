@@ -388,9 +388,10 @@ gbrain sources set-sync <id> <on|off> [--dry-run] [--expect <on|off>]
 gbrain sources host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
                                Managed brains: host a new, empty source in a bare
                                repository under <path> (see below). Previews without --expect.
-gbrain sources canonical <id> --to git|mixed [--dry-run | --apply --expect <hash>] [--json]
+gbrain sources canonical <id> --to git|mixed [--dry-run [--list-out <file>] [--approval-out <file>] | --apply (--expect <hash> | --approved <file>)] [--decisions <file>] [--json]
                                Managed brains: convert a source to git-canonical or back
-                               to mixed. Previews without --apply; the apply prints progress
+                               to mixed. Previews without --apply (review list, decisions
+                               and approvals: docs/guides/git-canonical.md); the apply prints progress
                                on stderr and, if stopped, where it stopped
                                (docs/designs/GIT_CANONICAL_MEMORY.md#conversion).
 ```
@@ -437,6 +438,8 @@ maintenance write) is stored database-only too; its receipt says
 write on, except for pages created while the source was a mirror: those have
 no file in the checkout and stay database-only. Git effects of a mirror's
 writes (for example a `forget`) complete as skipped. The flag is off by default.
+With `sync.write_through` off, sync keeps that canonical metadata in the
+database for every source, mirror or not, and never rewrites a checkout file.
 
 A managed brain never pulls inside a cycle. Advance a managed checkout with
 one command on its owner host:
