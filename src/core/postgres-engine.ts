@@ -21,6 +21,7 @@ import postgres from '#postgres'
 import { reservedTransactions, type ReservedTransactions } from './postgres-engine/reserved-transactions.ts';
 import { holdSearchConnection } from './search/connection-budget.ts';
 import { traceSqlOptions } from './sql-trace.ts';
+import { tlsRequiredDefaultError, withPgTls } from './pg-tls.ts';
 import { hasPostgresCancellationCapability, postgresCancellationUnavailable, reserveWithCancellation } from './postgres-engine/cancellation.ts';
 import { runBoundedStatement, runDeadlineRead } from './postgres-engine/bounded-statement.ts';
 import { needsJitOff, runJitOffStatement } from './postgres-engine/jit-off-statement.ts';
@@ -182,6 +183,7 @@ import { scopedRead, unscopedExecutor } from './engine-sql/brands.ts';
 import { writerStamp } from './persistence/writer-versions.ts';
 import { wellFormedJson } from './text-safe.ts';
 import { ENGINE_ROOT } from './engine-root.ts';
+import { insertEvalCandidate } from './feedback/store.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -469,8 +471,9 @@ export class PostgresEngine implements BrainEngine {
       if (typeof prepare === 'boolean') {
         opts.prepare = prepare;
       }
-      this._sql = postgres(url, traceSqlOptions(embedded ? { ...opts, ...settingsConnectionOptions(url) } : opts, 'instance'));
-      await db.checkPoolAndLoadSharedTypes(this._sql, url, { persisted: !embedded });
+      const instanceOpts = embedded ? { ...opts, ...settingsConnectionOptions(url) } : opts;
+      this._sql = postgres(url, traceSqlOptions(withPgTls(url, instanceOpts), 'instance'));
+      await db.checkPoolAndLoadSharedTypes(this._sql, url, { persisted: !embedded }).catch(async (e: unknown) => { throw (await tlsRequiredDefaultError(url, e, instanceOpts)) ?? e; });
       await db.setSessionDefaults(this._sql);
       this._connectionStyle = 'instance';
 
@@ -3110,20 +3113,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Eval capture (v0.25.0). See BrainEngine interface docs.
   async logEvalCandidate(input: EvalCandidateInput): Promise<number> {
-    const sql = this.sql;
-    const rows = await sql`
-      INSERT INTO eval_candidates (
-        tool_name, query, retrieved_slugs, retrieved_chunk_ids, source_ids,
-        expand_enabled, detail, detail_resolved, vector_enabled, expansion_applied,
-        latency_ms, remote, job_id, subagent_id, embedding_column
-      ) VALUES (
-        ${input.tool_name}, ${input.query}, ${input.retrieved_slugs}, ${input.retrieved_chunk_ids}, ${input.source_ids},
-        ${input.expand_enabled}, ${input.detail}, ${input.detail_resolved}, ${input.vector_enabled}, ${input.expansion_applied},
-        ${input.latency_ms}, ${input.remote}, ${input.job_id}, ${input.subagent_id}, ${input.embedding_column ?? null}
-      )
-      RETURNING id
-    `;
-    return rows[0]!.id as number;
+    return insertEvalCandidate(this, input);
   }
 
   async listEvalCandidates(filter?: { since?: Date; limit?: number; tool?: 'query' | 'search' }): Promise<EvalCandidate[]> {

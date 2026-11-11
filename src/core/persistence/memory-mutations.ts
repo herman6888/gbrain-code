@@ -25,8 +25,10 @@ import type { WriteRequest } from './model.ts';
 import { prepareMemoryMutation } from './memory-prepare.ts';
 import { readForgetTarget, refuseForgetReachingOtherCopies } from './forget-prepare.ts';
 import { UNATTRIBUTED_MEMORY_SLUG } from '../facts/extract-from-fence.ts';
-import { resolveExcludePrivatePages, withFolderRestricted } from '../search/private-visibility.ts';
-import { callerMember, memberFactAdmitSql, memberFactPage, memberPageIsOwn, memberPageNotOwned, memberPageSlug, scopePageIsShared, scopePageNotShared, SCOPE_PAGE_SLUG } from '../access/member-facts.ts';
+import { callerIsOwner, currentCallerAccess, privateProvenanceFilterUnderPolicy, resolveExcludePrivatePages, withFolderRestricted } from '../search/private-visibility.ts';
+import { projectionEligibleSql } from '../eligibility/sql.ts';
+import { resolveReadEligibility } from '../eligibility/policy.ts';
+import { callerMember, factVisibilitySql, memberFactPage, memberPageIsOwn, memberPageNotOwned, memberPageSlug, ownMemberFactIds, scopePageIsShared, scopePageNotShared, SCOPE_PAGE_SLUG } from '../access/member-facts.ts';
 import { perCallWriteSource } from '../access/attest-sources.ts';
 
 export { prepareMemoryMutation } from './memory-prepare.ts';
@@ -279,9 +281,9 @@ async function resolveRememberEntity(ctx: OperationContext, sourceId: string, en
   const { entityReferenceCandidates, resolveEntitySlugWithSource, resolveStrictEntityReference } = await import('../entities/resolve.ts');
   if (entity.includes('/')) return (await resolveEntitySlugWithSource(ctx.engine, sourceId, entity))!;
   const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
-  const strict = await resolveStrictEntityReference(ctx.engine, sourceId, entity, { sameName: true, excludePrivate });
+  const strict = await resolveStrictEntityReference(ctx.engine, sourceId, entity, { sameName: true, excludePrivate, forCaller: true });
   if (strict.slug !== null) return { slug: strict.slug };
-  const candidates = await entityReferenceCandidates(ctx.engine, sourceId, entity, { excludePrivate });
+  const candidates = await entityReferenceCandidates(ctx.engine, sourceId, entity, { excludePrivate, forCaller: true });
   if (strict.miss === 'no_page' && !candidates.length) {
     const unnamed = await resolveEntitySlugWithSource(ctx.engine, sourceId, entity);
     if (unnamed?.source === 'fallback_slugify') return { slug: unnamed.slug };
@@ -325,7 +327,17 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   // so no owner proposal is filed and its tier is never disclosed.
   const member = remote ? callerMember() : null;
   const ownPage = member ? memberPageSlug(member) : null;
-  if (ownPage && !(await ctx.engine.executeRaw(`SELECT 1 FROM facts WHERE id=$1 AND source_id=$2 AND ${memberFactAdmitSql('facts')}`, [id, sourceId])).length) throw missing();
+  if (ownPage && !(await ownMemberFactIds(ctx.engine, sourceId, [id])).has(id)) {
+    // #9101: a fact the caller reads (one it shared, or a teammate's shared fact) is refused by name; a fact it cannot read stays not_found.
+    // An attested QM actor keeps not_found for every fact off its page, as QM memory-provider contract v3 states.
+    if (currentCallerAccess().actor) throw missing();
+    const readable = callerIsOwner() ? 'TRUE' : factVisibilitySql('facts', ['world']);
+    const eligible = projectionEligibleSql('facts', 'facts', await resolveReadEligibility(ctx));
+    const reads = (await ctx.engine.executeRaw(`SELECT 1 FROM facts WHERE id=$1 AND source_id=$2 AND ${readable} AND ${eligible}${excludePrivate ? ` AND ${privateProvenanceFilterUnderPolicy('facts')}` : ''}`, [id, sourceId])).length > 0;
+    if (!reads) throw missing();
+    throw verbError('permission_denied', `Fact #${rawId} is not on your member page ${ownPage}, so this credential cannot withdraw it. Nothing was forgotten.`,
+      `A member credential withdraws only the facts on its own member page. The brain host withdraws this one with gbrain forget ${rawId}.`);
+  }
   // #5575 I3: a remote caller cannot forget a fact more trusted than its own writes; the owner is asked instead.
   if (remote) await guardRemoteForget(ctx.engine, { sourceId, factId: id, principal, reason, excludePrivate });
   const [source] = await ctx.engine.executeRaw<RememberSource>(

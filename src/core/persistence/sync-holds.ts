@@ -609,8 +609,11 @@ export async function holdBasisMoved(engine: Pick<BrainEngine, 'executeRaw'>, so
  * #8072: a `file_too_large` hold is re-screened by every sync only while that costs its size (an lstat): one the streamed
  * preparation refused after reading the whole file (`meta.streamed`) waits for its bytes to change, a retry or another gbrain.
  */
-/** GBRA-133: the `file_drift` screen version; 1 is #7340's rule (a page with no import record compares its file at the baseline commit). */
-export const FILE_DRIFT_VERSION = 1;
+/**
+ * GBRA-133: the `file_drift` screen version; 1 is #7340's rule (a page with no import record compares its file at the baseline commit),
+ * 2 adds the path's earlier committed versions (`driftHistory`), which landed after version 1 without re-screening its holds.
+ */
+export const FILE_DRIFT_VERSION = 2;
 
 export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, retried: boolean): boolean {
   return retried || (record.code === 'file_too_large' && record.meta.streamed?.gbrain_version !== VERSION) || ['frontmatter_slug_conflict', 'rename_held', 'parser_regression', 'content_rejected', 'write_gate_rejected', 'purged_content', 'legacy_slug_conflict', 'origin_conflict', 'page_identity_changed', 'git_object_missing'].includes(record.code)
@@ -917,7 +920,7 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'git_object_missing':
       return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),
-        user_message: `The Git object of ${record.path}${record.meta.blob_oid ? ` (blob ${record.meta.blob_oid})` : ''} is missing from the checkout of source ${source}, and its working-tree copy differs or is gone, so sync holds it and the rest of the source keeps syncing. Run git fsck in the checkout to see what is missing, restore it with git fetch (a partial or shallow clone) or from a backup, then run gbrain sync --source ${source} --no-pull.`,
+        user_message: `The Git object of ${record.path}${record.meta.blob_oid ? ` (blob ${record.meta.blob_oid})` : ''} is missing from the checkout of source ${source}, and its working-tree copy differs or is gone, so sync holds it and the rest of the source keeps syncing. Sync fetches nothing, so in a partial clone (git clone --filter) fetch the blob with git cat-file -p ${record.meta.blob_oid ?? '<blob>'} in the checkout or check the file out; otherwise run git fsck in the checkout to see what is missing and restore it with git fetch (a shallow clone) or from a backup. Then run gbrain sync --source ${source} --no-pull.`,
         why: 'An interrupted gc, a partial clone without its promisor remote or disk corruption can drop an object a commit still names; nothing is imported from a guess, and every sync re-tests the hold.',
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'path_not_utf8':
