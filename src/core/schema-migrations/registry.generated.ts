@@ -303,7 +303,11 @@ import { v299 } from './v299-access-member-sources.ts';
 import { v300 } from './v300-memory-proposals.ts';
 import { v301 } from './v301-member-email.ts';
 import { v302 } from './v302-link-transitions-source.ts';
-import { v303 } from './v303-cjk-bigram-fts.ts';
+import { v303 } from './v303-access-page-rules.ts';
+import { v304 } from './v304-access-owner-origin.ts';
+import { v305 } from './v305-access-lineage-designs.ts';
+import { v306 } from './v306-member-page-withdrawal-scope.ts';
+import { v307 } from './v307-page-label-guards.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -606,4 +610,8 @@ export const MIGRATIONS: Migration[] = [
   v301,
   v302,
   v303,
+  v304,
+  v305,
+  v306,
+  v307,
 ];
