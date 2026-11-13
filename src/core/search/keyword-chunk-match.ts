@@ -135,15 +135,17 @@ export function keywordCandidatesSql(ftsLang: string, c: {
   scope: { idx: number; many: boolean } | null;
   // Local fork patch (CJK bigram FTS): the chunk-driven probe must match the
   // same tsquery the caller ranks with (CJK bigram expression for zh queries).
-  tsquery: string = `websearch_to_tsquery('${ftsLang}', $1)`;
+  // Defaults to the upstream expression when omitted.
+  tsquery?: string;
 }): string {
   if (!c.excludePrivate || c.pageFiltered) return c.pageJoin;
+  const tsq = c.tsquery ?? `websearch_to_tsquery('${ftsLang}', $1)`;
   // chunk-visibility-ok: pageFilters carries buildVisibilityClause(..., { chunkAlias: 'cc' }), applied to every candidate in the page probe
   const chunkDriven = `SELECT p.id AS page_id, cc.id AS chunk_id, ${c.score} AS score
         FROM (
           SELECT cc.id, cc.page_id, cc.search_vector, cc.body_generation
           FROM content_chunks cc
-          WHERE cc.search_vector @@ ${c.tsquery} AND cc.modality = 'text' ${c.chunkFilters}
+          WHERE cc.search_vector @@ ${tsq} AND cc.modality = 'text' ${c.chunkFilters}
           OFFSET 0
         ) cc
         CROSS JOIN LATERAL (
