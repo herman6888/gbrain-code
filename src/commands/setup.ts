@@ -162,6 +162,8 @@ Flags:
                        people (2+ enabled members) refuses rather than write a connection bound
                        to nobody, unless this harness's entry or config mcp.stdio_member binds it.
   --members IDS        The people of --serves several, comma-separated (e.g. alice-example,bob-example).
+  --labelled-only      With --serves several: each member's key reads only pages labelled for
+                       that member (readable_by or a rule), never the owner's. Opt-in.
   --members-file PATH  The same, one id per line.
   --stdio-member ID    claude-code or codex: write serve --stdio-member ID into this harness's
                        MCP entry, so only its sessions read as ID (an enabled member, or one
@@ -270,6 +272,8 @@ interface SetupFlags {
   serves?: 'one' | 'several';
   members?: string;
   membersFile?: string;
+  /** GST-2670: --labelled-only, passed to access serves several. */
+  labelledOnly?: boolean;
   /** GST-363: written into this harness's MCP entry as serve --stdio-member; never into config. */
   stdioMember?: string;
   noStdioMember: boolean;
@@ -297,6 +301,7 @@ function parseFlags(args: string[]): SetupFlags | string {
   const serves = value('--serves');
   if (serves !== undefined && serves !== 'one' && serves !== 'several') return `unknown --serves '${serves}'; pass one or several`;
   if ((args.includes('--members') || args.includes('--members-file')) && serves !== 'several') return '--members and --members-file name the people of --serves several';
+  if (args.includes('--labelled-only') && serves !== 'several') return '--labelled-only applies to the people of --serves several';
   let stdioMember: string | undefined;
   try { stdioMember = parseStdioMemberFlag(args); } catch (e) { return `${(e as Error).message}; nothing was written`; }
   const noStdioMember = args.includes('--no-stdio-member');
@@ -356,6 +361,7 @@ function parseFlags(args: string[]): SetupFlags | string {
     ...(serves ? { serves: serves as 'one' | 'several' } : {}),
     ...(value('--members') !== undefined ? { members: value('--members') } : {}),
     ...(value('--members-file') !== undefined ? { membersFile: value('--members-file') } : {}),
+    ...(args.includes('--labelled-only') ? { labelledOnly: true } : {}),
     ...(stdioMember !== undefined ? { stdioMember } : {}),
     noStdioMember,
   };
@@ -1050,7 +1056,7 @@ async function runInstructionsOnly(flags: SetupFlags, out: Out): Promise<number>
   const turnHook = !off && !placed ? null : harness === 'hermes'
     ? (off ? removeHermesTurnHook({ hermesHome: dirname(target.path), dryRun: flags.dryRun }) : syncHermesTurnHook({ hermesHome: dirname(target.path), access, dryRun: flags.dryRun }))
     : harness === 'openclaw'
-      ? (off ? removeOpenclawTurnPlugin({ dryRun: flags.dryRun }) : syncOpenclawTurnPlugin({ access, dryRun: flags.dryRun }))
+      ? (off ? removeOpenclawTurnPlugin({ dryRun: flags.dryRun, workspace: flags.remove ? undefined : flags.workspace }) : syncOpenclawTurnPlugin({ access, dryRun: flags.dryRun, workspace: flags.workspace }))
       : isTurnRuleHarness(harness) ? turnRuleHookFor(harness, off, flags, projectDir, rerun.join(' ')) : null;
   // Loud failure: an accepted install whose per-turn hook does not load exits non-zero and names the harness's own check.
   // A 'print' outcome installed nothing and already names the step that does, so it is reported, not verified.
@@ -1070,6 +1076,7 @@ async function runInstructionsOnly(flags: SetupFlags, out: Out): Promise<number>
   if (skills && skillsOutcomeShown(skills)) say(out, describeSkillsBlockOutcome(skills, flags.dryRun));
   if (resolver) for (const line of describeResolverSetup(resolver, flags.dryRun)) say(out, line);
   if (skillPlugin) for (const line of describeOpenclawSkill(skillPlugin, flags.dryRun)) say(out, line);
+  if (harness === 'openclaw' && turnHook && !off) say(out, `  note     ${'route'.padEnd(7)} the per-turn rule is OpenClaw's primary route to the brain. Skills from \`gbrain skillpack scaffold --harness openclaw\` are an optional fallback: agents seldom open a listed skill on their own.`);
   if (cursorPins) for (const line of describeCursorPins(cursorPins, flags.dryRun)) say(out, line);
   if (check?.ok) say(out, `  verify   ${'turn hook'.padEnd(7)} ${check.message}`);
   if (mcp.setup === 'manual' && !flags.remove) say(out, `MCP: setup does not register ${adapter.label}'s MCP server. Follow ${adapter.guide} (one command), then start a new session.`);

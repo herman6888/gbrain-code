@@ -20,7 +20,7 @@
  *
  * Every other hold returns null: a held take, which owner-actions.ts refuses (`unavailable`), and an unmanaged brain,
  * a hold with no entity slug, or one whose page is missing (GBRA-190 G4 owns that class), which take its transactional
- * database-only release. A
+ * database-only release; on a strict source an unmanaged brain refuses `git_home_required` instead (GST-2692). A
  * deleted or private page refuses and the fact stays held; a segmented page over the ceiling, a malformed fence or a
  * row that no longer reads back refuse at preparation the same way.
  */
@@ -38,8 +38,10 @@ import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { prepareFenceFactAppend } from '../facts/fence-fact-append.ts';
 import { assertFactNotWithdrawn } from '../facts/single-prepare.ts';
 import { FENCE_SOURCE_DEFAULT } from '../facts/extract-from-fence.ts';
-import { parseFactsFenceFor, UNATTRIBUTED_MEMORY_SLUG, type ParsedFact } from '../facts-fence.ts';
-import { holdsInGit } from '../facts/held-fact-move.ts';
+import { isHoldingSlug, parseFactsFenceFor, UNATTRIBUTED_MEMORY_SLUG, type ParsedFact } from '../facts-fence.ts';
+import { sourceCanonicalGit } from '../persistence/git-door.ts';
+import { gitHomeRequired } from '../persistence/git-declared.ts';
+import { holdingHome, refuseUnheldFact } from '../facts/held-fact-move.ts';
 import { materializedPage, segmentedOverCeiling } from '../persistence/segmented-apply.ts';
 import { claimColumns } from '../facts/typed-claim.ts';
 import { getWriteGateHold, releaseWriteGateHold, type WriteGateHold } from '../write-gate-store.ts';
@@ -111,18 +113,27 @@ export async function releaseCell(engine: BrainEngine, hold: Pick<WriteGateHold,
  */
 export async function submitTrustRelease(engine: BrainEngine, holdId: number, by: string, config?: GBrainConfig,
   approved?: (hold: WriteGateHold, cell: ParsedFact | null) => Promise<boolean>): Promise<boolean | null> {
-  if (!(await managedPersistenceEnabled(engine))) return null;
+  const managed = await managedPersistenceEnabled(engine);
   const hold = await getWriteGateHold(engine, holdId);
   if (!hold || hold.kind !== 'fact') return null;
+  // GST-2692: on a strict source a release with managed persistence off refuses, never a database-only release.
+  if (!managed && await sourceCanonicalGit(engine, hold.source_id)) {
+    throw gitHomeRequired({ source_id: hold.source_id, slug: releaseTarget(hold)?.slug ?? UNATTRIBUTED_MEMORY_SLUG }, 'persistence_disabled', false);
+  }
+  if (!managed) return null;
   let target = releaseTarget(hold);
   let snapshot = target ? await engine.readPageSnapshot(target.slug, { sourceId: hold.source_id, includeDeleted: true }) : null;
-  // GST-2492 PR 2: on a strict source a fact with no entity, or whose entity has no page, is released onto
-  // memory/unattributed (a held row names its entity), so it is committed to Git before its database row.
-  if ((!target || !snapshot && target.mode === 'append') && await holdsInGit(engine, hold.source_id, str(hold.payload.entity_slug))) {
-    target = { slug: UNATTRIBUTED_MEMORY_SLUG, mode: 'append' };
-    snapshot = await engine.readPageSnapshot(UNATTRIBUTED_MEMORY_SLUG, { sourceId: hold.source_id, includeDeleted: true });
+  // GST-2492 PR 2: on a strict source a fact with no entity, or whose entity has no page, is released onto its holding page
+  // (memory/unattributed, or its folder's under a folder rule; a held row names its entity), so it is committed to Git
+  // before its database row.
+  const home = !target || !snapshot && target.mode === 'append' ? await holdingHome(engine, hold.source_id, str(hold.payload.entity_slug)) : null;
+  if (home && 'slug' in home) {
+    target = { slug: home.slug, mode: 'append' };
+    snapshot = await engine.readPageSnapshot(home.slug, { sourceId: hold.source_id, includeDeleted: true });
   }
-  if (!target || !snapshot && target.slug !== UNATTRIBUTED_MEMORY_SLUG) return null;
+  // GST-2676: a fact no holding page can carry (an exact page rule, an unreadable access state) refuses, never a database-only release.
+  if (home && 'refused' in home) await refuseUnheldFact(engine, hold.source_id, str(hold.payload.entity_slug)!, home.refused, false);
+  if (!target || !snapshot && !isHoldingSlug(target.slug)) return null;
   const { initializeLocalPersistence, requestPrincipalForContext } = await import('../persistence/page-mutations.ts');
   const { submissionAuthority } = await import('../persistence/authority.ts');
   const { admitWrite, getWriteRequest } = await import('../persistence/journal.ts');
@@ -203,13 +214,13 @@ export async function prepareTrustReleaseMutation(engine: BrainEngine, row: Writ
   const hold = await getWriteGateHold(engine, intent.hold_id);
   if (!current(hold)) throw decidedMeanwhile(intent.hold_id);
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
-  const firstHolding = !snapshot && row.slug === UNATTRIBUTED_MEMORY_SLUG && row.page_id === null && intent.mode === 'append';
+  const firstHolding = !snapshot && isHoldingSlug(row.slug) && row.page_id === null && intent.mode === 'append';
   if (!firstHolding && (!snapshot || snapshot.page.deleted_at || snapshot.page.id !== row.page_id)) {
     throw pageIdentityError(Boolean(snapshot && !snapshot.page.deleted_at), `The page h${hold.id} is released into was deleted or recreated; the fact stays held.`);
   }
   const p = hold.payload;
   const fact: NewFact & { valid_from: Date } = {
-    fact: String(p.fact ?? ''), kind: (str(p.kind) ?? 'fact') as NewFact['kind'], entity_slug: str(p.entity_slug) ?? (row.slug === UNATTRIBUTED_MEMORY_SLUG ? null : row.slug),
+    fact: String(p.fact ?? ''), kind: (str(p.kind) ?? 'fact') as NewFact['kind'], entity_slug: str(p.entity_slug) ?? (isHoldingSlug(row.slug) ? null : row.slug),
     visibility: p.visibility === 'world' ? 'world' : 'private', source: str(p.source) ?? `trust release h${hold.id}`, context: str(p.context),
     source_session: str(p.source_session), confidence: 1, valid_from: str(p.valid_from) ? new Date(String(p.valid_from)) : new Date(),
     valid_until: str(p.valid_until) ? new Date(String(p.valid_until)) : null, embedding: null, embedding_model: null, ...claimColumns(p as never),

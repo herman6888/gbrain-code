@@ -10,6 +10,448 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.721.0] - 2026-11-14
+
+**Deleting a private page no longer opens the pages derived from it: each page that was private only because of the deleted page now gets its own `visibility: private` label before the deleted page's row goes.**
+
+<!-- behavior-change: derived_origin_carry_private_gst2689 -->
+
+### Fixed
+
+- A summary whose `derived_from` names a private page, an atom extracted from a private page, and a synthesized concept built from such an atom read as private to remote callers even when their own label says world, because their origin is private. Once the origin's row was removed (an explicit `gbrain delete --purge`, or the purge after the 72-hour recovery window, including after a remote delete or a `git rm`), nothing kept them private any more, and every remote caller that is not the owner could read them through `get_page`, `get_versions`, `list_pages` and search.
+- Now gbrain gives each such page `visibility: private` first, as a label-only write. The page keeps its trust tier, no lowering proposal is filed, and on a brain with Git only the label line of its file changes. A soft delete (local or over MCP) writes the label once the delete committed, as a maintenance write (on a managed brain its batch names the delete's request id); if that write fails, the delete still goes through and the purge writes the label later. The delete's response is unchanged and names none of the labelled pages. Every purge writes the label again for each origin expired or expiring within a day before it removes any row, so an origin removed outside gbrain is covered from the next cycle.
+- Pages that are already private, pinned questions and pages that do not derive from the deleted page are never changed. A page that names readers (`readable_by`) and was hidden from them only through its private origin gets the label too and keeps its readers, so its listed readers still can't read it. The owner, a `granted_sources` credential and a listed reader read exactly the same pages as before.
+- When a label cannot be written (for example a file in the checkout that gbrain may not write), the deleted page is kept soft-deleted instead of purged. An explicit purge returns `purge_held`, the purge phase lists the page as `derived_origin_parked` and warns, and the new doctor check `derived_origin_parked` names the page with the derived page that blocks it and the reason. Once the cause is fixed, the next purge writes the label and frees the page, and the purge after removes it (a consented `gbrain pages purge-deleted --yes` does both, so its preview lists it). A page derived from it that is written while a purge runs is caught inside the purge's own transaction and holds the deleted page the same way, and a derived page that is itself soft-deleted holds it until it is purged or restored, so restoring it never brings it back readable.
+- A deleted page that is restored and later made world leaves its derived pages private until the owner relabels them. (GST-2689)
+
+**Searches stay within their four-connection limit, the extraction-lag check saves a database round trip, and four tests that failed now and then for reasons unrelated to the code under test now pass reliably.**
+
+### Fixed
+- One search or query can no longer hold a fifth database connection. Reads that turn off the query planner's JIT compiler or set a statement timeout used to take their own connection without waiting for one of the search's four slots. The projection readiness check is one of these reads, so a search running while any write was open on the database server could use five connections. These reads now wait for a slot like every other read. A read whose cancel signal fires while it waits now stops at once instead of waiting for another read to finish.
+- The extraction-lag check (used by `gbrain doctor` and the graph ranking) reads whether managed persistence is on at the same time as its config, not afterwards. On a remote database that saves one round trip.
+
+### Tests
+- The read round-trip test now holds each wave of queries until it settles, so it counts dependent round trips the same way however fast the database answers.
+- The status-mode server test no longer fails when the lock holder's process id happens to appear inside the server's random instance id. A process id in any other field still fails it.
+- Four HTTP-server end-to-end tests now remove the access members they add. Leftover members made a later test file's connection check fail.
+- The search connection limit test waits for background writes from its warmup search before it starts measuring, and checks that JIT-off and statement-timeout reads respect the limit.
+- The lock-wait sync test prints the rows that did not commit when it is about to fail, so a future failure names its cause.
+
+**On a source whose files live in Git, two paths no longer save a fact only in the database or drop it: a held fact the owner releases while managed persistence is off, and a commitment fact the Google loops job meets a passing database error on.**
+
+### Fixed
+- The Google open-loops job (`loops_extract`) now retries when saving a commitment's fact hits a passing database problem: a cancelled statement, a lock or serialization conflict, a dropped connection, or the write door giving up after its own retries (`write_interrupted`). Before, the job saved the open loop with no fact attached and moved on, so the fact for that commitment (for example "send alice-example the invoice summary by Friday") was lost. Now the job stops, the queue runs it again, and the retry saves both the fact and the loop that points at it. A write the door reports as still pending keeps the old behaviour, because it may still commit and a retry could save it twice.
+- On a source marked git-canonical (`canonical: git`, for example source-a), `gbrain trust release` of a held fact while managed persistence is turned off now refuses with `git_home_required` (reason `persistence_disabled`) and leaves the fact held, instead of writing it to the database with no file in Git. The refusal's fix previews turning managed persistence back on (`gbrain sources writer activate --confirm-quiesced --dry-run --json`); run the release again once it is on. Sources that are not git-canonical release exactly as before, and with `sync.write_through` off every write on a source stays database-only, the release included, on purpose.
+
+Facts that were dropped, or released database-only, before this fix are not recovered by upgrading. A dropped commitment fact comes back only if its email thread is extracted again; a fact already released database-only stays that way.
+
+## [0.60.720.0] - 2026-11-14
+
+**On a brain that serves several people, gbrain now counts the pages with no label, which every member's key can still read, and names the commands that close them; `--labelled-only` keeps members to the pages labelled for them.**
+
+### Added
+- **Open pages count (GST-2670).** A key bound to a member reads a page that has no label like any other key, so a chat export or mail import loaded before anyone named its readers is open to every member. gbrain now counts those pages, read-only, in the `gbrain access serves several` preview and receipt (also shown by `gbrain setup <harness> --serves several`), in `gbrain access serves`, in the new doctor check `open_shared_pages` and in `gbrain post-upgrade`. Each shows how many members' keys read them, the top folders, and the commands that label them, with the owner already in every reader list. A `visibility: private` page counts as open only when remote private pages are on for this brain or a reading member's grant opens its source. Doctor warns while DM, chat, conversation or mail pages are open and reports other open folders as information. The count changes nothing, never changes an exit code, and doesn't run on a one-person brain. `gbrain access serves --no-open-pages` skips it. See docs/guides/access-designations.md#pages-every-members-key-can-read.
+- **`--labelled-only` (GST-2670).** `gbrain access serves several --members <ids> --labelled-only` and `gbrain setup <harness> --serves several --labelled-only` keep each member's key to the pages labelled for that member. It is opt-in and never applies to the owner, so with the owner in the roster the run is BLOCKED before anything is written. Without the flag, no existing key reads anything different.
+
+**A storage manifest: agents can register what they archived to object storage and find it again later.** A new `storage` source holds one validated card per archived item: what it is, where every copy lives (store, bucket, path, restic repository and snapshot, size, file count, hash and its kind, when it was verified), where it came from and which skill restores it. `gbrain storage-register` adds a card (from stdin or `--card`) and never overwrites one; `gbrain storage-update <id> --expected-revision <rev>` patches a card bound to the revision it read, keeps the page's access labels and records restores newest first; `gbrain storage-find "<words>"` ranks the exact id, then an exact alias, then the cards holding most of the words, and a miss lists the closest cards; `gbrain storage-get` and `gbrain storage-list` read. On a brain with a Git checkout, `gbrain storage init` hosts the shelf in its own repository first (preview, then `--expect <plan_hash>`; it needs managed persistence), so each card is a commit before it is indexed. A repo-less brain gets a database-only shelf on the first register.
+
+Cards never carry credentials or commands. A card is refused when any field looks like a secret, an environment assignment, a credential variable, a URL with user info or a presigned URL, or when any key is named `command`, `cmd`, `script`, `exec`, `shell` or `instructions`; object keys are checked too, a value under a key named for a credential refuses wherever the word sits (`password`, `restic_password`, `token_value`, `token_count`, `application_key`) unless the key ends in a suffix that names where something lives (`_env`, `_file`, `_path`, `_name`, `_ref`, `_id`, `_var`, `_variable`), and the refusal says to rename a key that holds no credential that way, and the refusal never echoes the value. A first shelf creation that stopped part way is finished by the next register or `storage init`, and an archived shelf refuses until it is restored. A restore is `{ skill, args }` with flat scalar arguments. gbrain stamps `registered_by` and `origin` itself, and holds no store credentials.
+
+The shelf is written only through the storage verbs. `put_page`, `remember` and every other page writer are refused `storage_source_managed` there, a request parameter cannot open the door, register and update run only from the trusted local CLI, and a dream cycle or enrichment run scoped to the shelf skips it. The source is not federated, so a remote connection reads cards only when its grant names `storage`.
+
+**Agents find the shelf, and older archive records move onto it.** The brain-first lookup table every harness reads gains one row, "Find something archived to B2, Supabase or S3" (`gbrain storage-find` / `storage_find`), and a new `storage-manifest` skill says when to register, to find before restoring, to restore through the agent's own restore skill with the card's `restore.skill` and `restore.args`, and to record the restore with `gbrain storage-update`. `gbrain storage adopt` moves interim records (`stored-object` pages under `storage-manifest/` holding their record as JSON under `## Record`) onto the shelf: the preview shows each mapped card and every field a card refuses with its reason; `--apply --expect <plan_hash>` registers each card with `origin: adopt` and tags the original `storage-manifest-adopted`, deleting nothing; a record whose page a remote (MCP) client last wrote is blocked and never registered, so only records written on this machine or by sync become cards; each card takes its original's access labels (`visibility`, `access`, `confidentiality`, `readable_by`, with `readable_by` narrowed to the readers of every folder rule over the original), so a card is never read wider than its original, and an original whose readers and folder rules share no reader, or whose rules are still being applied, is blocked; and refuses until each refused field is named with `--drop-field` (a credential-shaped value always refuses); `--finalize` previews, then soft-deletes the adopted originals only when every card matches its original (a restore recorded since is not a difference); the preview names any other section an original holds and flags one longer than the 64 KiB it reads, and an original edited after the preview, even just before its delete, refuses. `gbrain storage export --jsonl` and `gbrain storage import --jsonl <file>` (preview per line, then `--apply --expect`) rebuild a shelf from a file, registering missing cards with `origin: import` and never overwriting a differing card; each line carries its card's access labels under `labels` and import restores them (a card on the shelf with other labels is a conflict); export leaves out and names a stored card that fails the card rules. Applies are idempotent and report `side_effects` and, when a run stops part way, the command that finishes it; a write gbrain accepted that has not committed yet is listed under `pending` with its receipt and the `gbrain write-request <id>` poll (exit 10), never reported as no change. The new doctor check `storage_manifest` warns about cards that fail the card schema, interim records not adopted yet and a hosted shelf whose directory is gone. On a brain with a Git checkout, adopt and import wait for `gbrain storage init`.
+
+### Itemized changes
+
+- `src/core/storage-manifest/adopt.ts`, `src/core/storage-manifest/jsonl.ts`, `src/commands/storage.ts`: `gbrain storage adopt` (preview, apply, finalize) and `gbrain storage export|import --jsonl`, each preview-first and bound to its plan_hash (a stale one refuses `preview_changed`). `schema.ts` exports the credential-shape rules, the command-key test and the card keys adopt maps onto, plus `cardContent`/`cardDigest` for comparing copies; `source.ts` gains `shelfWritable` (the refusal a storage write would get, without creating anything); `find.ts` gains `readShelfCards`.
+- `src/commands/doctor/checks/storage-manifest.ts`, `src/commands/doctor/registry.ts`, `src/core/doctor-categories.ts`: the read-only `storage_manifest` check (brain category), `not_applicable` with no shelf and no interim record. Doctor goldens regenerated for the new check.
+- `src/core/error-registry.ts`, `docs/guides/write-refusals.md`, `docs/guides/error-codes.md`: `storage_adopt_field_refused` (consent: the user agrees to leave refused fields out) and `storage_adopt_unverified`; `storage_record_invalid` gains reasons `no_record`, `duplicate_id`, `access_unpreservable`, `access_pending`, `labels` and `remote_written`.
+- `skills/conventions/brain-first.md` (and its generated copies in `AGENTS.md`, `INSTALL_FOR_AGENTS.md`, `skills/RESOLVER.md`, the bootstrap template and the plugin trees), `skills/storage-manifest/SKILL.md`, `skills/RESOLVER.md`, `skills/manifest.json`, `openclaw.plugin.json`: the lookup row and the skill.
+- `docs/guides/storage-manifest.md`: the guide (verbs, repo-less and Git-checkout brains, adopt, export and import, doctor, privacy).
+- Tests: `test/storage-manifest-adopt.test.ts`, `test/storage-manifest-jsonl.test.ts` and `test/doctor-storage-manifest.test.ts` (PGLite, repo-less) and `test/storage-manifest-adopt-hosted.test.ts` (managed PGLite with a Git checkout).
+- `src/core/storage-manifest/` (`schema.ts`, `door.ts`, `source.ts`, `find.ts`) and `src/core/ops/storage-manifest.ts`: the card schema and secret checks, the write door, the source lifecycle (`storage init`), keyless ranked lookup (exact id, `page_aliases`, word matches, `pg_trgm` closest cards) and the five ops `storage_find`, `storage_get`, `storage_list`, `storage_register`, `storage_update`.
+- `src/core/persistence/page-mutations.ts`, `src/core/persistence/memory-mutations.ts`: the page door and `remember`/`forget` refuse writers other than the storage verbs on a source with `role: storage_manifest`; the owner's import of commits already in the hosted repository still syncs.
+- `src/core/cycle.ts`, `src/commands/enrich.ts`: a cycle scoped to the storage source returns `skipped` with reason `storage_manifest_source`; enrichment considers no card there.
+- `src/core/source-resolver.ts`: the hosted shelf never counts as the sole non-default source, so after `storage init` bare `put`, `capture` and `sync` keep routing where they did before. `src/core/persistence/preadmit-cache.ts` caches the page door's source read with its new `role` column.
+- `src/core/error-registry.ts`, `docs/guides/write-refusals.md`, `docs/guides/error-codes.md`: `storage_source_managed`, `storage_manifest_missing`, `storage_record_invalid`, `storage_record_secret`, `storage_card_exists` and `storage_revision_conflict`, each with its recovery path. Remote register and update refuse with the shared `trusted_local_only`.
+- `src/commands/storage.ts`: `gbrain storage init`; the help separates the tiers report (`status`) from the shelf verbs.
+- Goldens: `test/fixtures/goldens/cli/tools-json.json` gains the three read tools; `test/fixtures/goldens/exports/types.json` gains the new error codes in the `canonical` union and lists `ThinkSynthesisStatus` in a new order (the new schema module declares the `not_json` literal first; the type is unchanged).
+- Tests: `test/storage-manifest.test.ts` (PGLite, repo-less) and `test/storage-manifest-hosted.test.ts` (managed PGLite with a Git checkout).
+- `src/core/schema-pack/base/gbrain-base-v2.yaml`: version 1.6.0 declares `stored-object`, so cards never read as an undeclared type and `unify-types` leaves them alone (`test/schema-pack-stored-object-type.test.ts`; doctor goldens regenerated for the new pack identity).
+- `src/core/engine-sql/sources.ts`: the local-path source list (autopilot's fan-out, `cycle_freshness`) leaves out the hosted shelf, whose cycle is always skipped. A register that loses a same-id race is refused `storage_card_exists`. `storage-update` rewrites a card whose stamped fields were removed by hand instead of failing.
+
+<!-- behavior-change: storage_shelf_stored_object_type_8894 -->
+
+**A summary page built from a private note now stays hidden from other people after that note is renamed and another page takes its old name.**
+
+### Fixed
+- **Concepts from renamed private notes (GST-2687).** gbrain writes short claim pages (atoms) from your notes, then groups atoms into topic pages (concepts). When a private note was renamed and a later rename gave its old name to a different, public page, the concept built from that note's atoms could be read by people other than the brain owner through `get_page`, `search`, `query` and `list_pages`. The atoms themselves were already hidden in this case; the concept is now hidden the same way, because gbrain follows the note's rename history to the private page it moved to. The brain owner, trusted local commands and a credential allowed to read private pages in that source still read it, exactly as before. Nothing is rewritten: the rule is checked when a page is read.
+- **Doctor and repair.** `gbrain doctor`'s `derived_visibility` check now counts such atoms (`looser_atoms`) and concepts (`looser_concepts`). `gbrain repair visibility` now follows the same rename history, so it previews them and stamps them `private`; before, it judged them by the public page that took the old name and could stamp an unlabelled one `world`.
+- Schema migration v311 adds the database function `gbrain_concept_inputs_private`, which holds this check so search stays fast on large brains. It changes no rows. On a brain where the migration has not run yet, reads keep working and still hide these concepts.
+
+## [0.60.719.0] - 2026-11-14
+
+**A brain owner can now make member CLIs read-only: with `access.enforced_member_writes` set to `refuse`, every write under `GBRAIN_ENFORCED_MEMBER` refuses.**
+
+### Added
+- `gbrain config set access.enforced_member_writes refuse` makes enforced member mode refuse `put`, `link`, `unlink`, `tag`, `untag`, `timeline-add`, `remember`, `edit_page`, `append_page` and `git commit-push` with named paths, with exit 3 and reason `writes_off`. `refuse_pages` refuses the same page writes and leaves named-path `git commit-push` to its usual checks, for a host whose member turns still commit files. The refusal comes before any page, path or source lookup, so it reads the same for a new, readable or hidden target and names none. The key lives in the brain's database, so it works on a brain with no repository, and a member can't change it because `config` is refused under the mode. Unset or `checked` keeps today's checked writes; any other value, or a config read that fails, counts as `refuse`. Reads, a CLI without the variable, `git commit-push --pull` and `--dry-run`, `sync`, `sources refresh` and `write-request` are unchanged. See docs/guides/enforced-member.md#writes-off.
+
+**Upgrading from an older release (about v0.60.150 to v0.60.248) no longer ends in exit 1, and doctor no longer reports a stopped serve as a second running build.**
+
+### Fixed
+- `gbrain upgrade` run from an older release finishes with exit 0 again. Those releases load one more file from the new install into the old process after the swap, and that file pulled in code needing functions the old process didn't have, so the upgrade printed an `internal_error` and exited 1 even though the new binary and its migrations were in place. That file now loads nothing but the line it prints (GST-2688).
+- `gbrain doctor`'s `runtime_build_skew` check no longer counts a process that has already exited as a running build. An older serve stopped with SIGTERM can leave its heartbeat row looking fresh for up to 30 seconds; a row whose process the check can prove is gone (same machine boot, pid gone or reused) is now skipped, while a row it can't prove dead still counts (GST-2688).
+
+**On a source whose pages are canonical in Git, a fact the Google loops extraction saves for a person or company with no page is no longer thrown away when the database has a brief hiccup while gbrain prepares the write.**
+
+### Fixed
+
+- On a `canonical: git` source, a fact for an entity with no page is kept on a holding page (`memory/unattributed`, or its folder's holding page under a folder access rule) until the entity's page exists. Choosing that page takes one read of the access rules. If that read hit a passing database error while the write was being prepared (a cancelled statement, a stale cached plan, a lock or serialization conflict, a dropped connection, a pooler's client limit), gbrain treated it as "the access rules cannot be read" and refused the write for good with `access_policy_pending`. For the Google loops extraction, the only writer on that path, the commitment fact was dropped while the loop row stayed, so the open loop pointed at no fact.
+- Now that error is handed back to the write queue, which releases the write and prepares it again, the same way it already retries every other passing database error. The fact lands on the holding page with its entity, committed to Git, and the loop row points at it. A statement that keeps getting cancelled still stops after `persistence.max_transient_retries` tries and ends `write_interrupted` with nothing written.
+- Real refusals are unchanged. An exact page rule on the entity still refuses `git_home_required`, and an access state the database role really cannot read (for example permission denied on the access tables) still refuses `access_policy_pending`.
+- A hiccup on the same read earlier, while the loops job first hands the fact to gbrain, still loses that one fact as it did before. The loops job keeps the loop row and logs `fact projection failed`.
+- Facts dropped this way before the fix are not recovered by this change.
+- On the same kind of source, an owner's `gbrain trust release` of a held fact for an entity with no page used to report `released` while saving the fact only in the database, with no row in Git, whenever no holding page could carry it: an exact page rule on the entity, or access rules the database role could not read. Now the release refuses with nothing written and the fact stays held: `git_home_required` names the entity's page to create, and `access_policy_pending` asks you to retry. Creating that page does not unlock the release, because a page under its own rule counts as private for a release (`page_not_found`); drop the hold and remember the fact on the page instead. Facts released this way before the fix are not changed; `gbrain repair facts-home` lists them as `folder_restricted`. (GST-2676)
+
+**When a shallow checkout hides a folder's access-rule history, the first import now refuses with a code and the exact command to fix it, `gbrain access rule migrate` moves rules between git and the database, renamed pages keep their atom lineage, connection strings lose their password whatever the scheme, and a policy-only mirror no longer trips the git convergence check.** Community wave W-A1, second part: bug reports verified on master and fixed with our own code.
+
+### Fixed
+- **First access-rule import (GST-2638).** The first import of a source's access rules refused when it could not read their git history. It now tells a missing history apart from an unreadable one. An unreadable history refuses with the new code `access_policy_history_unreadable`, and the fix it names is `git -C <source root> fetch --unshallow` and then the same command again. A plain sync on a shallow checkout whose rules do have committed history still fails closed. `gbrain access rule migrate --to git|database` moves the rules from one store to the other, the preview shows when only the owner can read pending pages, and the command exits 1 when the result would be invalid.
+- **Policy-only mirrors (GST-2634).** `gbrain doctor`'s git_convergence check no longer flags a source whose mirror holds only access policy.
+- **Ingest refusals (#8982).** A refused `POST /ingest` now carries a code, a fix and a docs link.
+- **Renamed pages, config secrets and root metadata deletes (#8920).** When a later rename onto an old slug drops its alias, an atom is still judged by the private page its origin moved to. A concept is still judged as before: by its input atoms and their origins' rename aliases only. Config secret keys are redacted, and the password in a connection URL is removed for any scheme. Deleting a root metadata file publishes the change to the database only.
+
+<!-- behavior-change: access_first_import_history_gst2638 -->
+
+### Name the room on the CLI, and think answers and writes carry room marks too
+
+**`--room <list>` now works on every gbrain operation command, and `think`, `put_page` and `remember` answers are marked for the room like reads are.** A harness that runs gbrain as a command, or a person checking what a group chat could see, gets the same marks an MCP caller gets, and the agent writing into a room can tell which parts of a synthesized answer came from pages the room cannot read.
+
+- `gbrain <command> --room alice-example,group:team-a` prints exactly what the command prints without it. With `--json` every item carries `room_access` and the document carries `_meta.room` (a list becomes `{ results, _meta }`); without it stderr names what the room cannot read. The local CLI marks the brain owner's view, or the member `--as` names; with no owner set, every item is unknown and the notice says to run `gbrain access owner set`.
+- A trailing `--room` with no value is never dropped. The command runs, every item is marked unknown (`invalid`), the degraded stamp shows and it exits 0.
+- It works through a running `gbrain serve` that owns a PGLite brain (the owner marks the answer) and on a thin client (sent as `_meta.room`). A host or owner that predates room marks leaves every item unknown (`not_supported`).
+- A `think` answer is marked at the strictest class of everything its synthesis retrieved or was shown (the anchor and the graph pages its prompt names, each under its own source); an answer built partly from takes or a calibration profile, or with no recorded evidence, is unknown. `put_page` and `remember` mark the page or fact they wrote and are never stamped degraded for it, so a committed write never reads as one to retry.
+- The shipped access-policy and agent templates now say how an agent acts on its owner's own turn in a group chat (at the owner's scope, written for the room, with truly private material offered in a private chat and never a refusal; everyone else is answered at the group's level) and that a send the principal asks for in their own verified message goes out as asked, with no approval phrase or draft-first step. Existing installs keep their own files.
+- Guide: [docs/guides/rooms.md](docs/guides/rooms.md).
+
+<!-- behavior-change: room_cli_think_writes_gst2639 -->
+<!-- behavior-change: owner_turn_sends_templates_gst2656 -->
+
+## [0.60.718.0] - 2026-11-14
+
+**Three ways a commit could reach the remote past the push secret scan are closed, and the scan can no longer be skipped.** In a managed root that sits in a subfolder of its repository, a commit could change that root's own `.gbrain-scan-allow` (for example to allow every path) and be pushed along with the secret it hid; it is now held for review like one at the top level. A strict (`canonical: git`) source's commit is now trusted only when its files are exactly what gbrain wrote, so anything a Git clean filter added is scanned. Git replace refs can no longer slip files into a page-write commit the scan trusts. `commitAndPush` also lost its unscanned mode, so no caller and no push handed over from a busy publish lock can publish without the scan; it reads only the commits the remote lacks, fetching a missing remote-tracking branch first.
+
+<!-- behavior-change: managed_push_scan_every_publish_gst2650 -->
+
+### Fixed
+- In a managed root below its repository's top level, the allowlist's path globs match paths relative to that root.
+- A strict-source commit made before this release that is still unpushed is scanned once when it is pushed.
+- A page-write commit whose staged file another process reset at the same moment is no longer reported as committed with the old content; the write fails and is retried.
+- The shared-checkout guide says that an uncommitted `.gbrain-scan-allow` is honoured, because it is the user's own answer to the scan.
+
+**On a source whose pages are canonical in Git, a fact the Google loops extraction finds for an entity with no page that an exact page rule names is now refused before anything is stored, the way `remember` already refused it.**
+
+### Fixed
+
+- On a `canonical: git` source, a commitment fact for an entity with no page under an exact page rule (`gbrain access rule add --slug people/bob-example --readers alice-example`) used to be stored in the database only, with no file or commit holding it, so a rebuild from Git lost it. Once `memory/unattributed` existed, the same write was refused instead, with a message that named `memory/unattributed` rather than the entity. The write is now refused `git_home_required` (reason `facts_lane`) before any row is written, and the message and fix name the entity's page to create. An access state the database role cannot read refuses `access_policy_pending` (retry), and that message now names the entity too.
+- The loops job still records the loop. Its log line reads `[loops_extract] fact projection failed … (git_home_required)` (or `(access_policy_pending)`) and names the entity's page, so an operator can see which page to create.
+- Sources that are not strict, brains with no Git repository, and fact writers that do not keep a fallback entity behave as before.
+- Facts an earlier version already stored this way are untouched: `gbrain repair facts-home --source <id>` lists them as `folder_restricted` (`page_rule`) and its apply leaves them; creating the entity's page lets the `extract_facts` upkeep step fence them.
+
+<!-- behavior-change: strict_fallback_refusal_gst2635 -->
+
+## [0.60.717.0] - 2026-11-14
+
+### Saving a fact to a holding page is faster and keeps less history
+
+**Saving a fact to a holding page (memory/unattributed, or a folder's holding page) no longer slows down and fills the database as the page grows (GST-2497).** Each save used to read the page's whole facts table about seventeen times and store another full copy of the page, so a page with thousands of facts took over a second per save and every save added a copy of it.
+- One save now reads the table at most three times. A parse of a given table is reused, and every caller gets its own copy.
+- A holding page keeps its newest five saved versions, the way large pages already do. Every fact row stays, the page still holds every row, and Git keeps every state where the brain has a repository. An older holding page sheds extra versions in batches of at most 100 on its next saves. `get_versions` and `gbrain revert` see only the five; an `as_of` read of the page says its history is incomplete, and `gbrain repair unwithdrawn-facts` lists that page's candidates as ambiguous (`--include-ambiguous` restores them).
+- After a sync, the held-fact move no longer plans a move on every sync when a folder rule covers a holding page but not the entity of a row on it. A rule that narrows a held row below its holding page's readers still moves it right after the sync.
+- On Postgres, the held-fact move's plan reads the write-through setting under the same deadline as its other reads, so a session holding the config table no longer keeps a sync past its preparation budget.
+
+<!-- behavior-change: holding_page_versions_gst2497 -->
+
+### The owner can ask a shared agent in a group chat and still get the whole answer
+
+**A harness can now tell gbrain which group chat an answer goes into, and gbrain marks every page and fact with whether the people in that chat could have read it.** The owner of a brain who asks their agent something in a team chat should get the same work as in a direct message, but the agent also needs to know what not to repeat in front of the room. Declaring the room does exactly that and nothing more. The read is never refused, shortened, reordered or failed because of it, and a call with no room returns what it always did.
+
+- Declare the room with the `X-Gbrain-Room` header (`gbrain serve --http`) or request-level `_meta.room`; a harness that can set neither may pass a `room` tool argument once `whoami` shows `features.room: true`. Entries are member ids, `group:<id>` or `guest`.
+- Each item in `get_page`, `search`, `query`, `list_pages`, `find_pages`, `get_chunks`, `get_timeline`, `get_backlinks`, `recall` and `entity` answers, each hot-memory fact and each saved fact a search returns (also shown on its line of the saved-facts block) carries `room_access`: `{readable: true}`, `{readable: false, reason}` (`readers`, `folder_rule`, `labelled_only`, `private_label`, `derived`, `personal_source`) or `{readable: "unknown", reason}`. `_meta.room` sums it up. A link, a timeline row or an entity-card fact is readable only when the room can read every page it depends on.
+- The `room_above_level` notice tells the model to use those items for the work, keep them out of the reply unless the ask needs them and offer them in a direct message. `room_hints_unavailable` says when the room could not be judged within 3 seconds or at all (the answer still goes out whole and on time, every item marked unknown, with the degraded stamp), and `room_conflict` says when a `room` argument disagreed with the harness; an argument can only add people.
+- The owner's own credential needs no `may_act_for` to declare a room, because a room only adds marks; any other member's credential needs `may_act_for` covering the room. Each marked call writes a `room_marked` row to the audience audit log with the room's principals and the counts, never page names or content.
+- No setting, no migration, and it works the same on a repo-less brain. Guide: [docs/guides/rooms.md](docs/guides/rooms.md).
+
+<!-- behavior-change: owner_room_marks_gst2639 -->
+
+## [0.60.716.0] - 2026-11-14
+
+**Model-written Life Chronicle events no longer read as your own notes after a trust claim, legacy bearer tokens keep their tools when the default MCP surface is narrowed, every way a page is hard-deleted now clears what the page left in six side tables, the secret scan catches passwords in escaped JSON and URL-encoded values, and the drift report records where it came from.** Community wave W-A1: bug reports verified on master and fixed with our own code.
+
+### Fixed
+- **Trust claim and legacy chronicle events (#9284).** `gbrain trust claim-sources` lifted legacy Life Chronicle event pages (`captured_via: life-chronicle:auto`) to "your notes", even when the page they summarise is an imported third-party email, so remote agents got a model summary of a stranger's text unquoted. The chronicle capture kind is now capped at agent_written, and a claim never puts an event above its depth page's tier, including a depth page the same claim classifies for the first time. `--relower --source <id>` can lower what a claim lifted even after `sources set-trust` ended that claim. Lowering never raises a row and never changes who can read a page. Rows already lifted change only when you run the relower; `gbrain doctor` counts them and names the dry-run command.
+- **Legacy bearer tokens and `mcp.default_surface_dcr` (#9266).** Setting the DCR default surface also narrowed legacy bearer tokens, which have no client row to pre-seed, so they lost tools their grants allowed. Legacy tokens now keep the server surface (still bounded by their scope, source and operation grants, and still clamped by `GBRAIN_MCP_FORCE_SURFACE`); OAuth clients with no surface row still get the default. Doctor and the advisor already reported it this way.
+- **Purge leftovers (#9146).** Only `delete --purge` removed a page's proposed takes, open loops, core-edit notice text, aliases, redirects and rename rows. Tombstone expiry (including after a managed connector delete), the batch delete connectors use and a restore that replays a purge now remove them too, as does source removal for the two tables that did not cascade. Write-gate holds go with the page, except a hold that arrived, or was re-opened by the same content arriving again, after the soft delete, which is a new pending write and stays until its own disposition. Works the same on brains with no repository.
+- **Secret scan (#8265).** The high-entropy assignment detector missed a password whose key quote is escaped (JSON inside a JSON string) and one after a URL-encoded `%3D`/`%3A` separator. Both are caught, ordinary query strings and encoded URLs are not, and an encoded URL that carries a username and password still is. New transcript imports redact both shapes; pages imported before are not rewritten, so `gbrain doctor` asks once for a read-only, model-free transcript re-audit that lists them.
+- **Drift report provenance (#9208).** The dream drift phase wrote `reports/drift-<date>` with no derivation, so it was stored at tier unknown with no origin. It now records a `derive:drift` origin and takes the lowest tier of the pages, takes and timeline entries the judge read, capped at agent_written, with each of them recorded as an input.
+
+<!-- behavior-change: chronicle_events_trust_cap_9284 -->
+<!-- behavior-change: audit_secrets_escaped_encoded_8265 -->
+
+## [0.60.715.0] - 2026-11-14
+
+**Skills and harness: skills that match the CLI and update safely, OpenClaw and claude-cli fixes, and skill resolver additions.** This release carries three PRs: #8918 (with #8190 and #8353), #8931 (with #8947) and #9095.
+
+### Skill checks, safe skill updates, the OpenClaw route and provider fixes (#8918)
+
+**Skills can no longer drift from the CLI or grow without a reviewer seeing it.**
+
+Every `gbrain ...` invocation a bundled skill shows now runs through the dispatcher's own subcommand and unknown-flag checks in CI, and every operation-shaped `tools:` entry must be a real operation. A PR that renames a command or flag fails until it updates the skills that name it, with the file, line, nearest valid name and the edit to make. Each SKILL.md over 16 KB has a size ceiling in `skills/skill-budgets.tsv` (today's size plus 10%), new skills stay within 16 KB and descriptions within 1 KB. `CONTRIBUTING.md` gains "Changing a skill", the update ladder adapted from skill-diet (MIT): fix it below the skill first, edit the existing line instead of appending, update the skill in the same PR as the code, and record `Skill-size:` before and after in the commit message.
+
+#### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A skill shows `gbrain config sett ...` or `gbrain doctor --jsn` | passed CI; an agent following it got an error | `bun run check:skill-health` fails with the nearest valid name |
+| A skill declares a `tools:` entry that is not an operation | passed | fails with the nearest operation |
+| A SKILL.md grows past its ceiling, or a new one passes 16 KB | passed | fails; raising a ceiling is a reviewer-visible edit |
+| `skills-commit-gate.sh` | four checks | also runs the skill health guard and prints `Skill-size:` lines for staged skills |
+
+**Installed skills get the same health check at runtime.**
+
+`gbrain skillpack health [<skill>]` checks the skills an agent actually loads (the harness or workspace skills folder, else the bundled skills) for size against budget, growth past 10% over the last diet, description size, missing triggers, and `gbrain` commands, flags or tools this gbrain does not have. Each finding names what it saw, what it expected, the fix (for an unedited copy of a bundled skill, `gbrain skillpack reference <skill>` first) and a verify command. It reads files only, so a brain with no git repository gets the same report. Folders without a skills manifest or `skills.lock.json` are checked only for copies of gbrain's bundled skills.
+
+| Situation | Before | Now |
+|---|---|---|
+| An installed skill still shows a flag a newer gbrain removed | an agent following it got an error | `gbrain doctor` warns (`skill_health`) with the line and the fix |
+| An installed skill grew well past its last diet | nothing reported | `gbrain skillpack health` reports it; doctor shows it without warning |
+| `gbrain maintain`, `gbrain skillpack-check` | no skill information | one-line skill health summary (`skill_health` in skillpack-check's JSON) |
+
+**Installed skills you never edited can take gbrain's current version whole, and that update never overwrites a skill you edited.**
+
+`gbrain skillpack reference <name>|--all --update-untouched` replaces a skill only when every one of its files still matches what gbrain installed. Scaffold, sync and harness installs now record the sha256 of each skill file they write, per skills root. A skill with any edited file, a pinned skill (`gbrain skillpack pin`), or a file with no recorded base that matches no released version is skipped whole and its diff is printed. Installs from before bases were recorded can opt in with `--accept-historical` when every file equals a released version listed in the new `skills/skills.lock.history.json`. Every update writes a journal and backups to `~/.gbrain/skillpack-backups/<id>/` before it changes anything, rehashes each file right before replacing it, and runs the conformance, trigger and resolver checks; a failure rolls back only the files that still hold the update's bytes. `gbrain skillpack restore <id>` undoes an update and refuses files you changed since, unless you name them with `--skip`. It never prompts (`--dry-run` is the preview), works the same on a brain with no git repository, and `gbrain upgrade` writes no skill files.
+
+#### Skill updates
+
+| Situation | Before | Now |
+|---|---|---|
+| You want gbrain's new version of skills you never touched | `--apply-clean-hunks` applied hunks two-way and could not tell your edits from gbrain's | `--update-untouched` replaces only skills whose every file still matches the install |
+| A skill you edited or pinned | `--apply-clean-hunks` could overwrite it hunk by hunk | skipped with `local_edits` or `pinned` and its diff |
+| An update fails a check or the process dies mid-update | — | rolled back per skill; doctor reports `skillpack_update_incomplete` with the restore command |
+| Exit code of an update | — | 0 nothing failed, 1 with `--fail-on-skipped` when a skill was skipped, 2 on a failure |
+| `~/.gbrain/skillpack-state.json` | schema v1 | schema v2 with per-skill bases and pins; a v1 file still loads |
+
+#### OpenClaw route
+
+**On OpenClaw, every skill gbrain installs now loads in one read, and setup and the install docs name the per-turn rule as the primary route, with skills as the fallback.**
+
+OpenClaw serves a skill only whole. A SKILL.md larger than one read (64,000 characters on a model with 200k+ context, 32,000 at 100k to 200k, 16,000 below that, and a 32,768-byte page when the context window is unknown) gets "cannot be partially served" and nothing else. `company-brainify` (37 KB) is trimmed to 30 KB with the same steps, gates and checks. A unit test now fails when any SKILL.md that `gbrain skillpack scaffold --harness openclaw --all` installs passes 32,000 bytes, or when anything gbrain writes for OpenClaw names `skills_read`, OpenClaw's deferred skill tool, which fails when called directly. In harness-evals, a listed skill was followed on 1-3% of turns and a per-turn rule on 97-100%. `gbrain setup openclaw` already installs that rule; it now says the rule is the primary route, `skillpack scaffold --harness openclaw` says its skills are the fallback, and INSTALL_FOR_AGENTS.md and docs/mcp/OPENCLAW.md lead with the rule.
+
+#### Providers and skills
+
+**Six provider and skill bugs fixed (#8142, #8143), and Particle joins as a chat provider.**
+
+- **Particle is a chat and expansion provider.** Set `PARTICLE_API_KEY` and use `particle:particle-1` (the id Particle's responses report, `particle-ai/particle-1`, works too). It runs over Chat Completions at `https://api.particle.ai/v1`, with tools, the subagent loop, prompt caching and a 1,048,576-token context; point `provider_base_urls.particle` at `https://us.api.particle.ai/v1` to keep traffic in the US. Spend caps price it at $0.25 input and $1.00 output per million tokens, with reasoning billed as output; cached input (listed at $0.03) is priced at the input rate until that rate is verified. A `thinking: 'off'` call such as an eval judge sends `reasoning_effort: 'none'` and keeps its requested output cap, and reasoning text never becomes answer text. No default model changed.
+- **A System One provider that refuses every call no longer reads as "budget exhausted" (#7272).** A decide call the provider refuses with a 4xx (402 billing, 401/403 auth, 400/404 model) never ran, so it now costs $0. Before, each refusal was charged its estimate, the daily budget filled with calls that never ran, and `decide status`, doctor and every slot reported `budget_exhausted` instead of the provider error. A 429, 5xx, timeout or transport failure keeps its charge.
+- **An embedding migration keeps a provider URL set with `gbrain config set` (#7666).** After the switch committed, the migration rebuilt its AI gateway from file and env config only, so a `provider_base_urls.<provider>` override in the database (a local Ollama on a non-default port) vanished and every re-embed failed with `Cannot connect to API`. The gateway now keeps the database overlay; file and env still win per key, and nothing from the database is written to the config file.
+- **A `deepseek:` model pointed at another OpenAI-compatible endpoint gets room to think (#7662).** With `provider_base_urls.deepseek` on another origin (Ollama Cloud, a proxy), gbrain still sent DeepSeek's thinking switch and the small judge cap that assumes it works, so a model that kept thinking used the whole cap and every `facts relink` judgement came back `model_unparseable`. That route now gets no switch and the thinking-model output headroom, priced the same way. The native DeepSeek origin, any path on it included, is unchanged.
+- **`openrouter:voyageai/voyage-*` embeddings are priced (#7034).** OpenRouter names Voyage's models `voyageai/<model>`, which missed the `voyage:` price rows, so a capped `gbrain embed` stopped with `no_pricing`. They now price from those rows (OpenRouter's rates are the same).
+- **The bootstrap interview saves an OpenRouter key as `openrouter_api_key` (#7977).** A `sk-or-v1-` key matched the OpenAI `sk-` prefix and was saved as `openai_api_key`.
+- **daily-task-manager names its page by the slug `ops/tasks` (#7932).** Its tool calls used `ops/tasks.md`, a different slug, so `get_page` missed the existing task list and the first-run rule could start a second one.
+
+### OpenClaw, Hermes, Windows and claude-cli harness fixes (#8931)
+
+**OpenClaw setups stop breaking each other, upgrades stop breaking OpenClaw, and four other harness fixes land.** Six fixes for people running gbrain with OpenClaw. Setting up one agent's workspace no longer rewrites or removes the per-turn brain rule every other agent on the same gateway relies on. Background turns (heartbeats, cron, finished commands) no longer get told to answer. `gbrain upgrade` no longer reinstalls gbrain in a way OpenClaw refuses to load as a plugin. `gbrain doctor` stops failing on skills another tool put in the workspace. The OpenClaw guide now leads with an install route that works and documents OpenClaw's own remote MCP connection.
+
+**gbrain's background claude-cli calls no longer read your personal Claude Code instructions.** On Claude Code 2.1.314 or newer the claude-cli provider runs its child with `--setting-sources ""`, so your `~/.claude/CLAUDE.md`, memory and `settings.json` stop steering gbrain's extraction and summary calls (and stop adding about 42k cached tokens to each). The trade-off: `settings.json`'s `env`, `apiKeyHelper` and permission rules don't reach the child either; the subscription login is kept. To load them again, set `GBRAIN_CLAUDE_CLI_USER_SETTINGS=1` in your shell or `~/.gbrain/.env`. Older CLIs are unchanged.
+
+Four more harness fixes: a per-turn hook you paste into Hermes by hand now counts, `gbrain setup claude-code --instructions-only` writes the per-turn rule hook on Windows, `request_tools` stops promising tools a stdio session cannot call, and `gbrain schema show --source` reads that source's pack.
+
+- `gbrain setup openclaw --workspace <dir>` leaves the gateway-shared turn-rule plugin alone when it would name another server, and `--no-instructions` there no longer removes it, or the brain-first block in other workspaces' `AGENTS.md`, for every agent; it says how to change it for all agents instead and exits 0. A plugin an older gbrain wrote for the same server is rewritten (reported by @Masashi-Ono0611, #8401).
+- OpenClaw heartbeat, cron and exec-completion turns get the brain-first rule without its closing "answer and finish" sentence, so they stop inviting replies nobody asked for (reported by @Masashi-Ono0611, #8440).
+- `gbrain doctor` reports skills in an OpenClaw workspace that have no resolver rows and no `manifest.json` as warnings, not errors, the way it already treats a foreign `skills/` found from the current directory (reported by @Masashi-Ono0611, #8629).
+- `gbrain upgrade` reinstalls a Bun global install with `--backend=copyfile`, and its recovery commands say the same, so an install OpenClaw loads as a plugin keeps loading after an upgrade (reported by @Masashi-Ono0611, #8663).
+- The OpenClaw guide marks the ClawHub bundle route as not available: the ClawHub package named `gbrain` is an unofficial old build that fails to install. It leads with the stdio route (reported by @Masashi-Ono0611, #8470).
+- `gbrain agent register --harness openclaw` no longer says OpenClaw has no remote MCP client, and the OpenClaw guide documents connecting over streamable HTTP with `openclaw mcp login` (reported by @Masashi-Ono0611, #8747).
+- When your `config.yaml` already has a `hooks:` section, `gbrain setup hermes` prints the `pre_llm_call` entry for you to add. Once you paste it, `gbrain doctor` now sees it (and still reports it untrusted until Hermes approves it) instead of calling it missing (reported by @Masashi-Ono0611, #8857).
+- `gbrain setup claude-code --instructions-only`, doctor's turn-hook repair and the hook-launcher refresh now write the per-turn rule hook for a Windows gbrain binary (`C:\...\gbrain.exe`) instead of skipping it with "no absolute gbrain binary was found". The hook names its paths in Git Bash's `/c/...` form, which is how Claude Code runs hooks on Windows. Codex runs hooks on Windows without a POSIX shell, so it still gets the printed step, now with that reason (reported by @Masashi-Ono0611, #8451).
+- On a stdio session started at a narrower surface (`gbrain serve --surface starter`), `request_tools {tools: [...]}` lists only the tools the session can call. A tool outside it comes back with its schema, `listed: false` and a note to call `request_tools {"surface":"full"}` first, instead of a promise that it is in your tool list (reported by @Masashi-Ono0611, #8734).
+- `gbrain schema show --source <id>` shows that source's own pack (its per-source override, else the brain-wide pack) instead of failing with `Unknown pack: <id>`. A pack you name still wins (reported by @Masashi-Ono0611, #8900).
+
+#### Itemized changes
+
+- `src/core/setup/openclaw-turn-plugin.ts`: the plugin's `package.json` records the access it was written for (`gbrain.access`); `syncOpenclawTurnPlugin({ workspace })` returns `print` (unverified, naming the `--remove` command) for an installed plugin whose rule would change, falling back to the server or launcher in its `RULE` literal when it records none, and `removeOpenclawTurnPlugin({ workspace })` skips; `syncBrainFirst`'s opt-out no longer strips other OpenClaw workspaces' blocks; `src/commands/setup.ts` passes `--workspace` (not on `--remove`). The plugin's `before_prompt_build` returns `renderBrainFirstTurnRule(access, 'openclaw', { reply: false })` when `ctx.inputProvenance.kind` is `internal_system`.
+- `src/core/check-resolvable.ts`: the low-confidence `unreachable` downgrade also applies to `openclaw_workspace_*` detection.
+- `src/commands/upgrade.ts`: `bun update`, `bun add -g` (stable, pinned and restore) and `bunReinstallCommand` / `reinstallHintLines` pass `--backend=copyfile`.
+- `src/core/mcp-registration.ts`: `openclawThinClientBlock` names OpenClaw's native remote MCP route.
+- Docs: `docs/mcp/OPENCLAW.md`, `docs/guides/upgrades-auto-update.md`, `TODOS.md`.
+- Tests: `test/brain-first-turn-rule.test.ts`, `test/setup-brain-first.test.ts`, `test/check-resolvable.test.ts`, `test/mcp-registration-blocks.test.ts`, and the upgrade suites that pin the child `bun` argv.
+- `src/core/ai/providers/claude-cli-language-model.ts`: `runClaude` adds `--setting-sources ""` when a cached `claude --version` (once per binary per process) reads `SETTING_SOURCES_MIN_VERSION` (2.1.314) or newer. `GBRAIN_CLAUDE_CLI_USER_SETTINGS=1` skips the flag and the probe, and a cwd `.env` cannot set it (`src/core/env-trust.ts`). Reported and first fixed by @Masashi-Ono0611 (#8350).
+- Docs: `docs/ai-providers/claude-cli.md` (the trade-off), `docs/guides/skillopt.md`, `docs/architecture/key-files/core-ai-continued.md`.
+- `behavior-changes.d/claude_cli_setting_sources_8342.md`: the upgrade-notice row.
+- Tests: `test/claude-cli-setting-sources-8342.test.ts` (including the opt-in); the `test/claude-cli-output-cap.test.ts` stub answers `--version`.
+
+### Skill resolver: session cleanup, extra skill folders and top_gate (#9095)
+
+**The skill resolver's hook lane now cleans up old session files before it exits, each harness can add its own skill folders, and a new experimental `top_gate` setting can hold back weak suggestions.** The skill resolver is the optional feature that offers your agent the right installed skill on each turn. It is still off by default, `top_gate` is off too, and none of this blocks a turn.
+
+Before, the hook lane exited right after its turn, so idle session files waited for the next CLI run to be cleaned up. Now the lane runs one cleanup pass of at most 64 files before it exits, and never runs past its deadline. Before, Claude Code and Codex catalogs were built only from each harness's default skill folder. Now you can list extra folders per harness, and setup keeps them on every later run.
+
+#### How to use it
+
+- Extra skill folders: `gbrain config set skills.resolver.per_harness.claude-code.dirs /abs/dir,/abs/other` (or `.codex.dirs`, at most 32 absolute paths), then run setup again. Setup builds the user catalog from the default folder plus every listed folder that exists, and the catalog's automatic rebuild keeps them. Unset the key and run setup again to drop them.
+- `top_gate`: `gbrain config set skills.resolver.top_gate <0-100>`, `--top-gate` on `gbrain skill-resolver`, or `top_gate` in the turn input. It empties the block when the best skill the block would show scores below the threshold, after dividing the score by the catalog's maximum idf so the number means the same thing at any catalog size. A skill named in the turn bypasses it. `skills.resolver.per_harness.<harness>.top_gate` overrides it for one harness.
+
+#### Things to watch
+
+- `top_gate` stays off because no threshold has yet removed suggestions on no-skill turns without hiding many right ones. On held-out turns written to break length-based gates, threshold 1.33 kept false suggestions at 0.17 to 0.19 but cut hit@5 on skill turns from 0.515-0.611 to 0.26-0.28. The guide shows both measurements; treat it as a setting to measure, not one to turn on.
+- An empty block can now carry `block_reason: "weak_top_match"`.
+- `min_match` behaves as before. Its docs now say it filters candidates and is not a gate.
+- A bad `top_gate` or `dirs` value makes the lane log `skill_resolver_config_invalid` and deliver nothing, like the other turn settings.
+
+<!-- behavior-change: skillpack_update_untouched -->
+<!-- behavior-change: claude_cli_setting_sources_8342 -->
+
+### A keyless brain keeps itself tidy, and doctor says when upkeep last ran
+
+**`gbrain maintain --unattended` runs the free upkeep a brain needs, and is safe to run from a scheduler.** It runs the same steps as `gbrain maintain --safe` (link and timeline extraction, stale-page checks, the free repair lanes) plus a new bookkeeping cleanup step. It never deletes a page and never starts a paid model call, with one exception you can switch off. On a brain with an embedding key, it embeds pages and facts that are missing embeddings, capped at $1 a day per brain (`maintenance.embed_daily_usd`, 0 turns it off). Two runs that overlap embed once, because the second skips that step. A run that is killed while embedding cannot spend that day's cap a second time, because the step books the rest of the cap before it spends and settles it afterwards. It works the same on a brain with no git repository and no API keys. A run that has nothing to do, or that finds the brain busy, degraded, behind on migrations or already looked after by `gbrain autopilot`, exits 0 and says why. A step that fails three runs in a row is retried once a week instead of every run, and doctor names it until the step succeeds or stops being part of upkeep.
+
+- `gbrain maintain --status` shows when upkeep last ran, what each step did, what failed, and when the next run is due.
+- A new doctor check, `unattended_maintenance`, reports the same thing. It warns when upkeep hasn't run for 48 hours or a step keeps failing, and its fix is `gbrain maintain --unattended`. A brain where `maintenance.auto` is `false`, or where autopilot runs upkeep, reads as ok.
+- `gbrain maintain --purge` previews which soft-deleted pages are past their 72-hour window. `--yes --expect <hash>` purges exactly the previewed set, matching each page by source and slug, and refuses with `preview_changed` when the set moved since the preview. Upkeep never purges pages on its own.
+
+### Smaller changes
+
+- The old bookkeeping cleanup inside the cycle's `purge` phase is now its own phase, `bookkeeping_gc`, with the same retentions. It never touches a page, so upkeep can run it while `purge` stays manual. `purge`'s summary now counts only pages, sources and orphaned clone folders.
+- `gbrain autopilot --install` on a PGLite brain or a brain with no repository now refuses with a structured error (`autopilot_pglite_daemon`, `autopilot_no_repo`) that points at `gbrain maintain --status`, instead of a plain message.
+- doctor's `cycle_freshness` fix no longer asks for spend consent on a brain with no chat or embedding key, since nothing it runs there costs money.
+- The cycle's skip message for a phase that needs a filesystem no longer claims the reason is a Postgres or remote engine.
+
+### Itemized changes
+
+- `src/core/maintenance/run.ts` (new): the `--safe` step list (moved from `src/commands/maintain.ts`, which re-exports it), `unattendedPlan`, and `runUnattendedMaintenance`. The run record is `maintenance.last_run` in the database config, so repo-less brains have one. Brain-wide steps run once per run, then one item per source.
+- `src/core/maintenance/status.ts` (new): `readUpkeepStatus`, the one view behind `--status` and doctor.
+- `src/commands/doctor/checks/unattended-maintenance.ts` (new): the `unattended_maintenance` check.
+- `src/core/cycle/bookkeeping-gc.ts` (new) and `src/core/cycle/phase-table.ts`: `bookkeeping_gc`, and a `tier` (`free`, `paid`, `deletes`, `filesystem`) on every phase, which the upkeep step list is tested against.
+- `src/core/cycle.ts`: `CycleOpts.stamp` (`full`, `source_only`, `none`) so a partial run can't claim a full cycle, and `deferFactEmbedding` so fact extraction stays free on a keyed brain.
+- `src/commands/autopilot-refusals.ts` (new) and `src/core/error-registry.ts`: new codes `autopilot_no_repo`, `autopilot_pglite_daemon`, `cycle_already_running`, `engine_degraded`, `maintenance_disabled` and `maintenance_owned_by_autopilot`.
+- Tests: `test/maintenance-unattended.test.ts` (PGLite and Postgres) and `test/e2e/maintain-unattended-keyless-pglite.test.ts`.
+
+<!-- behavior-change: unattended_maintenance_doctor_gbra438 -->
+<!-- behavior-change: bookkeeping_gc_phase_gbra438 -->
+<!-- behavior-change: autopilot_refusals_structured_gbra438 -->
+<!-- behavior-change: cycle_skip_text_gbra438 -->
+<!-- behavior-change: cycle_freshness_keyless_consent_gbra438 -->
+
+### Upkeep runs while your agent is connected, and `--schedule` covers the rest
+
+**An open `gbrain serve` now does the free upkeep for you, so a default install needs no service, cron job or second command.** When the agent connected to `gbrain serve` (stdio or HTTP) goes quiet, serve runs `gbrain maintain --unattended` in slices of about 3 seconds, at most one full round a day per brain, and stops a slice the moment a tool call arrives. It writes the same record that `gbrain maintain --status` and doctor read, with runner `serve`. It never deletes a page, and on a keyless brain it never spends anything. When two serves share one brain, only one runs it and the other skips. A source too big to finish within 30 slices is parked: the rest of the round finishes, serve stops doing upkeep until the next round (it tries the parked source again each round and after each restart), and `gbrain maintain --status` and doctor warn and name it; `gbrain maintain --unattended` finishes it at once. A tool call that stops a slice never counts toward the 30. Turn it off with `gbrain config set maintenance.auto false` (or `GBRAIN_SWEEP=0`, which also stops the idle sweep).
+
+- `gbrain maintain --schedule` is for a brain with no agent session open most days. It installs a job that runs `gbrain maintain --unattended` every 6 hours (launchd on macOS, a systemd user timer on Linux, cron otherwise). It asks before installing, `--dry-run` shows exactly what it would write, and `--unschedule` removes it. Nothing installs it by default. A scheduled run that finds a live `gbrain serve` on the brain exits 0 with `maintenance_owned_by_serve` and leaves the work to serve.
+- `gbrain init` and `gbrain setup <harness>` now say how upkeep works in their first-run settings block, and how to turn it off.
+- doctor's overdue upkeep warning and `gbrain maintain --status` now also offer `gbrain maintain --schedule` as the second fix.
+
+### Itemized changes
+
+- `src/core/maintenance/idle.ts` (new): `runIdleUpkeep` (the stdio serve calls it from its idle tick, after the sweep) and `armIdleUpkeep` (the HTTP serve's new idle timer), with a 3-second budget per run. `src/core/foreground-activity.ts` gains `onForegroundRequest`, which aborts a run in flight, and `src/commands/serve-http.ts` marks each `/mcp` POST as foreground work.
+- `src/core/maintenance/run.ts`: a PGLite brain runs `CHECKPOINT` after a finished round, recorded as the `checkpoint` step. A budgeted run counts each item's unfinished slices and parks the item at `UPKEEP_PARK_AFTER_SLICES` (30; a fresh 10,000-page brain needs 24 quiet slices for its first round), recorded under `parked`. Without this, a source whose facts walk alone outlasts a 3-second slice (past about 12,000 pages) restarted forever and the round never finished.
+- `src/commands/extract.ts`, `src/core/cycle.ts` and `src/core/cycle/connector-extract.ts`: the cycle's stale link drain now stops between batches of 25 pages when the cycle is aborted. Before, a first upkeep run on a 10,000-page brain with no repository spent 64 seconds in this one step, past its 3-second budget, and tool calls made meanwhile took about twice as long.
+- `src/core/cycle/extract-facts.ts`: the facts walk now gives the event loop a turn every 50 pages. On PGLite, queries finish without ever letting timers or stdin run, so on a 10,000-page brain the walk froze the serve for about 2 seconds and a tool call sent during it waited until the walk ended (p99 1.7 seconds). With the fix, the freeze is under 150 ms, a call stops the walk, and tool calls during upkeep stay at p99 241 ms against 139 ms with upkeep off.
+- `src/commands/maintain-schedule.ts` (new): `--schedule`, `--unschedule` and the live-serve check, routed before the engine opens. New codes `maintenance_owned_by_serve`, `schedule_unsupported` (Windows and containers) and `schedule_install_failed`.
+- Tests: `test/serve-idle-upkeep-gbra438.test.ts`, `test/maintenance-idle-gbra438.test.ts` (PGLite and Postgres, including two serves on one brain), `test/maintenance-park-gbra438.test.ts`, `test/extract-stale-managed-signal-gbra438.test.ts` (PGLite and Postgres), `test/maintain-schedule-gbra438.test.ts` and `test/e2e/serve-idle-upkeep-keyless-pglite.test.ts`.
+
+<!-- behavior-change: serve_idle_upkeep_gbra438 -->
+<!-- behavior-change: serve_http_idle_timer_gbra438 -->
+<!-- behavior-change: init_upkeep_line_gbra438 -->
+
+## [0.60.714.0] - 2026-11-13
+
+**Background extraction no longer loops forever on a default brain, and seven dream and maintenance jobs that stopped or double-charged now finish cleanly.**
+
+### Fixed
+- **The stale extract job stops chaining itself without end (#9295).** On the default config (frontmatter link sweep off), a page whose frontmatter named a page written later stayed "stale" after every sweep, because the check counted frontmatter references the sweep never re-resolves. The `extract` job then queued a new continuation every run. The sweep and `doctor`'s extraction-lag count now count only the references the configured sweep re-resolves, and a continuation chains again only when it left fewer pages stale than the run before it. The frontmatter reference is left unchecked, not marked done, so turning `autopilot.incremental_extract_include_frontmatter` on still finds and links it. A brain already looping simply stops at its next run; nothing to run on upgrade. Managed brains re-resolve both kinds of reference and were not affected.
+- **A released managed-atoms run can be resumed (#9079).** Resuming a release after an interruption reused the original run's request id for a different write and failed with "This request_id was used for a different write". The release now has its own run key.
+- **An edited managed page is resubmitted, not kept, when its activation is replayed (#9275).** Activations now record the page's prior content, so a replay can tell an operator's edit from the run's own write. Activations recorded before this release settle the old way once.
+- **A nested AI call that is refused before anything is sent no longer charges the outer budget (#9086).** The outer hold now settles at zero usage when the inner guard refuses, and the reported remaining budget subtracts live holds, so a group no longer reads full while it still has room. A call that was actually sent and then failed still books its usage.
+- **`gbrain repair agent-session-facts` works on segmented pages (#9027).** It reads the page whole (up to 24 MiB) and writes it back bound to that revision, instead of reporting `changed_since_preview` on every apply. Larger pages are declined with `page_body_segmented`.
+- **A Claude CLI reply that uses native tool-call markup is retried instead of read as a final answer (#9085).** Tool calls the model wrote in a form gbrain cannot run used to end the turn as plain prose. The reply is now treated as a transient failure, so the job's normal retry limit (at most two more attempts) applies. Markup quoted inside a code span or code block still reads as an answer.
+- **An extract job left with only blocked or held pages chains nothing (#8672).**
+- **`doctor`'s stale-mention check reads segmented pages (#9121).** It used to report links on segmented pages as stale because it never read their body.
+
+## [0.60.713.0] - 2026-11-13
+
+### A write killed in the middle no longer holds up its source
+
+**When a gbrain process dies while it holds the write at the head of a source's queue, the next write clears it at once instead of waiting.** A crash or `kill -9` used to leave that write's claim running with nobody renewing it, and every later write to the source waited behind it (`write_pending`) for the rest of its lease: 30 s while the write was preparing, about 6 minutes while it was publishing. On PGLite that wait happened on every such kill.
+
+- On a PGLite brain, the next gbrain process that opens the brain releases every claim written before it started and runs those writes again. The brain admits one process at a time, so their owners have exited. A process that cannot open the brain releases nothing.
+- On Postgres, a process killed on the same machine was already released at once; that is unchanged. A process on another machine, in another container or from before a reboot still waits out its lease, because gbrain cannot prove it is gone.
+- `gbrain sources writer status` now says so. A claim whose owner has provably exited reads `owner_exited: true`, `resumes_on_its_own: true` and `owner_live: false`, and its `next` is `claim_owner_exited` (nothing to do) instead of `claim_running` ("the owner is still renewing").
+- [docs/guides/troubleshooting.md](docs/guides/troubleshooting.md#stuck-write-head) lists how long each case takes and what status prints meanwhile.
+
+### A write receipt says when its Git commit landed
+
+**A receipt read after the write (`gbrain write-request <id>`, `get_write_request`, `list_write_requests`) now reports where Git is.** For a page on an ordinary (not `canonical: git`) checkout, `persistence.git_state` used to stay `queued` forever, even after the background Git effect committed the file, and no commit was named anywhere. It now comes from the Git effect: `committed` with the commit in `persistence.git_commit`, or `superseded`, `skipped`, `failed` or `retrying` with the cause in `persistence.git_reason`, and `queued` only while the effect is queued. Nothing stored is rewritten, so a Git effect from an earlier build, or one whose commit landed but whose push had to be retried, reads `committed` with no commit. Receipts of `canonical: git` sources are unchanged.
+
+Reported by @ethanbeard (#9227).
+
+<!-- behavior-change: stuck_head_released_9227 -->
+<!-- behavior-change: receipt_git_state_live_9227 -->
+
+### Label repairs no longer refuse pages over gbrain's own stamps
+
+**`gbrain repair visibility` and `gbrain repair private-labels` now label a page whose file differs from the database only by stamps gbrain keeps in the database, and they hold the pages they can't edit instead of failing the run (GST-2603).** A page retyped by a schema pack, a page with the `validate: false` grandfather stamp, or a page with a `legacy_type` retype record used to refuse every label repair, either as "cannot be made to the page's file line by line" or as `source_changed`. Enough of them in one window stopped the whole run as `item_failures_systemic`.
+- Those stamps no longer count as a difference. The page is labelled and its file still gains only the `visibility` line. A real difference (a date, the tags, the title, the body) still blocks the edit.
+- The preview checks every page in the window. A page whose file differs in a real key, or whose label line can't be edited as one line, is listed as held under `details.held` with the key that blocks it and its next step: `gbrain sources reconcile <id> <slug> --preview` for a file edited outside gbrain, or the line to fix. Held pages stay out of the preview hash and the approved set, so the rest of the window applies.
+- A page that starts refusing after the preview is declined with the new `label_edit_refused` code and nothing written. It never counts toward `item_failures_systemic`, the run exits 0, and the receipt names the pages that applied.
+- A brain without a repository writes the label to the database only, as before.
+- Labels and folder rules apply per source, so a page with the same slug in another source stayed readable after you labelled or ruled one copy, and a reader with no source filter found it by slug and in search. The previews of `gbrain repair visibility`, `gbrain repair private-labels --class restore` and `gbrain access rule add` / `import` now list those copies under `open_twins`: each same-slug page in another source that isn't private and that a caller outside the change could read, with their count and the command that covers them (the same repair or rule with `--source <other>`). The list is read-only and bounded, isn't part of the preview hash, and changes no copy for you.
+
+<!-- behavior-change: label_repairs_hold_refusals_gst2603 -->
+
+**Captured session files that mention a large entity page are extracted again instead of being stopped and later deleted.**
+
+### Fixed
+- The session sweep no longer fails every window whose facts name an entity page stored in segments (a page over about 1 MiB). Facts the extractor left without an entity and that mention such a page were checked against the page's whole body, which a segmented page refuses (`page_body_segmented`) after the model call; the window failed five times, stopped, and the session file was deleted at the un-ingested retention limit. The check now reads the page the way its writer does, so the window commits its facts onto the page's `## Facts` table, on a Git source and on a repo-less brain. Reported by @dvasselin (#9279).
+- A refusal that retrying cannot change now stops its window after the one paid attempt instead of five, retention keeps the session file it holds, and `gbrain doctor` (`memory_writeback`) counts these files as held. The first sweep after an upgrade retries each such window once, so a brain with files stopped by this bug recovers with no command.
+- A Gmail thread you purged while its import was still waiting to commit no longer leaves its open loops behind. `gbrain waiting` could keep listing the thread's subject and evidence quote after the purge; the sync now drops loops for threads it refused as purged in the same run when no page for them exists (#9011).
+
+<!-- behavior-change: corpus_segmented_entity_9279 -->
+
+## [0.60.712.0] - 2026-11-13
+
+### A page left behind when its file moved can be folded into the moved page
+
+**`gbrain repair moved-pages` folds a page whose file moved into the page the moved file imported as (GST-2584).** When a file moved while sync held the old page's deletion (`file_gone`), the new path imported as a fresh page and the old page stayed at its old slug with its links, facts, timeline and saved versions. Neither side of `gbrain repair file-drift` was right for it: `--prefer file` dropped what only the old page held, and `--prefer database` wrote a stale copy of the file back.
+- The new repair pairs the two pages only on proof read from Git. The old path's last committed content must be what one new path took in the commit that deleted it, or the content of that path's first commit, made between the old file's add and its deletion. The old page must still hold exactly that content, so later edits to the moved file don't matter, and a page edited in the database after the move stays held as `both_changed`. A frontmatter `id` alone never pairs two pages, and the file name only explains why nothing matched.
+- The preview lists every page whose file is gone, with a reason when it is kept: several candidates, another old page claiming the same moved page, segmented storage, a difference in who may read the two pages, a database edit after the move, or a history too shallow to read. `--apply --expect <hash> --yes` folds exactly the previewed pairs with destructive consent. Each pair's proof and both pages are re-checked under their page keys, including that the old file is still gone. The fold moves the old page's links, relationship dates, timeline, raw data, attachments, user tags, aliases, facts and saved versions to the moved page, makes the old slug an alias, clears the hold and soft-deletes the old page, which `gbrain restore` brings back within 72 hours. No file is written. A brain without a repository has nothing to fold, and the preview says so.
+- `gbrain repair file-drift --held` now lists such a page as `moved_to <slug>` and prints the fold command instead of a recreate or a delete. The `file_gone` hold says when the page simply has no import record, instead of naming a database edit.
+- A file that still names the type gbrain-base 1.0.0 gave its path, equal to the copy an older gbrain stored, is no longer counted as a database edit when a later pack retyped the page. The import keeps the retyped type and records the rename as a `legacy_type` retype stamp, so later edits keep it too.
+
+<!-- behavior-change: moved_pages_fold_gst2584 -->
+
+**On a strict source, a fact for a page-less entity under a folder access rule now lives in Git on its folder's own holding page, with exactly the readers the entity's page would have.** On a source whose pages are canonical in Git (`canonical: git`), a fact saved for an entity that has no page yet is held as a row of `memory/unattributed` until the page exists. An entity under a folder access rule was the exception. Naming it on that shared page would tell every reader the entity exists, so its fact stayed in the database only, and a rebuild from Git lost it. Now it is held on the holding page of the entity's own folder (`partners/memory/unattributed` for `partners/acme-example`). Every rule that covers the entity covers that page by path, so the fact has the same readers as the entity's page, nested and pending rules included, and it is stored the way the entity's page would be, either committed to Git, or database-only under `storage.db_only` or a path Git ignores. A rule added later moves the held facts it covers off the shared page as part of its own apply, and `gbrain access rule add` lists them in its preview first. An entity under an exact page rule (a rule on its own slug) has no such page, so `remember` now refuses with `git_home_required` (reason `facts_lane`) and a fix that creates the page; when the database role cannot read the access rules, it answers `access_policy_pending` with `next: wait`. Sources that are not strict and brains with no Git repository work as before.
+
+### Itemized changes
+
+- `src/core/facts-fence.ts`: `isHoldingSlug` (the shared `memory/unattributed` or any `<folder>/memory/unattributed`), its SQL twin and `folderHoldingSlug`. A folder's holding page reads only entity cells of its own folder; any other is a fence problem.
+- `src/core/facts/held-fact-move.ts`: `holdingHome` replaces `holdsInGit` and names the holding page, or refuses (`page_rule`, `access_unreadable`). `moveHeldFacts` reads every holding page, moves rows into entity pages, and re-homes shared-page rows whose entity a rule now covers; the shared page's row is removed, never struck with the destination. `planHeldMoves` is the one plan the move and the rule preview share, covering every holding page, in the order the move runs. An entity's struck (withdrawn) held rows leave the holding page with its live rows, removed rather than moved, and an entity with only struck rows gets its own removal. A move still pending when the write wait ends is reported (`pending`, with its request id) and not counted as moved.
+- `src/core/persistence/memory-mutations.ts`, `memory-prepare.ts`, `facts-prepare.ts`, `facts-maintenance.ts`, `prepared-maintenance.ts`, `forget-prepare.ts`, `single-prepare.ts`, `page-identity.ts`, `model.ts`, `src/core/facts/*`, `src/core/trust/release-publish.ts`: every fact writer, forget, purge and release treats any holding page as a holding page.
+- `src/core/persistence/git-declared.ts`, `verb-errors.ts`: the `facts_lane` refusal for an exact page rule carries a `put_page` fix; through `remember` it keeps the frozen `invalid_params` (and `unavailable` for `access_policy_pending`) with the canonical code, reason and fix.
+- `src/core/persistence/coordinator.ts`: a held fact on a database-only folder's holding page reports `write_through: {written: false, skipped: db_only, held_for}` instead of `no_repo_configured`.
+- `src/core/search/private-visibility.ts`: a held fact is also judged by its holding page as a page, so a raw-only rule (`covers_derived: false`) hides it as it hides the page; a fact still on a holding page for an entity a rule now narrows below that page (a folder rule over `memory/unattributed`, an exact page rule over a folder's holding page; a rule synced from Git, until the move) reads only for that rule's readers, and for nobody while the rule is pending.
+- `src/core/entities/resolve.ts`: a holding page under an entity directory (`people/memory/unattributed`) is never an entity page itself.
+- `src/commands/access-rules.ts`: the rule preview lists `held_facts_moving` and the apply moves them (`held_facts: {moved, unmovable}`), for the database and git stores; `gbrain access apply` and `gbrain access resume` move them too. Each listed fact's `to` comes from `heldRowDestination`, the resolution the move itself uses, so a row saved under a bare name shows the page that name resolves to. The preview now runs the move's own planner. It lists every row the apply moves (`from` and `to`, and `because: its page exists` for a row that moves only because its entity's page now exists), the struck rows that leave with them (`held_struck_rows_leaving`), and per page the rows and versions the receipts will record (`held_versions_editing.pages`: the versions carrying them now plus the one each move saves). The apply reports a pending move as incomplete with its request id.
+- `src/core/facts/fence-fact-append.ts`, `src/core/persistence/prepared-maintenance.ts`: a held row that leaves a holding page (the shared page or a folder's) for a page not every reader of it can read also leaves that page's saved versions, with the entity's struck rows, in the same transaction; every other byte of each version is kept, Git history is not rewritten, and the move's write receipt records it (`held_versions_edited`: the rows' fact ids, the row and version counts, where they went). The rule preview counts the rows and versions (`held_versions_editing`). A saved version stored in segments is not edited. The preview names how many per page (`segmented_versions_not_edited`, and a line saying readers of that page's saved versions can still read the moved rows there), and the apply's `held_facts` says `complete: false` with the same words (`segmented_pages`). A saved version with no timeline keeps a NULL timeline.
+- `src/core/facts/purge.ts`: purge's saved-version redaction moves, unchanged in SQL and transaction, into `rewriteVersionBodies` (its `keepNullTimeline` flag, which purge does not pass, writes a NULL timeline back as NULL for the held-row edit), which the held-row edit above also calls, so the page body reader ratchet still lists one saved-version reader.
+- `src/core/persistence/prepared-maintenance.ts`: the row hash a fact-fence adoption or held-fact move pins counts `valid_from` and `valid_until` to the second, the precision a fence cell keeps. A move accepted while the checkout is busy now commits under the request it named after the facts reconcile rewrites a new row's time to its cell's; before, that request ended `revision_conflict` and a second request made the move.
+- `src/commands/sync/perform.ts`, `src/core/cycle/extract-facts.ts`: after a managed sync releases its lease, held facts that a rule it applied narrows below their holding page's readers move at once (one query decides, and nothing is due when nothing changed); the maintenance cycle stays the fallback. That query and the move's plan, the entity resolver's reads for a bare-name row included, share one deadline, the sync preparation budget, and each of the move's own page reads ends at a budget of its own, so a lock another session holds on pages or page aliases no longer stalls the sync without end. A plan cut off at its deadline leaves the move to maintenance. Running it after the lease only spares a follower sync the wait, since the lease is re-entrant and the move's writes are not sync rows. Either path names the page when the move left a segmented saved version unedited (`HELD_VERSIONS_NOT_EDITED` in the cycle) or is still pending (`HELD_FACT_PENDING`).
+- `src/core/repair/facts-home.ts`, `src/core/facts/facts-home.ts`: `gbrain repair facts-home` writes a ruled entity's fact to its folder's page; `folder_restricted` now means only `page_rule` or `access_unreadable`, with `sync.write_through` off too (`holdingPageFor`).
+- Docs: `git-canonical.md`, `entity-scoped-facts.md`, `access-designations.md`, `repair.md`, `write-refusals.md`, `memory-boundaries.md`, `MEMORY_VERBS_v1.md`, `error-codes.md` (regenerated).
+- Tests: new `test/folder-holding-page-gst2492.test.ts` (held in Git before the reply and kept by a rebuild from a clone; three nested rules plus a pending one; no existence leak on get_page, search, query, recall, list_pages and find_pages; a raw-only rule; the rule apply's preview and move; the owner with the opt-in on and off; the page-rule and unreadable refusals locally and over MCP; database-only folders; background writers and repair; non-strict and repo-less unchanged; a segmented saved version named by the preview and reported incomplete by the apply, the sync path and maintenance; the preview's destination for a bare-name row equal to where the apply puts it; an exact page rule over a folder-held row, by CLI and by sync; the preview equal to the apply and its receipts; struck rows and a struck-only entity; a pending move; a NULL timeline kept); updated GST-2492 suites; PGLite and Postgres.
+
+<!-- behavior-change: folder_holding_page_gst2492 -->
+
 ## [0.60.711.0] - 2026-11-13
 
 **Upgrade and maintenance stability for self-hosters: upgrades are tested from real releases every night, health alerts page only on what needs someone, routine maintenance noise heals itself, an upgrade adds nothing you didn't turn on, the serve restart after a self-upgrade runs once per build without freezing the autopilot, a macOS brain on an external volume starts under launchd, a new doctor check counts session connections against the pooler limit, and twenty dream-cycle, doctor and repair fixes stop phantom work and false failures.**

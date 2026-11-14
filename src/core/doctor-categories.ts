@@ -102,6 +102,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'access_policy_store_mismatch',
   // GST-363: a brain that serves several people keeps each people/<name>/ folder to its readers (doctor/checks/unlabeled-people-folders.ts).
   'unlabeled_people_folders',
+  // GST-2670: pages every member's key reads on a brain that serves several people (doctor/checks/open-shared-pages.ts).
+  'open_shared_pages',
   // GST-363: credentials bound to nobody on a brain that serves several people (doctor/checks/unscoped-shared-reads.ts).
   'unscoped_shared_reads',
   // GST-363: config mcp.stdio_member set on a host where OpenClaw or Hermes is installed (doctor/checks/shared-stdio-binding.ts).
@@ -217,6 +219,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'parked_effects',
   // #6741: managed purges parked after repeated failures (doctor/checks/purge-parks.ts).
   'purge_parked_pages',
+  // GST-2689: origins kept from the purge because a page derived from them could not be labelled private (doctor/checks/purge-parks.ts).
+  'derived_origin_parked',
   // Wave B PR 4: fact purge sweeps of stored derivation results still pending or stalled (doctor/checks/derivation-purge-sweeps.ts).
   'derivation_purge_sweeps',
   'partial_embedding',
@@ -230,6 +234,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'source_config_shape',
   'source_routing_health',
   'stale_mentions',
+  // GST-1943: storage shelf cards that fail the card schema, interim records not adopted, a hosted shelf directory gone.
+  'storage_manifest',
   'stub_guard_24h',
   // Fact supersession threshold calibrated for the active embedding model (facts/supersession-threshold.ts).
   'supersession_calibration',
@@ -327,6 +333,11 @@ export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
   'skills_manifest_integrity',
   'skill_currency',
   'skill_preconditions',
+  // Skill size, growth since the last diet, triggers, and drift against this gbrain (gbrain skillpack health).
+  'skill_health',
+  // Skillpack update journals (crash-pending updates, kept backups).
+  'skillpack_update_incomplete',
+  'skillpack_backups',
   'whoknows_health',
 ]);
 
@@ -454,6 +465,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'global_maintenance_timeouts',
   // GBRA-130 C-6: no completed brain-wide pass while jobs fail or a phase keeps blocking it.
   'global_maintenance_stalled',
+  // GBRA-438: free unattended upkeep (maintenance.last_run) overdue or failing.
+  'unattended_maintenance',
   'embed_backfill_stalled',
   // #7117: the content-drift sweep's latest batch failed.
   'content_drift_sweep',

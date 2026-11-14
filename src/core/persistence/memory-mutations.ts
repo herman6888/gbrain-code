@@ -1,4 +1,5 @@
 import { throwIfHeld } from '../trust/gate-outcomes.ts';
+import { assertStorageSourceWriter } from '../storage-manifest/door.ts';
 import { forgetRequiresOwner, guardRemoteForget, remoteForgetRaced, supersessionGuarded } from '../trust/supersede-handlers.ts';
 import { storedTrustTier } from '../trust/tier.ts';
 import { randomUUID } from 'node:crypto';
@@ -10,7 +11,7 @@ import { enforceClientSlugFence, enforceSubagentSlugFence, validatePageSlug } fr
 import { isNullLikeEntity } from '../facts/write-single.ts';
 import { isFactWithdrawn, planFactWithdrawal } from '../facts/withdrawal.ts';
 import { inferFactSubject, isEntityInferenceEnabled, type InferredVia } from '../facts/subject-infer.ts';
-import { parseFactsFence } from '../facts-fence.ts';
+import { isHoldingSlug, parseFactsFence, UNATTRIBUTED_MEMORY_SLUG } from '../facts-fence.ts';
 import { isSegmentedPage, withoutBody } from '../page-body/page-shape.ts';
 import { segmentedRememberRefusal, type RememberCarry } from './verb-errors.ts';
 import { materializedPage, segmentedOverCeiling } from './segmented-apply.ts';
@@ -26,8 +27,7 @@ import { grantedWriteSource, writeGrantRefusal } from './write-grant.ts';
 import type { WriteRequest } from './model.ts';
 import { prepareMemoryMutation } from './memory-prepare.ts';
 import { ownerReachesFact, readForgetTarget, refuseForgetReachingOtherCopies } from './forget-prepare.ts';
-import { UNATTRIBUTED_MEMORY_SLUG } from '../facts/extract-from-fence.ts';
-import { callerIsOwner, currentCallerAccess, folderRestricted, privateProvenanceFilterUnderPolicy, resolveExcludePrivatePages, withFolderRestricted } from '../search/private-visibility.ts';
+import { callerIsOwner, currentCallerAccess, privateProvenanceFilterUnderPolicy, resolveExcludePrivatePages, withFolderRestricted } from '../search/private-visibility.ts';
 import { projectionEligibleSql } from '../eligibility/sql.ts';
 import { resolveReadEligibility } from '../eligibility/policy.ts';
 import { callerMember, factVisibilitySql, memberFactPage, memberPageIsOwn, memberPageNotOwned, memberPageSlug, ownMemberFactIds, scopePageIsShared, scopePageNotShared, SCOPE_PAGE_SLUG } from '../access/member-facts.ts';
@@ -121,15 +121,19 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
   const writeThrough = configuredWriteThrough && !sandbox;
   if (sandbox) authority.databaseOnlyReason = 'subagent_sandbox';
   else if (!configuredWriteThrough) authority.databaseOnlyReason = 'disabled_by_config';
-  // GST-2492: on a strict source (Git is the record) a named entity with no page holds its fact in Git, as a row of
-  // memory/unattributed that names the entity, until the entity's page exists. The fences and the authority above ran on
-  // the entity (decision D1); the holding row is gbrain's own companion write, authorized as a write to that entity.
-  // An entity under a folder access rule is not named on the world-readable holding page, and a holding page kept out of
-  // Git would not commit it: both keep the fact database-only, as before.
-  const holding = !inferred && memberPage === null && entitySlug !== null && !snapshot && writeThrough
-    && (await getWorktreeBinding(ctx.engine, sourceId))?.canonical_git === true && !await folderRestricted(ctx.engine, sourceId, entitySlug)
-    ? await ctx.engine.readPageSnapshot(UNATTRIBUTED_MEMORY_SLUG, { sourceId, includeDeleted: true }) ?? 'absent' : null;
-  const held = holding !== null && (holding === 'absent' || !holding.page.deleted_at && Boolean(holding.page.source_path));
+  // GST-2492: on a strict source (Git is the record) a named entity with no page holds its fact in Git, as a row of a
+  // holding page that names the entity, until the entity's page exists: memory/unattributed, or for an entity under a
+  // folder access rule its folder's holding page, which every rule covering the entity covers by path. The fences and the
+  // authority above ran on the entity (decision D1); the holding row is gbrain's own companion write, authorized as a write
+  // to that entity. A folder's holding page takes the folder's storage class (database-only under storage.db_only or a path
+  // Git ignores, as the entity's own page would be); a shared one kept out of Git keeps the fact database-only, as before.
+  const { holdingHome, refuseUnheldFact } = await import('../facts/held-fact-move.ts');
+  const home = !inferred && memberPage === null && entitySlug !== null && !snapshot && writeThrough ? await holdingHome(ctx.engine, sourceId, entitySlug) : null;
+  // An exact page rule on the entity, or an access state this role cannot read: no holding page carries those readers.
+  if (home && 'refused' in home) await refuseUnheldFact(ctx.engine, sourceId, entitySlug!, home.refused, ctx.remote !== false);
+  const holdingSlug = home && 'slug' in home ? home.slug : null;
+  const holding = holdingSlug ? await ctx.engine.readPageSnapshot(holdingSlug, { sourceId, includeDeleted: true }) ?? 'absent' : null;
+  const held = holding !== null && (holding === 'absent' || !holding.page.deleted_at && (Boolean(holding.page.source_path) || holdingSlug !== UNATTRIBUTED_MEMORY_SLUG));
   const page = held && holding !== 'absent' ? holding : snapshot;
   if (held) fence = true;
   // An inferred link never designates an owner or reports a missing one.
@@ -167,7 +171,7 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
       throw new InferredTargetRejected('ENTITY_LINK_FAILED');
     }
   }
-  return held && fence ? { slug: UNATTRIBUTED_MEMORY_SLUG, authority, snapshot: page, fence, binding, writeThrough, heldFor: entitySlug }
+  return held && fence ? { slug: holdingSlug!, authority, snapshot: page, fence, binding, writeThrough, heldFor: entitySlug }
     : { slug, authority, snapshot, fence, binding, writeThrough, heldFor: null };
 }
 
@@ -228,9 +232,10 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   const sub = await submission(ctx, 'remember', params, opts.visibilityDefaulted ? withoutDefault : params);
   if (sub.prior) { const prior = sub.prior; const settled = await waitForWrite(ctx.engine, prior, ctx.config, waitMs ?? ctx.writeWaitMs); return rememberLanded(ctx, settled, throwIfHeld(withRememberTarget(prior, () => writeResponse(settled)))); }
   const { p, sourceId, principal, callerIntent, requestId, clientRequestId } = sub;
-  const [source] = await ctx.engine.executeRaw<RememberSource>(
-    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  const [source] = await ctx.engine.executeRaw<RememberSource & { role: string | null }>(
+    "SELECT incarnation,archived,local_path,config->>'kind' AS kind,config->>'role' AS role FROM sources WHERE id=$1", [sourceId]);
   if (!source || source.archived) throw sourceInactive(sourceId);
+  assertStorageSourceWriter(ctx, sourceId, source.role, {});
   const { parseTtlParam } = await import('../ops/facts.ts');
   const validUntil = parseTtlParam(p.ttl);
   const entity = typeof p.entity === 'string' && !isNullLikeEntity(p.entity) ? p.entity.trim() : null;
@@ -302,7 +307,8 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
  */
 async function rememberLanded<T extends Record<string, unknown>>(ctx: OperationContext, row: WriteRequest, response: T): Promise<T> {
   const intent = row.intent as { visibility?: unknown; fence?: unknown; entity_slug?: unknown } | null;
-  if (row.authority.heldFor) ctx.emitNotice?.(entityPageMissingNotice(row.source_id, row.authority.heldFor, true));
+  if (row.authority.heldFor) ctx.emitNotice?.(entityPageMissingNotice(row.source_id, row.authority.heldFor,
+    { slug: row.slug, committed: (response.persistence as { mode?: unknown } | undefined)?.mode === 'filesystem' }));
   if ((response.write_through as { skipped?: unknown } | undefined)?.skipped === 'entity_page_missing' && typeof intent?.entity_slug === 'string') {
     const binding = await getWorktreeBinding(ctx.engine, row.source_id);
     const root = binding?.local_path || (await ctx.engine.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1', [row.source_id]))[0]?.local_path
@@ -423,9 +429,10 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   const hidePrivate = ownerReach || excludePrivate;
   // #5575 I3: a remote caller cannot forget a fact more trusted than its own writes; the owner is asked instead.
   if (remote) await guardRemoteForget(ctx.engine, { sourceId, factId: id, principal, reason, excludePrivate });
-  const [source] = await ctx.engine.executeRaw<RememberSource>(
-    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  const [source] = await ctx.engine.executeRaw<RememberSource & { role: string | null }>(
+    "SELECT incarnation,archived,local_path,config->>'kind' AS kind,config->>'role' AS role FROM sources WHERE id=$1", [sourceId]);
   if (!source || source.archived) throw sourceInactive(sourceId);
+  assertStorageSourceWriter(ctx, sourceId, source.role, {});
   const fact = await readForgetTarget(ctx.engine, id, sourceId, worldOnly, targetHidden, false, ownPage);
   if (!fact) throw missing();
   if (remote && supersessionGuarded('agent_written', fact.trust_tier)) {
@@ -445,8 +452,8 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   // root has no owner refuses when a canonical file carries the claim (Git is the parent: a database-only withdrawal
   // would come back on a rebuild from Git); a claim only database-only pages carry is withdrawn database-only.
   const plan = await planFactWithdrawal(ctx.engine, id, sourceId, worldOnly, ownPage ? undefined : targetHidden, ownPage);
-  // GST-2492: a fact held on memory/unattributed for an entity with no page is struck there too (its row names the entity).
-  const heldOn = fact.source_markdown_slug === UNATTRIBUTED_MEMORY_SLUG && fact.entity_slug !== null ? UNATTRIBUTED_MEMORY_SLUG : null;
+  // GST-2492: a fact held on a holding page for an entity with no page is struck there too (its row names the entity).
+  const heldOn = isHoldingSlug(fact.source_markdown_slug) && fact.entity_slug !== null ? fact.source_markdown_slug : null;
   const struck = plan ? plan.slugs.filter(page => plan.subject === '*' || plan.subject === page || page === heldOn) : [];
   const fileBacked = struck.length > 0 && (await ctx.engine.executeRaw(
     'SELECT 1 FROM pages WHERE source_id=$1 AND slug=ANY($2::text[]) AND deleted_at IS NULL AND source_path IS NOT NULL LIMIT 1', [sourceId, struck])).length > 0;

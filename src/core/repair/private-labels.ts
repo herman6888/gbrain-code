@@ -49,10 +49,12 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
+import { openTwins, openTwinsLines, openTwinsWarning, type OpenTwins } from '../access/open-twins.ts';
+import { ownerMemberId } from '../access/owner.ts';
 import { opError, type OperationContext } from '../ops/contract.ts';
 import { maintenancePreflight, publishMaintenancePages, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { isPlainLabelValue, type LabelEdit } from '../persistence/label-edit.ts';
-import { filesInCheckout, writeLabelPage } from './label-write.ts';
+import { filesInCheckout, labelFileRefusal, writeLabelPage } from './label-write.ts';
 import { getWriteRequest } from '../persistence/journal.ts';
 import { isTerminal } from '../persistence/model.ts';
 import { requestPrincipalForContext } from '../persistence/page-mutations.ts';
@@ -231,8 +233,17 @@ async function planRestore(engine: BrainEngine, scope: RepairScope, selection: S
  * derived_from slug without `.md`), and every tie is an equality join of those references, or of concept-provenance
  * links through idx_links_to, to the cleared pages. The postimage is the pages table shadowed with the window's keys
  * removed; its privacy rules read only candidate pages and the pages they name.
+ *
+ * GST-2689 `remove`: the postimage is the pages table with the cleared pages removed instead (their rows, so the links to
+ * them go too), `keys` is unused, an atom also ties to the page a rename moved its `source_slug` to (slug_aliases and
+ * slug_rename_history, read before a purge scrubs them). A page that names readers is judged by the same privacy rules,
+ * since readable_by never relaxes them: it is returned when the removal would open it to its listed readers. A soft-deleted
+ * page is a candidate too, since a restore brings it back with the origin row gone, and so is a removed page tied to
+ * another removed page (judged on its own row, against the postimage), since another hold may keep it from the purge.
  */
-export function dependentsSql(): string {
+export function dependentsSql(mode: 'clear' | 'remove' = 'clear'): string {
+  const remove = mode === 'remove';
+  const live = (sql: string) => remove ? '' : sql;
   return `WITH cleared AS MATERIALIZED (
       SELECT * FROM unnest($1::integer[], $2::text[], $3::text[], $4::text[]) AS c(id, source_id, slug, keys)),
     refs AS MATERIALIZED (SELECT p.id, p.source_id, p.slug, p.deleted_at, r.kind, r.ref FROM pages p
@@ -240,23 +251,28 @@ export function dependentsSql(): string {
         UNION ALL SELECT 'depth', p.frontmatter->'event'->>'depth'
         UNION ALL SELECT 'declared', regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text(
           CASE jsonb_typeof(p.frontmatter->'derived_from') WHEN 'array' THEN p.frontmatter->'derived_from'
-            WHEN 'string' THEN jsonb_build_array(p.frontmatter->'derived_from') ELSE '[]'::jsonb END) AS declared(slug)) r
+            WHEN 'string' THEN jsonb_build_array(p.frontmatter->'derived_from') ELSE '[]'::jsonb END) AS declared(slug)${remove ? `
+        UNION ALL SELECT 'source_slug', renamed.canonical_slug FROM slug_aliases renamed WHERE renamed.source_id = p.source_id
+          AND renamed.alias_slug = p.frontmatter->>'source_slug' AND renamed.notes = 'rename'
+        UNION ALL SELECT 'source_slug', moved.new_slug FROM slug_rename_history moved WHERE moved.source_id = p.source_id
+          AND moved.old_slug = p.frontmatter->>'source_slug'` : ''}) r
       WHERE p.source_id = ANY($2::text[]) AND r.ref IS NOT NULL),
     hits AS MATERIALIZED (SELECT r.id, r.source_id, r.slug, r.deleted_at, r.kind, c.id AS cleared_id
       FROM refs r JOIN cleared c ON c.source_id = r.source_id AND c.slug = r.ref),
     provenance AS MATERIALIZED (SELECT l.from_page_id, x.cleared_id, x.source_id
       FROM (SELECT c.id, c.id AS cleared_id, c.source_id FROM cleared c UNION ALL SELECT h.id, h.cleared_id, h.source_id FROM hits h WHERE h.kind = 'source_slug') x
       JOIN links l ON l.to_page_id = x.id WHERE l.link_source = 'concept-provenance' AND l.link_type = 'synthesized_from'),
-    ties AS (SELECT h.id, h.cleared_id FROM hits h WHERE h.deleted_at IS NULL
+    ties AS (SELECT h.id, h.cleared_id FROM hits h${live(' WHERE h.deleted_at IS NULL')}
       UNION ALL SELECT r.id, h.cleared_id FROM hits h JOIN refs r ON r.source_id = h.source_id AND r.kind = 'depth' AND r.ref = h.slug
-        WHERE h.kind = 'declared' AND r.deleted_at IS NULL
-      UNION ALL SELECT p.id, t.cleared_id FROM provenance t JOIN pages p ON p.id = t.from_page_id AND p.source_id = t.source_id AND p.deleted_at IS NULL),
-    candidates AS MATERIALIZED (SELECT DISTINCT t.id, t.cleared_id FROM ties t WHERE NOT EXISTS (SELECT 1 FROM cleared x WHERE x.id = t.id)),
+        WHERE h.kind = 'declared'${live(' AND r.deleted_at IS NULL')}
+      UNION ALL SELECT p.id, t.cleared_id FROM provenance t JOIN pages p ON p.id = t.from_page_id AND p.source_id = t.source_id${live(' AND p.deleted_at IS NULL')}),
+    candidates AS MATERIALIZED (SELECT DISTINCT t.id, t.cleared_id FROM ties t WHERE ${remove ? 't.id <> t.cleared_id' : 'NOT EXISTS (SELECT 1 FROM cleared x WHERE x.id = t.id)'}),${remove ? `
+    candidate_rows AS MATERIALIZED (SELECT a.id, a.source_id, a.slug, a.type, a.frontmatter FROM pages a WHERE a.id IN (SELECT id FROM candidates)),` : ''}
     public_after AS MATERIALIZED (WITH pages AS NOT MATERIALIZED (SELECT pg.id, pg.source_id, pg.slug, pg.type, pg.deleted_at,
           CASE WHEN c.id IS NULL THEN pg.frontmatter ELSE pg.frontmatter - string_to_array(c.keys, ',') END AS frontmatter
-        FROM pages pg LEFT JOIN cleared c ON c.id = pg.id)
-      SELECT after_clear.id FROM (SELECT a.id, a.source_id, a.slug, a.type, a.frontmatter FROM (SELECT DISTINCT id FROM candidates) k
-        JOIN pages a ON a.id = k.id OFFSET 0) after_clear WHERE ${privacyPartSql('after_clear')})
+        FROM pages pg LEFT JOIN cleared c ON c.id = pg.id${remove ? ' WHERE c.id IS NULL' : ''})
+      SELECT after_clear.id FROM (${remove ? 'SELECT * FROM candidate_rows' : `SELECT a.id, a.source_id, a.slug, a.type, a.frontmatter FROM (SELECT DISTINCT id FROM candidates) k
+        JOIN pages a ON a.id = k.id`} OFFSET 0) after_clear WHERE ${privacyPartSql('after_clear', true)})
     SELECT cand.id, cand.cleared_id, CASE WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN 'life_chronicle'
         WHEN p.type = 'atom' THEN 'atom' WHEN p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL THEN 'concept' ELSE 'derived_from' END AS category
       FROM candidates cand JOIN pages p ON p.id = cand.id
@@ -362,7 +378,11 @@ async function prepareWrite(ctx: OperationContext, item: LabelsItem): Promise<Re
         + `so the next sync or re-import would undo it from the file. ${entry.mode === 'clear' ? `Remove ${describeLabels(labels)} from that file's frontmatter`
           : `Add ${describeLabels(labels)} back to that file's frontmatter if it is missing`}, commit it, then run: gbrain sync --source ${entry.source_id}` } };
   }
-  return { revision: snapshot.revision, content: serializePageToMarkdown({ ...snapshot.page, frontmatter: next }, snapshot.tags), labels };
+  const content = serializePageToMarkdown({ ...snapshot.page, frontmatter: next }, snapshot.tags);
+  // GST-2603: a file that holds the page but cannot take the label edit line by line declines here, before its intent line.
+  const refusal = await labelFileRefusal(ctx.engine, snapshot, content, labelEditOf(entry));
+  if (refusal?.reason === 'label_edit_refused') throw refusal.error;
+  return { revision: snapshot.revision, content, labels };
 }
 
 /** The item's ledger line under its deterministic request id (a resumed run replays the same request). */
@@ -459,6 +479,9 @@ export const privateLabelsRepair: RepairHandler = {
     const dependents = found?.counts ?? null;
     const exposed = dependents ? Object.values(dependents).reduce((sum, n) => sum + n, 0) : 0;
     const fileBacked = (await filesInCheckout(engine, window.map(entry => entry.page_id))).size;
+    const owner = await ownerMemberId(engine);
+    const twins = await openTwins(engine, restore ? window : [], owner ? [owner] : [],
+      (source, slugs) => `gbrain repair visibility --source ${source}${slugs.map(slug => ` --slug ${slug}`).join('')}`);
     const warnings = [
       ...(pastWindow ? [`This preview lists one window of ${window.length} item(s); ${pastWindow} more found past it. Apply this window (or decide not to), then preview again for the next one: ${command}`] : []),
       restore ? 'Restoring re-adds each recorded label, so remote callers that are not the brain owner stop reading these pages again.'
@@ -477,6 +500,7 @@ export const privateLabelsRepair: RepairHandler = {
       ...(retried ? [`${retried} listed page(s) were tried by an earlier apply and did not change (the ledger has their intent line and nothing after it); `
         + 'they are listed after every page not tried yet. Each is tried again and, if its page still declines, left unchanged with its reason; '
         + 'such a decline does not count toward the run\'s systemic-failure stop.'] : []),
+      ...openTwinsWarning(twins),
       ...(planned.unreadable ? [`${planned.unreadable} ledger line(s) could not be read and are not planned.`] : []),
       ...(restore && before.removed_after_restore ? [`${before.removed_after_restore} page(s) had their label removed after a restore landed (the page changed since the revision the restore wrote), `
         + 'so they are not listed; re-add the label by hand if that edit was a mistake.'] : []),
@@ -488,7 +512,7 @@ export const privateLabelsRepair: RepairHandler = {
       listing: window.map(entry => ({ item: `${entry.source_id}:${entry.slug}`, class: entry.class,
         detail: entry.mode === 'restore' ? `re-add ${describeLabels(entry.labels)}` : entry.labels.visibility ? 'remove access: private, visibility: private' : 'remove access: private' })),
       details: { counts: { before, after: projected }, window: { size, listed: window.length, pending_past_window: pastWindow, next_preview: command, file_backed: fileBacked, tried_before: retried },
-        ...(dependents ? { dependents } : {}),
+        ...(dependents ? { dependents } : {}), ...(twins.count ? { open_twins: twins } : {}),
         ledger: ledger?.path ?? null, class: selection.class } };
   },
   async apply(ctx, raw, opts): Promise<RepairItemOutcome> {
@@ -592,6 +616,7 @@ export const privateLabelsRepair: RepairHandler = {
     const rows = details.ledger_rows as { intent: number; committed: number } | undefined;
     return [...(counts ? [`  before: ${line(counts.before)}`, `  after (this window applied): ${line(counts.after)}`] : []),
       ...(dependents ? [`  also exposed by this window: ${line(dependents)}`] : []),
+      ...openTwinsLines(details.open_twins as OpenTwins | undefined),
       ...(details.ledger ? [`  ledger: ${String(details.ledger)}${rows ? ` (this run appended ${rows.intent + rows.committed} line(s): ${rows.intent} intent, ${rows.committed} committed)` : ''}`] : [])];
   },
 };
