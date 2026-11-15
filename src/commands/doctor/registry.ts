@@ -115,6 +115,7 @@ import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
 import { wakeshiftEntry } from './checks/wakeshift.ts';
+import { wakeshiftOpenclawEntry } from './checks/wakeshift-openclaw.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
 import { memoryProposalsEntry } from './checks/memory-proposals.ts';
@@ -159,6 +160,7 @@ import { ownerReadsRestrictedEntry } from './checks/owner-reads-restricted.ts';
 import { accessLineageEntry } from './checks/access-lineage.ts';
 import { accessLabelledOnlyEntry } from './checks/access-labelled-only.ts';
 import { attestReadAccessEntry } from './checks/attest-read-access.ts';
+import { guestSourceEntry } from './checks/guest-source.ts';
 import { originTwinsEntry } from './checks/origin-twins.ts';
 import { slugPathMismatchEntry } from './checks/slug-path-mismatch.ts';
 import { renameIdentityDowngradesEntry } from './checks/rename-identity-downgrades.ts';
@@ -242,6 +244,12 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   pgvectorEntry,
   // #7276: the privacy check next, with its own entry budget, before any full scan.
   derivedVisibilityEntry,
+  // GBRA-541: then the checks that catch a lost write (LOST_WRITE_CHECKS), bounded, before any full scan uses the budget.
+  gitIndexLagEntry,
+  dbAheadOfGitEntry,
+  strictFactsOutsideGitEntry,
+  ownerHostStaleEntry,
+  uncommittedSyncDeletionsEntry,
   memberAccessEntry,
   folderAccessEntry,
   unlabeledPeopleFoldersEntry,
@@ -253,6 +261,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   accessLineageEntry,
   accessLabelledOnlyEntry,
   attestReadAccessEntry,
+  guestSourceEntry,
   rlsEntry,
   postgresTlsEntry,
   functionSearchPathEntry,
@@ -317,6 +326,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   autoChronicleEntry,
   factsDrainEntry,
   wakeshiftEntry,
+  wakeshiftOpenclawEntry,
   factTakeVectorsEntry,
   plannerStatsEntry,
   retrievalFeedbackEntry,
@@ -345,7 +355,6 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   derivedOriginParkedEntry,
   derivationPurgeSweepsEntry,
   missingRecordedFilesEntry,
-  uncommittedSyncDeletionsEntry,
   unindexedFilesEntry,
   overwrittenEditsEntry,
   rowsBehindEntry,
@@ -354,17 +363,11 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   managedSyncConvergenceEntry,
   // #7160: title-prefixed person pages next to the unprefixed page (read-only, preview-first).
   personTitleDuplicatesEntry,
-  // Git-canonical G1: the read-only git-gap census totals per source with a checkout (informational, always ok).
-  dbAheadOfGitEntry,
-  // Git-canonical G3: how far each strict source's index trails the commit at HEAD.
-  gitIndexLagEntry,
-  strictFactsOutsideGitEntry,
   // GST-1601: the one-sided local edits adopted in the last 24 h per source (informational, always ok).
   localEditAdoptionsEntry,
   // GBRA-221: live fence rows on imported pages whose body is outside-authored text (review only).
   outsideContentFencesEntry,
-  // GBRA-248 W0: writes waiting on a long-quiet owner host, and a file plane that disables embeddings over a database with vectors.
-  ownerHostStaleEntry,
+  // GBRA-248 W0: a file plane that disables embeddings over a database with vectors (owner_host_stale runs with LOST_WRITE_CHECKS).
   embeddingPlaneDisagreementEntry,
   // #6770: MCP request-log size and the opt-in retention prune (read-only; the enable fix asks the user).
   mcpRequestLogRetentionEntry,
@@ -384,6 +387,14 @@ export const CHEAP_INCIDENT_CHECKS: ReadonlySet<string> = new Set([
   // GBRA-150: bounded receipt and page reads, so a brain whose default run cannot finish still names its landing gaps.
   'sync_landing_gaps',
 ]);
+
+/**
+ * GBRA-541: checks that catch a write the database holds and Git does not (or that waits on a host that never commits it):
+ * written-but-uncommitted pages and facts, an index behind its commits, writes held on a quiet owner, deletions Git never
+ * held. Each is bounded, and every entry that emits one runs right after the privacy check, before the full scans, so a
+ * large brain's slow scans cannot use up the budget first (test/doctor-entry-deadline-6803.test.ts).
+ */
+export const LOST_WRITE_CHECKS: ReadonlySet<string> = new Set(['git_index_lag', 'db_ahead_of_git', 'strict_facts_outside_git', 'owner_host_stale', 'uncommitted_sync_deletions']);
 
 const CONNECTION_LANE: ReadonlySet<DoctorEntry> = new Set([offlineConnectionEntry, dbChecksGateEntry, connectionEntry, connectionGateEntry]);
 

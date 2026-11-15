@@ -36,6 +36,10 @@ import { writeCliNotices } from '../core/interop-notices.ts';
 import { BOT_HARNESSES, renderedExposure, sharedTokenNotice, writeExposureNotice, type ExposureServes } from '../core/grants/shared-exposure.ts';
 import { claudeCodeChannelPlugins } from './shared-exposure-local.ts';
 import { setupFirstRunNotices } from './init-first-run.ts';
+import { wakeshiftPublished } from '../core/wakeshift/config.ts';
+import { findOpenclawBin, installWakeshiftOpenclaw, networkHooksQuestion, openclawGatewayBind, wakeshiftOpenclawInstallArgv, WAKESHIFT_OPENCLAW_PACKAGE, WAKESHIFT_OPENCLAW_VERSION, type OpenclawRun } from './setup-openclaw-wakeshift.ts';
+import { requireConsent } from '../core/consent.ts';
+import { writeCliError } from '../cli/cli-error.ts';
 import { hostedOptionMuted, hostedOptionNotice, writeHostedOption } from '../core/onboard/hosted-option.ts';
 import { writeJsonDocument } from '../core/cli-force-exit.ts';
 import { configDir, gbrainPath, isThinClient, loadConfig, type GBrainConfig } from '../core/config.ts';
@@ -121,6 +125,8 @@ import {
   type BrainFirstOutcome,
 } from '../core/setup/brain-first.ts';
 import { HARNESS_ADAPTERS } from '../core/harness/registry.ts';
+import { applyBrainLayout, askBrainShape, brainShapeDecision, describeLayout, layoutNotices, parseLayoutFlags, withBrainShape, type BrainShape, type LayoutOutcome } from './setup-brain-layout.ts';
+import { isInteractive } from '../core/interaction.ts';
 
 export const SETUP_HELP = `gbrain setup <harness> — give an agent harness memory in one command
 
@@ -201,6 +207,29 @@ Flags:
                        commits; Cursor has no per-turn hook gbrain can use.
                        off removes what an earlier run wrote. The
                        choice is remembered; GBRAIN_SKILL_LOADING sets it too.
+  --wakeshift          OpenClaw: install Wakeshift's OpenClaw plugin (@wakeshift/openclaw, pinned)
+                       so gbrain can wake an OpenClaw session when a job finishes. Asks
+                       consent (--yes), runs OpenClaw's own installer, changes nothing else.
+  --shape personal     claude-code, codex: give the brain a personal shape. Writes three
+                       empty starter pages, create-only (me/facts, me/voice,
+                       me/how-i-decide, each marked status: stub; nothing about you is
+                       invented) and a short block beside the brain-first block that
+                       tells the agent to read them. A brand-new brain set up without
+                       --shape asks (at a terminal) or returns the brain_shape decision
+                       (agents); nothing is written until it is answered.
+  --shape company      Adds a company source (in default search only when the brain
+                       serves one person) with empty pages for company facts,
+                       decisions, pricing, customers, calls and playbooks, and the
+                       matching lines in that block. --shape both does personal too.
+  --shape none         Remove that block; the pages stay.
+  --notes DIR          With --shape personal or both: import a notes folder (absolute or
+                       ~/), read only, then check keyless search finds a note in it. Over
+                       500 markdown files, setup prints the import command instead.
+  --docs DIR           With --shape company or both: import a company docs folder into
+                       the company source the same way, read only.
+  --team | --solo      With a company shape: --team prints where a team's shared company
+                       brain lives and creates nothing for it; --solo (the default) makes
+                       the company part on this brain.
   --skills-index-only  Refresh every skills index recorded for this harness (its
                        file, launcher and skill set as recorded) and change
                        nothing else; with --skill-loading off, remove them.
@@ -260,6 +289,7 @@ interface SetupFlags {
   instructions?: boolean;
   instructionsOnly: boolean;
   skillsIndexOnly: boolean;
+  wakeshift: boolean;
   workspace?: string;
   skillLoading?: SkillLoading;
   /** --skill-loading resolve turns the skill-resolver lane on (skill-resolver-setup.ts); off or spring turns it off; unset leaves it as it is. OpenClaw also takes shadow. */
@@ -277,9 +307,17 @@ interface SetupFlags {
   /** GST-363: written into this harness's MCP entry as serve --stdio-member; never into config. */
   stdioMember?: string;
   noStdioMember: boolean;
+  /** GST-2731: the brain's shape (setup-brain-layout.ts); unset leaves it as it is. */
+  brain?: BrainShape;
+  /** GST-2731: the notes folder imported read only with --shape personal; null for --notes none. */
+  notes?: string | null;
+  /** GST-2731: the company docs folder imported read only with --shape company; null for --docs none. */
+  docs?: string | null;
+  /** GST-2731: --team, the company part lives on a shared brain; setup prints the route and creates nothing for it. */
+  team?: boolean;
 }
 
-const VALUE_FLAGS = new Set(['--surface', '--scope', '--name', '--source', '--gbrain-bin', '--workspace', '--skill-loading', '--agent', '--live-fraction', '--pins-route', '--owner-sender', '--serves', '--members', '--members-file', '--stdio-member']);
+const VALUE_FLAGS = new Set(['--shape', '--notes', '--docs', '--surface', '--scope', '--name', '--source', '--gbrain-bin', '--workspace', '--skill-loading', '--agent', '--live-fraction', '--pins-route', '--owner-sender', '--serves', '--members', '--members-file', '--stdio-member']);
 
 function parseFlags(args: string[]): SetupFlags | string {
   const value = (flag: string): string | undefined => {
@@ -310,6 +348,9 @@ function parseFlags(args: string[]): SetupFlags | string {
   if (memberFlag && (!['claude-code', 'codex'].includes(positionals[0] ?? '') || args.includes('--instructions-only') || args.includes('--remove'))) return `${memberFlag} changes the stdio MCP entry setup writes for claude-code or codex (not --instructions-only or --remove); nothing was written`;
   const shared = stdioMember === undefined ? null : sharedStdioHarness();
   if (shared) return `--stdio-member refused: ${shared} is installed on this host, and its sessions serve several people, so a stdio entry bound to one member is not something setup writes here; give each person their own key over HTTP instead (gbrain serve --http with gbrain auth create <name> --member <id> per person); nothing was written`;
+  const layout = parseLayoutFlags(value, (f) => args.includes(f), positionals[0]);
+  if (typeof layout === 'string') return layout;
+  if (layout.brain && (!['claude-code', 'codex'].includes(positionals[0] ?? '') || args.includes('--instructions-only') || args.includes('--remove'))) return '--shape shapes the brain behind gbrain setup claude-code or codex (not --instructions-only or --remove); nothing was written';
   const workspace = value('--workspace');
   if (workspace !== undefined && !workspace.startsWith('/') && !workspace.startsWith('~')) return '--workspace needs an absolute path';
   const flagLoading = value('--skill-loading');
@@ -353,6 +394,7 @@ function parseFlags(args: string[]): SetupFlags | string {
     instructions: args.includes('--instructions') ? true : args.includes('--no-instructions') ? false : undefined,
     instructionsOnly: args.includes('--instructions-only'),
     skillsIndexOnly: args.includes('--skills-index-only'),
+    wakeshift: args.includes('--wakeshift'),
     workspace,
     skillLoading: skillLoading as SkillLoading | undefined,
     ...(skillResolver ? { skillResolver } : {}),
@@ -364,6 +406,7 @@ function parseFlags(args: string[]): SetupFlags | string {
     ...(args.includes('--labelled-only') ? { labelledOnly: true } : {}),
     ...(stdioMember !== undefined ? { stdioMember } : {}),
     noStdioMember,
+    ...layout,
   };
 }
 
@@ -460,7 +503,7 @@ function describeConsent(c: SetupConsent, events: string[], out: Out, harness: S
   say(out, `  providers  ${c.providers.value}${c.providers.value === 'declined' ? ' (keyless: setup configures no paid provider; accept with --providers)' : ''} ${src(c.providers.source)}`);
 }
 
-export async function runSetup(args: string[]): Promise<number> {
+export async function runSetup(args: string[], deps: { openclaw?: { bin?: string | null; run?: OpenclawRun } } = {}): Promise<number> {
   if (args.includes('--help') || args.includes('-h') || args.length === 0) {
     console.log(SETUP_HELP);
     return 0;
@@ -476,6 +519,7 @@ export async function runSetup(args: string[]): Promise<number> {
   const mcpWired = flags.harness === 'claude-code' || flags.harness === 'codex';
   if (flags.harness === 'pi') return runPiSetup(flags, out);
   if (flags.skillsIndexOnly) return runSkillsIndexOnly(flags, out);
+  if (flags.wakeshift) return runWakeshiftOpenclaw(flags, args, out, deps.openclaw ?? {});
   if ((flags.instructionsOnly && (isBrainFirstHarness(flags.harness) || adapter)) || (isBrainFirstHarness(flags.harness) && !mcpWired)) {
     return runInstructionsOnly(flags, out);
   }
@@ -520,7 +564,7 @@ export async function runSetup(args: string[]): Promise<number> {
     if (flags.remove) return await runRemove(flags, receiptRead.setup, paths.receiptPath, brainHome, out);
 
     const hostedUrl = cfg?.remote_mcp?.mcp_url ?? receiptRead.hosted?.mcp_url ?? (receiptRead.hosted ? 'a hosted brain' : undefined);
-    if (hostedUrl) return refuse(hostedConnection(hostedUrl, receiptRead.hosted !== null, flags.name), out);
+    if (hostedUrl) return refuse(hostedConnection(hostedUrl, receiptRead.hosted !== null, flags), out);
     const prior = receiptRead.setup;
     if (prior && prior.gbrain_home !== brainHome) {
       return refuse(ownerConflict('other_install', `The '${flags.name}' connection belongs to the gbrain install at ${prior.gbrain_home}, not ${brainHome}.`, {
@@ -550,7 +594,7 @@ export async function runSetup(args: string[]): Promise<number> {
     }
     const binding = entryBinding(flags, found.mcp.stdioMember);
     if (binding.member) { plan = { ...plan, stdioMember: binding.member }; found = inspectClaudeSetup(plan); }
-    if (found.mcp.state === 'remote') return refuse(hostedConnection(found.mcp.url ?? 'a hosted brain', true, flags.name), out);
+    if (found.mcp.state === 'remote') return refuse(hostedConnection(found.mcp.url ?? 'a hosted brain', true, flags), out);
 
     const pluginOwner = flags.name === 'gbrain' ? claudePluginProvidesName(claudeUserSettingsPath(), 'gbrain') : null;
     if (pluginOwner && flags.stdioMember !== undefined) return refuse(pluginBindingRefusal(pluginOwner, 'claude-code', flags.stdioMember), out);
@@ -598,7 +642,8 @@ export async function runSetup(args: string[]): Promise<number> {
       const instructions = brainFirstFor('claude-code', flags, mcpAccess(flags.name, plan.advertise ?? surface, serves), { scope, projectDir });
       const skills = skillsFor('claude-code', flags, launcher, { scope, projectDir }, instructions);
       const resolver = await resolverFor('claude-code', flags, launcher);
-      return finish(out, { dryRun: true, target, consent, steps, states: [], verify: null, notices: [], notes, instructions, skills, resolver, serves, launcher });
+      const layout = await layoutFor('claude-code', flags, launcher, instructions, brainCreate);
+      return finish(out, { dryRun: true, target, consent, steps, states: [], verify: null, notices: layout.notices([]), notes, instructions, skills, resolver, serves, launcher, layout: layout.outcome });
     }
 
     let notices: Notice[] = [];
@@ -622,8 +667,9 @@ export async function runSetup(args: string[]): Promise<number> {
     }
     const states = ['configured', ...(verify.ok ? ['connection-verified', 'native-pending'] : [])];
     const turnHook = plan.events.includes('UserPromptSubmit') && instructions?.decision.value === 'accepted' ? verifyTurnHook('claude-code', { projectDir }) : null;
-    const code = await finish(out, { dryRun: false, target: { ...target, registration_owner: pluginOwner ? 'plugin' : 'setup' }, consent: result.receipt.consent, steps: result.steps, states, verify, notices, notes,
-      preserved: Object.keys(result.edited).map((event) => ({ kind: 'hook', event, reason: 'edited' })), instructions, skills, turnHook, resolver, serves, launcher });
+    const layout = await layoutFor('claude-code', flags, launcher, instructions, brainCreate);
+    const code = await finish(out, { dryRun: false, target: { ...target, registration_owner: pluginOwner ? 'plugin' : 'setup' }, consent: result.receipt.consent, steps: result.steps, states, verify, notices: layout.notices(notices), notes,
+      preserved: Object.keys(result.edited).map((event) => ({ kind: 'hook', event, reason: 'edited' })), instructions, skills, turnHook, resolver, serves, launcher, layout: layout.outcome });
     if (turnHook && !turnHook.ok) return out.json ? 1 : refuse(turnHookNotLoaded('claude-code', turnHook, ['gbrain', 'setup', 'claude-code', ...(scope === 'project' ? ['--scope', 'project'] : [])]), out);
     return verify.ok || pluginOwner ? code : 1;
   } catch (e) {
@@ -675,6 +721,22 @@ function liveServeConflict(live: NonNullable<Target['live_owner']>, harness: Set
         verify: verifyDryRun(harness, name) });
 }
 
+/**
+ * GST-2731: the brain's shape for this run. An explicit --shape applies it; a brand-new brain without one asks
+ * inline when a person is at the terminal, and otherwise adds the brain_shape decision to the first-run bundle
+ * (nothing is written until it is answered, --yes included).
+ */
+async function layoutFor(harness: SetupHarnessId, flags: SetupFlags, launcher: string, instructions: BrainFirstOutcome | null, brainCreate: boolean): Promise<{ outcome: LayoutOutcome | null; notices: (base: Notice[]) => Notice[] }> {
+  let shape: { brain?: BrainShape; notes?: string | null; docs?: string | null; team?: boolean } = { brain: flags.brain, notes: flags.notes, docs: flags.docs, team: flags.team };
+  const ask = brainCreate && !shape.brain;
+  if (ask && !flags.json && isInteractive()) shape = await askBrainShape();
+  const scope = flags.scope ?? 'user';
+  const source = flags.source ?? (process.env.GBRAIN_SOURCE && isValidSourceId(process.env.GBRAIN_SOURCE) ? process.env.GBRAIN_SOURCE : null);
+  const outcome = applyBrainLayout({ harness, scope, source, launcher, instructionsPath: instructions?.path ?? null, instructionsDeclined: instructions?.decision.value === 'declined',
+    flags: { brain: shape.brain, notes: shape.notes, docs: shape.docs, team: shape.team, dryRun: flags.dryRun } });
+  return { outcome, notices: (base) => [...(ask && !shape.brain ? withBrainShape(base, brainShapeDecision(harness, undefined, scope, source)) : base), ...layoutNotices(outcome, harness, scope, source)] };
+}
+
 /** Run the `gbrain init --json` child that creates a new keyless brain; returns setup's form of its first-run bundle. */
 function runBrainInit(initArgv: string[], out: Out, harness: SetupHarnessId): Notice[] {
   say(out, `Creating the brain: ${initArgv.join(' ')}`);
@@ -691,7 +753,7 @@ function runBrainInit(initArgv: string[], out: Out, harness: SetupHarnessId): No
   try {
     const doc = JSON.parse(initOut) as { path?: string; notices?: unknown[] };
     if (doc.path) say(out, `Brain ready at ${doc.path}`);
-    return [...setupFirstRunNotices(doc.notices ?? [], HARNESS_LABEL[harness]), ...(hosted ? [hosted] : [])];
+    return [...setupFirstRunNotices(doc.notices ?? [], HARNESS_LABEL[harness], { reportBack: wakeshiftPublished() }), ...(hosted ? [hosted] : [])];
   } catch { process.stderr.write(initOut); return hosted ? [hosted] : []; }
 }
 
@@ -702,7 +764,7 @@ async function runCodexSetup(flags: SetupFlags, launcher: string, cfg: GBrainCon
     if (flags.remove) return await runCodexRemove(flags, receiptRead.setup, paths.receiptPath, brainHome, out);
 
     const hostedUrl = cfg?.remote_mcp?.mcp_url ?? receiptRead.hosted?.mcp_url ?? (receiptRead.hosted ? 'a hosted brain' : undefined);
-    if (hostedUrl) return refuse(hostedConnection(hostedUrl, receiptRead.hosted !== null, flags.name, 'codex'), out);
+    if (hostedUrl) return refuse(hostedConnection(hostedUrl, receiptRead.hosted !== null, flags, 'codex'), out);
     const prior = receiptRead.setup;
     if (prior && prior.gbrain_home !== brainHome) {
       return refuse(ownerConflict('other_install', `The '${flags.name}' connection belongs to the gbrain install at ${prior.gbrain_home}, not ${brainHome}.`, {
@@ -731,7 +793,7 @@ async function runCodexSetup(flags: SetupFlags, launcher: string, cfg: GBrainCon
     }
     const binding = entryBinding(flags, found.mcp.stdioMember);
     if (binding.member) { plan = { ...plan, stdioMember: binding.member }; found = inspectCodexSetup(plan); }
-    if (found.mcp.state === 'remote') return refuse(hostedConnection(found.mcp.url ?? 'a hosted brain', true, flags.name, 'codex'), out);
+    if (found.mcp.state === 'remote') return refuse(hostedConnection(found.mcp.url ?? 'a hosted brain', true, flags, 'codex'), out);
 
     const pluginOwner = codexPluginProvidesName(paths.configPath, flags.name);
     if (pluginOwner && flags.stdioMember !== undefined) return refuse(pluginBindingRefusal(pluginOwner, 'codex', flags.stdioMember), out);
@@ -781,7 +843,8 @@ async function runCodexSetup(flags: SetupFlags, launcher: string, cfg: GBrainCon
       const instructions = brainFirstFor('codex', flags, mcpAccess(flags.name, plan.advertise ?? surface, serves), {});
       const skills = skillsFor('codex', flags, launcher, {}, instructions);
       const resolver = await resolverFor('codex', flags, launcher);
-      return finish(out, { harness: 'codex', dryRun: true, target, consent, steps, states: [], verify: null, notices: [], notes, instructions, skills, resolver, serves });
+      const layout = await layoutFor('codex', flags, launcher, instructions, brainCreate);
+      return finish(out, { harness: 'codex', dryRun: true, target, consent, steps, states: [], verify: null, notices: layout.notices([]), notes, instructions, skills, resolver, serves, layout: layout.outcome });
     }
 
     let notices: Notice[] = [];
@@ -807,8 +870,9 @@ async function runCodexSetup(flags: SetupFlags, launcher: string, cfg: GBrainCon
     const push = capabilityRows('codex')[0]!.push;
     const states = ['configured', ...(verify.ok ? ['connection-verified', push === 'native-verified' && result.receipt.trust.owned.UserPromptSubmit ? 'native-verified' : 'native-pending'] : [])];
     const turnHook = plan.events.includes('UserPromptSubmit') && instructions?.decision.value === 'accepted' ? verifyTurnHook('codex') : null;
+    const layout = await layoutFor('codex', flags, launcher, instructions, brainCreate);
     const code = await finish(out, { harness: 'codex', dryRun: false, target: { ...target, registration_owner: pluginOwner ? 'plugin' : 'setup' }, consent: result.receipt.consent,
-      steps: result.steps, states, verify, notices, notes: [...notes, ...result.notes], preserved: result.preserved, instructions, skills, turnHook, resolver, serves });
+      steps: result.steps, states, verify, notices: layout.notices(notices), notes: [...notes, ...result.notes], preserved: result.preserved, instructions, skills, turnHook, resolver, serves, layout: layout.outcome });
     if (turnHook && !turnHook.ok) return out.json ? 1 : refuse(turnHookNotLoaded('codex', turnHook, ['gbrain', 'setup', 'codex']), out);
     return verify.ok || pluginOwner ? code : 1;
   } catch (e) {
@@ -838,11 +902,12 @@ async function runCodexRemove(flags: SetupFlags, receipt: CodexSetupReceipt | nu
   return finish(out, { harness: 'codex', dryRun: flags.dryRun, remove: true, steps: r.steps, states: [], verify: null, notices: [], notes: r.notes, preserved: r.preserved, instructions, skills, resolver });
 }
 
-function hostedConnection(url: string, wired: boolean, name: string, harness: SetupHarnessId = 'claude-code'): OperationError {
+function hostedConnection(url: string, wired: boolean, flags: Pick<SetupFlags, 'name' | 'skillResolver'>, harness: SetupHarnessId = 'claude-code'): OperationError {
   const label = HARNESS_LABEL[harness];
+  const resolver = flags.skillResolver === 'on' ? ` The skill resolver needs no local brain: set it up with \`gbrain setup ${harness} --skills-index-only --skill-loading resolve\`.` : '';
   return opError('setup_hosted_connection',
-    `This machine already reaches a hosted brain (${url})${wired ? ` and ${label}'s '${name}' entry points at it` : ''}; gbrain setup will not create a second, local brain.`,
-    wired ? 'Nothing to do: the hosted connection is wired. `gbrain doctor --only harness_wiring` verifies it.' : `Connect ${label} to it with \`gbrain connect ${url} --harness ${harness} --install\`.`,
+    `This machine already reaches a hosted brain (${url})${wired ? ` and ${label}'s '${flags.name}' entry points at it` : ''}; gbrain setup will not create a second, local brain.`,
+    (wired ? 'Nothing to do: the hosted connection is wired. `gbrain doctor --only harness_wiring` verifies it.' : `Connect ${label} to it with \`gbrain connect ${url} --harness ${harness} --install\`.`) + resolver,
     { docs: 'docs/guides/repair.md#setup-hosted-connection',
       fix: wired
         ? { argv: ['gbrain', 'doctor', '--only', 'harness_wiring', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Shows which brain the registration reaches and smoke-tests it.' }
@@ -1094,6 +1159,61 @@ async function runInstructionsOnly(flags: SetupFlags, out: Out): Promise<number>
 }
 
 /**
+ * --wakeshift (OpenClaw only): consent, then Wakeshift's pinned OpenClaw plugin through OpenClaw's own installer
+ * (src/commands/setup-openclaw-wakeshift.ts). Prints Wakeshift's allowNetworkHooks question and never answers it.
+ */
+async function runWakeshiftOpenclaw(flags: SetupFlags, args: string[], out: Out, deps: { bin?: string | null; run?: OpenclawRun }): Promise<number> {
+  const remove = 'openclaw wakeshift reset && openclaw plugins uninstall wakeshift --force';
+  if (flags.harness !== 'openclaw') {
+    return refuse(opError('invalid_params', `--wakeshift installs Wakeshift's OpenClaw plugin, so it applies to gbrain setup openclaw only (got ${flags.harness ?? 'no harness'}).`, 'Run gbrain setup openclaw --wakeshift where the OpenClaw gateway runs.'), out);
+  }
+  if (flags.remove) {
+    return refuse(opError('invalid_params', "setup does not remove Wakeshift's plugin; OpenClaw's own commands do, and they also undo the hooks settings it changed.", `Run: ${remove}`), out);
+  }
+  const bin = deps.bin !== undefined ? deps.bin : findOpenclawBin();
+  const commands = wakeshiftOpenclawInstallArgv().map((a) => a.join(' ')).join(' && ');
+  if (!bin) {
+    return refuse(opError('openclaw_not_found', "openclaw is not on PATH, so Wakeshift's OpenClaw plugin was not installed; nothing changed.",
+      `Run gbrain setup openclaw --wakeshift where the OpenClaw gateway runs (in its container, if it is in one), or run there: ${commands}`,
+      { fix: { argv: ['gbrain', 'setup', 'openclaw', '--wakeshift'], consent: ['persistent_install', 'egress'], actor: 'user', requires_exclusive: false,
+        why: 'The plugin installs where the OpenClaw gateway runs, with openclaw on PATH.' } }), out);
+  }
+  const bind = openclawGatewayBind();
+  if (!flags.dryRun) {
+    try {
+      await requireConsent({
+        command: 'setup openclaw --wakeshift', effects: ['persistent_install', 'egress'], actor: 'user',
+        what: `Install Wakeshift's OpenClaw plugin ${WAKESHIFT_OPENCLAW_PACKAGE}@${WAKESHIFT_OPENCLAW_VERSION} from npm and enable it: ${commands}`,
+        why: 'gbrain can then wake this OpenClaw session when a job, write or cron run it watches finishes, instead of the agent polling.',
+        risk: "OpenClaw downloads the package from npm (published by Wakeshift with npm provenance). The plugin talks to Wakeshift's service and turns on OpenClaw's hooks endpoint with its own token, for conversations that connect through Wakeshift."
+          + (networkHooksQuestion(bind) ? ' This gateway listens beyond this computer; the plugin asks before using the endpoint there.' : ''),
+        user_message: "Install Wakeshift's OpenClaw plugin so gbrain can report back to this OpenClaw chat when long jobs or cron runs finish?",
+        argv: ['gbrain', 'setup', 'openclaw', '--wakeshift', '--yes'], args,
+      });
+    } catch (e) {
+      return writeCliError(e, 'setup', { json: out.json });
+    }
+  }
+  const result = installWakeshiftOpenclaw({ bin, run: deps.run, dryRun: flags.dryRun, bind });
+  const code = result.action === 'failed' || (result.verify && !result.verify.loaded) ? 1 : 0;
+  if (out.json) {
+    await writeJsonDocument(`${JSON.stringify({ harness: 'openclaw', dry_run: flags.dryRun, wakeshift: { ...result, remove } }, null, 2)}\n`, (t) => process.stdout.write(t));
+    return code;
+  }
+  say(out, `Wakeshift for OpenClaw (${WAKESHIFT_OPENCLAW_PACKAGE}@${result.version}):`);
+  const verb = result.action === 'dry_run' ? 'would run' : 'ran';
+  for (const c of result.commands) {
+    if (result.action === 'failed' && c === result.failed_command) { say(out, `  failed   ${c}${result.output ? `\n    ${result.output.replace(/\n/g, '\n    ')}` : ''}`); break; }
+    say(out, `  ${verb.padEnd(8)} ${c}`);
+  }
+  if (result.verify) say(out, `Verify: ${result.verify.message}`);
+  if (result.network_hooks_question) say(out, `Question from Wakeshift (answer it yourself): ${result.network_hooks_question}`);
+  if (result.action === 'installed') say(out, 'Next: the brain owner turns reporting back on with gbrain wakeshift enable on the brain host; agents then offer watch_job after a long submit.');
+  say(out, `Remove: ${remove}`);
+  return code;
+}
+
+/**
  * Cursor's pinned skills for the project setup runs in (cursor-skill-pins.ts):
  * --skill-loading resolve turns them on, off or --remove takes them out, and
  * a bare run refreshes a project that already has them.
@@ -1189,6 +1309,7 @@ async function finish(out: Out, doc: {
   resolver?: ResolverSetupResult | null;
   serves?: ServesOutcome | null;
   launcher?: string;
+  layout?: LayoutOutcome | null;
 }): Promise<number> {
   const harness = doc.harness ?? 'claude-code';
   const state = doc.states.at(-1) ?? null;
@@ -1202,6 +1323,7 @@ async function finish(out: Out, doc: {
       ...(doc.target ? { target: doc.target } : {}), ...(doc.consent ? { consent: doc.consent } : {}),
       steps: doc.steps, preserved: doc.preserved ?? [], instructions: doc.instructions ?? null, skills: doc.skills ?? null, ...(doc.resolver ? { skill_resolver: doc.resolver } : {}), ...(doc.turnHook ? { turn_hook_check: doc.turnHook } : {}), states: doc.states, state, verify: doc.verify,
       ...(doc.serves ? { serves: doc.serves } : {}),
+      ...(doc.layout ? { brain_layout: doc.layout } : {}),
       capability: capabilityRows(harness)[0], capability_table_version: SETUP_CAPABILITY_TABLE_VERSION,
       notes: doc.notes, notices: notices.map((n) => renderNotice(n, cliRenderContext())),
     }, null, 2)}\n`, (t) => process.stdout.write(t));
@@ -1211,6 +1333,7 @@ async function finish(out: Out, doc: {
   if (doc.instructions) say(out, doc.remove ? describeBrainFirstOutcome(doc.instructions, doc.dryRun) : describeInstructions(doc.instructions, doc.dryRun));
   if (doc.skills && skillsOutcomeShown(doc.skills)) say(out, describeSkillsBlockOutcome(doc.skills, doc.dryRun));
   if (doc.resolver) for (const line of describeResolverSetup(doc.resolver, doc.dryRun)) say(out, line);
+  if (doc.layout) for (const line of describeLayout(doc.layout, doc.dryRun)) say(out, line);
   if (doc.verify) say(out, `Verify: ${doc.verify.ok ? 'ok' : 'not verified'} (${doc.verify.reason}): ${doc.verify.message}`);
   if (doc.turnHook?.ok) say(out, `Turn hook: ok (${doc.turnHook.reason}): ${doc.turnHook.message}`);
   if (state) say(out, `State: ${state} (${doc.states.join(' -> ')}).${state === 'native-verified' ? '' : ' Native push is not claimed until an observed event reaches a fresh session.'}`);

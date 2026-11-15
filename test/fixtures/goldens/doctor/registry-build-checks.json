@@ -371,6 +371,26 @@
       },
       {
         "category": "brain",
+        "name": "git_index_lag"
+      },
+      {
+        "category": "brain",
+        "name": "db_ahead_of_git"
+      },
+      {
+        "category": "brain",
+        "name": "strict_facts_outside_git"
+      },
+      {
+        "category": "ops",
+        "name": "owner_host_stale"
+      },
+      {
+        "category": "brain",
+        "name": "uncommitted_sync_deletions"
+      },
+      {
+        "category": "brain",
         "name": "access_readers_malformed"
       },
       {
@@ -444,6 +464,10 @@
       {
         "category": "brain",
         "name": "attest_read_shared_scope"
+      },
+      {
+        "category": "brain",
+        "name": "guest_source"
       },
       {
         "category": "ops",
@@ -700,6 +724,10 @@
       {
         "category": "brain",
         "name": "unwithdrawn_facts"
+      },
+      {
+        "category": "brain",
+        "name": "purged_page_facts"
       },
       {
         "category": "brain",
@@ -1030,6 +1058,10 @@
         "name": "wakeshift"
       },
       {
+        "category": "ops",
+        "name": "wakeshift_openclaw"
+      },
+      {
         "category": "brain",
         "name": "fact_take_vectors"
       },
@@ -1151,10 +1183,6 @@
       },
       {
         "category": "brain",
-        "name": "uncommitted_sync_deletions"
-      },
-      {
-        "category": "brain",
         "name": "unindexed_files"
       },
       {
@@ -1179,27 +1207,11 @@
       },
       {
         "category": "brain",
-        "name": "db_ahead_of_git"
-      },
-      {
-        "category": "brain",
-        "name": "git_index_lag"
-      },
-      {
-        "category": "brain",
-        "name": "strict_facts_outside_git"
-      },
-      {
-        "category": "brain",
         "name": "local_edit_adoptions"
       },
       {
         "category": "brain",
         "name": "outside_content_fences"
-      },
-      {
-        "category": "ops",
-        "name": "owner_host_stale"
       },
       {
         "category": "brain",
