@@ -61,6 +61,22 @@ describe('build()', () => {
     expect(rowsOf(build(tree({ VERSION: '0.1.1.0\n', ...files })).text)).toEqual([{ since: '0.1.1.0', id: 'faster_sync_abc', text: 'Sync is faster now.' }]);
   });
 
+  test('front matter (kind, exception, deprecation) is read and left out of the notice text; bad values are problems', () => {
+    const root = tree({
+      VERSION: '0.1.0.0\n',
+      'CHANGELOG.md': changelog(section('0.1.0.0', 'First.', marker('kinded_row_abc'), marker('bad_kind_abc'))),
+      'behavior-changes.d/kinded_row_abc.md': '---\nkind: breaking\nexception: security\n---\nA kinded\nchange.\n',
+      'behavior-changes.d/bad_kind_abc.md': '---\nkind: sideways\nexception: data-loss\nowner: someone\n---\nText.\n',
+    });
+    const { text, problems } = build(root);
+    expect(rowsOf(text).find((r) => r.id === 'kinded_row_abc')?.text).toBe('A kinded change.');
+    expect(problems).toEqual([
+      'behavior-changes.d/bad_kind_abc.md: front matter line "owner: someone" is not one of kind, exception, deprecation',
+      'behavior-changes.d/bad_kind_abc.md: kind: sideways is not one of breaking, action, default, fix, add',
+      'behavior-changes.d/bad_kind_abc.md: exception: applies only to kind: breaking',
+    ]);
+  });
+
   test('a marker under a released CHANGELOG heading dates the row with that version, text joined to one line', () => {
     const root = tree({
       VERSION: '0.1.1.0\n',
@@ -204,6 +220,18 @@ describe('build()', () => {
     }
     expect(build(tree({ ...base, 'changelog.d/feature-x.md': '---\nbump: patch\n---\n**Faster sync.**\n' })).problems).toEqual([]);
     expect(build(tree({ ...base, 'changelog.d/feature-x.md': '**Faster sync.**\n\nbump: minor appears in prose here.\n' })).problems).toEqual([]);
+  });
+
+  test('a changelog.d fragment whose important: class is not security, regression or data-loss is refused, naming the three and the doc', () => {
+    const base = { VERSION: '0.1.0.0\n', 'CHANGELOG.md': changelog(section('0.1.0.0', 'First.')) };
+    for (const [line, value] of [['important: blocker', 'blocker'], ["important: 'urgent'", 'urgent'], ['"important": Security', 'Security'], ['important:', ''], ['important: blocker # unblocks a crew', 'blocker']]) {
+      const { problems } = build(tree({ ...base, 'changelog.d/fix-x.md': `---\n${line}\n---\n**Search works again.**\n` }));
+      expect(problems).toEqual([`changelog.d/fix-x.md says important: ${value}; stable takes the fast path only for security, regression (in a release that is on stable) or data-loss, so write one of those or delete the important: line (docs/RELEASING.md#daily-stable-check)`]);
+    }
+    for (const value of ['security', 'regression', 'data-loss', "'data-loss'", 'regression # on stable']) {
+      expect(build(tree({ ...base, 'changelog.d/fix-x.md': `---\nimportant: ${value}\n---\n**Search works again.**\n` })).problems).toEqual([]);
+    }
+    expect(build(tree({ ...base, 'changelog.d/fix-x.md': '**Search works again.**\n\nimportant: blocker appears in prose here.\n' })).problems).toEqual([]);
   });
 
   test('an id starting with a digit is refused, so the generated map never holds an unquoted numeric key', () => {

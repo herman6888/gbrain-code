@@ -215,6 +215,7 @@ test/harness-onboarding.test.ts	harness identity and private handoff	6	readFileS
 test/hook-command.serial.test.ts	user-prompt	18	source-surface-helper
 test/hook-push-spawn-env.test.ts	spawnDetachedPush env handoff	2	readFileSync
 test/hook-push-spawn-env.test.ts	tryExecAsync env handoff	1	readFileSync
+test/import-calls.test.ts	operations filter guard	1	exec-scan
 test/import-private-hold-callers-7897.test.ts	import entry points hold a non-canonical private request (#7897)	2	readFileSync
 test/init-mode-picker.test.ts	cost matrix: newest models, priced from model-pricing	6	readFileSync
 test/install-no-postinstall.test.ts	GST-2732: installing gbrain runs no lifecycle script	2	readFileSync
@@ -311,6 +312,9 @@ test/scripts/check-core-world-reads.test.ts	check-core-world-reads.ts: the ratch
 test/scripts/check-dynamic-ci.test.ts	check-dynamic-ci.ts	1	exec-scan,readFileSync
 test/scripts/check-function-size.test.ts	check-function-size.ts rules	11	readFileSync
 test/scripts/check-item-allowlist-catches.test.ts	CLI	2	readFileSync
+test/scripts/check-public-surface.test.ts	dropped manifest entries	5	bun-file
+test/scripts/check-public-surface.test.ts	the base it compares with	10	bun-file
+test/scripts/check-public-surface.test.ts	the committed manifest	2	bun-file
 test/scripts/chunk-visibility-ratchet.test.ts	check-chunk-visibility.ts	6	readFileSync
 test/scripts/ci-bounded-run.test.ts	(file-level)	7	readFileSync
 test/scripts/ci-executed-counts.test.ts	CLI	2	readFileSync
@@ -360,7 +364,7 @@ test/scripts/pregate-remote-gate.test.ts	pregate-remote-gate.sh --list	4	readFil
 test/scripts/pregate-remote-gate.test.ts	reuse of GitHub full runs on the identical tree	9	readFileSync
 test/scripts/pregate-remote-gate.test.ts	ship_lanes_from (/ship lanes carried from CI, docs/ci-event-parity.md#ship-lanes)	3	readFileSync
 test/scripts/promote-stable.test.ts	promote-stable.yml	2	readFileSync
-test/scripts/regen-all.test.ts	regen:all	5	readFileSync
+test/scripts/regen-all.test.ts	regen:all	6	readFileSync
 test/scripts/release-restamp.test.ts	release-restamp --stamp-only	2	readFileSync
 test/scripts/release-restamp.test.ts	release:restamp end to end	16	readFileSync
 test/scripts/release-restamp.test.ts	release:unstamp and merge: direct	7	readFileSync
@@ -457,6 +461,7 @@ test/transcription-injection.test.ts	transcription — command injection (#245)	
 test/trust-write-gate-drift.test.ts	(file-level)	1	readFileSync
 test/unmanaged-push-every-site-gst2456.serial.test.ts	gbrain git commit-push	8	readFileSync
 test/upgrade-post-swap-imports.test.ts	#6604 upgrade post-swap tail	3	readFileSync
+test/upgrade-transcript-archive-notice.test.ts	the conversation archive upgrade notice	3	readFileSync
 test/upgrade.serial.test.ts	detectInstallMethod — package-install classification (in-process)	5	readFileSync
 test/upgrade.serial.test.ts	runUpgrade target verification (#4366)	8	readFileSync
 test/v0_37_fix_wave.serial.test.ts	v0.37 Lane A — defaults sweep	8	source-surface-helper

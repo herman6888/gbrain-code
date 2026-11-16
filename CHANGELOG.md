@@ -10,6 +10,221 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.732.0] - 2026-11-16
+
+**Every pull request is now checked against stable's promise: removing a command, flag, MCP tool or parameter, config key or exit code needs a deprecation record whose 14-day notice has passed.**
+
+### Added
+- `bun run check:public-surface`, part of `bun run verify`. It compares this tree with the merge base against `docs/contracts/public-surface.json`, a list built from the code by `scripts/build-public-surface.ts` (refreshed by `bun run regen:all`). It refuses a pull request that drops a listed entry, or changes an exit code, before a `deprecations.d/<id>.md` record for it has reached its `remove_after` date. A `cli-command` or `mcp-tool` record also covers that command's flags or that tool's parameters.
+- Removals the promise does not cover go through with no record. That means anything missing from the list at the current stable release (the `stable` tag), and any removal in a pull request that adds a `kind: breaking` row with `exception: security` or `exception: data-loss`. The check fetches the tag when the clone lacks it, and in CI a fetch that fails or takes more than 20 seconds fails the check. Until a stable release carries the list, the check says so and counts everything as on stable; a revert then adds a row with `exception: revert` that names the pull request it reverts.
+- New deprecation records must give at least 14 days of notice. An announced `remove_after` date can move later but never earlier, and a merged record keeps the surface and name it announced.
+- New `behavior-changes.d` rows need `kind:` front matter (`breaking`, `action`, `default`, `fix` or `add`). A `breaking` row needs an exception or a `deprecation: <id>` naming a record whose date has passed.
+- A change to the CLI or agent-contract goldens needs a new behaviour-change row, or a `<!-- public-surface: no-behavior-change: <reason> -->` line in the changelog fragment.
+
+### For contributors
+- `docs/STABILITY.md` "How it is checked" says what the check enforces and what still rests on review: `--json` fields, the page format, wording, behaviour beyond names, the two-stable-releases rule, and the flags of the 124 CLI-only commands without a curated help record.
+- A branch converted with `bun run release:unstamp` gets rows without `kind:`; add one to each before pushing (docs/RELEASING.md).
+
+**The public-surface check no longer fails with "no merge base … even after deepening the clone" on shallow CI checkouts whose head is more than one commit past master.**
+
+### Fixed
+- `bun run check:public-surface` deepened a depth-1 CI checkout with `--filter=tree:0`, which GitHub's server fails on for a shallow clone that is not partial. It now deepens with `--filter=blob:none`, and when a fetch fails it prints git's own error under the FAIL line.
+
+**The public-surface check no longer passes silently when it cannot read master's copy of a file it compares with.**
+
+### Fixed
+- After a shallow CI checkout is deepened with `--filter=blob:none`, `bun run check:public-surface` fetches file contents at the merge base on demand. When that fetch failed, it read master's manifest as missing and skipped the removal check. It now tells a file that is missing on the merge base from one it could not read. Under `CI=true` it fails with git's own error, and locally it skips.
+- A file already on master whose name git quotes (one with non-ASCII characters) now counts as on master, so an old `changelog.d` waiver no longer covers a new golden change.
+
+**A page its owner purged stays purged after a restore, even when the purge waited behind a private derived page.**
+
+When an owner purges a page that a derived page depends on for its privacy, the purge waits until that derived page can be labelled private. Before this change, if an automatic purge removed the page first, or the next purge run failed or was deferred, the page was deleted without the purge records that tell a restore to delete it again, so restoring an older backup brought its text back. gbrain now remembers that the owner's purge is owed, by page id only, and whichever run finally removes the page writes those records, on repo brains and on brains without a repository. Restoring the page clears the reminder, so a page its owner brings back is never purged later by it.
+
+A restore now also removes the same rows a live page purge removes. Replaying a purge from the purge mirror used to delete the page but leave its write requests, file rows, derived generation items and their effects, which still held the purged text. Replay and the live purge now share one sweep. If replay cannot finish a sweep (a store that does not exist on the brain aside), the restore stops with `purge_replay_incomplete` and names the purge it could not replay, instead of reporting success. A new doctor warning, `purge_mirror`, says when recent purges are missing from this machine's purge mirror (for example when gbrain runs in a home directory that is removed after each run), so a restore from an older backup would not replay them. The fix is to give every writer one durable `GBRAIN_HOME`. Thanks to @oakleaf for the replay and purge mirror findings (#9469).
+
+<!-- behavior-change: owner_purge_tombstones_survive_9469 -->
+
+### Fixed
+
+- An owner purge that waited behind a private derived page writes its purge records whichever later run removes the page (an automatic expiry, or a run after a failed or deferred one), on every brain.
+- Restore-time purge replay removes write requests, file rows, derived generation items and their effects, the same rows the live purge removes, and fails with `purge_replay_incomplete` instead of reporting a partial sweep as done.
+
+### Added
+
+- Doctor check `purge_mirror`: a warning (never a failure) when purges recorded in the last 30 days have no line in this machine's purge mirror. It prints counts and the mirror's path, never a page name or text.
+
+**An upgrade from before v0.51 keeps a page in search while the index rebuilds, when its old index can't hold withdrawn, held or redacted text, and says how long the rebuild will take.**
+
+### Fixed
+- Upgrading from a release before v0.51 used to take every page out of keyword and vector search until `gbrain projections drain` finished: about 9 hours on a 50,000-page brain behind an 18 ms database round trip. Now a Markdown or code page indexed at or after the safe-chunk fence keeps answering from its old index until its own rebuild, as long as it has no facts or takes fence, no private-key text and no quarantine marker. Pages with a facts or takes fence, pages with private-key text, quarantined pages, images and pages indexed before the safe-chunk fence still wait for the rebuild, so a brain made mostly of entity pages with a Facts fence gets little from this change. Access checks are unchanged, a page that changes after the upgrade leaves search until it is rebuilt, and no embedding calls are made. Reported by @jonahberg (#9192).
+- The upgrade's `[153]` line says how many pages keep answering, how many wait and why, and how long the rebuild takes at the round trip it measured to the database. `gbrain doctor` still counts every page waiting for the rebuild, and says results may be incomplete only while some page is out of search.
+
+## [0.60.731.0] - 2026-11-16
+
+**docs/STABILITY.md now says what stays the same on the stable channel, and how much warning you get before something changes.**
+
+### Added
+- A "What stays the same on stable" section in docs/STABILITY.md. It covers command names and their documented flags, MCP tools and their parameters, documented config keys, the page and frontmatter format, exit codes and the top-level `--json` fields of documented commands, and upgrades from any stable release of the last six months. A removal or rename is announced in a stable release first, keeps working with a warning, and is removed no sooner than 14 days and two stable releases later. Security and data-loss fixes are the one exception. The section also lists what the promise does not cover, including very large brains during an upgrade until #9192 is fixed.
+- `deprecations.d/README.md`, which says how a planned removal is recorded and announced before it happens.
+- The README's Stability section points to the new promise.
+
+**Stable now waits for a green upgrade test from every recent stable release.**
+
+### Changed
+- The daily stable check promotes a release only after the upgrade matrix ran green on that release's exact tag and tree. With no run yet it starts one; a red run holds stable with a warning and is not started again by the schedule.
+- The upgrade matrix's full run also upgrades from the stable releases users may still be on, which are the last 8 stable releases plus the newest one of each older month, back 6 months. A test run from before this change no longer counts.
+- While the upgrade matrix's own break issue is open, stable holds. Only a security or data-loss fix that fails on no from-version the issue doesn't name may pass it.
+- `promote-stable.yml` takes an optional `matrix_run_url`, checks it the same way and records it as `matrix_run` in `stable.json` and the stable tag. A maintainer can still promote without one, recorded as `matrix_run: null`.
+
+**Doctor, init, call import and gbrain serve report and record the right thing in seven small cases.**
+
+### Fixed
+- `gbrain doctor`'s grant check is ok when the only operations a grant misses are ones the owner adds by name, and its message names them with the command that adds them.
+- `gbrain import --calls` finds a call already imported from any folder above the one you import, and reports a call whose page is still being written as pending instead of writing a second copy; with `--accept-pending` it still exits 10 when that write waits on a stale owner host.
+- A folder whose `.git` is an empty file is no longer taken as a git checkout.
+- Release notes drop a trailing internal issue code, like `(ABC-12)`, from each line of the change list.
+- `gbrain init --force --embedding-model <model>` records the new model and width in the database as well as the config file, so the two agree (#9451).
+- `gbrain serve` names upgrade migrations that haven't run, once at startup on stderr, and `gbrain doctor` reports them too, also on a brain an older release last opened whose local upgrade ledger is empty.
+
+### For contributors
+- The key-files page `google-and-loops.md` was at its 60,000-byte cap, so its harness and MCP entries moved unchanged to `google-and-loops-more.md`; the Google source entry now says what an unmanaged `--dry-run` returns.
+
+Reported by @Loprz (#9451).
+
+**Stable moves within a day only for security, data-loss and stable-regression fixes; everything else waits for the weekly move.**
+
+### Changed
+- An important fix, the kind that moves the stable channel early, is now only a security fix, a data-loss fix or a fix for a regression in a release that is on stable. A fix that unblocks one setup, or a regression only alpha releases have, rides the weekly move unless a maintainer promotes by hand. `gbrain upgrade --help`, docs/STABILITY.md, docs/RELEASING.md ("Daily stable check") and changelog.d/README.md say so.
+- `scripts/build-behavior-changes.ts` (in `check:regen-all`) refuses a changelog fragment whose `important:` class is anything but `security`, `regression` or `data-loss`, naming the three and docs/RELEASING.md#daily-stable-check, the same way it refuses a `bump:` other than `patch`. A `# comment` after a front-matter value is no longer read as part of it.
+- Tests: `test/scripts/build-behavior-changes.test.ts` covers the refused and accepted `important:` values.
+
+<!-- behavior-change: stable_important_three_classes_gst2818 -->
+
+## [0.60.730.0] - 2026-11-16
+
+**A dry run of a Google or GitHub source no longer writes pages (#9449).**
+
+### Fixed
+- `gbrain sync --source <id> --dry-run` on a Google (Gmail, Calendar, Contacts) or GitHub source of a brain without managed persistence fetched from the provider and wrote what it fetched: pages, chunks and soft-deletes. It now fetches and writes nothing, prints that the source has no preview, and returns the `dry_run` result, as Slack and meetings sources already did. A brain with managed persistence still refuses a connector dry run before any provider call (#9449).
+- Tests: `test/sync-connector-dry-run-9449.test.ts` runs a dry run of every connector kind on PGLite and Postgres and checks that nothing was fetched or written.
+
+Reported by @kostjakla-del-ok. First fixed by @Masashi-Ono0611.
+
+Supersedes #9450
+
+## [0.60.729.0] - 2026-11-15
+
+**Fifteen small fixes: the doctor's grant repair grants every operation it counted except the ones you approve by name, call import handles single files, look-alike names and pending writes, a folder whose own `.git` is not a repository is no longer taken as a checkout, storage adopt reports what it did, and doctor's type check reads through an index.**
+
+### Fixed
+- `gbrain doctor` (grant_new_ops_available) now prints a repair that grants every operation it counted as missing from a token's or OAuth client's grant, not only `put_pages`, and its preview is the same command with `--dry-run`, which shows each changed grant line as before and after. Membership operations (`join_brain`, `sync_brain_skills`, `leave_brain`), which you approve by name, are left out of that repair and listed apart with their own command. The apply still needs your agreement.
+- `gbrain import <file> --calls` imports that one call file instead of reporting success with nothing imported; a file that is not `.txt` or `.md` is reported as an error.
+- Call import keeps two files apart when a redaction pattern makes their names look the same, so the second file is imported instead of being treated as the first. Pages imported before this release are still found on a rerun.
+- Call import reports a write that was accepted but is still being saved as pending, with the command that reads its receipt, and exits 10 instead of counting it as a failure.
+- A folder whose own `.git` is not a repository (an empty `.git` folder, or a `.git` file pointing at a missing directory) is no longer taken as its own checkout, and when that folder sits untracked inside a real repository, gbrain no longer writes its managed marker into that repository, which made writes elsewhere in it fail with `writer_coordinator_required`.
+- `gbrain doctor` (type_proliferation) reads the distinct source and type pairs through a new index on pages (schema migration 316) instead of scanning every page, which took over 20 seconds on a large brain.
+- `gbrain storage adopt --apply` on a hosted shelf now indexes the cards it committed, so the shelf's sync checkpoint no longer lags until a manual sync; when it cannot, it prints the sync command to run.
+- `gbrain storage adopt --apply --json` counts adopted, skipped, refused and pending records and gives each write its receipt id.
+- `gbrain storage adopt` reports a record cut off by its 64 KiB read as `truncated`, and says to move the `## Record` section to the top, instead of reporting the record as missing.
+- Atom extraction skips the storage shelf, and doctor no longer names the shelf as a source with held atoms.
+- `gbrain storage-find` reports a card asked for by its exact title as an exact hit, not as a closest match.
+- An empty storage location path now says to write `/` for an item at the root of its bucket or repository.
+- Sync no longer tells you to restart a `gbrain serve` that already runs your gbrain version.
+- Owner sessions whose first message starts with a Claude Code slash command (such as `/clear` or `/model`) are no longer classed as launched by an agent (#9390).
+
+### Changed
+- The graduation tests bound and retry their git calls to the remote, so a hung fetch fails fast with a clear error.
+
+## [0.60.728.0] - 2026-11-15
+
+**Five small fixes: doctor sees a project-level Codex registration, a stray `.git` no longer claims a checkout, the host's CLI can read a write receipt another principal owns, keyless search keeps working when its fill step fails, and the conversation archive's folder-cap notice stays accurate.**
+
+### Fixed
+- `gbrain doctor` (harness_wiring) now also reads the workspace's `.codex/config.toml`, so a gbrain MCP server registered there for one project counts as registered instead of being reported as unwired (#9398). Reported by @Masashi-Ono0611.
+- An enclosing `.git` that is not a repository (for example an empty `~/.git` folder another tool left behind) no longer counts as the checkout that owns a brain folder under it, so gbrain stops writing its marker there and stops refusing writes under that folder with `writer_coordinator_required` (#9430). Reported by @garrietv and first fixed by @Masashi-Ono0611.
+- `gbrain write-request <id>` on the brain host now shows the receipt of a write that ran under another principal, such as a fact extraction submitted by an MCP client, which `gbrain sources writer failures` names as each row's next step. Remote callers and request ids two principals share still answer not found (#9426). Reported by @cupit01.
+- Keyless search no longer counts a fill row the model never answered as judged, leaves such rows out of the fill, and returns the plain keyword results when the any-word fill step fails instead of failing the whole search.
+- The conversation archive's `archive_rescope_folder_cap` notice shows only while the `conversations/` rule still keeps the folder to the owner, and on a source already at the 256-rule limit it says that `gbrain access rule export` then `import` fails until another rule is removed.
+
+### Changed
+- The refresh-barrier TLA+ nightly now runs in its own job and checks the adoption-plus-foreign-commit case one write at a time; the two-write run is kept as `RefreshBarrierAdoptFull.cfg` and runs by hand.
+
+**New page, docs/STABILITY.md: which release the default install follows, how a release becomes stable, and how to pin a version or go back.**
+
+### Added
+- `docs/STABILITY.md` explains that the README install command follows the stable channel, what a release has to pass before it becomes stable, when stable moves, how to stay on stable, pin an exact release or return to an earlier one, where behaviour changes are announced, and what the faster alpha channel is for. Nothing in gbrain changes; the page describes what it already does.
+- The README has a short Stability section that links to the page, and `llms.txt` / `llms-full.txt` list it.
+
+**Published release notes now open with one line per change and the pull request that made it.**
+
+### Changed
+- The release workflow puts a list at the top of each GitHub release: one line per change the release folds, taken from the change's changelog entry, with its pull request number. A release that never published is listed in the next one. CHANGELOG.md is unchanged.
+- `bun run verify` fails when a test reads a `changelog.d` file from the repository, because the next release deletes that file and the test breaks.
+- `changelog.d/README.md` says every pull request needs a changelog entry, a tests-only one included.
+
+**`gbrain setup --transcripts DIR` imports your exported call transcripts into the company brain with credentials removed, `me/facts` and `company/facts` become quotable facts pages, and setup says what the conversation archive is doing (GST-2731).**
+
+### Added
+- `gbrain setup claude-code|codex --shape company|both --transcripts DIR` (also asked at a terminal, after the docs folder) imports `.txt` and `.md` call or meeting transcripts from any recorder into the `company` source, one page per file at `company/calls/<date>-<title>`. Every credential in the text (API keys, tokens, passwords, plus your own redaction patterns) is replaced by a `<REDACTED:…>` marker before anything is stored, with the same redaction the conversation archive uses, and the file's path is redacted the same way. Pages are keyword-only: embedding them waits for your approval, with the conversation archive's hold. The facts backstop skips them; with a chat model key set, scheduled atom and event extraction can still read them within their budgets, and setup prints a `what leaves this machine` line saying which is on, or that nothing leaves. Each file is imported once. A rerun reports it unchanged, and a file changed since keeps its first page. Above 500 files setup prints the import command instead. `--transcripts` needs the company part on this brain, so it is refused with `--team`.
+- Setup prints who can read the call pages. That is everyone who can read the `company` source on a brain that serves one person, or the members the source's access rules allow on a brain that serves several. The pages carry no readers of their own.
+- `gbrain import DIR --calls [--prefix company/calls] [--source company]`, the same import on its own (implies `--no-embed`).
+- Page type `facts` (base packs; gbrain-base-v2 is now 1.7.0). `me/facts` and `company/facts` are created with `type: facts`, and the instructions setup writes for the agent say to quote only a facts page's dated lines and to add a new fact as a new dated line.
+- Doctor check `facts_undated_lines`: warns about a facts page with a fact line that has no date, naming the page and the line numbers (never the text), and asks you for the dates. It changes nothing.
+- Setup's report ends with one line on the conversation archive: on, off, or offered (a brain that may serve several people is only offered it).
+- Docs: `docs/guides/brain-layout.md`.
+- Tests: `test/import-calls.test.ts`, `test/doctor-facts-undated-lines.test.ts`, and the transcripts cases in `test/setup-brain-layout.test.ts`.
+
+## [0.60.727.0] - 2026-11-15
+
+- v0.60.726.0 was not published, so this is the first release you can install with the conversation archive; it carries everything in the [0.60.726.0 section of the changelog](https://github.com/garrytan/gbrain/blob/v0.60.727.0/CHANGELOG.md), plus one test fix.
+- The conversation archive is now on by default for personal brains; turn it off with `gbrain transcripts archive off` ([#9433](https://github.com/garrytan/gbrain/pull/9433))
+- New `gbrain transcripts archive` saves each day of your agent conversations, OpenClaw included, as one redacted, searchable page ([#9432](https://github.com/garrytan/gbrain/pull/9432))
+- Archive pages rank a little below your own notes, and `gbrain doctor` warns when the archive falls behind ([#9433](https://github.com/garrytan/gbrain/pull/9433))
+- Tests only: the archive upgrade-notice test keeps passing after a release ([#9437](https://github.com/garrytan/gbrain/pull/9437), [#9441](https://github.com/garrytan/gbrain/pull/9441))
+
+**The upgrade-notice test for the conversation archive keeps passing after a release folds its changelog entry (#9437).**
+
+### Fixed
+- `test/upgrade-transcript-archive-notice.test.ts` no longer reads the `changelog.d` fragment that every release deletes, so the full test suite passes on a release commit again. Tests only; no behavior change.
+
+## [0.60.726.0] - 2026-11-15
+
+- The conversation archive is now on by default for personal brains; turn it off with `gbrain transcripts archive off` ([#9433](https://github.com/garrytan/gbrain/pull/9433))
+- New `gbrain transcripts archive` saves each day of your agent conversations, OpenClaw included, as one redacted, searchable page ([#9432](https://github.com/garrytan/gbrain/pull/9432))
+- Archive pages rank a little below your own notes, and `gbrain doctor` warns when the archive falls behind ([#9433](https://github.com/garrytan/gbrain/pull/9433))
+
+**New, off by default: `gbrain transcripts archive` writes one redacted page per conversation per local day from your agent harnesses, plus a daily index (GST-2768).**
+
+### Added
+- `gbrain transcripts archive run | backfill --from <day> | status | adopt-legacy --dir <folder> | on | off`. Off until `gbrain transcripts archive on`; nothing is scheduled yet. Pages go to `conversations/<harness>/<day>/<label>-<hash8>` and `conversations/days/<day>` in the `conversations` source, redacted before any write; reruns change nothing; the first run pins the timezone so days never re-slice. Backfilled pages are keyword-searchable at once and their embedding waits for `gbrain embed --held`. On a shared brain every page names its readers (the owner, plus an existing `chat-<hash8>` group for a verified group chat); with no owner named, days are held with `archive_owner_unset`. Works on repo-less brains (database is the record), personal repo brains (files committed with `gbrain git commit-push`, then synced) and managed brains (the write coordinator).
+- OpenClaw: live sessions are read through the Gateway (`openclaw gateway call`, with OpenClaw's own config or `OPENCLAW_GATEWAY_URL` / `OPENCLAW_GATEWAY_TOKEN`, or `GBRAIN_OPENCLAW_GATEWAY_URL` / `GBRAIN_OPENCLAW_GATEWAY_TOKEN` to override them), checked against OpenClaw 2026.10.9 and 2026.11.3. The archive also reads OpenClaw's retained session files (`.jsonl.reset.<stamp>`, zstd `.jsonl.deleted.<stamp>.<hex>.zst` and `.jsonl.bak.<stamp>`) and merges them with the Gateway's copy of the same session, so a backfill works with the Gateway down and messages from before a reset are kept; migration and Doctor copies are skipped, and `gbrain transcripts ingest` still reads live files only. A day page is rewritten only when it keeps every message it already held, and backfill re-redacts a finished day when the redaction rules changed since it was written. The `openclaw` child gets only PATH, HOME, locale and the resolved Gateway URL and token, and a working-folder `.env` can no longer set any `OPENCLAW_*` or gbrain Gateway variable. Backfill reads large session folders in a bounded way and resumes where the last run stopped.
+- New error codes: `archive_gateway_unreachable`, `archive_gateway_auth`, `archive_gateway_failed`, `archive_owner_unset`, `archive_redaction_failed`, `archive_run_busy` (one run per source at a time), `archive_audience_unproven` (the brain's audience could not be checked, so nothing was written).
+- When a brain becomes shared, the next archive run first keeps every earlier archive page to the owner, then records the new audience. A failed day index write is retried on the next run.
+
+- Docs: `docs/guides/conversation-archive.md`.
+- Tests: `test/transcripts-archive-*.test.ts` (PGLite, including a real git remote and child CLI commit-push), `test/transcripts-openclaw-gateway.test.ts`, `test/transcripts-openclaw-archived-files.test.ts`, `test/transcripts-openclaw-files-only.test.ts`.
+
+### Known limits
+- Redaction works on what each day's own text marks as a secret. A value that a later day labels as a credential stays visible in the earlier day's page.
+- Pages written while the brain was personal are closed on the next archive run after it becomes shared, so they stay readable to other members for up to one maintenance interval.
+
+**The conversation archive is now on by default for personal brains, runs from the maintenance pass, ranks a little below your own pages, and has a doctor check (GST-2768).**
+
+<!-- behavior-change: transcript_archive_default_gst2768 -->
+
+### Changed
+- `transcripts.archive.enabled` unset now resolves on when the brain is personal (this default flip is approved by Garry's 2026-11-15 "do it" on GST-2768) (`brain.audience` personal, or the audience heuristic reads it as personal) and off on a shared or unknown brain, a thin client and a remote caller; an explicit on or off always wins, and a config read failure resolves off. A shared brain is only offered the archive. Existing personal brains see a one-time upgrade notice with the off command, `gbrain transcripts archive off`.
+- Search and query: an archive page ranks a little below a written page that scores close to it (rank prior 0.8), and one result list keeps at most two archive hits per day, unless the query asks about a conversation or a date. `search.rank_priors false` turns both off.
+- `gbrain init` and `gbrain setup <harness>` state the archive in their first-run settings (on, or offered on a shared brain), what leaves the machine, and how to turn it off.
+
+### Added
+- The maintenance pass runs the archive: unattended upkeep (a serve's idle tick, `gbrain maintain --unattended` and its schedule) and the autopilot tick archive the forward days, then one capped backfill run (`transcripts.archive.backfill_days_per_run`) of older days until none are left, at most once per `transcripts.archive.maintenance_floor_min` (default 360). It never runs when the archive resolves off, never fails the pass, and records its outcome in `transcripts.archive.last_maintenance`. One pass is bounded by count and by `ARCHIVE_MAINTENANCE_BUDGET_MS` (120 s, coordinator waits included). A busy run (`archive_run_busy`) or an unproven audience (`archive_audience_unproven`) is a recorded skip the next pass retries. On a managed brain the pass writes through the write coordinator as `put_page` requests under the local CLI identity (`local_cli`); a write accepted but not yet published counts as `accepted` and is not written again; called inside a coordinated write it skips with `archive_inside_publication`. Backfilled pages stay keyword-only until `gbrain embed --held`; no facts extraction or Dream synthesis runs on archive pages.
+- When a brain archived while personal becomes shared, the owner-only re-scope now adds one rule per folder that holds an archive page (replacing any rule already on those folders, a wider one included) instead of one `conversations/` rule, so a group conversation archived afterwards keeps its group. A personal history longer than the per-source rule limit (256 folders) is kept to the owner by one rule on `conversations/` instead (`archive_rescope_folder_cap`, reported by status and doctor), so group conversations archived afterwards stay owner-only too; widening that rule also opens the earlier days to its readers. When the re-scope waits (no owner: `archive_rescope_owner_unset`; rules kept in git: `archive_rescope_git_rules`), `gbrain transcripts archive status` and doctor say so in one line with the next step.
+- Embedding planning reads a page's archive hold marker and budget row in one statement instead of two.
+- Doctor check `transcript_archive_freshness`: warns when a harness's newest archived day is more than `transcripts.archive.stale_days` (default 2) behind its newest session day (fix: `gbrain transcripts archive run`, or `backfill --from <day>` for a wider gap), when no maintenance pass has run the archive in that long (fix: `gbrain autopilot --install`), and lists held days with their codes. Off is ok; a harness with no readable sessions is informational.
+- Docs: `docs/guides/conversation-archive.md` (default-on behaviour, what leaves the machine, the off switch, backfill and the held embedding, the doctor check, retiring a home-made pipeline).
+- Tests: `test/transcripts-archive-default.test.ts`, `test/transcripts-archive-maintenance.test.ts`, `test/search-archive-rank-prior.test.ts`, `test/doctor-transcript-archive-freshness.test.ts`, `test/upgrade-transcript-archive-notice.test.ts`, `test/transcripts-archive-maintenance-managed.test.ts`, `test/transcripts-archive-run-on-demand.test.ts`, `test/transcripts-archive-rescope-skipped.test.ts`, `test/page-embedding-budget-statements.test.ts`, and the archive line in `test/init-first-run.test.ts`.
+
 ## [0.60.725.0] - 2026-11-15
 
 **Doctor's Git checks now finish on large brains, and a check that could not see everything says health unknown instead of ok.**

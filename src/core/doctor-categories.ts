@@ -224,6 +224,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'purge_parked_pages',
   // GST-2689: origins kept from the purge because a page derived from them could not be labelled private (doctor/checks/purge-parks.ts).
   'derived_origin_parked',
+  // #9469: recent purges this process's purge mirror lacks, so a restore could not replay them (doctor/checks/purge-mirror.ts).
+  'purge_mirror',
   // Wave B PR 4: fact purge sweeps of stored derivation results still pending or stalled (doctor/checks/derivation-purge-sweeps.ts).
   'derivation_purge_sweeps',
   'partial_embedding',
@@ -286,6 +288,10 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'timeline_history',
   // #6147: imported conversation pages that may still carry a typed credential (cached audit).
   'transcript_secret_exposure',
+  // GST-2768: the conversation archive keeping up with the harness sessions (doctor/checks/transcript-archive.ts).
+  'transcript_archive_freshness',
+  // GST-2731: facts pages with undated fact lines (doctor/checks/facts-pages.ts).
+  'facts_undated_lines',
   // #5254 — pages written database-only to a source with no canonical owner.
   'unbound_source',
   'undeclared_db_only_pages',

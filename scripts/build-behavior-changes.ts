@@ -16,6 +16,7 @@
  * newer than the CHANGELOG's top release heading (gstack-restamp --release runs this before it folds the
  * fragments). On every other tree they are pending and generate nothing, so a PR never changes the generated file.
  * A changelog.d fragment whose front matter says `bump:` anything but `patch` is refused: releases are PATCH only.
+ * So is an `important:` class other than security, regression or data-loss: only those reach stable early.
  * Dependency-free and history-free: gstack's release check reruns it in a bare worktree of the release head.
  *
  * Exit: 0 written or fresh, 1 stale or invalid (FAIL/Why/Fix printed), 2 usage.
@@ -32,6 +33,7 @@ export const MARKER = /<!--\s*behavior-change:\s*([^\s]+)\s*-->/g;
 export const ID = /^[a-z][a-z0-9_]{2,95}$/;
 const NOTICE_CAP = 2_000;
 const DOCS = 'behavior-changes.d/README.md';
+const IMPORTANT_CLASSES = ['security', 'regression', 'data-loss'];
 
 export interface Release { version: string | null; ids: string[] }
 export interface Built { text: string; problems: string[] }
@@ -43,6 +45,28 @@ const cmp = (a: string, b: string) => {
   return 0;
 };
 const markers = (text: string) => [...text.matchAll(MARKER)].map(m => m[1]!);
+
+export const KINDS = ['breaking', 'action', 'default', 'fix', 'add'] as const;
+export const EXCEPTIONS = ['security', 'data-loss', 'revert'] as const;
+const FRONT_KEYS = ['kind', 'exception', 'deprecation'];
+
+/** A notice fragment: optional front matter (kind, exception, deprecation), then the notice text. */
+export function parseNoticeFragment(raw: string): { front: Record<string, string>; body: string; problems: string[] } {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(raw);
+  const front: Record<string, string> = {};
+  const problems: string[] = [];
+  for (const line of (m?.[1] ?? '').split(/\r?\n/).filter(l => l.trim())) {
+    const kv = /^([a-z_]+)\s*:\s*(.*?)\s*$/.exec(line);
+    if (!kv || !FRONT_KEYS.includes(kv[1]!)) { problems.push(`front matter line "${line.trim()}" is not one of ${FRONT_KEYS.join(', ')}`); continue; }
+    front[kv[1]!] = kv[2]!.replace(/^(['"])(.*)\1$/, '$2');
+  }
+  if (front.kind !== undefined && !(KINDS as readonly string[]).includes(front.kind)) problems.push(`kind: ${front.kind} is not one of ${KINDS.join(', ')}`);
+  if (front.exception !== undefined && !(EXCEPTIONS as readonly string[]).includes(front.exception)) problems.push(`exception: ${front.exception} is not one of ${EXCEPTIONS.join(', ')}`);
+  if (front.exception !== undefined && front.kind !== 'breaking') problems.push('exception: applies only to kind: breaking');
+  if (front.exception === 'revert' && !/#\d+/.test(m ? raw.slice(m[0].length) : raw)) problems.push('exception: revert needs the notice text to name the pull request it reverts (#<number>)');
+  if (front.deprecation !== undefined && !ID.test(front.deprecation)) problems.push(`deprecation: ${front.deprecation} is not a deprecations.d id`);
+  return { front, body: m ? raw.slice(m[0].length) : raw, problems };
+}
 
 /** CHANGELOG sections oldest first: each release heading with the ids its text marks; `## [Unreleased]` has version null. */
 export function changelogReleases(changelog: string): Release[] {
@@ -75,8 +99,11 @@ export function build(root: string): Built {
     ? readdirSync(join(root, CHANGELOG_FRAGMENT_DIR)).filter(f => f.endsWith('.md') && f !== 'README.md').sort() : [];
   for (const f of pendingFiles) {
     const front = /^---\r?\n([\s\S]*?)\r?\n---\s*(\n|$)/.exec(read(root, join(CHANGELOG_FRAGMENT_DIR, f)))?.[1] ?? '';
-    const bump = /^\s*['"]?bump['"]?\s*:(.*)$/m.exec(front)?.[1]?.trim().replace(/^(['"])(.*)\1$/, '$2');
+    const value = (re: RegExp) => re.exec(front)?.[1]?.replace(/\s+#.*$/, '').trim().replace(/^(['"])(.*)\1$/, '$2');
+    const bump = value(/^\s*['"]?bump['"]?\s*:(.*)$/m);
     if (bump !== undefined && bump !== 'patch') problems.push(`${CHANGELOG_FRAGMENT_DIR}/${f} says bump: ${bump}; gbrain releases are PATCH only and the release takes the highest bump in the batch, so delete the bump: line (or write bump: patch)`);
+    const important = value(/^\s*['"]?important['"]?\s*:(.*)$/m);
+    if (important !== undefined && !IMPORTANT_CLASSES.includes(important)) problems.push(`${CHANGELOG_FRAGMENT_DIR}/${f} says important: ${important}; stable takes the fast path only for security, regression (in a release that is on stable) or data-loss, so write one of those or delete the important: line (docs/RELEASING.md#daily-stable-check)`);
   }
   const pending = [...pendingFiles.flatMap(f => markers(read(root, join(CHANGELOG_FRAGMENT_DIR, f)))), ...releases.filter(r => !r.version).flatMap(r => r.ids)];
   const sinceOf = new Map<string, string>();
@@ -100,7 +127,9 @@ export function build(root: string): Built {
   for (const f of files) {
     const id = f.replace(/\.md$/, '');
     if (!f.endsWith('.md') || !ID.test(id)) { problems.push(`${FRAGMENT_DIR}/${f}: a fragment is named <id>.md, the id lowercase letters, digits and _, starting with a letter (3-96 characters)`); continue; }
-    const text = read(root, join(FRAGMENT_DIR, f)).trim().replace(/\s*\n\s*/g, ' ');
+    const parsed = parseNoticeFragment(read(root, join(FRAGMENT_DIR, f)));
+    for (const problem of parsed.problems) problems.push(`${FRAGMENT_DIR}/${f}: ${problem}`);
+    const text = parsed.body.trim().replace(/\s*\n\s*/g, ' ');
     if (!text) problems.push(`${FRAGMENT_DIR}/${f} is empty`);
     else if (text.length > NOTICE_CAP) problems.push(`${FRAGMENT_DIR}/${f} is ${text.length} characters; the notice renders at most ${NOTICE_CAP}`);
     else if (/<!--|^---/.test(text)) problems.push(`${FRAGMENT_DIR}/${f} holds markup; it is the notice text only`);

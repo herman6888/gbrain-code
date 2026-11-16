@@ -94,6 +94,8 @@ import { imageEmbeddingCoverageEntry } from './checks/image-embedding-coverage.t
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { globalMaintenanceStalledEntry } from './checks/global-maintenance-stalled.ts';
 import { unattendedMaintenanceEntry } from './checks/unattended-maintenance.ts';
+import { transcriptArchiveEntry } from './checks/transcript-archive.ts';
+import { factsPagesEntry } from './checks/facts-pages.ts';
 import { embedBackfillStalledEntry } from './checks/embed-backfill-stalled.ts';
 import { contentDriftSweepEntry } from './checks/content-drift-sweep.ts';
 import { connectorAccountMismatchEntry } from './checks/connector-account-mismatch.ts';
@@ -167,6 +169,7 @@ import { renameIdentityDowngradesEntry } from './checks/rename-identity-downgrad
 import { unindexedFilesEntry } from './checks/unindexed-files.ts';
 import { syncLandingGapsEntry } from './checks/landing-gaps.ts';
 import { derivedOriginParkedEntry, purgeParkedPagesEntry } from './checks/purge-parks.ts';
+import { purgeMirrorEntry } from './checks/purge-mirror.ts';
 import { derivationPurgeSweepsEntry } from './checks/derivation-purge-sweeps.ts';
 import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
 import { uncommittedSyncDeletionsEntry } from './checks/uncommitted-sync-deletions.ts';
@@ -303,6 +306,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   globalMaintenanceTimeoutsEntry,
   globalMaintenanceStalledEntry,
   unattendedMaintenanceEntry,
+  transcriptArchiveEntry,
   embedBackfillStalledEntry,
   contentDriftSweepEntry,
   connectorAccountMismatchEntry,
@@ -353,6 +357,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   renameIdentityDowngradesEntry,
   purgeParkedPagesEntry,
   derivedOriginParkedEntry,
+  purgeMirrorEntry,
   derivationPurgeSweepsEntry,
   missingRecordedFilesEntry,
   unindexedFilesEntry,
@@ -373,6 +378,8 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   mcpRequestLogRetentionEntry,
   // GST-1943: the storage shelf: cards failing the card schema, interim records not adopted, a hosted shelf directory gone.
   storageManifestEntry,
+  // GST-2731: facts pages (type: facts) with fact lines that carry no date (read-only; the fix asks the user for the dates).
+  factsPagesEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];

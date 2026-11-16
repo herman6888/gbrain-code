@@ -21,7 +21,11 @@ instructions. Do not put secrets in memory pages. A durable decision about a
 setup can be recorded without copying its credentials or assuming that setup is
 active in another harness.
 
-Automatic capture is opt-in. Installing the harness hooks opts into the
+Automatic capture is opt-in, except the [conversation archive](conversation-archive.md): on a
+personal brain it is on by default and keeps one redacted page per conversation
+per day from the harness sessions on this machine (nothing leaves a keyless
+machine; `gbrain transcripts archive off` stops it, and a shared brain is only
+offered it). It extracts no facts. Installing the harness hooks opts into the
 compaction and SessionEnd capture lanes; `gbrain config set
 memory.auto_writeback off` stops every capture lane, and `gbrain bootstrap
 harness --remove` stops the hooks from banking session text at all (see
@@ -569,6 +573,19 @@ An edited file imports normally. Its response carries the same store-by-store
 the purged page's facts. A write refused because it carries purged content,
 or accepted as a no-op after its purged rows were dropped, keeps no copy of
 that content in its stored write request.
+
+An owner purge held to keep a derived page private (`derived_origin_parked`)
+stays owed until its page is removed or restored: whichever purge later removes
+the page, the automatic one included, writes the purge tombstones.
+
+<a id="purge-mirror"></a>
+A restore replays every purge newer than the backup from the purge mirror,
+`purge-events.jsonl` in gbrain's config directory (`$GBRAIN_HOME/.gbrain`,
+else `~/.gbrain`), and a replayed page purge sweeps the same stores as the
+live purge. A host that runs each gbrain writer in a home directory it removes
+after the run loses that mirror, so run every writer with `GBRAIN_HOME` set to
+one durable directory. `gbrain doctor --only purge_mirror` warns when a purge
+from the last 30 days has no line in the mirror this process uses.
 
 ## Verify in the actual harness
 
