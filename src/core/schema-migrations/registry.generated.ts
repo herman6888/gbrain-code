@@ -316,11 +316,8 @@ import { v312 } from './v312-guest-notes.ts';
 import { v313 } from './v313-wake-events.ts';
 import { v314 } from './v314-guest-notes-fail-closed.ts';
 import { v315 } from './v315-facts-context-head-index.ts';
-<<<<<<< HEAD
-import { v316 } from './v316-cjk-bigram-fts.ts';
-=======
 import { v316 } from './v316-pages-source-type-index.ts';
->>>>>>> v0.60.732.0
+import { v317 } from './v317-cjk-bigram-fts.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -636,4 +633,5 @@ export const MIGRATIONS: Migration[] = [
   v314,
   v315,
   v316,
+  v317,
 ];
