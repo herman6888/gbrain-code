@@ -188,7 +188,12 @@ mode scans either way.
 
 A finding that is not a secret: add its fingerprint (`sha256:` and 16 hex
 characters, as the preview prints it) as a line of `.gbrain-scan-allow` at the
-checkout root (`#` starts a comment). The scan reads the file from the working
+checkout root (`#` starts a comment). A rule that fires on many harmless values
+in one kind of file takes a rule entry instead, `path:<glob> pattern:<rule>`,
+which allows only that rule in the matching files; the preview lists each hit it
+allowed with the line that allowed it, and names any line that allows nothing
+because it is malformed or names an unknown rule
+([details](write-refusals.md#allowlisting-a-reviewed-false-positive)). The scan reads the file from the working
 tree, so the next push uses it without a commit. That is deliberate: the file is
 the local user's answer to the scan, and writing it takes local write access to
 the checkout, which could push directly anyway. In a managed root below the
@@ -218,6 +223,7 @@ Follow the error's `fix.next` as the
 | <a id="checkout_not_a_source"></a>`checkout_not_a_source` | 1 | The checkout commit-push resolved from the working directory (no `--path`) is not one of the brain's source checkouts on this host, typically a wrapper that changed into another repository; nothing was staged. The message lists the brain's checkouts. Tell the user to make the script pass `--path` with the absolute brain checkout. A repository that only encloses a source checkout (a brain cloned inside another repository) is not one; a source registered at a subdirectory its checkout tracks is. A host whose brain records no source checkout, or a checkout with `gbrain.sourceRoot` set, is never refused this way. |
 | `commit_paths_invalid` | 1 | No paths, a path outside the checkout, the checkout root itself, or a path git would not stage (one outside a sparse-checkout definition included). Name the explicit files you wrote and rerun. |
 | <a id="commit_paths_skipped"></a>`commit_paths_skipped` | 1 | Git left a named path out of the commit: a modified file flagged assume-unchanged or skip-worktree (`reason` `assume_unchanged`, `skip_worktree`) a file inside a nested Git repository (`not_staged`), or, under a named folder, a tracked file the index holds as staged for removal while it is still on disk, as after `git rm --cached` (`staged_for_removal`; nothing is committed, and the refusal names both ways out: `gbrain git commit-push --untrack` to stop tracking it, `git restore --staged` to keep it tracked). The other named paths were committed (and, on a classic checkout, pushed); `detail` lists each skipped path with its `reason` and a plain `why` (for example "it sits inside the nested Git repository brain/imports"), the commit and the pushed head, or the push failure (`publish`) when the push failed too; the push log gets one `[push] SKIPPED, NEEDS ATTENTION` line with the same reasons. `--dry-run` runs the same check and reports the same paths and reasons, without writing the push log. An empty or broken `.git` folder, a `.git` file pointing at a repository that no longer exists, or a `.git` link to the repository's own `.git`, is not a nested repository: Git commits the files under it, and so does commit-push. A path spelled through a symlinked folder (a source path that links into the repository) names the file at its real place in the checkout. Check the flags with `git ls-files -v -- <path>`; clear them only after the user agrees, one flag per call (`git update-index --no-assume-unchanged -- <path>`, `git update-index --no-skip-worktree -- <path>`; given both, git clears only the first), and remember skip-worktree is often set on purpose to keep local edits out of commits, or move the file out of the nested repository, then rerun. A skip-worktree file absent from disk (a sparse checkout), a flagged gitlink and ignored files under a named directory are not reported. |
+| `commit_paths_unmerged` | 1 | A named file still has unresolved merge conflicts in the index (after a merge, rebase or stash pop that stopped on a conflict), so committing it would publish its conflict markers; nothing was staged or committed, and the file stays unmerged. `detail` lists the files. Show the user `git diff -- <file>`, resolve each one with them (edit out the markers, keeping the changes from both sides that belong in the file: one side may be a write gbrain made, so never discard a side wholesale), mark it resolved with `git add -- <file>`, then rerun. `git ls-files -u -- <file>` prints nothing once it is resolved. A write-through file gbrain could not commit this way stays in the pending ledger until it is resolved. |
 | `commit_prestaged_paths` | 1 | Another writer staged files under a directory you named; nothing was staged or committed. Name your own files explicitly. Unstage the others (`git restore --staged -- <file>`, which keeps their bytes) only after the user agrees. |
 | `commit_outside_source_root` | 1 | The commit, or a local commit about to be published, changes files outside the brain's [source root](#source-roots); nothing was pushed. Show the user `git show --stat <sha>`; rerun with `--allow-outside-source-root` only if they want it published. |
 | `git_index_locked` | 1 | A git command that does not take the writer lock held `index.lock`. Retry once after a few seconds. |
@@ -230,6 +236,7 @@ Follow the error's `fix.next` as the
 | `push_unconfirmed` | 4 | The commit is durable locally but no push destination confirmed it (network, credentials, branch protection, a remote that kept moving, or another push that held the push lock for the whole wait). Fix what the message names, then run `gbrain git commit-push --push-only`. Never force-push. |
 | `writer_coordinator_required` | 1 | This is a managed worktree. Stop using git for pages; save them through `put_page` and the other gbrain write tools. `scripts/brain-commit-push.sh` refuses this way on a checkout marked managed and commits nothing; `gbrain git commit-push` refuses this way when git left a named page out of its commit (the same causes as `commit_paths_skipped`), after committing the other named paths locally. Ask the user before re-saving such a page through `put_page` with the managed source (`gbrain put --source-id <source> <slug>`, or `source_id` over MCP; without it the write goes to the default source): it replaces the stored page with the file's content. |
 | `git_unavailable` | 1 | A git command failed, often a missing `user.name`/`user.email` or a refusing pre-commit hook. Read the message, fix that, rerun. When the branch names a remote that does not exist (a typo or a broken clone), the run stops before committing: fix the name or add the remote, then rerun. A checkout with no remote at all commits locally instead (`committed_local`). |
+| `git_command_stopped` | 1 | A git command did not finish on its own: it ran past its time limit (`reason` `timeout`), its output passed a size limit (`reason` `output_limit`: one the calling code set, or the largest string the runtime can hold, about 2 GB), or it ended on a signal (`reason` `signal`): something outside gbrain killed it, often the out-of-memory killer, or git crashed (the message then says `crashed with` and names the signal, such as `SIGSEGV`; run `git fsck` on the checkout before the rerun). Unless it crashed, git itself works, and gbrain did not use the partial output. Rerun once; for a signal check the machine first, and if a time limit stops it again, tell the user which command and checkout the message names. Below that runtime limit the size of a listing is never a reason: gbrain reads git's whole output, so naming a folder that holds most of a large checkout works. |
 
 `--pull` reports `up_to_date`, `advanced`, `ahead` (local commits not yet
 pushed; run `--push-only`), `skipped_dirty` (only with `--require-clean`) or
@@ -286,12 +293,39 @@ hook changed is taken back). A path the last commit holds nothing under, or a fi
 
 In a managed canonical worktree (the checkout gbrain's persistence owner writes), untracking a page file would
 make the next sync delete that page, so `--untrack` there only takes files under a `storage.db_only` directory
-that `gbrain.yml` at HEAD declares and that `.gitignore` ignores. The database row is canonical there, so every
-page stays live with its content. Anything else refuses `untrack_not_db_only` with the index as it was: declare
-the folder first (add it under `storage.db_only` and its `<dir>/` line to `.gitignore`, commit both with
-`gbrain git commit-push -m <msg> -- gbrain.yml .gitignore`), then rerun. The commit stays local, like every
-commit-push there; the owner's next Git publish, or `gbrain git commit-push --push-only --keep-checkout`,
-publishes it.
+that the source's `gbrain.yml` declares, at HEAD and on disk, and that `.gitignore` ignores. The source's
+`gbrain.yml` sits in the folder the source is rooted in, which can be a folder below the checkout's top
+(`brain/gbrain.yml`); a `gbrain.yml` anywhere else declares nothing. Only the brain records that folder, so every
+untrack there reads the brain first: without migrations, in one read-only transaction, for at most 10 seconds. When
+the brain cannot be read, every file refuses and nothing changes: an untrack in a managed checkout needs the brain
+reachable, and on PGLite that means nothing else holds it, so stop the process that does (a running `gbrain serve` or
+a sync), then rerun the untrack. A plain commit, and an untrack in a checkout with no managed source, never open the
+brain. A file is matched by its path under the declared directory, whatever its extension, with three extra checks:
+
+- A Markdown page file also needs its page slug under a declared directory, because sync keeps a page by its slug
+  (a folder spelled `Spaced Example/` gives slugs under `spaced-example/`; declare that spelling too). A source rooted
+  in a folder whose slugs start at the repository's top (`slug_root_mode: git-root`) keeps that folder in each slug,
+  so the refusal asks you to declare `brain/<dir>/` as well.
+- A code-extension file (`.json`, `.ts`, `.yml` and the rest of sync's code list) is a page with a flattened slug on a
+  source whose sync strategy imports code (`code` or `auto`), and a database-only folder does not make that page
+  database-only. The same brain read refuses one that is a page, whatever the source's strategy is now, and every one
+  on a source whose strategy imports code, page or not yet (its next sync imports it, even one an earlier sync skipped
+  under another strategy). On a Markdown source it also refuses one the source's last finished sync has not seen at its
+  current version (a commit since that sync changed it, or the source has not finished a sync), because a sync that
+  imports it after the check would leave a page the next sync deletes: run `gbrain sync --source <id>` (it runs even
+  when automatic sync is off for the source), then rerun the untrack. On PGLite the read takes the data directory's
+  one-process lock for its length.
+- A tracked symbolic link that points out of the declared directory, or a file reached through a symlinked
+  directory on disk, is refused, and so is a sibling folder that only shares the name as a prefix
+  (`backups-old/` is not under `backups/`).
+
+The database row is canonical there, so every admitted page stays live with its content. Anything else refuses
+`untrack_not_db_only` with the index as it was, and the fix names what is missing for each file: declare the folder
+(add it under `storage.db_only` in the `gbrain.yml` the refusal names and its `<dir>/` line to `.gitignore`, commit
+both with `gbrain git commit-push -m <msg> -- <that gbrain.yml> .gitignore`), add only the `.gitignore` line, declare
+the slug spelling, keep the code-file pages tracked, or free the brain and rerun. `--dry-run --untrack` makes the same checks, the brain read included,
+and lists the files the real run removes. The commit stays local, like every commit-push there; the owner's next Git
+publish, or `gbrain git commit-push --push-only --keep-checkout`, publishes it.
 
 If you already ran `git rm --cached` by hand, a plain commit-push of those paths refuses
 `commit_paths_skipped` and names the `--untrack` command that commits the removal.

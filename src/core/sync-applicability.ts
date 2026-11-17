@@ -15,19 +15,21 @@
  * whatever directory gbrain runs from.
  */
 import { existsSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import type { BrainEngine } from './engine.ts';
 import { gbrainPath, loadConfig } from './config.ts';
 import { opError, type OperationError } from './ops/contract.ts';
 import { readSyncAnchor } from './sync-anchor.ts';
 import { contentSetupKey } from './shared-skills/setup.ts';
-import { isForeignAbsolutePath, isHostAbsolutePath } from './path-confine.ts';
+import { isForeignAbsolutePath, isHostAbsolutePath, relativeEscapesRoot } from './path-confine.ts';
 
 /** A source whose sync root is a gbrain-owned content directory with no Git checkout. */
 export interface SyncContentDirectory {
   sourceId: string;
   root: string;
   keyless: boolean;
+  /** Why gbrain owns it: the root sits inside gbrain's own content directory, or a content-setup receipt claims it. */
+  ownedBy: 'content_root' | 'receipt';
 }
 
 function canonical(path: string): string {
@@ -36,7 +38,7 @@ function canonical(path: string): string {
 
 function underGbrainContent(root: string): boolean {
   const rel = relative(canonical(gbrainPath('content')), canonical(root));
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+  return rel !== '' && !relativeEscapesRoot(rel);
 }
 
 async function ownedByContentReceipt(engine: BrainEngine, sourceId: string, root: string): Promise<boolean> {
@@ -61,9 +63,10 @@ export async function syncContentDirectory(engine: BrainEngine, opts: { sourceId
     const root = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
     if (!root || !existsSync(root) || existsSync(join(root, '.git'))) return null;
     const sourceId = opts.sourceId ?? 'default';
-    if (!underGbrainContent(root) && !(await ownedByContentReceipt(engine, sourceId, root))) return null;
+    const ownedBy = underGbrainContent(root) ? 'content_root' : await ownedByContentReceipt(engine, sourceId, root) ? 'receipt' : null;
+    if (!ownedBy) return null;
     const keyless = loadConfig()?.embedding_disabled === true || (await engine.getConfig('embedding_disabled')) === 'true';
-    return { sourceId, root, keyless };
+    return { sourceId, root, keyless, ownedBy };
   } catch {
     return null;
   }

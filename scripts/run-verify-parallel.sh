@@ -157,6 +157,7 @@ CHECKS=(
   "check:fixture-privacy"
   "check:source-scope-onboard"
   "check:getpage-scope"
+  "check:relative-dotdot"
   "check:origin-assignment"
   "check:no-double-retry"
   "check:batch-audit-site"
@@ -220,6 +221,8 @@ CHECKS=(
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
+  # #9192: a migration that changes what the page revision trigger watches empties search until the rebuild.
+  "check:migration-projection"
   # GBRA-218: the remote-privacy relaxations are read only in private-visibility.ts.
   "check:remote-privacy-reads"
   # EO4 (refactor wave 1): RLS read brands stay unforgeable; brand factories

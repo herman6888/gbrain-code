@@ -59,6 +59,8 @@ export const DEGRADED_STAGE_GUIDANCE: Readonly<Record<RecallStage, StageGuidance
   projection_status_unknown: { why: 'whether recent writes are in the search index could not be checked', fix: 'doctor' },
   keyword_count_unavailable: { why: 'the keyword match count did not finish, so how many pages match the query is unknown', fix: null },
   saved_facts_withheld: { why: 'saved facts could not be checked for third-party text to quote, so they were withheld; the page results are complete', fix: 'doctor' },
+  fact_observed_date_unavailable: { why: 'when saved facts were said could not be read, so their date headers show observed unknown; that is not evidence the date is unknown', fix: 'doctor' },
+  contested_unavailable: { why: 'whether saved facts are disputed by another saved fact could not be checked, so no fact row carries a contested label; that is not evidence none is disputed', fix: 'doctor' },
   deadline: { why: 'the pack hit its time limit and is partial', fix: null },
   server_budget: { why: 'the server ran out of time budget for this pack', fix: null },
   no_query_terms: { why: 'the question has no searchable words and semantic search did not run, so no saved fact could be ranked against it', fix: 'embeddings' },
@@ -124,7 +126,7 @@ function rerankFix(reason: RerankFailedReason, retry?: { op: string; args: Recor
 }
 
 /** #6495: `keyword_arm_failed` with reason `skipped_after_timeout` (postgres-engine/keyword-timeout-cache.ts). */
-const KEYWORD_SKIPPED_WHY = 'the keyword arm was skipped: this exact keyword search hit the keyword statement timeout (search.keyword_statement_timeout_ms) within the last search.keyword_timeout_negative_cache_seconds (default 600 seconds), so the brain did not wait for the timeout again; a narrower query (source_id, types, since or until) runs keyword search, and the skip ends by itself when the entry expires';
+const KEYWORD_SKIPPED_WHY = 'the keyword arm was skipped: this exact keyword search hit the keyword statement timeout (search.keyword_statement_timeout_ms) within the last search.keyword_timeout_negative_cache_seconds (default 600 seconds), so the brain did not wait for the timeout again; a narrower query (source_id, types, since or until) runs keyword search, and the skip ends by itself when a background re-run in the serve of the statement answers or the entry expires';
 const KEYWORD_PLAN_VERIFY = { argv: ['gbrain', 'doctor', '--only', 'keyword_plan', '--json'] };
 function keywordPlanFix(): Action {
   return {

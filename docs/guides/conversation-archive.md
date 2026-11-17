@@ -11,7 +11,7 @@ gbrain transcripts archive on                          # turn it on (a shared br
 gbrain transcripts archive run --dry-run               # preview the last two local days
 gbrain transcripts archive run                         # write them
 gbrain transcripts archive backfill --from 2026-09-01  # older history, newest days first
-gbrain transcripts archive status                      # readers, timezone, archived and held days
+gbrain transcripts archive status                      # readers as of the last run, timezone, archived and held days
 gbrain doctor --only transcript_archive_freshness      # is it keeping up?
 ```
 
@@ -52,7 +52,15 @@ a time, never when the archive is off, and never fails the pass: its outcome, er
 and the next pass picks up the rest.
 
 `gbrain transcripts archive run` archives now, on demand, whatever the pass is doing; it works with automatic
-maintenance turned off (`maintenance.auto false`).
+maintenance turned off (`maintenance.auto false`), and `gbrain transcripts archive status` says so when it is off.
+
+`run` and `backfill` exit 1 when anything in the run failed, and 0 otherwise, even when most days were written:
+the days that did not make it are retried by the next run on their own, and a script or scheduler should see that
+this run left work behind. Every failure is in the `errors` list of `--json` (a reader that could not be read, a day
+that could not be written, with its `day` and `code`, a day index, or the `archive_owner_unset` hold on a shared
+brain), so the list is empty exactly when the exit code is 0. A `--dry-run` reports the `write_mode` the real run
+will use (`coordinator` on a brain whose writes go through the write coordinator), even before the archive source
+exists.
 
 On a managed brain the pass writes each day page as a `put_page` write request through the write coordinator, under the
 same local identity as `gbrain transcripts archive run` (`local_cli`). Waiting for the coordinator counts against the
@@ -71,14 +79,22 @@ false` turns both off.
 `gbrain doctor --only transcript_archive_freshness` (brain category) warns when:
 
 - a harness's newest archived day is more than `transcripts.archive.stale_days` (default 2) behind the newest session
-  day its reader sees. The fix is `gbrain transcripts archive run`, or
+  day the last run read. The fix is `gbrain transcripts archive run`, or
   `gbrain transcripts archive backfill --from <first missing day>` when the gap is wider than one run;
+- no archive run has read a reader successfully in that long, for example when maintenance passes keep stopping at
+  their deadline before that reader. The fix is `gbrain transcripts archive run`;
 - the archive is on but no maintenance pass has run it in that long. The fix is `gbrain autopilot --install`
   (a persistent service, so it asks first);
 - days are held (each is listed with its code, such as `archive_owner_unset` or `archive_redaction_failed`), a reader
-  failed, or the last pass recorded an error.
+  failed on the last run, or the last pass recorded an error.
 
-Off is ok with no detail, and a harness with no readable sessions is informational.
+Off is ok with no detail, and a harness with no readable sessions, or one no run has read yet, is informational.
+
+Neither this check nor `gbrain transcripts archive status` reads a session or calls the OpenClaw Gateway, so both
+answer in about a second however many sessions there are. They read the archive's ledger and config, and what each
+run (`run`, `backfill` or the maintenance pass, never a `--dry-run`) recorded about every reader: how many
+conversations it read, the newest session day any run has seen, and the reader's error if the last run failed. Status
+shows those as of that run, with its time; a reader no run has read yet says so.
 
 Every command takes `--json` and `--source <id>` (the archive source, `conversations` by default).
 
@@ -119,7 +135,9 @@ gbrain transcripts archive adopt-legacy --dir ~/brain/conversations            #
 gbrain transcripts archive adopt-legacy --dir ~/brain/conversations --apply    # record the covered days
 ```
 
-The old pages are never changed or deleted. Second, remove the old script's schedule yourself (its crontab line or
+The covered days are recorded in the brain's config, so they count before the archive source exists, and later
+runs skip them whichever archive source they write to (the brain turning shared included). The old pages are never
+changed or deleted. Second, remove the old script's schedule yourself (its crontab line or
 scheduled job), so two archivers do not run side by side. Third, let the maintenance pass fill the gap, or run
 `gbrain transcripts archive backfill --from <day>` now.
 
@@ -143,8 +161,18 @@ private conversations never land in the shared repository.
 
 ### When a personal brain becomes shared
 
-Pages archived while the brain was personal name no readers. The first archive run after the brain becomes shared
-keeps them to the owner before it writes anything: every folder that holds an archive page at that moment (one per
+Pages archived while the brain was personal name no readers. Until they are kept to the owner, every member reads
+them. The command that makes the brain shared does that before it returns: `gbrain access member add` or
+`gbrain access member enable` when it makes two or more enabled members, `gbrain config set brain.audience shared`,
+and `gbrain access owner set` on a brain that is already shared. `member add` and `member enable` do it before the
+member is added, enabled or bound to a token, so its credentials never read those pages; if that step fails, the
+command changes nothing and exits non-zero. Each prints one line on stderr per archive source,
+saying the pages are now kept to the owner or why they still wait (the codes below); `--json` output is unchanged.
+When the brain turns shared some other way, the next archive run (`gbrain transcripts archive run`) or maintenance pass
+does it, also before it writes anything. That includes members added or enabled from the admin page over HTTP or by
+`gbrain access serves several --members <ids> --yes`. A command run while an archive run that started on the personal
+brain is still writing the source keeps the pages archived so far to the owner at once; the pages that run still writes
+wait for the run after it (`archive_rescope_pending`). Either way, every folder that holds an archive page at that moment (one per
 harness and day, such as `conversations/codex/2026-10-01/`, plus `conversations/days/`) gets an access rule readable
 only by the owner. Other pages in the archive source, outside `conversations/`, keep the rules they had. This re-scope **replaces any existing rule on those folders, including one the owner made wider on
 purpose**; re-add the wider readers afterwards (`gbrain access rule add`, which waits for `gbrain access apply`) if
@@ -170,6 +198,22 @@ each say so in one line, when the shared brain names no owner (`archive_rescope_
 `gbrain access owner set <member>`) or when the source keeps its access rules in git (`archive_rescope_git_rules`:
 add a rule with prefix `conversations/` and the owner as its reader to the source's `.gbrain/access.yml`).
 
+Three ways a brain becomes shared leave those earlier pages open to every member until you act. In each, as in the
+paths above that wait for the next archive run,
+`gbrain transcripts archive status` prints `not kept to the owner yet (<code>): <what to do>`, its `--json` carries
+the same `rescope` object (`code` and `message`), and `gbrain doctor` warns on `transcript_archive_freshness` with that
+message, whether the archive is on or off:
+
+- **The audience flips from client usage, with no command.** With `brain.audience` unset, three or more people's MCP
+  clients active in 30 days make the brain read as shared. No command runs, so the code is `archive_rescope_pending`
+  until `gbrain transcripts archive run` or a maintenance pass runs; with automatic maintenance turned off
+  (`maintenance.auto false`) no pass runs, so only the archive run does it. Declaring `gbrain config set brain.audience shared` also runs it at once.
+- **A shared brain with no owner.** The re-scope has no one to keep the pages to, so it waits with
+  `archive_rescope_owner_unset`. `gbrain access owner set <member>` runs it at once.
+- **Rules kept in git.** gbrain never writes a source's `.gbrain/access.yml`, so it waits with
+  `archive_rescope_git_rules` until you add the `conversations/` rule there and sync. A repo-less brain keeps its rules
+  in the database and never hits this case.
+
 ## OpenClaw
 
 Current OpenClaw keeps live sessions in a database owned by its Gateway. gbrain reads them with
@@ -179,6 +223,12 @@ Current OpenClaw keeps live sessions in a database owned by its Gateway. gbrain 
 `OPENCLAW_GATEWAY_TOKEN`), never on the command line. Errors map to `archive_gateway_unreachable`,
 `archive_gateway_auth` and `archive_gateway_failed`; a failed read leaves the archive ledger unchanged, so the next
 run retries. Checked against OpenClaw 2026.10.9 and 2026.11.3, which list sessions and return history the same way.
+
+Each `openclaw gateway call` is a new process, and starting one takes far longer than the Gateway takes to answer,
+so gbrain asks for the largest history page the Gateway gives (1,000 messages within 4 MiB; OpenClaw before 2026.11
+caps a page at 512 KiB, and one before 2026.10 refuses the byte budget, so gbrain asks again without it) and reads up
+to 4 sessions at once. The messages of each session, and the order of the conversations, are the same as one read at
+a time; if any session cannot be read, the whole Gateway read fails once the reads already running have ended.
 
 Session files OpenClaw keeps on disk are read too, even when the Gateway is down: `<id>.jsonl.reset.<stamp>`, the
 zstd-compressed `<id>.jsonl.deleted.<stamp>.<hex>.zst` and the legacy compact backup `<id>.jsonl.bak.<stamp>`.

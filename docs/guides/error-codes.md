@@ -1004,6 +1004,16 @@ Reasons: `assume_unchanged`, `skip_worktree`, `not_staged`.
 
 More: [docs/guides/shared-checkout-git.md#outcomes](../../docs/guides/shared-checkout-git.md#outcomes)
 
+### commit_paths_unmerged
+
+<a id="commit_paths_unmerged"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The commit was refused before staging: a named file still has unresolved merge conflicts in the index, so committing it would publish its conflict markers. | Git keeps the two sides of a conflicted file (after a merge, rebase or stash pop that stopped on a conflict) as unmerged index entries until someone resolves it; staging it would record the file with its markers as resolved. | Resolve each file with the user (edit out the markers and keep the changes from both sides that belong in the file, since one side may be a write gbrain made), mark it resolved with git add -- <file>, then rerun the commit. | user | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-checkout-git.md#outcomes](../../docs/guides/shared-checkout-git.md#outcomes)
+
 ### commit_prestaged_paths
 
 <a id="commit_prestaged_paths"></a>
@@ -2236,6 +2246,18 @@ More: [docs/guides/repair.md#ghost-pages](../../docs/guides/repair.md#ghost-page
 |---|---|---|---|---|---|---|
 | The canonical root is not inside a Git checkout, so its Git effects have nothing to commit to. | Only the operator of the brain host can change what blocks this. | Initialize the root as a Git repository with a first commit and a remote on the brain host, then rerun; a database-only source needs no Git durability. | host_admin | `gbrain doctor --json` | 1 | no |
 
+### git_command_stopped
+
+<a id="git_command_stopped"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A git command was stopped before it finished (its time limit, an output limit, a signal from outside gbrain, or git crashing on a signal such as SIGSEGV), so gbrain did not use its partial output. | The child ended without exiting on its own (unless it crashed, git itself works), and a cut-off listing read as the answer would stage, restore or report the wrong files. | Rerun the same command once. For a signal, check the machine first (the out-of-memory killer or a supervisor), or for a crash run git fsck on the checkout; if it stops again, tell the user which command and checkout. | agent | `repeat the read that failed` | 1 | yes |
+
+Reasons: `timeout`, `output_limit`, `signal`.
+
+More: [docs/guides/shared-checkout-git.md#outcomes](../../docs/guides/shared-checkout-git.md#outcomes)
+
 ### git_conversion_blocked
 
 <a id="git_conversion_blocked"></a>
@@ -3058,7 +3080,7 @@ More: [docs/guides/multi-language-fts.md#cjk-keyword-budget](../../docs/guides/m
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Hybrid search's Postgres keyword arm skipped a statement that hit the keyword statement timeout within the negative-cache TTL; the search reports keyword_arm_failed with reason skipped_after_timeout and the vector arm still answers. | Running the same broad keyword statement again would hold a backend for the whole search.keyword_statement_timeout_ms and fail the same way. The skip covers that exact statement and scope only, lasts search.keyword_timeout_negative_cache_seconds (default 600, 0 turns it off) and is per serving process. A skipped keyword arm is not evidence of absence. | Narrow the search (source_id, types, since or until) to run keyword search now, or wait for the entry to expire; the user may raise search.keyword_statement_timeout_ms or change the TTL. Run: gbrain doctor --only keyword_plan --json | agent | `gbrain doctor --only keyword_plan --json` | 1 | no |
+| Hybrid search's Postgres keyword arm skipped a statement that hit the keyword statement timeout within the negative-cache TTL; the search reports keyword_arm_failed with reason skipped_after_timeout and the vector arm still answers. | Running the same broad keyword statement again would hold a backend for the whole search.keyword_statement_timeout_ms and fail the same way. The skip covers that exact statement and scope only, lasts at most search.keyword_timeout_negative_cache_seconds (default 600, 0 turns it off), ends as soon as a background re-run of the statement in the serve answers, and is per serving process. A skipped keyword arm is not evidence of absence. | Narrow the search (source_id, types, since or until) to run keyword search now, or wait for the entry to expire; the user may raise search.keyword_statement_timeout_ms or change the TTL. Run: gbrain doctor --only keyword_plan --json | agent | `gbrain doctor --only keyword_plan --json` | 1 | no |
 
 More: [docs/guides/troubleshooting.md#keyword-search-times-out-on-a-large-postgres-brain](../../docs/guides/troubleshooting.md#keyword-search-times-out-on-a-large-postgres-brain)
 
@@ -3361,6 +3383,16 @@ More: [docs/guides/write-refusals.md#merge_recommended](../../docs/guides/write-
 | A migration orchestrator failed, so the migration chain stopped; finished migrations stay recorded. | The server failed; this is not a caller mistake. | Server-side failure, not a caller mistake. Run `gbrain doctor --json` on the brain host; if it repeats, report it to the user. | host_admin | `gbrain doctor --json` | 1 | no |
 
 Reasons: `orchestrator_failed`, `orchestrator_threw`, `ledger_write_failed`, `preview_failed`, `schema_failed`.
+
+### migration_host_work_owed
+
+<a id="migration_host_work_owed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Doctor warning: a migration stopped three or more runs in a row on a conflict in one or more sources and recorded that host work is still owed (today only v0.53.0). | Each source in conflict needs the user's decision. The migration's read-only preview names each source, its conflict code and the step that settles it, and doctor stops warning once the preview finds no source in conflict. | Run the read-only inspect `gbrain apply-migrations --migration <version> --dry-run --json` on the brain host to see each source's conflict, its code and its next step, and settle each one with the user. For shared_skills_unmanifested, declare the skills to share in a skillpack.json at the source's root, or keep the source out with `gbrain sources shared-skills <id> off`. Run: gbrain apply-migrations --list --json | user | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#reviewed-changes-after-inventory](../../docs/guides/shared-brain-skills.md#reviewed-changes-after-inventory)
 
 ### migration_host_work_pending
 
@@ -4073,6 +4105,14 @@ More: [docs/guides/qm.md#proposed-writes](../../docs/guides/qm.md#proposed-write
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | provenance is required and must be non-empty. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### provider_response_unparseable
+
+<a id="provider_response_unparseable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A model provider answered with a success status, but its response body could not be parsed as one JSON document; no response text is kept. | The same request gets the same body, so retrying spends another paid call on the same failure. The common cause is a provider route that streams (Server-Sent Events) when a request omits `stream`; a job that hits it ends on its first attempt. | Ask the operator to make the route return one JSON body for a non-streaming request, for example with gbrain config set provider_chat_options.<provider>:<model> '{"stream": false}', then retry the job. | host_admin | `gbrain doctor --json` | 1 | no |
 
 ### publication_pending
 
@@ -4991,6 +5031,16 @@ More: [docs/guides/repair.md#setup-owner-conflict](../../docs/guides/repair.md#s
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The shared-skills operation was refused. | A capability this request needs is not configured or not reachable on this brain. | A required capability is not available on this brain. Run `gbrain doctor --json` to see what is missing. | agent | `gbrain doctor --json` | 1 | no |
+
+### shared_skills_unmanifested
+
+<a id="shared_skills_unmanifested"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A conflict in the v0.53.0 shared-skills migration: a source's skills/ folder holds skills but the source has no skillpack.json declaring them, so the migration left them as they are. | Adopting skills nobody declared could publish private or half-finished ones, so the migration never adopts them and records the source as a conflict until a person decides. The conflict affects only shared-skills adoption; every other command works. | Review the skills in that source's skills/ folder with the user, then either declare the ones to share in a skillpack.json at the source's root, or keep the source out of shared-skills adoption with `gbrain sources shared-skills <id> off`. Run: gbrain apply-migrations --dry-run --json | agent | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/shared-brain-skills.md#migrate-an-existing-brain](../../docs/guides/shared-brain-skills.md#migrate-an-existing-brain)
 
 ### shared_skills_unsupported
 
@@ -6122,7 +6172,7 @@ More: [docs/guides/write-refusals.md#unsupported_path](../../docs/guides/write-r
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| gbrain git commit-push --untrack in a managed canonical worktree was refused before the index changed: a file to untrack is not under a storage.db_only dir that gbrain.yml at HEAD declares, or .gitignore does not ignore it. | The next sync deletes the page of a file that leaves Git outside a declared storage.db_only dir, and a file .gitignore does not ignore can be committed again by any later commit. | Declare the folder under storage.db_only in gbrain.yml and add its <dir>/ line to .gitignore, commit both with gbrain git commit-push -m <msg> -- gbrain.yml .gitignore, then rerun the untrack. | agent | `repeat the read that failed` | 1 | no |
+| gbrain git commit-push --untrack in a managed canonical worktree was refused before the index changed: a file to untrack is not under a storage.db_only dir that the source's gbrain.yml (in the folder the source is rooted in) declares at HEAD and on disk, .gitignore does not ignore it, it is a symbolic link out of the dir, it is a Markdown page whose slug falls outside the dir, or it is a code-extension file that is a page, or that a code-importing source's sync imports as one, or that the source's last finished sync has not seen at its current version; or the brain, which records the source's folder, could not be read, which refuses every file. | The next sync deletes the page of a file that leaves Git unless sync keeps it as database-only, which it decides by page slug, and a file .gitignore does not ignore can be committed again by any later commit. | Follow the fix the refusal prints for each file: declare the folder under storage.db_only in the gbrain.yml the refusal names and its <dir>/ line in .gitignore (commit both with gbrain git commit-push -m <msg> -- <that gbrain.yml> .gitignore), add the .gitignore line, declare the slug spelling, keep code-file pages tracked, run gbrain sync --source <id> for code files sync has not seen yet, or retry once the brain is free; then rerun the untrack. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/shared-checkout-git.md#untrack](../../docs/guides/shared-checkout-git.md#untrack)
 

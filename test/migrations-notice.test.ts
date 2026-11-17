@@ -54,6 +54,16 @@ describe('pendingUpgradeMigrationsNotice', () => {
     expect(notice!.why).toContain(latest);
   });
 
+  test('a wedged migration a newer migration ran past is history, as apply-migrations says, so it gets no notice', async () => {
+    const older = MIGRATION_VERSIONS[MIGRATION_VERSIONS.length - 3]!;
+    const notice = await inHome(async () => {
+      for (const version of MIGRATION_VERSIONS) if (version !== older) appendCompletedMigration({ version, status: 'complete' } as never);
+      for (let i = 0; i < 3; i++) appendCompletedMigration({ version: older, status: 'partial' } as never);
+      return pendingUpgradeMigrationsNotice(engine, 'query', latest);
+    });
+    expect(notice).toBeNull();
+  });
+
   test('no ledger yet (a fresh brain) means no notice', async () => {
     expect(await inHome(() => pendingUpgradeMigrationsNotice(engine, 'query', latest))).toBeNull();
   });
@@ -101,6 +111,7 @@ describe('pendingUpgradeMigrationsNotice', () => {
   test('an empty ledger on a brain created in this run (schema version 1 at connect) gets no notice', async () => {
     const created = { getConfig: async () => null } as never;
     noteSchemaVersion(created, 1);
+    // pregate-literal: LATEST_SCHEMA_VERSION=316 any version above 1 stands for the brain after this run migrated it
     noteSchemaVersion(created, 316);
     expect(await inHome(() => pendingUpgradeMigrationsNotice(created, 'query', latest))).toBeNull();
   });

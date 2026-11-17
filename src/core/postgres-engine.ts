@@ -54,11 +54,11 @@ import {
 } from './retry.ts';
 import { isConnectionEndedError } from './retry-matcher.ts';
 import { CheckoutGauge, PoisonedDiscardCounter, PoolIncidentCounter, type PoolGaugeSnapshot } from './pool-gauge.ts';
-import { driverPoolStats, type DriverPoolStats } from './postgres-engine/pool-stats.ts';
+import { driverPoolStats, enginePoolStats, type DriverPoolStats } from './postgres-engine/pool-stats.ts';
 import {
   valueHash,
   normalizeDimension,
-  isNovelDimension, isBackdatedObservation, ONTOLOGY_SUPERSEDE_GUARD,
+  isNovelDimension, isBackdatedObservation, ONTOLOGY_SUPERSEDE_GUARD, NOT_CONVERSATION_SLOT_SQL, CONVERSATION_SLOT_SQL,
 } from './chronicle/ontology.ts';
 import { logDbDisconnect } from './audit/db-disconnect-audit.ts';
 import { logPoolRecovery } from './audit/pool-recovery-audit.ts';
@@ -124,7 +124,7 @@ import { commonOrTokens, narrowedOrFallbackText, readOrTokenShares } from './sea
 import { keywordArmRows } from './search/keyword-identifier-probe.ts';
 import { RARE_TERM_CHUNK_CAP, rankOrFallbackByRarity, rareTermPagesSql, type RareTermPages } from './search/keyword-or-rarity.ts';
 import { buildKeywordChunkMatch, keywordCandidatesSql, KEYWORD_RANK_CANDIDATES, KEYWORD_RANKED_ROWS_CTE, KEYWORD_STATEMENT_SETTINGS } from './search/keyword-chunk-match.ts';
-import { privatePagesFilterFragment, privateSnapshotFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateFactFilterForCaller, privatePagesFilterForCaller } from './search/private-visibility.ts';
+import { privatePagesFilterFragment, privateSnapshotFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateFactFilterForReader, privatePagesFilterForCaller } from './search/private-visibility.ts';
 import { deletedPageProjectionHiddenSql } from './eligibility/sql.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
@@ -163,7 +163,7 @@ import type { BodyFlipInput, BodyFlipResult, BodyRegion, BodyStagingInput, BodyS
 import type { SegmentDerivationInput, SegmentDerivationKind, SegmentDerivationRow } from './page-body/derivations.ts';
 import { hasCJK } from './cjk.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './engine-sql/cjk-search.ts';
-import { KeywordTimeoutNegativeCache } from './postgres-engine/keyword-timeout-cache.ts';
+import { KeywordTimeoutNegativeCache, keywordRerunPoolIdle } from './postgres-engine/keyword-timeout-cache.ts';
 import * as titlesImpl from './engine-sql/titles.ts';
 import * as keywordPagesImpl from './engine-sql/keyword-pages.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
@@ -219,7 +219,7 @@ export class PostgresEngine implements BrainEngine {
   readonly [ENGINE_ROOT]: object = this;
   private vectorIterativeScan?: Promise<boolean>;
   private keywordStatementTimeout?: Promise<string>;
-  private keywordTimeouts = new KeywordTimeoutNegativeCache();
+  private keywordTimeouts = new KeywordTimeoutNegativeCache(Date.now, undefined, () => keywordRerunPoolIdle(enginePoolStats(this), this._disconnectPromise)); // #7082
   private readonly vectorScope = vectorScopeLoader(() => this.executeRaw<PageSourceStats>(PAGE_SOURCE_STATS_SQL), ids => this.executeRaw<ScopeChunkCount>(SCOPE_CHUNKS_SQL, [ids]));
   /** Transaction clones keep chunk invalidation and replacement atomic. */
   private _chunkWritesInTransaction = false;
@@ -524,7 +524,8 @@ export class PostgresEngine implements BrainEngine {
   }
 
   private async disconnectInternal(): Promise<void> {
-    for (const stop of this._beforeDisconnect) await stop();
+    const open = !!this.connectionManager || !!this._sql || this._connectionStyle === 'module';
+    if (open) for (const stop of this._beforeDisconnect) await stop(); // hooks run once, as PGLite's early return does
     // v0.41.25.0 (#1570) — instrument disconnect calls to identify the
     // mid-process caller behind the singleton-null bug. The audit log
     // captures connection_style so we can tell instance-pool teardowns
@@ -541,9 +542,7 @@ export class PostgresEngine implements BrainEngine {
     // residual telemetry buffers are dropped on BOTH engines (symmetric lossy
     // semantics; the CLI-exit drain is where residuals flush). Guarded so a
     // no-op disconnect (never connected / already torn down) skips the drain.
-    if (this.connectionManager || this._sql || this._connectionStyle === 'module') {
-      await drainBackgroundWorkBeforeDisconnect();
-    }
+    if (open) await drainBackgroundWorkBeforeDisconnect();
     // v0.30.1: tear down the direct pool first if the manager owns one.
     if (this.connectionManager) {
       await this.connectionManager.disconnect();
@@ -1997,10 +1996,14 @@ export class PostgresEngine implements BrainEngine {
       SELECT id, value_hash, valid_from FROM facts
        WHERE source_id = ${sourceId} AND entity_slug = ${obs.entitySlug}
          AND dimension = ${dimension} AND expired_at IS NULL AND valid_until IS NULL
-         AND (dim_status IS NULL OR dim_status = 'active')
+         AND (dim_status IS NULL OR dim_status = 'active') AND ${sql.unsafe(NOT_CONVERSATION_SLOT_SQL)}
        ORDER BY valid_from DESC NULLS LAST, confidence DESC, id DESC
        LIMIT 1`;
     const current = cur[0];
+    // GBRA-574 B2: a conversation fact holding this exact stint key gives up its slot, so the observation is stored.
+    const freeKey = () => validFrom == null ? null : sql`UPDATE facts SET dimension = NULL, value = NULL, value_hash = NULL, dim_status = NULL
+      WHERE source_id = ${sourceId} AND entity_slug = ${obs.entitySlug} AND dimension = ${dimension} AND value_hash = ${vh}
+        AND source_markdown_slug = ${obs.source} AND valid_from = ${validFrom}::timestamptz AND ${sql.unsafe(CONVERSATION_SLOT_SQL)}`;
 
     if (current && current.value_hash === vh && !isBackdatedObservation(validFrom, current.valid_from)) {
       // Same value → corroboration, or noop when this provenance already
@@ -2008,10 +2011,11 @@ export class PostgresEngine implements BrainEngine {
       const seen = await sql`
         SELECT 1 FROM facts
          WHERE source_id = ${sourceId} AND entity_slug = ${obs.entitySlug} AND dimension = ${dimension}
-           AND value_hash = ${vh} AND source_markdown_slug = ${obs.source}
+           AND value_hash = ${vh} AND source_markdown_slug = ${obs.source} AND ${sql.unsafe(NOT_CONVERSATION_SLOT_SQL)}
            AND COALESCE(valid_from, '-infinity'::timestamptz) >= COALESCE(${current.valid_from}::timestamptz, '-infinity'::timestamptz)
          LIMIT 1`;
       if (seen.length) return { action: 'noop', factId: null, supersededId: null };
+      await freeKey();
       const ins = await sql<{ id: number }[]>`
         INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, dimension, value, value_hash, dim_status,
                            confidence, source, source_markdown_slug, valid_from, valid_until, expired_at, consolidated_into)
@@ -2025,6 +2029,7 @@ export class PostgresEngine implements BrainEngine {
         : { action: 'noop', factId: null, supersededId: null };
     }
 
+    await freeKey();
     const ins = await sql<{ id: number }[]>`
       INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, dimension, value, value_hash, dim_status,
                          confidence, source, source_markdown_slug, valid_from, valid_until)
@@ -2059,7 +2064,7 @@ export class PostgresEngine implements BrainEngine {
       ? sql`AND source_id = ANY(${opts.sourceIds})`
       : sql`AND (${opts?.sourceId ?? null}::text IS NULL OR source_id = ${opts?.sourceId ?? null})`;
     // Provenance/entity page gates and the deleted-page hide, BEFORE DISTINCT ON: the caller gets the newest value they may see.
-    const privacy = sql.unsafe(`AND ${deletedPageProjectionHiddenSql('facts', 'facts')}${opts?.excludePrivate ? ` AND ${privateFactFilterForCaller('facts')}` : ''}`);
+    const privacy = sql.unsafe(`AND ${deletedPageProjectionHiddenSql('facts', 'facts')}${opts?.excludePrivate ? ` AND ${privateFactFilterForReader('facts')}` : ''}${opts?.excludeDiary ? ` AND NOT starts_with(COALESCE(source_markdown_slug, ''), 'life/diary/')` : ''}`);
     const visibility = opts?.visibility ? sql`AND visibility = ANY(${opts.visibility})` : sql``;
     const rows = await sql<OntologyValue[]>`
       SELECT DISTINCT ON (dimension)
@@ -2067,7 +2072,7 @@ export class PostgresEngine implements BrainEngine {
         source_markdown_slug AS source, valid_from, valid_until AS valid_to,
         COALESCE(dim_status, 'active') AS status, id AS fact_id
       FROM facts
-      WHERE entity_slug = ${entitySlug} AND dimension IS NOT NULL AND expired_at IS NULL
+      WHERE entity_slug = ${entitySlug} AND dimension IS NOT NULL AND expired_at IS NULL AND ${sql.unsafe(NOT_CONVERSATION_SLOT_SQL)}
         ${scope} ${privacy} ${visibility}
         AND COALESCE(valid_from, '-infinity'::timestamptz) <= COALESCE(${asof}::timestamptz, now())
         AND COALESCE(valid_until, 'infinity'::timestamptz) > COALESCE(${asof}::timestamptz, now())
@@ -2085,12 +2090,12 @@ export class PostgresEngine implements BrainEngine {
     const rows = await sql<{ dimension: string; entities: number; observations: number }[]>`
       SELECT dimension, count(DISTINCT entity_slug)::int AS entities, count(*)::int AS observations
       FROM facts
-      WHERE dimension IS NOT NULL AND expired_at IS NULL ${scope}
+      WHERE dimension IS NOT NULL AND expired_at IS NULL AND ${sql.unsafe(NOT_CONVERSATION_SLOT_SQL)} ${scope}
       GROUP BY dimension ORDER BY entities DESC, dimension`;
     return rows.map((r) => ({ dimension: r.dimension, entities: Number(r.entities), observations: Number(r.observations) }));
   }
 
-  async findOntologyConflicts(opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts['visibility'] }): Promise<OntologyConflict[]> {
+  async findOntologyConflicts(opts?: PageReadScope & Pick<OntologyReadOpts, 'minConfidence' | 'visibility' | 'excludeDiary'>): Promise<OntologyConflict[]> {
     const sql = this.sql;
     const minConf = opts?.minConfidence ?? 0;
     const scope = opts?.sourceIds && opts.sourceIds.length
@@ -2098,13 +2103,13 @@ export class PostgresEngine implements BrainEngine {
       : sql`AND (${opts?.sourceId ?? null}::text IS NULL OR source_id = ${opts?.sourceId ?? null})`;
     // Same page gates as getOntology, inside the CTE so a conflict
     // that only exists because of a hidden provenance is never reported.
-    const privacy = sql.unsafe(`AND ${deletedPageProjectionHiddenSql('facts', 'facts')}${opts?.excludePrivate ? ` AND ${privateFactFilterForCaller('facts')}` : ''}`);
+    const privacy = sql.unsafe(`AND ${deletedPageProjectionHiddenSql('facts', 'facts')}${opts?.excludePrivate ? ` AND ${privateFactFilterForReader('facts')}` : ''}${opts?.excludeDiary ? ` AND NOT starts_with(COALESCE(source_markdown_slug, ''), 'life/diary/')` : ''}`);
     const visibility = opts?.visibility ? sql`AND visibility = ANY(${opts.visibility})` : sql``;
     const rows = await sql<{ entity_slug: string; dimension: string; values: OntologyConflict['values'] }[]>`
       WITH cur AS (
         SELECT entity_slug, dimension, value, source_markdown_slug AS source, confidence, id AS fact_id
         FROM facts
-        WHERE dimension IS NOT NULL AND expired_at IS NULL AND valid_until IS NULL
+        WHERE dimension IS NOT NULL AND expired_at IS NULL AND valid_until IS NULL AND ${sql.unsafe(NOT_CONVERSATION_SLOT_SQL)}
           AND (dim_status IS NULL OR dim_status = 'active')
           AND confidence >= ${minConf} ${scope} ${privacy} ${visibility}
       )
@@ -2338,7 +2343,7 @@ export class PostgresEngine implements BrainEngine {
     return factsImpl.insertFact(this.engineSql, () => this.resolveFactsEmbeddingCast(), input, ctx);
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date; successorFrom?: Date }): Promise<boolean> {
     return factsImpl.expireFact(this.engineSql, id, opts);
   }
 

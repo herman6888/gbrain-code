@@ -25,7 +25,7 @@
 
 import { observationDateLine, observationDateRule, parseExtractedEventDate, type ObservationDate } from '../ai/date-grounding.ts';
 import { chat, embedOne, isAvailable, getEmbeddingModel } from '../ai/gateway.ts';
-import { classifyGlobalLlmError } from '../ai/errors.ts';
+import { classifyGlobalLlmError, UNPARSEABLE_RESPONSE_CODE } from '../ai/errors.ts';
 import { stripReasoningBlocks } from '../llm-json.ts';
 import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS, restoreNeutralized } from '../think/sanitize.ts';
@@ -35,6 +35,7 @@ import type { BrainEngine, NewFact, FactKind, FactAttribution } from '../engine.
 import { normalizeMetricLabel } from './extract-from-fence.ts';
 import { isNullLikeEntity } from './write-single.ts';
 import { isAIInvocationPolicyError } from '../ai/invocation-guard.ts';
+import { normalizeSlot } from './slots.ts';
 
 /**
  * v0.31 (D15): kill-switch for fact extraction.
@@ -145,6 +146,8 @@ export interface ExtractorVariant {
   dateGrounding?: boolean;
   /** Keep assistant-made claims as their own, attributed facts. */
   attribution?: boolean;
+  /** GBRA-574 B2: tag facts with a slot (facts/slots.ts). Never read from config: set by ExtractInput.slots. */
+  slots?: boolean;
 }
 
 const flagIs = (v: string | null, values: readonly string[]) => v != null && values.includes(v.trim().toLowerCase());
@@ -298,6 +301,11 @@ export interface ExtractInput {
   variant?: ExtractorVariant;
   /** #8064: the agent (session-speaker label) that wrote the turn's user side; the owner when absent. */
   userSpeaker?: string;
+  /**
+   * GBRA-574 B2: ask for a per-fact slot (location, employer, role). Only the conversation extractor
+   * (conversation-window-extract.ts) sets it, so every other caller's prompt and schema stay as they were.
+   */
+  slots?: boolean;
   /** Optional pre-embedding admission selector for extracted fact tiers. */
   notabilityAdmission?: {
     allowed: readonly FactNotability[];
@@ -450,10 +458,21 @@ const ATTRIBUTION_BLOCK = [
   '  did, "other" for a named third party, null when the speaker is unclear.',
 ].join('\n');
 
-/** @internal Exported for the prompt-shape test. Both variants off → the historical prompt, byte-identical. */
+/** Slot block (GBRA-574 B2): the one single-valued dimension a fact states, for read-time validity windows. */
+const SLOT_BLOCK = [
+  '',
+  'Slots: a fact that states where a person lives, which organization employs them, or their role or job title adds',
+  '"slot":["location|employer|role","<the place, organization or title alone>"]. Every other fact leaves "slot" out.',
+  '- Only with an entity: the person the value belongs to. No entity, no slot.',
+  '- A fact saying the value changed (moved, joined, was promoted) carries the new value. A fact that only ends a value',
+  '  ("left the company") or states a past one ("used to live in ...") has no slot.',
+  '- No slot for plans, wishes, trips, visits or guesses.',
+].join('\n');
+
+/** @internal Exported for the prompt-shape test. Every variant off → the historical prompt, byte-identical. */
 export function buildExtractorSystem(admitsLow: boolean, variant: ExtractorVariant = {}): string {
   const base = admitsLow ? EXTRACTOR_SYSTEM_ADMITS_LOW : EXTRACTOR_SYSTEM_SKIPS_LOW;
-  return base + (variant.dateGrounding ? DATE_GROUNDING_BLOCK : '') + (variant.attribution ? ATTRIBUTION_BLOCK : '');
+  return base + (variant.dateGrounding ? DATE_GROUNDING_BLOCK : '') + (variant.attribution ? ATTRIBUTION_BLOCK : '') + (variant.slots ? SLOT_BLOCK : '');
 }
 
 /** Extractor input ceiling; corpus windows (context/corpus-windows.ts) are cut to fit it. */
@@ -503,14 +522,15 @@ const FACTS_RESPONSE_SCHEMA = { name: 'facts_extraction', schema: FACTS_EXTRACTI
 
 /**
  * The variant's response schema: grounding adds a nullable `valid_from`,
- * attribution a nullable `attributed_to`; both off → the historical schema.
+ * attribution a nullable `attributed_to`, slots a nullable `slot`; all off → the historical schema.
  */
 function factsResponseSchema(variant: ExtractorVariant): typeof FACTS_RESPONSE_SCHEMA {
-  if (!variant.dateGrounding && !variant.attribution) return FACTS_RESPONSE_SCHEMA;
+  if (!variant.dateGrounding && !variant.attribution && !variant.slots) return FACTS_RESPONSE_SCHEMA;
   const items = (FACTS_EXTRACTION_SCHEMA.properties as { facts: { items: Record<string, unknown> } }).facts.items;
   const extra: Record<string, unknown> = {
     ...(variant.dateGrounding ? { valid_from: { type: ['string', 'null'] } } : {}),
     ...(variant.attribution ? { attributed_to: { type: ['string', 'null'], enum: ['user', 'assistant', 'other', null] } } : {}),
+    ...(variant.slots ? { slot: { anyOf: [{ type: 'null' }, { type: 'array', items: { type: 'string' } }] } } : {}),
   };
   const variantItems = {
     ...items,
@@ -543,7 +563,9 @@ export type ExtractFactsOutcome =
  * Bounded diagnostic breadcrumb for the message: the cause's CONSTRUCTOR name
  * (validated as a plain identifier — never `.name`, never `.message`) plus
  * the whole-run class `classifyGlobalLlmError` derives from the cause chain
- * (`auth` / `billing` / `rate_limit` / `model_not_found`, the same vocabulary ingest_log uses).
+ * (`auth` / `billing` / `rate_limit` / `model_not_found`, the same vocabulary ingest_log uses), or instead
+ * `provider_response_unparseable` when the provider's success response could not be parsed (#9466; that class
+ * would read `auth`, which sends an operator to a valid key).
  * Both are closed vocabularies with no interpolated provider text, so a 4xx
  * body echoing a key / org id cannot ride through. Defense-in-depth, not a
  * hard boundary: anything unexpected is dropped (never substituted), and a
@@ -557,7 +579,8 @@ function safeCauseLabel(cause: unknown): string | undefined {
       const name: unknown = typeof ctor === 'function' ? ctor.name : undefined;
       if (typeof name === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) ctorName = name;
     }
-    const label = [ctorName, classifyGlobalLlmError(cause)].filter(Boolean).join(' ');
+    const unparseable = (cause as { code?: unknown } | null)?.code === UNPARSEABLE_RESPONSE_CODE;
+    const label = [ctorName, unparseable ? UNPARSEABLE_RESPONSE_CODE : classifyGlobalLlmError(cause)].filter(Boolean).join(' ');
     return label || undefined;
   } catch {
     return undefined;
@@ -643,12 +666,13 @@ export async function extractFactsFromTurnWithOutcome(
   // because those reuse `extractorSystem`. Read AFTER the availability gate —
   // a chat_unavailable early return must not pay config round-trips (#4298
   // resolved the model/gate ordering; these reads sit behind it).
-  const [promptAppendix, junkFilterOn, missingConfidence, variant] = await Promise.all([
+  const [promptAppendix, junkFilterOn, missingConfidence, configured] = await Promise.all([
     getFactsExtractionPromptAppendix(input.engine),
     isJunkFilterEnabled(input.engine),
     getMissingConfidence(input.engine),
     input.variant ?? getExtractorVariant(input.engine),
   ]);
+  const variant: ExtractorVariant = input.slots ? { ...configured, slots: true } : configured;
   const extractorSystem = promptAppendix
     ? `${buildExtractorSystem(admitsLow, variant)}\n\n${promptAppendix}`
     : buildExtractorSystem(admitsLow, variant);
@@ -839,6 +863,8 @@ export async function extractFactsFromTurnWithOutcome(
     const claimValue  = candidate.value ?? null;
     const claimUnit   = candidate.unit ?? null;
     const claimPeriod = candidate.period ?? null;
+    const entitySlug = isUnknownSpeakerLabel(candidate.entity) || isNullLikeEntity(candidate.entity) ? null : (candidate.entity ?? null);
+    const slot = variant.slots ? normalizeSlot(candidate.slot?.dimension, candidate.slot?.value, entitySlug) : null;
 
     facts.push({
       fact: factText,
@@ -851,9 +877,7 @@ export async function extractFactsFromTurnWithOutcome(
       // where the prompt asked for JSON null — otherwise the resolver's
       // fallback adopts the token as the slug and the facts land unreachable
       // under entity_slug='null'. Same token set the `remember` verb applies.
-      entity_slug: isUnknownSpeakerLabel(candidate.entity) || isNullLikeEntity(candidate.entity)
-        ? null
-        : (candidate.entity ?? null),
+      entity_slug: entitySlug,
       source: input.source,
       source_session: input.sessionId ?? null,
       confidence,
@@ -871,6 +895,7 @@ export async function extractFactsFromTurnWithOutcome(
         ? { valid_from: parseExtractedEventDate(candidate.valid_from)! }
         : {}),
       ...(variant.attribution && candidate.attributed_to ? { attributed_to: candidate.attributed_to } : {}),
+      ...(slot ? { dimension: slot.dimension, value: slot.value } : {}),
     });
   }
 
@@ -925,6 +950,8 @@ interface RawExtracted {
   /** Date-grounding variant: the event date the extractor stated (raw string; validated on use). */
   valid_from?: string | null;  /** Attribution variant: who asserted the claim; anything outside the three speakers parses as null. */
   attributed_to?: FactAttribution | null;
+  /** Slots variant: the raw slot (validated on use by normalizeSlot). */
+  slot?: { dimension: string; value: string } | null;
 }
 
 /**
@@ -1011,12 +1038,19 @@ function tryArrayShapeDetailed(s: string): ParsedExtractorShape | null {
         period: typeof o.period === 'string' ? o.period : null,
         valid_from: typeof o.valid_from === 'string' ? o.valid_from : null,
         attributed_to: o.attributed_to === 'user' || o.attributed_to === 'assistant' || o.attributed_to === 'other' ? o.attributed_to : null,
+        slot: rawSlot(o.slot),
       });
     }
     return { facts: out, invalidCandidates };
   } catch {
     return null;
   }
+}
+
+function rawSlot(s: unknown): RawExtracted['slot'] {
+  if (typeof s !== 'object' || s === null) return null;
+  const [dimension, value] = Array.isArray(s) ? s : [(s as Record<string, unknown>).dimension, (s as Record<string, unknown>).value];
+  return typeof dimension === 'string' && typeof value === 'string' ? { dimension, value } : null;
 }
 
 function clampConfidence(x: number | undefined, missing: number): number {
