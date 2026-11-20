@@ -40,7 +40,7 @@ import { emptyRead, hiddenTakesNotice, localTranscriptsNotice, recallInteropNoti
 import { degradedStampFor, degradedStampLine, type DegradedStamp } from '../core/degraded-stamp.ts';
 import { assertUnscopedReadReachesPages } from '../core/sources-not-readable.ts';
 import { accessPolicyNotices } from '../core/access/policy-notice.ts';
-import { hiddenToolHint, hiddenToolNext, hiddenToolRoute, paramCallable, paramNotOnSurface, type ToolConnection } from './hidden-tool-hint.ts';
+import { hiddenToolHint, hiddenToolNext, hiddenToolRoute, itemParamKeys, paramCallable, paramNotOnSurface, type ToolConnection } from './hidden-tool-hint.ts';
 import { opAllowedForBoundClient } from '../core/ops/context.ts';
 import { takePostUpgradeMcpNotice } from '../core/post-upgrade-notice.ts';
 import { takeHttpBehaviorNotice, takeLocalBehaviorNotice } from '../core/behavior-change-notice.ts';
@@ -672,7 +672,7 @@ export function dispatchRenderContext(opts: DispatchOpts): RenderContext {
       const op = byName.get(opName);
       return !!op && isCallable(op, {
         transport, surface, scopes: opts.auth?.scopes ?? [], publishGates: {}, allowedOps: opts.allowedOps,
-      }) && (transport === 'cli' || (opAllowedForBoundClient(opts.auth, op) && Object.keys(args ?? {}).every(key => paramCallable(op, key, surface))));
+      }) && (transport === 'cli' || (opAllowedForBoundClient(opts.auth, op) && [...Object.keys(args ?? {}), ...itemParamKeys(op, args ?? {})].every(key => paramCallable(op, key, surface))));
     },
     preapproved: () => false,
     ...(opts.auth?.clientId ? { principal: opts.auth.clientId } : {}),
@@ -1093,7 +1093,7 @@ export async function dispatchToolCall(
     }
     if (audience || attested?.actor) assertion('accepted');
     const callParams = attested ? attested.params : args;
-    return withCallerAccess({ ...access, privateFactSources: privateFactSources && !audience && !attested?.actor && readMode === null && !opts.enforcedMember ? privateFactSources : [] }, async () => {
+    return withCallerAccess({ ...access, privateFactSources: privateFactSources && !audience && !attested?.actor && readMode === null && !opts.enforcedMember ? privateFactSources : [], ...(access.owner && opts.auth && opts.transport !== 'stdio' && !roomDeclaration && !audience && !attested?.actor && readMode === null && !opts.enforcedMember ? { ownerReads: true } : {}) }, async () => {
       const out = await withRequestIdentityMemo(() => withReadMode(readMode, () => dispatchResolvedCall(engine, name, callParams, scoped)));
       // _meta.access (MCP_META_CHANNELS.md): the view this call was answered under, for the harness; own producer, isolated.
       try { out._meta = { ...(out._meta ?? {}), access: await appliedAccessSummary(engine, scoped.auth, [scoped.sourceId, ...(scoped.localFederatedSourceIds ?? [])]) }; } catch { /* the key is absent */ }

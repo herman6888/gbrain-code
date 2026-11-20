@@ -67,6 +67,8 @@ src/core/ai/recipes/llama-server.ts	process_env	1	W3: AI settings arrive on the 
 src/core/ai/recipes/lmstudio.ts	process_env	1	W3: AI settings arrive on the engine
 src/core/ai/reranker-readiness-engine.ts	load_config	1	W3: AI settings arrive on the engine
 src/core/ai/reranker-readiness-engine.ts	process_env	1	W3: AI settings arrive on the engine
+src/core/apple-contacts/apple-contacts-source.ts	fs_import	1	W7: filesystem boundary moves to the local app (GST-3256: a Git-recorded source checks its checkout for a hand-authored page, as people-calendar-sweep.ts does)
+src/core/apple/contacts-client.ts	fs_import	1	W7: filesystem boundary moves to the local app (GST-3256: lstat and read of the 0600 token file the source names)
 src/core/archive-crawler-config.ts	fs_import	1	W7: filesystem boundary moves to the local app
 src/core/atomic-write.ts	fs_import	1	W7: filesystem boundary moves to the local app
 src/core/attendance-repair.ts	process_env	1	W6: settings plane out of the core
@@ -980,6 +982,8 @@ src/core/secret-scan-allowlist.ts	fs_import	1	W7: filesystem boundary moves to t
 src/core/secret-scan-allowlist.ts	module_collection	1	W6: per-engine state, or mark as a constant table
 src/core/secret-scan.ts	fs_import	1	W7: filesystem boundary moves to the local app
 src/core/secret-scan.ts	module_collection	1	W6: per-engine state, or mark as a constant table
+src/core/secret-store/backup.ts	fs_import	1	W7: filesystem boundary moves to the local app (the backup status file lives on the machine beside the keyring)
+src/core/secret-store/backup.ts	load_config	1	W6: settings plane out of the core (reads the configured storage backend for the secret store backup)
 src/core/secret-store/keyring.ts	fs_import	1	W7: filesystem boundary moves to the local app (the secret store key file lives on the machine)
 src/core/secret-store/keyring.ts	process_env	1	W6: settings plane out of the core (GBRAIN_SECRET_STORE_KEY override)
 src/core/secret-store/spool.ts	fs_import	1	W7: filesystem boundary moves to the local app (the encrypted spool lives on the machine)
@@ -1244,3 +1248,10 @@ src/core/setup/pi-skill-extension.ts	spawn_import	1	GBRA-435 Pi skill-resolver e
 src/core/setup/cursor-skill-pins.ts	fs_import	1	GBRA-435 Cursor pinned skills: setup writes the project's pinned-skills rule, its git exclude line and the project record under GBRAIN_HOME (no brain or engine is opened); stays
 src/core/setup/cursor-skill-pins.ts	process_env	1	GBRA-435 Cursor pinned skills: HOME locates the user-level skill directories Cursor loads; stays
 src/core/setup/cursor-skill-pins.ts	spawn_import	1	GBRA-435 Cursor pinned skills: setup runs git rev-parse to find the repository's info/exclude; stays
+src/core/entities/identity-decisions.ts	fs_import	1	W7: filesystem boundary moves to the local app (decision files under .gbrain/identity/, same door as access/policy-git.ts)
+src/core/entities/identity-decisions.ts	process_env	4	W7: the commit-lock marker (COMMIT_LOCK_ENV) exported to commitAndPush while the lock is held, as in access/policy-git.ts; it moves with the filesystem boundary
+src/core/entities/identity-decisions.ts	spawn_import	1	W7: process-wide effects move to src/cli (git show of the committed decision file)
+src/core/owned-folder/destination.ts	fs_import	1	W7: filesystem boundary moves to the local app; GST-3022 owned folders: checks the default source checkout exists and resolves its real top level before any file is written there
+src/core/owned-folder/paths.ts	fs_import	1	W7: filesystem boundary moves to the local app; GST-3022 owned folders: realpath of a sync root, import target or uploaded file, so a symlink cannot reach .gbrain-owned/
+src/core/owned-folder/remove.ts	fs_import	1	W7: filesystem boundary moves to the local app; GST-3022 owned folders: checks OWNER.json and prunes the directories a source removal leaves empty, never following a symlink
+src/core/owned-folder/writer.ts	fs_import	1	W7: filesystem boundary moves to the local app; GST-3022 owned folders: the one writer of the folder: OWNER.json, the README and the day files, with lstat symlink checks

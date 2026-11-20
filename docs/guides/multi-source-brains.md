@@ -453,7 +453,8 @@ gbrain sources add <id> --url <git-url> [--pat-file <p>] [--clone-dir <path>] [-
                                Clone + register a remote repo in one step; auto-hardens
                                for durability when a PAT is provided (see "Durability" below).
 gbrain sources list [--json]   List all sources with page counts + federation state.
-gbrain sources archive <id>    Soft-delete: hide from search, keep data for a TTL
+gbrain sources archive <id>    Soft-delete: hide from search and from every read
+                               (API tokens included), keep data for a TTL
                                grace window. Prefer this over `remove`.
 gbrain sources restore <id>    Un-archive. `gbrain sources archived` lists expiries;
                                `gbrain sources purge` permanently deletes expired archives —
@@ -486,6 +487,10 @@ gbrain sources set-sync <id> <on|off> [--dry-run] [--expect <on|off>]
                                Off: autopilot cycles work only on pages changed since
                                the last cycle, so a file edited on disk is picked up
                                by the next explicit sync, not by the cycle.
+gbrain sources rebind <id> [--expect <current-push-urls>] [--yes] [--json]
+                               iMessage sources: record a changed push destination
+                               for the source's .gbrain-owned/ folder. Previews
+                               without --yes; see docs/guides/apple-setup.md#where-the-pages-live.
 gbrain sources host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
                                Managed brains: host a new, empty source in a bare
                                repository under <path> (see below). Previews without --expect.

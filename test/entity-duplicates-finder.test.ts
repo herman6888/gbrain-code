@@ -22,7 +22,10 @@
  * đ, ß, æ, œ, þ, ı and capitals); evidence lists every key type the members
  * share and every key type they all carry with disjoint values; the finder
  * writes nothing; a different exclusive key (LinkedIn, GitHub, declared id)
- * vetoes clean while a different handle or email only shows; role and
+ * vetoes clean while a different handle or email only shows; two different
+ * domains keep a group out of clean (a US firm and its UK namesake on one
+ * LinkedIn page); in a company name a run of single letters folds as one
+ * word (L.L.C. = LLC), while a person's initials stay apart; role and
  * household addresses are tagged; free-mail domains are never company keys;
  * a union of clean groups that share a page is checked as a whole; \`gbrain dedupe --preview --json\` keeps
  * an exact versioned key set; matchers are pluggable. PGLite, no repository,
@@ -45,6 +48,7 @@ import { entityDuplicatesEntry } from '../src/commands/doctor/checks/entity-dupl
 import { parseSchemaPackManifest } from '../src/core/schema-pack/manifest-v1.ts';
 import { nameWords } from '../src/core/entities/name-variants.ts';
 import type { DoctorContext } from '../src/commands/doctor/context.ts';
+import { GITHUB_RESERVED_NAMES } from '../src/core/entities/github-reserved.ts';
 
 for (const backend of testBackends()) describe(backend, () => {
 let engine: BrainEngine;
@@ -181,6 +185,22 @@ describe('name folds', () => {
     }
     expect(strictNameFold('Sam Example Jr.')).toBe('sam example jr');
     for (const n of ['Dr. Ada Søndergaard III', 'Łukasz Ó Example-Sample']) expect(strictNameFold(n)).toBe(nameWords(n).join(' '));
+  });
+
+  test('in a company name a run of single letters folds as one word, so a dotted legal suffix matches the plain one', async () => {
+    for (const n of ['Iselwood, L.L.C.', 'Iselwood L L C', 'ISELWOOD LLC']) {
+      expect(strictNameFold(n, 'company')).toBe('iselwood llc');
+      expect(variantNameFold(n, 'company')).toBe('iselwood');
+    }
+    expect(strictNameFold('D. R. Example')).toBe('d r example');
+    expect(strictNameFold('D. R. Example')).not.toBe(strictNameFold('Dr. Example'));
+    expect(variantNameFold('D. R. Example', 'person')).not.toBe(variantNameFold('Example', 'person'));
+    expect(strictNameFold('Alice B Example')).toBe('alice b example');
+    await page('companies/iselwood', 'company', 'Iselwood, L.L.C.', { linkedin: 'linkedin.com/company/iselwood' });
+    await page('companies/iselwood', 'company', 'Iselwood LLC', { linkedin: 'https://www.linkedin.com/company/iselwood/' }, 'source-b');
+    const [g, ...rest] = await groups('cross_source');
+    expect(rest).toEqual([]);
+    expect(g!.class).toBe('clean');
   });
 
   test('Søndergaard and Sondergaard with a shared declared id are one clean group, not a conflict', async () => {
@@ -343,6 +363,30 @@ describe('phone numbers', () => {
 });
 
 describe('GitHub URLs', () => {
+  test('every reserved GitHub name is a lowercase login-shaped word, since the github key compares a lowercased login against the set', () => {
+    expect([...GITHUB_RESERVED_NAMES].filter(n => !/^[a-z0-9][a-z0-9-]{0,38}$/.test(n))).toEqual([]);
+  });
+
+  test('route words GitHub serves its own pages at (enterprises, watching, customer-stories) and the deleted-user placeholder give no key', async () => {
+    await page('companies/acme-example', 'company', 'Acme Example', { github: 'https://github.com/enterprises/acme-example' });
+    await page('companies/acme-example', 'company', 'Acme Example', { github: 'github.com/enterprises/acme-example/people' }, 'source-b');
+    await page('people/alice-example', 'person', 'Alice Example', { github: 'https://github.com/watching' });
+    await page('people/alice-example', 'person', 'Alice Example', { github: 'https://github.com/customer-stories/acme-example' }, 'source-b');
+    await page('people/bob-example', 'person', 'Bob Example', { github: 'ghost' });
+    await page('people/bob-example', 'person', 'Bob Example', { github: '@ghost' }, 'source-b');
+    const found = await groups('cross_source');
+    expect(found.map(g => g.class)).toEqual(['weak', 'weak', 'weak']);
+    for (const g of found) expect(g.evidence.filter(e => e.key === 'github')).toEqual([]);
+  });
+
+  test('a login GitHub still serves as a profile stays a key, even when it looks like a route word', async () => {
+    await page('people/alice-example', 'person', 'Alice Example', { github: 'https://github.com/inbox' });
+    await page('people/alice-example', 'person', 'Alice Example', { github: 'inbox' }, 'source-b');
+    const [g] = await groups('cross_source');
+    expect(g!.class).toBe('clean');
+    expect(g!.evidence).toContainEqual({ matcher: 'shared_key', rule: 'shared_key', key: 'github', field: 'github', key_class: 'exclusive' });
+  });
+
   test('a URL under a path GitHub reserves (orgs, sponsors, settings and the like) names no login and gives no key', async () => {
     await page('people/alice-example', 'person', 'Alice Example', { github: 'https://github.com/orgs/acme-example' });
     await page('people/alice-example', 'person', 'Alice Example', { github: 'github.com/orgs/acme-example/people' }, 'source-b');
@@ -374,6 +418,17 @@ describe('company domains', () => {
     const [g] = await groups('cross_source');
     expect(g!.class).toBe('clean');
     expect(g!.evidence).toContainEqual({ matcher: 'shared_key', rule: 'shared_key', key: 'linkedin', field: 'linkedin', key_class: 'exclusive' });
+  });
+
+  test('two same-name companies on one LinkedIn company page with different domains are likely, not clean', async () => {
+    await page('companies/acme-example', 'company', 'Acme Example', { linkedin: 'https://www.linkedin.com/company/acme-example/', domain: 'acme-example.com', country: 'US' });
+    await page('companies/acme-example', 'company', 'Acme Example', { linkedin: 'linkedin.com/company/acme-example', website: 'https://acme-example.co.uk', country: 'UK' }, 'source-b');
+    await page('companies/bolt-example', 'company', 'Bolt Example', { linkedin: 'linkedin.com/company/bolt-example', domain: 'bolt-example.com' });
+    await page('companies/bolt-example', 'company', 'Bolt Example', { linkedin: 'linkedin.com/company/bolt-example', website: 'https://www.bolt-example.com/about' }, 'source-b');
+    const bySlug = new Map((await groups('cross_source')).map(g => [g.members[0]!.slug, g]));
+    expect(bySlug.get('companies/acme-example')!.class).toBe('likely');
+    expect(bySlug.get('companies/acme-example')!.evidence).toContainEqual({ matcher: 'key_check', rule: 'key_differs', key: 'domain', field: 'domain', key_class: 'contact', veto: false });
+    expect(bySlug.get('companies/bolt-example')!.class).toBe('clean');
   });
 
   test('a person page has no domain key', async () => {
