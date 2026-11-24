@@ -205,8 +205,22 @@ export const IGNORED_MEMBERS: ReadonlySet<string> = new Set([
   // Segmented-body staging and derivation tables (not copied).
   'allocateBodyOccurrenceIds', 'stageSegmentTexts', 'stageManifestRows', 'openBodyStaging', 'setBodyStagingState',
   'upsertSegmentDerivations', 'retireSegmentDerivations',
-  // The memory proposal queue: the seed leaves memory_proposals behind on purpose (rust/docs/store/seed.md), so nothing follows it.
+  // The memory proposal queue: the Rust store does not serve memory_proposals yet (rust/docs/store/seed.md lists it under "Gaps: not served by the Rust store"),
+  // so the seed does not copy it, nothing follows it, and a row in it blocks a swap.
   'expireMemoryProposals', 'purgeMemoryProposals',
+]);
+
+/**
+ * The ignored members that do write the brain database (locks, logs, caches, staging). The follower does not copy them,
+ * but a process that only calls them is still a writer, so the writer observer notes it (wrapper.ts mayWrite).
+ */
+export const IGNORED_WRITE_MEMBERS: ReadonlySet<string> = new Set([
+  'acquireCycleLock', 'refreshCycleLock', 'releaseCycleLock', 'deleteCycleLock', 'deleteCycleLockIfStale',
+  'logIngest', 'logEvalCandidate', 'logEvalCaptureFailure', 'deleteEvalCandidatesBefore', 'writeContradictionsRun',
+  'putContradictionCacheEntry', 'sweepContradictionCache', 'putDreamVerdict', 'sweepDreamVerdicts', 'putCodeTraversalCache',
+  'clearCodeTraversalCache', 'insertLocalWriterRow',
+  'allocateBodyOccurrenceIds', 'stageSegmentTexts', 'stageManifestRows', 'openBodyStaging', 'setBodyStagingState',
+  'upsertSegmentDerivations', 'retireSegmentDerivations',
 ]);
 
 /** Members that run caller SQL; the wrapper parses it (sql-writes.ts). */

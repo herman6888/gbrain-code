@@ -545,6 +545,7 @@ export interface TakesScorecard {
 export interface TakesScorecardOpts extends PageReadScope {
   holder?: string;
   domainPrefix?: string; // e.g. 'companies/' to scope the scorecard
+  domainPrefixAlso?: string[]; // more prefixes read with `domainPrefix` (one name stored under another spelling)
   since?: string;        // ISO date 'YYYY-MM-DD'
   until?: string;        // ISO date 'YYYY-MM-DD'
   /** Federated/source scope via the take's page.source_id (array wins over scalar). */
@@ -918,7 +919,7 @@ export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, c
 
 export interface BrainEngine {
   /** Discriminator: lets migrations and other consumers branch on engine kind without instanceof + dynamic imports. */
-  readonly kind: 'postgres' | 'pglite';
+  readonly kind: 'postgres' | 'pglite' | 'rust';
   readonly capabilities: EngineCapabilities; // what this engine can do, by name (engine-capabilities.ts); ask it instead of branching on kind
 
   // Lifecycle
