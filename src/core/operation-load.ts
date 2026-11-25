@@ -104,6 +104,7 @@ const OP_AREAS: Record<string, string> = {
   entity_identity_list: 'entities',
   // v0.47 open-loop engine (google source kind)
   open_loops: 'loops', loops_close: 'loops', loops_mute: 'loops', loops_unmute: 'loops',
+  learned: 'insights', learned_keep: 'insights', learned_undo: 'insights', // nightly learning ledger (ops/learned.ts)
   questions_pin: 'questions', questions_list: 'questions', questions_status: 'questions', questions_refresh: 'questions', questions_unpin: 'questions', // C4
   // insight / signal reads
   get_recent_salience: 'insights', find_anomalies: 'insights',
@@ -119,7 +120,9 @@ const OP_AREAS: Record<string, string> = {
   schema_explain_type: 'schema', schema_review_orphans: 'schema',
   schema_apply_mutations: 'schema', reload_schema_pack: 'schema',
   // discovery
-  request_tools: 'discovery',
+  request_tools: 'discovery', capabilities: 'discovery',
+  // agent policy (advisory rules for outside actions)
+  policy_check: 'agent-policy', agent_policy: 'agent-policy',
 };
 
 const finalized = new WeakSet<Operation>();

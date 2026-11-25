@@ -100,6 +100,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('guest_sources', 'security', 'Which sources hold outside-guest notes, their writer list and tier ceiling; dropping it would let any writer add owner-tier pages there.'),
     carry('ingest_applied_captures', 'operational', 'Applied /ingest captures by job idempotency key, so a re-run or a replay of a capture after graduation still writes nothing.'),
     carry('ingest_log', 'operational', 'Ingestion log.'),
+    carry('learning_items', 'user_data', 'The learning ledger: what each night recorded and whether the owner was shown, kept, undid or answered it; that history cannot be rebuilt from the targets.'),
     carry('links', 'user_data', 'Page graph links.'),
     carry('link_edge_proposals', 'user_data', 'Relationship contradiction proposals with the user\'s accept/reject/undo decisions and the paid judge results behind them.'),
     carry('link_relationships', 'user_data', 'Temporal relationship state; recorded_at and retired_at keep when the brain first and last saw a relationship, which a rebuild cannot recover.'),
@@ -228,6 +229,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('wake_subscriptions', 'operational', 'Report-back watches (Wakeshift): open ones point at jobs minion_jobs carries and at Wakeshift subscriptions that outlive the move, so a wake still arrives after graduation.'),
     carry('wake_terms_acceptances', 'operational', 'Members\' acceptances of the operator\'s Wakeshift terms; dropping them would ask every member to agree again.'),
     carry('wanted_links', 'user_data', 'Unresolved authored links (wanted pages); the edge appears when the target page is written, so they are not re-derived without a full re-extraction.'),
+    carry('write_gate_hold_rechecks', 'operational', 'Held writes a purge kept for another page, waiting for the maintenance sweep to check them again; dropping them would leave a held write two side-by-side purges left behind in the database.'),
     carry('write_gate_holds', 'user_data', 'Facts and takes the write gate held for the owner\'s review (#5575); dropping them would lose content awaiting release or drop.'),
     carry('write_gate_receipts', 'user_data', 'Write-gate verdicts (flag/quarantine) per persisted row (#5575); dropping them would forget which agent-written instructions are unconfirmed.'),
 

@@ -1,7 +1,8 @@
+import * as opCheckpointImpl from './engine-sql/op-checkpoint.ts';
 import { registerManagedFilesystemEngine } from './persistence/filesystem-guard.ts';
 import { capabilitiesForEngineKind, type EngineCapabilities } from './engine-capabilities.ts';
 import { writerStamp } from './persistence/writer-versions.ts';
-import { noteRequestConfigWrite, requestConfigRows, requestConfigValue } from './config-snapshot.ts';
+import { assertReservedConfigWrite, noteRequestConfigWrite, requestConfigRows, requestConfigValue } from './config-snapshot.ts';
 import { replaceDerivedLinks, replaceDerivedLinksBatch, type DerivedLinkBatchItem, type DerivedLinkOrigin, type DerivedLinkReplacementOptions } from './derived-links.ts';
 import { trackPgliteDatabase, PgliteClosingError, notifyPgliteOpened } from './pglite-lifecycle.ts';
 import { mutatePageTag } from './page-state/tags.ts';
@@ -212,6 +213,7 @@ import { wellFormedJson } from './text-safe.ts';
 import { ENGINE_ROOT } from './engine-root.ts';
 import { insertEvalCandidate } from './feedback/store.ts';
 import { noteSchemaVersion } from './migrate-pending.ts';
+import * as cliReadsOpsImpl from './engine-sql/cli-reads-ops.ts';
 
 /**
  * #4284 — opt-in out-of-band watchdog for a PGLite disconnect with a live
@@ -1182,7 +1184,7 @@ export class PGLiteEngine implements BrainEngine {
     await this.connect(config);
   }
 
-  async initSchema(): Promise<void> {
+  async initSchema(opts: { embedding?: { dimensions: number; model: string } } = {}): Promise<void> {
     // Tier 3: snapshot was loaded into PGlite — schema + migrations already
     // applied. Only record the schema version, as a cold init does.
     if (this._snapshotLoaded) return noteSchemaVersion(this, parseInt(await this.getConfig('version') ?? '', 10));
@@ -1198,7 +1200,7 @@ export class PGLiteEngine implements BrainEngine {
       // return falsy), so the catch below is the only fallback path (#3461).
       dims = gw.getEmbeddingDimensions();
       model = gw.getEmbeddingModel();
-    } catch { /* gateway not configured — use defaults */ }
+    } catch { /* gateway not configured — use defaults */ } if (opts.embedding) ({ dimensions: dims, model } = opts.embedding); // a caller's explicit identity (shadow replay copies) wins
 
     const storedIdentity = await readStoredEmbeddingIdentity(this);
     if (storedIdentity) {
@@ -1457,6 +1459,9 @@ export class PGLiteEngine implements BrainEngine {
   getSource(sourceId: string) { return sourcesImpl.getSource(unscopedExecutor(this.engineSql, 'sources: single-row read ran unscoped through executeRaw'), sourceId); }
   getConfigValues(keys: readonly string[]) { return configImpl.getConfigValues(unscopedExecutor(this.engineSql, 'config: keyed read ran unscoped through executeRaw'), keys); }
   readManagedModeRows() { return persistenceStateImpl.readManagedModeRows(unscopedExecutor(this.engineSql, 'persistence: managed-mode read ran unscoped through executeRaw')); }
+
+  // Read-command statements (engine-sql/cli-reads-ops.ts), through executeRaw as before; PGLite has no statement deadline or JIT, so it ignores those bounds as it did.
+  private get rawRead(): cliReadsOpsImpl.EngineRawRead { return (sql, params) => this.executeRaw(sql, params); }
   listExportPageKeys(q: exportReadsImpl.ExportPageKeyQuery) { return exportReadsImpl.listExportPageKeys(this, q); }
   readExportWithdrawalLedgerBytes(sourceId: string) { return exportReadsImpl.readExportWithdrawalLedgerBytes(this, sourceId); }
   listExportWithdrawals(sourceId: string) { return exportReadsImpl.listExportWithdrawals(this, sourceId); }
@@ -1503,6 +1508,9 @@ export class PGLiteEngine implements BrainEngine {
   async listSourceLocalPaths(): Promise<string[]> {
     return sourcesImpl.listSourceLocalPaths(unscopedExecutor(this.engineSql, 'sources: unscoped on master (the filesystem lock read it through executeRaw)'));
   }
+
+  // The CLI import and extract reads that ran unscoped through executeRaw (engine-sql/cli-reads-import.ts), on the current connection.
+  private get cliReads() { return unscopedExecutor(this.engineSql, 'cli reads: the import and extract paths ran these unscoped through executeRaw'); }
 
   /** Page-write reads (engine-sql/write-misc.ts). */
   private get writeMiscReads() { return unscopedExecutor(this.engineSql, 'write misc: page writes ran these unscoped through executeRaw'); }
@@ -3129,6 +3137,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async setConfig(key: string, value: string): Promise<void> {
+    assertReservedConfigWrite(key);
     await this.db.query(
       `INSERT INTO config (key, value) VALUES ($1, $2)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
@@ -3138,6 +3147,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async unsetConfig(key: string): Promise<number> {
+    assertReservedConfigWrite(key);
     const { affectedRows } = await this.db.query(
       'DELETE FROM config WHERE key = $1',
       [key],
@@ -3383,6 +3393,9 @@ export class PGLiteEngine implements BrainEngine {
   upsertOpenLoop(loop: OpenLoopUpsertInput) { return openLoopsImpl.upsertOpenLoop(this.engineSql, loop); }
   closeOpenLoop(sourceId: string | null, id: number, status: Exclude<OpenLoopStatus, 'open'>, closedBy: string) { return openLoopsImpl.closeOpenLoop(this.engineSql, sourceId, id, status, closedBy); }
   listOpenLoops(opts?: OpenLoopListOpts) { return openLoopsImpl.listOpenLoops(unscopedExecutor(this.engineSql, 'open loops: the list read ran through executeRaw unscoped'), opts); }
+  countOpenLoopsByCounterpartyEmail(sourceId: string, emails: readonly string[], loopType: string) { return openLoopsImpl.countOpenLoopsByCounterpartyEmail(unscopedExecutor(this.engineSql, 'open loops: the withheld-noise count ran through executeRaw unscoped'), sourceId, emails, loopType); }
+  async listPendingCoreEditNotices(sourceIds: readonly string[] | null) { return trustTierReads.listPendingCoreEditNotices(this, sourceIds); }
+  purgeStaleAppliedCaptures(ttlDays: number) { return opCheckpointImpl.purgeStaleAppliedCaptures(this, ttlDays); }
   readEntityOpenLoops(slug: string, sourceId: string, limit: number) { return openLoopsImpl.readEntityOpenLoops(unscopedExecutor(this.engineSql, 'open loops: the entity card read ran through executeRaw unscoped'), slug, sourceId, limit); }
   // Decide proposals (group C; engine-sql/decide-proposals.ts).
   async insertDecideProposal(p: decideProposals.NewProposal) { return decideProposals.insertDecideProposal(this, p); }

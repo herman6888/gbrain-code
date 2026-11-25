@@ -124,6 +124,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "string",
         "description": "Typed claim period, e.g. monthly.",
         "fullSurfaceOnly": true
+      },
+      "facet": {
+        "type": "string",
+        "description": "Profile facet (diet, allergy, size.shoe, brand, style, constraint, schedule, household, other); no entity: your own profile.",
+        "fullSurfaceOnly": true
       }
     },
     "mutating": true,
@@ -4124,6 +4129,115 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     }
   },
   {
+    "name": "policy_check",
+    "description": "Before you send, spend, delete, sign up, call or publish on the user's behalf outside this brain, ask whether the user's agent policy allows it. Advisory: allow, ask, deny or none (no policy).",
+    "params": {
+      "verb": {
+        "type": "string",
+        "required": true,
+        "enum": [
+          "send",
+          "publish",
+          "spend",
+          "delete",
+          "sign_up",
+          "call",
+          "book",
+          "cancel",
+          "dispute",
+          "submit",
+          "return",
+          "use",
+          "renew",
+          "remind",
+          "other"
+        ],
+        "description": "The outside action."
+      },
+      "amount": {
+        "type": "number",
+        "description": "Money involved, with currency."
+      },
+      "currency": {
+        "type": "string",
+        "description": "Three-letter currency code for amount, like USD."
+      },
+      "merchant": {
+        "type": "string",
+        "description": "Merchant or service, when a rule may name it."
+      },
+      "to": {
+        "type": "string",
+        "enum": [
+          "self",
+          "household",
+          "known",
+          "new"
+        ],
+        "description": "Who it reaches: self, household, known or new."
+      }
+    },
+    "callShape": "{\"verb\":\"spend\",\"amount\":60,\"currency\":\"USD\",\"merchant\":\"acme-example\"}",
+    "scope": "read",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": {
+      "exempt": "derived decision fields (rule id, revision, state) from the owner-approved policy; no page text"
+    },
+    "cliHints": {
+      "name": "policy-check",
+      "hidden": true
+    },
+    "annotations": {
+      "title": "policy_check (advisory)",
+      "readOnlyHint": true
+    },
+    "area": "agent-policy"
+  },
+  {
+    "name": "agent_policy",
+    "description": "The user's agent policy rules that apply to you, as rows, with its state and revision. Advisory; call policy_check for one action.",
+    "params": {},
+    "scope": "read",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": {
+      "exempt": "the owner-approved rules written for agents to read, as rows; never the page"
+    },
+    "cliHints": {
+      "name": "agent-policy",
+      "hidden": true
+    },
+    "annotations": {
+      "title": "agent_policy (advisory)",
+      "readOnlyHint": true
+    },
+    "area": "agent-policy"
+  },
+  {
+    "name": "capabilities",
+    "description": "Which gbrain ops this installation serves and this connection can call now, listed or not, with the fix for each one that is not callable.",
+    "params": {
+      "ops": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Op names to check (default: policy_check, agent_policy, capabilities)."
+      }
+    },
+    "scope": "read",
+    "mutating": false,
+    "idempotent": true,
+    "agentCallable": true,
+    "outputRedaction": "no_stored_text",
+    "annotations": {
+      "title": "capabilities (what this connection can call)",
+      "readOnlyHint": true
+    },
+    "area": "discovery"
+  },
+  {
     "name": "submit_job",
     "idempotent": false,
     "outputRedaction": {
@@ -6573,6 +6687,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "string",
         "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
         "fullSurfaceOnly": true
+      },
+      "profile": {
+        "type": "boolean",
+        "description": "true: add your own profile (facets, constraints, relationships, preferences).",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -8061,5 +8180,89 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     },
     "scope": "write",
     "area": "admin"
+  },
+  {
+    "name": "learned",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": "retrieval",
+    "description": "What the brain learned since you last looked: new facts its extractors saved, facts that disagree (which one is right?), promises people made to you, people who may be the same person (with the gbrain dedupe confirm and reject commands, run on the brain host), thin pages it filled in, and rows you typed into Facts fences (shown, never counted). Default: the items you have not been shown yet from the last 7 days; with since, every item since that date. Grouped by kind, questions first, 15 by default; each item carries a stable id and evidence links (the page or loop it came from). Reading stamps the items as shown. With stats: per-night counts (a night ends at 06:00 in brain.timezone) of items shown, kept, undone and expired, and the share of nights with at least 5 counted items.",
+    "params": {
+      "since": {
+        "type": "string",
+        "description": "ISO date or timestamp (e.g. 2026-11-20). Lists every item recorded since then, shown or not. Default: unseen items of the last 7 days (stats: the last 30 days)."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Most items to return (default 15, at most 100). Every item returned is shown and stamped."
+      },
+      "stats": {
+        "type": "boolean",
+        "description": "Return the per-night stats instead of the items. Shows nothing, so it stamps nothing."
+      }
+    },
+    "scope": "read",
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "cliHints": {
+      "name": "learned"
+    },
+    "area": "insights"
+  },
+  {
+    "name": "learned_keep",
+    "mutating": true,
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Keep items from the learned note: mark what the brain learned as right. Writes only the note's own record (no page or fact changes). Takes item ids from learned (comma separated), or all for every pending change you can read from the last 7 days (up to 100). Questions (facts that disagree, possible duplicate people) are answered, not kept.",
+    "params": {
+      "ids": {
+        "type": "string",
+        "required": true,
+        "description": "Item ids from learned, comma separated (e.g. 12,15), or all."
+      }
+    },
+    "scope": "write",
+    "annotations": {
+      "idempotentHint": true
+    },
+    "cliHints": {
+      "name": "learned-keep",
+      "positional": [
+        "ids"
+      ]
+    },
+    "area": "insights"
+  },
+  {
+    "name": "learned_undo",
+    "mutating": true,
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Undo items from the learned note through the operation that owns each change: a new fact is forgotten (withdrawn; history kept), a promise is dropped, a filled-in page is reverted to the version before it was filled (refused when the page was edited since, with the commands to choose a version). For facts that disagree it rejects the newer fact on the brain host; for possible duplicate people it returns the gbrain dedupe reject command for the brain host. Each result says what happened.",
+    "params": {
+      "ids": {
+        "type": "string",
+        "required": true,
+        "description": "Item ids from learned, comma separated (e.g. 12,15)."
+      },
+      "reason": {
+        "type": "string",
+        "description": "Why it was wrong; recorded on the reversal (forget reason, loop note or revert reason)."
+      }
+    },
+    "scope": "write",
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true
+    },
+    "cliHints": {
+      "name": "learned-undo",
+      "positional": [
+        "ids"
+      ]
+    },
+    "area": "insights"
   }
 ];

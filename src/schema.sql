@@ -285,6 +285,8 @@ CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_
 -- index (idx_pages_title_lower_hash, a hash index: a page title has no length limit, #9779) is not here: v240 and
 -- v326 build it online, and this file replays on every boot, where a plain CREATE INDEX would block page writes.
 CREATE INDEX IF NOT EXISTS idx_pages_slug_trgm ON pages USING GIN (slug gin_trgm_ops);
+-- v335: idx_pages_spelling_key (the key of every stored slug spelling, src/core/slug-spelling-key.ts) is not here for the
+-- same reason: v335 builds it online, and a replay of this file on an upgrading brain would build it with a plain CREATE INDEX.
 -- v0.13.1 #170: avoids 14.6s seqscan on large brains when listing pages newest-first.
 CREATE INDEX IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC);
 -- v0.18.0: source-scoped scans (per /plan-eng-review Section 4).
@@ -3586,6 +3588,22 @@ DO $rls$ BEGIN
     ALTER TABLE write_gate_holds ENABLE ROW LEVEL SECURITY;
   END IF;
 END $rls$;
+
+CREATE TABLE IF NOT EXISTS write_gate_hold_rechecks (
+  id               BIGSERIAL PRIMARY KEY,
+  source_id        TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  hold_id          BIGINT NOT NULL,
+  observed_version TEXT NOT NULL,
+  survivor_ids     BIGINT[] NOT NULL DEFAULT '{}',
+  queued_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS write_gate_hold_rechecks_queue_idx ON write_gate_hold_rechecks (queued_at, id);
+CREATE INDEX IF NOT EXISTS write_gate_hold_rechecks_hold_idx ON write_gate_hold_rechecks (hold_id);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE write_gate_hold_rechecks ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
 -- END GENERATED from src/core/write-gate-schema.ts (WRITE_GATE_SCHEMA_SQL)
 
 -- #5255/#5176 (O-DX-8): last upstream observation per source, recorded by sync
@@ -3811,6 +3829,34 @@ CREATE TABLE IF NOT EXISTS sync_notifier_sources (
   owner_seen_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Learning ledger (migration v334, nightly learning): pointers to what each cycle learned, no copied text.
+-- BEGIN GENERATED from src/core/learning/schema.ts (LEARNING_ITEMS_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS learning_items (
+  id                BIGSERIAL PRIMARY KEY,
+  run_id            UUID NOT NULL,
+  source_id         TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  kind              TEXT NOT NULL CHECK (kind IN ('fact_added','you_wrote','promise_found','page_filled','conflict_found','duplicate_to_confirm')),
+  target_table      TEXT NOT NULL CHECK (target_table IN ('facts','decide_proposals','open_loops','page_versions','pages')),
+  target_id         BIGINT NOT NULL,
+  subject_slug      TEXT,
+  subject_source_id TEXT,
+  prior_revision    TEXT,
+  state             TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','kept','undone','answered','expired')),
+  shown_at          TIMESTAMPTZ,
+  decided_at        TIMESTAMPTZ,
+  decided_by        TEXT,
+  member_id         TEXT,
+  CONSTRAINT learning_items_target_uniq UNIQUE (kind, target_table, target_id)
+);
+CREATE INDEX IF NOT EXISTS learning_items_source_state_created_idx ON learning_items (source_id, state, created_at);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE learning_items ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/learning/schema.ts (LEARNING_ITEMS_SCHEMA_SQL)
 
 -- Last statement: pg_temp ends every gbrain function's pinned search_path (#7632), after any CREATE OR REPLACE above reset it.
 -- BEGIN GENERATED from src/core/function-search-path.ts (FUNCTION_SEARCH_PATH_HARDENING_SQL). Edit that file, then run: bun run build:schema
